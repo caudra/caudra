@@ -34,7 +34,7 @@ description: "Every TOML config file in full, with each key commented out and de
 #
 # Full reference: https://caudra.ai/docs/configuration/
 
-version = 2
+version = 3
 
 # Start every session with YOLO mode (skip permission prompts, deny rules still
 # apply); global config only.
@@ -384,6 +384,12 @@ version = 2
 # receipt; independent of the enforced execution deadline.
 # Type: u64, at least 1.
 # shell_async_threshold_secs = 120
+
+# Show an ETA on a shell card, from a small model trained on this machine's
+# past shell runs. It only labels the card: timeouts and delivery never change.
+# When off, nothing is predicted or recorded.
+# Type: bool.
+# shell_eta = true
 
 # Name a new session by summarizing its first prompt with the Title model.
 # Type: bool.
@@ -1046,12 +1052,6 @@ version = 2
 # Type: string.
 # content_screening = "off"
 
-# Advise with local shell estimates. Enforce may fill an omitted timeout and
-# select delivery at admission. Explicit timeouts stay unchanged. Modes: off,
-# shadow, advise, enforce.
-# Type: string.
-# shell_duration = "off"
-
 # Suggest a shortlisted skill. The agent still chooses whether to load it.
 # Modes: off, shadow, advise.
 # Type: string.
@@ -1148,14 +1148,6 @@ version = 2
 # Probability that sampled content addresses the agent.
 # Type: float.
 # content_addressed_to_agent = 0.9
-
-# Probability that a shell command runs until stopped.
-# Type: float.
-# shell_endless = 0.9
-
-# Probability mass a duration bound needs before an engine estimate is used.
-# Type: float.
-# shell_duration = 0.9
 
 # Confidence required for skill suggestions. Subagent routing picks the Fast
 # model when this much difficulty probability is at or below routine work, and

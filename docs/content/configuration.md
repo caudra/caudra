@@ -69,7 +69,7 @@ timeout_secs = 180
 max_file_size_mb = 4
 ```
 
-All fields are optional. A file starts with `version = 2`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
+All fields are optional. A file starts with `version = 3`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
@@ -451,6 +451,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `deferred_questions` | bool | `true` | - | Let the main agent ask a `question` without waiting for the answer, so it keeps working while the form waits for you. The answer reaches it later, and you can also put a waiting question off with F4. When off, every question waits for its answer |
 | `shell_execution` | string | `auto` | - | Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt |
 | `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline |
+| `shell_eta` | bool | `true` | - | Show an ETA on a shell card, from a small model trained on this machine's past shell runs. It only labels the card: timeouts and delivery never change. When off, nothing is predicted or recorded |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `summarize_memory` | bool | `true` | - | Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
@@ -708,7 +709,7 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 ### `decisions`
 
-The `[decisions]` table holds the settings every decision endpoint shares: deadlines, logging, features, and thresholds. The endpoints themselves are `[decisions.<name>]` tables in the global `providers.toml`, and the engine runs only while one of them is active. `caudra auth login --decision` adds one and makes it active. See [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, Caudra still validates this table. It starts no engine, sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No passive feature or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active endpoint but no passive feature. Shell duration history works without an endpoint.
+The `[decisions]` table holds the settings every decision endpoint shares: deadlines, logging, features, and thresholds. The endpoints themselves are `[decisions.<name>]` tables in the global `providers.toml`, and the engine runs only while one of them is active. `caudra auth login --decision` adds one and makes it active. See [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, Caudra still validates this table. It starts no engine, sends no decision requests, reads no engine credentials, and leaves decision logs untouched. No passive feature or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active endpoint but no passive feature.
 
 These settings are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls. `base_url`, `protocol`, `model`, `api_key_env`, and `allow_http` are not accepted here. The error for each one shows the `providers.toml` table that replaces it. The [upgrade](#config-file-versions) comments out `allow_remote`, because configuring an endpoint is now the consent to send decision context to it.
 
@@ -731,7 +732,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 
 #### `decisions.features`
 
-`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, and permission-related shell-effect checks. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the reranking features still follow their feature settings in YOLO. Deterministic denies and hard restrictions still apply.
+`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, and permission-related shell-effect checks. Content screening, tool search, skill selection, goal prescreening, subagent routing, the question-tool nudge, and the reranking features still follow their feature settings in YOLO. Deterministic denies and hard restrictions still apply.
 
 | Feature | Default | Supported modes | Behavior beyond shadow |
 |---------|---------|-----------------|------------------------|
@@ -739,7 +740,6 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `auto_screening` | `off` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. Only `enforce` lets Auto run scripts and other lines that cannot be checked command by command. No answer channel means denial. |
 | `shell_effect` | `off` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
 | `content_screening` | `off` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
-| `shell_duration` | `off` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |
 | `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the `task` call, profile pins, and continuations keep their routing. |
@@ -762,25 +762,11 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `auto_flag` | float | `0.85` | Probability for escalating an eligible Auto call. |
 | `content_injection` | float | `0.9` | Probability that sampled content attempts instruction injection. |
 | `content_addressed_to_agent` | float | `0.9` | Probability that sampled content addresses the agent. |
-| `shell_endless` | float | `0.9` | Probability that a shell command runs until stopped. |
-| `shell_duration` | float | `0.9` | Probability mass a duration bound needs before an engine estimate is used. |
 | `routing_confidence` | float | `0.9` | Confidence required for skill suggestions. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. Memory recall, memory duplicates, and output pointers name a candidate only at or above this relevance probability. |
 | `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
 | `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 | `question_tool_nudge` | float | `0.85` | Minimum noul score for a question-tool reminder. Provisional, not a calibrated probability; advise only, and errors or uncertainty never reopen the turn. |
 | `relevance_floor` | float | `0.1` | Relevance probability below which an enforcing rerank feature prunes or demotes a candidate. Memory search omits it, compaction retention keeps a newer result in its place, and tool search ranks it after the candidates judged relevant, in keyword order. A list the engine could not judge is never emptied. |
-
-#### Shell duration
-
-`shell_duration` applies only to eligible local native shell calls, not remote workspaces or managed sandboxes. Measured exact-command history takes priority over command-family history, and both take priority over a model estimate. Timeouts, cancellations, and failures are recorded separately from completed latency samples. History is separate from the opt-in decision log, so `log = false` does not disable duration observations.
-
-A model estimate scores a command on four levels: exits at once, runs for seconds, runs for minutes, or runs until stopped. It counts as running until stopped when the `endless` answer or the probability of that level reaches `shell_endless`. Otherwise the first of these bounds whose probability reaches `shell_duration` decides: at least minutes, at once, then at most seconds. With no bound reached, the call runs without an estimate.
-
-Measured runs are labeled by fixed boundaries. A run within 1 second exited at once, a run under 120 seconds took seconds, and a longer run took minutes. These boundaries stay the same whatever `agent.shell_async_threshold_secs` is. When neither the command nor its family has enough history, the request lists up to four related families as `earlier_runs`, drawn from runs in the same project and working directory. The command's own family comes first, then families with the same program, each with how long its runs took.
-
-In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the tool schema's default and maximum. An explicit timeout is never changed. An endless prediction gives caution only and does not remove the execution deadline.
-
-With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous or asynchronous delivery at admission, bounded by the effective timeout and `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed runtime never promotes a synchronous call to asynchronous delivery. An admission receipt is not completion or success.
 
 #### Question-tool nudge
 
@@ -907,7 +893,7 @@ Each TOML config file starts with a top-level `version`, the version of its form
 
 | File | Version | Without `version` | Newer than this build reads |
 |------|---------|-------------------|-----------------------------|
-| `caudra.toml` | 2 | Read as version 1 | Caudra stops with an error |
+| `caudra.toml` | 3 | Read as version 1 | Caudra stops with an error |
 | `permissions.toml` | 2 | Read as version 1 | Fails closed. Tool calls are denied until the file is fixed |
 | `mcp.toml` | 2 | Read as version 1 | Servers from that file do not start, and Caudra shows the error |
 | `providers.toml` | 1 | Read as version 1 | Caudra stops with an error |
@@ -948,7 +934,7 @@ reads like this after the upgrade:
 # My settings
 
 # Added by Caudra 0.2.0-preview.12 on 2026-10-20: the format version of this file, which Caudra now requires.
-version = 2
+version = 3
 
 [ui.tool_output_lines]
 # Upgraded by Caudra 0.2.0-preview.12 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.

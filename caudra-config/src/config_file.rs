@@ -15,15 +15,22 @@ use crate::migration::{self, ArrayRename, ConfigFormat, MigrationError, ReadErro
 use crate::{CODE_TOOL_NAME, PROJECT_DIR, RawConfig};
 
 pub const CONFIG_FILE: &str = "caudra.toml";
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 pub const CONFIG_FORMAT: ConfigFormat = ConfigFormat {
     file: CONFIG_FILE,
     latest: CONFIG_VERSION,
-    steps: &[Step {
-        from: 1,
-        why: None,
-        apply: upgrade_from_1,
-    }],
+    steps: &[
+        Step {
+            from: 1,
+            why: None,
+            apply: upgrade_from_1,
+        },
+        Step {
+            from: 2,
+            why: Some(SHELL_ETA_WHY),
+            apply: upgrade_from_2,
+        },
+    ],
     requires_version: false,
 };
 pub const INIT_LUA_FILE: &str = "init.lua";
@@ -39,6 +46,7 @@ const ALLOW_REMOTE_WHY: &str =
 const DECISION_ENGINE_WHY: &str = "the decision engine is no longer experimental";
 const CONTINUATION_TURNS_WHY: &str =
     "truncation is now a steering rule, limited by `agent.steering.rules.truncation.max_attempts`";
+const SHELL_ETA_WHY: &str = "shell ETAs come from a local model now, switched by `agent.shell_eta`";
 const CODE_REQUIRED_WHY: &str = "`code`, which replaced `python_execution` and `mcp`, cannot be disabled; turn off a module's tool group instead";
 /// `code` and the tools it replaced, which could be disabled while they were
 /// tools of their own.
@@ -230,6 +238,13 @@ fn upgrade_from_1(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
     Ok(())
 }
 
+fn upgrade_from_2(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+    upgrade.retire_key(&["decisions", "features"], "shell_duration");
+    upgrade.retire_key(&["decisions", "thresholds"], "shell_duration");
+    upgrade.retire_key(&["decisions", "thresholds"], "shell_endless");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -281,8 +296,8 @@ workflows = true
     const LEGACY_GLOBAL_UPGRADED: &str = "\
 # My Caudra config
 
-# Upgraded by Caudra 9.9.9 on 2026-10-20: version 1 → 2.
-version = 2
+# Upgraded by Caudra 9.9.9 on 2026-10-20: version 1 → 3.
+version = 3
 
 [ui.tool_output_lines]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.
@@ -324,13 +339,14 @@ disabled_tools = [\"code_refs\", \"mcp\", \"code\"]
 ";
     const LEGACY_PROJECT_UPGRADED: &str = "\
 # Added by Caudra 9.9.9 on 2026-10-20: the format version of this file, which Caudra now requires.
-version = 2
+version = 3
 
 [agent]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `code_refs` to `source_code_refs` in `agent.disabled_tools`, because the code-graph tools are now `source_code_context` and `source_code_refs`.
 # Upgraded by Caudra 9.9.9 on 2026-10-20: removed `mcp` and removed `code` in `agent.disabled_tools`, because `code`, which replaced `python_execution` and `mcp`, cannot be disabled; turn off a module's tool group instead.
 disabled_tools = [\"source_code_refs\"]
 ";
+    const SHELL_DURATION_V2: &str = "version = 2\n\n[decisions.features]\nshell_duration = \"enforce\"\n\n[decisions.thresholds]\nshell_duration = 0.8\nshell_endless = 0.9\n";
     const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ncross_session_messaging = true\nautomations = true\nautopilot = true\n";
 
     fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -356,7 +372,7 @@ disabled_tools = [\"source_code_refs\"]
     }
 
     #[test_case("", FeatureFlags::NONE; "empty_file")]
-    #[test_case("version = 2\n[experimental]\n", FeatureFlags::NONE; "empty_table")]
+    #[test_case("version = 3\n[experimental]\n", FeatureFlags::NONE; "empty_table")]
     #[test_case("[experimental]\nworkflows = false\n", FeatureFlags::NONE; "explicit_false")]
     #[test_case("[experimental]\nlua_plugins = true\n", FeatureFlags::NONE.with(Feature::LuaPlugins); "one_flag")]
     #[test_case("[experimental]\ncross_session_messaging = false\n", FeatureFlags::NONE; "messaging_false")]
@@ -381,7 +397,7 @@ disabled_tools = [\"source_code_refs\"]
     #[test]
     fn settings_share_the_file_with_flags() {
         let (_dir, path) = write(
-            "version = 2\nalways_fast = true\n[experimental]\nworkflows = true\n[ui]\nscrollbar = false\n",
+            "version = 3\nalways_fast = true\n[experimental]\nworkflows = true\n[ui]\nscrollbar = false\n",
         );
         let loaded = load_global_config(&path).unwrap();
         assert!(loaded.features.enabled(Feature::Workflows));
@@ -408,9 +424,9 @@ disabled_tools = [\"source_code_refs\"]
     }
 
     #[test_case("[experimental]\nworkflow = true\n", "unknown field `workflow`"; "unknown_flag")]
-    #[test_case("version = 2\n[experimental]\nworkflows = 1\n", "line 3"; "non_bool_flag")]
-    #[test_case("version = 2\nexperimental = true\n", "line 2"; "flag_table_not_a_table")]
-    #[test_case("version = 2\n[ui]\nsho_thinking = true\n", "line 3"; "unknown_setting_keeps_its_line")]
+    #[test_case("version = 3\n[experimental]\nworkflows = 1\n", "line 3"; "non_bool_flag")]
+    #[test_case("version = 3\nexperimental = true\n", "line 2"; "flag_table_not_a_table")]
+    #[test_case("version = 3\n[ui]\nsho_thinking = true\n", "line 3"; "unknown_setting_keeps_its_line")]
     fn invalid_global_files_are_refused(contents: &str, expected: &str) {
         let (_dir, path) = write(contents);
         let error = load_global_config(&path).unwrap_err();
@@ -418,7 +434,7 @@ disabled_tools = [\"source_code_refs\"]
         assert!(error.to_string().contains(expected), "{error}");
     }
 
-    #[test_case("version = 3\n", "newer"; "newer_version")]
+    #[test_case("version = 4\n", "newer"; "newer_version")]
     #[test_case("version = 0\n", "version"; "invalid_version")]
     #[test_case("[ui\n", "line 1"; "syntax_error")]
     fn unreadable_formats_are_refused_with_the_path(contents: &str, expected: &str) {
@@ -454,7 +470,7 @@ disabled_tools = [\"source_code_refs\"]
         let dir = tempfile::tempdir().unwrap();
         let path = project_config_path(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "version = 2\n[agent]\ntodo_reminder = false\n").unwrap();
+        fs::write(&path, "version = 3\n[agent]\ntodo_reminder = false\n").unwrap();
         assert_eq!(
             load_project_config(&path).unwrap().agent.todo_reminder,
             Some(false)
@@ -488,7 +504,7 @@ disabled_tools = [\"source_code_refs\"]
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            format!("version = 2\n[ui]\ntheme = \"{open}{MISSING_THEME}}}\"\n"),
+            format!("version = 3\n[ui]\ntheme = \"{open}{MISSING_THEME}}}\"\n"),
         )
         .unwrap();
         let error = if scope == GLOBAL_SCOPE {
@@ -574,6 +590,26 @@ disabled_tools = [\"source_code_refs\"]
 
         assert_eq!(text, LEGACY_PROJECT_UPGRADED);
         assert_eq!(validate_project(&path, &text), Ok(()));
+    }
+
+    #[test]
+    fn shell_duration_keys_retire_into_text_that_loads() {
+        let (_dir, path) = write(SHELL_DURATION_V2);
+
+        let migrated = migrate(SHELL_DURATION_V2, &CONFIG_FORMAT, &test_stamp()).unwrap();
+        let text = migrated.text.unwrap();
+
+        assert_eq!(migrated.changes.len(), 3);
+        assert_eq!(validate_global(&path, &text), Ok(()));
+        assert!(
+            load_global_config(&path)
+                .unwrap()
+                .settings
+                .into_config(false)
+                .unwrap()
+                .agent
+                .shell_eta
+        );
     }
 
     #[test]

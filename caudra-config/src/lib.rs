@@ -1401,14 +1401,10 @@ pub fn resolve_shell_background(
     config: &AgentConfig,
     background_supported: bool,
     effective_timeout_secs: u64,
-    expected_secs: Option<u64>,
 ) -> Result<bool, &'static str> {
     match effective_shell_execution(config, background_supported).ok_or(SHELL_ASYNC_UNSUPPORTED)? {
         ExecutionMode::Sync => Ok(false),
-        ExecutionMode::Auto => Ok(expected_secs
-            .unwrap_or(effective_timeout_secs)
-            .min(effective_timeout_secs)
-            > config.shell_async_threshold_secs),
+        ExecutionMode::Auto => Ok(effective_timeout_secs > config.shell_async_threshold_secs),
         ExecutionMode::Async => Ok(true),
     }
 }
@@ -1547,6 +1543,7 @@ pub struct AgentFileConfig {
     pub deferred_questions: Option<bool>,
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
+    pub shell_eta: Option<bool>,
     pub generate_titles: Option<bool>,
     pub summarize_memory: Option<bool>,
     pub stale_read_check: Option<bool>,
@@ -1593,6 +1590,7 @@ impl AgentFileConfig {
             deferred_questions,
             shell_execution,
             shell_async_threshold_secs,
+            shell_eta,
             generate_titles,
             summarize_memory,
             stale_read_check,
@@ -2854,6 +2852,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Show an ETA on a shell card, from a small model trained on this machine's past shell runs. It only labels the card: timeouts and delivery never change. When off, nothing is predicted or recorded"
+    )]
+    pub shell_eta: bool,
+
+    #[config(
+        default = true,
         desc = "Name a new session by summarizing its first prompt with the Title model"
     )]
     pub generate_titles: bool,
@@ -3001,6 +3005,7 @@ impl AgentConfig {
             shell_async_threshold_secs: file
                 .shell_async_threshold_secs
                 .unwrap_or(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS),
+            shell_eta: file.shell_eta.unwrap_or(true),
             background_reminder_turns: file
                 .background_reminder_turns
                 .unwrap_or(DEFAULT_BACKGROUND_REMINDER_TURNS),
@@ -5260,35 +5265,11 @@ mod tests {
                     _ => Ok(false),
                 };
                 assert_eq!(
-                    resolve_shell_background(&config, supported, timeout, None),
+                    resolve_shell_background(&config, supported, timeout),
                     expected
                 );
             }
         }
-    }
-
-    #[test_case(ExecutionMode::Auto, Some(10), 600, false)]
-    #[test_case(ExecutionMode::Auto, Some(600), 10, false)]
-    #[test_case(ExecutionMode::Auto, Some(600), 600, true)]
-    #[test_case(ExecutionMode::Auto, Some(120), 600, false)]
-    #[test_case(ExecutionMode::Auto, None, 600, true)]
-    #[test_case(ExecutionMode::Auto, None, 120, false)]
-    #[test_case(ExecutionMode::Sync, Some(600), 600, false)]
-    #[test_case(ExecutionMode::Async, Some(10), 10, true)]
-    fn shell_prediction_only_routes_at_admission(
-        mode: ExecutionMode,
-        expected: Option<u64>,
-        deadline: u64,
-        background: bool,
-    ) {
-        let config = AgentConfig {
-            shell_execution: mode,
-            ..AgentConfig::default()
-        };
-        assert_eq!(
-            resolve_shell_background(&config, true, deadline, expected),
-            Ok(background)
-        );
     }
 
     #[test_case("task_execution", "auto", None)]
@@ -6181,6 +6162,13 @@ mod tests {
             serde_json::to_value(&config.agent).unwrap()[DEFERRED_QUESTIONS_FIELD],
             expected
         );
+    }
+
+    #[test_case("", true ; "enabled_by_default")]
+    #[test_case("shell_eta = false", false ; "disabled")]
+    fn shell_eta_config(source: &str, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        assert_eq!(raw.into_config(false).unwrap().agent.shell_eta, expected);
     }
 
     #[test]

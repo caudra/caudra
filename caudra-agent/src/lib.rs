@@ -59,6 +59,7 @@ pub mod prompt;
 pub mod remote_project_context;
 pub mod scratch;
 pub mod session_fork;
+pub mod shell_eta;
 mod stored_session;
 mod subagent_history;
 pub mod template;

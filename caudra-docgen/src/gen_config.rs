@@ -33,9 +33,6 @@ use crate::gen_providers::join_and;
 use crate::gen_reference_configs;
 use crate::page_header;
 
-/// The one feature with a section of its own further down the page.
-const SHELL_DURATION_FEATURE: &str = "shell_duration";
-const SHELL_DURATION_LINK: &str = " See [shell duration](#shell-duration).";
 const MCP_REMINDER_SLOT: &str = "{mcp_reminder}";
 const PROFILE_CHANGES_SLOT: &str = "{profile_changes}";
 const EXAMPLE_MCP_SERVER: &str = "analytics";
@@ -698,11 +695,10 @@ fn write_decisions_section(out: &mut String) {
          active. `caudra auth login --decision` adds one and makes it active. See \
          [Decision endpoints](/docs/providers/#decision-endpoints). With no active endpoint, \
          Caudra still validates this table. It starts no engine, sends no decision requests, \
-         reads no engine credentials, and leaves decision logs and shell duration history \
-         untouched. No passive feature or decision logging is enabled by default. Explicit \
+         reads no engine credentials, and leaves decision logs untouched. No passive feature or decision logging is enabled by default. Explicit \
          workflow [`decide()` calls](/docs/workflows/#typed-decisions) and the MCP \
          [`decide()` and `rerank()` helpers](/docs/mcp/#decisions-and-reranking) need an active \
-         endpoint but no passive feature. Shell duration history works without an endpoint.\n\n\
+         endpoint but no passive feature.\n\n\
          These settings are global-only. Projects may set individual features \
          to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
          Other project overrides are errors, even when they repeat a global value. \
@@ -738,8 +734,8 @@ fn write_decisions_section(out: &mut String) {
          `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior \
          listed below, never permission grants or relaxed executor restrictions. \
          Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, \
-         and permission-related shell-effect checks. Shell duration, content screening, tool search, \
-         skill selection, goal prescreening, subagent routing, the question-tool nudge, and the \
+         and permission-related shell-effect checks. Content screening, tool search, skill \
+         selection, goal prescreening, subagent routing, the question-tool nudge, and the \
          reranking features still follow their feature settings in YOLO. Deterministic denies and \
          hard restrictions still apply.\n\n\
          | Feature | Default | Supported modes | Behavior beyond shadow |\n\
@@ -754,14 +750,9 @@ fn write_decisions_section(out: &mut String) {
             .iter()
             .map(|mode| format!("`{}`", mode.as_str()))
             .collect();
-        let see_also = if feature.name == SHELL_DURATION_FEATURE {
-            SHELL_DURATION_LINK
-        } else {
-            ""
-        };
         writeln!(
             out,
-            "| `{}` | `{}` | {} | {}{see_also} |",
+            "| `{}` | `{}` | {} | {} |",
             feature.name,
             FeatureMode::default().as_str(),
             modes.join(", "),
@@ -777,35 +768,7 @@ fn write_decisions_section(out: &mut String) {
     );
     write_table(out, DecisionThresholds::FIELDS);
     out.push_str(
-        "\n#### Shell duration\n\n\
-         `shell_duration` applies only to eligible local native shell calls, not remote workspaces \
-         or managed sandboxes. Measured exact-command history takes priority over command-family \
-         history, and both take priority over a model estimate. Timeouts, cancellations, and failures \
-         are recorded separately from completed latency samples. History is separate from the \
-         opt-in decision log, so `log = false` does not disable duration observations.\n\n\
-         A model estimate scores a command on four levels: exits at once, runs for seconds, \
-         runs for minutes, or runs until stopped. It counts as running until stopped when the \
-         `endless` answer or the probability of that level reaches `shell_endless`. Otherwise \
-         the first of these bounds whose probability reaches `shell_duration` decides: at least \
-         minutes, at once, then at most seconds. With no bound reached, the call runs without an \
-         estimate.\n\n\
-         Measured runs are labeled by fixed boundaries. A run within 1 second exited at once, a \
-         run under 120 seconds took seconds, and a longer run took minutes. These boundaries \
-         stay the same whatever `agent.shell_async_threshold_secs` is. When neither the command \
-         nor its family has enough history, the request lists up to four related families as \
-         `earlier_runs`, drawn from runs in the same project and working directory. The \
-         command's own family comes first, then families with the same program, each with how \
-         long its runs took.\n\n\
-         In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted \
-         `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the \
-         tool schema's default and maximum. An explicit timeout is never changed. An endless \
-         prediction gives caution only and does not remove the execution deadline.\n\n\
-         With `agent.shell_execution = \"auto\"`, Enforce estimates can select synchronous or \
-         asynchronous delivery at admission, bounded by the effective timeout and \
-         `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed \
-         runtime never promotes a synchronous call to asynchronous delivery. An admission \
-         receipt is not completion or success.\n\n\
-         #### Question-tool nudge\n\n\
+        "\n#### Question-tool nudge\n\n\
          `question_tool_nudge` defaults to `off` and supports `off`, `shadow`, and `advise`. \
          It checks an attempted final prose reply for a live request for the user to clarify, choose, \
          supply information, or approve a next step. It needs a configured engine and a usable \

@@ -278,8 +278,6 @@ features! {
         "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.";
     content_screening: [Advise],
         "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.";
-    shell_duration: [Advise, Enforce],
-        "Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged.";
     skill_suggestions: [Advise],
         "Suggest a shortlisted skill. The agent still chooses whether to load it.";
     goal_prescreen: [Enforce],
@@ -311,8 +309,6 @@ pub struct DecisionThresholds {
     pub auto_flag: f64,
     pub content_injection: f64,
     pub content_addressed_to_agent: f64,
-    pub shell_endless: f64,
-    pub shell_duration: f64,
     pub routing_confidence: f64,
     pub goal_skip_below: f64,
     pub question_tool_nudge: f64,
@@ -327,8 +323,6 @@ impl Default for DecisionThresholds {
             auto_flag: DEFAULT_FLAG_THRESHOLD,
             content_injection: DEFAULT_CONFIDENCE_THRESHOLD,
             content_addressed_to_agent: DEFAULT_CONFIDENCE_THRESHOLD,
-            shell_endless: DEFAULT_CONFIDENCE_THRESHOLD,
-            shell_duration: DEFAULT_CONFIDENCE_THRESHOLD,
             routing_confidence: DEFAULT_CONFIDENCE_THRESHOLD,
             goal_skip_below: DEFAULT_GOAL_SKIP_BELOW,
             question_tool_nudge: DEFAULT_QUESTION_TOOL_NUDGE,
@@ -375,24 +369,6 @@ impl DecisionThresholds {
             max: None,
             env: None,
             description: "Probability that sampled content addresses the agent.",
-        },
-        ConfigField {
-            name: "shell_endless",
-            ty: "float",
-            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
-            min: None,
-            max: None,
-            env: None,
-            description: "Probability that a shell command runs until stopped.",
-        },
-        ConfigField {
-            name: "shell_duration",
-            ty: "float",
-            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
-            min: None,
-            max: None,
-            env: None,
-            description: "Probability mass a duration bound needs before an engine estimate is used.",
         },
         ConfigField {
             name: "routing_confidence",
@@ -450,8 +426,6 @@ impl DecisionThresholds {
                 "thresholds.content_addressed_to_agent",
                 Some(self.content_addressed_to_agent),
             ),
-            ("thresholds.shell_endless", Some(self.shell_endless)),
-            ("thresholds.shell_duration", Some(self.shell_duration)),
             (
                 "thresholds.routing_confidence",
                 Some(self.routing_confidence),
@@ -1505,7 +1479,6 @@ mod tests {
     #[test_case("auto_screening", false, true)]
     #[test_case("shell_effect", true, false)]
     #[test_case("content_screening", true, false)]
-    #[test_case("shell_duration", true, true)]
     #[test_case("skill_suggestions", true, false)]
     #[test_case("goal_prescreen", false, true)]
     #[test_case("subagent_routing", false, true)]
@@ -1597,10 +1570,6 @@ mod tests {
     #[test_case(
         "[decisions.features]\nauto_screening = 'shadow'",
         "features.auto_screening"
-    )]
-    #[test_case(
-        "[decisions.features]\nshell_duration = 'enforce'",
-        "features.shell_duration"
     )]
     fn project_cannot_enable_or_weaken(global_only: &str, field: &str) {
         let mut global: RawConfig = toml::from_str(

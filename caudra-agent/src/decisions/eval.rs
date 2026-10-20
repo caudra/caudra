@@ -36,7 +36,7 @@ use super::state::MAX_STATE_BYTES;
 use super::{
     CodeSymbol, DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions,
     MAX_RERANK_BATCH, PermissionAction, content, permission, question_tool_nudge, questions,
-    rerank_source_code_context, shell_duration, shell_effect,
+    rerank_source_code_context, shell_effect,
 };
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
 use crate::agent::{
@@ -73,8 +73,6 @@ const FAST: &str = "fast";
 const BEST: &str = "best";
 const P50: f64 = 0.5;
 const P95: f64 = 0.95;
-/// Fixture names for the levels of the `duration` score, lowest first.
-const DURATION_LEVELS: [&str; 4] = ["instant", "seconds", "minutes", "endless"];
 /// The first rank's discount is `1 / log2(2)`.
 const DCG_RANK_OFFSET: f64 = 2.0;
 const NOT_ADVISORY: &str = "n/a";
@@ -136,14 +134,6 @@ struct Scored {
     label: String,
     verdicts: Vec<Verdict>,
     latency_ms: u64,
-}
-
-#[derive(Deserialize)]
-struct DurationCase {
-    command: String,
-    #[serde(default)]
-    earlier_runs: Vec<Value>,
-    expect: String,
 }
 
 #[derive(Deserialize)]
@@ -351,12 +341,6 @@ fn decision_eval() {
     };
     let passed = smol::block_on(async {
         [
-            run(
-                "shell_duration",
-                include_str!("eval/shell_duration.json"),
-                |case| shell_duration_case(decisions, case),
-            )
-            .await,
             run("permission", include_str!("eval/permission.json"), |case| {
                 permission_case(decisions, case)
             })
@@ -465,7 +449,6 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.permission_advice = FeatureMode::Advise;
     features.shell_effect = FeatureMode::Advise;
     features.content_screening = FeatureMode::Advise;
-    features.shell_duration = FeatureMode::Enforce;
     features.skill_suggestions = FeatureMode::Advise;
     features.goal_prescreen = FeatureMode::Enforce;
     features.subagent_routing = FeatureMode::Enforce;
@@ -818,28 +801,6 @@ fn question_tool_quiz_miss_is_not_scored_as_success() {
         question_tool_verdict(&outcome, DECIDED, true),
         Verdict::Undecided
     );
-}
-
-async fn shell_duration_case(decisions: &Decisions, case: DurationCase) -> Scored {
-    let questions = questions::SHELL_DURATION.as_ref().expect(SET_INVALID);
-    let state = shell_duration::duration_state(&case.command, None, case.earlier_runs.clone());
-    let outcome = evaluate(decisions, DecisionFeature::ShellDuration, &state, questions).await;
-    let thresholds = &decisions.config().thresholds;
-    let level = outcome.result.as_ref().ok().and_then(|response| {
-        shell_duration::prior(
-            response,
-            thresholds.shell_duration,
-            thresholds.shell_endless,
-        )
-        .and_then(|level| DURATION_LEVELS.get(level).copied())
-    });
-    let verdict = matched(outcome.result.is_ok(), level, Some(case.expect.as_str()));
-    scored(
-        (&case.command, &case.earlier_runs, &case.expect),
-        level,
-        vec![verdict],
-        outcome.latency_ms,
-    )
 }
 
 async fn permission_case(decisions: &Decisions, case: PermissionCase) -> Scored {

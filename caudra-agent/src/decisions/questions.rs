@@ -6,12 +6,6 @@ use std::sync::LazyLock;
 
 use caudra_decision::QuestionSet;
 
-pub(crate) static SHELL_DURATION: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
-    embedded(
-        "shell_duration.v2",
-        include_str!("questions/shell_duration.json"),
-    )
-});
 pub(crate) static PERMISSION: LazyLock<Option<QuestionSet>> =
     LazyLock::new(|| embedded("permission.v1", include_str!("questions/permission.json")));
 pub(crate) static SHELL_EFFECT: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
@@ -43,20 +37,18 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CONTENT, GOAL, LazyLock, PERMISSION, QUESTION_TOOL_NUDGE, QuestionSet, SHELL_DURATION,
-        SHELL_EFFECT, SUBAGENT,
+        CONTENT, GOAL, LazyLock, PERMISSION, QUESTION_TOOL_NUDGE, QuestionSet, SHELL_EFFECT,
+        SUBAGENT,
     };
     use crate::agent::GOAL_MET_QUESTION;
     use crate::agent::subagent::DIFFICULTY_QUESTION;
     use crate::decisions::content::{ADDRESSED_TO_AGENT, INJECTION};
     use crate::decisions::permission::FLAGS;
     use crate::decisions::question_tool_nudge::QUESTION;
-    use crate::decisions::shell_duration::{DURATION_QUESTION, ENDLESS_QUESTION};
     use crate::decisions::shell_effect::{CHANGES_SYSTEM, WRITES};
 
     const SET_INVALID: &str = "an embedded question set failed to parse";
 
-    #[test_case(&SHELL_DURATION, &[(DURATION_QUESTION, QuestionType::Score), (ENDLESS_QUESTION, QuestionType::Noul)]; "shell_duration")]
     #[test_case(&PERMISSION, &FLAGS.map(|flag| (flag, QuestionType::Noul)); "permission")]
     #[test_case(&SHELL_EFFECT, &[(WRITES, QuestionType::Noul), (CHANGES_SYSTEM, QuestionType::Noul)]; "shell_effect")]
     #[test_case(&CONTENT, &[(INJECTION, QuestionType::Noul), (ADDRESSED_TO_AGENT, QuestionType::Noul)]; "content")]

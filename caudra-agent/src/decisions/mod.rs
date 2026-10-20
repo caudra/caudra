@@ -8,7 +8,6 @@ mod permission;
 pub(crate) mod question_tool_nudge;
 pub(crate) mod questions;
 mod rerank;
-pub(crate) mod shell_duration;
 mod shell_effect;
 mod source_code_context;
 mod state;
@@ -41,9 +40,6 @@ use futures_lite::future;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Host;
-
-pub use shell_duration::DurationEffect;
-use shell_duration::ShellDurationCache;
 
 pub use active::{
     RemovedDecisionEndpoint, SavedDecisionEndpoint, endpoint_api_key, remove_decision_endpoint,
@@ -92,7 +88,6 @@ pub enum DecisionFeature {
     AutoScreening,
     ShellEffect,
     ContentScreening,
-    ShellDuration,
     SkillSuggestions,
     GoalPrescreen,
     SubagentRouting,
@@ -108,12 +103,11 @@ pub enum DecisionFeature {
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then the script callers.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 17] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
         Self::ContentScreening,
-        Self::ShellDuration,
         Self::SkillSuggestions,
         Self::GoalPrescreen,
         Self::SubagentRouting,
@@ -139,7 +133,6 @@ impl DecisionFeature {
             Self::AutoScreening => "auto",
             Self::ShellEffect => "shell_effect",
             Self::ContentScreening => "content",
-            Self::ShellDuration => "shell_duration",
             Self::SkillSuggestions => "skill_suggestions",
             Self::GoalPrescreen => "goal",
             Self::SubagentRouting => "subagent_routing",
@@ -164,7 +157,6 @@ impl DecisionFeature {
             Self::AutoScreening => Some("auto_screening"),
             Self::ShellEffect => Some("shell_effect"),
             Self::ContentScreening => Some("content_screening"),
-            Self::ShellDuration => Some("shell_duration"),
             Self::SkillSuggestions => Some("skill_suggestions"),
             Self::GoalPrescreen => Some("goal_prescreen"),
             Self::SubagentRouting => Some("subagent_routing"),
@@ -205,7 +197,6 @@ impl DecisionFeature {
             Self::AutoScreening => &features.auto_screening,
             Self::ShellEffect => &features.shell_effect,
             Self::ContentScreening => &features.content_screening,
-            Self::ShellDuration => &features.shell_duration,
             Self::SkillSuggestions => &features.skill_suggestions,
             Self::GoalPrescreen => &features.goal_prescreen,
             Self::SubagentRouting => &features.subagent_routing,
@@ -236,7 +227,6 @@ impl DecisionFeature {
             | Self::AutoScreening
             | Self::ShellEffect
             | Self::ContentScreening
-            | Self::ShellDuration
             | Self::SkillSuggestions
             | Self::GoalPrescreen
             | Self::SubagentRouting
@@ -275,7 +265,6 @@ impl DecisionFeature {
             | Self::AutoScreening
             | Self::ShellEffect
             | Self::ContentScreening
-            | Self::ShellDuration
             | Self::SkillSuggestions
             | Self::GoalPrescreen
             | Self::SubagentRouting
@@ -307,12 +296,6 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
             content::ADDRESSED_TO_AGENT.into(),
             config.content_addressed_to_agent,
         );
-    } else if feature == DecisionFeature::ShellDuration.name() {
-        overrides.insert(
-            shell_duration::ENDLESS_QUESTION.into(),
-            config.shell_endless,
-        );
-        thresholds.score_tolerance = shell_duration::LEVEL_TOLERANCE;
     } else if feature == DecisionFeature::QuestionToolNudge.name() {
         overrides.insert(
             question_tool_nudge::QUESTION.into(),
@@ -425,7 +408,6 @@ struct Inner {
     state_dir: StateDir,
     log: Arc<Mutex<Option<DecisionLog>>>,
     usage: Mutex<Option<UsageLedger>>,
-    shell_duration_cache: Mutex<ShellDurationCache>,
     permission_questions: QuestionSet,
     tainted: AtomicBool,
     status: Mutex<DecisionStatus>,
@@ -509,7 +491,6 @@ impl Decisions {
             state_dir: state_dir.clone(),
             log: Arc::new(Mutex::new(None)),
             usage: Mutex::new(None),
-            shell_duration_cache: Mutex::new(ShellDurationCache::default()),
             permission_questions,
             tainted: AtomicBool::new(false),
             status: Mutex::new(DecisionStatus::default()),
@@ -1286,7 +1267,6 @@ mod tests {
     }
 
     #[test_case(&questions::PERMISSION; "permission")]
-    #[test_case(&questions::SHELL_DURATION; "duration")]
     #[test_case(&questions::SHELL_EFFECT; "shell_effect")]
     #[test_case(&questions::CONTENT; "content")]
     #[test_case(&questions::GOAL; "goal")]
