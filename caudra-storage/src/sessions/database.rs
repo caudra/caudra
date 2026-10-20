@@ -83,7 +83,7 @@ use crate::workflow::{
 use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
-    StateDir, StorageError, existing_state_lock, lock_session_artifacts,
+    StateClass, StateDir, StorageError, existing_state_lock, lock_session_artifacts,
     lock_session_artifacts_within, shared_existing_state_lock, shared_state_lock,
     sync_parent_dir_durable, try_exclusive_existing_state_lock,
 };
@@ -5206,6 +5206,21 @@ fn describe_migration_holders(state_dir: &StateDir, path: &Path) -> String {
         described.push_str(&format!("\n  {id}  {title}"));
     }
     described
+}
+
+/// [`describe_migration_holders`] for whatever holds the instance lock on the
+/// persistent database of `state_dir`, for a command that refuses to rewrite
+/// a shared file while another Caudra runs.
+pub fn describe_open_sessions(state_dir: &StateDir) -> String {
+    let persistent = state_dir.for_class(StateClass::Persistent);
+    let path = persistent.path().join(SESSIONS_DB_FILE);
+    describe_migration_holders(&persistent, &path)
+}
+
+/// The title of every session in the persistent database of `state_dir`,
+/// read-only and best effort, for naming the sessions that hold a lock.
+pub fn persistent_session_titles(state_dir: &StateDir) -> HashMap<CaudraId, String> {
+    session_titles(&state_dir.persistent_path().join(SESSIONS_DB_FILE))
 }
 
 /// Reads titles straight from the old schema. Every version of `sessions` has

@@ -1,9 +1,10 @@
-//! The startup upgrade of the global config files on disk. A file whose
-//! format changed is rewritten only while no other Caudra runs, since an older
-//! one would refuse it on its next reload; a file that only lacks its
+//! Upgrades config files on disk. Startup upgrades the global files, and
+//! rewrites one whose format changed only while no other Caudra runs, since an
+//! older one would refuse it on its next reload; a file that only lacks its
 //! `version` key means the same to every build, so it is stamped regardless.
-//! Every rewrite is backed up first, and a file that cannot be rewritten is
-//! still read upgraded in memory.
+//! `caudra config migrate` upgrades global and project files alike while it
+//! holds the instance lock itself. Every rewrite is backed up first, and a
+//! file that cannot be rewritten is still read upgraded in memory.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,13 +26,13 @@ const BACKUP_FAILED: &str = "it could not be backed up first";
 /// Whether a file's upgraded text, read from `path`, loads with its real parser.
 pub type Validator = fn(&Path, &str) -> Result<(), String>;
 
-/// A global config file the startup upgrade covers.
-pub struct GlobalFile {
+/// A config file an upgrade on disk covers.
+pub struct UpgradableFile {
     pub format: &'static ConfigFormat,
     pub validate: Validator,
 }
 
-/// What the startup upgrade did with one global file that was not current.
+/// What an upgrade on disk did with one file that was not current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Upgraded {
@@ -49,20 +50,42 @@ pub enum Outcome {
         latest: u32,
         holders: Vec<CaudraId>,
     },
-    /// Left as it is on disk, for `error`.
+    /// Left as it is on disk, because it does not read, parse, or upgrade to
+    /// text that loads. Its loader reports `error` as well.
+    Invalid { file: &'static str, error: String },
+    /// Left as it is on disk, because it could not be backed up or written,
+    /// or the instance lock could not be checked.
     Failed { file: &'static str, error: String },
 }
 
-/// One [`Outcome`] per global file that was not current, in the order the
-/// files were given. Empty when every file was current or missing.
+/// One [`Outcome`] per file that was not current, in the order the files
+/// were given. Empty when every file was current or missing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpgradeReport {
     pub outcomes: Vec<Outcome>,
 }
 
-/// A file's upgrade, checked to load, and the bytes it replaces.
+/// What upgrading one file that is not current would change, worked out
+/// without writing anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Planned {
+    Upgrade {
+        file: &'static str,
+        from: u32,
+        to: u32,
+        original: String,
+        upgraded: String,
+        changes: Vec<Change>,
+    },
+    Invalid {
+        file: &'static str,
+        error: String,
+    },
+}
+
+/// A file's upgrade, checked to load, and the text it replaces.
 struct Candidate {
-    original: Vec<u8>,
+    original: String,
     revision: FileRevision,
     from: u32,
     text: String,
@@ -71,13 +94,18 @@ struct Candidate {
 
 /// Whether this process may rewrite a file whose format changed.
 enum Guard {
-    Acquired { _lock: InstanceLock },
+    Acquired {
+        _lock: InstanceLock,
+    },
+    /// The caller holds the lock for the whole run.
+    Held,
     Busy(Vec<CaudraId>),
     Unavailable(String),
 }
 
 struct Upgrader<'a> {
     state_dir: &'a StateDir,
+    scope: BackupScope<'a>,
     stamp: &'a Stamp,
     guard: Option<Guard>,
 }
@@ -114,10 +142,32 @@ impl UpgradeReport {
                     open_sessions = holders.len(),
                     "global config file left at its old format while other Caudra processes run"
                 ),
+                Outcome::Invalid { file, error } => {
+                    warn!(file, %error, "global config file not upgraded, because it does not load");
+                }
                 Outcome::Failed { file, error } => {
                     warn!(file, %error, "global config file not upgraded on disk");
                 }
             }
+        }
+    }
+}
+
+impl Outcome {
+    pub fn file(&self) -> &'static str {
+        match self {
+            Self::Upgraded { file, .. }
+            | Self::Blocked { file, .. }
+            | Self::Invalid { file, .. }
+            | Self::Failed { file, .. } => file,
+        }
+    }
+}
+
+impl Planned {
+    pub fn file(&self) -> &'static str {
+        match self {
+            Self::Upgrade { file, .. } | Self::Invalid { file, .. } => file,
         }
     }
 }
@@ -139,71 +189,117 @@ pub fn upgrade_global(
     config_dir: &Path,
     state_dir: &StateDir,
     stamp: &Stamp,
-    files: &[GlobalFile],
+    files: &[UpgradableFile],
 ) -> UpgradeReport {
-    let mut upgrader = Upgrader {
+    Upgrader {
         state_dir,
+        scope: BackupScope::Global,
         stamp,
         guard: None,
-    };
-    let mut outcomes = Vec::new();
-    let mut pending = Vec::new();
-    for file in files {
-        let path = config_dir.join(file.format.file);
-        match upgrader.prepare(file, &path) {
-            Ok(Some(candidate)) => pending.push((file, path, candidate)),
-            Ok(None) => {}
-            Err(error) => outcomes.push(Outcome::Failed {
-                file: file.format.file,
-                error,
-            }),
-        }
     }
-    if pending
+    .run(config_dir, files)
+}
+
+/// Upgrades every one of `files` in `dir`, whose owner `scope` names, for a
+/// caller that holds the instance lock, so no file is left blocked.
+pub fn upgrade_holding(
+    dir: &Path,
+    state_dir: &StateDir,
+    scope: BackupScope<'_>,
+    stamp: &Stamp,
+    files: &[UpgradableFile],
+    _lock: &InstanceLock,
+) -> UpgradeReport {
+    Upgrader {
+        state_dir,
+        scope,
+        stamp,
+        guard: Some(Guard::Held),
+    }
+    .run(dir, files)
+}
+
+/// What upgrading `files` in `dir` would change. Missing and current files
+/// are left out, as an upgrade leaves them.
+pub fn plan(dir: &Path, stamp: &Stamp, files: &[UpgradableFile]) -> Vec<Planned> {
+    files
         .iter()
-        .any(|(file, _, candidate)| candidate.from < file.format.latest)
-    {
-        upgrader.guard();
-    }
-    outcomes.extend(
-        pending
-            .into_iter()
-            .filter_map(|(file, path, candidate)| upgrader.settle(file, &path, candidate, true)),
-    );
-    UpgradeReport { outcomes }
+        .filter_map(|file| {
+            let name = file.format.file;
+            match prepare(file, &dir.join(name), stamp) {
+                Ok(candidate) => candidate.map(|candidate| Planned::Upgrade {
+                    file: name,
+                    from: candidate.from,
+                    to: file.format.latest,
+                    original: candidate.original,
+                    upgraded: candidate.text,
+                    changes: candidate.changes,
+                }),
+                Err(error) => Some(Planned::Invalid { file: name, error }),
+            }
+        })
+        .collect()
+}
+
+/// `None` when the file is missing or already current.
+fn prepare(file: &UpgradableFile, path: &Path, stamp: &Stamp) -> Result<Option<Candidate>, String> {
+    let Some(original) = atomic_file::read(path).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let original = String::from_utf8(original).map_err(|_| NOT_UTF8.to_owned())?;
+    let migrated = migrate(&original, file.format, stamp).map_err(|error| error.to_string())?;
+    let Some(upgraded) = migrated.text else {
+        return Ok(None);
+    };
+    (file.validate)(path, &upgraded).map_err(|error| format!("{WOULD_NOT_LOAD}: {error}"))?;
+    Ok(Some(Candidate {
+        revision: atomic_file::revision_of(Some(original.as_bytes())),
+        original,
+        from: migrated.from,
+        text: upgraded,
+        changes: migrated.changes,
+    }))
 }
 
 impl Upgrader<'_> {
+    fn run(mut self, dir: &Path, files: &[UpgradableFile]) -> UpgradeReport {
+        let mut outcomes = Vec::new();
+        let mut pending = Vec::new();
+        for file in files {
+            let path = dir.join(file.format.file);
+            match prepare(file, &path, self.stamp) {
+                Ok(Some(candidate)) => pending.push((file, path, candidate)),
+                Ok(None) => {}
+                Err(error) => outcomes.push(Outcome::Invalid {
+                    file: file.format.file,
+                    error,
+                }),
+            }
+        }
+        if pending
+            .iter()
+            .any(|(file, _, candidate)| candidate.from < file.format.latest)
+        {
+            self.guard();
+        }
+        outcomes.extend(
+            pending
+                .into_iter()
+                .filter_map(|(file, path, candidate)| self.settle(file, &path, candidate, true)),
+        );
+        UpgradeReport { outcomes }
+    }
+
     fn guard(&mut self) -> &Guard {
         let state_dir = self.state_dir;
         self.guard.get_or_insert_with(|| Guard::take(state_dir))
-    }
-
-    /// `None` when the file is missing or already current.
-    fn prepare(&self, file: &GlobalFile, path: &Path) -> Result<Option<Candidate>, String> {
-        let Some(original) = atomic_file::read(path).map_err(|error| error.to_string())? else {
-            return Ok(None);
-        };
-        let text = str::from_utf8(&original).map_err(|_| NOT_UTF8.to_owned())?;
-        let migrated = migrate(text, file.format, self.stamp).map_err(|error| error.to_string())?;
-        let Some(upgraded) = migrated.text else {
-            return Ok(None);
-        };
-        (file.validate)(path, &upgraded).map_err(|error| format!("{WOULD_NOT_LOAD}: {error}"))?;
-        Ok(Some(Candidate {
-            revision: atomic_file::revision_of(Some(&original)),
-            original,
-            from: migrated.from,
-            text: upgraded,
-            changes: migrated.changes,
-        }))
     }
 
     /// Writes `candidate` if this process may, reading the file once more
     /// when it changed after it was read.
     fn settle(
         &mut self,
-        file: &GlobalFile,
+        file: &UpgradableFile,
         path: &Path,
         candidate: Candidate,
         retry: bool,
@@ -211,7 +307,7 @@ impl Upgrader<'_> {
         let (name, latest) = (file.format.file, file.format.latest);
         if candidate.from < latest {
             match self.guard() {
-                Guard::Acquired { .. } => {}
+                Guard::Acquired { .. } | Guard::Held => {}
                 Guard::Busy(holders) => {
                     return Some(Outcome::Blocked {
                         file: name,
@@ -228,7 +324,6 @@ impl Upgrader<'_> {
                 }
             }
         }
-        let failed = |error: String| Some(Outcome::Failed { file: name, error });
         match self.commit(name, path, &candidate) {
             Ok(backup) => Some(Outcome::Upgraded {
                 file: name,
@@ -237,12 +332,17 @@ impl Upgrader<'_> {
                 backup,
                 changes: candidate.changes,
             }),
-            Err(AtomicFileError::Conflict { .. }) if retry => match self.prepare(file, path) {
-                Ok(Some(again)) => self.settle(file, path, again, false),
-                Ok(None) => None,
-                Err(error) => failed(error),
-            },
-            Err(error) => failed(error.to_string()),
+            Err(AtomicFileError::Conflict { .. }) if retry => {
+                match prepare(file, path, self.stamp) {
+                    Ok(Some(again)) => self.settle(file, path, again, false),
+                    Ok(None) => None,
+                    Err(error) => Some(Outcome::Invalid { file: name, error }),
+                }
+            }
+            Err(error) => Some(Outcome::Failed {
+                file: name,
+                error: error.to_string(),
+            }),
         }
     }
 
@@ -255,10 +355,10 @@ impl Upgrader<'_> {
         atomic_file::commit_after(path, &candidate.revision, candidate.text.as_bytes(), || {
             back_up_config(
                 self.state_dir,
-                BackupScope::Global,
+                self.scope,
                 file,
                 candidate.from,
-                &candidate.original,
+                candidate.original.as_bytes(),
                 Timestamp::now(),
             )
             .map_err(|error| io::Error::other(format!("{BACKUP_FAILED}: {error}")))
@@ -276,13 +376,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
+    use caudra_storage::backups::BackupScope;
     use caudra_storage::id::CaudraId;
+    use caudra_storage::projects::project_id;
     use caudra_storage::sessions::SessionLease;
-    use caudra_storage::{StateDir, hold_instance};
+    use caudra_storage::{StateDir, hold_instance, try_instance_lock};
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::{GlobalFile, Outcome, UpgradeReport, upgrade_global};
+    use super::{
+        Outcome, Planned, UpgradableFile, UpgradeReport, plan, upgrade_global, upgrade_holding,
+    };
     use crate::migration::{Change, ConfigFormat, MigrationError, Step, Upgrade, read, test_stamp};
 
     const BEHIND_FILE: &str = "behind.toml";
@@ -295,6 +399,7 @@ mod tests {
     const REJECTED: &str = "rejected by its parser";
     const RENAMED: &str = "renamed `old` to `new`";
     const BACKUPS: &str = "backups/config/global";
+    const PROJECT_BACKUPS: &str = "backups/config/projects";
     #[cfg(unix)]
     const BACKUP_MODE: u32 = 0o600;
     #[cfg(unix)]
@@ -318,21 +423,21 @@ mod tests {
         steps: &[],
         requires_version: false,
     };
-    const ACCEPTED: &[GlobalFile] = &[
-        GlobalFile {
+    const ACCEPTED: &[UpgradableFile] = &[
+        UpgradableFile {
             format: &BEHIND,
             validate: accepts,
         },
-        GlobalFile {
+        UpgradableFile {
             format: &UNSTAMPED_FORMAT,
             validate: accepts,
         },
     ];
-    const REJECTING: &[GlobalFile] = &[GlobalFile {
+    const REJECTING: &[UpgradableFile] = &[UpgradableFile {
         format: &BEHIND,
         validate: rejects,
     }];
-    const EDITED_ONCE: &[GlobalFile] = &[GlobalFile {
+    const EDITED_ONCE: &[UpgradableFile] = &[UpgradableFile {
         format: &BEHIND,
         validate: edits_once,
     }];
@@ -390,7 +495,7 @@ mod tests {
             fs::read_to_string(self.path(name)).unwrap()
         }
 
-        fn upgrade(&self, files: &[GlobalFile]) -> UpgradeReport {
+        fn upgrade(&self, files: &[UpgradableFile]) -> UpgradeReport {
             upgrade_global(self.config.path(), &self.state_dir, &test_stamp(), files)
         }
 
@@ -505,7 +610,7 @@ mod tests {
         let report = fixture.upgrade(REJECTING);
 
         assert!(
-            matches!(&report.outcomes[..], [Outcome::Failed { file: BEHIND_FILE, error }] if error.contains(REJECTED)),
+            matches!(&report.outcomes[..], [Outcome::Invalid { file: BEHIND_FILE, error }] if error.contains(REJECTED)),
             "{report:?}"
         );
         assert_eq!(fixture.contents(BEHIND_FILE), LEGACY);
@@ -567,5 +672,54 @@ mod tests {
         assert_eq!(fixture.backups(), slice::from_ref(backup));
         assert_eq!(fs::read_to_string(backup).unwrap(), UNSTAMPED);
         assert!(fixture.contents(UNSTAMPED_FILE).contains(UNSTAMPED));
+    }
+
+    #[test]
+    fn a_caller_holding_the_lock_upgrades_a_project_file_into_its_own_backups() {
+        let fixture = Fixture::new(&[(BEHIND_FILE, LEGACY)]);
+        let project = TempDir::new().unwrap();
+        let lock = try_instance_lock(&fixture.state_dir).unwrap().unwrap();
+
+        let report = upgrade_holding(
+            fixture.config.path(),
+            &fixture.state_dir,
+            BackupScope::Project(project.path()),
+            &test_stamp(),
+            ACCEPTED,
+            &lock,
+        );
+
+        let [Outcome::Upgraded { backup, .. }] = &report.outcomes[..] else {
+            panic!("{report:?}");
+        };
+        let projects = fixture
+            .state
+            .path()
+            .join(PROJECT_BACKUPS)
+            .join(project_id(project.path()));
+        assert_eq!(backup.parent(), Some(projects.as_path()));
+        assert_eq!(fs::read_to_string(backup).unwrap(), LEGACY);
+        assert_eq!(fixture.contents(BEHIND_FILE), fixture.upgraded(LEGACY));
+    }
+
+    #[test]
+    fn a_plan_writes_nothing_and_skips_current_files() {
+        let fixture = Fixture::new(&[(BEHIND_FILE, LEGACY), (UNSTAMPED_FILE, STAMPED)]);
+
+        let planned = plan(fixture.config.path(), &test_stamp(), ACCEPTED);
+
+        assert_eq!(
+            planned,
+            [Planned::Upgrade {
+                file: BEHIND_FILE,
+                from: 1,
+                to: 2,
+                original: LEGACY.to_owned(),
+                upgraded: fixture.upgraded(LEGACY),
+                changes: renamed(),
+            }]
+        );
+        assert_eq!(fixture.contents(BEHIND_FILE), LEGACY);
+        assert_eq!(fs::read_dir(fixture.state.path()).unwrap().count(), 0);
     }
 }

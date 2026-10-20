@@ -1,9 +1,13 @@
-//! `caudra config`: where Caudra looks for settings, and every setting a file
-//! takes. Neither action reads a setting, so both work while one is broken.
+//! `caudra config`: where Caudra looks for settings, every setting a file
+//! takes, and upgrading the files to this Caudra's format. No action reads a
+//! setting, so each works while one is broken.
+
+mod migrate;
 
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::process::ExitCode;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
@@ -24,7 +28,7 @@ const DOCS: &str = "docs";
 const EXAMPLE: &str = "example";
 const LABEL_WIDTH: usize = 9;
 
-pub fn run(action: ConfigAction) -> Result<()> {
+pub fn run(action: ConfigAction) -> Result<ExitCode> {
     match action {
         ConfigAction::Files => {
             let config_dir = paths::config_dir_path().context("resolve the config directory")?;
@@ -32,8 +36,9 @@ pub fn run(action: ConfigAction) -> Result<()> {
             print!("{}", listing(&files::locate(&config_dir, &cwd)));
         }
         ConfigAction::Example { file } => example(file)?,
+        ConfigAction::Migrate { project, dry_run } => return migrate::run(project, dry_run),
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn example(file: &ConfigFile) -> Result<()> {

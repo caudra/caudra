@@ -4507,6 +4507,13 @@ pub fn validate_global_permissions(path: &Path, text: &str) -> Result<(), String
         .map_err(|error| format!("cannot parse permissions: {error}"))
 }
 
+/// Whether `text`, a project permissions file in the latest format, loads.
+pub fn validate_project_permissions(_path: &Path, text: &str) -> Result<(), String> {
+    interpolation::from_str::<PermissionsFileConfig>(text, Lookup::Refused)
+        .map(drop)
+        .map_err(|error| format!("cannot parse permissions: {error}"))
+}
+
 /// `lookup` is settled on the path as named, since a symlinked file still
 /// belongs to the directory that holds the link.
 fn read_permissions_file(

@@ -724,6 +724,19 @@ impl Command {
         )
     }
 
+    /// `caudra config migrate` upgrades the global files itself, so the one
+    /// upgrade every other command runs first cannot rewrite them before a
+    /// `--dry-run` shows what would change, and the command reports every
+    /// upgrade it made.
+    pub fn upgrades_config_itself(&self) -> bool {
+        matches!(
+            self,
+            Self::Config {
+                action: ConfigAction::Migrate { .. }
+            }
+        )
+    }
+
     pub fn loads_settings(&self) -> bool {
         matches!(
             self,
@@ -972,6 +985,15 @@ pub enum ConfigAction {
             default_value = files::CAUDRA.stem()
         )]
         file: &'static ConfigFile,
+    },
+    /// Upgrade the global config files to this Caudra's format, backing each up first
+    Migrate {
+        /// Also upgrade the project files in .caudra/, which teammates then need this Caudra to read
+        #[arg(long)]
+        project: bool,
+        /// Print what would change, with a diff per file, and write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1637,6 +1659,7 @@ mod tests {
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
     const UPDATE_NOT_PARSED: &str = "expected the update subcommand";
     const CONFIG_EXAMPLE_NOT_PARSED: &str = "expected the config example subcommand";
+    const CONFIG_MIGRATE_NOT_PARSED: &str = "expected the config migrate subcommand";
     const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
     const SNAPSHOTS_NOT_PARSED: &str = "expected the storage snapshots subcommand";
@@ -1994,6 +2017,37 @@ mod tests {
             panic!("{CONFIG_EXAMPLE_NOT_PARSED}");
         };
         assert_eq!(file.name, expected);
+    }
+
+    #[test_case(&[], false, false ; "global_only")]
+    #[test_case(&["--project"], true, false ; "project")]
+    #[test_case(&["--dry-run"], false, true ; "dry_run")]
+    #[test_case(&["--project", "--dry-run"], true, true ; "project_dry_run")]
+    fn config_migrate_parses_its_flags(extra: &[&str], project: bool, dry_run: bool) {
+        let args = ["caudra", "config", "migrate"].iter().chain(extra);
+        let command = Cli::try_parse_from(args).unwrap().command.unwrap();
+
+        assert!(command.upgrades_config_itself());
+        assert!(command.runs_without_config());
+        let Command::Config {
+            action:
+                ConfigAction::Migrate {
+                    project: parsed_project,
+                    dry_run: parsed_dry_run,
+                },
+        } = command
+        else {
+            panic!("{CONFIG_MIGRATE_NOT_PARSED}");
+        };
+        assert_eq!((parsed_project, parsed_dry_run), (project, dry_run));
+    }
+
+    #[test_case(&["caudra", "config", "files"] ; "config_files")]
+    #[test_case(&["caudra", "tools"] ; "tools")]
+    fn other_commands_take_the_startup_upgrade(args: &[&str]) {
+        let command = Cli::try_parse_from(args).unwrap().command.unwrap();
+
+        assert!(!command.upgrades_config_itself());
     }
 
     #[test_case("init.lua" ; "file_without_a_reference")]

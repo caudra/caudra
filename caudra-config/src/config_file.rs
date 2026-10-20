@@ -111,10 +111,24 @@ pub fn validate_global(path: &Path, text: &str) -> Result<(), String> {
 /// A repository must never opt its users into an experiment or read their
 /// environment, so both are refused outright rather than ignored.
 pub fn load_project_config(path: &Path) -> Result<RawConfig, ConfigFileError> {
-    let Some(loaded) = migration::read(path, &CONFIG_FORMAT)? else {
-        return Ok(RawConfig::default());
-    };
-    match parse(&loaded.text, Lookup::Refused).map_err(|source| invalid(path, source))? {
+    match migration::read(path, &CONFIG_FORMAT)? {
+        Some(loaded) => parse_project(path, &loaded.text),
+        None => Ok(RawConfig::default()),
+    }
+}
+
+/// Whether `text`, the project `caudra.toml` at `path` in the latest format,
+/// loads into a valid config.
+pub fn validate_project(path: &Path, text: &str) -> Result<(), String> {
+    parse_project(path, text)
+        .map_err(|error| error.to_string())?
+        .into_config(false)
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
+fn parse_project(path: &Path, text: &str) -> Result<RawConfig, ConfigFileError> {
+    match parse(text, Lookup::Refused).map_err(|source| invalid(path, source))? {
         (Some(_), _) => Err(ConfigFileError::ProjectExperimental {
             path: path.to_path_buf(),
         }),

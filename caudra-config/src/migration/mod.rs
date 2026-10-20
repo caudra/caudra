@@ -3,8 +3,8 @@
 //! comments survive, and every changed line gains a note naming the build and
 //! the day that changed it.
 
+pub mod disk;
 mod edit;
-pub mod global;
 mod note;
 
 use std::borrow::Cow;

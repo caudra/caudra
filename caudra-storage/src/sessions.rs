@@ -55,7 +55,7 @@ pub use database::{
     HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
     SessionCursor, SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket,
     ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
-    eager_load_limit, set_eager_load_limit,
+    describe_open_sessions, eager_load_limit, persistent_session_titles, set_eager_load_limit,
 };
 pub use lease::{
     INSTANCES_LOCK_FILE, InstanceHold, InstanceLock, SessionLease, hold_instance, open_instances,

@@ -484,6 +484,17 @@ fn report_settings_notices(cli: &Cli) {
     }
 }
 
+/// The startup upgrade's notices for subcommands, on stderr so a protocol on
+/// stdout stays clean. The TUI shows its own.
+fn report_upgrade_notices(cli: &Cli) {
+    if cli.command.is_none() {
+        return;
+    }
+    for notice in cli.startup.upgrade_notices() {
+        eprintln!("note: {notice}");
+    }
+}
+
 pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Result<ExitCode> {
     caudra_storage::paths::check_namespace_override()?;
     cli.startup = match startup {
@@ -503,6 +514,14 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
     // Before anything opens a private file through one of these directories,
     // and before the scratch redirect creates any more of them.
     let tightened = caudra_storage::paths::tighten_private_dirs();
+    if !cli
+        .command
+        .as_ref()
+        .is_some_and(Command::upgrades_config_itself)
+    {
+        cli.startup.upgrade_global_files();
+    }
+    report_upgrade_notices(&cli);
     redirect_temp_dir();
     if let Ok(storage) = StateDir::resolve() {
         ensure_legacy_auth_migrated(&storage);
@@ -638,7 +657,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         }) => {
             subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
         }
-        Some(Command::Config { action }) => config::run(action)?,
+        Some(Command::Config { action }) => return config::run(action),
         Some(Command::Logs {
             follow,
             level,

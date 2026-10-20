@@ -60,6 +60,7 @@ use crate::docs;
 use crate::progress::SandboxProgress;
 use crate::release_notes;
 use crate::setup;
+use crate::startup::project_notices;
 
 const LOGIN_PLACEHOLDER_PROVIDER: &str = "anthropic";
 const LOGIN_PLACEHOLDER_UNAVAILABLE: &str = "built-in login placeholder provider is not registered";
@@ -1494,6 +1495,11 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let _logging = setup::init_logging(&stack.config.storage);
     let init_logging_ms = lap();
     cli.startup.upgrade.log();
+    let mut config_notices = cli.startup.upgrade_notices();
+    let mut notified_project_files = HashSet::new();
+    if !workcell_runtime.is_remote() {
+        config_notices.extend(project_notices(&cwd, &mut notified_project_files));
+    }
     setup::apply_storage_limits(&stack.config.storage);
     setup::register_change_stores();
     setup::init_telemetry(&stack.config.telemetry);
@@ -1566,6 +1572,9 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut initial_prompt = resolve_prompt(cli.prompt.take())?;
 
     if cli.print {
+        for notice in &config_notices {
+            eprintln!("note: {notice}");
+        }
         let fast = stack.config.always_fast && stack.model.supports_fast();
         let thinking = stack
             .config
@@ -1644,6 +1653,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     }
     let mut warnings = resolved.warnings;
     warnings.extend(stack_warnings);
+    warnings.extend(config_notices);
     warnings.extend(moved_back);
     if !tightened.is_empty() {
         warnings.push(format!(
@@ -2214,6 +2224,9 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage);
         stack = new_stack;
         warnings.extend(new_warnings);
+        if !workcell_runtime.is_remote() {
+            warnings.extend(project_notices(&reload_cwd, &mut notified_project_files));
+        }
         focused = focused.min(tabs.len() - 1);
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,

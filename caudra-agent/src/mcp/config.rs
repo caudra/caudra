@@ -774,6 +774,11 @@ pub fn validate_global(path: &Path, text: &str) -> Result<(), String> {
     parse(text, Lookup::Global(path)).map(drop)
 }
 
+/// Whether `text`, a project MCP file in the latest format, loads.
+pub fn validate_project(_path: &Path, text: &str) -> Result<(), String> {
+    parse(text, Lookup::Refused).map(drop)
+}
+
 /// Only the global file may read the environment: a project file runs no
 /// review before an HTTPS server connects, so it could send a secret anywhere.
 /// The first key `content` sets that code mode removed, spelled as the file spells it. A file
