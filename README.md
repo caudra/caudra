@@ -35,8 +35,8 @@ Each clip is a short excerpt of a real session, played at its original speed. Cl
 Open a running subagent's chat and type. It reads your guidance at its next turn while the main agent keeps working.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/queue/">Queue and steering</a> · <a href="https://caudra.ai/gallery/#steer">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#steer"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/steer-still.webp?v=2">
-  <img src="https://caudra.ai/readme/steer.webp?v=2" alt="Excerpt of Guide a running subagent. In the chat of a background task, you ask the subagent to call the new test an empty listing has no next cursor while it reads the source files and patches src/pagination.test.ts. The guidance waits in the task queue under Guide." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/steer-still.webp?v=3">
+  <img src="https://caudra.ai/readme/steer.webp?v=3" alt="Excerpt of Guide a running subagent. In the chat of a background task, you type a name for the new test, returns no cursor for an empty listing, while it reads the source files and patches src/pagination.test.ts. The guidance waits in the task queue under Guide." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -44,8 +44,8 @@ Open a running subagent's chat and type. It reads your guidance at its next turn
 Command-aware filters shrink shell output before the model reads it, with rules that mostly come from <a href="https://www.rtk-ai.app/docs/">RTK</a>. One click shows the raw output.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/tools/#shell">Shell</a> · <a href="https://caudra.ai/gallery/#filter">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#filter"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/filter-still.webp?v=2">
-  <img src="https://caudra.ai/readme/filter.webp?v=2" alt="Excerpt of Filter shell output. make check exits with code 2, and its card shows the filtered output, 4 pass and 3 fail, with the note filtered, make, progress, 36% smaller, click for raw. The reply then lists the failing tests." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/filter-still.webp?v=3">
+  <img src="https://caudra.ai/readme/filter.webp?v=3" alt="Excerpt of Filter shell output. make check exits with code 2, and its card shows the filtered output, 4 pass and 3 fail, with the note filtered, make, progress, 36% smaller, click for raw. The reply then lists the failing tests." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -53,8 +53,8 @@ Command-aware filters shrink shell output before the model reads it, with rules 
 Revert files first counts what it would create, replace, or delete. Choosing it again applies the revert, and Unrevert puts the files back.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/sessions/#file-revert">File revert</a> · <a href="https://caudra.ai/gallery/#revert">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#revert"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/revert-still.webp?v=2">
-  <img src="https://caudra.ai/readme/revert.webp?v=2" alt="Excerpt of Revert files from a message. The message menu opens beside the first tool batch of the reply, and Revert files reports 0 created, 2 replaced, 0 deleted. Repeat to confirm. Then the menu opens again." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/revert-still.webp?v=3">
+  <img src="https://caudra.ai/readme/revert.webp?v=3" alt="Excerpt of Revert files from a message. The message menu opens beside the first tool batch of the reply, and Revert files reports 0 created, 2 replaced, 0 deleted. Repeat to confirm. Then the menu opens again." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -62,8 +62,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 <code>Ctrl+X w</code> opens source control, an editor, and project search while the session keeps running.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/workbench/">Workbench</a> · <a href="https://caudra.ai/gallery/#workbench">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#workbench"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/workbench-still.webp?v=2">
-  <img src="https://caudra.ai/readme/workbench.webp?v=2" alt="Excerpt of The workbench beside a session. While the session runs make check again, the workbench opens with the two changed files in source control on the left. Then the diff of src/pagination.ts opens on the right, with the change at line 29." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/workbench-still.webp?v=3">
+  <img src="https://caudra.ai/readme/workbench.webp?v=3" alt="Excerpt of The workbench beside a session. While the session runs make check again, the workbench opens with the two changed files in source control on the left. Then the diff of src/pagination.ts opens on the right, with the change at line 29." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -71,8 +71,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 <code>/goal</code> keeps the session working until a separate evaluator finds your condition met.<br>
 <sub>Model: <code>openai/gpt-6.1-sol</code> · <a href="https://caudra.ai/docs/commands/#completion-goals">Completion goals</a> · <a href="https://caudra.ai/gallery/#goal">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#goal"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/goal-still.webp?v=2">
-  <img src="https://caudra.ai/readme/goal.webp?v=2" alt="Excerpt of Work toward a goal. The agent reports that make check exited 0 with 7 tests passed. The footer shows the active goal and then Evaluating goal, and the transcript ends with Goal achieved: make check exited 0 with all 7 tests passing." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/goal-still.webp?v=3">
+  <img src="https://caudra.ai/readme/goal.webp?v=3" alt="Excerpt of Work toward a goal. The agent reports that make check exited 0 with 7 tests passed. The footer shows the active goal and then Evaluating goal, and the transcript ends with Goal achieved: make check exited 0 with all 7 tests passing." width="100%">
 </picture></a>
 </td></tr>
 <tr><td>
@@ -80,8 +80,8 @@ Revert files first counts what it would create, replace, or delete. Choosing it 
 Qwen3.8-27B on <a href="https://github.com/tensorninja/ninfer-4090">ninfer-4090</a> uses the same tools and permission rules as a hosted model.<br>
 <sub>Model: <code>ninfer-4090/qwen3.8-27b</code> · <a href="https://caudra.ai/docs/providers/#providers-toml">Custom providers</a> · <a href="https://caudra.ai/gallery/#local">Full session</a></sub></p>
 <a href="https://caudra.ai/gallery/#local"><picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/local-still.webp?v=2">
-  <img src="https://caudra.ai/readme/local.webp?v=2" alt="Excerpt of A local model fixes the bug. The prompt goes to Qwen3.8-27B on ninfer-4090, and a bar above the input shows the prefill rate, between 1.9k and 3.6k tok/s. Then the model reads src/pagination.ts and src/pagination.test.ts." width="100%">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://caudra.ai/readme/local-still.webp?v=3">
+  <img src="https://caudra.ai/readme/local.webp?v=3" alt="Excerpt of A local model fixes the bug. The prompt goes to Qwen3.8-27B on ninfer-4090, and a bar above the input shows the prefill rate, between 3.5k and 3.7k tok/s. Then the model reads src/pagination.ts and src/pagination.test.ts and edits src/pagination.ts." width="100%">
 </picture></a>
 </td></tr>
 </table>
