@@ -42,6 +42,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Host;
 
+pub use shell_duration::DurationEffect;
 use shell_duration::ShellDurationCache;
 
 pub use active::{

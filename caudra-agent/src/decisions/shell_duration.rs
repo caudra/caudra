@@ -19,8 +19,8 @@ use std::{
 };
 
 use super::{
-    DecisionFeature, DecisionReceipt, Decisions, NoteAnchor, NoteDraft, NoteOutcome, push_fitting,
-    questions,
+    DecisionFeature, DecisionReceipt, Decisions, NoteAnchor, NoteDraft, NoteOutcome, counted,
+    push_fitting, questions,
 };
 use crate::{
     ToolDoneEvent, ToolOutput,
@@ -71,13 +71,90 @@ const STOPPED: &str = "did not finish before it was stopped";
 const ENDLESS_WARNING: &str =
     "Duration estimate: this command may run until stopped; its execution deadline still applies.";
 const DURATION_FALLBACK: &str = "ran the call without an estimate";
-const BACKGROUND: &str = "background";
-const FOREGROUND: &str = "foreground";
-const UNTIL_STOPPED_DETAIL: &str = "level: until stopped";
-/// Each verb reads the same after "would have", for a shadow row.
-const SET_VERB: &str = "set";
-const MOVED_VERB: &str = "moved";
-const WARNED_VERB: &str = "warned";
+const EXACT_HISTORY: &str = "exact history";
+const FAMILY_HISTORY: &str = "command family history";
+const EFFECT_JOINER: &str = " and ";
+const REASON_SEPARATOR: &str = ": ";
+const SHORT_TIMEOUT_TAIL: &str = " timeout may be too short";
+const TAKES: &str = "it should take ";
+const EXITS_AT_ONCE: &str = "it should exit at once";
+const WITHOUT_ESTIMATE: &str = "Without the estimate, its ";
+const OWN_TIMEOUT_WOULD: &str = " timeout would have ";
+const MEASURED_OVER: &str = "Measured over ";
+const ENGINE_SOURCE: &str = "Estimated by the decision engine from the command alone.";
+const RUN: &str = "earlier run";
+const RUNS: &str = "earlier runs";
+const THIS_COMMAND: &str = "of this command";
+const SIMILAR_COMMANDS: &str = "of similar commands";
+
+/// What a duration estimate changed about a shell call. Its note's summary
+/// opens with the words of each, so a reader of the note alone can tell which
+/// one it was; each opening reads the same after "would have", for shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurationEffect {
+    ShortTimeout,
+    Background,
+    Foreground,
+    Timeout,
+}
+
+impl DurationEffect {
+    /// Most telling first: a warning, then a move, then a timeout.
+    const ALL: [Self; 4] = [
+        Self::ShortTimeout,
+        Self::Background,
+        Self::Foreground,
+        Self::Timeout,
+    ];
+
+    const fn opening(self) -> &'static str {
+        match self {
+            Self::ShortTimeout => "warned that its ",
+            Self::Background => "sent it to the background",
+            Self::Foreground => "kept it in the foreground",
+            Self::Timeout => "set the timeout to ",
+        }
+    }
+
+    /// What a card's chip says about the effect, or would have done in
+    /// shadow.
+    pub const fn chip(self, shadow: bool) -> &'static str {
+        match (self, shadow) {
+            (Self::ShortTimeout, false) => "timeout may be short",
+            (Self::ShortTimeout, true) => "would warn",
+            (Self::Background, false) => "sent to background",
+            (Self::Background, true) => "would background",
+            (Self::Foreground, false) => "kept in foreground",
+            (Self::Foreground, true) => "would keep in foreground",
+            (Self::Timeout, false) => "timeout set",
+            (Self::Timeout, true) => "would set timeout",
+        }
+    }
+
+    /// Whether the effect warns the reader rather than changing the call.
+    pub const fn warns(self) -> bool {
+        matches!(self, Self::ShortTimeout)
+    }
+
+    /// The most telling effect a note's `summary` names. A note written
+    /// before effects had their own words names none.
+    pub fn named_in(summary: &str) -> Option<Self> {
+        let summary = summary
+            .strip_prefix(NoteOutcome::Shadow.lead())
+            .unwrap_or(summary);
+        let (changes, _) = summary.split_once(REASON_SEPARATOR)?;
+        let changes: Vec<&str> = changes.split(EFFECT_JOINER).collect();
+        Self::ALL.into_iter().find(|effect| {
+            changes
+                .iter()
+                .any(|change| change.starts_with(effect.opening()))
+        })
+    }
+}
+
+fn humanize_secs(secs: u64) -> String {
+    humanize_duration(Duration::from_secs(secs))
+}
 
 #[derive(Clone, Debug)]
 struct Estimate {
@@ -102,16 +179,41 @@ impl Estimate {
     /// The wait the estimate predicts, in the units of a timeout. A command
     /// expected to exit at once has no wait to show.
     fn eta(&self) -> Option<String> {
+        self.span().map(|span| format!("{ETA_LABEL}{span}"))
+    }
+
+    /// The likely wait, from the median to the p90, or one value when they
+    /// read the same.
+    fn span(&self) -> Option<String> {
         if self.p90_ms <= INSTANT_MS {
             return None;
         }
-        let [p50, p90] = [self.p50_ms, self.p90_ms]
-            .map(|ms| humanize_duration(Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND))));
+        let [p50, p90] =
+            [self.p50_ms, self.p90_ms].map(|ms| humanize_secs(ms.div_ceil(MILLIS_PER_SECOND)));
         Some(if p50 == p90 {
-            format!("{ETA_LABEL}{p90}")
+            p90
         } else {
-            format!("{ETA_LABEL}{p50}{ETA_RANGE}{p90}")
+            format!("{p50}{ETA_RANGE}{p90}")
         })
+    }
+
+    /// How long the call should take, as a note summary ends.
+    fn expectation(&self) -> String {
+        match self.span() {
+            Some(span) => format!("{TAKES}{span}"),
+            None => EXITS_AT_ONCE.to_owned(),
+        }
+    }
+
+    /// Where the estimate came from, as a reader would put it.
+    fn source_line(&self) -> String {
+        let whose = match self.source {
+            EXACT_HISTORY => THIS_COMMAND,
+            FAMILY_HISTORY => SIMILAR_COMMANDS,
+            _ => return ENGINE_SOURCE.to_owned(),
+        };
+        let runs = usize::try_from(self.samples).unwrap_or(usize::MAX);
+        format!("{MEASURED_OVER}{} {whose}.", counted(runs, RUN, RUNS))
     }
 
     /// Where the estimate came from, with a sample count only for history.
@@ -241,8 +343,8 @@ impl Decisions {
                     p90_ms: estimate.p90_ms,
                     samples: estimate.samples,
                     source: match estimate.source {
-                        DurationSource::Exact => "exact history",
-                        DurationSource::Family => "command family history",
+                        DurationSource::Exact => EXACT_HISTORY,
+                        DurationSource::Family => FAMILY_HISTORY,
                     },
                     extend_timeout: true,
                 };
@@ -468,44 +570,49 @@ impl ShellDurationPlan {
             FeatureMode::Shadow => self.estimated_timeout(call.input, call.schema),
             FeatureMode::Advise | FeatureMode::Off => None,
         };
+        let Some(estimate) = &self.estimate else {
+            return;
+        };
         let mut effects = Vec::new();
+        let mut details = Vec::new();
         if let Some(timeout) = timeout {
-            effects.push(format!("{SET_VERB} the timeout to {timeout} s"));
+            effects.push(format!(
+                "{}{}",
+                DurationEffect::Timeout.opening(),
+                humanize_secs(timeout)
+            ));
         }
         if *mode != FeatureMode::Advise
-            && let Some(background) = self.moved_delivery(ctx, call, timeout)
+            && let Some((background, own_timeout)) = self.moved_delivery(ctx, call, timeout)
         {
-            let place = if background { BACKGROUND } else { FOREGROUND };
-            effects.push(format!("{MOVED_VERB} it to the {place}"));
+            let (effect, otherwise) = if background {
+                (DurationEffect::Background, DurationEffect::Foreground)
+            } else {
+                (DurationEffect::Foreground, DurationEffect::Background)
+            };
+            effects.push(effect.opening().to_owned());
+            details.push(format!(
+                "{WITHOUT_ESTIMATE}{}{OWN_TIMEOUT_WOULD}{}.",
+                humanize_secs(own_timeout),
+                otherwise.opening()
+            ));
         }
         if let Some((requested, _)) = self.short_timeout() {
             effects.push(format!(
-                "{WARNED_VERB} that its {requested} s timeout is too short"
+                "{}{}{SHORT_TIMEOUT_TAIL}",
+                DurationEffect::ShortTimeout.opening(),
+                humanize_secs(requested)
             ));
         }
         if effects.is_empty() {
             return;
         }
-        let mut summary = effects.join("; ");
-        let mut details = Vec::new();
-        if let Some(estimate) = &self.estimate {
-            let (p50, p90) = (
-                estimate.p50_ms.div_ceil(MILLIS_PER_SECOND),
-                estimate.p90_ms.div_ceil(MILLIS_PER_SECOND),
-            );
-            summary.push_str(&format!(
-                " from an estimate of p90 {p90} s ({})",
-                estimate.provenance()
-            ));
-            details.push(format!("p50 {p50} s, p90 {p90} s"));
-            details.push(estimate.provenance());
-        }
-        if self.endless {
-            details.push(UNTIL_STOPPED_DETAIL.into());
-        }
-        if let Some(requested) = self.requested_timeout {
-            details.push(format!("requested timeout {requested} s"));
-        }
+        let summary = format!(
+            "{}{REASON_SEPARATOR}{}",
+            effects.join(EFFECT_JOINER),
+            estimate.expectation()
+        );
+        details.push(estimate.source_line());
         emit(NoteDraft::new(
             &self.decisions,
             feature,
@@ -515,15 +622,15 @@ impl ShellDurationPlan {
         ));
     }
 
-    /// The delivery the estimate chooses, when it differs from the one the
-    /// call gets from its own timeout. `timeout` is the one the estimate
-    /// filled in, if any.
+    /// The delivery the estimate chooses, whether background, when it differs
+    /// from the one the call gets from its own timeout, with that timeout.
+    /// `timeout` is the one the estimate filled in, if any.
     fn moved_delivery(
         &self,
         ctx: &ToolContext,
         call: &ShellCall,
         timeout: Option<u64>,
-    ) -> Option<bool> {
+    ) -> Option<(bool, u64)> {
         let own_timeout = match timeout {
             Some(_) => timeout_bounds(call.schema)?.0,
             None => call.timeout_secs,
@@ -533,7 +640,7 @@ impl ShellDurationPlan {
         };
         let own = deliver(own_timeout, None)?;
         let estimated = deliver(timeout.unwrap_or(own_timeout), self.estimated_secs())?;
-        (own != estimated).then_some(estimated)
+        (own != estimated).then_some((estimated, own_timeout))
     }
 
     pub(crate) fn annotation(&self) -> Option<String> {
@@ -691,15 +798,17 @@ fn completed_level(elapsed_ms: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AT_ONCE, DURATION_FALLBACK, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION,
-        ENGINE_PRIOR, Estimate, HISTORY_CACHE_ENTRIES, INSTANT_MS, LEVELS, MAX_EARLIER_RUNS,
-        MINUTES, MINUTES_MS, SECONDS, SET_VERB, STOPPED, ShellCall, ShellDurationCache,
-        ShellDurationPlan, TOOK, UNTIL_STOPPED, WARNED_VERB, WORKDIR_FIELD, duration_label,
-        duration_state, earlier_run, history_key, prior,
+        AT_ONCE, DURATION_FALLBACK, DURATION_QUESTION, DurationEffect, EARLIER_RUNS,
+        ENDLESS_QUESTION, ENGINE_PRIOR, ENGINE_SOURCE, Estimate, FAMILY_HISTORY,
+        HISTORY_CACHE_ENTRIES, INSTANT_MS, LEVELS, MAX_EARLIER_RUNS, MINUTES, MINUTES_MS, SECONDS,
+        STOPPED, ShellCall, ShellDurationCache, ShellDurationPlan, TOOK, UNTIL_STOPPED,
+        WORKDIR_FIELD, duration_label, duration_state, earlier_run, history_key, prior,
     };
     use crate::{
         AgentEvent, AgentMode, CancelToken, EventSender,
-        decisions::{DecisionFeature, DecisionState, Decisions, NoteAnchor, NoteOutcome},
+        decisions::{
+            DecisionFeature, DecisionNote, DecisionState, Decisions, NoteAnchor, NoteOutcome,
+        },
         permissions::PermissionManager,
         tools::{
             ToolExecResult,
@@ -744,6 +853,20 @@ mod tests {
     const MINUTES_ETA: &str = "ETA 5m–10m";
     const EQUAL_ENDS_ETA: &str = "ETA 8s";
     const SUB_SECOND_P50_ETA: &str = "ETA 1s–2s";
+    const LONG_TIMEOUT_SECS: u64 = 900;
+    const JARGON: [&str; 3] = ["p50", "p90", ENGINE_PRIOR];
+    const FOREGROUND_SUMMARY: &str = "kept it in the foreground: it should take 10s–2m";
+    const SHADOW_FOREGROUND_SUMMARY: &str =
+        "would have kept it in the foreground: it should take 10s–2m";
+    const FOREGROUND_REASON: &str =
+        "Without the estimate, its 15m timeout would have sent it to the background.";
+    const EXACT_SOURCE: &str = "Measured over 3 earlier runs of this command.";
+    const FAMILY_SOURCE: &str = "Measured over 1 earlier run of similar commands.";
+    const LEGACY_SUMMARY: &str =
+        "moved it to the foreground from an estimate of p90 120 s (engine prior)";
+    const BOTH_SUMMARY: &str =
+        "set the timeout to 5m and sent it to the background: it should take 5m–10m";
+    const WARNED_SUMMARY: &str = "kept it in the foreground and warned that its 5s timeout may be too short: it should take 10s–2m";
 
     fn history(p50_ms: u64, p90_ms: u64) -> Estimate {
         Estimate {
@@ -855,28 +978,20 @@ mod tests {
         assert!(plan.inject_timeout(&input, &schema).is_none());
     }
 
-    #[test_case(FeatureMode::Enforce, None, None, false, Some((NoteOutcome::Acted, SET_VERB)); "enforce_sets_the_timeout")]
-    #[test_case(FeatureMode::Shadow, None, None, false, Some((NoteOutcome::Shadow, SET_VERB)); "shadow_would_set_the_timeout")]
-    #[test_case(FeatureMode::Advise, Some(SHORT_TIMEOUT_SECS), None, false, Some((NoteOutcome::Acted, WARNED_VERB)); "advise_warns_of_a_short_timeout")]
-    #[test_case(FeatureMode::Advise, None, None, false, None; "an_eta_alone_says_nothing")]
-    #[test_case(FeatureMode::Enforce, None, Some(ENGINE_FAILURE), false, Some((NoteOutcome::FellBack, ENGINE_FAILURE)); "fresh_failure_falls_back")]
-    #[test_case(FeatureMode::Shadow, None, Some(ENGINE_FAILURE), false, None; "shadow_failure_says_nothing")]
-    #[test_case(FeatureMode::Enforce, None, None, true, None; "cancelled_says_nothing")]
-    fn shell_duration_notes_only_what_it_changed(
-        mode: FeatureMode,
+    /// The notes `plan` reports about a call that asked for `requested`.
+    fn reported(
+        mut plan: ShellDurationPlan,
         requested: Option<u64>,
-        failure: Option<&str>,
+        background_supported: bool,
         cancelled: bool,
-        expected: Option<(NoteOutcome, &str)>,
-    ) {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = StateDir::from_path(temp.path().join("state"));
-        let mut plan = plan(&dir, mode.clone(), LONG_P90_MS);
+    ) -> Vec<DecisionNote> {
         plan.requested_timeout = requested;
-        plan.failure = failure.map(String::from);
         let schema =
             json!({"properties":{"timeoutSec":{"default":DEFAULT_SECS,"maximum":CAP_SECS}}});
-        let input = json!({"command": COMMAND});
+        let input = match requested {
+            Some(timeout) => json!({"command": COMMAND, "timeoutSec": timeout}),
+            None => json!({"command": COMMAND}),
+        };
         let effective = plan.inject_timeout(&input, &schema);
         let (sender, events) = flume::unbounded();
         let event_tx = EventSender::new(sender, 0);
@@ -893,17 +1008,38 @@ mod tests {
                 input: effective.as_ref().unwrap_or(&input),
                 schema: &schema,
                 timeout_secs: requested.unwrap_or(DEFAULT_SECS),
-                background_supported: false,
+                background_supported,
             },
         );
-        let notes: Vec<_> = events
+        events
             .try_iter()
             .filter_map(|envelope| match envelope.event {
-                AgentEvent::Decision(note) => Some(note),
+                AgentEvent::Decision(note) => Some(*note),
                 _ => None,
             })
-            .collect();
-        let Some((outcome, lead)) = expected else {
+            .collect()
+    }
+
+    #[test_case(FeatureMode::Enforce, None, None, false, Some((NoteOutcome::Acted, Some(DurationEffect::Timeout))); "enforce_sets_the_timeout")]
+    #[test_case(FeatureMode::Shadow, None, None, false, Some((NoteOutcome::Shadow, Some(DurationEffect::Timeout))); "shadow_would_set_the_timeout")]
+    #[test_case(FeatureMode::Advise, Some(SHORT_TIMEOUT_SECS), None, false, Some((NoteOutcome::Acted, Some(DurationEffect::ShortTimeout))); "advise_warns_of_a_short_timeout")]
+    #[test_case(FeatureMode::Advise, None, None, false, None; "an_eta_alone_says_nothing")]
+    #[test_case(FeatureMode::Enforce, None, Some(ENGINE_FAILURE), false, Some((NoteOutcome::FellBack, None)); "fresh_failure_falls_back")]
+    #[test_case(FeatureMode::Shadow, None, Some(ENGINE_FAILURE), false, None; "shadow_failure_says_nothing")]
+    #[test_case(FeatureMode::Enforce, None, None, true, None; "cancelled_says_nothing")]
+    fn shell_duration_notes_only_what_it_changed(
+        mode: FeatureMode,
+        requested: Option<u64>,
+        failure: Option<&str>,
+        cancelled: bool,
+        expected: Option<(NoteOutcome, Option<DurationEffect>)>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().join("state"));
+        let mut plan = plan(&dir, mode.clone(), LONG_P90_MS);
+        plan.failure = failure.map(String::from);
+        let notes = reported(plan, requested, false, cancelled);
+        let Some((outcome, effect)) = expected else {
             assert!(notes.is_empty());
             return;
         };
@@ -914,13 +1050,51 @@ mod tests {
         assert_eq!(note.mode, mode);
         assert_eq!(note.outcome, outcome);
         assert_eq!(note.anchor, NoteAnchor::Tool(CALL_ID.into()));
-        assert!(
-            note.summary
-                .starts_with(&format!("{}{lead}", outcome.lead()))
-        );
+        assert!(note.summary.starts_with(outcome.lead()));
+        assert_eq!(DurationEffect::named_in(&note.summary), effect);
         if outcome == NoteOutcome::FellBack {
             assert!(note.summary.ends_with(DURATION_FALLBACK));
+            return;
         }
+        for line in iter::once(&note.summary).chain(&note.details) {
+            for jargon in JARGON {
+                assert!(!line.contains(jargon), "{line}");
+            }
+        }
+    }
+
+    #[test_case(FeatureMode::Enforce, FOREGROUND_SUMMARY; "enforce_keeps_it_in_the_foreground")]
+    #[test_case(FeatureMode::Shadow, SHADOW_FOREGROUND_SUMMARY; "shadow_would_have")]
+    fn a_foreground_move_says_why_in_plain_words(mode: FeatureMode, summary: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().join("state"));
+        let mut plan = plan(&dir, mode, LONG_P90_MS);
+        plan.estimate = Some(LEVELS[SECONDS].clone());
+        let notes = reported(plan, Some(LONG_TIMEOUT_SECS), true, false);
+        let [note] = notes.as_slice() else {
+            panic!("{ONE_NOTE}");
+        };
+        assert_eq!(note.summary, summary);
+        assert_eq!(note.details, [FOREGROUND_REASON, ENGINE_SOURCE]);
+        assert_eq!(
+            DurationEffect::named_in(&note.summary),
+            Some(DurationEffect::Foreground)
+        );
+    }
+
+    #[test_case(LEVELS[SECONDS].clone(), ENGINE_SOURCE; "an_engine_estimate")]
+    #[test_case(history(MINUTES_MS, MINUTES_MS), EXACT_SOURCE; "this_commands_runs")]
+    #[test_case(Estimate { source: FAMILY_HISTORY, samples: 1, ..history(MINUTES_MS, MINUTES_MS) }, FAMILY_SOURCE; "one_similar_run")]
+    fn the_source_line_names_where_the_estimate_came_from(estimate: Estimate, expected: &str) {
+        assert_eq!(estimate.source_line(), expected);
+    }
+
+    #[test_case(LEGACY_SUMMARY, None; "a_note_from_before_effects_had_words")]
+    #[test_case(BOTH_SUMMARY, Some(DurationEffect::Background); "a_move_outranks_a_timeout")]
+    #[test_case(WARNED_SUMMARY, Some(DurationEffect::ShortTimeout); "a_warning_outranks_everything")]
+    #[test_case(SHADOW_FOREGROUND_SUMMARY, Some(DurationEffect::Foreground); "shadow_lead_is_skipped")]
+    fn named_in_picks_the_most_telling_effect(summary: &str, expected: Option<DurationEffect>) {
+        assert_eq!(DurationEffect::named_in(summary), expected);
     }
 
     #[test_case(LEVELS[AT_ONCE].clone(), None; "at_once_prior")]

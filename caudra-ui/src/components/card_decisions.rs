@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use caudra_agent::decisions::{DecisionFeature, NoteOutcome};
+use caudra_agent::decisions::{DecisionFeature, DurationEffect, NoteOutcome};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -38,8 +38,13 @@ pub enum DecisionState {
     /// The engine has not answered yet.
     Pending,
     /// `text` is what a standalone row would hold: its title, then a detail
-    /// per line.
-    Settled { outcome: NoteOutcome, text: String },
+    /// per line. `effect` is what a shell duration estimate changed, when
+    /// its note names it.
+    Settled {
+        outcome: NoteOutcome,
+        text: String,
+        effect: Option<DurationEffect>,
+    },
 }
 
 impl CardDecision {
@@ -51,10 +56,18 @@ impl CardDecision {
         details: &[String],
     ) -> Self {
         let text = decision_text(feature.label(), outcome, summary, details);
+        let effect = match feature {
+            DecisionFeature::ShellDuration => DurationEffect::named_in(summary),
+            _ => None,
+        };
         Self {
             call_id,
             feature,
-            state: DecisionState::Settled { outcome, text },
+            state: DecisionState::Settled {
+                outcome,
+                text,
+                effect,
+            },
         }
     }
 
@@ -66,6 +79,19 @@ impl CardDecision {
         let words = chip_words(&self.feature);
         match &self.state {
             DecisionState::Pending => (format!("{}{PENDING_SUFFIX}", words.pending), Tone::Pending),
+            DecisionState::Settled {
+                outcome,
+                effect: Some(effect),
+                ..
+            } if *outcome != NoteOutcome::FellBack => {
+                let shadow = *outcome == NoteOutcome::Shadow;
+                let tone = match (shadow, effect.warns()) {
+                    (true, _) => Tone::Shadow,
+                    (false, true) => Tone::Loud,
+                    (false, false) => Tone::Acted,
+                };
+                (effect.chip(shadow).to_owned(), tone)
+            }
             DecisionState::Settled { outcome, .. } => match outcome {
                 NoteOutcome::Acted if words.loud => (words.acted.to_owned(), Tone::Loud),
                 NoteOutcome::Acted => (words.acted.to_owned(), Tone::Acted),
@@ -172,7 +198,7 @@ pub fn section(decisions: &[CardDecision]) -> Vec<(Vec<Line<'static>>, &str)> {
     decisions
         .iter()
         .filter_map(|decision| match &decision.state {
-            DecisionState::Settled { outcome, text } => {
+            DecisionState::Settled { outcome, text, .. } => {
                 Some((decision_lines(text, *outcome, true), text.as_str()))
             }
             DecisionState::Pending => None,
@@ -354,6 +380,17 @@ mod tests {
     const GRANDCHILD: &str = "t1:2:0";
     const SUMMARY: &str = "moved 5 of 12 rows up";
     const DETAIL: &str = "0.97  src/lib.rs:12 chip  moved 4th to 1st";
+    const FOREGROUND_NOTE: &str = "kept it in the foreground: it should take 10s–2m";
+    const SHADOW_FOREGROUND_NOTE: &str =
+        "would have kept it in the foreground: it should take 10s–2m";
+    const SHORT_TIMEOUT_NOTE: &str =
+        "warned that its 5s timeout may be too short: it should take 10s–2m";
+    const LEGACY_NOTE: &str =
+        "moved it to the foreground from an estimate of p90 120 s (engine prior)";
+    const FOREGROUND_CHIP: &str = "kept in foreground";
+    const SHADOW_FOREGROUND_CHIP: &str = "would keep in foreground";
+    const SHORT_TIMEOUT_CHIP: &str = "timeout may be short";
+    const ESTIMATED_CHIP: &str = "estimated";
 
     fn settled(call_id: &str, feature: DecisionFeature, outcome: NoteOutcome) -> CardDecision {
         CardDecision::settled(call_id.into(), feature, outcome, SUMMARY, &[DETAIL.into()])
@@ -383,6 +420,26 @@ mod tests {
             text(&chip_spans([&decision])),
             format!(" {DECISION_PREFIX}{word}")
         );
+    }
+
+    #[test_case(NoteOutcome::Acted, FOREGROUND_NOTE, FOREGROUND_CHIP, Tone::Acted ; "a_move_says_where")]
+    #[test_case(NoteOutcome::Shadow, SHADOW_FOREGROUND_NOTE, SHADOW_FOREGROUND_CHIP, Tone::Shadow ; "a_shadow_move_says_it_would")]
+    #[test_case(NoteOutcome::Acted, SHORT_TIMEOUT_NOTE, SHORT_TIMEOUT_CHIP, Tone::Loud ; "a_short_timeout_warns")]
+    #[test_case(NoteOutcome::Acted, LEGACY_NOTE, ESTIMATED_CHIP, Tone::Acted ; "an_older_note_falls_back")]
+    fn a_shell_duration_chip_says_what_changed(
+        outcome: NoteOutcome,
+        summary: &str,
+        word: &str,
+        tone: Tone,
+    ) {
+        let decision = CardDecision::settled(
+            CALL.into(),
+            DecisionFeature::ShellDuration,
+            outcome,
+            summary,
+            &[],
+        );
+        assert_eq!(decision.chip(), (word.to_owned(), tone));
     }
 
     #[test]

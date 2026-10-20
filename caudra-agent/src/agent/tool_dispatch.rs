@@ -1006,12 +1006,12 @@ async fn run_inner(
             // The verdict covers the effective input, so from here a stale plan
             // only loses its side effects and the call is never authorized again.
             ShellDurationPlan::discard_stale(&mut duration_plan, ctx);
-            let annotation = match (
-                invocation.start_annotation(),
-                duration_plan
-                    .as_ref()
-                    .and_then(ShellDurationPlan::annotation),
-            ) {
+            let own_annotation = invocation.start_annotation();
+            let eta = duration_plan
+                .as_ref()
+                .and_then(ShellDurationPlan::annotation);
+            let shows_eta = eta.is_some();
+            let annotation = match (own_annotation.clone(), eta) {
                 (Some(annotation), Some(estimate)) => Some(format!("{annotation}; {estimate}")),
                 (annotation, estimate) => annotation.or(estimate),
             };
@@ -1287,6 +1287,13 @@ async fn run_inner(
             let result = recording
                 .around(ctx, invocation.execute(execution_ctx))
                 .await;
+            // A wait that is over says nothing, and a restored card never had it.
+            if shows_eta {
+                ctx.event_tx.try_send(AgentEvent::ToolAnnotation {
+                    id: id.clone(),
+                    annotation: own_annotation.unwrap_or_default(),
+                });
+            }
             if let Some(observation) = observation {
                 observation
                     .finish(&result, execution_ctx.cancel.is_cancelled())
@@ -2423,19 +2430,24 @@ mod tests {
             } else {
                 assert_eq!(prepared, input);
             }
-            let start = fixture
-                .events
-                .try_iter()
-                .find_map(|envelope| match envelope.event {
+            let mut events = fixture.events.try_iter().map(|envelope| envelope.event);
+            let start = events
+                .find_map(|event| match event {
                     AgentEvent::ToolStart(start) => Some(start),
                     _ => None,
                 })
                 .unwrap();
             assert_eq!(start.raw_input.as_ref(), Some(&prepared));
-            assert_eq!(
-                start.annotation.is_some(),
-                matches!(mode, FeatureMode::Advise | FeatureMode::Enforce)
-            );
+            let shows_eta = matches!(mode, FeatureMode::Advise | FeatureMode::Enforce);
+            assert_eq!(start.annotation.is_some(), shows_eta);
+            let cleared = events.any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolAnnotation { id, annotation }
+                        if id == start.id && annotation.is_empty()
+                )
+            });
+            assert_eq!(cleared, shows_eta && !asynchronous);
             let history = ShellDurations::open(&fixture.dir)
                 .unwrap()
                 .estimate(&key)
