@@ -2394,6 +2394,7 @@ mod tests {
             instructions: None,
             state: Some(serde_json::json!({"kind": "file"})),
         });
+        let annotation = output.annotation();
         let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
 
         let (display, restores) = display_messages(&messages, &outputs);
@@ -2403,7 +2404,11 @@ mod tests {
             display[0].tool_output.as_deref(),
             Some(ToolOutput::Index(_))
         ));
-        assert_eq!(display[0].annotation.as_deref(), Some(INDEX_ANNOTATION));
+        assert_eq!(display[0].annotation, annotation);
+        assert!(
+            annotation.unwrap_or_default().starts_with(INDEX_ANNOTATION),
+            "a restored index still says how many lines it holds"
+        );
     }
 
     fn restored_discovery() -> PeerOutput {

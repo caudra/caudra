@@ -30,6 +30,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use caudra_markdown::render::truncate_long_lines;
+use caudra_providers::{estimate_tokens_cached, token_label};
 
 use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
@@ -2947,10 +2948,12 @@ fn header_annotation(msg: &DisplayMessage, open: bool) -> Option<String> {
         .map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
     let own = match msg.tool_output.as_deref() {
         Some(ToolOutput::Peers(output)) => Some(output.annotation()),
-        Some(ToolOutput::Tasks(tasks)) if open => msg
-            .annotation
-            .clone()
-            .filter(|annotation| !matches!(tasks.as_slice(), [task] if *annotation == task.state)),
+        Some(ToolOutput::Tasks(tasks)) if open => {
+            match (tasks.as_slice(), msg.annotation.as_deref()) {
+                ([task], Some(annotation)) => without_state(annotation, &task.state),
+                (_, annotation) => annotation.map(str::to_owned),
+            }
+        }
         _ => msg.annotation.clone(),
     };
     match (tally, own) {
@@ -2958,6 +2961,17 @@ fn header_annotation(msg: &DisplayMessage, open: bool) -> Option<String> {
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     }
+}
+
+/// An open task card draws its state among its facts, so the header keeps only
+/// what follows it, such as what the answer costs the context.
+fn without_state(annotation: &str, state: &str) -> Option<String> {
+    let rest = match annotation.strip_prefix(state) {
+        Some("") => return None,
+        Some(rest) => rest.strip_prefix(ACTIVITY_SEPARATOR),
+        None => None,
+    };
+    Some(rest.unwrap_or(annotation).to_owned())
 }
 
 /// `expansion` is `None` on a compact row the reader has not opened, which is
@@ -3427,11 +3441,11 @@ pub fn build_instructions_lines(
     }
     let expanded = expanded.unwrap_or_default();
     let header = blocks.first().map_or("", |b| b.path.as_str());
-    let annotation = if blocks.len() > 1 {
-        Some(format!("+{}", blocks.len() - 1))
-    } else {
-        None
-    };
+    let tokens = token_label(blocks.iter().map(instruction_tokens).sum());
+    let annotation = Some(match blocks.len() {
+        0 | 1 => tokens,
+        more => format!("+{}{FOOTER_SEPARATOR}{tokens}", more - 1),
+    });
 
     let mut b = ToolLineBuilder::new(
         width,
@@ -3470,20 +3484,31 @@ pub fn build_instructions_lines(
     b.finish(None, Some(output))
 }
 
+/// What an instruction file costs the context: its text rides along with the
+/// result that loaded it.
+fn instruction_tokens(block: &InstructionBlock) -> u32 {
+    estimate_tokens_cached(&block.content)
+}
+
 fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
     let style = theme::current().tool_dim;
     let path_style = theme::current().tool_path;
     let mut lines = Vec::with_capacity(blocks.len());
     let mut search_text = String::new();
     for block in blocks {
-        lines.push(Line::from(vec![
-            Span::styled(COMPACT_LOAD_PREFIX, style),
-            Span::styled(block.path.clone(), path_style),
-        ]));
+        let tokens = format!(
+            "{FOOTER_SEPARATOR}{}",
+            token_label(instruction_tokens(block))
+        );
         if !search_text.is_empty() {
             search_text.push('\n');
         }
-        write!(search_text, "{COMPACT_LOAD_PREFIX}{}", block.path).unwrap();
+        write!(search_text, "{COMPACT_LOAD_PREFIX}{}{tokens}", block.path).unwrap();
+        lines.push(Line::from(vec![
+            Span::styled(COMPACT_LOAD_PREFIX, style),
+            Span::styled(block.path.clone(), path_style),
+            Span::styled(tokens, style),
+        ]));
     }
     ToolLines {
         links: LinkMap::none_for(&lines),
@@ -7714,6 +7739,41 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains("↳ Loaded site/docs/AGENTS.md"), "{text}");
         assert!(!text.contains("never hand-edit"), "{text}");
+    }
+
+    const STATE_ONCE_MSG: &str = "an open task card names its state among its facts, not twice";
+
+    #[test_case("completed", None ; "a_bare_state_leaves_nothing")]
+    #[test_case("completed · ~1.2k tokens", Some("~1.2k tokens") ; "the_cost_stays")]
+    #[test_case("completedness", Some("completedness") ; "a_longer_word_is_not_the_state")]
+    #[test_case("2 tasks", Some("2 tasks") ; "a_listing_keeps_its_count")]
+    fn an_open_task_header_drops_its_state(annotation: &str, expected: Option<&str>) {
+        assert_eq!(
+            without_state(annotation, "completed").as_deref(),
+            expected,
+            "{STATE_ONCE_MSG}"
+        );
+    }
+
+    const INSTRUCTION_TOKENS_MSG: &str =
+        "a loaded instruction file says about what its text costs the context";
+
+    #[test_case(None ; "compact_row")]
+    #[test_case(Some(false) ; "card")]
+    fn loaded_instructions_say_their_tokens(expanded: Option<bool>) {
+        let blocks = vec![InstructionBlock {
+            path: "AGENTS.md".into(),
+            content: "Never push. ".repeat(100),
+        }];
+        let tokens = token_label(estimate_tokens_cached(&blocks[0].content));
+
+        let tl = build_instructions_lines(&blocks, 120, expanded);
+
+        let header = line_text(&tl.lines[0]);
+        assert!(
+            header.contains(&tokens),
+            "{INSTRUCTION_TOKENS_MSG}: {header}"
+        );
     }
 
     #[test_case("filePath", "file_path" ; "camel_matches_snake")]

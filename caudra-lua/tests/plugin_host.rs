@@ -2995,10 +2995,13 @@ caudra.api.register_tool({{
         Some(Arc::clone(&reg)),
     )
     .expect("driver ok");
+    let streamed = ToolOutput::Plain("stream_done".into())
+        .annotation()
+        .unwrap();
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 line \
+            "child_done/5 items stream_done/streamed line/{streamed} \
              {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
         )
     );

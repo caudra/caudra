@@ -111,7 +111,7 @@ pub use types::{
 };
 pub use types::{
     ReasoningSummary, format_live_duration, format_settled_duration, reasoning_summary,
-    streaming_reasoning_summary,
+    streaming_reasoning_summary, with_context_tokens,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

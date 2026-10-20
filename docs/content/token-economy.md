@@ -94,6 +94,8 @@ more context and mistakes        one bounded result
 
 `/usage` shows the token breakdown of the current session, and `--output-format json` in [Headless Mode](/docs/headless/) reports `total_cost_usd` per run. Cheap is a feature you can measure.
 
+A tool card that loads text into the context says about how many tokens that text costs, after what it found: `209 lines · ~2.1k tokens` on a file read or a skill, `exit 0 · ~840 tokens` on a command, `12 matches in 3 files · ~610 tokens` on a search. File reads and searches, file indexes, commands, `code` runs, skills, subagent answers, source-code lookups, web pages and MCP results all say it. An instruction file a read pulls in, such as an `AGENTS.md`, gets a row of its own with its own count. The count is an estimate of what the model reads. Inside a `code` card, the model reads only what the snippet printed or returned, so the `code` card's own count is what the run cost, whatever a call's row inside it says.
+
 Each turn is priced when it happens and that number is stored with the session. Prices move (DeepSeek, for one, doubles every rate during peak UTC hours), so a total re-priced later would be a guess. What you see is what you were billed.
 
 Some models charge more per token once a request's prompt passes a set size, and cached tokens count toward that size. Each request is priced by the size of its own prompt, so the long requests late in a session can cost more per token than the short ones at its start.

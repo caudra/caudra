@@ -6900,7 +6900,7 @@ mod tests {
     /// the dispatch's annotation, which grep never sets, so the row that
     /// answers how much matched was blank on the one tool whose entire result
     /// is a count.
-    #[test_case(BatchToolStatus::Success, None, Some("(3 matches in 2 files)") ; "the result speaks for itself")]
+    #[test_case(BatchToolStatus::Success, None, Some("(3 matches in 2 files · ~") ; "the result speaks for itself")]
     #[test_case(BatchToolStatus::Success, Some(GIVEN_ANNOTATION), Some("(cached)") ; "a given annotation still wins")]
     #[test_case(BatchToolStatus::Error, None, None ; "a failure is named by its own body")]
     fn a_child_row_annotates_what_its_result_holds(

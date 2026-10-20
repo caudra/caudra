@@ -2780,8 +2780,11 @@ fn remote_source_code_graph_result(
             footer,
             state: Some(value),
         }))
-        .with_model_output(Some(model_output))
-        .with_annotation(Some(annotation)),
+        .with_annotation(Some(caudra_agent::with_context_tokens(
+            annotation,
+            &model_output,
+        )))
+        .with_model_output(Some(model_output)),
     )
 }
 
@@ -3837,7 +3840,7 @@ fn file_glob_result(output: FileGlobOutput) -> ToolExecResult {
     } else {
         text.clone()
     };
-    let annotation = glob_annotation(&output);
+    let annotation = caudra_agent::with_context_tokens(glob_annotation(&output), &text);
     text_result(&output, display, false, text).with_annotation(Some(annotation))
 }
 
@@ -4256,8 +4259,8 @@ fn source_code_graph_result(
         footer,
         state: Some(state),
     }))
+    .with_annotation(Some(caudra_agent::with_context_tokens(annotation, &exact)))
     .with_model_output(Some(exact))
-    .with_annotation(Some(annotation))
 }
 
 /// Moves the rows the decision engine judges relevant to the task to the top
@@ -9370,9 +9373,14 @@ mod tests {
         output: FileGlobOutput,
         expected: &str,
     ) {
+        let result = file_glob_result(output);
+        let model = result.model_output.as_deref().unwrap_or_default();
         assert_eq!(
-            file_glob_result(output).annotation.as_deref(),
-            Some(expected)
+            result.annotation,
+            Some(caudra_agent::with_context_tokens(
+                expected.to_owned(),
+                model
+            ))
         );
     }
 

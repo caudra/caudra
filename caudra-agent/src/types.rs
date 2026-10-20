@@ -722,8 +722,23 @@ impl TextOutput {
             Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => {
                 token_label(estimate_tokens_cached(&self.text))
             }
-            _ => counted(self.text.lines().count(), LINE_NOUN),
+            _ => with_context_tokens(counted(self.text.lines().count(), LINE_NOUN), &self.text),
         }
+    }
+}
+
+/// About how many tokens the model reads in `model_text`, or `None` when it
+/// reads nothing there.
+fn context_tokens(model_text: &str) -> Option<String> {
+    (!model_text.trim().is_empty()).then(|| token_label(estimate_tokens_cached(model_text)))
+}
+
+/// `label · ~N tokens`: what a result holds, then about what it costs the
+/// context. A label for text the model reads nothing of stands alone.
+pub fn with_context_tokens(label: String, model_text: &str) -> String {
+    match context_tokens(model_text) {
+        Some(tokens) => format!("{label}{CARD_ANNOTATION_SEPARATOR}{tokens}"),
+        None => label,
     }
 }
 
@@ -1683,10 +1698,9 @@ impl SkillOutput {
     /// they came from and is not a line of them. Tokens are counted over what
     /// the model reads, since that is what the skill costs the context.
     fn annotation(&self) -> String {
-        format!(
-            "{}{CARD_ANNOTATION_SEPARATOR}{}",
+        with_context_tokens(
             counted(self.body.lines().count(), LINE_NOUN),
-            token_label(estimate_tokens_cached(&self.model_text()))
+            &self.model_text(),
         )
     }
 }
@@ -2220,19 +2234,21 @@ impl ToolOutput {
                 ..
             } => {
                 let shown = lines.len();
-                Some(
-                    if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
-                        counted(shown, LINE_NOUN)
-                    } else if shown == 0 {
-                        format!("0 of {}", counted(*total_lines, LINE_NOUN))
-                    } else {
-                        let end = start_line
-                            .saturating_add(shown)
-                            .saturating_sub(1)
-                            .min(*total_lines);
-                        format!("lines {start_line}–{end} of {total_lines}")
-                    },
-                )
+                let label = if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
+                    counted(shown, LINE_NOUN)
+                } else if shown == 0 {
+                    format!("0 of {}", counted(*total_lines, LINE_NOUN))
+                } else {
+                    let end = start_line
+                        .saturating_add(shown)
+                        .saturating_sub(1)
+                        .min(*total_lines);
+                    format!("lines {start_line}–{end} of {total_lines}")
+                };
+                Some(match shown {
+                    0 => label,
+                    _ => with_context_tokens(label, &self.as_display_text()),
+                })
             }
             Self::WriteCode {
                 byte_count, lines, ..
@@ -2246,42 +2262,52 @@ impl ToolOutput {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
                 let f = if files == 1 { "file" } else { "files" };
-                Some(match capped {
+                let label = match capped {
                     Some(cap) => format!(
                         "{matches} matches in {files} {f} (capped, {}/{} searched)",
                         cap.files_scanned, cap.files_listed
                     ),
                     None => format!("{matches} matches in {files} {f}"),
-                })
+                };
+                Some(with_context_tokens(label, &self.as_display_text()))
             }
             Self::ReadDir(t) => {
                 let n = t.text.lines().count();
-                Some(format!("{n} entries"))
+                Some(with_context_tokens(format!("{n} entries"), &t.text))
             }
-            Self::Index(IndexOutput::File { lines, .. }) => Some(counted(lines.len(), LINE_NOUN)),
+            Self::Index(IndexOutput::File { lines, .. }) => Some(with_context_tokens(
+                counted(lines.len(), LINE_NOUN),
+                &self.as_display_text(),
+            )),
             Self::Index(IndexOutput::Directory {
                 total_count,
                 truncated,
                 ..
-            }) => Some(if *truncated {
-                format!("at least {total_count} entries")
-            } else {
-                format!("{total_count} entries")
-            }),
+            }) => {
+                let label = if *truncated {
+                    format!("at least {total_count} entries")
+                } else {
+                    format!("{total_count} entries")
+                };
+                Some(with_context_tokens(label, &self.as_display_text()))
+            }
             Self::Memory(output) => Some(output.annotation()),
             Self::Peers(output) => Some(output.annotation()),
             Self::Skill(skill) => Some(skill.annotation()),
-            Self::Shell(output) => Some(if output.timed_out {
-                "timed out".into()
-            } else if output.output_limit_exceeded {
-                "output limit exceeded".into()
-            } else if let Some(exit_code) = output.exit_code {
-                format!("exit {exit_code}")
-            } else if let Some(signal) = output.signal {
-                format!("signal {signal}")
-            } else {
-                "exit unknown".into()
-            }),
+            Self::Shell(output) => {
+                let label = if output.timed_out {
+                    "timed out".into()
+                } else if output.output_limit_exceeded {
+                    "output limit exceeded".into()
+                } else if let Some(exit_code) = output.exit_code {
+                    format!("exit {exit_code}")
+                } else if let Some(signal) = output.signal {
+                    format!("signal {signal}")
+                } else {
+                    "exit unknown".into()
+                };
+                Some(with_context_tokens(label, &output.model_text))
+            }
             Self::Plain(text) | Self::Markdown(text)
                 if !text.text.is_empty() || text.summary().is_some() =>
             {
@@ -2294,13 +2320,26 @@ impl ToolOutput {
                     .to_string(),
             ),
             Self::WorkflowRun(card) => Some(card.headline()),
-            Self::Tasks(cards) => Some(match cards.as_slice() {
-                [card] => card.state.clone(),
-                _ => counted(cards.len(), TASK_NOUN),
-            }),
+            Self::Tasks(cards) => {
+                let label = match cards.as_slice() {
+                    [card] => card.state.clone(),
+                    _ => counted(cards.len(), TASK_NOUN),
+                };
+                Some(match cards.iter().any(|card| card.result.is_some()) {
+                    true => with_context_tokens(label, &self.as_text()),
+                    false => label,
+                })
+            }
             Self::Environment { headline, .. } => Some(headline.clone()),
             Self::Mcp(output) => output.annotation(),
-            Self::Code(output) => output.annotation(),
+            Self::Code(output) => match (output.annotation(), context_tokens(&output.model_text()))
+            {
+                (Some(calls), Some(tokens)) => {
+                    Some(format!("{calls}{CARD_ANNOTATION_SEPARATOR}{tokens}"))
+                }
+                (calls, tokens) => calls.or(tokens),
+            },
+            Self::SourceCodeGraph { .. } => context_tokens(&self.as_display_text()),
             _ => None,
         }
     }
@@ -5047,28 +5086,71 @@ mod tests {
             output.as_display_text(),
             "stdout tail:\nraw stdout\nstderr tail:\nraw stderr"
         );
-        assert_eq!(output.annotation().as_deref(), Some("exit 0"));
+        assert_eq!(
+            output.annotation(),
+            Some(format!(
+                "exit 0{CARD_ANNOTATION_SEPARATOR}{}",
+                token_label(estimate_tokens_cached(&output.as_text()))
+            ))
+        );
     }
 
-    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
-    #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
+    /// Nothing the model reads, or a write it only hears the outcome of, has no
+    /// tokens to report.
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 1–5 of 100") ; "read_code_first_window")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 10–14 of 100") ; "read_code_middle_window")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 96, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("lines 96–100 of 100") ; "read_code_window_reaches_eof")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 101, lines: vec![], total_lines: 100, instructions: None }, Some("0 of 100 lines") ; "read_code_offset_past_eof")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }, Some("0 lines") ; "read_code_empty_file")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 0, instructions: None }, Some("5 lines") ; "read_code_old_session_without_total")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec!["x".into(); 3] }, Some("3 lines") ; "write_code_lines")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_falls_back_for_old_sessions")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some("0 lines") ; "write_code_empty_file")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, Some("1 matches in 1 file") ; "grep_file_count")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, Some("1 matches in 1 file (capped, 40/900 searched)") ; "grep_capped_reports_how_far_it_got")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    const CONTEXT_TOKENS_MSG: &str =
+        "a result the model reads says what it found, then about what it costs the context";
+
+    #[test_case(ToolOutput::Plain("ok".into()), "1 line" ; "plain_short")]
+    #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), "20 lines" ; "plain_long")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, "5 lines" ; "read_code_full_file")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, "lines 1–5 of 100" ; "read_code_first_window")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, "lines 10–14 of 100" ; "read_code_middle_window")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 96, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, "lines 96–100 of 100" ; "read_code_window_reaches_eof")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 0, instructions: None }, "5 lines" ; "read_code_old_session_without_total")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, "1 matches in 1 file" ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, "1 matches in 1 file (capped, 40/900 searched)" ; "grep_capped_reports_how_far_it_got")]
+    #[test_case(ToolOutput::ReadDir("a.rs\nb.rs".into()), "2 entries" ; "read_dir")]
+    fn a_result_the_model_reads_adds_its_tokens(output: ToolOutput, label: &str) {
+        let tokens = token_label(estimate_tokens_cached(&output.as_display_text()));
+        assert_eq!(
+            output.annotation(),
+            Some(format!("{label}{CARD_ANNOTATION_SEPARATOR}{tokens}")),
+            "{CONTEXT_TOKENS_MSG}"
+        );
+    }
+
+    /// A read that loaded an instruction file reports the file alone: the
+    /// instructions say their own count on their own row.
+    #[test]
+    fn a_read_counts_its_own_lines_and_not_the_instructions_it_loaded() {
+        let read = |instructions| ToolOutput::ReadCode {
+            path: "a.rs".into(),
+            start_line: 1,
+            lines: vec!["x".into(); 5],
+            total_lines: 5,
+            instructions,
+        };
+        let loaded = read(Some(vec![InstructionBlock {
+            path: "AGENTS.md".into(),
+            content: "Never push. ".repeat(100),
+        }]));
+        assert_eq!(
+            loaded.annotation(),
+            read(None).annotation(),
+            "{CONTEXT_TOKENS_MSG}"
+        );
     }
 
     #[test]
@@ -5113,6 +5195,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_finished_task_adds_the_tokens_of_its_answer() {
+        let mut card = task(DONE_STATE);
+        card.result = Some(json!({ "output": WEB_RESULT }));
+        let output = ToolOutput::Tasks(vec![card]);
+        assert_eq!(
+            output.annotation(),
+            Some(with_context_tokens(
+                DONE_STATE.to_owned(),
+                &output.as_text()
+            )),
+            "{CONTEXT_TOKENS_MSG}"
+        );
+    }
+
+    #[test_case(Vec::new(), None ; "a_run_without_calls_reports_its_tokens_alone")]
+    #[test_case(vec![CodeCall::default()], Some("1 call") ; "a_run_with_calls_counts_them_first")]
+    fn a_code_run_adds_the_tokens_of_what_it_printed(calls: Vec<CodeCall>, label: Option<&str>) {
+        let code = CodeOutput {
+            stdout: WEB_RESULT.to_owned(),
+            calls,
+            ..Default::default()
+        };
+        let tokens = token_label(estimate_tokens_cached(&code.model_text()));
+        let expected = match label {
+            Some(label) => format!("{label}{CARD_ANNOTATION_SEPARATOR}{tokens}"),
+            None => tokens,
+        };
+        assert_eq!(
+            ToolOutput::Code(code).annotation(),
+            Some(expected),
+            "{CONTEXT_TOKENS_MSG}"
+        );
+    }
+
     const WEB_RESULT: &str = "# Title\n\nFirst paragraph.\nSecond paragraph.";
     const EMPTY_SEARCH_RESULT: &str = "No matches.";
     const UNICODE_PAGE: &str = "結果\nαβγ\n";
@@ -5136,12 +5253,12 @@ mod tests {
         assert_eq!(restored.as_text(), text);
     }
 
-    /// A web result is sized by what the model pays for it. Other text, such
-    /// as a `code` result, keeps its line count.
+    /// A web result is sized by what the model pays for it alone. Other text,
+    /// such as a `code` result, keeps its line count beside it.
     #[test_case(ToolOutput::Markdown, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_fetched_page_counts_tokens")]
     #[test_case(ToolOutput::Plain, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_page_fetched_as_text_counts_tokens")]
     #[test_case(ToolOutput::Markdown, "websearch", token_label(estimate_tokens(WEB_RESULT)) ; "search_results_count_tokens")]
-    #[test_case(ToolOutput::Plain, "code", "4 lines".to_owned() ; "a_python_result_counts_lines")]
+    #[test_case(ToolOutput::Plain, "code", format!("4 lines{CARD_ANNOTATION_SEPARATOR}{}", token_label(estimate_tokens(WEB_RESULT))) ; "a_python_result_counts_lines")]
     fn a_text_result_is_sized_by_its_kind(
         variant: fn(TextOutput) -> ToolOutput,
         kind: &str,

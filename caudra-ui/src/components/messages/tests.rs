@@ -32,7 +32,7 @@ use caudra_agent::{
     ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SourceCodeGraphRow,
     SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
-use caudra_providers::{PeerAudience, PeerMessageOrigin};
+use caudra_providers::{PeerAudience, PeerMessageOrigin, estimate_tokens_cached, token_label};
 use caudra_storage::background::ShellJobMetadata;
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -1511,18 +1511,19 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
 #[test_case(
     FILE_WRITE_TOOL_NAME,
     ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
-    Some("1 line")
+    "1 line"
     ; "write_bytes"
 )]
 #[test_case(
     "grep",
     grep_output(2),
-    Some("2 matches in 2 files")
+    "2 matches in 2 files"
     ; "grep_files"
 )]
-fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: Option<&str>) {
+fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: &str) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", tool));
+    let annotation = output.annotation();
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: tool.into(),
@@ -1540,12 +1541,14 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
-    assert_eq!(panel.messages[0].annotation.as_deref(), expected);
+    assert_eq!(panel.messages[0].annotation, annotation);
+    let annotation = annotation.unwrap_or_default();
+    assert!(annotation.starts_with(expected), "{annotation}");
 }
 
-#[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
-#[test_case("ok",                           Some("2m timeout · 1 line")  ; "merges_start_and_short_output")]
-fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
+#[test_case("line\n".repeat(200).as_str(), "2m timeout · 200 lines" ; "merges_start_and_output_annotations")]
+#[test_case("ok",                           "2m timeout · 1 line"  ; "merges_start_and_short_output")]
+fn tool_done_annotation_merge(output: &str, expected: &str) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut event = start("t1", SHELL_TOOL_NAME);
     event.annotation = Some("2m timeout".into());
@@ -1567,7 +1570,11 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
-    assert_eq!(panel.messages[0].annotation.as_deref(), expected);
+    let tokens = token_label(estimate_tokens_cached(output));
+    assert_eq!(
+        panel.messages[0].annotation,
+        Some(format!("{expected} · {tokens}"))
+    );
 }
 
 fn grep_output(n_files: usize) -> ToolOutput {
@@ -7418,7 +7425,8 @@ fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "⌕ Grepped t1 (1 line)");
+    let size = done("t1").output.annotation().unwrap();
+    assert_eq!(first_line_text(&panel, 0), format!("⌕ Grepped t1 ({size})"));
 }
 
 /// The past tense asserts the call happened, so a failure has to fall back to
@@ -7489,7 +7497,11 @@ fn an_unknown_tool_falls_back_to_its_registered_name() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "⚙ mystery_tool t1 (1 line)");
+    let size = done("t1").output.annotation().unwrap();
+    assert_eq!(
+        first_line_text(&panel, 0),
+        format!("⚙ mystery_tool t1 ({size})")
+    );
 }
 
 #[test]
@@ -7523,12 +7535,14 @@ fn a_read_replaces_its_requested_window_with_the_returned_range() {
         total_lines: 668,
         instructions: None,
     };
+    let size = event.output.annotation().unwrap();
     panel.tool_done(event);
     rebuild(&mut panel);
 
+    assert!(size.starts_with("lines 190–329 of 668"), "{size}");
     assert_eq!(
         first_line_text(&panel, 0),
-        "→ Read src/main.rs (lines 190–329 of 668)"
+        format!("→ Read src/main.rs ({size})")
     );
 }
 
