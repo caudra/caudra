@@ -12,6 +12,7 @@ pub mod nudge;
 pub use child_guard::ChildGuard;
 pub mod headless;
 pub mod history;
+pub mod learning;
 pub mod mailbox;
 pub mod mcp;
 pub mod memory;

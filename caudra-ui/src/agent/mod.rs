@@ -263,6 +263,8 @@ pub(crate) struct AgentHandles {
     automation: Option<AutomationSession>,
     pub(crate) background: Option<BackgroundTasks>,
     pub(crate) task_host: Option<Arc<WorkflowHostContext>>,
+    /// The session's continual learner, while one runs.
+    pub(crate) learner: Arc<arc_swap::ArcSwapOption<caudra_agent::learning::LearnerHandle>>,
     delivery_fence: Arc<DeliveryFence>,
     background_enabled: bool,
     session_id: Option<CaudraId>,
@@ -493,6 +495,7 @@ impl AgentHandles {
         app.shared_history = Some(Arc::clone(&self.history));
         app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
+        app.learner = Some(Arc::clone(&self.learner));
         app.context_store = Some(self.context_store.clone());
         app.tools_preview_source = Some(Arc::clone(&self.tools_preview_source));
         if app
@@ -952,6 +955,7 @@ fn spawn_agent_internal(
         agent_loop.cache_warmer(),
     );
     let tools_preview_source = Arc::new(agent_loop.tools_preview_source());
+    let learner = agent_loop.learner_handle();
     let task_host = agent_loop
         .task_host()
         .map(Arc::new)
@@ -987,6 +991,7 @@ fn spawn_agent_internal(
         background,
         background_enabled,
         task_host,
+        learner,
         delivery_fence,
         session_id: session_id.map(|session| session.id()),
         subagent_history,

@@ -29241,6 +29241,13 @@ mod theme_colours {
             shown: |app| app.memory_inspector.is_open(),
         },
         Surface {
+            name: "learn_inspector",
+            open: |app, _| {
+                app.execute_command(cmd("/learn"), 0);
+            },
+            shown: |app| app.learn_inspector.is_open(),
+        },
+        Surface {
             name: "task_picker",
             open: |app, _| {
                 app.tasks_browse();

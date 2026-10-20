@@ -63,6 +63,9 @@ pub const MEMORY_EVENT_RUN_ID: u64 = u64::MAX - 3;
 /// The `run_id` of an autopilot event a headless frontend raised itself, such
 /// as an engagement a control started or an interrupt ended. It is no run's.
 pub const AUTOPILOT_EVENT_RUN_ID: u64 = u64::MAX - 4;
+/// The `run_id` continual learning's events carry. It runs between turns, so
+/// they belong to none.
+pub const LEARNING_EVENT_RUN_ID: u64 = u64::MAX - 5;
 /// How much of a run's report or result a transcript card quotes.
 pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
 /// What a front end sends down the answer channel for a form the user closed
@@ -3207,6 +3210,9 @@ pub enum AgentEvent {
     CacheHitSamples(Vec<HitSamples>),
     /// A model's tokenizer ratio after a sample moved it, for the store.
     TokenCalibration(StoredCalibration),
+    /// A continual learning run changed instruction files or memory. Never
+    /// a transcript row: the conversation it ran beside is left as it was.
+    Learned(Box<crate::learning::LearnedNotice>),
     ToolResultsSubmitted {
         message: Box<Message>,
     },

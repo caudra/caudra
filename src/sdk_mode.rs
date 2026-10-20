@@ -131,6 +131,7 @@ const GOAL_ACTIVE: &str = "active";
 const GOAL_FINISHED: &str = "finished";
 const NO_GOAL: &str = "none";
 pub(crate) const AUTOPILOT_SYSTEM_SUBTYPE: &str = "autopilot";
+pub(crate) const LEARNING_SYSTEM_SUBTYPE: &str = "learning_notice";
 const DECISION_SYSTEM_SUBTYPE: &str = "decision";
 pub(crate) const ACCOUNT_SWITCH_SYSTEM_SUBTYPE: &str = "account_switch";
 pub(crate) const ACCOUNT_EXHAUSTED_SYSTEM_SUBTYPE: &str = "account_exhausted";
@@ -3550,6 +3551,9 @@ impl EventPump {
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::TokenCalibration(_)
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::Learned(notice) => self
+                .writer
+                .emit_system(LEARNING_SYSTEM_SUBTYPE, serde_json::to_value(notice)?)?,
             AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
             AgentEvent::AccountRouted {
                 account,

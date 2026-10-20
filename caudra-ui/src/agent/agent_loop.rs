@@ -4,7 +4,7 @@ use std::{env, sync::Arc};
 
 use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent;
 use caudra_agent::agent::cache_warming::{CacheWarmer, WarmStop, WarmerContext, WarmerRef};
 use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
@@ -15,6 +15,8 @@ use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
     ContextReadiness, ContextSnapshot,
 };
+use caudra_agent::learning::runner::Spend;
+use caudra_agent::learning::{Learner, LearnerDeps, LearnerHandle};
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::elicitor::QuestionForms;
 use caudra_agent::mcp::{McpHandle, McpSession, prompt_preamble};
@@ -33,7 +35,7 @@ use caudra_agent::tools::{
     DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolDefinitions, ToolFilter,
     ToolRegistry,
 };
-use caudra_agent::types::{MEMORY_EVENT_RUN_ID, TodoItem};
+use caudra_agent::types::{LEARNING_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem};
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -185,6 +187,11 @@ pub(super) struct AgentLoop {
     /// Summarizes `memory`'s store while the loop lives. `None` when
     /// summaries are off or there is no memory.
     memory_pump: Option<Pump>,
+    /// Continual learning for the session's project. `None` when learning is
+    /// off, the session is not stored, or it works in a remote workspace.
+    learner: Option<Learner>,
+    /// What `/learn` asks for a run through, swapped with the learner.
+    learner_handle: Arc<ArcSwapOption<LearnerHandle>>,
     tools: Value,
     /// Tools a `code` module dispatches, absent from `tools` yet available.
     hosted: Vec<String>,
@@ -344,6 +351,8 @@ impl AgentLoop {
             instructions: InstructionBaseline::default(),
             memory: MemoryBaseline::default(),
             memory_pump: None,
+            learner: None,
+            learner_handle: Arc::default(),
             tools: Value::Null,
             hosted: Vec::new(),
             surface: SurfaceBaseline::default(),
@@ -764,6 +773,9 @@ impl AgentLoop {
             model_slot.load().model.spec() == selected_spec
         }));
 
+        if let Some(learner) = &self.learner {
+            learner.hold();
+        }
         let mut agent = Agent::new(
             self.agent_params(&effective_slot, &selected_slot, prompt_slots, tool_filter),
             AgentRunParams {
@@ -816,6 +828,9 @@ impl AgentLoop {
         self.surface.touch(Instant::now());
         if let Some(pump) = &self.memory_pump {
             pump.nudge();
+        }
+        if let Some(learner) = &self.learner {
+            learner.nudge();
         }
 
         self.clear_cancel_trigger(run_id);
@@ -1062,6 +1077,10 @@ impl AgentLoop {
         self.mode.load().has_session_plan(self.plan.as_ref())
     }
 
+    pub(super) fn learner_handle(&self) -> Arc<ArcSwapOption<LearnerHandle>> {
+        Arc::clone(&self.learner_handle)
+    }
+
     pub(super) fn cache_warmer(&self) -> WarmerRef {
         self.cache_warmer.downgrade()
     }
@@ -1187,6 +1206,7 @@ impl AgentLoop {
         )
         .await;
         self.restart_memory_pump();
+        self.restart_learner();
         Ok(())
     }
 
@@ -1216,6 +1236,47 @@ impl AgentLoop {
                 None,
             )
         });
+    }
+
+    /// One learner per project directory: a change of directory replaces it,
+    /// and drops a run in flight, which then advances nothing.
+    fn restart_learner(&mut self) {
+        self.learner = None;
+        self.learner_handle.store(None);
+        let local = self.workspace_session.is_none() && self.remote_project_context.is_none();
+        let Some(state) = self
+            .tool_output_store
+            .as_deref()
+            .map(ToolOutputStore::state_dir)
+            .filter(|state| !state.is_ephemeral())
+            .cloned()
+        else {
+            return;
+        };
+        if !self.config.continual_learning || self.session_id.is_none() || !local {
+            return;
+        }
+        let host = match self.task_host() {
+            Ok(host) => host,
+            Err(error) => {
+                warn!(%error, "continual learning unavailable without a task host");
+                return;
+            }
+        };
+        let learner = Learner::start(LearnerDeps {
+            state,
+            cwd: PathBuf::from(self.vars.apply("{cwd}").as_ref()),
+            config_dir: caudra_storage::paths::config_dir().ok(),
+            host,
+            memory: self.memory.store().cloned(),
+            targets: self.config.learning_targets.clone(),
+            spend: Spend {
+                events: EventSender::new(self.agent_tx.clone(), LEARNING_EVENT_RUN_ID),
+                ledger: None,
+            },
+        });
+        self.learner_handle.store(Some(Arc::new(learner.handle())));
+        self.learner = Some(learner);
     }
 
     fn build_system(

@@ -28,6 +28,22 @@ const ASSISTANT_TYPE: &str = "assistant_text";
 const REASONING_TYPE: &str = "reasoning";
 const TOOL_CALL_TYPE: &str = "tool_call";
 const TOOL_RESULT_TYPE: &str = "tool_result";
+const ORIGIN_FIELD: &str = "origin";
+const TURN_ORIGIN: &str = "turn";
+const DISPLAY_TEXT_FIELD: &str = "display_text";
+const STATE_FIELD: &str = "state";
+const INTERRUPTED_STATE: &str = "interrupted";
+const REFUSED_CALLS_FIELD: &str = "refused_calls";
+const IS_ERROR_FIELD: &str = "is_error";
+const NOT_AUTHORED_FIELDS: [&str; 7] = [
+    "steering",
+    "task_event",
+    "workflow_event",
+    "automation_event",
+    "autopilot_event",
+    "peer_event",
+    STANDING_REMINDER_FIELD,
+];
 
 /// An item's kind and the tool a call names. `None` for anything that is not
 /// a history item this search knows.
@@ -92,6 +108,39 @@ pub(super) fn full_text(payload: &Value) -> Option<String> {
         HistoryKind::ToolResult => field(payload, CONTENT_FIELD)?.to_owned(),
     };
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// What a person typed, as opposed to text Caudra, an automation, autopilot,
+/// another session or a finished task put in the user's place.
+pub(super) fn authored(payload: &Value) -> bool {
+    field(payload, ORIGIN_FIELD) == Some(TURN_ORIGIN)
+        && NOT_AUTHORED_FIELDS
+            .iter()
+            .all(|name| payload.get(*name).is_none_or(Value::is_null))
+}
+
+/// The text a person typed: what the prompt showed when it differs from what
+/// the model was sent.
+pub(super) fn typed_text(payload: &Value) -> Option<String> {
+    field(payload, DISPLAY_TEXT_FIELD)
+        .filter(|display| !display.trim().is_empty())
+        .map(|display| display.trim().to_owned())
+        .or_else(|| full_text(payload))
+}
+
+pub(super) fn interrupted(payload: &Value) -> bool {
+    field(payload, STATE_FIELD) == Some(INTERRUPTED_STATE)
+}
+
+pub(super) fn refused(payload: &Value) -> bool {
+    payload
+        .get(REFUSED_CALLS_FIELD)
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+pub(super) fn failed(payload: &Value) -> bool {
+    flag(payload, IS_ERROR_FIELD)
 }
 
 fn field<'a>(payload: &'a Value, name: &str) -> Option<&'a str> {

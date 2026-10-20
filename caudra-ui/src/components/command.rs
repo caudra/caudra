@@ -246,6 +246,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/learn",
+        description: "Review what continual learning changed, revert it, or pause it",
+        max_args: 0,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/tasks",
         description: "Browse tasks and steer running subagents",
         max_args: usize::MAX,
@@ -1581,6 +1588,7 @@ mod tests {
     }
 
     #[test_case("/memory"; "memory")]
+    #[test_case("/learn"; "learn")]
     #[test_case("/auto"; "auto")]
     #[test_case("/decisions"; "decisions")]
     #[test_case("/decision-model"; "decision_model")]

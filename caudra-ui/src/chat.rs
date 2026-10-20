@@ -329,7 +329,8 @@ impl Chat {
             AgentEvent::ModelUsage { .. }
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
-            | AgentEvent::TokenCalibration(_) => {}
+            | AgentEvent::TokenCalibration(_)
+            | AgentEvent::Learned(_) => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalEvaluation { .. }

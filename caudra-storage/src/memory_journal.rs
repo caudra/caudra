@@ -27,6 +27,7 @@ const DELETE_KIND: &str = "delete";
 const SESSION_ORIGIN_PREFIX: &str = "session:";
 const EXTERNAL_ORIGIN: &str = "external";
 const IMPORT_ORIGIN: &str = "import";
+const LEARNER_ORIGIN_PREFIX: &str = "learner:";
 const FRONTMATTER_FENCE: &str = "---";
 const HEADING_MARKER: char = '#';
 const KIND_FIELD: &str = "entry kind";
@@ -107,13 +108,14 @@ impl EntryKind {
     }
 }
 
-/// Who made a change: a session, an edit to the file made outside Caudra, or
-/// an import.
+/// Who made a change: a session, an edit to the file made outside Caudra, an
+/// import, or a continual-learning run, by its id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EntryOrigin {
     Session(String),
     External,
     Import,
+    Learner(i64),
 }
 
 impl EntryOrigin {
@@ -122,6 +124,7 @@ impl EntryOrigin {
             Self::Session(id) => format!("{SESSION_ORIGIN_PREFIX}{id}"),
             Self::External => EXTERNAL_ORIGIN.to_owned(),
             Self::Import => IMPORT_ORIGIN.to_owned(),
+            Self::Learner(run) => format!("{LEARNER_ORIGIN_PREFIX}{run}"),
         }
     }
 
@@ -129,9 +132,12 @@ impl EntryOrigin {
         match value {
             EXTERNAL_ORIGIN => Some(Self::External),
             IMPORT_ORIGIN => Some(Self::Import),
-            _ => value
-                .strip_prefix(SESSION_ORIGIN_PREFIX)
-                .map(|id| Self::Session(id.to_owned())),
+            _ => match value.strip_prefix(LEARNER_ORIGIN_PREFIX) {
+                Some(run) => run.parse().ok().map(Self::Learner),
+                None => value
+                    .strip_prefix(SESSION_ORIGIN_PREFIX)
+                    .map(|id| Self::Session(id.to_owned())),
+            },
         }
     }
 }
@@ -935,6 +941,7 @@ mod tests {
     #[test_case(EntryOrigin::Session(SESSION.to_owned()); "session")]
     #[test_case(EntryOrigin::External; "external")]
     #[test_case(EntryOrigin::Import; "import")]
+    #[test_case(EntryOrigin::Learner(42); "learner")]
     fn origin_survives_storage(origin: EntryOrigin) {
         let (_root, _state, journal) = fixture();
         journal

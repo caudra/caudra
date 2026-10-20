@@ -18,6 +18,7 @@ mod goal;
 #[cfg(debug_assertions)]
 mod grab;
 mod image_paste;
+mod learning;
 mod memory;
 pub(crate) mod mode;
 mod mouse;
@@ -90,6 +91,7 @@ use crate::components::input::{
     AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, InputState, Submission,
 };
 use crate::components::keybindings::{self, KeybindContext, key, leader};
+use crate::components::learn_inspector::LearnInspector;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::logs_modal::{LogsAction, LogsModal};
 use crate::components::lua_float::FloatManager;
@@ -158,6 +160,7 @@ use caudra_agent::autopilot::{ActionName, DecisionKind};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
+use caudra_agent::learning::LearnerHandle;
 use caudra_agent::mcp::McpSnapshot;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{AutopilotNote, PermissionManager, PermissionPolicyError};
@@ -567,6 +570,10 @@ pub struct App {
     permission_review: Option<bool>,
     pub(super) memory_inspector: MemoryInspector,
     memory_reads: memory::MemoryReads,
+    pub(super) learn_inspector: LearnInspector,
+    learn_reads: learning::LearnReads,
+    /// The session's continual learner, while one runs.
+    pub(crate) learner: Option<Arc<ArcSwapOption<LearnerHandle>>>,
     /// Set by the event loop after construction: whether a summarizer writes
     /// the memory's lines, which the inspector says when it does not.
     pub(crate) summarize_memory: bool,
@@ -913,6 +920,9 @@ impl App {
             permission_review: None,
             memory_inspector: MemoryInspector::new(),
             memory_reads: memory::MemoryReads::default(),
+            learn_inspector: LearnInspector::new(),
+            learn_reads: learning::LearnReads::default(),
+            learner: None,
             summarize_memory: true,
             task_picker: TaskPicker::new(),
             shell_modal: ShellModal::new(),
@@ -2061,6 +2071,7 @@ impl App {
         self.decisions_modal.close();
         self.skills_modal.close();
         self.storage_modal.close();
+        self.learn_inspector.close();
         self.system_prompt_modal.close();
         self.projection_modal.close();
         self.docs_modal.close();
@@ -2141,6 +2152,10 @@ impl App {
         }
         if self.storage_modal.is_open() {
             self.storage_modal.scroll(delta);
+            return None;
+        }
+        if self.learn_inspector.is_open() {
+            self.learn_inspector.scroll(delta);
             return None;
         }
         if self.system_prompt_modal.is_open() {
@@ -2566,6 +2581,12 @@ impl App {
             guard_repeat!(false);
             self.storage_modal.handle_key(key);
             return Some(vec![]);
+        }
+
+        if self.learn_inspector.is_open() {
+            guard_repeat!(false);
+            let action = self.learn_inspector.handle_key(key);
+            return Some(self.handle_learn_action(action));
         }
 
         if self.system_prompt_modal.is_open() {
@@ -5180,6 +5201,7 @@ impl App {
                     | AgentEvent::CacheWarmEpisode(_)
                     | AgentEvent::CacheHitSamples(_)
                     | AgentEvent::TokenCalibration(_)
+                    | AgentEvent::Learned(_)
             )
         {
             let cancelled_terminal = envelope.subagent.is_none()
@@ -5473,6 +5495,11 @@ impl App {
             }
             AgentEvent::TokenCalibration(calibration) => {
                 self.storage_writer.record_calibration(calibration);
+                return vec![];
+            }
+            AgentEvent::Learned(notice) => {
+                self.flash(format!("{} (/learn)", notice.headline()));
+                self.learning_changed();
                 return vec![];
             }
             AgentEvent::GoalEvaluating { evaluation } => {
@@ -6131,6 +6158,7 @@ impl App {
                 vec![]
             }
             "/memory" => self.open_memory_inspector(),
+            "/learn" => self.open_learn_inspector(),
             "/tasks" => self.execute_task_control(&cmd.args),
             "/shells" => self.shells_browse(),
             "/peers" => vec![Action::ListPeers],
@@ -6595,7 +6623,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 50] {
+    fn overlays(&self) -> [&dyn Overlay; 51] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6608,6 +6636,7 @@ impl App {
             &self.decisions_modal,
             &self.skills_modal,
             &self.storage_modal,
+            &self.learn_inspector,
             &self.system_prompt_modal,
             &self.projection_modal,
             &self.goal_panel,
@@ -6650,7 +6679,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 50] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 51] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6663,6 +6692,7 @@ impl App {
             &mut self.decisions_modal,
             &mut self.skills_modal,
             &mut self.storage_modal,
+            &mut self.learn_inspector,
             &mut self.system_prompt_modal,
             &mut self.projection_modal,
             &mut self.goal_panel,
@@ -6982,6 +7012,7 @@ impl App {
             | self.poll_workflow_replies()
             | self.poll_automations()
             | self.poll_memory()
+            | self.poll_learning()
             | self.poll_task_controls()
             | self.poll_task_continuation()
             | self.poll_task_history()
@@ -7479,6 +7510,7 @@ impl App {
             self.tooltip.cadence(Instant::now()),
             self.automation_cadence(),
             self.memory_cadence(),
+            self.learning_cadence(),
             Cadence::when(self.shell_env.reply.is_some(), Cadence::PENDING),
             // The `#` popup is not an overlay, so its spinner has to be asked
             // for here rather than through `overlays`.

@@ -348,7 +348,7 @@ fn filters(query: &HistoryQuery) -> Result<(String, Vec<SqlValue>), SessionError
     Ok((clauses.join(" AND "), values))
 }
 
-fn in_list(column: &str, len: usize) -> String {
+pub(super) fn in_list(column: &str, len: usize) -> String {
     if len == 0 {
         return "0".to_owned();
     }
@@ -421,7 +421,7 @@ fn candidate(row: &Row<'_>) -> Result<Candidate, SessionError> {
     })
 }
 
-fn kind_from_code(code: i64) -> Result<HistoryKind, SessionError> {
+pub(super) fn kind_from_code(code: i64) -> Result<HistoryKind, SessionError> {
     HistoryKind::from_code(code).ok_or_else(|| SessionError::CorruptDatabaseValue {
         field: KIND_FIELD,
         reason: format!("unknown kind code {code}"),
@@ -430,7 +430,7 @@ fn kind_from_code(code: i64) -> Result<HistoryKind, SessionError> {
 
 /// The payload at `ordinal` of the reference's stream, when it is still the
 /// item the reference names.
-fn payload_at(
+pub(super) fn payload_at(
     connection: &Connection,
     reference: &HistoryRef,
     ordinal: usize,

@@ -48,6 +48,7 @@ const THIS_SESSION: &str = "this session";
 const ANOTHER_SESSION: &str = "another session";
 const EXTERNAL_EDIT: &str = "an edit made outside Caudra";
 const IMPORT: &str = "the import";
+const LEARNER: &str = "continual learning run";
 
 /// What the pane is drawn against.
 pub(super) struct Scene<'a> {
@@ -313,10 +314,11 @@ pub(super) fn authorship(meta: &EntryMeta, session_id: &str) -> String {
         EntryKind::Delete => (DELETE_KIND, RECORDED),
     };
     let author = match &meta.origin {
-        EntryOrigin::Session(id) if id == session_id => THIS_SESSION,
-        EntryOrigin::Session(_) => ANOTHER_SESSION,
-        EntryOrigin::External => EXTERNAL_EDIT,
-        EntryOrigin::Import => IMPORT,
+        EntryOrigin::Session(id) if id == session_id => THIS_SESSION.to_owned(),
+        EntryOrigin::Session(_) => ANOTHER_SESSION.to_owned(),
+        EntryOrigin::External => EXTERNAL_EDIT.to_owned(),
+        EntryOrigin::Import => IMPORT.to_owned(),
+        EntryOrigin::Learner(run) => format!("{LEARNER} {run}"),
     };
     let when = local_time(meta.created_ms, MINUTE_FORMAT).unwrap_or_default();
     format!("{kind} {}{SEPARATOR}{made} {when} by {author}", meta.name)

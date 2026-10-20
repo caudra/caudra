@@ -86,6 +86,8 @@ use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::code::CodeSession;
 use crate::commits;
+use crate::learning::runner::Spend as LearnerSpend;
+use crate::learning::{Learner, LearnerDeps};
 use crate::mcp::elicitor::ElicitorFactory;
 use crate::mcp::prompt_preamble;
 use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
@@ -105,7 +107,7 @@ use crate::tools::{
 };
 use crate::types::{
     AUTOPILOT_EVENT_RUN_ID, AutopilotEvent, BACKGROUND_EVENT_RUN_ID, BatchToolEntry,
-    MEMORY_EVENT_RUN_ID, TodoItem,
+    LEARNING_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem,
 };
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
@@ -3375,6 +3377,7 @@ async fn spawn_prepared_session(
             (Arc::clone(&live.0), Arc::clone(&live.1))
         })
     };
+    let store_cwd = store.session.cwd.clone();
     let memory_pump = memory
         .store()
         .filter(|_| params.config.summarize_memory)
@@ -3530,6 +3533,37 @@ async fn spawn_prepared_session(
         ..base
     };
     let subagent_cancels = Arc::clone(&base.subagent_cancels);
+    let learner = (params.config.continual_learning
+        && params.workspace_session.is_none()
+        && params.remote_project_context.is_none()
+        && !state_dir.is_ephemeral())
+    .then(|| {
+        Learner::start(LearnerDeps {
+            state: state_dir.clone(),
+            cwd: params.initial_wd.clone(),
+            config_dir: caudra_storage::paths::config_dir().ok(),
+            host: WorkflowHostContext::from_agent_params(
+                &base,
+                HostExtras {
+                    mcp: None,
+                    loaded_instructions: baseline.loaded().clone(),
+                    user_response_rx: None,
+                },
+                live_resolver(),
+                Arc::new(|| AgentMode::Build),
+                Arc::new(CancelMap::new()),
+            ),
+            memory: memory.store().cloned(),
+            targets: params.config.learning_targets.clone(),
+            spend: LearnerSpend {
+                events: EventSender::new(agent_tx.clone(), LEARNING_EVENT_RUN_ID),
+                ledger: Some(Ledger {
+                    state: state_dir.clone(),
+                    cwd: store_cwd,
+                }),
+            },
+        })
+    });
 
     let task = smol::spawn({
         let mode_route = Arc::clone(&mode_route);
@@ -4569,6 +4603,9 @@ async fn spawn_prepared_session(
                     agent = agent.with_autopilot(autopilot.clone());
                 }
 
+                if let Some(learner) = &learner {
+                    learner.hold();
+                }
                 let result = agent.run(input).await;
                 let route = agent.conversation_route();
                 drop(agent);
@@ -4582,6 +4619,9 @@ async fn spawn_prepared_session(
                 cancel_task.cancel().await;
                 if let Some(pump) = &memory_pump {
                     pump.nudge();
+                }
+                if let Some(learner) = &learner {
+                    learner.nudge();
                 }
 
                 if cancel.is_cancelled() || !matches!(result, Ok(DoneReason::EndTurn)) {
@@ -4668,6 +4708,7 @@ async fn spawn_prepared_session(
             }
             drop(base);
             drop(memory_pump);
+            drop(learner);
             // Holds a sender for its last episode, which it emits on drop.
             drop(cache_warmer);
             drop(agent_tx);

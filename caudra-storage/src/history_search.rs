@@ -10,9 +10,11 @@ mod extract;
 mod index;
 mod query;
 mod snippet;
+mod timeline;
 
 pub(crate) use extract::strip_reminders;
 pub use query::highlight_history;
+pub use timeline::TimelineItem;
 
 use std::fmt;
 use std::ops::Range;

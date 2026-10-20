@@ -105,13 +105,14 @@ pub enum ModelPurpose {
     Goal,
     Extract,
     Memory,
+    Learn,
     Autopilot,
     Fast,
     Best,
 }
 
 impl ModelPurpose {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Chat,
         Self::Plan,
         Self::Subagent,
@@ -120,6 +121,7 @@ impl ModelPurpose {
         Self::Goal,
         Self::Extract,
         Self::Memory,
+        Self::Learn,
         Self::Autopilot,
         Self::Fast,
         Self::Best,
@@ -143,6 +145,7 @@ impl ModelPurpose {
             Self::Goal => "Goal",
             Self::Extract => "Extract",
             Self::Memory => "Memory",
+            Self::Learn => "Learn",
             Self::Autopilot => "Autopilot",
             Self::Fast => "Fast",
             Self::Best => "Best",
@@ -159,6 +162,7 @@ impl ModelPurpose {
             Self::Goal => "goal",
             Self::Extract => "extract",
             Self::Memory => "memory",
+            Self::Learn => "learn",
             Self::Autopilot => "autopilot",
             Self::Fast => "fast",
             Self::Best => "best",
@@ -185,7 +189,7 @@ impl FromStr for ModelPurpose {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, memory, autopilot, fast, best"
+    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, memory, learn, autopilot, fast, best"
 )]
 pub struct UnknownPurpose(pub String);
 
@@ -1772,6 +1776,7 @@ best = "gpt-4.1"
     #[test_case("goal", ModelPurpose::Goal ; "goal")]
     #[test_case("extract", ModelPurpose::Extract ; "extract")]
     #[test_case("memory", ModelPurpose::Memory ; "memory")]
+    #[test_case("learn", ModelPurpose::Learn ; "learn")]
     #[test_case("autopilot", ModelPurpose::Autopilot ; "autopilot")]
     #[test_case("fast", ModelPurpose::Fast ; "fast")]
     #[test_case("best", ModelPurpose::Best ; "best")]
@@ -1793,6 +1798,7 @@ best = "gpt-4.1"
                 ModelPurpose::Goal,
                 ModelPurpose::Extract,
                 ModelPurpose::Memory,
+                ModelPurpose::Learn,
                 ModelPurpose::Autopilot,
                 ModelPurpose::Fast,
                 ModelPurpose::Best,

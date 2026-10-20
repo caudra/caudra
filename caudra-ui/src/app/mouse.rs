@@ -284,6 +284,11 @@ impl App {
             self.storage_modal.handle_mouse(event);
             return Vec::new();
         }
+        if self.learn_inspector.is_open() && !self.permission_prompt_holds_input() {
+            self.clear_control_hovers();
+            self.learn_inspector.handle_mouse(event);
+            return Vec::new();
+        }
         if self.system_prompt_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let action = self.system_prompt_modal.handle_mouse(event);
@@ -1523,6 +1528,7 @@ impl App {
         dismiss!(self.decisions_modal);
         dismiss!(self.skills_modal);
         dismiss!(self.storage_modal);
+        dismiss!(self.learn_inspector);
         dismiss!(self.system_prompt_modal);
         dismiss!(self.projection_modal);
         dismiss!(self.goal_panel);

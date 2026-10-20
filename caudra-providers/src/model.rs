@@ -977,13 +977,15 @@ impl Model {
         catalog_access: CatalogAccess,
     ) -> Result<Option<Self>, ModelError> {
         match purpose {
-            // A memory line stands in for its notes for months, so it is
-            // written by the model trusted with compaction.
+            // A memory line stands in for its notes for months, and a learned
+            // rule is read by every later session, so both are written by the
+            // model trusted with compaction.
             ModelPurpose::Chat
             | ModelPurpose::Plan
             | ModelPurpose::Subagent
             | ModelPurpose::Compact
-            | ModelPurpose::Memory => Ok(Some(anchor.clone())),
+            | ModelPurpose::Memory
+            | ModelPurpose::Learn => Ok(Some(anchor.clone())),
             ModelPurpose::Title | ModelPurpose::Goal | ModelPurpose::Extract => {
                 Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
             }
@@ -1531,6 +1533,7 @@ mod tests {
     #[test_case(ModelPurpose::Goal, "openai/gpt-5.6-luna" ; "goal_uses_fast")]
     #[test_case(ModelPurpose::Extract, "openai/gpt-5.6-luna" ; "extract_uses_fast")]
     #[test_case(ModelPurpose::Memory, OPENAI_CHAT_SPEC ; "memory_keeps_anchor")]
+    #[test_case(ModelPurpose::Learn, OPENAI_CHAT_SPEC ; "learn_keeps_anchor")]
     #[test_case(ModelPurpose::Autopilot, "openai/gpt-5.6-sol" ; "autopilot_uses_best")]
     #[test_case(ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "fast_uses_small_default")]
     #[test_case(ModelPurpose::Best, "openai/gpt-5.6-sol" ; "best_uses_non_small_default")]

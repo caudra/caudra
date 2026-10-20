@@ -461,6 +461,8 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `shell_native_redirect` | string | `enforce` | - | What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected |
 | `image_model` | string | `sunburst` | - | GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price |
 | `cache_warming` | string | `off` | - | Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only |
+| `continual_learning` | bool | `true` | - | Learn from your conversations in the background: after enough new prompts, the Learn model reads them and keeps durable conventions, setup facts and preferences in the instruction files and memory notes. A project config can turn it off, never on |
+| `learning_targets` | string[] | `["project", "local", "global", "memory"]` | - | Where continual learning may write: `project` (the committed AGENTS.md), `local` (AGENTS.local.md), `global` (~/.config/caudra/AGENTS.md), `memory` (memory notes). A project list can only narrow the global one |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 
 ### `agent.messaging`

@@ -26,6 +26,8 @@ pub mod goal_log;
 pub mod history_search;
 pub mod id;
 pub mod input_history;
+#[path = "sessions/learning.rs"]
+pub mod learning;
 pub mod local_documents;
 pub mod log;
 pub mod mcp_trust;

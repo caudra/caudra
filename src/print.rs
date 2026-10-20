@@ -512,6 +512,7 @@ pub fn run(
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::TokenCalibration(_)
+            | AgentEvent::Learned(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => {
                 note_autopilot(event, &mut tally, verbose_out.as_mut(), &session_id)?;

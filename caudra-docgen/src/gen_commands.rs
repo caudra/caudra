@@ -377,6 +377,11 @@ pub fn generate() -> String {
         "- **`/memory`**: open the memory inspector: the view the model reads, the summary tree under each of its lines, and the notes. `Enter` on a note opens it in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit. See [Memory](/docs/memory/#the-inspector) for its marks, modes, and keys."
     )
     .unwrap();
+    writeln!(
+        out,
+        "- **`/learn`**: open the learning inspector: the project's [continual learning](/docs/learning/) runs, newest first, with what each changed and dropped. `↑`/`↓` pick a run and `←`/`→` a change in it. `n` runs now, `u` reverts the selected change, and `p` pauses or resumes learning for the project. See [Reviewing what it learned](/docs/learning/#reviewing-what-it-learned)."
+    )
+    .unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "## Custom commands").unwrap();

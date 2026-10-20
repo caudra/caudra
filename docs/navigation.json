@@ -34,6 +34,7 @@
         "token-economy",
         "context",
         "memory",
+        "learning",
         "changes-from-maki",
         "queue"
       ]

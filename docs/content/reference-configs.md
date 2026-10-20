@@ -440,6 +440,19 @@ version = 2
 # Type: string.
 # cache_warming = "off"
 
+# Learn from your conversations in the background: after enough new prompts,
+# the Learn model reads them and keeps durable conventions, setup facts and
+# preferences in the instruction files and memory notes. A project config can
+# turn it off, never on.
+# Type: bool.
+# continual_learning = true
+
+# Where continual learning may write: `project` (the committed AGENTS.md),
+# `local` (AGENTS.local.md), `global` (~/.config/caudra/AGENTS.md), `memory`
+# (memory notes). A project list can only narrow the global one.
+# Type: string[].
+# learning_targets = ["project", "local", "global", "memory"]
+
 # Tools to withhold from the model: built-in names, `server.tool`, or
 # `server.*` for a whole MCP server. A project list extends the global one.
 # Type: string[].

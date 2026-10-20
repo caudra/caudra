@@ -706,6 +706,9 @@ impl App {
         if self.storage_modal.is_open() {
             claim!(self.storage_modal.view(frame, full), self.storage_modal);
         }
+        if self.learn_inspector.is_open() {
+            claim!(self.learn_inspector.view(frame, full), self.learn_inspector);
+        }
         if self.system_prompt_modal.is_open() {
             claim!(
                 self.system_prompt_modal.view(frame, full),

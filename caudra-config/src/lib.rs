@@ -1323,6 +1323,33 @@ impl CacheWarmingMode {
     }
 }
 
+/// Where continual learning may write what it learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LearningTarget {
+    /// The project's committed instruction file, shared with everyone.
+    Project,
+    /// The project's gitignored `AGENTS.local.md`, for this machine.
+    Local,
+    /// `~/.config/caudra/AGENTS.md`, for every project.
+    Global,
+    /// The project's memory notes.
+    Memory,
+}
+
+impl LearningTarget {
+    pub const ALL: [Self; 4] = [Self::Project, Self::Local, Self::Global, Self::Memory];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Local => "local",
+            Self::Global => "global",
+            Self::Memory => "memory",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
@@ -1531,6 +1558,8 @@ pub struct AgentFileConfig {
     pub shell_native_redirect: Option<ShellNativeRedirect>,
     pub image_model: Option<ImageModel>,
     pub cache_warming: Option<CacheWarmingMode>,
+    pub continual_learning: Option<bool>,
+    pub learning_targets: Option<Vec<LearningTarget>>,
     pub disabled_tools: Option<Vec<String>>,
     /// `Some` for any `[agent.shell_env]` table, even an empty one, so a
     /// project layer that holds one is refused.
@@ -1576,6 +1605,19 @@ impl AgentFileConfig {
             image_model,
             cache_warming
         );
+        // Restrictions only: an overlay can stop learning or narrow where it
+        // writes, never start it or widen it, because it spends and it edits
+        // files people share.
+        if overlay.continual_learning == Some(false) {
+            self.continual_learning = Some(false);
+        }
+        if let Some(overlay) = overlay.learning_targets {
+            let narrowed = match self.learning_targets.take() {
+                Some(base) => base.into_iter().filter(|t| overlay.contains(t)).collect(),
+                None => overlay,
+            };
+            self.learning_targets = Some(narrowed);
+        }
         // Restriction only, unlike every other list here: a project must not be
         // able to hand itself back a tool the global config took away.
         if let Some(overlay) = overlay.disabled_tools {
@@ -2876,6 +2918,25 @@ pub struct AgentConfig {
     )]
     pub cache_warming: CacheWarmingMode,
 
+    #[config(
+        default = true,
+        desc = "Learn from your conversations in the background: after enough new prompts, the Learn model reads them and keeps durable conventions, setup facts and preferences in the instruction files and memory notes. A project config can turn it off, never on"
+    )]
+    pub continual_learning: bool,
+
+    #[config(
+        ty = "string[]",
+        default = "LearningTarget::ALL.to_vec()",
+        default_doc = "[\"project\", \"local\", \"global\", \"memory\"]",
+        desc = "Where continual learning may write: `project` (the committed AGENTS.md), `local` (AGENTS.local.md), `global` (~/.config/caudra/AGENTS.md), `memory` (memory notes). A project list can only narrow the global one"
+    )]
+    pub learning_targets: Vec<LearningTarget>,
+
+    /// Set on the learner's own runs, whose `history` calls stay in the
+    /// session's project whatever scope they ask for.
+    #[config(skip, default = false)]
+    pub history_project_only: bool,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -2960,6 +3021,11 @@ impl AgentConfig {
             shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
             cache_warming: file.cache_warming.unwrap_or_default(),
+            continual_learning: file.continual_learning.unwrap_or(true),
+            learning_targets: file
+                .learning_targets
+                .unwrap_or_else(|| LearningTarget::ALL.to_vec()),
+            history_project_only: false,
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,

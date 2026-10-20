@@ -32,6 +32,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/stash-list` | Browse stashed prompts |  |  |
 | `/dismiss-update` | Hide the update banner until Caudra restarts |  |  |
 | `/memory` | Inspect project memory: the view, its summary tree, and the notes |  |  |
+| `/learn` | Review what continual learning changed, revert it, or pause it |  |  |
 | `/tasks` | Browse tasks and steer running subagents |  |  |
 | `/shells` | Browse shell commands and stop running ones |  |  |
 | `/peers` | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
@@ -300,6 +301,7 @@ Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bo
   While a main-session question form is waiting, press `F2` or click `Ask /btw` to clarify its choices. `Esc` returns to the unchanged form and stops any streaming side response. Reopening restores the clarification thread until the form is submitted, dismissed, or cancelled. Task and subagent questions do not support this action yet.
 - **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).
 - **`/memory`**: open the memory inspector: the view the model reads, the summary tree under each of its lines, and the notes. `Enter` on a note opens it in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit. See [Memory](/docs/memory/#the-inspector) for its marks, modes, and keys.
+- **`/learn`**: open the learning inspector: the project's [continual learning](/docs/learning/) runs, newest first, with what each changed and dropped. `↑`/`↓` pick a run and `←`/`→` a change in it. `n` runs now, `u` reverts the selected change, and `p` pauses or resumes learning for the project. See [Reviewing what it learned](/docs/learning/#reviewing-what-it-learned).
 
 ## Custom commands
 

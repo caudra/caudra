@@ -44,6 +44,7 @@ pub enum LedgerPurpose {
     Memory,
     Autopilot,
     CacheWarm,
+    Learning,
 }
 
 impl LedgerPurpose {
@@ -60,6 +61,7 @@ impl LedgerPurpose {
             Self::Memory => "memory",
             Self::Autopilot => "autopilot",
             Self::CacheWarm => "cache_warm",
+            Self::Learning => "learning",
         }
     }
 
@@ -76,6 +78,7 @@ impl LedgerPurpose {
             "memory" => Some(Self::Memory),
             "autopilot" => Some(Self::Autopilot),
             "cache_warm" => Some(Self::CacheWarm),
+            "learning" => Some(Self::Learning),
             _ => None,
         }
     }
@@ -552,6 +555,7 @@ mod tests {
     #[test_case(LedgerPurpose::Memory ; "memory")]
     #[test_case(LedgerPurpose::Autopilot ; "autopilot")]
     #[test_case(LedgerPurpose::CacheWarm ; "cache_warm")]
+    #[test_case(LedgerPurpose::Learning ; "learning")]
     fn a_purpose_round_trips_through_the_ledger(purpose: LedgerPurpose) {
         let (_temp, dir) = state_dir();
         ledger(&dir)

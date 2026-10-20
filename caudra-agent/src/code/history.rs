@@ -100,6 +100,9 @@ const HISTORY_OF: &str = "the history of ";
 const ALL_PROJECTS_WORDS: &str = "all projects";
 /// Raised by every call of a session whose conversation is not stored.
 pub const UNSAVED: &str = "history is unavailable: this session is not saved";
+/// Raised when a run held to its project asks for another project's history.
+pub const PROJECT_ONLY: &str =
+    "this run reaches only the current project's history: use scope=\"project\" or \"session\"";
 pub static DOC: ModuleDoc = ModuleDoc {
     namespace: HISTORY_MODULE,
     summary: "`history`: full-text search over the conversations stored on this machine, compacted parts and subagents included; `history.search`, `history.read`, `history.sessions`.",
@@ -195,6 +198,7 @@ impl HostModule for HistoryModule {
 struct Caller {
     session: Option<CaudraId>,
     here: Here,
+    project_only: bool,
     judge: Option<Judge>,
     notes: Option<NoteSink>,
 }
@@ -204,13 +208,23 @@ impl Caller {
         Self {
             session: ctx.session_id.as_ref().map(|session| session.id()),
             here: Here::of(ctx),
+            project_only: ctx.config.history_project_only,
             judge: judge(ctx),
             notes: ctx.note_sink(),
         }
     }
 
-    /// Which history `requested` names, and whether it is the session's own project.
+    /// Which history `requested` names, and whether it is the session's own project. A run
+    /// held to its project reaches no other.
     fn reach(&self, requested: &Requested) -> Result<Reach, ScriptError> {
+        let reach = self.reach_any(requested)?;
+        if self.project_only && !reach.current {
+            return Err(value_error(PROJECT_ONLY));
+        }
+        Ok(reach)
+    }
+
+    fn reach_any(&self, requested: &Requested) -> Result<Reach, ScriptError> {
         let own = || {
             let project = self.here.project();
             Reach {
@@ -503,6 +517,9 @@ impl ReadCall {
                 .await
                 .map_err(|error| runtime(unreadable_message(&error)))?
                 .ok_or_else(|| value_error(format!("no stored session holds `{reference}`")))?;
+            if caller.project_only && !reach.current {
+                return Err(value_error(PROJECT_ONLY));
+            }
             let row = row(
                 READ_METHOD,
                 HistoryHelper::Read,
@@ -1002,6 +1019,28 @@ mod tests {
         };
         assert_eq!(calls[0].status, status);
         assert_eq!(calls[0].server, HISTORY_MODULE);
+    }
+
+    /// A run held to its project reads that project and its conversation, and raises before it
+    /// could ask for any other.
+    #[test_case(Target::Project, true ; "this_project")]
+    #[test_case(Target::Session, true ; "this_conversation")]
+    #[test_case(Target::OtherProject, false ; "another_project")]
+    #[test_case(Target::AllProjects, false ; "all_projects")]
+    fn a_run_held_to_its_project_reaches_no_other(target: Target, reaches: bool) {
+        let mut fixture = fixture(AgentMode::Build);
+        fixture.ctx.config.history_project_only = true;
+        let gateway = fixture.gateway();
+
+        let reply = invoke(&gateway, search(SEARCH_METHOD, fixture.scope(target)));
+
+        match reply {
+            Ok(_) => assert!(reaches),
+            Err(error) => {
+                assert!(!reaches, "{error:?}");
+                assert_eq!(error.message, PROJECT_ONLY);
+            }
+        }
     }
 
     /// A prompt names the call and whose history it reads, and remembers that history rather
