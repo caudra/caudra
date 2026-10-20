@@ -1679,10 +1679,15 @@ impl SkillOutput {
         format!("{}\n{}", self.location, self.body)
     }
 
-    /// Counted over the instructions alone: the location says where they came
-    /// from and is not a line of them.
+    /// Lines are counted over the instructions alone: the location says where
+    /// they came from and is not a line of them. Tokens are counted over what
+    /// the model reads, since that is what the skill costs the context.
     fn annotation(&self) -> String {
-        counted(self.body.lines().count(), LINE_NOUN)
+        format!(
+            "{}{CARD_ANNOTATION_SEPARATOR}{}",
+            counted(self.body.lines().count(), LINE_NOUN),
+            token_label(estimate_tokens_cached(&self.model_text()))
+        )
     }
 }
 
@@ -5062,9 +5067,14 @@ mod tests {
     #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, Some("1 matches in 1 file (capped, 40/900 searched)") ; "grep_capped_reports_how_far_it_got")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
-    #[test_case(skill(), Some("3 lines") ; "skill_counts_its_body_not_its_location")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    #[test]
+    fn a_skill_counts_its_body_lines_and_the_tokens_the_model_reads() {
+        let tokens = token_label(estimate_tokens_cached(SKILL_MODEL_TEXT));
+        assert_eq!(skill().annotation(), Some(format!("3 lines · {tokens}")));
     }
 
     const SUMMARY: &str = "3 runs";
