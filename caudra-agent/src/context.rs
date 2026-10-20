@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use caudra_config::{AgentConfig, CompactionBuffer, ProfileToolPolicy};
+use caudra_providers::calibration;
 use caudra_providers::{
-    ContentBlock, Message, Model, Role, adapt_attachments_for_model, estimate_tokens_cached,
+    ContentBlock, Message, Model, Role, TokenScale, adapt_attachments_for_model,
+    estimate_tokens_cached,
 };
 use serde_json::Value;
 
@@ -570,6 +572,7 @@ impl ContextSnapshot {
             capture.system,
             capture.tools,
             capture.projected_messages,
+            calibration::scale(capture.model),
         );
         let mut inventory = capture.inventory;
         inventory.apply_accounting(&accounting);
@@ -590,13 +593,35 @@ impl ContextSnapshot {
     }
 }
 
+/// The request in `model`'s own tokens, as far as calibration has learned
+/// them.
 pub fn estimate_context_usage(
     model: &Model,
     system: &str,
     tools: &Value,
     projected_messages: &[Message],
 ) -> ContextUsage {
-    account_request(model, system, tools, projected_messages).usage
+    account_request(
+        model,
+        system,
+        tools,
+        projected_messages,
+        calibration::scale(model),
+    )
+    .usage
+}
+
+/// The request as o200k counts it, which is what calibration compares
+/// against what the provider billed.
+pub(crate) fn estimate_unscaled_request(
+    model: &Model,
+    system: &str,
+    tools: &Value,
+    projected_messages: &[Message],
+) -> u32 {
+    account_request(model, system, tools, projected_messages, TokenScale::UNIT)
+        .usage
+        .used()
 }
 
 #[derive(Default)]
@@ -678,6 +703,7 @@ fn account_request(
     system: &str,
     tools: &Value,
     projected_messages: &[Message],
+    scale: TokenScale,
 ) -> RequestAccounting {
     let (system_prompt, memory_prompt_tokens) = account_system(system);
     let tools = account_tools(tools);
@@ -704,6 +730,43 @@ fn account_request(
         skill_results: messages.skill_results,
         builtin_definitions: tools.builtin_definitions,
         system_unattributed: tools.system_unattributed,
+    }
+    .scaled(scale)
+}
+
+impl RequestAccounting {
+    /// Every count in `scale`'s tokens. Applied once to the finished counts,
+    /// so each category is the same o200k estimate the breakdown always was.
+    fn scaled(mut self, scale: TokenScale) -> Self {
+        if scale == TokenScale::UNIT {
+            return self;
+        }
+        let usage = &mut self.usage;
+        for tokens in [
+            &mut usage.system_prompt,
+            &mut usage.system_tools,
+            &mut usage.mcp_tools,
+            &mut usage.profiles,
+            &mut usage.memory,
+            &mut usage.skills,
+            &mut usage.messages,
+            &mut self.memory_definition_tokens,
+            &mut self.memory_prompt_tokens,
+            &mut self.memory_result_tokens,
+            &mut self.skill_definition_tokens,
+            &mut self.skill_result_tokens,
+            &mut self.system_unattributed,
+        ]
+        .into_iter()
+        .chain(self.skill_results.values_mut())
+        .chain(
+            self.builtin_definitions
+                .iter_mut()
+                .map(|definition| &mut definition.tokens),
+        ) {
+            *tokens = scale.apply(*tokens);
+        }
+        self
     }
 }
 
@@ -1047,6 +1110,8 @@ mod tests {
     const CROWDED_EXCESS: u32 = 30;
     const TASK_CONTROL_NAME: &str = "task_control";
     const CONFIG_DISABLED_REASON: &str = "disabled in configuration";
+    const CALIBRATED_CATEGORY_MSG: &str = "each category must be scaled by the model's ratio";
+    const UNSCALED_SAMPLE_MSG: &str = "calibration must compare against the unscaled estimate";
 
     fn model(context_window: u32, window_excludes_output: bool) -> Model {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
@@ -1826,6 +1891,39 @@ mod tests {
         };
         *is_error = false;
         assert!(total > estimate_message_tokens(&messages));
+    }
+
+    /// Every category is billed in the model's own tokens, while calibration
+    /// still compares against the plain o200k count.
+    #[test]
+    fn a_calibrated_model_scales_every_category_but_not_what_it_learns_from() {
+        const RATIO: f64 = 1.5;
+        let model = model(TEST_WINDOW, false);
+        let tools = json!([definition(AVAILABLE_MCP, "fetch an issue")]);
+        let messages = [Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: USER_TEXT.repeat(50),
+            }],
+            ..Message::default()
+        }];
+        let scale = TokenScale::new(RATIO);
+        let unit = account_request(&model, SYSTEM_TEXT, &tools, &messages, TokenScale::UNIT).usage;
+        let scaled = account_request(&model, SYSTEM_TEXT, &tools, &messages, scale).usage;
+
+        for (unit, scaled) in [
+            (unit.system_prompt, scaled.system_prompt),
+            (unit.system_tools, scaled.system_tools),
+            (unit.mcp_tools, scaled.mcp_tools),
+            (unit.messages, scaled.messages),
+        ] {
+            assert_eq!(scaled, scale.apply(unit), "{CALIBRATED_CATEGORY_MSG}");
+        }
+        assert_eq!(
+            estimate_unscaled_request(&model, SYSTEM_TEXT, &tools, &messages),
+            unit.used(),
+            "{UNSCALED_SAMPLE_MSG}"
+        );
     }
 
     #[test]

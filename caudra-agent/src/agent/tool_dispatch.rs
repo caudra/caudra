@@ -38,7 +38,7 @@ use crate::{
     ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolKey, resolve_shell_background};
-use caudra_providers::estimate_tokens_cached;
+use caudra_providers::TokenScale;
 use caudra_storage::decision_log::DecisionEffect;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
 
@@ -697,7 +697,7 @@ pub async fn run(
     };
     if !admitted {
         let took = started.elapsed();
-        account(&mut done, &source, took);
+        account(&mut done, &source, took, ctx.token_scale());
         report(&done, canonical, &source, logged_input, took);
     }
     done
@@ -1212,7 +1212,7 @@ async fn run_inner(
                                 )
                                 .await;
                                 let took = started.elapsed();
-                                account(&mut done, &log_source, took);
+                                account(&mut done, &log_source, took, owned.token_scale());
                                 *owned_report
                                     .0
                                     .lock()
@@ -1875,7 +1875,7 @@ fn git_activity(name: &str, input: &Value) {
 ///
 /// The outcome is whatever the failure's producer stated, never a reading of
 /// the text: a command that printed "timeout" and exited 1 failed on its own.
-fn account(done: &mut ToolDoneEvent, source: &str, took: Duration) {
+fn account(done: &mut ToolDoneEvent, source: &str, took: Duration, scale: TokenScale) {
     let outcome = match done.is_error {
         true => done.accounting.outcome.unwrap_or(LedgerOutcome::Other),
         false => LedgerOutcome::Ok,
@@ -1884,7 +1884,7 @@ fn account(done: &mut ToolDoneEvent, source: &str, took: Duration) {
         duration_ms: took.as_millis() as u64,
         source: Some(Arc::from(source)),
         outcome: Some(outcome),
-        model_tokens: estimate_tokens_cached(&done.composed_model_output()),
+        model_tokens: scale.count(&done.composed_model_output()),
     };
 }
 
@@ -3755,7 +3755,7 @@ mod tests {
         let worker = Arc::clone(waiter.as_ref().unwrap());
         let mut done =
             ToolDoneEvent::error(id.clone(), ERROR_CANCELLED).with_failure(ToolFailure::Cancelled);
-        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO, TokenScale::UNIT);
         if waiter_first {
             drop(waiter.take());
         }
@@ -6165,7 +6165,7 @@ mod telemetry_tests {
         attribute: &str,
     ) {
         let mut done = ToolDoneEvent::error(CALL_ID.into(), FAILURE_TEXT).with_failure(failure);
-        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO, TokenScale::UNIT);
 
         assert_eq!(done.accounting.outcome, Some(outcome));
         assert_eq!(error_type(outcome), Some(attribute));
@@ -6178,7 +6178,7 @@ mod telemetry_tests {
     #[test_case("invalid input: expected a string"; "invalid")]
     fn an_unstated_failure_is_other_whatever_its_text_says(text: &str) {
         let mut done = ToolDoneEvent::error(CALL_ID.into(), text);
-        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO, TokenScale::UNIT);
 
         assert_eq!(done.accounting.outcome, Some(LedgerOutcome::Other));
     }
@@ -6192,7 +6192,7 @@ mod telemetry_tests {
     fn accounting_records_the_outcome_and_what_the_result_costs_the_window() {
         let mut done =
             ToolDoneEvent::error(CALL_ID.into(), FAILURE_TEXT).with_failure(ToolFailure::NotFound);
-        account(&mut done, SOURCE_NATIVE, Duration::from_millis(42));
+        account(&mut done, SOURCE_NATIVE, Duration::from_millis(42), TokenScale::UNIT);
 
         assert_eq!(done.accounting.duration_ms, 42);
         assert_eq!(done.accounting.outcome, Some(LedgerOutcome::NotFound));
@@ -6204,7 +6204,7 @@ mod telemetry_tests {
     fn a_call_that_succeeded_is_accounted_as_such() {
         let mut done = ToolDoneEvent::error(CALL_ID.into(), "");
         done.is_error = false;
-        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO, TokenScale::UNIT);
 
         assert_eq!(done.accounting.outcome, Some(LedgerOutcome::Ok));
         assert_eq!(done.accounting.model_tokens, 0);

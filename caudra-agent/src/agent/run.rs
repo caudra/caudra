@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use caudra_providers::accounts::{self, Reroute};
+use caudra_providers::calibration;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
@@ -39,6 +40,7 @@ use super::history::{
     settle_failed_attempt, user_request,
 };
 use super::instructions::LoadedInstructions;
+use super::measured::{MeasuredContext, SentRequest};
 use super::mention_preamble;
 use super::provider_projection;
 use super::relative_paths::PathBase;
@@ -60,7 +62,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::code::CodeSession;
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
-    ContextSnapshot, estimate_context_usage,
+    ContextSnapshot, estimate_context_usage, estimate_unscaled_request,
 };
 use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
@@ -319,32 +321,6 @@ pub fn resolve_compaction_model(
 enum TurnOutcome {
     Continue,
     Done(DoneReason),
-}
-
-/// The last request the provider billed, and where the transcript stood when it
-/// was sent.
-///
-/// Auto-compaction and the status bar both need one number for how full the
-/// window is, and only the provider can supply it. The estimate is kept for what
-/// it is good at — how much the transcript has *grown* since — which needs no
-/// tokenizer agreement, only that the same counter answers at both ends.
-#[derive(Debug, Clone, Copy)]
-struct MeasuredContext {
-    reported: u32,
-    history_len: usize,
-}
-
-impl MeasuredContext {
-    /// `None` once the transcript is shorter than it was when the count was
-    /// taken: compaction and rollback replace what was billed, so the anchor no
-    /// longer describes anything and would otherwise hold a stale high count.
-    fn extended_by(self, history: &[Message]) -> Option<u32> {
-        let appended = history.get(self.history_len..)?;
-        Some(
-            self.reported
-                .saturating_add(estimate_message_tokens(appended)),
-        )
-    }
 }
 
 #[derive(Clone)]
@@ -2388,7 +2364,7 @@ impl<'h> Agent<'h> {
         let message_id = CaudraId::generate();
         self.event_tx
             .send(AgentEvent::MessageStarted { id: message_id })?;
-        let (stream_result, warm, prefix) = {
+        let (stream_result, warm, prefix, sent) = {
             let tools = &self.tools;
             repair_state.register_definitions(tools);
             let provider_history = self.projected_history(tools);
@@ -2396,6 +2372,21 @@ impl<'h> Agent<'h> {
                 ContextReadiness::CapturedCurrentRequest,
                 provider_history.as_ref(),
             );
+            let sent = SentRequest {
+                estimated: estimate_unscaled_request(
+                    &self.model,
+                    &self.system,
+                    tools,
+                    provider_history.as_ref(),
+                ),
+                prefix: prefix_fingerprint(
+                    &self.model,
+                    &self.system,
+                    tools,
+                    &self.opts.clamped(&self.model),
+                ),
+                epoch: request_epoch,
+            };
             let result = stream_with_retry(
                 &*self.provider,
                 &self.model,
@@ -2439,7 +2430,7 @@ impl<'h> Agent<'h> {
                 .as_ref()
                 .filter(|_| result.is_ok())
                 .map(|_| prefix_fingerprint(&self.model, &self.system, tools, &opts));
-            (result, warm, prefix)
+            (result, warm, prefix, sent)
         };
         self.stream_retry = stream_retry;
         match (&stream_result, &self.cache_warmer) {
@@ -2539,10 +2530,13 @@ impl<'h> Agent<'h> {
         );
 
         if interrupted.is_none() {
-            self.measured = Some(MeasuredContext {
+            let measured = MeasuredContext {
                 reported: response.usage.total_input(),
                 history_len: sent_at_history_len,
-            });
+                sent: Some(sent),
+            };
+            self.calibrate(measured)?;
+            self.measured = Some(measured);
         }
         let usage = response.usage;
         self.total_usage += usage;
@@ -3931,8 +3925,36 @@ impl<'h> Agent<'h> {
     /// billed, extended by everything appended since. `None` before the first
     /// response, when nothing has been billed to anchor on.
     fn context_size(&self) -> Option<u32> {
-        self.measured
-            .and_then(|measured| measured.extended_by(self.history.as_slice()))
+        self.measured.and_then(|measured| {
+            measured.extended_by(self.history.as_slice(), calibration::scale(&self.model))
+        })
+    }
+
+    /// Learns the model's tokenizer from what the provider billed for the
+    /// growth between the last request and this one, when that growth is
+    /// clean enough to measure it.
+    fn calibrate(&self, later: MeasuredContext) -> Result<(), AgentError> {
+        let Some((estimated, reported)) = self
+            .measured
+            .and_then(|earlier| earlier.sample(later, self.history.as_slice()))
+        else {
+            return Ok(());
+        };
+        let Some(learned) = calibration::observe(&self.model, estimated, reported) else {
+            return Ok(());
+        };
+        debug!(
+            provider = %self.model.provider,
+            model = %self.model.id,
+            estimated,
+            reported,
+            ratio = learned.ratio,
+            weight = learned.weight,
+            samples = learned.samples,
+            "token calibration sample"
+        );
+        self.event_tx.send(AgentEvent::TokenCalibration(learned))?;
+        Ok(())
     }
 
     fn request_context_size(&self) -> u32 {
@@ -4830,6 +4852,7 @@ mod tests {
     include!("peer_tests.rs");
     include!("question_nudge_tests.rs");
 
+    use caudra_providers::TokenScale;
     use std::collections::{HashMap, VecDeque};
     use std::slice;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6071,6 +6094,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: before,
                 history_len: agent.history.len(),
+                sent: None,
             });
             assert!(!compaction::is_overflow(
                 &TokenUsage {
@@ -6147,6 +6171,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: before,
                 history_len: agent.history.len(),
+                sent: None,
             });
             let outcome = agent.turn().await;
             if window_excludes_output {
@@ -6221,6 +6246,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: before,
                 history_len: agent.history.len(),
+                sent: None,
             });
             let sent_len = agent.history.len();
             assert!(compaction::is_overflow(
@@ -6357,6 +6383,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: u32::MAX,
                 history_len: 1,
+                sent: None,
             });
             if queued {
                 agent.interrupt_source =
@@ -7280,6 +7307,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: MAIN_REQUEST_USAGE.total_input(),
                 history_len: agent.history.len(),
+                sent: None,
             });
             agent.goal.set(GO).unwrap();
             let context = agent.context_size();
@@ -8651,6 +8679,7 @@ mod tests {
             agent.measured = Some(MeasuredContext {
                 reported: u32::MAX,
                 history_len: agent.history.len(),
+                sent: None,
             });
             if queued {
                 agent.interrupt_source =
@@ -10190,6 +10219,7 @@ mod tests {
             agent.measured = reported.map(|reported| MeasuredContext {
                 reported,
                 history_len: agent.history.len(),
+                sent: None,
             });
             let result = agent.try_auto_compact().await.unwrap();
 
@@ -10210,6 +10240,63 @@ mod tests {
     const GROWTH_UNCOUNTED: &str = "what was appended after the count must be added to it";
     const STALE_ANCHOR_KEPT: &str =
         "an anchor older than the transcript describes messages that no longer exist";
+    const CALIBRATION_MODEL: &str = "calibration-test-model";
+    const CALIBRATION_UNLEARNED: &str =
+        "a tool loop's billed growth must teach the model's ratio and report it for storage";
+
+    #[test]
+    fn a_tool_loop_teaches_the_model_its_tokenizer_ratio() {
+        const ESTIMATED: u32 = 10_000;
+        const GROWTH: u32 = 2_000;
+        const REPORTED: u32 = 12_000;
+        const RATIO: f64 = 1.25;
+        let mut history = History::new(vec![
+            Message::user("read it".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("t1", "file_read", json!({"path": "a"}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "let x = 1;\n".repeat(400),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+        ]);
+        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        Arc::make_mut(&mut agent.model).id = CALIBRATION_MODEL.into();
+        let sent = |estimated| SentRequest {
+            estimated,
+            prefix: 1,
+            epoch: 1,
+        };
+        agent.measured = Some(MeasuredContext {
+            reported: REPORTED,
+            history_len: 1,
+            sent: Some(sent(ESTIMATED)),
+        });
+        agent
+            .calibrate(MeasuredContext {
+                reported: REPORTED + (f64::from(GROWTH) * RATIO) as u32,
+                history_len: 3,
+                sent: Some(sent(ESTIMATED + GROWTH)),
+            })
+            .unwrap();
+        drop(agent);
+
+        let learned = drain_events(&event_rx).into_iter().find_map(|envelope| match envelope.event {
+            AgentEvent::TokenCalibration(learned) => Some(learned),
+            _ => None,
+        });
+        let learned = learned.expect(CALIBRATION_UNLEARNED);
+        assert_eq!(learned.model, CALIBRATION_MODEL, "{CALIBRATION_UNLEARNED}");
+        assert!((learned.ratio - RATIO).abs() < 1e-9, "{CALIBRATION_UNLEARNED}");
+    }
 
     /// The estimate is only ever asked how much was appended, so a transcript it
     /// counts wildly wrong in absolute terms still reports the provider's number.
@@ -10220,10 +10307,11 @@ mod tests {
         let measured = MeasuredContext {
             reported: REPORTED,
             history_len: history.len(),
+            sent: None,
         };
 
         assert_eq!(
-            measured.extended_by(&history),
+            measured.extended_by(&history, TokenScale::UNIT),
             Some(REPORTED),
             "{ANCHOR_IGNORED}"
         );
@@ -10236,9 +10324,10 @@ mod tests {
         let measured = MeasuredContext {
             reported: REPORTED,
             history_len: 1,
+            sent: None,
         };
 
-        let size = measured.extended_by(&history).expect(GROWTH_UNCOUNTED);
+        let size = measured.extended_by(&history, TokenScale::UNIT).expect(GROWTH_UNCOUNTED);
         assert_eq!(
             size,
             REPORTED + estimate_message_tokens(&history[1..]),
@@ -10254,10 +10343,11 @@ mod tests {
         let measured = MeasuredContext {
             reported: 300_000,
             history_len: 4,
+            sent: None,
         };
 
         assert_eq!(
-            measured.extended_by(&[Message::user("summary".into())]),
+            measured.extended_by(&[Message::user("summary".into())], TokenScale::UNIT),
             None,
             "{STALE_ANCHOR_KEPT}"
         );

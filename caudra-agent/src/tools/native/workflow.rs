@@ -594,6 +594,7 @@ fn error(failure: ToolFailure, message: String) -> ToolExecResult {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::TokenScale;
     use std::path::PathBuf;
 
     use caudra_workflow::{LogLine, RunStatus, RunUsage, SourceKind};
@@ -956,7 +957,7 @@ mod tests {
 
     fn row(answer: WorkflowResponse, input: Value) -> Option<String> {
         let ctx = with_runtime(move |_| Ok(answer.clone()));
-        run(input, &ctx).output.ok()?.annotation()
+        run(input, &ctx).output.ok()?.annotation(TokenScale::UNIT)
     }
 
     /// The folded row says what the read found rather than how long it runs.

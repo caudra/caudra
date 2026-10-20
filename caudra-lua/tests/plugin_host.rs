@@ -10,7 +10,7 @@ use caudra_agent::tools::{
     ToolExecResult, ToolFailure, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     test_support::stub_ctx, timeout_annotation,
 };
-use caudra_agent::{AgentMode, CancelToken, ToolOutput, ToolOutputLimits};
+use caudra_agent::{AgentMode, CancelToken, TokenScale, ToolOutput, ToolOutputLimits};
 use caudra_config::{
     AlwaysThinking, Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey,
     ToolOutputLines, TouchMode,
@@ -2996,7 +2996,7 @@ caudra.api.register_tool({{
     )
     .expect("driver ok");
     let streamed = ToolOutput::Plain("stream_done".into())
-        .annotation()
+        .annotation(TokenScale::UNIT)
         .unwrap();
     assert_eq!(
         out,

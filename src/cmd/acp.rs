@@ -184,6 +184,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&storage)
         .context("load model purpose bindings")?;
+    caudra_providers::calibration::load_from_storage(&storage);
     let model_registry_ms = lap();
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());

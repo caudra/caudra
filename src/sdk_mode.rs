@@ -3548,6 +3548,7 @@ impl EventPump {
             | AgentEvent::DecisionSettled(_)
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
+            | AgentEvent::TokenCalibration(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Autopilot(event) => self.emit_autopilot(event)?,
             AgentEvent::AccountRouted {

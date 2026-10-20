@@ -32,7 +32,9 @@ use caudra_agent::{
     ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SourceCodeGraphRow,
     SpanStyle, SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
-use caudra_providers::{PeerAudience, PeerMessageOrigin, estimate_tokens_cached, token_label};
+use caudra_providers::{
+    PeerAudience, PeerMessageOrigin, TokenScale, estimate_tokens_cached, token_label,
+};
 use caudra_storage::background::ShellJobMetadata;
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -707,7 +709,7 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
     for level in 0..depth {
         output = ToolOutput::Batch {
             entries: vec![BatchToolEntry {
-                annotation: output.annotation(),
+                annotation: output.annotation(TokenScale::UNIT),
                 output: Some(output),
                 status: BatchToolStatus::Success,
                 ..running_child(if level == 0 {
@@ -1523,7 +1525,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
 fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: &str) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", tool));
-    let annotation = output.annotation();
+    let annotation = output.annotation(TokenScale::UNIT);
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: tool.into(),
@@ -1577,6 +1579,30 @@ fn tool_done_annotation_merge(output: &str, expected: &str) {
     );
 }
 
+const ARRIVAL_COUNT_KEPT: &str =
+    "a card keeps the token count its result arrived with when the model's scale moves on";
+const SCALED_OUTPUT: &str = "the quick brown fox jumps over the lazy dog\n";
+
+#[test]
+fn a_card_keeps_the_token_count_it_arrived_with() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_token_scale(TokenScale::new(2.0));
+    panel.tool_start(start("t1", SHELL_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        output: ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()),
+        ..done("t1")
+    });
+    let arrived = ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()).annotation(TokenScale::new(2.0));
+    panel.set_token_scale(TokenScale::UNIT);
+    panel.set_view(ViewMode::Expanded);
+    assert_eq!(panel.messages[0].annotation, arrived, "{ARRIVAL_COUNT_KEPT}");
+    assert_ne!(
+        arrived,
+        ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()).annotation(TokenScale::UNIT),
+        "{ARRIVAL_COUNT_KEPT}"
+    );
+}
+
 const WAITING_ANNOTATION: &str = "waiting 1s";
 const CLEARED_ANNOTATION_MSG: &str =
     "an annotation a running call cleared leaves nothing for the result to follow";
@@ -1591,7 +1617,7 @@ fn a_cleared_live_annotation_leaves_the_result_its_own() {
         stdout: "done".into(),
         ..CodeOutput::default()
     });
-    let annotation = output.annotation();
+    let annotation = output.annotation(TokenScale::UNIT);
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: CODE_TOOL_NAME.into(),
@@ -7514,7 +7540,7 @@ fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    let size = done("t1").output.annotation().unwrap();
+    let size = done("t1").output.annotation(TokenScale::UNIT).unwrap();
     assert_eq!(first_line_text(&panel, 0), format!("⌕ Grepped t1 ({size})"));
 }
 
@@ -7586,7 +7612,7 @@ fn an_unknown_tool_falls_back_to_its_registered_name() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    let size = done("t1").output.annotation().unwrap();
+    let size = done("t1").output.annotation(TokenScale::UNIT).unwrap();
     assert_eq!(
         first_line_text(&panel, 0),
         format!("⚙ mystery_tool t1 ({size})")
@@ -7624,7 +7650,7 @@ fn a_read_replaces_its_requested_window_with_the_returned_range() {
         total_lines: 668,
         instructions: None,
     };
-    let size = event.output.annotation().unwrap();
+    let size = event.output.annotation(TokenScale::UNIT).unwrap();
     panel.tool_done(event);
     rebuild(&mut panel);
 

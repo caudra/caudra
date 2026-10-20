@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod calibration;
 mod cassette;
 pub(crate) mod error;
 pub mod history;
@@ -48,7 +49,8 @@ pub use providers::openai::images as openai_images;
 pub use providers::user_agent;
 pub use providers::xai::auth as xai_auth;
 pub use tokens::{
-    estimate_tokens, estimate_tokens_cached, format_hit_rate, format_tokens_u64, token_label,
+    TokenScale, estimate_tokens, estimate_tokens_cached, format_hit_rate, format_tokens_u64,
+    token_label,
 };
 pub use types::{
     AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, CacheKey, ContentBlock,

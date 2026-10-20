@@ -531,6 +531,7 @@ fn storage_error(error: LocalDocumentError) -> ToolError {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::TokenScale;
     use std::borrow::Cow;
     use std::collections::BTreeSet;
     use std::fs;
@@ -1109,7 +1110,7 @@ mod tests {
         let (_root, ctx, path) = local();
         PlanFile::new(path).unwrap().write(content).unwrap();
         let output = run(&ctx, json!({"action":"read"})).output.unwrap();
-        let annotation = output.annotation();
+        let annotation = output.annotation(TokenScale::UNIT);
         match summary {
             Some(summary) => assert_eq!(annotation.as_deref(), Some(summary)),
             None => assert_ne!(annotation.as_deref(), Some(EMPTY_PLAN)),

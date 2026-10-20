@@ -48,6 +48,8 @@ pub mod shell_history;
 pub mod state;
 pub mod theme;
 pub mod thinking;
+#[path = "sessions/token_calibration.rs"]
+pub mod token_calibration;
 pub mod tool_ledger;
 pub mod tool_outputs;
 pub mod topics;

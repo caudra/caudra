@@ -33,6 +33,7 @@ use caudra_agent::tools::{
     timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
+use caudra_providers::TokenScale;
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, McpHelper,
@@ -1190,6 +1191,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 entry,
                 limits.progress.get(&index),
                 limits.models.get(&index).map(String::as_str),
+                limits.token_scale,
             )
             .as_deref(),
             workdir,
@@ -1500,6 +1502,7 @@ fn child_annotation(
     entry: &BatchToolEntry,
     progress: Option<&ToolProgress>,
     model: Option<&str>,
+    scale: TokenScale,
 ) -> Option<String> {
     let own = match entry.output.as_ref() {
         Some(ToolOutput::Peers(output)) => Some(output.annotation()),
@@ -1507,7 +1510,10 @@ fn child_annotation(
     }
     .or_else(|| match entry.status {
         BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
-        BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
+        BatchToolStatus::Success => entry
+            .output
+            .as_ref()
+            .and_then(|output| output.annotation(scale)),
         BatchToolStatus::Drafting
         | BatchToolStatus::AwaitingApproval
         | BatchToolStatus::Running
@@ -3482,6 +3488,9 @@ pub struct RenderLimits {
     /// What the decision engine decided about each child, by index in the
     /// roster.
     pub decisions: ChildDecisions,
+    /// What one estimated token is worth on the model reading the children's
+    /// results, for a child whose row carries no annotation of its own.
+    pub token_scale: TokenScale,
 }
 
 impl RenderLimits {
@@ -3502,6 +3511,14 @@ impl RenderLimits {
             cwd: None,
             stands_in: Arc::default(),
             decisions: ChildDecisions::default(),
+            token_scale: TokenScale::UNIT,
+        }
+    }
+
+    pub fn with_token_scale(self, token_scale: TokenScale) -> Self {
+        Self {
+            token_scale,
+            ..self
         }
     }
 
@@ -3666,6 +3683,7 @@ impl RenderLimits {
             cwd: self.cwd.clone(),
             stands_in: Arc::default(),
             decisions: ChildDecisions::default(),
+            token_scale: self.token_scale,
         })
     }
 }

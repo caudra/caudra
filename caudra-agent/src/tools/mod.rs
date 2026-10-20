@@ -61,8 +61,9 @@ use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
 };
 use caudra_config::{Feature, FeatureFlags, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
-use caudra_providers::Model;
 use caudra_providers::RequestOptions;
+use caudra_providers::calibration;
+use caudra_providers::{Model, TokenScale};
 use caudra_providers::provider::Provider;
 use caudra_storage::StateDir;
 use caudra_storage::accounts::{StoredSecret, list_accounts};
@@ -620,6 +621,12 @@ impl ToolContext {
         self.jobs
             .clone()
             .or_else(|| self.background.as_ref().map(|tasks| tasks.main_scope()))
+    }
+
+    /// What one estimated token is worth on the model that will read this
+    /// call's result.
+    pub fn token_scale(&self) -> TokenScale {
+        calibration::scale(&self.model)
     }
 
     /// The plan this context's tools act on and its children inherit: the

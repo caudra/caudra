@@ -41,9 +41,10 @@ use caudra_agent::{
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
+use caudra_providers::calibration;
 use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, CaudraId, HistoryItem, HistoryItemKind,
-    SteeringKind, SteeringOrigin, UserOrigin,
+    ReasoningSource, SteeringKind, SteeringOrigin, TokenScale, UserOrigin,
 };
 use caudra_storage::engine_decisions::{StoredDecisionAnchor, StoredEngineDecision};
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -291,7 +292,7 @@ impl Chat {
                         .as_deref()
                         .is_some_and(|annotation| annotation.starts_with(plan::WRITE_RESULT_PREFIX))
                 {
-                    e.annotation = e.output.annotation();
+                    e.annotation = e.output.annotation(self.messages_panel.token_scale());
                 }
                 let is_full_write = &*e.tool == FILE_WRITE_TOOL_NAME;
                 let tool_id = e.id.clone();
@@ -327,7 +328,8 @@ impl Chat {
             }
             AgentEvent::ModelUsage { .. }
             | AgentEvent::CacheWarmEpisode(_)
-            | AgentEvent::CacheHitSamples(_) => {}
+            | AgentEvent::CacheHitSamples(_)
+            | AgentEvent::TokenCalibration(_) => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalEvaluation { .. }
@@ -956,6 +958,11 @@ impl Chat {
             .leave_stage(tool_id, CallStage::AwaitingApproval);
     }
 
+    /// The scale results arriving from now on are counted in.
+    pub fn set_token_scale(&mut self, scale: TokenScale) {
+        self.messages_panel.set_token_scale(scale);
+    }
+
     pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.set_tool_model(tool_id, model);
     }
@@ -1453,6 +1460,7 @@ pub fn interleaved_history_to_display(
                 call_id,
                 name,
                 input,
+                source,
                 ..
             } => {
                 let static_name = name.as_str();
@@ -1495,6 +1503,7 @@ pub fn interleaved_history_to_display(
                     reconstructed.clone(),
                     result_text,
                     tool_output_lines,
+                    source.as_ref(),
                 );
                 if let Some(tool_annotation) = tool_call
                     .as_deref()
@@ -1718,22 +1727,29 @@ fn restored_answers(output: Arc<ToolOutput>, input: &serde_json::Value) -> Arc<T
 
 /// Mirrors the live `tool_done` path so restored sessions
 /// look the same as streamed ones.
+///
+/// Counted in the current scale of the model that made the call, which is the
+/// one that read its result.
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
     reconstructed: Option<Arc<ToolOutput>>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
+    caller: Option<&ReasoningSource>,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
+    let scale = caller.map_or(TokenScale::UNIT, |caller| {
+        calibration::scale_of(&caller.provider, &caller.model)
+    });
     match reconstructed {
         Some(output) => {
-            let annotation = output.annotation();
+            let annotation = output.annotation(scale);
             (summary.to_owned(), 0, Some(output), annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
             let annotation = if !result.is_empty() {
-                ToolOutput::Plain(result.into()).annotation()
+                ToolOutput::Plain(result.into()).annotation(scale)
             } else {
                 None
             };
@@ -1799,9 +1815,9 @@ mod tests {
     use caudra_config::decisions::FeatureMode;
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
-        AutopilotOrigin, Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
-        StandingReminderKind, TaskEventOrigin, estimate_tokens_cached, project_messages,
-        token_label,
+        AutopilotOrigin, Billing, ContentBlock, Message, Model, PeerAudience, PeerMessageOrigin,
+        ReasoningTransport, Role, StandingReminderKind, TaskEventOrigin, estimate_tokens_cached,
+        project_messages, token_label,
     };
     use caudra_storage::engine_decisions::StoredDecisionOutcome;
     use caudra_workspace::PlanRef;
@@ -2471,7 +2487,7 @@ mod tests {
             instructions: None,
             state: Some(serde_json::json!({"kind": "file"})),
         });
-        let annotation = output.annotation();
+        let annotation = output.annotation(TokenScale::UNIT);
         let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
 
         let (display, restores) = display_messages(&messages, &outputs);
@@ -4379,6 +4395,43 @@ mod tests {
         assert_eq!(
             stored_decision_row(&row).text,
             format!("{title}{DECISION_SEPARATOR}{DECISION_SUMMARY}")
+        );
+    }
+
+    const CALIBRATED_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
+    /// A model id no other test learns about, since the registry is
+    /// process-wide.
+    const CALIBRATED_MODEL_ID: &str = "restored-card-calibration";
+    const CALIBRATED_ESTIMATE: u32 = 1_000;
+    const CALIBRATED_REPORTED: u32 = 1_500;
+    const RESTORED_SCALE_MSG: &str = "a restored card counts at its caller model's current ratio";
+
+    #[test]
+    fn a_restored_card_counts_at_its_callers_current_ratio() {
+        let mut model = Model::from_spec(CALIBRATED_MODEL_SPEC).unwrap();
+        model.id = CALIBRATED_MODEL_ID.into();
+        calibration::observe(&model, CALIBRATED_ESTIMATE, CALIBRATED_REPORTED).unwrap();
+        let caller = ReasoningSource::new(&model, ReasoningTransport::Other);
+        let output = Arc::new(ToolOutput::Plain("the quick brown fox\n".repeat(50).into()));
+
+        let (_, _, _, annotation) = build_loaded_tool(
+            SHELL_TOOL_NAME,
+            "",
+            Some(Arc::clone(&output)),
+            None,
+            &ToolOutputLines::default(),
+            Some(&caller),
+        );
+
+        assert_eq!(
+            annotation,
+            output.annotation(calibration::scale(&model)),
+            "{RESTORED_SCALE_MSG}"
+        );
+        assert_ne!(
+            annotation,
+            output.annotation(TokenScale::UNIT),
+            "{RESTORED_SCALE_MSG}"
         );
     }
 }

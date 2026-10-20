@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use caudra_providers::{estimate_tokens_cached, token_label};
+use caudra_providers::TokenScale;
 
 use super::elicitation::ElicitAction;
 use super::kind::McpServerKind;
@@ -197,7 +197,7 @@ impl McpOutput {
 
     /// `JSON · 12 lines · 1 image`: what kind of text came back, how much of
     /// it, and what else came with it.
-    pub fn annotation(&self) -> Option<String> {
+    pub fn annotation(&self, scale: TokenScale) -> Option<String> {
         let bodies: Vec<(String, bool)> = self.blocks.iter().filter_map(McpBlock::body).collect();
         let lines: usize = bodies.iter().map(|(body, _)| body.lines().count()).sum();
         let mut parts = Vec::new();
@@ -209,7 +209,7 @@ impl McpOutput {
         }
         let model_text = self.model_text();
         if !model_text.is_empty() {
-            parts.push(token_label(estimate_tokens_cached(&model_text)));
+            parts.push(scale.label(&model_text));
         }
         for (noun, count) in [
             (
@@ -371,6 +371,7 @@ pub fn mcp_tool_parts(name: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_providers::{estimate_tokens_cached, token_label};
     use serde_json::json;
     use test_case::test_case;
 
@@ -447,7 +448,7 @@ mod tests {
         let output = McpOutput::from_result(result(raw));
         let tokens = token_label(estimate_tokens_cached(&output.model_text()));
         assert_eq!(
-            output.annotation(),
+            output.annotation(TokenScale::UNIT),
             expected.map(|expected| expected.replace("{tokens}", &tokens))
         );
     }

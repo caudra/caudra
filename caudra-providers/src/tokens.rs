@@ -105,6 +105,43 @@ pub fn estimate_tokens_cached(text: &str) -> u32 {
     count
 }
 
+/// What one o200k token is worth on a given model, learned by
+/// [`crate::calibration`] from what its provider billed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenScale(f64);
+
+impl TokenScale {
+    /// The estimate as o200k counts it, for a model nothing has been learned
+    /// about and for the learning itself.
+    pub const UNIT: Self = Self(1.0);
+
+    pub const fn new(ratio: f64) -> Self {
+        Self(ratio)
+    }
+
+    pub fn apply(self, tokens: u32) -> u32 {
+        if self == Self::UNIT {
+            return tokens;
+        }
+        (f64::from(tokens) * self.0).round().min(f64::from(u32::MAX)) as u32
+    }
+
+    /// [`estimate_tokens_cached`] in this model's tokens.
+    pub fn count(self, text: &str) -> u32 {
+        self.apply(estimate_tokens_cached(text))
+    }
+
+    pub fn label(self, text: &str) -> String {
+        token_label(self.count(text))
+    }
+}
+
+impl Default for TokenScale {
+    fn default() -> Self {
+        Self::UNIT
+    }
+}
+
 /// Renders a count for display. The marker is not decoration: every count this
 /// module produces is an estimate for any model outside the GPT-4o/5 family.
 pub fn token_label(tokens: u32) -> String {
@@ -136,12 +173,13 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CACHE_CAPACITY, NO_RATE, cut_middle, estimate_tokens, estimate_tokens_cached,
+        CACHE_CAPACITY, NO_RATE, TokenScale, cut_middle, estimate_tokens, estimate_tokens_cached,
         format_hit_rate, format_tokens_u64, token_label,
     };
 
     const HEAD: u32 = 8;
     const TAIL: u32 = 12;
+    const PROSE: &str = "The quick brown fox jumps over the lazy dog.";
 
     #[test_case(None, NO_RATE ; "nothing_to_score_is_not_a_zero_hit")]
     #[test_case(Some(0.0), "0%" ; "a_real_zero_is_a_number")]
@@ -164,6 +202,22 @@ mod tests {
     #[test_case(2, "~2 tokens" ; "two")]
     fn token_labels_agree_with_their_count(tokens: u32, expected: &str) {
         assert_eq!(token_label(tokens), expected);
+    }
+
+    #[test_case(TokenScale::UNIT, 10, 10 ; "unit_keeps_the_estimate")]
+    #[test_case(TokenScale::new(1.25), 10, 13 ; "rounds_half_up")]
+    #[test_case(TokenScale::new(0.5), 3, 2 ; "halves_and_rounds")]
+    #[test_case(TokenScale::new(2.0), u32::MAX, u32::MAX ; "saturates")]
+    fn a_scale_applies_its_ratio(scale: TokenScale, tokens: u32, expected: u32) {
+        assert_eq!(scale.apply(tokens), expected);
+    }
+
+    #[test]
+    fn a_scaled_count_scales_the_estimate() {
+        assert_eq!(
+            TokenScale::new(2.0).count(PROSE),
+            estimate_tokens(PROSE) * 2
+        );
     }
 
     #[test_case("", 0 ; "empty_text_costs_nothing")]

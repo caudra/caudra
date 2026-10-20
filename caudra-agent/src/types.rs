@@ -11,7 +11,7 @@ use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, Reroute, Rout
 use caudra_providers::{
     AgentError, AutomationEventOrigin, AutopilotOrigin, Billing, ContentBlock, DocumentSource,
     ImageSource, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerMessageOrigin, Role,
-    StopReason, TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
+    StopReason, TaskEventOrigin, TokenScale, TokenUsage, token_label,
 };
 use caudra_storage::autopilot::AutopilotEnd;
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
@@ -19,6 +19,7 @@ use caudra_storage::cache_warming::{CacheWarmEpisode, HitSamples};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::UnrecordedCall;
+use caudra_storage::token_calibration::StoredCalibration;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -714,7 +715,7 @@ impl TextOutput {
 
     /// Keyed on the stored state rather than the tool name, so a reopened
     /// session sizes the card the same way the live run did.
-    fn size_label(&self) -> String {
+    fn size_label(&self, scale: TokenScale) -> String {
         if let Some(summary) = self.summary() {
             return summary.to_owned();
         }
@@ -727,26 +728,28 @@ impl TextOutput {
             Some(TOOL_OUTPUT_TOOL_NAME) => format!(
                 "{}{CARD_ANNOTATION_SEPARATOR}{} {TOOL_OUTPUT_LOADED}",
                 counted(self.text.lines().count(), LINE_NOUN),
-                token_label(estimate_tokens_cached(&self.text))
+                scale.label(&self.text)
             ),
-            Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => {
-                token_label(estimate_tokens_cached(&self.text))
-            }
-            _ => with_context_tokens(counted(self.text.lines().count(), LINE_NOUN), &self.text),
+            Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => scale.label(&self.text),
+            _ => with_context_tokens(
+                counted(self.text.lines().count(), LINE_NOUN),
+                &self.text,
+                scale,
+            ),
         }
     }
 }
 
 /// About how many tokens the model reads in `model_text`, or `None` when it
 /// reads nothing there.
-fn context_tokens(model_text: &str) -> Option<String> {
-    (!model_text.trim().is_empty()).then(|| token_label(estimate_tokens_cached(model_text)))
+fn context_tokens(model_text: &str, scale: TokenScale) -> Option<String> {
+    (!model_text.trim().is_empty()).then(|| scale.label(model_text))
 }
 
 /// `label · ~N tokens`: what a result holds, then about what it costs the
 /// context. A label for text the model reads nothing of stands alone.
-pub fn with_context_tokens(label: String, model_text: &str) -> String {
-    match context_tokens(model_text) {
+pub fn with_context_tokens(label: String, model_text: &str, scale: TokenScale) -> String {
+    match context_tokens(model_text, scale) {
         Some(tokens) => format!("{label}{CARD_ANNOTATION_SEPARATOR}{tokens}"),
         None => label,
     }
@@ -1707,10 +1710,11 @@ impl SkillOutput {
     /// Lines are counted over the instructions alone: the location says where
     /// they came from and is not a line of them. Tokens are counted over what
     /// the model reads, since that is what the skill costs the context.
-    fn annotation(&self) -> String {
+    fn annotation(&self, scale: TokenScale) -> String {
         with_context_tokens(
             counted(self.body.lines().count(), LINE_NOUN),
             &self.model_text(),
+            scale,
         )
     }
 }
@@ -2245,7 +2249,7 @@ impl ToolOutput {
     /// Short header suffix summarizing the output, e.g. `12 lines`.
     /// The UI uses it on tool completion, and `caudra.agent.call_tool` falls
     /// back to it when the tool's reply has no annotation of its own.
-    pub fn annotation(&self) -> Option<String> {
+    pub fn annotation(&self, scale: TokenScale) -> Option<String> {
         match self {
             Self::ReadCode {
                 start_line,
@@ -2267,7 +2271,7 @@ impl ToolOutput {
                 };
                 Some(match shown {
                     0 => label,
-                    _ => with_context_tokens(label, &self.as_display_text()),
+                    _ => with_context_tokens(label, &self.as_display_text(), scale),
                 })
             }
             Self::WriteCode {
@@ -2289,15 +2293,16 @@ impl ToolOutput {
                     ),
                     None => format!("{matches} matches in {files} {f}"),
                 };
-                Some(with_context_tokens(label, &self.as_display_text()))
+                Some(with_context_tokens(label, &self.as_display_text(), scale))
             }
             Self::ReadDir(t) => {
                 let n = t.text.lines().count();
-                Some(with_context_tokens(format!("{n} entries"), &t.text))
+                Some(with_context_tokens(format!("{n} entries"), &t.text, scale))
             }
             Self::Index(IndexOutput::File { lines, .. }) => Some(with_context_tokens(
                 counted(lines.len(), LINE_NOUN),
                 &self.as_display_text(),
+                scale,
             )),
             Self::Index(IndexOutput::Directory {
                 total_count,
@@ -2309,11 +2314,11 @@ impl ToolOutput {
                 } else {
                     format!("{total_count} entries")
                 };
-                Some(with_context_tokens(label, &self.as_display_text()))
+                Some(with_context_tokens(label, &self.as_display_text(), scale))
             }
             Self::Memory(output) => Some(output.annotation()),
             Self::Peers(output) => Some(output.annotation()),
-            Self::Skill(skill) => Some(skill.annotation()),
+            Self::Skill(skill) => Some(skill.annotation(scale)),
             Self::Shell(output) => {
                 let label = if output.timed_out {
                     "timed out".into()
@@ -2326,12 +2331,12 @@ impl ToolOutput {
                 } else {
                     "exit unknown".into()
                 };
-                Some(with_context_tokens(label, &output.model_text))
+                Some(with_context_tokens(label, &output.model_text, scale))
             }
             Self::Plain(text) | Self::Markdown(text)
                 if !text.text.is_empty() || text.summary().is_some() =>
             {
-                Some(text.size_label())
+                Some(text.size_label(scale))
             }
             Self::Image { text, .. } => Some(
                 text.strip_prefix("[image: ")
@@ -2346,20 +2351,22 @@ impl ToolOutput {
                     _ => counted(cards.len(), TASK_NOUN),
                 };
                 Some(match cards.iter().any(|card| card.result.is_some()) {
-                    true => with_context_tokens(label, &self.as_text()),
+                    true => with_context_tokens(label, &self.as_text(), scale),
                     false => label,
                 })
             }
             Self::Environment { headline, .. } => Some(headline.clone()),
-            Self::Mcp(output) => output.annotation(),
-            Self::Code(output) => match (output.annotation(), context_tokens(&output.model_text()))
-            {
+            Self::Mcp(output) => output.annotation(scale),
+            Self::Code(output) => match (
+                output.annotation(),
+                context_tokens(&output.model_text(), scale),
+            ) {
                 (Some(calls), Some(tokens)) => {
                     Some(format!("{calls}{CARD_ANNOTATION_SEPARATOR}{tokens}"))
                 }
                 (calls, tokens) => calls.or(tokens),
             },
-            Self::SourceCodeGraph { .. } => context_tokens(&self.as_display_text()),
+            Self::SourceCodeGraph { .. } => context_tokens(&self.as_display_text(), scale),
             _ => None,
         }
     }
@@ -3198,6 +3205,8 @@ pub enum AgentEvent {
     CacheWarmEpisode(Box<CacheWarmEpisode>),
     /// Request pairs inside the cache lifetime, and how many of them hit.
     CacheHitSamples(Vec<HitSamples>),
+    /// A model's tokenizer ratio after a sample moved it, for the store.
+    TokenCalibration(StoredCalibration),
     ToolResultsSubmitted {
         message: Box<Message>,
     },
@@ -4158,7 +4167,7 @@ pub struct Envelope {
 mod tests {
     use super::*;
     use caudra_config::InboundPolicy;
-    use caudra_providers::{PeerAudience, estimate_tokens};
+    use caudra_providers::{PeerAudience, estimate_tokens, estimate_tokens_cached};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::tool_outputs::ToolOutputStore;
@@ -4335,7 +4344,10 @@ mod tests {
         };
 
         assert_eq!(output.as_text(), ENVIRONMENT_TEXT);
-        assert_eq!(output.annotation().as_deref(), Some(ENVIRONMENT_HEADLINE));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(ENVIRONMENT_HEADLINE)
+        );
     }
 
     const MEMORY_DIRECTORY: &str = "/notes";
@@ -4365,7 +4377,7 @@ mod tests {
         });
 
         assert_eq!(
-            output.annotation().as_deref(),
+            output.annotation(TokenScale::UNIT).as_deref(),
             Some(format!("2 notes{CARD_ANNOTATION_SEPARATOR}{}", token_label(1_000)).as_str())
         );
     }
@@ -4397,7 +4409,7 @@ mod tests {
         });
 
         assert_eq!(
-            output.annotation().as_deref(),
+            output.annotation(TokenScale::UNIT).as_deref(),
             Some(format!("1 note{CARD_ANNOTATION_SEPARATOR}2 tags").as_str())
         );
     }
@@ -4439,7 +4451,10 @@ mod tests {
         let restored: ToolOutput = serde_json::from_str(&stored).expect("and loads back");
 
         assert_eq!(restored.as_text(), output.as_text());
-        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT),
+            output.annotation(TokenScale::UNIT)
+        );
     }
 
     /// A remote note has no path to name, so the reference and revision that
@@ -4490,7 +4505,7 @@ mod tests {
             )
         );
         assert_eq!(
-            restored.annotation().as_deref(),
+            restored.annotation(TokenScale::UNIT).as_deref(),
             Some(format!("1 note{CARD_ANNOTATION_SEPARATOR}1 tag").as_str())
         );
     }
@@ -4529,7 +4544,7 @@ mod tests {
             )
         );
         assert_eq!(
-            output.annotation().as_deref(),
+            output.annotation(TokenScale::UNIT).as_deref(),
             Some(format!("2 lines{CARD_ANNOTATION_SEPARATOR}1 {MEMORY_PENDING_LABEL}").as_str())
         );
     }
@@ -4570,7 +4585,10 @@ mod tests {
                  {MEMORY_HIT_BULLET}3+1 ci.md"
             )
         );
-        assert_eq!(output.annotation().as_deref(), Some("2 notes"));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some("2 notes")
+        );
     }
 
     /// An answer with no rows is only what qualifies it: a heading over
@@ -4595,7 +4613,10 @@ mod tests {
         let restored: ToolOutput = serde_json::from_str(&stored).expect("and loads back");
 
         assert_eq!(restored.as_text(), output.as_text());
-        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT),
+            output.annotation(TokenScale::UNIT)
+        );
     }
 
     const PEER_TARGET: &str = "calm-quick-fox-kind-brave-owl";
@@ -4696,7 +4717,10 @@ mod tests {
             assert_eq!(session["broadcasts"], true);
             assert_eq!(session.as_object().unwrap().len(), 8);
         }
-        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(annotation)
+        );
         assert_eq!(output.is_empty_result(), count == 0);
         assert_ne!(output.as_text(), output.as_display_text());
         let display = output.as_display_text();
@@ -4784,7 +4808,10 @@ mod tests {
                 "reason": null,
             })
         );
-        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(annotation)
+        );
         assert!(!output.is_empty_result());
         if let Some(note) = note {
             assert!(output.as_display_text().contains(note));
@@ -4817,7 +4844,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             statuses
         );
-        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(annotation)
+        );
         let display = output.as_display_text();
         assert!(display.contains(&format!("Audience: topic {PEER_TOPIC}")));
         for note in [PEER_RECEIPT_ACCEPTED, PEER_RECEIPT_UNKNOWN] {
@@ -4881,7 +4911,10 @@ mod tests {
                 &json!({"topic": PEER_TOPIC, "messages": count, "last": PEER_SENT_UTC})
             );
         }
-        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(annotation)
+        );
         assert_eq!(output.is_empty_result(), count == 0);
         let display = output.as_display_text();
         assert_eq!(display == PEER_TOPICS_EMPTY, count == 0);
@@ -4919,7 +4952,10 @@ mod tests {
                 })
             );
         }
-        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(annotation)
+        );
         let empty = shown == 0 && withheld == 0;
         assert_eq!(output.is_empty_result(), empty);
         let display = output.as_display_text();
@@ -4961,7 +4997,10 @@ mod tests {
         let restored: ToolOutput = serde_json::from_str(&stored).unwrap();
         assert!(matches!(restored, ToolOutput::Peers(_)));
         assert_eq!(restored.as_text(), output.as_text());
-        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT),
+            output.annotation(TokenScale::UNIT)
+        );
         assert_eq!(
             restored.structured_display_text(),
             Some(output.as_display_text())
@@ -5111,7 +5150,7 @@ mod tests {
             "stdout tail:\nraw stdout\nstderr tail:\nraw stderr"
         );
         assert_eq!(
-            output.annotation(),
+            output.annotation(TokenScale::UNIT),
             Some(format!(
                 "exit 0{CARD_ANNOTATION_SEPARATOR}{}",
                 token_label(estimate_tokens_cached(&output.as_text()))
@@ -5130,7 +5169,7 @@ mod tests {
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
-        assert_eq!(output.annotation().as_deref(), expected);
+        assert_eq!(output.annotation(TokenScale::UNIT).as_deref(), expected);
     }
 
     const CONTEXT_TOKENS_MSG: &str =
@@ -5149,8 +5188,21 @@ mod tests {
     fn a_result_the_model_reads_adds_its_tokens(output: ToolOutput, label: &str) {
         let tokens = token_label(estimate_tokens_cached(&output.as_display_text()));
         assert_eq!(
-            output.annotation(),
+            output.annotation(TokenScale::UNIT),
             Some(format!("{label}{CARD_ANNOTATION_SEPARATOR}{tokens}")),
+            "{CONTEXT_TOKENS_MSG}"
+        );
+    }
+
+    #[test_case(0.5 ; "a_model_that_counts_fewer_tokens")]
+    #[test_case(1.5 ; "a_model_that_counts_more_tokens")]
+    fn a_result_counts_its_tokens_at_the_models_scale(ratio: f64) {
+        let output = ToolOutput::ReadDir("a.rs\nb.rs\n".repeat(200).into());
+        let scale = TokenScale::new(ratio);
+        let tokens = token_label(scale.apply(estimate_tokens_cached(&output.as_display_text())));
+        assert_eq!(
+            output.annotation(scale),
+            Some(format!("400 entries{CARD_ANNOTATION_SEPARATOR}{tokens}")),
             "{CONTEXT_TOKENS_MSG}"
         );
     }
@@ -5171,8 +5223,8 @@ mod tests {
             content: "Never push. ".repeat(100),
         }]));
         assert_eq!(
-            loaded.annotation(),
-            read(None).annotation(),
+            loaded.annotation(TokenScale::UNIT),
+            read(None).annotation(TokenScale::UNIT),
             "{CONTEXT_TOKENS_MSG}"
         );
     }
@@ -5180,7 +5232,10 @@ mod tests {
     #[test]
     fn a_skill_counts_its_body_lines_and_the_tokens_the_model_reads() {
         let tokens = token_label(estimate_tokens_cached(SKILL_MODEL_TEXT));
-        assert_eq!(skill().annotation(), Some(format!("3 lines · {tokens}")));
+        assert_eq!(
+            skill().annotation(TokenScale::UNIT),
+            Some(format!("3 lines · {tokens}"))
+        );
     }
 
     const SUMMARY: &str = "3 runs";
@@ -5195,8 +5250,14 @@ mod tests {
         let output = ToolOutput::Plain(TextOutput::summarized(text, SUMMARY.to_owned()));
         let restored: ToolOutput =
             serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
-        assert_eq!(output.annotation().as_deref(), Some(SUMMARY));
-        assert_eq!(restored.annotation().as_deref(), Some(SUMMARY));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(SUMMARY)
+        );
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT).as_deref(),
+            Some(SUMMARY)
+        );
     }
 
     fn task(state: &str) -> TaskCard {
@@ -5214,7 +5275,9 @@ mod tests {
     #[test_case(Vec::new(), "0 tasks" ; "an_empty_listing_says_so")]
     fn a_task_row_says_what_it_found(cards: Vec<TaskCard>, expected: &str) {
         assert_eq!(
-            ToolOutput::Tasks(cards).annotation().as_deref(),
+            ToolOutput::Tasks(cards)
+                .annotation(TokenScale::UNIT)
+                .as_deref(),
             Some(expected)
         );
     }
@@ -5225,10 +5288,11 @@ mod tests {
         card.result = Some(json!({ "output": WEB_RESULT }));
         let output = ToolOutput::Tasks(vec![card]);
         assert_eq!(
-            output.annotation(),
+            output.annotation(TokenScale::UNIT),
             Some(with_context_tokens(
                 DONE_STATE.to_owned(),
-                &output.as_text()
+                &output.as_text(),
+                TokenScale::UNIT
             )),
             "{CONTEXT_TOKENS_MSG}"
         );
@@ -5258,7 +5322,7 @@ mod tests {
             None => tokens,
         };
         assert_eq!(
-            ToolOutput::Code(code).annotation(),
+            ToolOutput::Code(code).annotation(TokenScale::UNIT),
             Some(expected),
             "{CONTEXT_TOKENS_MSG}"
         );
@@ -5280,10 +5344,16 @@ mod tests {
             "{lines}{CARD_ANNOTATION_SEPARATOR}{} {TOOL_OUTPUT_LOADED}",
             token_label(estimate_tokens(text))
         );
-        assert_eq!(output.annotation().as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            output.annotation(TokenScale::UNIT).as_deref(),
+            Some(expected.as_str())
+        );
         let restored: ToolOutput =
             serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
-        assert_eq!(restored.annotation().as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT).as_deref(),
+            Some(expected.as_str())
+        );
         assert_eq!(restored.as_text(), text);
     }
 
@@ -5302,7 +5372,7 @@ mod tests {
     ) {
         let output = variant(TextOutput::of_kind(WEB_RESULT, kind));
 
-        assert_eq!(output.annotation(), Some(expected));
+        assert_eq!(output.annotation(TokenScale::UNIT), Some(expected));
     }
 
     #[test]
@@ -5319,7 +5389,7 @@ mod tests {
         });
 
         assert_eq!(
-            output.annotation().as_deref(),
+            output.annotation(TokenScale::UNIT).as_deref(),
             Some("at least 10000 entries")
         );
     }

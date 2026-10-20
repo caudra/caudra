@@ -32,7 +32,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use caudra_markdown::render::truncate_long_lines;
-use caudra_providers::{estimate_tokens_cached, token_label};
+use caudra_providers::{TokenScale, token_label};
 
 use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
@@ -183,6 +183,7 @@ pub struct RenderCtx<'a> {
     pub cwd: Option<Arc<Path>>,
     /// Whether the card draws what the engine decided about its call.
     pub show_decisions: bool,
+    pub token_scale: TokenScale,
 }
 
 impl RenderCtx<'_> {
@@ -214,6 +215,7 @@ impl RenderCtx<'_> {
             .with_models(models)
             .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
             .with_cwd(self.cwd.clone())
+            .with_token_scale(self.token_scale)
     }
 
     /// Whether this call is drawn as a fixed-height scroller rather than
@@ -3500,13 +3502,14 @@ pub fn build_instructions_lines(
     blocks: &[InstructionBlock],
     width: u16,
     expanded: Option<bool>,
+    scale: TokenScale,
 ) -> ToolLines {
     if expanded.is_none() {
-        return compact_instruction_lines(blocks);
+        return compact_instruction_lines(blocks, scale);
     }
     let expanded = expanded.unwrap_or_default();
     let header = blocks.first().map_or("", |b| b.path.as_str());
-    let tokens = token_label(blocks.iter().map(instruction_tokens).sum());
+    let tokens = token_label(blocks.iter().map(|block| scale.count(&block.content)).sum());
     let annotation = Some(match blocks.len() {
         0 | 1 => tokens,
         more => format!("+{}{FOOTER_SEPARATOR}{tokens}", more - 1),
@@ -3549,22 +3552,15 @@ pub fn build_instructions_lines(
     b.finish(None, Some(output))
 }
 
-/// What an instruction file costs the context: its text rides along with the
-/// result that loaded it.
-fn instruction_tokens(block: &InstructionBlock) -> u32 {
-    estimate_tokens_cached(&block.content)
-}
-
-fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
+/// An instruction file's text rides along with the result that loaded it, so
+/// each row says what it costs the context.
+fn compact_instruction_lines(blocks: &[InstructionBlock], scale: TokenScale) -> ToolLines {
     let style = theme::current().tool_dim;
     let path_style = theme::current().tool_path;
     let mut lines = Vec::with_capacity(blocks.len());
     let mut search_text = String::new();
     for block in blocks {
-        let tokens = format!(
-            "{FOOTER_SEPARATOR}{}",
-            token_label(instruction_tokens(block))
-        );
+        let tokens = format!("{FOOTER_SEPARATOR}{}", scale.label(&block.content));
         if !search_text.is_empty() {
             search_text.push('\n');
         }
@@ -3597,6 +3593,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_providers::estimate_tokens_cached;
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
@@ -3657,6 +3654,7 @@ mod tests {
             task_cards: None,
             cwd: None,
             show_decisions: true,
+            token_scale: TokenScale::UNIT,
         }
     }
 
@@ -6541,7 +6539,7 @@ mod tests {
         let msg = read_msg_with_instructions(3, 30);
         let output = msg.tool_output.as_deref().unwrap();
         let blocks = output.instructions().unwrap();
-        let tl = build_instructions_lines(blocks, 80, Some(expanded));
+        let tl = build_instructions_lines(blocks, 80, Some(expanded), TokenScale::UNIT);
         assert_eq!(tl.truncation, expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("inst 29"), expect_all_visible);
@@ -6569,7 +6567,7 @@ mod tests {
             path: "agents.md".into(),
             content: "follow style guide".into(),
         }];
-        let tl = build_instructions_lines(&blocks, 80, Some(false));
+        let tl = build_instructions_lines(&blocks, 80, Some(false), TokenScale::UNIT);
         assert!(!tl.highlight.is_empty());
         let text = lines_text(&tl);
         assert!(text.contains("follow style guide"));
@@ -7832,7 +7830,7 @@ mod tests {
             content: "never hand-edit generated docs".into(),
         }];
 
-        let tl = build_instructions_lines(&blocks, 80, None);
+        let tl = build_instructions_lines(&blocks, 80, None, TokenScale::UNIT);
 
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);
@@ -7878,16 +7876,18 @@ mod tests {
     const INSTRUCTION_TOKENS_MSG: &str =
         "a loaded instruction file says about what its text costs the context";
 
-    #[test_case(None ; "compact_row")]
-    #[test_case(Some(false) ; "card")]
-    fn loaded_instructions_say_their_tokens(expanded: Option<bool>) {
+    #[test_case(None, TokenScale::UNIT ; "compact_row")]
+    #[test_case(Some(false), TokenScale::UNIT ; "card")]
+    #[test_case(None, TokenScale::new(1.5) ; "compact_row_at_the_models_scale")]
+    #[test_case(Some(false), TokenScale::new(1.5) ; "card_at_the_models_scale")]
+    fn loaded_instructions_say_their_tokens(expanded: Option<bool>, scale: TokenScale) {
         let blocks = vec![InstructionBlock {
             path: "AGENTS.md".into(),
             content: "Never push. ".repeat(100),
         }];
-        let tokens = token_label(estimate_tokens_cached(&blocks[0].content));
+        let tokens = token_label(scale.apply(estimate_tokens_cached(&blocks[0].content)));
 
-        let tl = build_instructions_lines(&blocks, 120, expanded);
+        let tl = build_instructions_lines(&blocks, 120, expanded, scale);
 
         let header = line_text(&tl.lines[0]);
         assert!(
@@ -9443,6 +9443,7 @@ mod tests {
         ));
         let rctx = RenderCtx {
             show_decisions: shown,
+            token_scale: TokenScale::UNIT,
             ..test_rctx(width)
         };
         build_tool_lines(&msg, ToolStatus::Success, &rctx, expansion)

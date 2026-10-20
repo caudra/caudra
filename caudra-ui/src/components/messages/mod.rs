@@ -50,7 +50,7 @@ use caudra_agent::types::WorkflowRunCard;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
-use caudra_providers::AutomationEventOrigin;
+use caudra_providers::{AutomationEventOrigin, TokenScale};
 use caudra_storage::id::CaudraId;
 use caudra_workflow::RunSnapshot;
 
@@ -1044,6 +1044,9 @@ pub struct MessagesPanel {
     /// so a non-empty entry is exactly a card with a clock still counting.
     batch_child_started: BatchStartedMap,
     subagent_models: SubagentModels,
+    /// What one estimated token is worth on the model this chat runs, read
+    /// when a result lands so its card keeps the count it arrived with.
+    token_scale: TokenScale,
     /// One bar per window on screen, keyed exactly as `card_scroll` is, since
     /// a bar holds the anchor of a drag in progress and several windows can be
     /// visible at once. Entries for windows that are no longer drawn are swept
@@ -1190,6 +1193,7 @@ impl MessagesPanel {
             batch_child_output: BatchLiveMap::new(),
             batch_child_started: BatchStartedMap::new(),
             subagent_models: SubagentModels::default(),
+            token_scale: TokenScale::UNIT,
             card_bars: HashMap::new(),
             card_windows: Vec::new(),
             armed_card: None,
@@ -2786,7 +2790,7 @@ impl MessagesPanel {
             .annotation
             .as_deref()
             .map(str::to_owned)
-            .or_else(|| event.output.annotation());
+            .or_else(|| event.output.annotation(self.token_scale));
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
@@ -2846,6 +2850,14 @@ impl MessagesPanel {
 
     /// Names the model the subagent behind `tool_id` runs on. A batch child
     /// has no card of its own, so its model goes on its batch's roster.
+    pub fn set_token_scale(&mut self, scale: TokenScale) {
+        self.token_scale = scale;
+    }
+
+    pub fn token_scale(&self) -> TokenScale {
+        self.token_scale
+    }
+
     pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
         if self.tool_card(tool_id).is_none()
             && let Some((batch_id, index)) = batch_child_id(tool_id)
@@ -2972,7 +2984,7 @@ impl MessagesPanel {
             .map(|d| d.full);
         let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
             .content_width(self.viewport_width);
-        let tl = build_instructions_lines(blocks, width, exp);
+        let tl = build_instructions_lines(blocks, width, exp, self.token_scale);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let compact = self.card_draws_compact(parent_id);
@@ -5348,6 +5360,7 @@ impl MessagesPanel {
             task_cards: Some(&self.task_cards),
             cwd: self.cwd.clone(),
             show_decisions: self.show_decisions,
+            token_scale: self.token_scale,
         }
     }
 

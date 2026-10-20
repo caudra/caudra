@@ -325,10 +325,11 @@ async fn call_tool(
     let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
-    let annotation = done
-        .annotation
-        .clone()
-        .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
+    let annotation = done.annotation.clone().or_else(|| {
+        (!done.is_error)
+            .then(|| done.output.annotation(tctx.token_scale()))
+            .flatten()
+    });
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }

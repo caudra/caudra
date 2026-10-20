@@ -1433,6 +1433,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&persistent_storage)
         .context("load model purpose bindings")?;
+    caudra_providers::calibration::load_from_storage(&persistent_storage);
     let model_registry_ms = lap();
 
     let mut cwd = env::current_dir().unwrap_or_else(|_| ".".into());

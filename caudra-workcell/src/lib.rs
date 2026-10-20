@@ -77,7 +77,7 @@ use caudra_agent::{
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, PDF_DATA_URL_PREFIX, PatchedFile, SearchCap,
     SharedBuf, ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput,
-    SnapshotLine, SourceCodeGraphRow, TextOutput, ToolInput, ToolOutput,
+    SnapshotLine, SourceCodeGraphRow, TextOutput, TokenScale, ToolInput, ToolOutput,
 };
 use caudra_config::ShellNativeRedirect;
 use caudra_storage::StateDir;
@@ -1761,7 +1761,7 @@ impl RemoteWorkcellInvocation {
             }
             match status.state {
                 OperationState::Completed { result, .. } => {
-                    let result = remote_result(self.kind, &self.input, result);
+                    let result = remote_result(self.kind, &self.input, result, ctx.token_scale());
                     return if progress.reported_gap.is_some() {
                         result.with_annotation(Some(REMOTE_PROGRESS_GAP.into()))
                     } else {
@@ -2386,6 +2386,7 @@ fn remote_result(
     kind: ToolKind,
     input: &Input,
     envelope: RemoteToolResultEnvelope,
+    scale: TokenScale,
 ) -> ToolExecResult {
     let RemoteToolResultEnvelope {
         model_output,
@@ -2395,7 +2396,9 @@ fn remote_result(
     let parsed = match kind {
         ToolKind::FileRead => deserialize_remote(&structured_content)
             .map(|output| remote_file_read_result(output, &model_output)),
-        ToolKind::FileGlob => deserialize_remote(&structured_content).map(file_glob_result),
+        ToolKind::FileGlob => {
+            deserialize_remote(&structured_content).map(|output| file_glob_result(output, scale))
+        }
         ToolKind::FileGrep => deserialize_remote(&structured_content).map(file_grep_result),
         ToolKind::FileWrite => deserialize_remote(&structured_content).map(|output| {
             let Input::FileWrite(input) = input else {
@@ -2419,7 +2422,7 @@ fn remote_result(
             model_output.clone(),
         )),
         ToolKind::SourceCodeContext | ToolKind::SourceCodeRefs => {
-            remote_source_code_graph_result(kind, structured_content, model_output.clone())
+            remote_source_code_graph_result(kind, structured_content, model_output.clone(), scale)
         }
         ToolKind::Environment => environment_card(&structured_content, None)
             .map(|output| ToolExecResult::from(Ok::<_, String>(output))),
@@ -2723,6 +2726,7 @@ fn remote_source_code_graph_result(
     kind: ToolKind,
     value: Value,
     model_output: String,
+    scale: TokenScale,
 ) -> Result<ToolExecResult, serde_json::Error> {
     if value["refused"] == true {
         let candidates = value["didYouMean"].as_array().map_or(0, Vec::len);
@@ -2783,6 +2787,7 @@ fn remote_source_code_graph_result(
         .with_annotation(Some(caudra_agent::with_context_tokens(
             annotation,
             &model_output,
+            scale,
         )))
         .with_model_output(Some(model_output)),
     )
@@ -2940,7 +2945,7 @@ impl WorkcellInvocation {
                     })
                     .await
                 {
-                    Ok(Ok(output)) => file_glob_result(output),
+                    Ok(Ok(output)) => file_glob_result(output, ctx.token_scale()),
                     Ok(Err(error)) => failed(filesystem_error(error)),
                     Err(error) => failed(error),
                 }
@@ -3170,6 +3175,7 @@ impl WorkcellInvocation {
                             ranked_rows(&output.results),
                             graph_footer(&output),
                             annotation,
+                            ctx.token_scale(),
                         )
                         .with_model_suffix(reordered)
                     }
@@ -3196,6 +3202,7 @@ impl WorkcellInvocation {
                             reference_rows(&output),
                             graph_footer(&output),
                             summary.annotation(),
+                            ctx.token_scale(),
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
@@ -3833,14 +3840,14 @@ fn file_read_result(output: FileReadOutput) -> ToolExecResult {
 /// is what both the model and the reader get. Serializing the record instead
 /// would carry every path twice and drop the sentence that says what was
 /// withheld.
-fn file_glob_result(output: FileGlobOutput) -> ToolExecResult {
+fn file_glob_result(output: FileGlobOutput, scale: TokenScale) -> ToolExecResult {
     let text = output.model_text().into_owned();
     let display = if text.is_empty() {
         caudra_agent::NO_FILES_FOUND.into()
     } else {
         text.clone()
     };
-    let annotation = caudra_agent::with_context_tokens(glob_annotation(&output), &text);
+    let annotation = caudra_agent::with_context_tokens(glob_annotation(&output), &text, scale);
     text_result(&output, display, false, text).with_annotation(Some(annotation))
 }
 
@@ -4249,6 +4256,7 @@ fn source_code_graph_result(
     rows: Vec<SourceCodeGraphRow>,
     footer: String,
     annotation: String,
+    scale: TokenScale,
 ) -> ToolExecResult {
     let state = serde_json::to_value(output).expect("source-code graph output serializes");
     let exact = output.model_text().into_owned();
@@ -4259,7 +4267,9 @@ fn source_code_graph_result(
         footer,
         state: Some(state),
     }))
-    .with_annotation(Some(caudra_agent::with_context_tokens(annotation, &exact)))
+    .with_annotation(Some(caudra_agent::with_context_tokens(
+        annotation, &exact, scale,
+    )))
     .with_model_output(Some(exact))
 }
 
@@ -5437,6 +5447,7 @@ mod tests {
                 structured_content: serde_json::to_value(output).expect("structured result"),
                 is_error: false,
             },
+            TokenScale::UNIT,
         );
         assert_eq!(
             remote.output.unwrap().as_text(),
@@ -5510,6 +5521,7 @@ mod tests {
                 structured_content: serde_json::to_value(fetched_pdf(attached)).unwrap(),
                 is_error: false,
             },
+            TokenScale::UNIT,
         );
 
         assert!(remote.documents.is_empty());
@@ -5636,6 +5648,7 @@ mod tests {
                 model_output: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
                 is_error,
             },
+            TokenScale::UNIT,
         );
         assert_eq!(remote.is_error, is_error);
         assert_eq!(
@@ -5687,6 +5700,7 @@ mod tests {
                 model_output: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
                 is_error,
             },
+            TokenScale::UNIT,
         );
         assert!(result.is_error);
         assert!(
@@ -7816,6 +7830,7 @@ mod tests {
                 model_output: MISLEADING_OUTPUT.into(),
                 is_error: false,
             },
+            TokenScale::UNIT,
         );
         let local = shell_result_parts(output, MISLEADING_OUTPUT.into(), None);
 
@@ -9372,20 +9387,21 @@ mod tests {
         output: FileGlobOutput,
         expected: &str,
     ) {
-        let result = file_glob_result(output);
+        let result = file_glob_result(output, TokenScale::UNIT);
         let model = result.model_output.as_deref().unwrap_or_default();
         assert_eq!(
             result.annotation,
             Some(caudra_agent::with_context_tokens(
                 expected.to_owned(),
-                model
+                model,
+                TokenScale::UNIT
             ))
         );
     }
 
     #[test]
     fn a_capped_glob_reports_what_it_withheld_to_both_readers() {
-        let result = file_glob_result(glob_output(1, 340, true));
+        let result = file_glob_result(glob_output(1, 340, true), TokenScale::UNIT);
         let model = result.model_output.clone().expect("model text");
         assert!(
             model.contains("[truncated: showing 1 of 340 matching files]"),
@@ -9401,7 +9417,9 @@ mod tests {
 
     #[test]
     fn a_capped_glob_that_matched_nothing_is_not_a_complete_miss() {
-        let ToolOutput::Plain(text) = file_glob_result(glob_output(0, 0, false)).output.unwrap()
+        let ToolOutput::Plain(text) = file_glob_result(glob_output(0, 0, false), TokenScale::UNIT)
+            .output
+            .unwrap()
         else {
             panic!("expected plain glob output");
         };
@@ -9609,6 +9627,7 @@ mod tests {
                     structured_content: serde_json::to_value(output).expect(EDIT_PATCH_MSG),
                     is_error: false,
                 },
+                TokenScale::UNIT,
             )
         } else {
             file_edit_result(output)

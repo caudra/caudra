@@ -395,6 +395,7 @@ fn format_grep(call: &GrepCall, result: &ToolOutputGrepResult) -> String {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::TokenScale;
     use super::*;
     use crate::AgentMode;
     use crate::tools::test_support::stub_ctx;
@@ -474,13 +475,13 @@ mod tests {
         assert!(fits(&response));
         assert!(
             output
-                .annotation()
+                .annotation(TokenScale::UNIT)
                 .unwrap()
                 .contains(&token_label(estimate_tokens(&response)))
         );
         let restored: ToolOutput =
             serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
-        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(restored.annotation(TokenScale::UNIT), output.annotation(TokenScale::UNIT));
         assert_eq!(restored.as_text(), response);
     }
 

@@ -23,6 +23,7 @@ use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
 use caudra_storage::cache_warming::{CacheWarmEpisode, CacheWarmLedger, HitSamples};
+use caudra_storage::token_calibration::{StoredCalibration, TokenCalibrationStore};
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::goal_log::GoalLogWrite;
 use caudra_storage::id::CaudraId;
@@ -85,6 +86,9 @@ type PendingToolCalls = Arc<Mutex<Vec<QueuedToolCall>>>;
 /// row references is on disk first.
 type PendingRows<R> = Arc<Mutex<Vec<QueuedRow<R>>>>;
 type PendingWarming = Arc<Mutex<Vec<WarmingWrite>>>;
+/// Each row is a model's whole learned state, so only the newest per model
+/// needs writing.
+type PendingCalibrations = Arc<Mutex<HashMap<(String, String), StoredCalibration>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -189,6 +193,7 @@ pub struct StorageWriter {
     engine_decisions: PendingRows<StoredEngineDecision>,
     account_switches: PendingRows<StoredAccountSwitch>,
     warming: PendingWarming,
+    calibrations: PendingCalibrations,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -217,6 +222,8 @@ impl StorageWriter {
         let writer_account_switches = Arc::clone(&account_switches);
         let warming: PendingWarming = Arc::default();
         let writer_warming = Arc::clone(&warming);
+        let calibrations: PendingCalibrations = Arc::default();
+        let writer_calibrations = Arc::clone(&calibrations);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
@@ -242,6 +249,8 @@ impl StorageWriter {
                     account_switches: writer_account_switches,
                     warming: writer_warming,
                     warm_ledger: None,
+                    calibrations: writer_calibrations,
+                    calibration_store: None,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -284,6 +293,7 @@ impl StorageWriter {
             engine_decisions,
             account_switches,
             warming,
+            calibrations,
             done_rx,
             thread,
             generation,
@@ -408,6 +418,19 @@ impl StorageWriter {
             .push(write);
         if let Err(flume::TrySendError::Disconnected(())) = self.wake.try_send(()) {
             warn!("storage writer unavailable; a cache-warming record may not be kept");
+        }
+    }
+
+    pub fn record_calibration(&self, calibration: StoredCalibration) {
+        self.calibrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (calibration.provider.clone(), calibration.model.clone()),
+                calibration,
+            );
+        if let Err(flume::TrySendError::Disconnected(())) = self.wake.try_send(()) {
+            warn!("storage writer unavailable; a token calibration may not be kept");
         }
     }
 
@@ -613,6 +636,8 @@ struct Writer {
     account_switches: PendingRows<StoredAccountSwitch>,
     warming: PendingWarming,
     warm_ledger: Option<CacheWarmLedger>,
+    calibrations: PendingCalibrations,
+    calibration_store: Option<TokenCalibrationStore>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -947,6 +972,30 @@ impl Writer {
         }
     }
 
+    /// Dropped with a warning on failure: a lost row only means the next run
+    /// learns that model again.
+    fn write_calibrations(&mut self) {
+        let rows = mem::take(&mut *self.calibrations.lock().unwrap_or_else(|e| e.into_inner()));
+        if rows.is_empty() {
+            return;
+        }
+        let store = match &self.calibration_store {
+            Some(store) => store,
+            None => match TokenCalibrationStore::open(&self.dir) {
+                Ok(store) => self.calibration_store.insert(store),
+                Err(error) => {
+                    warn!(%error, rows = rows.len(), "token calibration store unavailable");
+                    return;
+                }
+            },
+        };
+        for row in rows.into_values() {
+            if let Err(error) = store.upsert(&row) {
+                warn!(%error, provider = %row.provider, model = %row.model, "token calibration write failed");
+            }
+        }
+    }
+
     /// One pass over everything queued. The tabs request is claimed before the
     /// snapshots are written, because `write_workspace_tabs` keeps only the ids
     /// the database still holds and the slot is emptied by the claim. Reading
@@ -984,6 +1033,7 @@ impl Writer {
         self.flush_usage(usage);
         self.flush_tool_calls(tool_calls);
         self.write_warming();
+        self.write_calibrations();
     }
 
     fn finish(
@@ -1716,6 +1766,8 @@ mod tests {
             account_switches: Arc::default(),
             warming: Arc::default(),
             warm_ledger: None,
+            calibrations: Arc::default(),
+            calibration_store: None,
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),

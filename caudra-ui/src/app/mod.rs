@@ -183,6 +183,7 @@ use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
+use caudra_providers::calibration;
 use caudra_providers::accounts::{AccountStatus, RoutedAccount};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{adjust_model_for_inspection, seed_setup_thinking};
@@ -5178,6 +5179,7 @@ impl App {
                 AgentEvent::ModelUsage { .. }
                     | AgentEvent::CacheWarmEpisode(_)
                     | AgentEvent::CacheHitSamples(_)
+                    | AgentEvent::TokenCalibration(_)
             )
         {
             let cancelled_terminal = envelope.subagent.is_none()
@@ -5469,6 +5471,10 @@ impl App {
                     .record_cache_warm(WarmingWrite::Samples(samples));
                 return vec![];
             }
+            AgentEvent::TokenCalibration(calibration) => {
+                self.storage_writer.record_calibration(calibration);
+                return vec![];
+            }
             AgentEvent::GoalEvaluating { evaluation } => {
                 self.flash(format!("Evaluating goal (#{evaluation})..."));
                 return vec![];
@@ -5644,6 +5650,13 @@ impl App {
             None
         };
         let todo_changed = matches!(&event, AgentEvent::ToolDone(e) if matches!(&e.output, ToolOutput::TodoList(_)));
+        if matches!(event, AgentEvent::ToolDone(_))
+            && let Some(scale) = self
+                .route_model(self.state.applied_mode)
+                .map(|model| calibration::scale(&model))
+        {
+            self.chats[chat_idx].set_token_scale(scale);
+        }
         let result = self.chats[chat_idx].handle_event(event, plan_path);
         if todo_changed && chat_idx == self.active_chat {
             self.sync_todo_panel();

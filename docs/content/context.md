@@ -19,7 +19,7 @@ The `plan` tool needs a session plan, which a session gets the first time it ent
 
 Press `g` to leave the inventory for what those tools have actually done, counted per session, per project, and across every run. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
 
-The per-source breakdown is an estimate. Caudra counts text and images locally with one tokenizer, which is exact only for the GPT-4o and GPT-5 families, so the total a provider bills for the same request can differ. The measured line and the status bar carry the provider's own count instead, extended by a local estimate of whatever arrived after it.
+The per-source breakdown is an estimate. Caudra counts text and images locally with one tokenizer, which is exact only for the GPT-4o and GPT-5 families, and scales the count by what it has [learned about the model's own tokenizer](/docs/token-economy/#watching-it-work) from what the provider billed. The total a provider bills for the same request can still differ. The measured line and the status bar carry the provider's own count instead, extended by a local estimate of whatever arrived after it.
 
 `/context` shows current capacity. `/usage` shows cumulative spend:
 

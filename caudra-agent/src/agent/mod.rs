@@ -8,6 +8,7 @@ mod goal_progress;
 mod history;
 mod instructions;
 pub(crate) mod judging;
+mod measured;
 pub mod mention_preamble;
 mod provider_projection;
 pub(crate) mod relative_paths;

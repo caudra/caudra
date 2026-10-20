@@ -7,6 +7,7 @@ use std::ops::Range;
 use caudra_agent::code::MODULE_DOCS;
 use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutcome, CodeOutput};
 use caudra_agent::tools::ToolEffect;
+use caudra_providers::TokenScale;
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, DecisionHelper, MCP_SUMMARY_PREFIX, McpBlock, McpHelper,
     McpOutput, ToolOutput, pretty_json,
@@ -122,7 +123,11 @@ fn entry(call: &CodeCall) -> BatchToolEntry {
         annotation: match (call.helper, &output) {
             (Some(McpHelper::History(_)), Some(ToolOutput::Mcp(answer))) => history_summary(answer),
             (Some(McpHelper::History(_)), _) => None,
-            (_, output) => output.as_ref().and_then(ToolOutput::annotation),
+            // The model reads a run's printed text and result, which the
+            // `code` card itself counts; a call's row only sizes its answer.
+            (_, output) => output
+                .as_ref()
+                .and_then(|output| output.annotation(TokenScale::UNIT)),
         },
         output,
         model_suffix: None,

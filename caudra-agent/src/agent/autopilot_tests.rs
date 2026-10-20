@@ -442,6 +442,7 @@ mod autopilot_tests {
             agent.measured = Some(MeasuredContext {
                 reported: u32::MAX,
                 history_len: agent.history.len(),
+                sent: None,
             });
             let mut agent = agent.with_autopilot(handle.clone());
             assert!(agent.try_auto_compact().await.unwrap());
