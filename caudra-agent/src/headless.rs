@@ -870,6 +870,7 @@ impl SessionStore {
                 self.record_engine_decision(note, agent);
                 return Ok(());
             }
+            AgentEvent::DecisionPending(_) | AgentEvent::DecisionSettled(_) => return Ok(()),
             AgentEvent::Autopilot(AutopilotEvent::Engaged { engagement, goal })
                 if self.autopilot.is_some() =>
             {

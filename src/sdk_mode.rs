@@ -3544,6 +3544,8 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge { .. }
             | AgentEvent::Unrecorded { .. }
+            | AgentEvent::DecisionPending(_)
+            | AgentEvent::DecisionSettled(_)
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::PromptProgress { .. } => {}

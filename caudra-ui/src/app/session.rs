@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{
-    CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, decision_inserts, history_to_display,
-    interleaved_history_to_display,
+    CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, attach_card_decisions, decision_inserts,
+    history_to_display, interleaved_history_to_display,
 };
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{OtherCheckout, SessionPickerAction, SessionRow};
@@ -705,17 +705,19 @@ impl App {
             .into_iter()
             .map(|((history_len, _), row)| (history_len, row))
             .collect();
-        inserts.extend(decision_inserts(
+        let restored = decision_inserts(
             &active_history,
             decisions.iter().filter(|row| row.agent.is_none()),
-        ));
-        let (display_msgs, restore_items) = interleaved_history_to_display(
+        );
+        inserts.extend(restored.rows);
+        let (mut display_msgs, restore_items) = interleaved_history_to_display(
             &active_history,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
             inserts,
         );
+        attach_card_decisions(&mut display_msgs, restored.cards);
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
             self.state.session.subagent_messages(),
@@ -1684,13 +1686,16 @@ fn render_subagent_displays(
         let rows = decisions
             .iter()
             .filter(|row| row.agent.as_deref() == Some(subagent.tool_use_id.as_str()));
-        interleaved_history_to_display(
+        let restored = decision_inserts(messages, rows);
+        let (mut display, restore) = interleaved_history_to_display(
             messages,
             tool_outputs,
             tool_output_lines,
             show_reminders,
-            decision_inserts(messages, rows),
-        )
+            restored.rows,
+        );
+        attach_card_decisions(&mut display, restored.cards);
+        (display, restore)
     };
     let workers = restore_workers(restorable.len());
     if workers == 1 {

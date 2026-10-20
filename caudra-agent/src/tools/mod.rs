@@ -51,7 +51,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::code::CodeSession;
 use crate::code::hosted::HostedCall;
 use crate::context::ContextPublisher;
-use crate::decisions::{NoteAnchor, NoteDraft, NoteSink};
+use crate::decisions::{DecisionFeature, Decisions, NoteAnchor, NoteDraft, NoteSink, PendingNote};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
@@ -667,6 +667,15 @@ impl ToolContext {
     pub fn note_sink(&self) -> Option<NoteSink> {
         let id = self.tool_use_id.clone()?;
         Some(NoteSink::new(self.event_tx.clone(), NoteAnchor::Tool(id)))
+    }
+
+    /// Shows on this call's card that `feature` is asking the engine, until
+    /// the guard emits its note or drops.
+    pub fn begin_decision(&self, decisions: &Decisions, feature: DecisionFeature) -> PendingNote {
+        match self.note_sink() {
+            Some(sink) => sink.begin(decisions, feature),
+            None => PendingNote::unanchored(feature),
+        }
     }
 }
 

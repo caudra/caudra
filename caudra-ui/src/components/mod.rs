@@ -2,6 +2,7 @@ pub(crate) mod accounts_modal;
 pub(crate) mod audit_log;
 pub(crate) mod automation_inspector;
 pub(crate) mod autopilot_panel;
+pub(crate) mod card_decisions;
 pub(crate) mod changelog_modal;
 pub(crate) mod code_card;
 pub(crate) mod code_view;
@@ -135,6 +136,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::live_elapsed;
 use crate::selection::wrap_breaks;
+use card_decisions::CardDecision;
 use keybindings::{Bind, key};
 use modal::FooterHits;
 use peer_manager::SubscriptionChange;
@@ -1411,6 +1413,9 @@ pub struct DisplayMessage {
     pub tool_started: Option<Instant>,
     /// Pictures a prompt carried, drawn under its text.
     pub images: Arc<[ImageSource]>,
+    /// What the decision engine decided, or is deciding, about this card's
+    /// call and, for a batch, its children.
+    pub decisions: Vec<CardDecision>,
 }
 
 impl DisplayMessage {
@@ -1453,16 +1458,10 @@ impl DisplayMessage {
         summary: &str,
         details: &[String],
     ) -> Self {
-        let marker = match outcome {
-            NoteOutcome::Shadow => SHADOW_MARKER,
-            NoteOutcome::Acted | NoteOutcome::FellBack => "",
-        };
-        let mut text = format!("{marker}{feature}{DECISION_SEPARATOR}{summary}");
-        for detail in details {
-            text.push('\n');
-            text.push_str(detail);
-        }
-        Self::new(DisplayRole::Decision(outcome), text)
+        Self::new(
+            DisplayRole::Decision(outcome),
+            card_decisions::decision_text(feature, outcome, summary, details),
+        )
     }
 
     pub fn new(role: DisplayRole, text: String) -> Self {
@@ -1490,11 +1489,13 @@ impl DisplayMessage {
             thinking_duration: None,
             tool_started: None,
             images: Arc::default(),
+            decisions: Vec::new(),
         }
     }
 
     pub fn plan(text: String, plan_path: String) -> Self {
         Self {
+            decisions: Vec::new(),
             role: DisplayRole::Assistant,
             text,
             source: None,

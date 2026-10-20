@@ -10,7 +10,7 @@ use caudra_storage::{
     id::CaudraId,
 };
 
-use crate::chat::{Chat, decision_inserts, interleaved_history_to_display};
+use crate::chat::{Chat, attach_card_decisions, decision_inserts, interleaved_history_to_display};
 use crate::components::DisplayMessage;
 use crate::repaint::Dirty;
 
@@ -127,14 +127,19 @@ impl App {
                     let rows = decisions
                         .map(|(storage, session_id)| load_engine_decisions(&storage, session_id))
                         .unwrap_or_default();
-                    let inserts = decision_inserts(
+                    let restored = decision_inserts(
                         &items,
                         rows.iter()
                             .filter(|row| row.agent.as_deref() == Some(task_id.as_str())),
                     );
-                    let (messages, restore) = interleaved_history_to_display(
-                        &items, &outputs, &lines, reminders, inserts,
+                    let (mut messages, restore) = interleaved_history_to_display(
+                        &items,
+                        &outputs,
+                        &lines,
+                        reminders,
+                        restored.rows,
                     );
+                    attach_card_decisions(&mut messages, restored.cards);
                     Ok(ArchivedChat {
                         card,
                         messages,

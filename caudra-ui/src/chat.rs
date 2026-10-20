@@ -10,6 +10,7 @@ use std::time::Duration;
 use crossterm::event::MouseEvent;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
+use crate::components::card_decisions::{CardDecision, DecisionState};
 use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::MessagesPanel;
 use crate::components::prompt_progress::PromptProgress;
@@ -24,7 +25,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::background::BackgroundTasks;
-use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor};
+use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor, PendingDecision};
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
@@ -194,8 +195,10 @@ impl Chat {
     }
 
     /// Whether decisions from here on get a row; rows already drawn stay.
+    /// What a card already carries shows or hides with the switch.
     pub(crate) fn set_show_decisions(&mut self, shown: bool) {
         self.show_decisions = shown;
+        self.messages_panel.set_show_decisions(shown);
     }
 
     /// Grows the instruction this task is being given, before the subagent
@@ -366,7 +369,18 @@ impl Chat {
             | AgentEvent::Autopilot(_) => {}
             AgentEvent::Decision(note) => {
                 if self.show_decisions {
-                    self.place_decision(&note);
+                    self.place_decision(*note);
+                }
+            }
+            AgentEvent::DecisionPending(pending) => {
+                if self.show_decisions {
+                    self.wait_on_decision(*pending);
+                }
+            }
+            AgentEvent::DecisionSettled(pending) => {
+                if let NoteAnchor::Tool(call_id) = &pending.anchor {
+                    self.messages_panel
+                        .settle_decision(call_id, &pending.feature);
                 }
             }
             AgentEvent::StreamReset
@@ -525,31 +539,38 @@ impl Chat {
         self.messages_panel.push(plan_message(plan));
     }
 
-    /// A call's row goes right under the call's card, which parallel calls
-    /// may already have drawn others after. Anything else, including a call
-    /// whose card this chat does not hold, follows the transcript.
-    fn place_decision(&mut self, note: &DecisionNote) {
-        let row = DisplayMessage::decision(
+    /// A call's decision goes on the call's card, settling the wait it
+    /// answers. Anything else, including a call whose card this chat does not
+    /// hold, is a row that follows the transcript.
+    fn place_decision(&mut self, note: DecisionNote) {
+        if let NoteAnchor::Tool(id) = &note.anchor
+            && self.messages_panel.attach_decision(CardDecision::settled(
+                id.clone(),
+                note.feature.clone(),
+                note.outcome,
+                &note.summary,
+                &note.details,
+            ))
+        {
+            return;
+        }
+        self.messages_panel.flush();
+        self.messages_panel.push(DisplayMessage::decision(
             note.feature.label(),
             note.outcome,
             &note.summary,
             &note.details,
-        );
-        let after_card = match &note.anchor {
-            NoteAnchor::Tool(id) => self.messages_panel.row_after_card(id),
-            NoteAnchor::History(_) => None,
-        };
-        let Some(index) = after_card else {
-            self.messages_panel.flush();
-            self.messages_panel.push(row);
-            return;
-        };
-        self.messages_panel.insert(index, row);
-        let finish = self.finish.as_mut().map(|(_, bubble)| bubble);
-        for row in [self.stall_row.as_mut(), finish].into_iter().flatten() {
-            if *row >= index {
-                *row += 1;
-            }
+        ));
+    }
+
+    /// A wait shows on the card of the call it is about, and nowhere else.
+    fn wait_on_decision(&mut self, pending: PendingDecision) {
+        if let NoteAnchor::Tool(call_id) = pending.anchor {
+            self.messages_panel.attach_decision(CardDecision {
+                call_id,
+                feature: pending.feature,
+                state: DecisionState::Pending,
+            });
         }
     }
 
@@ -1193,31 +1214,81 @@ pub fn history_to_display(
     )
 }
 
-/// Each stored decision row with the position
-/// [`interleaved_history_to_display`] places it at: a turn's row before the
-/// item it was made at, a call's right after the item that made the call. A
-/// call that appears twice, kept across a compaction, keeps its row under the
-/// first. A row whose call `items` no longer holds is dropped, and a feature
-/// this build does not know is titled by its stored name.
+/// Stored decisions split the way a live chat draws them: rows for
+/// [`interleaved_history_to_display`] to place, and the decisions that go on
+/// a call's card.
+pub(crate) struct RestoredDecisions {
+    pub(crate) rows: Vec<(usize, DisplayMessage)>,
+    pub(crate) cards: Vec<CardDecision>,
+}
+
+/// A turn's row goes before the item it was made at. A call's decision goes
+/// on the call's card; one whose feature this build does not know cannot say
+/// what its chip is, so it keeps a row right after the item that made the
+/// call, titled by its stored name. A decision whose call `items` no longer
+/// holds is dropped.
 pub(crate) fn decision_inserts<'a>(
     items: &[HistoryItem],
-    rows: impl IntoIterator<Item = &'a StoredEngineDecision>,
-) -> Vec<(usize, DisplayMessage)> {
+    stored: impl IntoIterator<Item = &'a StoredEngineDecision>,
+) -> RestoredDecisions {
     let mut after_calls: HashMap<&str, usize> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         if let HistoryItemKind::ToolCall { call_id, .. } = &item.kind {
             after_calls.entry(call_id.as_str()).or_insert(index + 1);
         }
     }
-    rows.into_iter()
-        .filter_map(|row| {
-            let position = match &row.anchor {
-                StoredDecisionAnchor::History(len) => *len,
-                StoredDecisionAnchor::Tool(id) => after_call(&after_calls, id)?,
-            };
-            Some((position, stored_decision_row(row)))
-        })
-        .collect()
+    let mut restored = RestoredDecisions {
+        rows: Vec::new(),
+        cards: Vec::new(),
+    };
+    for row in stored {
+        let feature = DecisionFeature::from_name(&row.feature);
+        match (&row.anchor, feature) {
+            (StoredDecisionAnchor::History(len), _) => {
+                restored.rows.push((*len, stored_decision_row(row)));
+            }
+            (StoredDecisionAnchor::Tool(id), Some(feature)) => {
+                if after_call(&after_calls, id).is_some() {
+                    restored.cards.push(CardDecision::settled(
+                        id.clone(),
+                        feature,
+                        row.outcome.into(),
+                        &row.summary,
+                        &row.details,
+                    ));
+                }
+            }
+            (StoredDecisionAnchor::Tool(id), None) => {
+                if let Some(position) = after_call(&after_calls, id) {
+                    restored.rows.push((position, stored_decision_row(row)));
+                }
+            }
+        }
+    }
+    restored
+}
+
+/// Puts each restored decision on the first card drawing its call, a batch
+/// child's on its batch's card.
+pub(crate) fn attach_card_decisions(display: &mut [DisplayMessage], cards: Vec<CardDecision>) {
+    for decision in cards {
+        let mut call_id = decision.call_id.as_str();
+        let card = loop {
+            if let Some(card) = display
+                .iter()
+                .position(|msg| msg.role.tool_id() == Some(call_id))
+            {
+                break Some(card);
+            }
+            match batch_child_id(call_id) {
+                Some((parent, _)) => call_id = parent,
+                None => break None,
+            }
+        };
+        if let Some(card) = card {
+            display[card].decisions.push(decision);
+        }
+    }
 }
 
 /// A batch child's call is drawn on its batch's card, so it falls back to the
@@ -1456,6 +1527,7 @@ pub fn interleaved_history_to_display(
                     });
                 }
                 display.push(DisplayMessage {
+                    decisions: Vec::new(),
                     role: DisplayRole::Tool(Box::new(ToolRole {
                         id: call_id.clone(),
                         status,
@@ -3966,6 +4038,7 @@ mod tests {
     const CHILD_ROW: &str = "ranked in a batch child";
     const UNKNOWN_CALL_ROW: &str = "ranked in a call that is gone";
     const COMPACTION_SUMMARY: &str = "## Objective";
+    const PENDING_STATE: &str = "pending";
 
     fn decision(outcome: NoteOutcome, anchor: NoteAnchor) -> AgentEvent {
         DecisionNote::new(
@@ -3979,24 +4052,52 @@ mod tests {
         .into()
     }
 
-    /// Each message as a reader tells it apart: a card by its call, a
-    /// decision row by its outcome, anything else by its text.
-    fn live_placement(chat: &Chat) -> Vec<&str> {
+    fn pending(anchor: NoteAnchor) -> AgentEvent {
+        AgentEvent::DecisionPending(Box::new(PendingDecision {
+            feature: DecisionFeature::MemorySearch,
+            anchor,
+        }))
+    }
+
+    fn settled(anchor: NoteAnchor) -> AgentEvent {
+        AgentEvent::DecisionSettled(Box::new(PendingDecision {
+            feature: DecisionFeature::MemorySearch,
+            anchor,
+        }))
+    }
+
+    /// `t1` followed by `t1=acted` for each decision on the card.
+    fn card_label(id: &str, decisions: &[CardDecision]) -> String {
+        let mut label = id.to_owned();
+        for decision in decisions {
+            let state = match &decision.state {
+                DecisionState::Pending => PENDING_STATE,
+                DecisionState::Settled { outcome, .. } => outcome.as_str(),
+            };
+            label.push_str(&format!(" {}={state}", decision.call_id));
+        }
+        label
+    }
+
+    /// Each message as a reader tells it apart: a card by its call and the
+    /// decisions on it, a decision row by its outcome, anything else by its
+    /// text.
+    fn live_placement(chat: &Chat) -> Vec<String> {
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
             .map(|message| match &message.role {
-                DisplayRole::Tool(tool) => tool.id.as_str(),
-                DisplayRole::Decision(outcome) => outcome.as_str(),
-                _ => message.text.as_str(),
+                DisplayRole::Tool(tool) => card_label(&tool.id, &message.decisions),
+                DisplayRole::Decision(outcome) => outcome.as_str().to_owned(),
+                _ => message.text.clone(),
             })
             .collect()
     }
 
     /// Two calls run side by side, so a later card is already drawn when the
-    /// first call's rows arrive. Each still lands under its own card, the
-    /// second row on a card after the first.
+    /// first call's decisions arrive. Each still lands on its own card, in
+    /// the order it arrived, and none draws a row.
     #[test]
-    fn a_calls_row_lands_under_its_card_beside_a_parallel_call() {
+    fn a_calls_decision_lands_on_its_card_beside_a_parallel_call() {
         let mut chat = chat();
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
         chat.handle_event(tool_start(SECOND_CALL, SHELL_TOOL_NAME), None);
@@ -4012,17 +4113,14 @@ mod tests {
         assert_eq!(
             live_placement(&chat),
             [
-                FIRST_CALL,
-                NoteOutcome::Acted.as_str(),
-                NoteOutcome::FellBack.as_str(),
-                SECOND_CALL,
-                NoteOutcome::Shadow.as_str(),
+                format!("{FIRST_CALL} {FIRST_CALL}=acted {FIRST_CALL}=fell_back"),
+                format!("{SECOND_CALL} {SECOND_CALL}=shadow"),
             ]
         );
     }
 
     #[test]
-    fn a_batch_childs_row_lands_under_its_batch() {
+    fn a_batch_childs_decision_lands_on_its_batch() {
         let mut chat = chat();
         chat.handle_event(batch_start(SECOND_CALL, 1), None);
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
@@ -4037,13 +4135,16 @@ mod tests {
 
         assert_eq!(
             live_placement(&chat),
-            [SECOND_CALL, NoteOutcome::Acted.as_str(), FIRST_CALL]
+            [
+                format!("{SECOND_CALL} {SECOND_CALL_CHILD}=acted"),
+                FIRST_CALL.to_owned(),
+            ]
         );
     }
 
     #[test_case(NoteAnchor::History(0) ; "a_turns_row")]
     #[test_case(NoteAnchor::Tool(UNKNOWN_CALL.into()) ; "a_row_for_a_card_this_chat_lacks")]
-    fn a_row_without_a_card_follows_the_transcript(anchor: NoteAnchor) {
+    fn a_decision_without_a_card_is_a_row_that_follows_the_transcript(anchor: NoteAnchor) {
         let mut chat = chat();
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
         chat.handle_event(tool_start(SECOND_CALL, SHELL_TOOL_NAME), None);
@@ -4054,6 +4155,40 @@ mod tests {
             live_placement(&chat),
             [FIRST_CALL, SECOND_CALL, NoteOutcome::Acted.as_str()]
         );
+    }
+
+    /// The card says the engine is working until it answers: with a note,
+    /// which takes the wait's place, with nothing to show, or by the call
+    /// ending first.
+    #[test_case(Some(decision(NoteOutcome::Acted, NoteAnchor::Tool(FIRST_CALL.into()))), format!("{FIRST_CALL} {FIRST_CALL}=acted") ; "a_note_takes_its_place")]
+    #[test_case(Some(settled(NoteAnchor::Tool(FIRST_CALL.into()))), FIRST_CALL.to_owned() ; "a_quiet_answer_clears_it")]
+    #[test_case(Some(tool_done(FIRST_CALL, SHELL_TOOL_NAME, ToolOutput::Plain(String::new().into()))), FIRST_CALL.to_owned() ; "the_call_ending_clears_it")]
+    #[test_case(None, format!("{FIRST_CALL} {FIRST_CALL}={PENDING_STATE}") ; "until_then_it_waits")]
+    fn a_wait_shows_on_the_card_until_the_engine_answers(answer: Option<AgentEvent>, card: String) {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        chat.handle_event(pending(NoteAnchor::Tool(FIRST_CALL.into())), None);
+
+        if let Some(answer) = answer {
+            chat.handle_event(answer, None);
+        }
+
+        assert_eq!(live_placement(&chat), [card]);
+    }
+
+    #[test]
+    fn a_wait_without_a_card_draws_nothing() {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+
+        for anchor in [
+            NoteAnchor::History(0),
+            NoteAnchor::Tool(UNKNOWN_CALL.into()),
+        ] {
+            chat.handle_event(pending(anchor), None);
+        }
+
+        assert_eq!(live_placement(&chat), [FIRST_CALL]);
     }
 
     #[test]
@@ -4083,6 +4218,7 @@ mod tests {
         );
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
 
+        chat.handle_event(pending(NoteAnchor::Tool(FIRST_CALL.into())), None);
         for anchor in [NoteAnchor::History(0), NoteAnchor::Tool(FIRST_CALL.into())] {
             chat.handle_event(decision(NoteOutcome::Acted, anchor), None);
         }
@@ -4129,9 +4265,10 @@ mod tests {
     }
 
     /// A compaction keeps the first call's pair after its summary, so the
-    /// transcript holds that call twice and its row stays under the first.
-    /// A turn's row counts items across the seam, a batch child's row falls
-    /// back to its batch, and a row whose call is gone is dropped.
+    /// transcript holds that call twice and its decision stays on the first
+    /// card. A turn's row counts items across the seam, a batch child's
+    /// decision goes on its batch's card, a decision whose call is gone is
+    /// dropped, and one this build cannot name keeps a row under its card.
     #[test]
     fn stored_rows_restore_among_the_history_across_a_compaction() {
         let mut summary = Message {
@@ -4173,37 +4310,58 @@ mod tests {
                 FIRST_CALL_ROW,
                 StoredDecisionAnchor::Tool(FIRST_CALL.into()),
             ),
+            stored(
+                RETIRED_FEATURE,
+                DECISION_SUMMARY,
+                StoredDecisionAnchor::Tool(SECOND_CALL.into()),
+            ),
         ];
 
-        let (display, _) = interleaved_history_to_display(
+        let restored = decision_inserts(&items, &rows);
+        let (mut display, _) = interleaved_history_to_display(
             &items,
             &empty_outputs(),
             &ToolOutputLines::default(),
             false,
-            decision_inserts(&items, &rows),
+            restored.rows,
         );
+        attach_card_decisions(&mut display, restored.cards);
 
-        let shown: Vec<&str> = display
+        let summary = |text: &str| text.rsplit(DECISION_SEPARATOR).next().unwrap().to_owned();
+        let shown: Vec<(String, Vec<String>)> = display
             .iter()
-            .map(|message| match &message.role {
-                DisplayRole::Tool(tool) => tool.id.as_str(),
-                DisplayRole::Decision(_) => message.text.rsplit(DECISION_SEPARATOR).next().unwrap(),
-                _ => message.text.as_str(),
+            .map(|message| {
+                let decisions = message
+                    .decisions
+                    .iter()
+                    .map(|decision| match &decision.state {
+                        DecisionState::Settled { text, .. } => summary(text),
+                        DecisionState::Pending => String::new(),
+                    })
+                    .collect();
+                let shown = match &message.role {
+                    DisplayRole::Tool(tool) => tool.id.clone(),
+                    DisplayRole::Decision(_) => summary(&message.text),
+                    _ => message.text.clone(),
+                };
+                (shown, decisions)
             })
             .collect();
+        let row = |text: &str| (text.to_owned(), Vec::new());
         assert_eq!(
             shown,
             [
-                USER_TEXT,
-                FIRST_CALL,
-                FIRST_CALL_ROW,
-                TURN_ROW,
-                COMPACTION_BORDER_TEXT,
-                COMPACTION_SUMMARY,
-                FIRST_CALL,
-                SECOND_CALL,
-                SECOND_CALL_ROW,
-                CHILD_ROW,
+                row(USER_TEXT),
+                (FIRST_CALL.into(), vec![FIRST_CALL_ROW.into()]),
+                row(TURN_ROW),
+                row(COMPACTION_BORDER_TEXT),
+                row(COMPACTION_SUMMARY),
+                row(FIRST_CALL),
+                (
+                    SECOND_CALL.into(),
+                    vec![SECOND_CALL_ROW.into(), CHILD_ROW.into()]
+                ),
+                row(DECISION_SUMMARY),
             ]
         );
     }

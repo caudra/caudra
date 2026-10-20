@@ -37,7 +37,7 @@ use crate::autopilot::{
     AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
 };
 use crate::code::output::{CodeCall, CodeOutput, CodeProgressEvent};
-use crate::decisions::DecisionNote;
+use crate::decisions::{DecisionNote, PendingDecision};
 use crate::mcp::kind::McpServerKind;
 use crate::mcp::output::McpOutput;
 use crate::peers::{
@@ -3158,6 +3158,10 @@ pub enum AgentEvent {
     Autopilot(AutopilotEvent),
     /// What a decision feature did, for a transcript row the model never sees.
     Decision(Box<DecisionNote>),
+    /// A decision feature is asking the engine about a call.
+    DecisionPending(Box<PendingDecision>),
+    /// The engine answered, or failed quietly, without a note to show for it.
+    DecisionSettled(Box<PendingDecision>),
     TurnComplete(Box<TurnCompleteEvent>),
     ModelUsage {
         usage: TokenUsage,

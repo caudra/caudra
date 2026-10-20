@@ -5519,20 +5519,19 @@ fn decision_outcomes_are_drawn_apart() {
     }
 }
 
-/// A row reporting on a call goes under the call's card, so it must not take
-/// the card's place as the transcript's newest message.
+/// A row drawn after a card reports on the turn the card belongs to, so it
+/// must not take the card's place as the transcript's newest message.
 #[test]
 fn a_decision_row_never_takes_the_newest_card_place() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
     let card = panel.message_count() - 1;
 
-    let after_card = panel.row_after_card(TOOL_ID).unwrap();
-    panel.insert(after_card, decision_row(NoteOutcome::Acted, &[]));
+    let row = panel.push(decision_row(NoteOutcome::Acted, &[]));
 
-    assert_eq!(after_card, card + 1);
+    assert_eq!(row, card + 1);
     assert!(panel.is_latest(card));
-    assert!(!panel.is_latest(after_card));
+    assert!(!panel.is_latest(row));
 }
 
 fn titled(details: &[&str]) -> String {

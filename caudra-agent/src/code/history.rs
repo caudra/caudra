@@ -29,7 +29,7 @@ use super::module::{
 use super::names::HISTORY_MODULE;
 use super::output::CodeCall;
 use super::runner::{ScriptCall, ScriptError, ScriptErrorKind};
-use crate::decisions::{NoteSink, counted};
+use crate::decisions::{DecisionFeature, NoteSink, PendingNote, counted};
 use crate::history::{
     self, HistoryProject, HistoryResults, HistorySearch, HistoryStore, Ranking, iso_time,
 };
@@ -421,13 +421,17 @@ impl SearchCall {
                         rerank,
                         limit,
                     };
+                    let feature = DecisionFeature::HistorySearch;
+                    let pending = match (&caller.notes, &caller.judge) {
+                        (Some(notes), Some(judge)) if rerank => {
+                            notes.begin(&judge.decisions, feature)
+                        }
+                        _ => PendingNote::unanchored(feature),
+                    };
                     let mut results = history::search(&store, search, caller.judge.as_ref())
                         .await
                         .map_err(unreadable)?;
-                    if let (Some(notes), Some(decision)) = (&caller.notes, results.decision.take())
-                    {
-                        notes.emit(decision);
-                    }
+                    pending.settle(results.decision.take());
                     Ok(answered(results.summary(), results_value(&results)))
                 })
             });

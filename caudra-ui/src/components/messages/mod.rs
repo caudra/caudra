@@ -11,15 +11,16 @@ use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
-    AUTOPILOT_BODY_INDENT, DECISION_BODY_INDENT, RenderCtx, ScrollTail, ToolLines,
-    append_annotation, append_right_info, assistant_style, autopilot_style,
-    build_instructions_lines, build_tool_lines, decision_style, done_style, draws_live_script,
-    error_style, format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
-    truncate_to_header, user_style,
+    AUTOPILOT_BODY_INDENT, DECISION_PREFIX, RenderCtx, ScrollTail, ToolLines, append_annotation,
+    append_right_info, assistant_style, autopilot_style, build_instructions_lines,
+    build_tool_lines, done_style, draws_live_script, error_style, format_timestamp_now, names_tool,
+    notice_style, shell_clock_ticks, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
-    apply_scroll_rows, automation_inspector, code_card,
+    apply_scroll_rows, automation_inspector,
+    card_decisions::{self, CardDecision},
+    code_card,
     code_view::{
         self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
         CardPolicy, Disclosure, RowTarget, ScrollSpan, ScrollWindow,
@@ -68,7 +69,7 @@ use super::tooltip::{Anchor, Tip, TipKey};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::code::output::{CodeCall, CodeOutput};
 use caudra_agent::commits::{self, CommitRef};
-use caudra_agent::decisions::NoteOutcome;
+use caudra_agent::decisions::{DecisionFeature, NoteOutcome};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
@@ -1108,6 +1109,8 @@ pub struct MessagesPanel {
     /// The session's working directory, which a call's `workdir` argument is
     /// resolved against until its result says where the call ran.
     cwd: Option<Arc<Path>>,
+    /// Whether a card draws what the engine decided about its call.
+    show_decisions: bool,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose message changed since the last frame and whose segment is
@@ -1217,6 +1220,7 @@ impl MessagesPanel {
             hover: None,
             commit_index: CommitIndex::default(),
             cwd: None,
+            show_decisions: ui_config.show_decisions,
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
@@ -1796,39 +1800,28 @@ impl MessagesPanel {
         );
     }
 
-    /// Puts `msg` before the message at `index`. Only the segments from there
-    /// on are rebuilt. An index naming a later message follows it, except a
-    /// reasoning window's or a diagram's, which are let go as
-    /// [`Self::remove`] lets them go.
-    pub fn insert(&mut self, index: usize, msg: DisplayMessage) {
-        if index >= self.messages.len() {
-            self.push(msg);
-            return;
-        }
-        self.clear_hover();
-        self.messages.insert(index, msg);
-        self.cache.truncate_messages(index);
-        let follow = |at: usize| if at >= index { at + 1 } else { at };
-        self.auto_open = self.auto_open.map(follow);
-        if let Some(anchor) = &mut self.held_anchor {
-            anchor.msg_index = anchor.msg_index.map(follow);
-        }
-        self.diagram_pans.retain(|key, _| key.msg_index < index);
-        self.forget_thinking_windows(
-            |block| matches!(block, ThinkingWindow::Settled(msg_index) if msg_index >= index),
-        );
+    /// Puts `decision` on the card that draws its call, a batch child's on
+    /// its batch's card. `false` when no card holds the call.
+    pub fn attach_decision(&mut self, decision: CardDecision) -> bool {
+        let Some(root) = self.root_tool_id(&decision.call_id).map(str::to_owned) else {
+            return false;
+        };
+        self.update_tool(&root, |msg| {
+            card_decisions::record(&mut msg.decisions, decision)
+        });
+        true
     }
 
-    /// Where a row reporting on the call `tool_id` names goes: right after
-    /// its card, past any rows already reporting on it. `None` when no card
-    /// holds the call. A batch child's card is its batch's.
-    pub fn row_after_card(&self, tool_id: &str) -> Option<usize> {
-        let (card, _) = self.tool_card(self.root_tool_id(tool_id)?)?;
-        let reports = self.messages[card + 1..]
-            .iter()
-            .take_while(|msg| matches!(msg.role, DisplayRole::Decision(_)))
-            .count();
-        Some(card + 1 + reports)
+    /// The engine answered `feature` about `call_id` with nothing to show.
+    pub fn settle_decision(&mut self, call_id: &str, feature: &DecisionFeature) {
+        let Some(root) = self.root_tool_id(call_id).map(str::to_owned) else {
+            return;
+        };
+        if let Some(msg) = self.find_tool_msg_mut(&root)
+            && card_decisions::settle(&mut msg.decisions, call_id, feature)
+        {
+            self.mark_card_dirty(&root);
+        }
     }
 
     /// Drops the newest harness notice reading `text`. Found by content rather
@@ -2706,6 +2699,9 @@ impl MessagesPanel {
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         self.clear_history_anchors(&event.id);
         self.dirty_cards.remove(&event.id);
+        if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            card_decisions::settle_all(&mut msg.decisions);
+        }
         let active_shell = |call_id: &str| {
             self.task_cards
                 .get(call_id)
@@ -3584,6 +3580,21 @@ impl MessagesPanel {
     /// running, and a call that ran names the directory its result recorded.
     pub(crate) fn set_cwd(&mut self, cwd: &Path) {
         self.cwd = Some(Arc::from(cwd));
+    }
+
+    /// Redraws only the cards that carry a decision, the rest look the same.
+    pub(crate) fn set_show_decisions(&mut self, shown: bool) {
+        if self.show_decisions == shown {
+            return;
+        }
+        self.show_decisions = shown;
+        let decided: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|msg| !msg.decisions.is_empty())
+            .filter_map(|msg| msg.role.tool_id().map(str::to_owned))
+            .collect();
+        self.dirty_cards.extend(decided);
     }
 
     /// The text of the reader's own message under the pointer, and how far into
@@ -5293,6 +5304,7 @@ impl MessagesPanel {
             batch_started: &self.batch_child_started,
             task_cards: Some(&self.task_cards),
             cwd: self.cwd.clone(),
+            show_decisions: self.show_decisions,
         }
     }
 
@@ -6249,21 +6261,10 @@ fn injected_line(text: &str) -> Vec<Line<'static>> {
 /// A decision row's title behind its prefix, and once `open`, each detail
 /// under it. Plain text: a label such as a note name is drawn as written.
 fn built_decision(msg: &DisplayMessage, outcome: NoteOutcome, open: bool) -> BuiltMessage {
-    let style = decision_style(outcome);
-    let mut text = msg.text.lines();
-    let mut lines = vec![Line::from(vec![
-        Span::styled(style.prefix, style.prefix_style),
-        Span::styled(text.next().unwrap_or_default().to_owned(), style.text_style),
-    ])];
-    if open {
-        lines.extend(text.map(|detail| {
-            Line::from(vec![
-                Span::raw(DECISION_BODY_INDENT),
-                Span::styled(detail.to_owned(), style.text_style),
-            ])
-        }));
-    }
-    BuiltMessage::bare(lines, format!("{}{}", style.prefix, msg.text))
+    BuiltMessage::bare(
+        card_decisions::decision_lines(&msg.text, outcome, open),
+        format!("{DECISION_PREFIX}{}", msg.text),
+    )
 }
 
 /// An autopilot decision's title as an autopilot row draws it, its subject

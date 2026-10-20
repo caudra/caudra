@@ -23,6 +23,7 @@ use crate::autopilot::{
     AutopilotHandle, DecisionKind, DecisionOrigin, DecisionOutcome, DecisionRequest, DecisionSlot,
     DelegateAction, DelegateOutcome, DelegateOutput, WireError, mode_label,
 };
+use crate::decisions::{DecisionFeature, NoteAnchor, NoteSink};
 use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
 use crate::tools::{PermissionIntent, PermissionScopes, ToolContext};
 use crate::types::Answerer;
@@ -826,10 +827,15 @@ impl PermissionManager {
         let mut escalation = None;
         let mut screening_note = None;
         if let Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine) = current.auto {
+            let pending = self.decisions().map(|service| {
+                NoteSink::new(event_tx.clone(), NoteAnchor::Tool(request_id.to_owned()))
+                    .begin(&service, DecisionFeature::AutoScreening)
+            });
             let screened = self
                 .screen_auto_candidate(&request, &context, cancel)
                 .await
                 .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
+            drop(pending);
             let note = screened.decision_note(request_id, cancel);
             current = screened.policy;
             if current.automatic {
@@ -1023,6 +1029,13 @@ impl PermissionManager {
         let advice_revision = self.broker.revision.load(Ordering::Acquire);
         let mut advisory_task = self.permission_advice(&request);
         let mut shell_advisory_task = self.shell_effect_advice(&request, context.plan_scoped);
+        let mut shell_pending = self
+            .decisions()
+            .filter(|_| shell_advisory_task.is_some())
+            .map(|service| {
+                NoteSink::new(event_tx.clone(), NoteAnchor::Tool(request_id.to_owned()))
+                    .begin(&service, DecisionFeature::ShellEffect)
+            });
         let wait = async {
             let mut source_request_id = String::new();
             let mut delegate_call = delegate
@@ -1092,6 +1105,7 @@ impl PermissionManager {
                             };
                             let (service, decision) = task.await;
                             shell_advisory_task = None;
+                            shell_pending = None;
                             (service, decision, false)
                         },
                     )

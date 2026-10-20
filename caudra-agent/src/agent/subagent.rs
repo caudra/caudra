@@ -1486,6 +1486,7 @@ async fn route_subagent(
     let context = ctx
         .permissions
         .decision_context(json!({"input_scope": ROUTING_INPUT_SCOPE}));
+    let pending = ctx.begin_decision(&decisions, feature.clone());
     let outcome = ctx
         .cancel
         .race(
@@ -1495,7 +1496,9 @@ async fn route_subagent(
         .await
         .ok()
         .flatten()
-        .flatten()?;
+        .flatten();
+    drop(pending);
+    let outcome = outcome?;
     if !ctx.permissions.passive_decision_is_current(revision) {
         return None;
     }

@@ -1,5 +1,6 @@
 use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, task_card};
 
+use super::card_decisions::{self, CardDecision};
 use super::code_view;
 use super::command_text::{command_spans, overlay};
 use super::mcp_card::{McpCall, OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER, script_argument};
@@ -177,6 +178,8 @@ pub struct RenderCtx<'a> {
     /// resolved against until its result says where the call ran. `None`
     /// names no directory for a call that has no result yet.
     pub cwd: Option<Arc<Path>>,
+    /// Whether the card draws what the engine decided about its call.
+    pub show_decisions: bool,
 }
 
 impl RenderCtx<'_> {
@@ -2157,6 +2160,14 @@ impl ToolLineBuilder {
         self.search_text.push_str(text);
     }
 
+    /// What the engine decided about the call leads its opened body.
+    fn push_decisions(&mut self, decisions: &[CardDecision]) {
+        for (lines, text) in card_decisions::section(decisions) {
+            self.lines.extend(indented(lines, self.body_indent));
+            self.push_search_text(text);
+        }
+    }
+
     /// The leading glyph is the tool, so a glance at the head says what the
     /// card is doing rather than only how it ended. The sigil holds one column
     /// in both states: the spinner takes the slot in front of it while the
@@ -3023,14 +3034,23 @@ pub fn build_tool_lines(
         .as_deref()
         .filter(|_| msg.render_snapshot.is_none());
 
+    let call_id = msg.role.tool_id().unwrap_or_default();
+    let decisions: &[CardDecision] = match rctx.show_decisions {
+        true => &msg.decisions,
+        false => &[],
+    };
+    let mut limits = rctx.limits_for(
+        msg.role.tool_id(),
+        expanded.full,
+        rctx.resting_budget(tool_name, msg.tool_output.as_deref()),
+    );
+    if !decisions.is_empty() {
+        limits.decisions = card_decisions::children(decisions, call_id);
+    }
     let mut b = ToolLineBuilder::new(
         rctx.width,
         Indicator::resolve(status, msg.tool_output.as_deref()),
-        rctx.limits_for(
-            msg.role.tool_id(),
-            expanded.full,
-            rctx.resting_budget(tool_name, msg.tool_output.as_deref()),
-        ),
+        limits,
     );
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
@@ -3044,7 +3064,10 @@ pub fn build_tool_lines(
         msg.tool_output.as_deref(),
         rctx.cwd.as_deref(),
     );
-    let annotation = annotation_spans(report.as_deref(), workdir);
+    let mut annotation = annotation_spans(report.as_deref(), workdir);
+    annotation.extend(card_decisions::chip_spans(card_decisions::about(
+        decisions, call_id,
+    )));
     if rctx.compact {
         b.push_compact_header(
             tool_name,
@@ -3114,12 +3137,14 @@ pub fn build_tool_lines(
             || msg.tool_input.is_some()
             || msg.tool_output.is_some()
             || msg.live_body.is_some()
+            || card_decisions::any_settled(decisions)
             || body.is_some_and(|body| !body.trim().is_empty());
         if let Some((progress, first, window)) = progress_body {
             b.push_progress_body(progress, first, window);
         }
         return b.finish(msg.tool_input.clone(), msg.tool_output.clone());
     }
+    b.push_decisions(decisions);
     if is_report {
         if let Some(message) = report_message(tool_name, msg.tool_raw_input.as_deref()) {
             let start = b.lines.len();
@@ -3544,6 +3569,7 @@ mod tests {
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
     use crate::selection::ScreenSelection;
+    use caudra_agent::decisions::DecisionFeature;
     use caudra_agent::peers::SendReceipt;
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
@@ -3586,6 +3612,7 @@ mod tests {
             batch_started: &NO_STARTED,
             task_cards: None,
             cwd: None,
+            show_decisions: true,
         }
     }
 
@@ -3699,6 +3726,7 @@ mod tests {
         output: Option<ToolOutput>,
     ) -> DisplayMessage {
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -3790,6 +3818,7 @@ mod tests {
         output: Option<ToolOutput>,
     ) -> DisplayMessage {
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -5262,6 +5291,7 @@ mod tests {
 
     fn task_msg(output: String) -> DisplayMessage {
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -5366,6 +5396,7 @@ mod tests {
 
     fn index_msg(body: &str) -> DisplayMessage {
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -5467,6 +5498,7 @@ mod tests {
 
     fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -5783,6 +5815,7 @@ mod tests {
             )
         };
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -6420,6 +6453,7 @@ mod tests {
     ) -> DisplayMessage {
         let lines: Vec<String> = (0..line_count).map(|i| format!("{prefix} {i}")).collect();
         DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -7836,6 +7870,7 @@ mod tests {
             style: SpanStyle::Default,
         }]]);
         let msg = DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -7884,6 +7919,7 @@ mod tests {
             style: SpanStyle::Default,
         }]]);
         let msg = DisplayMessage {
+            decisions: Vec::new(),
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
@@ -9289,6 +9325,70 @@ mod tests {
             text.contains(IMAGE_MISSING_PREFIX),
             matches!(shown, Shown::MissingFile),
             "{text}"
+        );
+    }
+
+    const DECIDED_COMMAND: &str = "cargo nextest run --workspace --all-features";
+    const RERANKED_CHIP: &str = "reranked";
+    const DECISION_SUMMARY: &str = "moved 5 of 12 rows up";
+    const DECISION_DETAIL: &str = "0.97  src/lib.rs:12  moved 4th to 1st";
+    const NARROW_CARD: u16 = 24;
+
+    fn decided_card(width: u16, shown: bool, expansion: Option<Disclosure>) -> ToolLines {
+        let mut msg = bash_msg(DECIDED_COMMAND, ToolStatus::Success, None, None);
+        msg.decisions.push(CardDecision::settled(
+            "t1".into(),
+            DecisionFeature::SourceCodeContext,
+            NoteOutcome::Acted,
+            DECISION_SUMMARY,
+            &[DECISION_DETAIL.into()],
+        ));
+        let rctx = RenderCtx {
+            show_decisions: shown,
+            ..test_rctx(width)
+        };
+        build_tool_lines(&msg, ToolStatus::Success, &rctx, expansion)
+    }
+
+    #[test_case(UNBROKEN ; "a_wide_card")]
+    #[test_case(NARROW_CARD ; "a_card_too_narrow_for_its_command")]
+    fn the_chip_survives_the_header_it_rides_on(width: u16) {
+        let text = lines_text(&decided_card(width, true, None));
+        assert!(text.contains(RERANKED_CHIP), "{text}");
+    }
+
+    #[test_case(None, false ; "a_folded_card_keeps_it_to_the_chip")]
+    #[test_case(Some(Disclosure::default()), true ; "an_opened_card_shows_what_was_decided")]
+    fn the_decision_section_shows_only_in_an_open_body(
+        expansion: Option<Disclosure>,
+        opened: bool,
+    ) {
+        let tl = decided_card(UNBROKEN, true, expansion);
+        let text = lines_text(&tl);
+        assert_eq!(
+            (
+                text.contains(DECISION_SUMMARY),
+                text.contains(DECISION_DETAIL),
+                tl.search_text.contains(DECISION_SUMMARY),
+            ),
+            (opened, opened, opened),
+            "{text}"
+        );
+    }
+
+    #[test_case(None ; "folded")]
+    #[test_case(Some(Disclosure::default()) ; "opened")]
+    fn a_card_hides_its_decisions_while_they_are_switched_off(expansion: Option<Disclosure>) {
+        let tl = decided_card(UNBROKEN, false, expansion);
+        let text = lines_text(&tl);
+        assert!(
+            !text.contains(RERANKED_CHIP) && !text.contains(DECISION_SUMMARY),
+            "{text}"
+        );
+        assert!(
+            !tl.search_text.contains(DECISION_SUMMARY),
+            "{}",
+            tl.search_text
         );
     }
 }

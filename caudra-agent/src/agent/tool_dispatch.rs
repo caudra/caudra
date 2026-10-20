@@ -594,6 +594,8 @@ pub async fn run(
         && let Some(output_ref) = &done.output_ref
         && let Some(decisions) = ctx.permissions.decisions()
     {
+        let pending = NoteSink::new(ctx.event_tx.clone(), NoteAnchor::Tool(done.id.clone()))
+            .begin(&decisions, DecisionFeature::OutputPointers);
         let (pointers, note) = output_pointers::pointer_lines(
             OmittedOutput {
                 focus,
@@ -616,9 +618,7 @@ pub async fn run(
                 None => pointers,
             });
         }
-        if let Some(note) = note {
-            NoteSink::new(ctx.event_tx.clone(), NoteAnchor::Tool(done.id.clone())).emit(note);
-        }
+        pending.settle(note);
     }
     if !admitted
         && !ctx.cancel.is_cancelled()
@@ -637,6 +637,8 @@ pub async fn run(
         let context = ctx
             .permissions
             .decision_context(serde_json::json!({"tool": canonical}));
+        let pending = NoteSink::new(ctx.event_tx.clone(), NoteAnchor::Tool(done.id.clone()))
+            .begin(&decisions, DecisionFeature::ContentScreening);
         let screening = ctx
             .cancel
             .race(
@@ -681,10 +683,7 @@ pub async fn run(
             )),
             Screening::Quiet => None,
         };
-        if let Some(note) = note {
-            ctx.event_tx
-                .try_send(note.anchored(NoteAnchor::Tool(done.id.clone())));
-        }
+        pending.settle(note);
     }
     if !ctx.cancel.is_cancelled()
         && let Some(observations) = &ctx.steering_observations
@@ -819,6 +818,8 @@ async fn run_inner(
             && matches!(entry.source, ToolSource::Native { trusted: true, .. })
             && let Some(decisions) = ctx.permissions.decisions()
         {
+            let _pending = NoteSink::new(ctx.event_tx.clone(), NoteAnchor::Tool(id.clone()))
+                .begin(&decisions, DecisionFeature::ShellDuration);
             ctx.cancel
                 .race(
                     ctx.permissions

@@ -51,7 +51,8 @@ pub use active::{
 };
 pub use content::Screening;
 pub use note::{
-    DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, counted, placement, score_line,
+    DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, PendingDecision, PendingNote,
+    counted, placement, score_line,
 };
 pub use permission::{
     PERMISSION_QUESTION_FILE, PermissionAction, PermissionDecision, PermissionFlag,

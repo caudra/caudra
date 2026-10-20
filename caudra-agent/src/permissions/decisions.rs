@@ -565,8 +565,8 @@ mod tests {
     use crate::permissions::enforce::EvaluationContext;
     use crate::permissions::tests::{
         CONTROLLED_REQUEST, FIRST_COMMAND, SHELL_WORKDIR, controlled_enforcement, default_mgr,
-        enforce_shell_without_prompt, make_config, mgr_with, opaque_line_intent, shell_policy_rule,
-        shell_prompt, shell_request, workcell_shell_subject,
+        enforce_shell_without_prompt, make_config, mgr_with, next_shown_event, opaque_line_intent,
+        shell_policy_rule, shell_prompt, shell_request, shown_events, workcell_shell_subject,
     };
     use crate::permissions::{
         AutoNote, EngineFlag, PendingRegistration, PermissionAnswer, PermissionManager,
@@ -933,17 +933,17 @@ mod tests {
                 Box::pin(controlled_enforcement(&manager, &scopes, &sender, &cancel));
             assert!(future::poll_once(&mut enforcement).await.is_none());
             assert_eq!(service.calls.load(Ordering::Relaxed), 1);
-            assert!(events.is_empty());
+            assert!(shown_events(&events).is_empty());
             manager.set_session_mode(Some(mode));
             let result = future::poll_once(&mut enforcement).await;
             if allowed {
                 assert!(result.unwrap().is_ok());
-                assert!(events.is_empty());
+                assert!(shown_events(&events).is_empty());
             } else {
                 assert!(result.is_none());
                 assert!(matches!(
-                    events.try_recv().unwrap().event,
-                    AgentEvent::PermissionRequest(_)
+                    shown_events(&events).first(),
+                    Some(AgentEvent::PermissionRequest(_))
                 ));
                 assert!(future::poll_once(&mut enforcement).await.is_none());
                 assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
@@ -1004,11 +1004,10 @@ mod tests {
                     enforcement.as_mut().await.unwrap();
                     panic!("{PREMATURE_ADMISSION}");
                 },
-                events.recv_async(),
+                next_shown_event(&events),
             )
-            .await
-            .unwrap();
-            let AgentEvent::PermissionRequest(request) = prompt.event else {
+            .await;
+            let AgentEvent::PermissionRequest(request) = prompt else {
                 panic!("{PROMPT_MISSING}");
             };
             assert!(!request.presentation.advisories.is_empty());

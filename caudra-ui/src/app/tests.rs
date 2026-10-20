@@ -28600,6 +28600,7 @@ mod engine_decisions {
     };
     use crate::AppSession;
     use crate::chat::Chat;
+    use crate::components::card_decisions::DecisionState;
     use crate::components::{DECISION_SEPARATOR, DisplayRole};
 
     const CALL: &str = "decision-call";
@@ -28624,19 +28625,29 @@ mod engine_decisions {
         .into()
     }
 
-    /// A card by its call, a decision row by its summary, anything else by
-    /// its text.
+    fn decision_summary(text: &str) -> &str {
+        let title = text.lines().next().unwrap_or_default();
+        title.rsplit(DECISION_SEPARATOR).next().unwrap_or_default()
+    }
+
+    /// A card by its call followed by the decisions it carries, a decision
+    /// row by its summary, anything else by its text.
     fn placement(chat: &Chat) -> Vec<&str> {
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
-            .map(|message| match &message.role {
-                DisplayRole::Tool(tool) => tool.id.as_str(),
-                DisplayRole::Decision(_) => message
-                    .text
-                    .rsplit(DECISION_SEPARATOR)
-                    .next()
-                    .unwrap_or_default(),
-                _ => message.text.as_str(),
+            .flat_map(|message| match &message.role {
+                DisplayRole::Tool(tool) => {
+                    std::iter::once(tool.id.as_str())
+                        .chain(message.decisions.iter().filter_map(
+                            |decision| match &decision.state {
+                                DecisionState::Settled { text, .. } => Some(decision_summary(text)),
+                                DecisionState::Pending => None,
+                            },
+                        ))
+                        .collect::<Vec<_>>()
+                }
+                DisplayRole::Decision(_) => vec![decision_summary(&message.text)],
+                _ => vec![message.text.as_str()],
             })
             .collect()
     }

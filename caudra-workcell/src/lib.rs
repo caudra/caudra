@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use caudra_agent::decisions::{
-    CodeSymbol, rerank_source_code_context, source_code_context_out_of_deadline,
+    CodeSymbol, DecisionFeature, rerank_source_code_context, source_code_context_out_of_deadline,
 };
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
@@ -4293,6 +4293,7 @@ async fn rerank_context_rows(
         Some(ctx.permissions.as_ref()),
         &ctx.cancel,
     );
+    let pending = ctx.begin_decision(&decisions, DecisionFeature::SourceCodeContext);
     let (reordered, note) = match remaining {
         Some(remaining) => {
             future::or(rerank, async {
@@ -4303,9 +4304,7 @@ async fn rerank_context_rows(
         }
         None => rerank.await,
     };
-    if let Some((note, sink)) = note.zip(ctx.note_sink()) {
-        sink.emit(note);
-    }
+    pending.settle(note);
     reordered
 }
 

@@ -194,12 +194,13 @@ version = 1
 # Type: bool.
 # show_reminders = true
 
-# Show what the decision engine changed: one row where it reordered, pruned or
-# pointed out results, suggested a skill or model, skipped a goal check, or
-# flagged a call, and one where it failed and the default applied. A dim
-# `shadow` row shows what a feature in shadow mode would have done. Each row
-# expands on click to the candidates and scores behind it. The model never sees
-# these rows.
+# Show what the decision engine changed or is deciding. A decision about a tool
+# call is a chip on the call's card, such as `◆ reranking…` while the
+# engine works and `◆ reranked` once it answers, and opening the card shows
+# the candidates and scores behind it. A decision about a turn, such as a skill
+# suggestion or a skipped goal check, is a row that expands on click. Failures
+# say the default applied, and `shadow` marks what a feature in shadow mode
+# would have done. The model never sees them.
 # Type: bool.
 # show_decisions = true
 

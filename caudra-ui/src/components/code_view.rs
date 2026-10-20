@@ -14,6 +14,7 @@ use crate::provenance::LineProvenance;
 use crate::selection::wrap_breaks;
 use crate::theme;
 
+use super::card_decisions::{self, ChildDecisions};
 use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
@@ -1187,6 +1188,9 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             child_annotation(entry, limits.progress.get(&index)).as_deref(),
             workdir,
         ));
+        if let Some(decisions) = limits.decisions.get(&index) {
+            spans.extend(card_decisions::chip_spans(decisions));
+        }
         if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
             let clock = match entry.status {
                 BatchToolStatus::Running => format_live_duration(elapsed),
@@ -3456,6 +3460,9 @@ pub struct RenderLimits {
     /// The children of a `code` card whose answers the snippet only printed or ended on, by index
     /// in the roster. Each one's card stands in for that dump, so it rests open.
     pub stands_in: Arc<[usize]>,
+    /// What the decision engine decided about each child, by index in the
+    /// roster.
+    pub decisions: ChildDecisions,
 }
 
 impl RenderLimits {
@@ -3474,6 +3481,7 @@ impl RenderLimits {
             width: UNCONSTRAINED_WIDTH,
             cwd: None,
             stands_in: Arc::default(),
+            decisions: ChildDecisions::default(),
         }
     }
 
@@ -3632,6 +3640,7 @@ impl RenderLimits {
             width: self.width.saturating_sub(batch_child_indent_width()),
             cwd: self.cwd.clone(),
             stands_in: Arc::default(),
+            decisions: ChildDecisions::default(),
         })
     }
 }

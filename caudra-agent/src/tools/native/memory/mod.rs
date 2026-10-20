@@ -25,7 +25,7 @@ use caudra_workspace::RecordScope;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::decisions::{DecisionFeature, NoteDraft, NoteSink, counted};
+use crate::decisions::{DecisionFeature, NoteSink, PendingNote, counted};
 use crate::memory::relevance::{self, Judge};
 use crate::memory::search::{Hit, MAX_HITS, terms};
 use crate::memory::snapshot::EntryStatus;
@@ -753,8 +753,9 @@ async fn ranked_search(
     rows: Option<&NoteSink>,
 ) -> Result<(Vec<Hit>, Vec<String>), ToolError> {
     let pool = store.search_pool(query)?;
+    let pending = begin(rows, judge, DecisionFeature::MemorySearch);
     let (ranking, note) = relevance::rank_search(judge, query, &pool).await;
-    emit(rows, note);
+    pending.settle(note);
     let Some(ranking) = ranking else {
         return Ok((
             pool.into_iter()
@@ -855,10 +856,11 @@ async fn duplicates(
     rows: Option<&NoteSink>,
 ) -> String {
     let notes = relevance::duplicate_pool(store, name, content);
+    let pending = begin(rows, judge, DecisionFeature::MemoryDuplicates);
     let advice = match relevance::duplicate_advice(judge, name, content, &notes).await {
         Ok(advice) => advice,
         Err(note) => {
-            emit(rows, note);
+            pending.settle(note);
             return String::new();
         }
     };
@@ -869,10 +871,7 @@ async fn duplicates(
         "named {} on the same topic",
         counted(advice.advised.len(), EXISTING_NOTE, EXISTING_NOTES)
     );
-    emit(
-        rows,
-        Some(advice.note(DecisionFeature::MemoryDuplicates, &acted, &notes)),
-    );
+    pending.emit(advice.note(DecisionFeature::MemoryDuplicates, &acted, &notes));
     if !advice.applied() {
         return String::new();
     }
@@ -885,9 +884,10 @@ async fn duplicates(
     advised
 }
 
-fn emit(rows: Option<&NoteSink>, note: Option<NoteDraft>) {
-    if let (Some(rows), Some(note)) = (rows, note) {
-        rows.emit(note);
+fn begin(rows: Option<&NoteSink>, judge: &Judge, feature: DecisionFeature) -> PendingNote {
+    match rows {
+        Some(rows) => rows.begin(&judge.decisions, feature),
+        None => PendingNote::unanchored(feature),
     }
 }
 

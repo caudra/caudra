@@ -507,6 +507,8 @@ pub fn run(
             | AgentEvent::Nudge { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::Decision(_)
+            | AgentEvent::DecisionPending(_)
+            | AgentEvent::DecisionSettled(_)
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::PromptProgress { .. } => {}

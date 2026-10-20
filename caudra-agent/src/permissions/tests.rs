@@ -7,7 +7,7 @@ use caudra_workspace::{
     ResourceRevision, SourceTrustAnchor, WorkspacePath,
 };
 
-use crate::{AgentEvent, EventSender};
+use crate::{AgentEvent, Envelope, EventSender};
 
 use std::sync::Arc;
 
@@ -754,7 +754,34 @@ pub(super) async fn controlled_enforcement(
 
 pub(super) const SHELL_PROMPT_MISSING: &str = "the shell call ran without a prompt";
 
-const PROMPT_NOT_FIRST: &str = "a prompted shell call raises its prompt before any other event";
+const PROMPT_NOT_FIRST: &str =
+    "a prompted shell call raises its prompt before any event but the engine's waits";
+
+fn is_engine_wait(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::DecisionPending(_) | AgentEvent::DecisionSettled(_)
+    )
+}
+
+/// Every event sent so far, leaving out the engine's waits around a call.
+pub(super) fn shown_events(events: &flume::Receiver<Envelope>) -> Vec<AgentEvent> {
+    events
+        .drain()
+        .map(|envelope| envelope.event)
+        .filter(|event| !is_engine_wait(event))
+        .collect()
+}
+
+/// The next event that is not one of the engine's waits.
+pub(super) async fn next_shown_event(events: &flume::Receiver<Envelope>) -> AgentEvent {
+    loop {
+        let event = events.recv_async().await.unwrap().event;
+        if !is_engine_wait(&event) {
+            return event;
+        }
+    }
+}
 
 /// A line the first-party shell could not review command by command, the way
 /// it presents one: the command it did read, then the whole line, protected
@@ -811,8 +838,7 @@ pub(super) async fn shell_prompt(
             None
         },
         async {
-            let AgentEvent::PermissionRequest(request) = events.recv_async().await.unwrap().event
-            else {
+            let AgentEvent::PermissionRequest(request) = next_shown_event(&events).await else {
                 panic!("{PROMPT_NOT_FIRST}");
             };
             Some(request)

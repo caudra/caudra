@@ -5,7 +5,7 @@ use caudra_storage::engine_decisions::{
 use serde::{Serialize, Serializer};
 
 use super::{DecisionFeature, Decisions, candidate_text};
-use crate::EventSender;
+use crate::{AgentEvent, EventSender};
 
 const MAX_SUMMARY_BYTES: usize = 200;
 const MAX_DETAIL_BYTES: usize = 200;
@@ -223,6 +223,80 @@ impl NoteSink {
     pub fn emit(&self, draft: NoteDraft) {
         self.event_tx.try_send(draft.anchored(self.anchor.clone()));
     }
+
+    /// Says `feature` is asking the engine about this anchor, when it will:
+    /// a feature that is off or has no engine never waits, so nothing is said.
+    pub fn begin(&self, decisions: &Decisions, feature: DecisionFeature) -> PendingNote {
+        let pending = decisions.enabled(&feature);
+        if pending {
+            self.event_tx.try_send(AgentEvent::DecisionPending(Box::new(
+                self.pending(&feature),
+            )));
+        }
+        PendingNote {
+            sink: Some(self.clone()),
+            feature,
+            pending,
+        }
+    }
+
+    fn pending(&self, feature: &DecisionFeature) -> PendingDecision {
+        PendingDecision {
+            feature: feature.clone(),
+            anchor: self.anchor.clone(),
+        }
+    }
+}
+
+/// A decision a call waits on, so its card can say so until the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingDecision {
+    #[serde(serialize_with = "feature_name")]
+    pub feature: DecisionFeature,
+    pub anchor: NoteAnchor,
+}
+
+/// Holds a [`PendingDecision`] open. Emitting the note settles it; dropped
+/// without one, because the engine stayed quiet, nothing changed, or the call
+/// was cancelled, it says the wait is over.
+pub struct PendingNote {
+    sink: Option<NoteSink>,
+    feature: DecisionFeature,
+    pending: bool,
+}
+
+impl PendingNote {
+    /// For a surface with nowhere to place a row.
+    pub fn unanchored(feature: DecisionFeature) -> Self {
+        Self {
+            sink: None,
+            feature,
+            pending: false,
+        }
+    }
+
+    pub fn emit(mut self, draft: NoteDraft) {
+        self.pending &= draft.feature != self.feature;
+        if let Some(sink) = &self.sink {
+            sink.emit(draft);
+        }
+    }
+
+    pub fn settle(self, draft: Option<NoteDraft>) {
+        if let Some(draft) = draft {
+            self.emit(draft);
+        }
+    }
+}
+
+impl Drop for PendingNote {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.as_ref().filter(|_| self.pending) {
+            sink.event_tx.try_send(AgentEvent::DecisionSettled(Box::new(
+                sink.pending(&self.feature),
+            )));
+        }
+    }
 }
 
 /// `0.97  42+1 release-preview-7  kept 1st`: a candidate's score, the label
@@ -313,19 +387,25 @@ fn single_line(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::decisions::FeatureMode;
+    use caudra_config::decisions::{
+        DecisionEndpoint, DecisionProtocol, DecisionsConfig, FeatureMode,
+    };
     use caudra_storage::engine_decisions::{
         StoredDecisionAnchor, StoredDecisionOutcome, StoredEngineDecision,
     };
     use serde_json::json;
     use test_case::test_case;
 
+    use caudra_storage::StateDir;
+    use flume::Receiver;
+    use tempfile::TempDir;
+
     use super::{
         DecisionNote, ELLIPSIS, MAX_DETAIL_BYTES, MAX_DETAIL_LINES, MAX_NOTE_BYTES,
-        MAX_SUMMARY_BYTES, NoteAnchor, NoteOutcome, UNASSIGNED_SEQ, placement,
+        MAX_SUMMARY_BYTES, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, UNASSIGNED_SEQ, placement,
     };
-    use crate::AgentEvent;
-    use crate::decisions::DecisionFeature;
+    use crate::decisions::{DecisionFeature, Decisions};
+    use crate::{AgentEvent, Envelope, EventSender};
 
     const SUMMARY: &str = "moved 3 of 12 rows up";
     const DETAIL: &str = "0.97  42+1 release-preview-7  kept 1st";
@@ -338,6 +418,9 @@ mod tests {
     const TOOL_USE_ID: &str = "toolu_01";
     const AT_MS: u64 = 1_767_225_600_000;
     const AGENT: &str = "task-1";
+    const BASE_URL: &str = "http://127.0.0.1:1";
+    const PENDING: &str = "pending";
+    const SETTLED: &str = "settled";
 
     fn note(summary: &str, details: Vec<String>) -> DecisionNote {
         DecisionNote::new(
@@ -441,6 +524,69 @@ mod tests {
             }
         );
         assert_eq!(NoteOutcome::from(stored.outcome), note.outcome);
+    }
+
+    fn sink_for(mode: FeatureMode) -> (NoteSink, Decisions, Receiver<Envelope>, TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = DecisionsConfig {
+            endpoint: Some(DecisionEndpoint::new(
+                DecisionProtocol::TypeSafe.as_str(),
+                DecisionProtocol::TypeSafe,
+                BASE_URL.parse().unwrap(),
+            )),
+            ..DecisionsConfig::default()
+        };
+        config.features.source_code_context = mode;
+        let decisions = Decisions::new(config, &StateDir::from_path(root.path().into())).unwrap();
+        let (tx, rx) = flume::unbounded();
+        let sink = NoteSink::new(
+            EventSender::new(tx, 0),
+            NoteAnchor::Tool(TOOL_USE_ID.into()),
+        );
+        (sink, decisions, rx, root)
+    }
+
+    /// What the card hears, in order: `pending`, `settled`, or the note's summary.
+    fn heard(events: &Receiver<Envelope>) -> Vec<String> {
+        events
+            .try_iter()
+            .map(|envelope| match envelope.event {
+                AgentEvent::DecisionPending(pending) => {
+                    assert_eq!(pending.anchor, NoteAnchor::Tool(TOOL_USE_ID.into()));
+                    PENDING.to_owned()
+                }
+                AgentEvent::DecisionSettled(_) => SETTLED.to_owned(),
+                AgentEvent::Decision(note) => note.summary,
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect()
+    }
+
+    fn draft(feature: DecisionFeature) -> NoteDraft {
+        NoteDraft {
+            feature,
+            mode: FeatureMode::Enforce,
+            outcome: NoteOutcome::Acted,
+            summary: SUMMARY.into(),
+            details: Vec::new(),
+        }
+    }
+
+    #[test_case(Some(DecisionFeature::SourceCodeContext), &[PENDING, SUMMARY]; "its_note_settles_the_wait")]
+    #[test_case(None, &[PENDING, SETTLED]; "dropped_without_one_it_says_the_wait_is_over")]
+    #[test_case(Some(DecisionFeature::MemorySearch), &[PENDING, SUMMARY, SETTLED]; "another_features_note_leaves_it_waiting")]
+    fn a_wait_ends_once(emitted: Option<DecisionFeature>, expected: &[&str]) {
+        let (sink, decisions, events, _root) = sink_for(FeatureMode::Enforce);
+        let pending = sink.begin(&decisions, DecisionFeature::SourceCodeContext);
+        pending.settle(emitted.map(draft));
+        assert_eq!(heard(&events), expected);
+    }
+
+    #[test]
+    fn a_feature_that_is_off_never_waits() {
+        let (sink, decisions, events, _root) = sink_for(FeatureMode::Off);
+        drop(sink.begin(&decisions, DecisionFeature::SourceCodeContext));
+        assert!(heard(&events).is_empty());
     }
 
     #[test_case(NoteAnchor::History(HISTORY_LEN), json!({"history": HISTORY_LEN}); "history")]
