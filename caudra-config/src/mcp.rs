@@ -1,17 +1,24 @@
 //! `mcp.toml` constants and field metadata. The schema lives in caudra-agent,
 //! which reads these so the reference cannot drift from the loader.
 
-use crate::migration::ConfigFormat;
+use crate::migration::{ConfigFormat, MigrationError, Step, Upgrade};
 use crate::{ConfigField, ConfigValue};
 
 pub const MCP_FILE: &str = "mcp.toml";
-pub const MCP_VERSION: u32 = 1;
+pub const MCP_VERSION: u32 = 2;
 pub const MCP_FORMAT: ConfigFormat = ConfigFormat {
     file: MCP_FILE,
     latest: MCP_VERSION,
-    steps: &[],
+    steps: &[Step {
+        from: 1,
+        why: Some(DEFERRAL_REMOVED),
+        apply: upgrade_from_1,
+    }],
     requires_version: false,
 };
+const SERVERS_KEY: &str = "mcp";
+const DEFERRAL_REMOVED: &str =
+    "MCP tools are reached through the `code` tool, which loads nothing up front";
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_CALLBACK_PATH: &str = "/mcp/oauth/callback";
@@ -140,3 +147,17 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         description: "The host name of the redirect URI, such as `localhost` when the server registered that form. The listener still binds to 127.0.0.1",
     },
 ];
+
+fn upgrade_from_1(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+    upgrade.retire_key(&[], "defer_tools");
+    let servers: Vec<String> = upgrade
+        .document()
+        .get(SERVERS_KEY)
+        .and_then(|servers| servers.as_table_like())
+        .map(|servers| servers.iter().map(|(name, _)| name.to_owned()).collect())
+        .unwrap_or_default();
+    for server in servers {
+        upgrade.retire_key(&[SERVERS_KEY, &server], "always_load");
+    }
+    Ok(())
+}

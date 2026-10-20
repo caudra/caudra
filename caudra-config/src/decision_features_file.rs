@@ -82,10 +82,11 @@ mod tests {
     use crate::own_writes;
 
     const FEATURE: &str = "memory_search";
-    const COMMENTED: &str = "# my settings\n[decisions.features]\n# keep this\nmemory_search = \"off\" # trailing\nhistory_search = \"enforce\"\n";
-    const INLINE: &str = "[decisions]\nlog = true\nfeatures = { history_search = \"enforce\" }\n";
-    const DOTTED: &str = "decisions.features.history_search = \"enforce\"\n";
-    const SCALAR_FEATURES: &str = "[decisions]\nfeatures = 1\n";
+    const COMMENTED: &str = "# my settings\nversion = 2\n[decisions.features]\n# keep this\nmemory_search = \"off\" # trailing\nhistory_search = \"enforce\"\n";
+    const INLINE: &str =
+        "version = 2\n[decisions]\nlog = true\nfeatures = { history_search = \"enforce\" }\n";
+    const DOTTED: &str = "version = 2\ndecisions.features.history_search = \"enforce\"\n";
+    const SCALAR_FEATURES: &str = "version = 2\n[decisions]\nfeatures = 1\n";
 
     fn written(contents: Option<&str>) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();

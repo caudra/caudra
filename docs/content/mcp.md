@@ -67,7 +67,7 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-The file can start with `version = 1`, and a file without it counts as version 1. When the version is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions).
+The file starts with `version = 2`. A file without it counts as version 1, which Caudra upgrades as it reads it. When the version is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions).
 
 Earlier versions read a top-level `defer_tools` key and a per-server `always_load` key. MCP tools now load nothing up front (see [Code mode](#code-mode)), so a file that still sets either key fails to load until you delete it.
 

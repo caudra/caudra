@@ -22,7 +22,7 @@
 #
 # Full reference: https://caudra.ai/docs/configuration/
 
-version = 1
+version = 2
 
 # Start every session with YOLO mode (skip permission prompts, deny rules still
 # apply); global config only.

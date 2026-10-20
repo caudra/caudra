@@ -69,7 +69,7 @@ timeout_secs = 180
 max_file_size_mb = 4
 ```
 
-All fields are optional. A file may start with `version = 1`, and a file without it counts as version 1. Typos in field names and values of the wrong type cause an error right away, with the file and line.
+All fields are optional. A file may start with `version = 2`, and a file without it counts as version 2. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
@@ -901,7 +901,7 @@ Set `CAUDRA_NAMESPACE` to choose the directory name yourself instead of letting 
 
 ## Config file versions
 
-Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means. For a file with an optional key, the error says the file needs a newer Caudra.
+Each TOML config file takes a top-level `version`. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means. For a file with an optional key, the error says the file needs a newer Caudra.
 
 | File | `version` | Newer than this build reads |
 |------|-----------|-----------------------------|

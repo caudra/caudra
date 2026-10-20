@@ -34,7 +34,7 @@ description: "Every TOML config file in full, with each key commented out and de
 #
 # Full reference: https://caudra.ai/docs/configuration/
 
-version = 1
+version = 2
 
 # Start every session with YOLO mode (skip permission prompts, deny rules still
 # apply); global config only.
@@ -1285,7 +1285,7 @@ version = 1
 #
 # Full reference: https://caudra.ai/docs/permissions/#toml-policy
 
-version = 1
+version = 2
 
 # What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow`
 # acts as `prompt` and waits in /permissions for review, and a project cannot
@@ -1370,7 +1370,7 @@ version = 1
 #
 # Full reference: https://caudra.ai/docs/mcp/
 
-version = 1
+version = 2
 
 # [mcp.filesystem]
 # Each [mcp.NAME] table is one server, and a stdio server like this one runs

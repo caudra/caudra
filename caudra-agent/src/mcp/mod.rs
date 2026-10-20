@@ -2515,7 +2515,8 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use async_lock::Mutex as AsyncMutex;
-    use caudra_config::mcp::MCP_FILE;
+    use caudra_config::config_version::CONFIG_VERSION_KEY;
+    use caudra_config::mcp::{MCP_FILE, MCP_VERSION};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
     use caudra_workspace::PlanRef;
@@ -3605,7 +3606,7 @@ mod tests {
             std::fs::write(
                 global.join(MCP_FILE),
                 format!(
-                    "[mcp.{RELOAD_SERVER}]\ncommand = ['{MISSING_PROGRAM}']\nenabled = {initially_enabled}\n"
+                    "{CONFIG_VERSION_KEY} = {MCP_VERSION}\n[mcp.{RELOAD_SERVER}]\ncommand = ['{MISSING_PROGRAM}']\nenabled = {initially_enabled}\n"
                 ),
             )
             .unwrap();

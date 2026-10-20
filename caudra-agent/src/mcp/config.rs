@@ -24,9 +24,6 @@ use caudra_config::{global_config_dir, is_valid_server_name};
 
 const SERVERS_KEY: &str = "mcp";
 const ENABLED_KEY: &str = "enabled";
-const REMOVED_TOP_LEVEL_KEY: &str = "defer_tools";
-const REMOVED_SERVER_KEY: &str = "always_load";
-const REMOVED_KEY_REASON: &str = "was removed: MCP tools are reached through the `code` tool, which loads nothing up front. Delete the key";
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
@@ -754,7 +751,7 @@ fn write_enabled(
     }
 
     let mcp = doc
-        .entry("mcp")
+        .entry(SERVERS_KEY)
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
     let server = mcp
         .as_table_like_mut()
@@ -781,25 +778,6 @@ pub fn validate_project(_path: &Path, text: &str) -> Result<(), String> {
 
 /// Only the global file may read the environment: a project file runs no
 /// review before an HTTPS server connects, so it could send a secret anywhere.
-/// The first key `content` sets that code mode removed, spelled as the file spells it. A file
-/// that still tunes deferral would otherwise load as though it did something.
-fn removed_key(content: &str) -> Option<String> {
-    let table: toml::Table = toml::from_str(content).ok()?;
-    if table.contains_key(REMOVED_TOP_LEVEL_KEY) {
-        return Some(REMOVED_TOP_LEVEL_KEY.to_owned());
-    }
-    table
-        .get(SERVERS_KEY)?
-        .as_table()?
-        .iter()
-        .find(|(_, server)| {
-            server
-                .as_table()
-                .is_some_and(|server| server.contains_key(REMOVED_SERVER_KEY))
-        })
-        .map(|(name, _)| format!("{SERVERS_KEY}.{name}.{REMOVED_SERVER_KEY}"))
-}
-
 fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>, McpConfigError> {
     let lookup = match source {
         McpConfigSource::Global => Lookup::Global(path),
@@ -852,9 +830,6 @@ fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>
 }
 
 fn parse(content: &str, lookup: Lookup<'_>) -> Result<McpConfig, String> {
-    if let Some(key) = removed_key(content) {
-        return Err(format!("`{key}` {REMOVED_KEY_REASON}"));
-    }
     interpolation::from_str(content, lookup).map_err(|error| error.to_string())
 }
 
@@ -872,11 +847,50 @@ mod tests {
         DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, HTTP_FIELDS, MCP_VERSION, OAUTH_FIELDS,
         SERVER_FIELDS, STDIO_FIELDS,
     };
-    use caudra_config::migration::MigrationError;
+    use caudra_config::migration::{MigrationError, Stamp};
     use serde_json::Value;
     use test_case::test_case;
 
     const GLOBAL_SERVER: &str = "global-server";
+    const GITHUB_SERVER: &str = "github";
+    const DOCS_SERVER: &str = "docs";
+    const STAMP_BY: &str = "Caudra 9.9.9";
+    const LEGACY_MCP: &str = "\
+# My MCP servers
+
+defer_tools = 30
+
+[mcp.github]
+# the GitHub server
+command = [\"gh-mcp\"]
+always_load = true
+
+[mcp.docs]
+url = \"https://docs.example.test/mcp\"
+always_load = false # eager
+timeout = 5000
+";
+    const LEGACY_MCP_UPGRADED: &str = "\
+# My MCP servers
+
+# Added by Caudra 9.9.9 on 2026-10-20: the format version of this file, which Caudra now requires.
+version = 2
+
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `defer_tools`, because MCP tools are reached through the `code` tool, which loads nothing up front.
+# defer_tools = 30
+
+[mcp.github]
+# the GitHub server
+command = [\"gh-mcp\"]
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `mcp.github.always_load`, because MCP tools are reached through the `code` tool, which loads nothing up front.
+# always_load = true
+
+[mcp.docs]
+url = \"https://docs.example.test/mcp\"
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `mcp.docs.always_load`, because MCP tools are reached through the `code` tool, which loads nothing up front.
+# always_load = false # eager
+timeout = 5000
+";
     const PROJECT_CANARY: &str = "project-canary";
     const SERVERS_TABLE: &str = "mcp";
     const TOKEN_VARIABLE: &str = "CAUDRA_TEST_MCP_TOKEN";
@@ -976,21 +990,26 @@ mod tests {
         assert!(errors.to_string().contains(MCP_FILE));
     }
 
-    #[test_case("defer_tools = 30\n[mcp.srv]\ncommand = [\"x\"]\n", Some(REMOVED_TOP_LEVEL_KEY) ; "defer_tools")]
-    #[test_case("[mcp.srv]\ncommand = [\"x\"]\nalways_load = true\n", Some(REMOVED_SERVER_KEY) ; "always_load")]
-    #[test_case("[mcp.srv]\ncommand = [\"x\"]\n", None ; "current_file")]
-    fn removed_keys_fail_the_file(document: &str, removed: Option<&str>) {
+    #[test]
+    fn a_legacy_file_retires_deferral_and_still_loads() {
+        let stamp = Stamp {
+            by: STAMP_BY.to_owned(),
+            on: jiff::civil::date(2026, 10, 20),
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MCP_FILE);
-        fs::write(&path, document).unwrap();
-        let read = read_config(&path, McpConfigSource::Global);
-        match removed {
-            Some(key) => assert!(matches!(
-                read,
-                Err(McpConfigError::Parse { error, .. }) if error.contains(key) && error.contains(REMOVED_KEY_REASON)
-            )),
-            None => assert!(read.is_ok_and(|config| config.is_some())),
-        }
+        fs::write(&path, LEGACY_MCP).unwrap();
+
+        let migrated = migration::migrate(LEGACY_MCP, &MCP_FORMAT, &stamp).unwrap();
+        let config = read_config(&path, McpConfigSource::Global)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(migrated.text.as_deref(), Some(LEGACY_MCP_UPGRADED));
+        assert_eq!(
+            config.mcp.keys().collect::<BTreeSet<_>>(),
+            BTreeSet::from([&GITHUB_SERVER.to_owned(), &DOCS_SERVER.to_owned()])
+        );
     }
 
     #[test]
@@ -1161,11 +1180,9 @@ command = ["project"]
 
         fs::write(
             &path,
-            r#"[mcp.srv]
-command = ["echo"]
-timeout = 5000
-enabled = true
-"#,
+            format!(
+                "{CONFIG_VERSION_KEY} = {MCP_VERSION}\n[mcp.srv]\ncommand = [\"echo\"]\ntimeout = 5000\nenabled = true\n"
+            ),
         )
         .unwrap();
         persist_enabled(&path, McpConfigSource::Global, "srv", false).unwrap();
@@ -1180,11 +1197,15 @@ enabled = true
     fn persist_enabled_keeps_comments(source: &str, expected: &str) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MCP_FILE);
-        fs::write(&path, source).unwrap();
+        let stamp = format!("{CONFIG_VERSION_KEY} = {MCP_VERSION}\n");
+        fs::write(&path, format!("{stamp}{source}")).unwrap();
 
         persist_enabled(&path, McpConfigSource::Global, "srv", false).unwrap();
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{stamp}{expected}")
+        );
     }
 
     #[test]
@@ -1375,7 +1396,7 @@ command = ["echo", "hello"]
         fs::write(
             &path,
             format!(
-                "[mcp.{GLOBAL_SERVER}]\nurl = 'https://mcp.example.test'\nheaders = {{ Authorization = 'Bearer {{env:{TOKEN_VARIABLE}}}' }}\n"
+                "{CONFIG_VERSION_KEY} = {MCP_VERSION}\n[mcp.{GLOBAL_SERVER}]\nurl = 'https://mcp.example.test'\nheaders = {{ Authorization = 'Bearer {{env:{TOKEN_VARIABLE}}}' }}\n"
             ),
         )
         .unwrap();

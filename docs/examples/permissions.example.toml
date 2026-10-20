@@ -19,7 +19,7 @@
 #
 # Full reference: https://caudra.ai/docs/permissions/#toml-policy
 
-version = 1
+version = 2
 
 # What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow`
 # acts as `prompt` and waits in /permissions for review, and a project cannot

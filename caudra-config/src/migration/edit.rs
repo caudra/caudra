@@ -72,7 +72,7 @@ impl Upgrade<'_> {
                 dotted(path, old),
                 dotted(&[], new)
             ));
-            self.annotate(&at, new, |prefix| note::annotate(prefix, &note));
+            self.annotate(&at, new, &note, None);
         }
         Ok(())
     }
@@ -120,7 +120,7 @@ impl Upgrade<'_> {
                 dotted(from, key),
                 dotted(to, key)
             ));
-            self.annotate(&destination, key, |prefix| note::annotate(prefix, &note));
+            self.annotate(&destination, key, &note, None);
         }
         Ok(())
     }
@@ -175,7 +175,7 @@ impl Upgrade<'_> {
                 edits.join(" and "),
                 dotted(path, key)
             ));
-            self.annotate(&at, key, |prefix| note::annotate(prefix, &note));
+            self.annotate(&at, key, &note, None);
         }
     }
 
@@ -202,7 +202,7 @@ impl Upgrade<'_> {
                 "changed `{}` from {old} to {new}",
                 dotted(path, key)
             ));
-            self.annotate(&at, key, |prefix| note::annotate(prefix, &note));
+            self.annotate(&at, key, &note, None);
         }
     }
 
@@ -231,8 +231,16 @@ impl Upgrade<'_> {
                 *existing.decor_mut() = decor;
             }
             let note = note::upgraded(self.stamp, &format!("version {from} → {latest}"), None);
+            let first =
+                body_keys(root).into_iter().next() == Some(vec![CONFIG_VERSION_KEY.to_owned()]);
+            let inserted = &mut self.inserted;
             edit_line_prefix(root, CONFIG_VERSION_KEY, |prefix| {
-                note::annotate(prefix, &note)
+                let (head, rest) = if first {
+                    note::split_leading(prefix)
+                } else {
+                    ("", prefix)
+                };
+                format!("{head}{}", note::annotate(rest, &note, None, inserted))
             });
             return;
         }
@@ -297,9 +305,7 @@ impl Upgrade<'_> {
             bare(&removed)
         );
         let note = self.record(what);
-        self.annotate(at, key, |prefix| {
-            note::annotate_retired(prefix, &note, &entry)
-        });
+        self.annotate(at, key, &note, Some(&entry));
     }
 
     /// Removes the line, and puts the note and the line commented out where
@@ -333,7 +339,7 @@ impl Upgrade<'_> {
         if let Some((parent, leaf)) = dotted_parent(header, &target) {
             parent.remove(leaf);
         }
-        let retired = note::retired(&prefix, &note, &line);
+        let retired = note::retired(&prefix, &note, &line, &mut self.inserted);
         let after = |suffix: &str| {
             format!(
                 "{suffix}{NEWLINE}{}",
@@ -417,15 +423,19 @@ impl Upgrade<'_> {
         Some(at)
     }
 
-    /// Edits the prefix of the line that holds `key` at `at`: the line of
-    /// the inline table it sits in, if any.
-    fn annotate(&mut self, at: &Location, key: &str, edit: impl FnOnce(&str) -> String) {
+    /// Puts `note` above the line that holds `key` at `at`, or above the line
+    /// of the inline table it sits in, followed by `entry` commented out when
+    /// one was retired from that inline table.
+    fn annotate(&mut self, at: &Location, key: &str, note: &str, entry: Option<&str>) {
         let (segments, key) = match at.inline_from {
             Some(inline) => (&at.segments[..inline], at.segments[inline].key.as_str()),
             None => (at.segments.as_slice(), key),
         };
+        let inserted = &mut self.inserted;
         if let Some(Parent::Table(table)) = parent_mut(self.document.as_table_mut(), segments) {
-            edit_line_prefix(table, key, edit);
+            edit_line_prefix(table, key, |prefix| {
+                note::annotate(prefix, note, entry, inserted)
+            });
         }
     }
 
@@ -872,6 +882,26 @@ mod tests {
         Ok(())
     }
 
+    fn retire_adjacent(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+        upgrade.retire_key(&["agent"], "defer_builtin_tools");
+        upgrade.retire_key(&["agent"], "max_continuation_turns");
+        Ok(())
+    }
+
+    fn rename_then_retire_in_array(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+        upgrade.rename_in_array(
+            &["agent"],
+            "disabled_tools",
+            &[("code_context", ArrayRename::To("source_code_context"))],
+        );
+        upgrade.rename_in_array(
+            &["agent"],
+            "disabled_tools",
+            &[("python_execution", ArrayRename::Retire)],
+        );
+        Ok(())
+    }
+
     fn retire_always_load(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
         upgrade.retire_key(&["servers"], "always_load");
         Ok(())
@@ -1006,6 +1036,16 @@ mod tests {
         ; "retire_in_every_table_of_an_array"
     )]
     #[test_case("[agent.defer_builtin_tools]\nx = 1\n", "[agent.defer_builtin_tools]\nx = 1\n", retire_defer ; "retire_leaves_tables")]
+    #[test_case(
+        "[agent]\nmodel = \"a\"\ndefer_builtin_tools = true\n# retries\nmax_continuation_turns = 5\nlast = 1\n",
+        concat!("[agent]\nmodel = \"a\"\n", upgraded!("retired `agent.defer_builtin_tools`"), "# defer_builtin_tools = true\n", upgraded!("retired `agent.max_continuation_turns`"), "#\n# retries\n# max_continuation_turns = 5\nlast = 1\n"), retire_adjacent
+        ; "adjacent_retirements_keep_their_order"
+    )]
+    #[test_case(
+        "[agent]\n# mine\ndisabled_tools = [\"code_context\", \"python_execution\"]\n",
+        concat!("[agent]\n", upgraded!("renamed `code_context` to `source_code_context` in `agent.disabled_tools`"), "#\n", upgraded!("removed `python_execution` in `agent.disabled_tools`"), "#\n# mine\ndisabled_tools = [\"source_code_context\"]\n"), rename_then_retire_in_array
+        ; "a_second_note_on_a_line_goes_below_the_first"
+    )]
     fn primitives_edit_in_place_and_note_the_line(body: &str, expected: &str, apply: Apply) {
         assert_eq!(upgrade(body, apply), Ok(expected.to_owned()));
     }

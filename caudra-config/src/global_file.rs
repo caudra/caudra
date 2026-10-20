@@ -101,8 +101,15 @@ mod tests {
 
     use super::{GlobalDocument, GlobalFileError};
     use crate::config_file::CONFIG_FILE;
-    use crate::migration::MigrationError;
     use crate::migration::tests_support::BEHIND;
+    use crate::migration::{ConfigFormat, MigrationError};
+
+    /// A format at the version the test files declare.
+    const CURRENT: ConfigFormat = ConfigFormat {
+        latest: 1,
+        steps: &[],
+        ..BEHIND
+    };
 
     const ON_DISK: &str = "version = 1\nalways_yolo = false\n";
     const EDITED: &str = "version = 1\nalways_yolo = true\n";
@@ -125,7 +132,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), ON_DISK);
-        loaded.commit(&edited).unwrap();
+        loaded.commit_in(&edited, &CURRENT).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), EDITED);
     }
 }

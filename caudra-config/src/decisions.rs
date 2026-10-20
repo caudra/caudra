@@ -33,7 +33,6 @@ const INVALID_CREDENTIAL_MESSAGE: &str =
     "credential must be nonempty and contain no control characters";
 const STORED_KEY_FIELD: &str = "api_key";
 const API_KEY_ENV_FIELD: &str = "api_key_env";
-pub const TOOL_SEARCH_FEATURE_REMOVED: &str = "`decisions.features.tool_search` was removed with `tool_search`: no tool is loaded on demand any more. Delete the key";
 
 /// A ready-made endpoint the login flows offer by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,15 +211,6 @@ fn invalid(field: &'static str, message: &'static str) -> DecisionsConfigError {
     DecisionsConfigError::Invalid { field, message }
 }
 
-#[derive(Debug, Clone, Default)]
-struct RemovedToolSearch;
-
-impl<'de> Deserialize<'de> for RemovedToolSearch {
-    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(TOOL_SEARCH_FEATURE_REMOVED))
-    }
-}
-
 macro_rules! features {
     ($($field:ident: [$($mode:ident),+], $description:literal);+ $(;)?) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -232,9 +222,6 @@ macro_rules! features {
         #[serde(default, deny_unknown_fields)]
         pub struct RawDecisionFeatures {
             $(pub $field: Option<FeatureMode>,)+
-            /// Refuses the removed feature, so a file that still sets it fails to load.
-            #[serde(rename = "tool_search")]
-            removed_tool_search: RemovedToolSearch,
         }
 
         impl RawDecisionFeatures {
@@ -505,8 +492,6 @@ pub struct RawDecisionsConfig {
     legacy_model: Option<String>,
     #[serde(rename = "api_key_env")]
     legacy_api_key_env: Option<String>,
-    #[serde(rename = "allow_remote")]
-    legacy_allow_remote: Option<bool>,
     #[serde(rename = "allow_http")]
     legacy_allow_http: Option<bool>,
     #[serde(skip)]
@@ -563,7 +548,6 @@ impl RawDecisionsConfig {
             legacy_protocol,
             legacy_model,
             legacy_api_key_env,
-            legacy_allow_remote,
             legacy_allow_http
         );
         self.features.overlay(overlay.features);
@@ -626,7 +610,6 @@ impl RawDecisionsConfig {
             ("protocol", self.legacy_protocol.is_some()),
             ("model", self.legacy_model.is_some()),
             ("api_key_env", self.legacy_api_key_env.is_some()),
-            ("allow_remote", self.legacy_allow_remote.is_some()),
             ("allow_http", self.legacy_allow_http.is_some()),
         ]
         .into_iter()
@@ -1476,12 +1459,11 @@ mod tests {
         assert!(!format!("{key:?}").contains(STORED_KEY));
     }
 
-    #[test_case("base_url = 'http://100.64.0.3:8000/v1'\nprotocol = 'openai'\nallow_remote = true\nallow_http = true", "openai", "http://100.64.0.3:8000/v1"; "full")]
+    #[test_case("base_url = 'http://100.64.0.3:8000/v1'\nprotocol = 'openai'\nallow_http = true", "openai", "http://100.64.0.3:8000/v1"; "full")]
     #[test_case("base_url = 'https://decisions.example.test'", "typesafe", "https://decisions.example.test"; "base_url")]
     #[test_case("protocol = 'openai'", "openai", "https://api.openai.com/v1"; "protocol")]
     #[test_case("model = 'custom'", "typesafe", "https://api.typesafe.ai"; "model")]
     #[test_case("api_key_env = 'CUSTOM_KEY'", "typesafe", "https://api.typesafe.ai"; "api_key_env")]
-    #[test_case("allow_remote = true", "typesafe", "https://api.typesafe.ai"; "allow_remote")]
     #[test_case("allow_http = true", "typesafe", "https://api.typesafe.ai"; "allow_http")]
     fn legacy_connection_keys_point_to_providers_toml(source: &str, name: &str, base_url: &str) {
         let Err(error) = toml::from_str::<RawConfig>(&format!("[decisions]\n{source}"))
@@ -1495,7 +1477,6 @@ mod tests {
             panic!("expected the migration error, got {error}");
         };
         assert!(error.to_string().contains(LOGIN_HINT), "{error}");
-        assert!(!table.contains("allow_remote"), "{table}");
         let parsed: toml::Table = toml::from_str(table).unwrap();
         let migrated: DecisionEndpointDef = parsed[super::DECISIONS_TABLE][name]
             .clone()
@@ -1546,20 +1527,6 @@ mod tests {
                 toml::from_str(&format!("[features]\n{feature} = '{mode}'")).unwrap();
             assert_eq!(raw.resolve().is_ok(), allowed, "{feature}: {mode}");
         }
-    }
-
-    #[test_case("off" ; "off")]
-    #[test_case("enforce" ; "enforce")]
-    fn removed_tool_search_feature_names_its_removal(mode: &str) {
-        let error =
-            toml::from_str::<RawConfig>(&format!("[decisions.features]\ntool_search = '{mode}'"))
-                .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(super::TOOL_SEARCH_FEATURE_REMOVED),
-            "{error}"
-        );
     }
 
     #[test]

@@ -18,7 +18,7 @@
 #
 # Full reference: https://caudra.ai/docs/mcp/
 
-version = 1
+version = 2
 
 # [mcp.filesystem]
 # Each [mcp.NAME] table is one server, and a stdio server like this one runs

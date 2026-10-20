@@ -14,12 +14,18 @@ use super::{
     SessionError, compress_payload, decompress_payload, from_i64, to_i64,
 };
 
+/// The code-graph tools' old and new names, which the config files move to as
+/// well.
+pub const SOURCE_CODE_TOOL_RENAMES: [(&str, &str); 2] = [
+    ("code_context", "source_code_context"),
+    ("code_refs", "source_code_refs"),
+];
 /// The bare names, plus the two spellings models also wrote: GPT's
 /// `functions.` prefix and the Anthropic subscription wire name. Dispatch
 /// still strips or maps both, so they move with the bare name.
 const RENAMED_TOOLS: [(&str, &str); 6] = [
-    ("code_context", "source_code_context"),
-    ("code_refs", "source_code_refs"),
+    SOURCE_CODE_TOOL_RENAMES[0],
+    SOURCE_CODE_TOOL_RENAMES[1],
     ("functions.code_context", "functions.source_code_context"),
     ("functions.code_refs", "functions.source_code_refs"),
     ("mcp_Code_context", "mcp_Source_code_context"),

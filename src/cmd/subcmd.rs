@@ -16,8 +16,8 @@ use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventory
 use caudra_agent::tools::profile_policy::{CEILING_DISABLED, LEGACY_LOADING, registered_decision};
 use caudra_agent::tools::registry::ToolDefinitions;
 use caudra_agent::tools::{
-    DescriptionContext, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState,
-    builtin_report, execution, is_tool_enabled,
+    DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
+    execution, is_tool_enabled,
 };
 use caudra_config::decisions::{
     DECISION_PRESETS, DecisionEndpointDef, DecisionPreset, DecisionProtocol,
@@ -1456,8 +1456,6 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
 }
 
 const SOURCE_MCP: &str = "mcp";
-/// `permissions.toml` still accepts the pre-rename section for the shell tool.
-const LEGACY_SHELL_KEY: &str = "bash";
 /// Padded to a common width so the name column starts at one column.
 const STATE_WIDTH: usize = 4;
 
@@ -1502,10 +1500,6 @@ fn builtin_rows(
         .iter()
         .map(|entry| {
             let name = entry.name();
-            let keys = match name {
-                SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
-                _ => vec![ToolKey::native(name)],
-            };
             let mut report = builtin_report(name, filter, cli_disallowed, &config.agent, model);
             let decision = registered_decision(entry, &ctx, policy, false);
             if !matches!(decision.reason, CEILING_DISABLED | LEGACY_LOADING) {
@@ -1523,7 +1517,7 @@ fn builtin_rows(
                 source: entry.source.as_log_field().into_owned(),
                 state: report.state,
                 note: report.reason,
-                permission: permission_default(&config.permissions, &keys),
+                permission: permission_default(&config.permissions, &[ToolKey::native(name)]),
             }
         })
         .collect();

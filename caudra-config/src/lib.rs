@@ -11,7 +11,7 @@ use std::time::Duration;
 use caudra_config_macro::ConfigSection;
 use caudra_storage::paths;
 use caudra_storage::retention::{GroupBy, KeepPolicy};
-use caudra_storage::sessions::StoredMode;
+use caudra_storage::sessions::{SOURCE_CODE_TOOL_RENAMES, StoredMode};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use caudra_storage::version::UpdateChannel;
 use caudra_terminal_host::PANE_ENVIRONMENT;
@@ -23,21 +23,28 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 
+use crate::config_file::SOURCE_CODE_WHY;
 use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
-use crate::migration::ConfigFormat;
+use crate::migration::{ConfigFormat, MigrationError, Step, Upgrade};
 use crate::shell_env::{ShellEnvConfig, ShellEnvError, ShellEnvFileConfig};
 
 pub const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
-pub const PERMISSIONS_VERSION: u32 = 1;
+pub const PERMISSIONS_VERSION: u32 = 2;
 pub const PERMISSIONS_FORMAT: ConfigFormat = ConfigFormat {
     file: PERMISSIONS_FILE,
     latest: PERMISSIONS_VERSION,
-    steps: &[],
+    steps: &[Step {
+        from: 1,
+        why: None,
+        apply: upgrade_permissions_from_1,
+    }],
     requires_version: false,
 };
+const PYTHON_EXECUTION_RENAMED: &str = "the `python_execution` tool is now `code`";
+const BASH_RENAMED: &str = "the `bash` tool is now `shell`";
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
 const UNSET_DEFAULT: &str = "unset";
 const REQUIRED_DEFAULT: &str = "required";
@@ -146,8 +153,6 @@ const TASK_ASYNC_UNSUPPORTED: &str = "task_execution = async requires a frontend
 const SHELL_ASYNC_UNSUPPORTED: &str = "shell_execution = async requires a frontend with shell delivery support; use a supported session or change agent.shell_execution";
 const TASK_SYNC_REQUIRED: &str = "agent.task_execution requires task calls to wait for completion";
 const TASK_ASYNC_REQUIRED: &str = "agent.task_execution requires background: true or omission";
-pub const CODE_LINES_RENAMED: &str = "`ui.tool_output_lines.python_execution` was renamed to `ui.tool_output_lines.code`, because the `code` tool now runs plain computation. Rename the key";
-pub const DEFER_BUILTIN_TOOLS_REMOVED: &str = "`agent.defer_builtin_tools` was removed with `tool_search`: the tools it deferred are now `code` modules (`image`, `host`, `workflow`, `automation`). Delete the key";
 pub const CODE_REQUIRED: &str = "`code` cannot be disabled: it hosts the `image`, `host`, `workflow`, `automation`, `history`, `mcp` and `decisions` modules; turn off a module's tool group instead (`images`, `execution`, `delegation`)";
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
@@ -1410,10 +1415,6 @@ impl ImageModel {
 pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
     pub code: Option<usize>,
-    /// Refuses the budget's old name, so a file that still sets it fails to load rather than
-    /// silently losing the setting.
-    #[serde(rename = "python_execution")]
-    renamed_python_execution: RenamedCodeLines,
     pub task: Option<usize>,
     pub index: Option<usize>,
     pub grep: Option<usize>,
@@ -1421,24 +1422,6 @@ pub struct ToolOutputLinesFile {
     pub write: Option<usize>,
     pub web: Option<usize>,
     pub other: Option<usize>,
-}
-
-#[derive(Default, Debug, Clone)]
-struct RenamedCodeLines;
-
-impl<'de> Deserialize<'de> for RenamedCodeLines {
-    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(CODE_LINES_RENAMED))
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-struct RemovedDeferBuiltinTools;
-
-impl<'de> Deserialize<'de> for RemovedDeferBuiltinTools {
-    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(DEFER_BUILTIN_TOOLS_REMOVED))
-    }
 }
 
 impl ToolOutputLinesFile {
@@ -1546,10 +1529,6 @@ pub struct AgentFileConfig {
     pub shell_output_filter: Option<bool>,
     pub shell_workdir_redirect: Option<bool>,
     pub shell_native_redirect: Option<ShellNativeRedirect>,
-    /// Refuses the removed key, so a file that still sets it fails to load rather than
-    /// silently ignoring it.
-    #[serde(rename = "defer_builtin_tools")]
-    removed_defer_builtin_tools: RemovedDeferBuiltinTools,
     pub image_model: Option<ImageModel>,
     pub cache_warming: Option<CacheWarmingMode>,
     pub disabled_tools: Option<Vec<String>>,
@@ -1937,6 +1916,24 @@ impl McpPermissions {
             description: "What a call to a tool of this server that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default`",
         },
     ];
+}
+
+/// Renames the tool tables whose tool was renamed: under its old name a rule
+/// would silently stop applying. `[mcp]` holds the rules of MCP servers, not
+/// the retired `mcp` tool, so it keeps its name.
+fn upgrade_permissions_from_1(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+    upgrade.because(SOURCE_CODE_WHY);
+    for (old, new) in SOURCE_CODE_TOOL_RENAMES {
+        upgrade.rename_key(&[], old, new)?;
+    }
+    upgrade.because(PYTHON_EXECUTION_RENAMED).rename_key(
+        &[],
+        "python_execution",
+        CODE_TOOL_NAME,
+    )?;
+    upgrade
+        .because(BASH_RENAMED)
+        .rename_key(&[], "bash", "shell")
 }
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
@@ -5484,19 +5481,6 @@ mod tests {
         );
     }
 
-    #[test_case("auto" ; "auto")]
-    #[test_case("always" ; "always")]
-    #[test_case("never" ; "never")]
-    fn removed_defer_builtin_tools_names_its_removal(value: &str) {
-        let error =
-            toml::from_str::<RawConfig>(&format!("[agent]\ndefer_builtin_tools = \"{value}\"\n"))
-                .unwrap_err();
-        assert!(
-            error.to_string().contains(DEFER_BUILTIN_TOOLS_REMOVED),
-            "{error}"
-        );
-    }
-
     #[test_case("trace", LogLevel::Trace ; "trace")]
     #[test_case("debug", LogLevel::Debug ; "debug")]
     #[test_case("info", LogLevel::Info ; "info")]
@@ -5852,13 +5836,6 @@ mod tests {
         let raw: RawConfig = toml::from_str("[ui.tool_output_lines]\ncode = 9\n").unwrap();
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.ui.tool_output_lines.get("code"), 9);
-    }
-
-    #[test]
-    fn tool_output_lines_old_python_execution_key_names_its_replacement() {
-        let error = toml::from_str::<RawConfig>("[ui.tool_output_lines]\npython_execution = 9\n")
-            .unwrap_err();
-        assert!(error.to_string().contains(CODE_LINES_RENAMED), "{error}");
     }
 
     #[test_case(false, None,        true  ; "enabled_by_default")]
@@ -6302,19 +6279,19 @@ mod tests {
         write_global_permissions(
             dir.path(),
             "default = \"allow\"\n\n\
-             [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
+             [shell]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
         let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("cargo *".into()),
             effect: Effect::Allow,
         }));
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("rm -rf *".into()),
             effect: Effect::Deny,
         }));
@@ -6338,7 +6315,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(
             dir.path(),
-            "[bash]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n",
+            "[shell]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n",
         );
         let caudra_dir = dir.path().join(".caudra");
         fs::create_dir_all(&caudra_dir).unwrap();
@@ -6354,12 +6331,12 @@ mod tests {
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 3);
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("git *".into()),
             effect: Effect::Allow,
         }));
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("rm -rf *".into()),
             effect: Effect::Deny,
         }));
@@ -6568,8 +6545,7 @@ mod tests {
             dir.path(),
             "default = \"allow\"\n\
              [\"*\"]\nallow = [\"*\"]\ndefault = \"allow\"\n\
-             [bash]\nallow = true\ndefault = \"allow\"\n\
-             [shell]\nallow = [\"git status *\"]\n\
+             [shell]\nallow = [\"*\", \"git status *\"]\ndefault = \"allow\"\n\
              [read]\nallow = [\"src/**\"]\n\
              [mcp.deepwiki]\nallow = true\ndefault = \"allow\"\n\
              [mcp.github]\nallow = [\"search\", \"*\"]\n",
@@ -6579,7 +6555,7 @@ mod tests {
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("*".into()),
             effect: Effect::Allow,
         }));
@@ -6597,7 +6573,7 @@ mod tests {
                 .contains(&PermissionReviewCandidate {
                     source: PermissionSource::Global,
                     kind: PermissionReviewKind::Rule,
-                    tool: Some(ToolKey::native("bash")),
+                    tool: Some(ToolKey::native("shell")),
                     scope: None,
                 })
         );
@@ -6643,7 +6619,7 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\
              [\"*\"]\ndeny = true\n\
-             [bash]\ndeny = [\"rm *\"]\ndefault = \"prompt\"\n\
+             [shell]\ndeny = [\"rm *\"]\ndefault = \"prompt\"\n\
              [write]\ndeny = true\ndefault = \"deny\"\n\
              [mcp.server]\ndeny = true\ndefault = \"prompt\"\n\
              [mcp.github]\ndeny = [\"delete\", \"*\"]\ndefault = \"deny\"\n",
@@ -6655,7 +6631,7 @@ mod tests {
         assert_eq!(perms.rules.len(), 6);
         assert!(perms.rules.iter().all(|rule| rule.effect == Effect::Deny));
         assert_eq!(
-            perms.tool_defaults.get(&ToolKey::native("bash")),
+            perms.tool_defaults.get(&ToolKey::native("shell")),
             Some(&DefaultEffect::Prompt)
         );
         assert_eq!(
@@ -6720,6 +6696,104 @@ mod tests {
         assert_eq!(
             build_permissions(versioned, PermissionsFileConfig::default()).rules,
             build_permissions(unversioned, PermissionsFileConfig::default()).rules
+        );
+    }
+
+    #[test]
+    fn a_legacy_permissions_file_renames_its_tool_tables() {
+        const LEGACY: &str = "\
+# Team permissions
+
+default = \"prompt\"
+code_refs.default = \"allow\"
+
+# never push from the agent
+[bash]
+allow = [\"git status *\"]
+deny = [\"git push *\"]
+
+[code_context]
+default = \"allow\"
+
+[python_execution]
+deny = true
+
+[\"*\"]
+default = \"prompt\"
+
+[mcp.github]
+allow = [\"list_issues\"]
+";
+        const UPGRADED: &str = "\
+# Team permissions
+
+# Added by Caudra 9.9.9 on 2026-10-20: the format version of this file, which Caudra now requires.
+version = 2
+
+default = \"prompt\"
+# Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `code_refs` to `source_code_refs`, because the code-graph tools are now `source_code_context` and `source_code_refs`.
+source_code_refs.default = \"allow\"
+
+# Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `bash` to `shell`, because the `bash` tool is now `shell`.
+#
+# never push from the agent
+[shell]
+allow = [\"git status *\"]
+deny = [\"git push *\"]
+
+# Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `code_context` to `source_code_context`, because the code-graph tools are now `source_code_context` and `source_code_refs`.
+[source_code_context]
+default = \"allow\"
+
+# Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `python_execution` to `code`, because the `python_execution` tool is now `code`.
+[code]
+deny = true
+
+[\"*\"]
+default = \"prompt\"
+
+[mcp.github]
+allow = [\"list_issues\"]
+";
+
+        let text = migration::migrate(LEGACY, &PERMISSIONS_FORMAT, &migration::test_stamp())
+            .unwrap()
+            .text
+            .unwrap();
+        let config: PermissionsFileConfig = toml::from_str(&text).unwrap();
+
+        assert_eq!(text, UPGRADED);
+        assert_eq!(
+            config
+                .tools
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "*",
+                CODE_TOOL_NAME,
+                "shell",
+                "source_code_context",
+                "source_code_refs"
+            ])
+        );
+        assert_eq!(
+            validate_project_permissions(Path::new(PERMISSIONS_FILE), &text),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_legacy_bash_table_beside_a_shell_table_is_a_conflict() {
+        const BOTH: &str = "[bash]\ndeny = [\"git push *\"]\n\n[shell]\nallow = [\"ls\"]\n";
+
+        assert_eq!(
+            migration::migrate(BOTH, &PERMISSIONS_FORMAT, &migration::test_stamp()),
+            Err(MigrationError::Conflict {
+                file: PERMISSIONS_FILE,
+                old: "bash".to_owned(),
+                new: "shell".to_owned(),
+            })
         );
     }
 
@@ -6809,7 +6883,7 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(
             dir.path(),
-            "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
+            "[shell]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
         let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
@@ -6836,15 +6910,15 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(
             dir.path(),
-            "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
+            "default = \"deny\"\n\n[shell]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
         let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(perms.default, DefaultEffect::Deny);
-        assert!(!perms.tool_defaults.contains_key(&ToolKey::native("bash")));
+        assert!(!perms.tool_defaults.contains_key(&ToolKey::native("shell")));
         assert_eq!(perms.review_candidates.len(), 1);
         assert!(perms.rules.contains(&PermissionRule {
-            tool: ToolKey::native("bash"),
+            tool: ToolKey::native("shell"),
             scope: Some("cargo *".into()),
             effect: Effect::Allow,
         }));
@@ -6854,7 +6928,7 @@ mod tests {
                 .contains(&PermissionReviewCandidate {
                     source: PermissionSource::Global,
                     kind: PermissionReviewKind::Default,
-                    tool: Some(ToolKey::native("bash")),
+                    tool: Some(ToolKey::native("shell")),
                     scope: None,
                 })
         );
@@ -6864,18 +6938,18 @@ mod tests {
     fn permissions_default_merge_project_overrides_global_per_tool() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[bash]\ndefault = \"allow\"\n");
+        write_global_permissions(dir.path(), "[shell]\ndefault = \"allow\"\n");
         let caudra_dir = dir.path().join(".caudra");
         fs::create_dir_all(&caudra_dir).unwrap();
         fs::write(
             caudra_dir.join("permissions.toml"),
-            "[bash]\ndefault = \"deny\"\n",
+            "[shell]\ndefault = \"deny\"\n",
         )
         .unwrap();
 
         let perms = load_permissions_inner(dir.path(), Some(global.as_path()));
         assert_eq!(
-            perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
+            perms.tool_defaults.get(&ToolKey::native("shell")).copied(),
             Some(DefaultEffect::Deny)
         );
     }
@@ -6886,13 +6960,13 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(
             dir.path(),
-            "default = \"deny\"\n\n[bash]\ndefault = \"deny\"\n",
+            "default = \"deny\"\n\n[shell]\ndefault = \"deny\"\n",
         );
         let caudra_dir = dir.path().join(".caudra");
         fs::create_dir_all(&caudra_dir).unwrap();
         fs::write(
             caudra_dir.join("permissions.toml"),
-            "default = \"prompt\"\n\n[bash]\ndefault = \"prompt\"\n",
+            "default = \"prompt\"\n\n[shell]\ndefault = \"prompt\"\n",
         )
         .unwrap();
 
@@ -6901,7 +6975,7 @@ mod tests {
         assert_eq!(
             permissions
                 .tool_defaults
-                .get(&ToolKey::native("bash"))
+                .get(&ToolKey::native("shell"))
                 .copied(),
             Some(DefaultEffect::Deny)
         );

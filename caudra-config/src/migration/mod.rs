@@ -45,7 +45,8 @@ pub struct ConfigFormat {
 #[derive(Debug)]
 pub struct Step {
     pub from: u32,
-    /// Appended to every note this step leaves, after "because".
+    /// Appended to every note this step leaves, after "because", unless an
+    /// edit gives its own with [`Upgrade::because`].
     pub why: Option<&'static str>,
     pub apply: fn(&mut Upgrade<'_>) -> Result<(), MigrationError>,
 }
@@ -83,7 +84,7 @@ pub enum MigrationError {
         source: ConfigVersionError,
     },
     #[error(
-        "{file} sets both `{old}` and `{new}`, which now mean the same thing: keep `{new}`, remove `{old}`, and start Caudra again"
+        "{file} sets both `{old}` and `{new}`, which now mean the same thing: merge what `{old}` sets into `{new}`, remove `{old}`, and start Caudra again"
     )]
     Conflict {
         file: &'static str,
@@ -136,6 +137,9 @@ pub struct Upgrade<'a> {
     stamp: &'a Stamp,
     why: Option<&'static str>,
     changes: Vec<Change>,
+    /// The notes and retired lines this upgrade put in front of a line, which
+    /// stay above any note it adds to that line later.
+    inserted: Vec<String>,
 }
 
 impl Stamp {
@@ -185,6 +189,13 @@ impl Upgrade<'_> {
         &self.document
     }
 
+    /// Gives the notes of the edits that follow `why` in place of the step's,
+    /// for a step whose changes have reasons of their own.
+    pub fn because(&mut self, why: &'static str) -> &mut Self {
+        self.why = Some(why);
+        self
+    }
+
     /// Records `what` and returns the note that goes above the changed line.
     fn record(&mut self, what: String) -> String {
         let note = note::upgraded(self.stamp, &what, self.why);
@@ -229,6 +240,7 @@ pub fn migrate(
         stamp,
         why: None,
         changes: Vec::new(),
+        inserted: Vec::new(),
     };
     upgrade.stamp_version(declared, format.latest);
     for version in from..format.latest {
@@ -294,12 +306,13 @@ pub fn upgrade_text(text: String, format: &ConfigFormat) -> Result<Loaded, Migra
 /// Refuses a save over `on_disk`, a file in `format` as it is on disk, while
 /// it is behind `latest`. Writing it anyway would upgrade it with neither a
 /// backup nor notes, under any other Caudra still reading the old shape. A
-/// file that only lacks the `version` key is current.
+/// file that sets nothing, or no file at all, has nothing to upgrade.
 pub fn ensure_current(on_disk: &DocumentMut, format: &ConfigFormat) -> Result<(), MigrationError> {
     let file = format.file;
     let declared = declared_version(on_disk, format)
         .map_err(|source| MigrationError::Version { file, source })?;
-    if declared.unwrap_or(FIRST_VERSION) < format.latest {
+    let empty = declared.is_none() && on_disk.as_table().is_empty();
+    if !empty && declared.unwrap_or(FIRST_VERSION) < format.latest {
         return Err(MigrationError::Pending { file });
     }
     Ok(())
@@ -330,7 +343,7 @@ fn declared_version(
 const TEST_STAMP_BY: &str = "Caudra 9.9.9";
 
 #[cfg(test)]
-fn test_stamp() -> Stamp {
+pub(crate) fn test_stamp() -> Stamp {
     Stamp {
         by: TEST_STAMP_BY.to_owned(),
         on: jiff::civil::date(2026, 10, 20),
@@ -648,7 +661,8 @@ model = 'a'
         );
     }
 
-    #[test_case("", Err(MigrationError::Pending { file: BEHIND_FILE }) ; "unstamped_and_behind")]
+    #[test_case("x = 1\n", Err(MigrationError::Pending { file: BEHIND_FILE }) ; "unstamped_and_behind")]
+    #[test_case("# nothing yet\n", Ok(()) ; "empty")]
     #[test_case("version = 1\n", Err(MigrationError::Pending { file: BEHIND_FILE }) ; "stamped_and_behind")]
     #[test_case("version = 2\n", Ok(()) ; "current")]
     #[test_case("version = 3\n", Err(MigrationError::Version { file: BEHIND_FILE, source: ConfigVersionError::Newer { found: 3, latest: 2 } }) ; "newer")]

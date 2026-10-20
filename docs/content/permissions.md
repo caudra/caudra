@@ -549,7 +549,7 @@ A checkout of a git repository also accepts trust granted at the same place in a
 
 An unreadable or malformed permissions file fails closed. Caudra disables inherited allows and denies tool calls until the file is fixed.
 
-The file can start with `version = 1`, and a file without it counts as version 1. A version newer than this build reads fails closed the same way, so an older Caudra never applies rules it would misread. See [Config file versions](/docs/configuration/#config-file-versions).
+The file starts with `version = 2`. A file without it counts as version 1, which Caudra upgrades as it reads it. A version newer than this build reads fails closed the same way, so an older Caudra never applies rules it would misread. See [Config file versions](/docs/configuration/#config-file-versions).
 
 A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
 

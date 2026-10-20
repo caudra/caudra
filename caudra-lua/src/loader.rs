@@ -1490,7 +1490,7 @@ mod tests {
         policy: PermissionRulePolicy,
         mut merged: Option<RawConfig>,
     ) {
-        const LEGACY: &str = "caudra.setup({ decisions = { base_url = 'http://127.0.0.1:8000', allow_remote = true } })";
+        const LEGACY: &str = "caudra.setup({ decisions = { base_url = 'http://127.0.0.1:8000', allow_http = true } })";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
         fs::write(&path, LEGACY).unwrap();

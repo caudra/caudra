@@ -54,6 +54,8 @@ use tracing::warn;
 #[path = "source_code_rename.rs"]
 mod source_code_rename;
 
+pub use source_code_rename::SOURCE_CODE_TOOL_RENAMES;
+
 use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
 use super::lease::{SessionLease, held_session_ids};
 use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
