@@ -130,6 +130,16 @@ No built-in Lua plugin loads in production: `ACTIVE_DEFAULT_LUA_PLUGINS` is empt
 `DEFAULT_BUILTINS` is what tests and docgen may load by name. The Lua host and its API are fully
 supported for external plugins; only the built-ins moved to Rust.
 
+## Config files
+
+User-authored TOML configs upgrade themselves like `caudra.db` does (`caudra-config/src/migration/`):
+
+- Renaming, moving, retyping or removing a key is a format change: add a `Step` to that file's `ConfigFormat` and raise `latest` in the same commit. Never add a fix-it error stub or a serde alias for an old spelling. A new optional key that older builds can ignore needs no bump.
+- Read a config file through `migration::read` / `upgrade_text`, never `toml::from_str` on the raw file, so every parser sees the latest shape.
+- Write a global file only through `atomic_file`, after `migration::ensure_current`. Never rewrite a project `.caudra/` file except from `caudra config migrate --project`.
+- Backups go through `caudra_storage::backups` into the state dir's `backups/`, never beside the original.
+- A test that writes a global config back must declare the current `version`, or the write is refused as `Pending`.
+
 ## Docs
 
 The website is maintained separately and consumes the canonical docs from this repository. Application development, docs generation, and native builds require no JavaScript tooling or website build.
