@@ -368,6 +368,9 @@ const LITERAL_KEYS: &[(&str, &[&str])] = &[
     ("task_control", &["task_id"]),
 ];
 const SHELL_COMMAND_KEY: &str = "command";
+/// The tools whose card keeps a clock: a command, and a `code` run, which can
+/// wait or poll for as long as its deadline allows.
+const CLOCKED_TOOLS: [&str; 2] = [SHELL_TOOL_NAME, CODE_TOOL_NAME];
 /// The tools whose streaming body is a source the call carries entire rather
 /// than a file it names, and whether the header is a summary of that same
 /// source. All three draw the body as numbered lines whole, so it is rendered
@@ -1252,9 +1255,9 @@ fn duration_millis(tool: Option<&str>, key: &str, value: &serde_json::Number) ->
 
 fn is_default_arg(tool: Option<&str>, key: &str, value: &str) -> bool {
     tool.is_some_and(|tool| {
-        DEFAULT_ARGS.iter().any(|(known, arg, default)| {
-            *known == tool && same_key(arg, key) && *default == value
-        })
+        DEFAULT_ARGS
+            .iter()
+            .any(|(known, arg, default)| *known == tool && same_key(arg, key) && *default == value)
     })
 }
 
@@ -2937,32 +2940,34 @@ fn draws_live_markdown(tool_name: &str, header: &str) -> bool {
         || renders_as_markdown(header)
 }
 
-/// A shell call's clock: wall time while it runs, and the command's own
-/// measured time once it lands, which leaves out the dispatch either side of
+pub(super) fn keeps_clock(tool_name: &str) -> bool {
+    CLOCKED_TOOLS
+        .iter()
+        .any(|known| names_tool(known, tool_name))
+}
+
+/// A clocked call's clock: wall time while it runs, and the duration its
+/// output measured once it lands, which leaves out the dispatch either side of
 /// it and so can step down slightly on settle.
 ///
-/// Only `shell` reports a duration of its own, and that one is persisted with
-/// the output, so it is the one tool whose card reads the same restored as it
-/// did live. The running branch has to ask the tool's name; the settled one
-/// does not, because nothing else produces a [`ToolOutput::Shell`].
-fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
+/// That duration is persisted with the output, so the card reads the same
+/// restored as it did live. The running branch has to ask the tool's name;
+/// the settled one does not, because only a clocked tool measures one.
+fn call_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
     if status == ToolStatus::InProgress {
         return msg
             .tool_started
-            .filter(|_| names_tool(SHELL_TOOL_NAME, msg.role.tool_name().unwrap_or_default()))
+            .filter(|_| keeps_clock(msg.role.tool_name().unwrap_or_default()))
             .map(live_elapsed);
     }
-    match msg.tool_output.as_deref() {
-        Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
-        _ => None,
-    }
+    msg.tool_output.as_deref().and_then(ToolOutput::duration)
 }
 
-/// Whether [`shell_elapsed`] reads the wall clock for this card. A settled
-/// shell draws its measured duration, which never moves, so only a running
+/// Whether [`call_elapsed`] reads the wall clock for this card. A settled
+/// call draws its measured duration, which never moves, so only a running
 /// one owes a repaint as time passes.
-pub(super) fn shell_clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> bool {
-    status == ToolStatus::InProgress && shell_elapsed(msg, status).is_some()
+pub(super) fn clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> bool {
+    status == ToolStatus::InProgress && call_elapsed(msg, status).is_some()
 }
 
 /// What the header says in parentheses: how much work the call has done, then
@@ -3133,7 +3138,7 @@ pub fn build_tool_lines(
         );
         b.prepend_indicator(rctx.started_at);
     }
-    if let Some(elapsed) = shell_elapsed(msg, status) {
+    if let Some(elapsed) = call_elapsed(msg, status) {
         b.append_duration(elapsed);
     }
     let progress_body = msg
@@ -3604,6 +3609,7 @@ mod tests {
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
     use crate::selection::ScreenSelection;
+    use caudra_agent::code::output::CodeOutput;
     use caudra_agent::decisions::DecisionFeature;
     use caudra_agent::peers::SendReceipt;
     use caudra_agent::tools::{
@@ -6610,17 +6616,40 @@ mod tests {
     /// What `shell_output()` reports as the command's own time.
     const MEASURED_CLOCK: &str = " · 10ms";
 
-    fn running_shell(started: bool) -> DisplayMessage {
-        let mut msg = bash_msg("cargo test", ToolStatus::InProgress, None, None);
+    /// What `code_output()` measured as the run's wall time, the same as the
+    /// command's own time in `shell_output()`.
+    const MEASURED_MS: u64 = 10;
+
+    fn timed_code_output(duration_ms: Option<u64>) -> ToolOutput {
+        ToolOutput::Code(CodeOutput {
+            code: "print(1)".into(),
+            stdout: "1".into(),
+            duration_ms,
+            ..CodeOutput::default()
+        })
+    }
+
+    fn clocked_call(
+        tool: &str,
+        status: ToolStatus,
+        output: Option<ToolOutput>,
+        started: bool,
+    ) -> DisplayMessage {
+        let mut msg = bash_msg("cargo test", status, None, output);
+        if let DisplayRole::Tool(role) = &mut msg.role {
+            role.name = tool.into();
+        }
         msg.tool_started = started.then(Instant::now);
         msg
     }
 
-    #[test_case(test_rctx(80)    ; "expanded")]
-    #[test_case(compact_rctx(80) ; "compact")]
-    fn a_running_shell_header_carries_a_live_clock(rctx: RenderCtx<'static>) {
+    #[test_case(SHELL_TOOL_NAME, test_rctx(80)    ; "shell_expanded")]
+    #[test_case(SHELL_TOOL_NAME, compact_rctx(80) ; "shell_compact")]
+    #[test_case(CODE_TOOL_NAME,  test_rctx(80)    ; "code_expanded")]
+    #[test_case(CODE_TOOL_NAME,  compact_rctx(80) ; "code_compact")]
+    fn a_running_clocked_header_carries_a_live_clock(tool: &str, rctx: RenderCtx<'static>) {
         let _clock = FrozenClock::at(SHELL_RAN_FOR);
-        let msg = running_shell(true);
+        let msg = clocked_call(tool, ToolStatus::InProgress, None, true);
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &rctx, None);
 
         assert!(
@@ -6630,30 +6659,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_settled_shell_header_reports_the_commands_own_time() {
+    #[test_case(SHELL_TOOL_NAME, shell_output(false)             ; "shell")]
+    #[test_case(CODE_TOOL_NAME,  timed_code_output(Some(MEASURED_MS)) ; "code")]
+    fn a_settled_clocked_header_reports_its_measured_time(tool: &str, output: ToolOutput) {
         let _clock = FrozenClock::at(SHELL_RAN_FOR);
-        let mut msg = bash_msg(
-            "cargo test",
-            ToolStatus::Success,
-            None,
-            Some(shell_output(false)),
-        );
-        msg.tool_started = Some(Instant::now());
+        let msg = clocked_call(tool, ToolStatus::Success, Some(output), true);
         let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
 
         let header = line_text(&tl.lines[0]);
         assert!(header.ends_with(MEASURED_CLOCK), "got {header}");
         assert!(
             !header.contains(LIVE_CLOCK),
-            "the subprocess's own time supersedes the wall clock: {header}"
+            "the measured time supersedes the wall clock: {header}"
         );
     }
 
-    #[test]
-    fn an_unstarted_shell_card_draws_no_clock() {
-        let msg = running_shell(false);
-        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+    #[test_case(SHELL_TOOL_NAME, ToolStatus::InProgress, None                    ; "an_unstarted_shell")]
+    #[test_case(CODE_TOOL_NAME,  ToolStatus::InProgress, None                    ; "an_unstarted_code_run")]
+    #[test_case(CODE_TOOL_NAME,  ToolStatus::Success,    Some(timed_code_output(None)) ; "a_code_run_saved_untimed")]
+    fn a_card_with_no_time_to_tell_draws_no_clock(
+        tool: &str,
+        status: ToolStatus,
+        output: Option<ToolOutput>,
+    ) {
+        let msg = clocked_call(tool, status, output, false);
+        let tl = build_tool_lines(&msg, status, &test_rctx(80), None);
 
         assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
     }
@@ -6739,14 +6769,11 @@ mod tests {
         );
     }
 
-    /// Same card, same start time: only `shell` reports a duration of its own,
-    /// so only `shell` gets a clock.
+    /// Same card, same start time: only a clocked tool measures a duration of
+    /// its own, so only a clocked tool gets a clock.
     #[test]
-    fn a_non_shell_tool_draws_no_clock() {
-        let mut msg = running_shell(true);
-        if let DisplayRole::Tool(tool) = &mut msg.role {
-            tool.name = FILE_READ_TOOL_NAME.into();
-        }
+    fn an_unclocked_tool_draws_no_clock() {
+        let msg = clocked_call(FILE_READ_TOOL_NAME, ToolStatus::InProgress, None, true);
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
 
         assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));

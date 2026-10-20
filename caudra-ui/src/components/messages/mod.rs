@@ -13,8 +13,9 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     AUTOPILOT_BODY_INDENT, DECISION_PREFIX, RenderCtx, ScrollTail, ToolLines, append_annotation,
     append_right_info, assistant_style, autopilot_style, build_instructions_lines,
-    build_tool_lines, done_style, draws_live_script, error_style, format_timestamp_now, names_tool,
-    notice_style, shell_clock_ticks, thinking_style, truncate_to_header, user_style,
+    build_tool_lines, clock_ticks, done_style, draws_live_script, error_style,
+    format_timestamp_now, keeps_clock, names_tool, notice_style, thinking_style,
+    truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
@@ -2572,14 +2573,14 @@ impl MessagesPanel {
         }
     }
 
-    /// Puts a clock on every shell child that is running without one, and
+    /// Puts a clock on every clocked child that is running without one, and
     /// takes it off every child that is not.
     ///
     /// Reconciled against the roster rather than stamped on the transition,
     /// because a roster can arrive with a child already running — a start
     /// re-delivered for a batch mid-flight does exactly that — and a clock
     /// that is never started never counts. Leaving the map exactly the set of
-    /// running shell children is also what lets `refresh_live_progress` ask
+    /// running clocked children is also what lets `refresh_live_progress` ask
     /// whether it is empty instead of re-deriving the condition.
     fn sync_child_clocks(&mut self, tool_id: &str) {
         let ticking: Vec<usize> = match self
@@ -2590,8 +2591,7 @@ impl MessagesPanel {
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
-                    entry.status == BatchToolStatus::Running
-                        && names_tool(SHELL_TOOL_NAME, &entry.tool)
+                    entry.status == BatchToolStatus::Running && keeps_clock(&entry.tool)
                 })
                 .map(|(index, _)| index)
                 .collect(),
@@ -2907,11 +2907,14 @@ impl MessagesPanel {
         self.store_snapshot(tool_id, snapshot, false, theme_gen);
     }
 
+    /// An empty `annotation` clears the one a running call set, so a result's
+    /// own annotation lands later on nothing rather than after a separator.
     pub fn tool_annotation(&mut self, tool_id: &str, annotation: String) {
+        let annotation = (!annotation.is_empty()).then_some(annotation);
         if self.tool_card(tool_id).is_some()
             && (self.tool_in_progress(tool_id) || self.active_shell_call(tool_id))
         {
-            self.update_tool(tool_id, |msg| msg.annotation = Some(annotation));
+            self.update_tool(tool_id, |msg| msg.annotation = annotation);
         } else if let Some((parent, index)) = batch_child_id(tool_id)
             && self.batch_child_running(parent, index)
             && let Some(root) = self.root_tool_id(tool_id)
@@ -2922,7 +2925,7 @@ impl MessagesPanel {
             && let Some(output) = &mut msg.tool_output
             && let Some(entry) = batch_entry_mut(Arc::make_mut(output), indices)
         {
-            entry.annotation = Some(annotation);
+            entry.annotation = annotation;
             self.mark_card_dirty(root);
         }
     }
@@ -5733,9 +5736,9 @@ impl MessagesPanel {
                 // rows the card has no header for and it carries none itself.
                 // The header clock asks the renderer's own question, so the set
                 // refreshed here cannot drift from the set whose clock moves.
-                // Every settled shell draws a clock too, and counting those
-                // rebuilt each one in the transcript on every frame.
-                let ticking = shell_clock_ticks(msg, tool.status)
+                // Every settled clocked call draws a clock too, and counting
+                // those rebuilt each one in the transcript on every frame.
+                let ticking = clock_ticks(msg, tool.status)
                     || msg.progress.as_ref().is_some_and(ToolProgress::is_live)
                     || progress
                         .get(&tool.id)

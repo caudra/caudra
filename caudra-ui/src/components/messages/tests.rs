@@ -16,7 +16,7 @@ use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_sou
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
-use caudra_agent::code::output::CodeCallStatus;
+use caudra_agent::code::output::{CodeCallStatus, CodeOutput};
 use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::tools::native::plan;
 use caudra_agent::tools::{
@@ -1577,6 +1577,57 @@ fn tool_done_annotation_merge(output: &str, expected: &str) {
     );
 }
 
+const WAITING_ANNOTATION: &str = "waiting 1s";
+const CLEARED_ANNOTATION_MSG: &str =
+    "an annotation a running call cleared leaves nothing for the result to follow";
+
+#[test]
+fn a_cleared_live_annotation_leaves_the_result_its_own() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", CODE_TOOL_NAME));
+    panel.tool_annotation("t1", WAITING_ANNOTATION.into());
+    panel.tool_annotation("t1", String::new());
+    let output = ToolOutput::Code(CodeOutput {
+        stdout: "done".into(),
+        ..CodeOutput::default()
+    });
+    let annotation = output.annotation();
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: CODE_TOOL_NAME.into(),
+        output,
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        remote_written_paths: false,
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+        documents: Vec::new(),
+        accounting: ToolAccounting::default(),
+    });
+    assert!(annotation.is_some());
+    assert_eq!(
+        panel.messages[0].annotation, annotation,
+        "{CLEARED_ANNOTATION_MSG}"
+    );
+}
+
+#[test]
+fn a_cleared_child_annotation_leaves_the_row_bare() {
+    let mut panel = panel_with_running_shell();
+    panel.tool_annotation(EAGER_CHILD_ID, WAITING_ANNOTATION.into());
+    panel.tool_annotation(EAGER_CHILD_ID, String::new());
+    assert_eq!(
+        roster(&panel)[0].annotation,
+        None,
+        "{CLEARED_ANNOTATION_MSG}"
+    );
+}
+
 fn grep_output(n_files: usize) -> ToolOutput {
     ToolOutput::GrepResult {
         entries: (0..n_files)
@@ -2541,7 +2592,10 @@ fn a_task_keeps_its_model_through_usage_and_settling(batched: bool) {
 
     panel.tool_annotation(call, LIVE_USAGE.into());
     assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
-    assert!(seg_text(&panel, TOOL_ID).contains(LIVE_USAGE), "{USAGE_SHOWN}");
+    assert!(
+        seg_text(&panel, TOOL_ID).contains(LIVE_USAGE),
+        "{USAGE_SHOWN}"
+    );
 
     if batched {
         panel.batch_progress(TOOL_ID, 0, batch_child(TASK_TOOL_NAME, TOOL_ID));

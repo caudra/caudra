@@ -75,6 +75,7 @@ const RUN_DISCARDED_NOTE: &str =
 /// Runs `code` for the agent `ctx` belongs to, holding its variables for the whole run, and stops
 /// it once `timeout` has passed.
 pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration) -> CodeOutput {
+    let started = Instant::now();
     let Some(modules) = modules(ctx).await else {
         return CodeOutput {
             code,
@@ -143,6 +144,7 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration
         },
     };
     output.calls = gateway.finish();
+    output.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     output.state_note = (!notes.is_empty()).then(|| notes.join(" "));
     for repair in outcome.repairs {
         output.lessons.extend(repair.lesson);

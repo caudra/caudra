@@ -2222,6 +2222,16 @@ fn written_size(byte_count: usize, lines: &[String]) -> String {
 }
 
 impl ToolOutput {
+    /// How long the call took by its own measure, stored with the output so a restored card keeps
+    /// its clock: a command's own time, or a `code` run's wall time.
+    pub fn duration(&self) -> Option<Duration> {
+        match self {
+            Self::Shell(output) => Some(Duration::from_millis(output.duration_ms)),
+            Self::Code(output) => output.duration_ms.map(Duration::from_millis),
+            _ => None,
+        }
+    }
+
     pub fn plan_write_result(&self) -> Option<PlanWriteResult> {
         let Self::Markdown(text) = self else {
             return None;
@@ -5222,6 +5232,16 @@ mod tests {
             )),
             "{CONTEXT_TOKENS_MSG}"
         );
+    }
+
+    const RAN_FOR_MS: u64 = 2_400;
+
+    #[test_case(ToolOutput::Shell(shell_output()), Some(10) ; "a_command_keeps_its_own_time")]
+    #[test_case(ToolOutput::Code(CodeOutput { duration_ms: Some(RAN_FOR_MS), ..Default::default() }), Some(RAN_FOR_MS) ; "a_code_run_keeps_its_wall_time")]
+    #[test_case(ToolOutput::Code(CodeOutput::default()), None ; "a_code_run_saved_untimed_has_no_clock")]
+    #[test_case(ToolOutput::Plain("ok".into()), None ; "other_results_are_untimed")]
+    fn a_result_keeps_how_long_its_call_took(output: ToolOutput, millis: Option<u64>) {
+        assert_eq!(output.duration(), millis.map(Duration::from_millis));
     }
 
     #[test_case(Vec::new(), None ; "a_run_without_calls_reports_its_tokens_alone")]

@@ -19,9 +19,9 @@ use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
-    header_workdir, inflected_header, label_spans, names_tool, progress_lines, raw_toggle_label,
-    repeats_tool, report_header, report_markdown, report_message, scroll_footer_text,
-    subagent_annotation, title,
+    header_workdir, inflected_header, keeps_clock, label_spans, names_tool, progress_lines,
+    raw_toggle_label, repeats_tool, report_header, report_markdown, report_message,
+    scroll_footer_text, subagent_annotation, title,
 };
 use super::{
     ToolProgress, code_card, environment_card, is_collapsible, json_text, json_tree, mcp_card,
@@ -1525,22 +1525,19 @@ fn child_annotation(
 }
 
 /// A child's clock, on the same terms a standalone card keeps one: wall time
-/// while it runs, and the command's own measured time once it lands.
+/// while it runs, and the time its output measured once it lands.
 ///
-/// `shell` alone, because `shell` alone reports a duration, and that one is
-/// persisted with the output, so a restored roster reads as the run did. A
+/// Only the clocked tools, because they alone measure a duration, and that one
+/// is persisted with the output, so a restored roster reads as the run did. A
 /// child that started before the roster was being timed has no clock rather
 /// than a wrong one.
 fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Duration> {
     if entry.status == BatchToolStatus::Running {
         return started
-            .filter(|_| names_tool(SHELL_TOOL_NAME, &entry.tool))
+            .filter(|_| keeps_clock(&entry.tool))
             .map(|started| live_elapsed(*started));
     }
-    match entry.output.as_ref() {
-        Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
-        _ => None,
-    }
+    entry.output.as_ref().and_then(ToolOutput::duration)
 }
 
 /// A child's own rendering, structured where the tool produced structure and
@@ -8158,29 +8155,43 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_running_shell_child_counts_up() {
+    fn code_child_output(duration_ms: u64) -> ToolOutput {
+        ToolOutput::Code(CodeOutput {
+            stdout: CHILD_BODY.into(),
+            duration_ms: Some(duration_ms),
+            ..CodeOutput::default()
+        })
+    }
+
+    #[test_case(SHELL_CHILD ; "shell")]
+    #[test_case(CODE_TOOL_NAME ; "code")]
+    fn a_running_clocked_child_counts_up(tool: &str) {
         let _clock = FrozenClock::at(CHILD_RAN_FOR);
-        let card = render_batch(&[shell_child(BatchToolStatus::Running)], false, &started(0));
+        let entry = BatchToolEntry {
+            status: BatchToolStatus::Running,
+            ..batch_entry(tool, 0)
+        };
+        let card = render_batch(&[entry], false, &started(0));
         let row = line_text(&card.lines[0]);
 
         assert!(row.ends_with(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
     }
 
-    /// The subprocess's own time supersedes the wall clock the row was drawn
-    /// with, exactly as a standalone card's header does.
-    #[test]
-    fn a_settled_shell_child_reports_the_commands_own_time() {
+    /// The measured time supersedes the wall clock the row was drawn with,
+    /// exactly as a standalone card's header does.
+    #[test_case(SHELL_CHILD, shell_child_output(CHILD_MEASURED_MS) ; "shell")]
+    #[test_case(CODE_TOOL_NAME, code_child_output(CHILD_MEASURED_MS) ; "code")]
+    fn a_settled_clocked_child_reports_its_measured_time(tool: &str, output: ToolOutput) {
         let _clock = FrozenClock::at(CHILD_RAN_FOR);
         let entry = BatchToolEntry {
-            output: Some(shell_child_output(CHILD_MEASURED_MS)),
-            ..shell_child(BatchToolStatus::Success)
+            output: Some(output),
+            ..batch_entry(tool, 0)
         };
         let card = render_batch(&[entry], false, &started(0));
         let row = line_text(&card.lines[0]);
 
         assert!(
-            row.ends_with(CHILD_MEASURED_CLOCK),
+            row.contains(CHILD_MEASURED_CLOCK),
             "{CHILD_CLOCK_MSG}: {row}"
         );
         assert!(!row.contains(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");

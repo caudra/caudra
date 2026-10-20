@@ -122,6 +122,10 @@ pub struct CodeOutput {
     /// The call whose answer the snippet ended on, when it ended on nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_repeats: Option<usize>,
+    /// The run's wall time, for the card's clock. `None` for a run that never started and for one
+    /// saved before runs were timed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
