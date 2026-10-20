@@ -2575,7 +2575,8 @@ impl<'h> Agent<'h> {
         // A turn that ends by saying what it is about to do, and then does
         // none of it. Read here because the response is moved below, and only
         // for a turn that would otherwise hand control back: a tool call or a
-        // captured report means the work continued.
+        // captured report means the work continued, and so does work still
+        // running elsewhere, whose report wakes the agent to do what it named.
         let abandoned = !has_tools
             && stop_reason == Some(StopReason::EndTurn)
             && !self
@@ -2583,6 +2584,7 @@ impl<'h> Agent<'h> {
                 .as_ref()
                 .is_some_and(|ready| ready.load(Ordering::Acquire))
             && self.tools.as_array().is_some_and(|tools| !tools.is_empty())
+            && !self.session_work().running
             && steering::visible_text(&response.message)
                 .is_some_and(|text| steering::abandons_turn(&text));
         let (observed, all_repairable) = if has_tools {
@@ -5908,6 +5910,9 @@ mod tests {
     const MAX_ABANDONED_NUDGES: u32 = 2;
     /// A real qwen3.8-27b tail: the turn ends on the work it is about to do.
     const ANNOUNCEMENT: &str = "Let me look at the workcell dependency and provider core files.";
+    /// A real tail from a main agent whose background task was still running.
+    const DELEGATED_ANNOUNCEMENT: &str =
+        "I'll report readiness and the proposed first batch before asking for repair approval.";
     const REPORT: &str = "The dependency is pinned at rev f40392a in Cargo.toml:41.";
     const STEERING_EMPTY: &str = "empty_response";
     const STEERING_ABANDONED: &str = "abandoned_turn";
@@ -11353,6 +11358,33 @@ mod tests {
             let result = agent.run(default_input()).await;
             assert!(matches!(result, Ok(DoneReason::EndTurn)), "{result:?}");
             assert_eq!(agent.num_turns, expected_turns);
+        });
+    }
+
+    /// Running work reports back and wakes the agent, so a turn that names
+    /// what it does with that report has not walked away from anything.
+    #[test_case(ANNOUNCEMENT ; "announcement")]
+    #[test_case(DELEGATED_ANNOUNCEMENT ; "delegated_announcement")]
+    fn an_announced_turn_waiting_on_running_work_is_not_continued(text: &str) {
+        smol::block_on(async {
+            let responses = vec![assistant_response(vec![ContentBlock::Text {
+                text: text.into(),
+            }])];
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.tools = serde_json::json!([{"name": "file_read"}]);
+            agent
+                .subagent_cancels
+                .insert(RUNNING_TASK.into(), CancelToken::new().0);
+            let result = agent.run(default_input()).await;
+            assert!(matches!(result, Ok(DoneReason::EndTurn)), "{result:?}");
+            assert_eq!(agent.num_turns, 1);
+            assert!(!history.as_slice().iter().any(|message| {
+                message
+                    .steering
+                    .as_ref()
+                    .is_some_and(|origin| origin.rule == STEERING_ABANDONED)
+            }));
         });
     }
 

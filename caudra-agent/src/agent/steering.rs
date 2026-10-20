@@ -1672,6 +1672,9 @@ mod tests {
     #[test_case("The script transformed all 10 families. Now let me verify syntax and rendering, then handle CWE.", true ; "promise_after_a_finding")]
     #[test_case("The 10 families transformed but not yet verified. Continuing: verify syntax + render, then CWE, profiles, hash.", true ; "resumption_opener")]
     #[test_case("`fromtimestamp` isn't in the isolated interpreter — computing via `timedelta` instead:", true ; "colon_after_inline_code")]
+    // From a gpt-6-astra main agent waiting on its own background task: the
+    // text alone reads as abandonment, so only running work can excuse it.
+    #[test_case("I'll report readiness and the proposed first batch before asking for repair approval.", true ; "promise_while_delegated_work_runs")]
     // Real hand-backs from the same corpus, and from the claude and gpt
     // sessions the rule must leave alone.
     #[test_case("Done — `sleep 20` ran and exited cleanly (code 0, no output).", false ; "completion")]
