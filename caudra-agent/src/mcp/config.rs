@@ -16,9 +16,9 @@ use super::error::McpError;
 use super::kind::McpServerKind;
 use super::protocol::ServerDiscovery;
 use crate::tools::is_builtin_tool;
-use caudra_config::config_version::ConfigVersion;
-use caudra_config::interpolation::{self, ConfigTextError, Lookup};
-use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSION};
+use caudra_config::interpolation::{self, Lookup};
+use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_FORMAT};
+use caudra_config::migration::{self, ReadError};
 use caudra_config::own_writes;
 use caudra_config::toml_document::set_value;
 use caudra_config::{global_config_dir, is_valid_server_name};
@@ -780,24 +780,35 @@ fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>
         McpConfigSource::Global => Lookup::Global(path),
         McpConfigSource::Project | McpConfigSource::Runtime => Lookup::Refused,
     };
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let content = match migration::read(path, &MCP_FORMAT) {
+        Ok(Some(loaded)) => loaded.text,
+        Ok(None) => {
             tracing::info!(
                 path = %path.display(),
                 "no mcp config to read"
             );
             return Ok(None);
         }
-        Err(e) => {
+        Err(ReadError::Io { source, .. }) => {
             tracing::error!(
                 path = %path.display(),
-                error = %e,
+                error = %source,
                 "failed to read mcp config"
             );
             return Err(McpConfigError::Read {
                 path: path.into(),
-                error: e.to_string(),
+                error: source.to_string(),
+            });
+        }
+        Err(ReadError::Invalid { source, .. }) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %source,
+                "failed to upgrade mcp config"
+            );
+            return Err(McpConfigError::Parse {
+                path: path.into(),
+                error: source.to_string(),
             });
         }
     };
@@ -807,9 +818,7 @@ fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>
             error: format!("`{key}` {REMOVED_KEY_REASON}"),
         });
     }
-    ConfigVersion::<MCP_VERSION>::check_document(&content)
-        .map_err(ConfigTextError::from)
-        .and_then(|_| interpolation::from_str(&content, lookup))
+    interpolation::from_str(&content, lookup)
         .inspect_err(|e| {
             tracing::warn!(
                 path = %path.display(),
@@ -833,8 +842,8 @@ mod tests {
     use caudra_config::example::mcp::{HTTP_SERVER, OAUTH_CLIENT, STDIO_SERVER};
     use caudra_config::example::{self, Render};
     use caudra_config::mcp::{
-        DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, HTTP_FIELDS, OAUTH_FIELDS, SERVER_FIELDS,
-        STDIO_FIELDS,
+        DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, HTTP_FIELDS, MCP_VERSION, OAUTH_FIELDS,
+        SERVER_FIELDS, STDIO_FIELDS,
     };
     use serde_json::Value;
     use test_case::test_case;

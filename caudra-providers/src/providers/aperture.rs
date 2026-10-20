@@ -1074,6 +1074,8 @@ mod tests {
         // Model ids containing dots must be quoted: TOML treats `glm-5.2` as a
         // dotted key unless wrapped in quotes.
         let toml = r#"
+version = 1
+
 [aperture.overrides.ikora-openai]
 base = "llama-cpp"
 

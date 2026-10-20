@@ -12,8 +12,9 @@ use thiserror::Error;
 use toml_edit::DocumentMut;
 use tracing::warn;
 
-use crate::config_file::GlobalConfigFile;
+use crate::config_file::{CONFIG_FORMAT, GlobalConfigFile};
 use crate::interpolation::Lookup;
+use crate::migration;
 use crate::own_writes;
 
 const STAGING_PREFIX: &str = ".caudra.toml.";
@@ -91,9 +92,12 @@ impl GlobalDocument {
     }
 }
 
-/// `text` as an editable document, once it loads as a valid global config.
+/// `text` as an editable document, once it loads as a valid global config. The document stays
+/// as written; only the check reads it upgraded.
 fn validated(path: &Path, text: &str) -> Result<DocumentMut, String> {
-    GlobalConfigFile::parse(text, Lookup::Global(path))
+    let loaded = migration::upgrade_text(text.to_owned(), &CONFIG_FORMAT)
+        .map_err(|error| error.to_string())?;
+    GlobalConfigFile::parse(&loaded.text, Lookup::Global(path))
         .map_err(|error| error.to_string())?
         .settings
         .into_config(false)

@@ -5,14 +5,15 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config_file::{CONFIG_FILE, INIT_LUA_FILE};
+use crate::config_file::{CONFIG_FILE, CONFIG_FORMAT, INIT_LUA_FILE};
 use crate::example::{self, Document, Render};
 use crate::experimental::Feature;
-use crate::mcp::MCP_FILE;
-use crate::providers::PROVIDERS_FILE;
-use crate::sandbox::SANDBOX_FILE;
-use crate::workcell::WORKCELL_PROFILE_FILE;
-use crate::{ENV_FILE, PERMISSIONS_FILE, PROJECT_DIR};
+use crate::mcp::{MCP_FILE, MCP_FORMAT};
+use crate::migration::ConfigFormat;
+use crate::providers::{PROVIDERS_FILE, PROVIDERS_FORMAT};
+use crate::sandbox::{SANDBOX_FILE, SANDBOX_FORMAT};
+use crate::workcell::{WORKCELL_FORMAT, WORKCELL_PROFILE_FILE};
+use crate::{ENV_FILE, PERMISSIONS_FILE, PERMISSIONS_FORMAT, PROJECT_DIR};
 
 pub const DOCS_ORIGIN: &str = "https://caudra.ai";
 const COMMANDS_DIR: &str = "commands/";
@@ -41,6 +42,8 @@ pub struct ConfigFile {
     /// The docs page, as a site path.
     pub docs: &'static str,
     pub example: Option<fn() -> Document>,
+    /// How a TOML file's text is upgraded to the shape this build reads.
+    pub format: Option<&'static ConfigFormat>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +70,7 @@ pub const CAUDRA: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/configuration/",
     example: Some(example::caudra::document),
+    format: Some(&CONFIG_FORMAT),
 };
 
 pub const PERMISSIONS: ConfigFile = ConfigFile {
@@ -77,6 +81,7 @@ pub const PERMISSIONS: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/permissions/#toml-policy",
     example: Some(example::permissions::document),
+    format: Some(&PERMISSIONS_FORMAT),
 };
 
 pub const MCP: ConfigFile = ConfigFile {
@@ -87,6 +92,7 @@ pub const MCP: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/mcp/",
     example: Some(example::mcp::document),
+    format: Some(&MCP_FORMAT),
 };
 
 pub const PROVIDERS: ConfigFile = ConfigFile {
@@ -97,6 +103,7 @@ pub const PROVIDERS: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/providers/#providers-toml",
     example: Some(example::providers::document),
+    format: Some(&PROVIDERS_FORMAT),
 };
 
 pub const WORKCELL: ConfigFile = ConfigFile {
@@ -107,6 +114,7 @@ pub const WORKCELL: ConfigFile = ConfigFile {
     feature: Some(Feature::RemoteWorkcell),
     docs: "/docs/remote-workspaces/#configure-a-profile",
     example: Some(example::workcell::document),
+    format: Some(&WORKCELL_FORMAT),
 };
 
 pub const SANDBOXES: ConfigFile = ConfigFile {
@@ -117,6 +125,7 @@ pub const SANDBOXES: ConfigFile = ConfigFile {
     feature: Some(Feature::Sandboxes),
     docs: "/docs/sandboxes/#configuration-schema",
     example: Some(example::sandboxes::document),
+    format: Some(&SANDBOX_FORMAT),
 };
 
 pub const INIT_LUA: ConfigFile = ConfigFile {
@@ -127,6 +136,7 @@ pub const INIT_LUA: ConfigFile = ConfigFile {
     feature: Some(Feature::LuaPlugins),
     docs: "/docs/plugins/",
     example: None,
+    format: None,
 };
 
 pub const ENV: ConfigFile = ConfigFile {
@@ -137,6 +147,7 @@ pub const ENV: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/configuration/#environment-variables",
     example: None,
+    format: None,
 };
 
 pub const COMMANDS: ConfigFile = ConfigFile {
@@ -147,6 +158,7 @@ pub const COMMANDS: ConfigFile = ConfigFile {
     feature: None,
     docs: "/docs/commands/#custom-commands",
     example: None,
+    format: None,
 };
 
 pub const CONFIG_FILES: &[ConfigFile] = &[
@@ -255,7 +267,9 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::{CONFIG_FILES, FileState, MCP, PROVIDERS, Scope, find_example, locate};
+    use super::{
+        CONFIG_FILES, FileState, MCP, PROVIDERS, Scope, TOML_SUFFIX, find_example, locate,
+    };
     use crate::PROJECT_DIR;
     #[cfg(unix)]
     use crate::config_file::CONFIG_FILE;
@@ -274,6 +288,26 @@ mod tests {
     #[test_case("commands" ; "directory")]
     fn only_toml_files_have_examples(name: &str) {
         assert!(find_example(name).is_none());
+    }
+
+    #[test]
+    fn every_toml_file_has_a_format_whose_steps_chain_to_its_reference() {
+        for file in CONFIG_FILES {
+            assert_eq!(
+                file.format.is_some(),
+                file.name.ends_with(TOML_SUFFIX),
+                "{}",
+                file.name
+            );
+            let Some(format) = file.format else {
+                continue;
+            };
+            assert_eq!(format.file, file.name);
+            assert_eq!(format.check(), Ok(()));
+            if let Some(document) = file.example {
+                assert_eq!(document().version, format.latest, "{}", file.name);
+            }
+        }
     }
 
     #[test]

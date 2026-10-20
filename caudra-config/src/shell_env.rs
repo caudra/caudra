@@ -344,8 +344,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::config_file::{CONFIG_FILE, GlobalConfigFile};
-    use crate::interpolation::Lookup;
+    use crate::config_file::{CONFIG_FILE, load_global_config};
     use crate::{ENV_FILE, PROJECT_DIR, RawConfig, load_env_files_scoped};
 
     const ORIGINAL: &str = "# my settings\nversion = 1\n\n[ui]\n# keep this\ntheme = \"{env:CAUDRA_TEST_SHELL_ENV_THEME}\" # trailing\n\n[agent]\ntodo_reminder = false\n";
@@ -380,7 +379,7 @@ mod tests {
     }
 
     fn config(path: &Path) -> ShellEnvConfig {
-        GlobalConfigFile::parse(&fs::read_to_string(path).unwrap(), Lookup::Global(path))
+        load_global_config(path)
             .unwrap()
             .settings
             .into_config(false)

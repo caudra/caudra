@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -8,27 +7,29 @@ use serde::de::IntoDeserializer;
 use thiserror::Error;
 use toml::de::{DeTable, Deserializer as TomlDeserializer, Error as TomlError};
 
-use crate::config_version::ConfigVersion;
+use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
 use crate::experimental::FeatureFlags;
 use crate::interpolation::{self, ConfigTextError, InterpolationError, Lookup};
+use crate::migration::{self, ConfigFormat, ReadError};
 use crate::{PROJECT_DIR, RawConfig};
 
 pub const CONFIG_FILE: &str = "caudra.toml";
 pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_FORMAT: ConfigFormat = ConfigFormat {
+    file: CONFIG_FILE,
+    latest: CONFIG_VERSION,
+    steps: &[],
+    requires_version: false,
+};
 pub const INIT_LUA_FILE: &str = "init.lua";
-const VERSION_KEY: &str = "version";
 const EXPERIMENTAL_KEY: &str = "experimental";
 
 #[derive(Debug, Error)]
 pub enum ConfigFileError {
     #[error("resolve the config directory: {0}")]
     ConfigDir(#[source] io::Error),
-    #[error("read {}: {source}", path.display())]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error(transparent)]
+    Read(#[from] ReadError),
     #[error("invalid {}: {source}", path.display())]
     Invalid {
         path: PathBuf,
@@ -89,8 +90,8 @@ impl GlobalConfigFile {
 
 /// A missing file means every default, including every experiment off.
 pub fn load_global_config(path: &Path) -> Result<GlobalConfigFile, ConfigFileError> {
-    match read(path)? {
-        Some(text) => GlobalConfigFile::parse(&text, Lookup::Global(path))
+    match migration::read(path, &CONFIG_FORMAT)? {
+        Some(loaded) => GlobalConfigFile::parse(&loaded.text, Lookup::Global(path))
             .map_err(|source| invalid(path, source)),
         None => Ok(GlobalConfigFile::default()),
     }
@@ -99,25 +100,14 @@ pub fn load_global_config(path: &Path) -> Result<GlobalConfigFile, ConfigFileErr
 /// A repository must never opt its users into an experiment or read their
 /// environment, so both are refused outright rather than ignored.
 pub fn load_project_config(path: &Path) -> Result<RawConfig, ConfigFileError> {
-    let Some(text) = read(path)? else {
+    let Some(loaded) = migration::read(path, &CONFIG_FORMAT)? else {
         return Ok(RawConfig::default());
     };
-    match parse(&text, Lookup::Refused).map_err(|source| invalid(path, source))? {
+    match parse(&loaded.text, Lookup::Refused).map_err(|source| invalid(path, source))? {
         (Some(_), _) => Err(ConfigFileError::ProjectExperimental {
             path: path.to_path_buf(),
         }),
         (None, settings) => Ok(settings),
-    }
-}
-
-fn read(path: &Path) -> Result<Option<String>, ConfigFileError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(ConfigFileError::Read {
-            path: path.to_path_buf(),
-            source,
-        }),
     }
 }
 
@@ -144,7 +134,7 @@ fn parse(
         error
     };
     let mut root = DeTable::parse(text)?;
-    root.get_mut().remove(VERSION_KEY);
+    root.get_mut().remove(CONFIG_VERSION_KEY);
     let features = root
         .get_mut()
         .remove(EXPERIMENTAL_KEY)
@@ -165,6 +155,7 @@ mod tests {
     };
     use crate::experimental::{Feature, FeatureFlags};
     use crate::interpolation::{ENV_OPEN, FILE_OPEN};
+    use crate::migration::ReadError;
     use crate::{ENV_FILE, InboundPolicy};
     use test_case::test_case;
 
@@ -250,17 +241,29 @@ mod tests {
     }
 
     #[test_case("[experimental]\nworkflow = true\n", "unknown field `workflow`"; "unknown_flag")]
-    #[test_case("[experimental]\nworkflows = 1\n", "line 2"; "non_bool_flag")]
-    #[test_case("experimental = true\n", "line 1"; "flag_table_not_a_table")]
-    #[test_case("[ui]\nsho_thinking = true\n", "line 2"; "unknown_setting_keeps_its_line")]
-    #[test_case("version = 2\n", "newer"; "newer_version")]
-    #[test_case("version = 0\n", "version"; "invalid_version")]
-    #[test_case("[ui\n", "line 1"; "syntax_error")]
+    #[test_case("version = 1\n[experimental]\nworkflows = 1\n", "line 3"; "non_bool_flag")]
+    #[test_case("version = 1\nexperimental = true\n", "line 2"; "flag_table_not_a_table")]
+    #[test_case("version = 1\n[ui]\nsho_thinking = true\n", "line 3"; "unknown_setting_keeps_its_line")]
     fn invalid_global_files_are_refused(contents: &str, expected: &str) {
         let (_dir, path) = write(contents);
         let error = load_global_config(&path).unwrap_err();
         assert!(matches!(error, ConfigFileError::Invalid { .. }), "{error}");
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test_case("version = 2\n", "newer"; "newer_version")]
+    #[test_case("version = 0\n", "version"; "invalid_version")]
+    #[test_case("[ui\n", "line 1"; "syntax_error")]
+    fn unreadable_formats_are_refused_with_the_path(contents: &str, expected: &str) {
+        let (_dir, path) = write(contents);
+        let error = load_global_config(&path).unwrap_err();
+        assert!(
+            matches!(error, ConfigFileError::Read(ReadError::Invalid { .. })),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains(expected), "{message}");
     }
 
     #[test_case("[experimental]\n"; "empty_table")]
@@ -343,7 +346,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(matches!(
             load_global_config(&path),
-            Err(ConfigFileError::Read { .. })
+            Err(ConfigFileError::Read(ReadError::Io { .. }))
         ));
     }
 }

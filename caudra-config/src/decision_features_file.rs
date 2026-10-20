@@ -77,9 +77,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::config_file::{CONFIG_FILE, GlobalConfigFile};
+    use crate::config_file::{CONFIG_FILE, load_global_config};
     use crate::decisions::DecisionsConfig;
-    use crate::interpolation::Lookup;
     use crate::own_writes;
 
     const FEATURE: &str = "memory_search";
@@ -98,7 +97,7 @@ mod tests {
     }
 
     fn decisions(path: &Path) -> DecisionsConfig {
-        GlobalConfigFile::parse(&fs::read_to_string(path).unwrap(), Lookup::Global(path))
+        load_global_config(path)
             .unwrap()
             .settings
             .into_config(false)

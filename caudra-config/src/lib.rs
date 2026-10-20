@@ -25,12 +25,19 @@ use url::Url;
 
 use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
+use crate::migration::ConfigFormat;
 use crate::shell_env::{ShellEnvConfig, ShellEnvError, ShellEnvFileConfig};
 
 pub const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
 pub const PERMISSIONS_VERSION: u32 = 1;
+pub const PERMISSIONS_FORMAT: ConfigFormat = ConfigFormat {
+    file: PERMISSIONS_FILE,
+    latest: PERMISSIONS_VERSION,
+    steps: &[],
+    requires_version: false,
+};
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
 const UNSET_DEFAULT: &str = "unset";
 const REQUIRED_DEFAULT: &str = "required";
@@ -4504,9 +4511,12 @@ fn read_permissions_file(
     };
     let content =
         fs::read_to_string(&path).map_err(|error| format!("cannot read permissions: {error}"))?;
-    let mut config: PermissionsFileConfig = interpolation::from_str(&content, lookup)
+    let digest = permission_source_digest(content.as_bytes());
+    let loaded = migration::upgrade_text(content, &PERMISSIONS_FORMAT)
         .map_err(|error| format!("cannot parse permissions: {error}"))?;
-    config.loaded_file = Some((path, permission_source_digest(content.as_bytes())));
+    let mut config: PermissionsFileConfig = interpolation::from_str(&loaded.text, lookup)
+        .map_err(|error| format!("cannot parse permissions: {error}"))?;
+    config.loaded_file = Some((path, digest));
     Ok(Some(config))
 }
 
@@ -4547,7 +4557,7 @@ pub fn global_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_version::CONFIG_VERSION_KEY;
+    use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersionError};
     use crate::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::{env, fs};
     use tempfile::TempDir;
@@ -5221,6 +5231,12 @@ mod tests {
         assert_eq!(field.min, min);
     }
 
+    /// What the loader parses: the text upgraded to the latest format first.
+    fn parse_permissions(text: &str) -> PermissionsFileConfig {
+        let loaded = migration::upgrade_text(text.to_owned(), &PERMISSIONS_FORMAT).unwrap();
+        toml::from_str(&loaded.text).unwrap()
+    }
+
     fn write_global_permissions(dir: &Path, content: &str) {
         let perms_dir = dir.join(".config/caudra");
         fs::create_dir_all(&perms_dir).unwrap();
@@ -5269,10 +5285,7 @@ mod tests {
             fs::write(temp.path().join(PERMISSIONS_FILE), source).unwrap();
             load_permissions_scoped(temp.path(), Some(temp.path()), false)
         } else {
-            build_permissions(
-                toml::from_str(source).unwrap(),
-                PermissionsFileConfig::default(),
-            )
+            build_permissions(parse_permissions(source), PermissionsFileConfig::default())
         };
         assert!(config.loaded_sources.is_empty());
     }
@@ -6680,18 +6693,31 @@ mod tests {
     }
 
     #[test]
-    fn current_permissions_version_is_not_read_as_a_tool_section() {
+    fn an_unversioned_permissions_file_reads_as_the_first_version() {
         const RULES: &str = "[shell]\ndeny = [\"git push *\"]\n";
         let versioned: PermissionsFileConfig = toml::from_str(&format!(
             "{CONFIG_VERSION_KEY} = {PERMISSIONS_VERSION}\n{RULES}"
         ))
         .unwrap();
-        let unversioned: PermissionsFileConfig = toml::from_str(RULES).unwrap();
+        let unversioned = parse_permissions(RULES);
 
         assert_eq!(
             build_permissions(versioned, PermissionsFileConfig::default()).rules,
             build_permissions(unversioned, PermissionsFileConfig::default()).rules
         );
+    }
+
+    #[test]
+    fn the_permissions_parser_requires_the_version() {
+        let expected = ConfigVersionError::Missing {
+            latest: PERMISSIONS_VERSION,
+        };
+
+        let Err(error) = toml::from_str::<PermissionsFileConfig>("[shell]\n") else {
+            panic!("a file without a version parsed");
+        };
+
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
     }
 
     #[test_case(true ; "global")]
@@ -6729,10 +6755,9 @@ mod tests {
     #[test]
     fn project_trust_material_includes_denies_and_asks() {
         let global = PermissionsFileConfig::default();
-        let project: PermissionsFileConfig = toml::from_str(
+        let project = parse_permissions(
             "[shell]\nallow = [\"git *\"]\nask = [\"git push *\"]\ndeny = [\"git clean *\"]\n",
-        )
-        .unwrap();
+        );
 
         let permissions = build_permissions(global, project);
 

@@ -1,13 +1,18 @@
 use std::fmt;
-use std::io;
 use std::path::Path;
 
-use caudra_config::config_version::ConfigVersion;
+use caudra_config::migration::{self, ConfigFormat};
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use tracing::warn;
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_FORMAT: ConfigFormat = ConfigFormat {
+    file: MANIFEST_FILE,
+    latest: MANIFEST_VERSION,
+    steps: &[],
+    requires_version: false,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -132,10 +137,8 @@ pub(crate) fn load_plugin_permissions_with_trust(
         return (PluginPermissions::denied(), false);
     };
     let manifest_path = dir.join(MANIFEST_FILE);
-    match std::fs::read_to_string(&manifest_path) {
-        Ok(content) => match ConfigVersion::<MANIFEST_VERSION>::check_document(&content)
-            .and_then(|_| toml::from_str::<toml::Value>(&content))
-        {
+    match migration::read(&manifest_path, &MANIFEST_FORMAT) {
+        Ok(Some(loaded)) => match toml::from_str::<toml::Value>(&loaded.text) {
             Ok(val) => (PluginPermissions::from_manifest(&val), true),
             Err(e) => {
                 warn!(
@@ -146,20 +149,20 @@ pub(crate) fn load_plugin_permissions_with_trust(
                 (PluginPermissions::denied(), false)
             }
         },
+        Ok(None) => {
+            warn!(
+                dir = %dir.display(),
+                "no {MANIFEST_FILE} next to plugin; all permissions denied. Create one \
+                 (even an empty file) next to it to grant permissions"
+            );
+            (PluginPermissions::denied(), false)
+        }
         Err(e) => {
-            if e.kind() == io::ErrorKind::NotFound {
-                warn!(
-                    dir = %dir.display(),
-                    "no {MANIFEST_FILE} next to plugin; all permissions denied. Create one \
-                     (even an empty file) next to it to grant permissions"
-                );
-            } else {
-                warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "cannot read {MANIFEST_FILE}, denying all permissions"
-                );
-            }
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "cannot load {MANIFEST_FILE}, denying all permissions"
+            );
             (PluginPermissions::denied(), false)
         }
     }
@@ -246,6 +249,20 @@ mod tests {
                 "{perm}"
             );
         }
+    }
+
+    #[test]
+    fn an_unversioned_manifest_keeps_its_grants() {
+        let (permissions, trusted) = load_manifest("[permissions]\nnet = false\n");
+
+        assert!(trusted);
+        assert!(!permissions.is_allowed(Permission::Net));
+        assert!(permissions.is_allowed(Permission::Run));
+    }
+
+    #[test]
+    fn the_manifest_format_chains_its_steps() {
+        assert_eq!(MANIFEST_FORMAT.check(), Ok(()));
     }
 
     #[test]

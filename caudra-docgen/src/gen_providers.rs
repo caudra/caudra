@@ -877,7 +877,8 @@ pub fn generate() -> String {
 mod tests {
     use caudra_config::files;
     use caudra_config::interpolation::{self, Lookup};
-    use caudra_config::providers::ProvidersConfig;
+    use caudra_config::migration;
+    use caudra_config::providers::{PROVIDERS_FORMAT, ProvidersConfig};
     use caudra_providers::manifest::ManifestRegistry;
     use caudra_providers::model::ModelEntry;
     use test_case::test_case;
@@ -920,7 +921,10 @@ mod tests {
             .skip(1)
             .filter_map(|rest| rest.split_once(FENCE_END).map(|(body, _)| body))
             .filter(|body| body.contains(DECISION_HEADER))
-            .map(|body| interpolation::from_str(body, Lookup::Refused).unwrap())
+            .map(|body| {
+                let loaded = migration::upgrade_text(body.to_owned(), &PROVIDERS_FORMAT).unwrap();
+                interpolation::from_str(&loaded.text, Lookup::Refused).unwrap()
+            })
             .collect();
         assert!(!examples.is_empty());
         for (name, def) in examples.iter().flat_map(|config| &config.decisions) {

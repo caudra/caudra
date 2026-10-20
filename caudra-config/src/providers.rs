@@ -21,6 +21,7 @@ use caudra_storage::thinking::ReasoningOptions;
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
 use crate::decisions::{DECISIONS_TABLE, DecisionEndpointDef};
 use crate::interpolation::{self, Lookup};
+use crate::migration::{self, ConfigFormat, MigrationError, ReadError};
 use crate::own_writes;
 use crate::toml_document::{merge_item, to_table};
 use crate::{ConfigField, ConfigValue};
@@ -35,6 +36,12 @@ pub use accounts::{
 
 pub const PROVIDERS_FILE: &str = "providers.toml";
 pub(crate) const PROVIDERS_VERSION: u32 = 1;
+pub const PROVIDERS_FORMAT: ConfigFormat = ConfigFormat {
+    file: PROVIDERS_FILE,
+    latest: PROVIDERS_VERSION,
+    steps: &[],
+    requires_version: false,
+};
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
@@ -983,7 +990,6 @@ impl ProviderDef {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvidersConfig {
     /// Named ahead of the flattened map, so the key never reads as a slug.
-    #[serde(default)]
     version: ConfigVersion<PROVIDERS_VERSION>,
     /// Named decision endpoints, `[decisions.<name>]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1064,16 +1070,17 @@ impl ProvidersConfig {
     }
 
     fn parse_file(path: &Path) -> Result<Self, String> {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                interpolation::from_str::<ProvidersConfig>(&content, Lookup::Global(path))
+        match migration::read(path, &PROVIDERS_FORMAT) {
+            Ok(Some(loaded)) => {
+                interpolation::from_str::<ProvidersConfig>(&loaded.text, Lookup::Global(path))
                     .map_err(|error| error.to_string())
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot read providers.toml");
+            Ok(None) => Ok(Self::default()),
+            Err(ReadError::Io { source, .. }) => {
+                tracing::warn!(path = %path.display(), error = %source, "cannot read providers.toml");
                 Ok(Self::default())
             }
+            Err(ReadError::Invalid { source, .. }) => Err(source.to_string()),
         }
     }
 
@@ -1155,6 +1162,8 @@ pub enum ProvidersParseError {
     Config(#[from] TomlError),
     #[error(transparent)]
     Document(#[from] toml_edit::TomlError),
+    #[error(transparent)]
+    Format(#[from] MigrationError),
 }
 
 /// `providers.toml` as written, `{env:NAME}` references and comments included,
@@ -1197,10 +1206,12 @@ impl ProvidersFile {
         Ok(())
     }
 
+    /// Edits land in the upgraded document, so a save writes the latest shape.
     fn parse(text: &str) -> Result<Self, ProvidersParseError> {
+        let loaded = migration::upgrade_text(text.to_owned(), &PROVIDERS_FORMAT)?;
         Ok(Self {
-            config: toml::from_str(text)?,
-            document: text.parse()?,
+            config: toml::from_str(&loaded.text)?,
+            document: loaded.text.parse()?,
         })
     }
 
@@ -1488,11 +1499,17 @@ id = "small"
 context_window = 8192
 "#;
 
+    /// What the loader parses: the text upgraded to the latest format first.
+    pub(super) fn parse_config(text: &str) -> Result<ProvidersConfig, TomlError> {
+        let loaded = migration::upgrade_text(text.to_owned(), &PROVIDERS_FORMAT).unwrap();
+        toml::from_str(&loaded.text)
+    }
+
     #[test_case("qwen3.8-27b-lora", Some(229_376) ; "exact_entry_inherits_what_it_omits")]
     #[test_case("small", Some(8_192) ; "exact_entry_overrides_field_by_field")]
     #[test_case("never-declared", Some(229_376) ; "discovered_model_gets_defaults")]
     fn model_defaults_apply_unless_an_exact_entry_overrides(model_id: &str, window: Option<u32>) {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let settings = parsed.get("local").unwrap().model_settings(model_id);
 
         assert_eq!(settings.context_window, window, "{ABSENT_MEANS_INHERIT}");
@@ -1503,7 +1520,7 @@ context_window = 8192
     #[test_case(ModelPurpose::Fast, "small" ; "list_prefers_its_first_entry")]
     #[test_case(ModelPurpose::Best, "qwen3.8-27b-lora" ; "bare_string_is_still_accepted")]
     fn declared_purposes_bind_a_model_id(purpose: ModelPurpose, expected: &str) {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let def = parsed.get("local").unwrap();
 
         assert_eq!(
@@ -1523,7 +1540,7 @@ context_window = 8192
     #[test_case("qwen3.8-27b-lora", false ; "another_purposes_model_does_not")]
     #[test_case("tiny", false ; "unrelated_id_does_not")]
     fn declared_entries_cover_their_family(model_id: &str, expected: bool) {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let fast = parsed
             .get("local")
             .unwrap()
@@ -1536,7 +1553,7 @@ context_window = 8192
 
     #[test]
     fn undeclared_purposes_stay_absent_rather_than_defaulting() {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let def = parsed.get("local").unwrap();
 
         assert_eq!(def.purposes.get(&ModelPurpose::Plan), None);
@@ -1549,9 +1566,9 @@ context_window = 8192
     #[test]
     #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn defaults_and_models_survive_a_serialize_roundtrip() {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
-        let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
+        let reparsed: ProvidersConfig = parse_config(&rewritten).unwrap();
 
         let local = reparsed.get("local").unwrap();
         let settings = local.model_settings("small");
@@ -1571,7 +1588,7 @@ context_window = 8192
     /// controls"), not an absent one, so it must survive the merge.
     #[test]
     fn empty_default_reasoning_options_are_declared_not_missing() {
-        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let settings = parsed
             .get("local")
             .unwrap()
@@ -1582,7 +1599,7 @@ context_window = 8192
 
     #[test]
     fn model_def_reads_declared_reasoning_options() {
-        let parsed: ProvidersConfig = toml::from_str(DECLARED_LEVELS_TOML).unwrap();
+        let parsed: ProvidersConfig = parse_config(DECLARED_LEVELS_TOML).unwrap();
         let model = &parsed.get("local").unwrap().models[0];
 
         assert_eq!(model.id, "qwen3.8-27b");
@@ -1616,7 +1633,7 @@ context_window = 8192
             },
         );
         let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: ProvidersConfig = toml::from_str(&toml_str).unwrap();
+        let parsed: ProvidersConfig = parse_config(&toml_str).unwrap();
         assert_eq!(
             parsed.get("my-provider").unwrap().protocol,
             Some(Protocol::Openai)
@@ -1645,7 +1662,7 @@ compaction = "x"
 
     #[test]
     fn config_rejects_an_unknown_purpose() {
-        let error = toml::from_str::<ProvidersConfig>(UNKNOWN_PURPOSE_TOML).unwrap_err();
+        let error = parse_config(UNKNOWN_PURPOSE_TOML).unwrap_err();
         assert!(error.to_string().contains(UNKNOWN_PURPOSE), "{error}");
     }
 
@@ -1662,7 +1679,7 @@ compaction = "x"
     #[test_case("goal" ; "goal")]
     fn provider_purposes_reject_workload_keys(purpose: &str) {
         let input = format!("[local.purposes]\n{purpose} = \"model\"\n");
-        let error = toml::from_str::<ProvidersConfig>(&input).unwrap_err();
+        let error = parse_config(&input).unwrap_err();
 
         assert!(error.to_string().contains(NON_CLASS_PURPOSE), "{error}");
     }
@@ -1673,7 +1690,7 @@ compaction = "x"
     #[test_case("fast = [\"small\", \"\\t\"]", EMPTY_PURPOSE_PREFIX ; "whitespace_list_entry")]
     fn provider_purposes_reject_empty_model_prefixes(declaration: &str, expected: &str) {
         let input = format!("[local.purposes]\n{declaration}\n");
-        let error = toml::from_str::<ProvidersConfig>(&input).unwrap_err();
+        let error = parse_config(&input).unwrap_err();
 
         assert!(error.to_string().contains(expected), "{error}");
     }
@@ -1685,7 +1702,7 @@ compaction = "x"
 fast = ["shared", "small"]
 best = ["large", "shared"]
 "#;
-        let error = toml::from_str::<ProvidersConfig>(input).unwrap_err();
+        let error = parse_config(input).unwrap_err();
 
         assert!(
             error.to_string().contains(DUPLICATE_PURPOSE_PREFIX),
@@ -1701,7 +1718,7 @@ fast = "gpt-4"
 best = "gpt-4.1"
 "#;
 
-        assert!(toml::from_str::<ProvidersConfig>(input).is_ok());
+        assert!(parse_config(input).is_ok());
     }
 
     #[test_case("\"model\"", false ; "one")]
@@ -1709,14 +1726,14 @@ best = "gpt-4.1"
     #[test_case("[\"model\", \"other\"]", true ; "many")]
     fn purpose_models_preserve_their_one_or_many_shape(value: &str, expected_array: bool) {
         let input = format!("[local.purposes]\nfast = {value}\n");
-        let parsed: ProvidersConfig = toml::from_str(&input).unwrap();
+        let parsed: ProvidersConfig = parse_config(&input).unwrap();
         #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
         let rewritten_value: toml::Value = toml::from_str(&rewritten).unwrap();
         let fast = &rewritten_value["local"]["purposes"]["fast"];
 
         assert_eq!(fast.is_array(), expected_array, "{rewritten}");
-        let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
+        let reparsed: ProvidersConfig = parse_config(&rewritten).unwrap();
         assert_eq!(
             reparsed.get("local").unwrap().purposes[&ModelPurpose::Fast],
             parsed.get("local").unwrap().purposes[&ModelPurpose::Fast]
@@ -1726,7 +1743,7 @@ best = "gpt-4.1"
     #[test]
     fn purpose_models_validate_without_trimming_model_ids() {
         let input = "[local.purposes]\nfast = \" model \"\n";
-        let parsed: ProvidersConfig = toml::from_str(input).unwrap();
+        let parsed: ProvidersConfig = parse_config(input).unwrap();
 
         assert_eq!(
             parsed.get("local").unwrap().purposes[&ModelPurpose::Fast].preferred(),
@@ -1956,7 +1973,7 @@ best = "gpt-4.1"
     #[test]
     #[expect(clippy::disallowed_methods, reason = "checks what serde renders")]
     fn saving_stamps_the_version_without_turning_it_into_a_provider() {
-        let unversioned: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let unversioned: ProvidersConfig = parse_config(DEFAULTS_TOML).unwrap();
         let rewritten = toml::to_string_pretty(&unversioned).unwrap();
         let document: toml::Table = toml::from_str(&rewritten).unwrap();
         let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
@@ -2049,7 +2066,7 @@ protocol = "anthropic"
 
     #[test]
     fn allow_remote_is_unknown_in_decision_endpoints() {
-        let error = toml::from_str::<ProvidersConfig>(
+        let error = parse_config(
             "[decisions.remote]\nprotocol = \"typesafe\"\nbase_url = \"https://api.typesafe.ai\"\nallow_remote = true\n",
         )
         .unwrap_err();
@@ -2061,13 +2078,13 @@ protocol = "anthropic"
     }
 
     #[test_case(
-        "[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\n",
-        "[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\ndefault_model = \"model\"\n";
+        "version = 1\n[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\n",
+        "version = 1\n[proxy]\nprotocol = 'openai' # inline note\nbase_url = \"https://{env:PROXY_HOST}/v1\"\ndefault_model = \"model\"\n";
         "table"
     )]
     #[test_case(
-        "proxy = { protocol = 'openai', base_url = 'https://example.test/v1' } # inline note\n",
-        "proxy = { protocol = 'openai', base_url = 'https://example.test/v1', default_model = \"model\" } # inline note\n";
+        "version = 1\nproxy = { protocol = 'openai', base_url = 'https://example.test/v1' } # inline note\n",
+        "version = 1\nproxy = { protocol = 'openai', base_url = 'https://example.test/v1', default_model = \"model\" } # inline note\n";
         "inline_table"
     )]
     fn a_provider_edit_changes_only_the_edited_key(source: &str, expected: &str) {

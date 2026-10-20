@@ -652,6 +652,7 @@ mod tests {
     use caudra_storage::accounts::AUTO_SELECTION;
 
     use super::*;
+    use crate::providers::tests::parse_config;
     use crate::providers::{PROVIDERS_FILE, ProvidersConfig, resolve_base_url};
 
     const PROVIDER: &str = "anthropic";
@@ -747,9 +748,7 @@ base_url = "https://openai.example/v1"
     }
 
     fn parse_error(text: &str) -> String {
-        toml::from_str::<ProvidersConfig>(text)
-            .unwrap_err()
-            .to_string()
+        parse_config(text).unwrap_err().to_string()
     }
 
     #[test]
@@ -777,7 +776,7 @@ base_url = "https://openai.example/v1"
 
     #[test]
     fn an_empty_switching_table_takes_the_defaults() {
-        let config: ProvidersConfig = toml::from_str("[anthropic.switching]\n").unwrap();
+        let config: ProvidersConfig = parse_config("[anthropic.switching]\n").unwrap();
         let switching = config.get(PROVIDER).unwrap().switching.clone().unwrap();
 
         assert_eq!(switching.switch_below, DEFAULT_SWITCH_BELOW);
@@ -792,7 +791,7 @@ base_url = "https://openai.example/v1"
     #[test_case("[anthropic]\nbase_url = \"https://proxy.example/v1\"\n[[anthropic.accounts]]\nname = \"personal\"\n", false ; "with_a_base_url")]
     #[test_case("[anthropic]\napi_key = \"sk-test\"\n", false ; "with_a_provider_key")]
     fn only_accounts_and_switching_leave_the_provider_alone(text: &str, accounts_only: bool) {
-        let config: ProvidersConfig = toml::from_str(text).unwrap();
+        let config: ProvidersConfig = parse_config(text).unwrap();
 
         assert_eq!(
             config.get(PROVIDER).unwrap().is_accounts_only(),
@@ -805,7 +804,7 @@ base_url = "https://openai.example/v1"
     fn an_accounts_only_table_keeps_the_built_in_base_url() {
         let slug = "caudra-test-accounts-only-slug";
         let config: ProvidersConfig =
-            toml::from_str(&format!("[[{slug}.accounts]]\nname = \"personal\"\n")).unwrap();
+            parse_config(&format!("[[{slug}.accounts]]\nname = \"personal\"\n")).unwrap();
 
         assert_eq!(
             resolve_base_url(slug, config.get(slug)),
@@ -1067,7 +1066,7 @@ base_url = "https://openai.example/v1"
     #[test]
     fn the_provider_order_parses_ahead_of_the_providers() {
         let config: ProvidersConfig =
-            toml::from_str("[switching]\nproviders = [\"anthropic\", \"openai\"]\n").unwrap();
+            parse_config("[switching]\nproviders = [\"anthropic\", \"openai\"]\n").unwrap();
 
         assert_eq!(config.provider_order(), [PROVIDER, OTHER_PROVIDER]);
         assert!(config.get(SWITCHING_KEY).is_none());

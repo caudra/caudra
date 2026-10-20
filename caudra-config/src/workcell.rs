@@ -16,11 +16,19 @@ use serde::Serialize;
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::config_version::ConfigVersion;
 use crate::interpolation::{self, ConfigTextError, InterpolationError, Lookup};
+use crate::migration::{self, ConfigFormat, MigrationError};
 use crate::{ConfigField, ConfigValue};
 
 pub(crate) const WORKCELL_PROFILE_FILE: &str = "workcell.toml";
 pub(crate) const WORKCELL_PROFILE_VERSION: u32 = 1;
+pub const WORKCELL_FORMAT: ConfigFormat = ConfigFormat {
+    file: WORKCELL_PROFILE_FILE,
+    latest: WORKCELL_PROFILE_VERSION,
+    steps: &[],
+    requires_version: true,
+};
 pub(crate) const MAX_PROFILE_FILE_BYTES: u64 = 256 * 1024;
 pub(crate) const MAX_PROFILE_NAME_BYTES: usize = 64;
 pub(crate) const MAX_ENDPOINT_BYTES: usize = 2048;
@@ -312,8 +320,8 @@ pub enum WorkcellProfileError {
     Parse,
     #[error("local Workcell profile file: {0}")]
     Reference(#[source] InterpolationError),
-    #[error("unsupported local Workcell profile version {0}; expected version 1")]
-    Version(u32),
+    #[error("local Workcell profile file: {0}")]
+    Format(#[source] MigrationError),
     #[error(transparent)]
     ProfileName(#[from] WorkcellProfileNameError),
     #[error("invalid endpoint in Workcell profile '{profile}': {source}")]
@@ -365,7 +373,8 @@ pub enum WorkcellSelectionError {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkcellProfileFile {
-    version: u32,
+    #[serde(rename = "version")]
+    _version: ConfigVersion<WORKCELL_PROFILE_VERSION>,
     workcell: RawWorkcellProfiles,
 }
 
@@ -459,15 +468,21 @@ pub fn load_workcell_profiles_from(
     if content.len() as u64 > MAX_PROFILE_FILE_BYTES {
         return Err(WorkcellProfileError::FileTooLarge);
     }
-    parse_profile_file(&content, Lookup::Global(&path))
+    parse_profile_file(content, Lookup::Global(&path))
 }
 
+/// Errors withhold the TOML parser's diagnostics, which quote the file.
 fn parse_profile_file(
-    content: &str,
+    content: String,
     lookup: Lookup<'_>,
 ) -> Result<WorkcellProfiles, WorkcellProfileError> {
+    let loaded =
+        migration::upgrade_text(content, &WORKCELL_FORMAT).map_err(|error| match error {
+            MigrationError::Parse { .. } => WorkcellProfileError::Parse,
+            error => WorkcellProfileError::Format(error),
+        })?;
     let raw: WorkcellProfileFile =
-        interpolation::from_str(content, lookup).map_err(|error| match error {
+        interpolation::from_str(&loaded.text, lookup).map_err(|error| match error {
             ConfigTextError::Toml(_) => WorkcellProfileError::Parse,
             ConfigTextError::Reference(error) => WorkcellProfileError::Reference(error),
         })?;
@@ -513,9 +528,6 @@ impl TryFrom<WorkcellProfileFile> for WorkcellProfiles {
     type Error = WorkcellProfileError;
 
     fn try_from(file: WorkcellProfileFile) -> Result<Self, Self::Error> {
-        if file.version != WORKCELL_PROFILE_VERSION {
-            return Err(WorkcellProfileError::Version(file.version));
-        }
         let mut profiles = BTreeMap::new();
         for (name, raw) in file.workcell.profiles {
             let name = WorkcellProfileName::new(name)?;
@@ -630,9 +642,11 @@ mod tests {
     use test_case::test_case;
 
     use crate::ENV_FILE;
+    use crate::config_version::ConfigVersionError;
     use crate::example::{self, Render};
 
     const PROFILE_NAME: &str = "production";
+    const VERSION_LINE: &str = "version = 1";
     const CREDENTIAL_REF: &str = "credential:production";
     const SECRET_ENDPOINT: &str = "https://workcell.example/private/tenant";
     const SERVER_ID: &str = "server-private-id";
@@ -675,7 +689,7 @@ expected_workspace_id = "workspace-1"
 
     fn reference(render: Render) -> WorkcellProfiles {
         parse_profile_file(
-            &example::workcell::document().render(render),
+            example::workcell::document().render(render),
             Lookup::Refused,
         )
         .expect("reference")
@@ -816,13 +830,28 @@ credential_ref = "credential:other"
     }
 
     #[test_case("[workcell.profiles.", "[profiles."; "legacy_top_level_profiles")]
-    #[test_case("version = 1", ""; "missing_version")]
     #[test_case("[workcell.profiles.production]", "[workcell]\nunknown = true\n[workcell.profiles.production]"; "unknown_workcell_field")]
     fn finalized_profile_shape_is_required(from: &str, to: &str) {
         assert!(matches!(
             load_content(&VALID_PROFILE.replace(from, to)),
             Err(WorkcellProfileError::Parse)
         ));
+    }
+
+    #[test_case("", ConfigVersionError::Missing { latest: WORKCELL_PROFILE_VERSION }; "missing_version")]
+    #[test_case("version = 2", ConfigVersionError::Newer { found: 2, latest: WORKCELL_PROFILE_VERSION }; "newer_version")]
+    fn a_profile_file_must_declare_a_version_it_reads(version: &str, expected: ConfigVersionError) {
+        let error = load_content(&VALID_PROFILE.replace(VERSION_LINE, version))
+            .expect_err("unreadable version");
+
+        assert!(
+            matches!(
+                &error,
+                WorkcellProfileError::Format(MigrationError::Version { source, .. })
+                    if *source == expected
+            ),
+            "{error}"
+        );
     }
 
     #[test_case("https://workcell.example/api"; "https")]

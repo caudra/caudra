@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use caudra_config::config_version::{ConfigVersion, ConfigVersionError};
+use caudra_config::migration::{self, MigrationError};
 use caudra_config::{
     DefaultEffect, Effect, Feature, FeatureFlags, McpPermissionRule, McpPermissions,
-    PERMISSIONS_VERSION, PermissionRule, PermissionsConfig, ToolKey,
+    PERMISSIONS_FORMAT, PERMISSIONS_VERSION, PermissionRule, PermissionsConfig, ToolKey,
 };
 use caudra_workflow::meta::MAX_SOURCE_BYTES;
 use caudra_workflow::{WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowMeta, parse_meta};
@@ -782,13 +783,19 @@ pub fn parse_remote_permissions(
     bytes: &[u8],
 ) -> Result<RemotePermissionDeclarations, RemoteProjectContextError> {
     let text = std::str::from_utf8(bytes).map_err(|_| permission_content_error())?;
-    let mut table: toml::Table = toml::from_str(text).map_err(|_| permission_content_error())?;
-    ConfigVersion::<PERMISSIONS_VERSION>::take(&mut table).map_err(|cause| {
-        RemoteProjectContextError::UnsupportedVersion {
-            path: PERMISSIONS_ASSET.into(),
-            cause,
-        }
-    })?;
+    let unsupported = |cause| RemoteProjectContextError::UnsupportedVersion {
+        path: PERMISSIONS_ASSET.into(),
+        cause,
+    };
+    let loaded = migration::upgrade_text(text.to_owned(), &PERMISSIONS_FORMAT).map_err(
+        |error| match error {
+            MigrationError::Version { source, .. } => unsupported(source),
+            _ => permission_content_error(),
+        },
+    )?;
+    let mut table: toml::Table =
+        toml::from_str(&loaded.text).map_err(|_| permission_content_error())?;
+    ConfigVersion::<PERMISSIONS_VERSION>::take(&mut table).map_err(unsupported)?;
     let mut declarations = RemotePermissionDeclarations::default();
     for (name, value) in table {
         if name == "default" {

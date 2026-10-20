@@ -1,10 +1,17 @@
 //! `mcp.toml` constants and field metadata. The schema lives in caudra-agent,
 //! which reads these so the reference cannot drift from the loader.
 
+use crate::migration::ConfigFormat;
 use crate::{ConfigField, ConfigValue};
 
 pub const MCP_FILE: &str = "mcp.toml";
 pub const MCP_VERSION: u32 = 1;
+pub const MCP_FORMAT: ConfigFormat = ConfigFormat {
+    file: MCP_FILE,
+    latest: MCP_VERSION,
+    steps: &[],
+    requires_version: false,
+};
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_CALLBACK_PATH: &str = "/mcp/oauth/callback";

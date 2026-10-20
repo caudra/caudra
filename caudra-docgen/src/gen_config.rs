@@ -1393,8 +1393,9 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::config_file::GlobalConfigFile;
+    use caudra_config::config_file::{CONFIG_FORMAT, GlobalConfigFile};
     use caudra_config::interpolation::{ENV_OPEN, FILE_OPEN, Lookup};
+    use caudra_config::migration;
     use caudra_config::{
         AgentConfig, ConfigValue, DecisionsConfig, Feature, SteeringConfig,
         decisions::RawDecisionsConfig,
@@ -1442,7 +1443,9 @@ mod tests {
             let shape = example
                 .replace(ENV_OPEN, REFERENCE_PLACEHOLDER)
                 .replace(FILE_OPEN, REFERENCE_PLACEHOLDER);
-            if let Err(error) = GlobalConfigFile::parse(&shape, Lookup::Refused) {
+            let loaded = migration::upgrade_text(shape, &CONFIG_FORMAT)
+                .unwrap_or_else(|error| panic!("{error}\n{example}"));
+            if let Err(error) = GlobalConfigFile::parse(&loaded.text, Lookup::Refused) {
                 panic!("{error}\n{example}");
             }
         }

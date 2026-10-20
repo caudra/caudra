@@ -19,6 +19,7 @@ const SYMLINK: &str = "symlink";
 const UNREADABLE: &str = "unreadable";
 const STATE_WIDTH: usize = UNREADABLE.len();
 const NEEDS: &str = "needs";
+const FORMAT: &str = "format";
 const DOCS: &str = "docs";
 const EXAMPLE: &str = "example";
 const LABEL_WIDTH: usize = 9;
@@ -44,7 +45,7 @@ fn example(file: &ConfigFile) -> Result<()> {
 }
 
 /// One block per file: what it holds, the switch it needs, each place Caudra
-/// looks for it, and where to read more.
+/// looks for it, the format version this build reads, and where to read more.
 fn listing(located: &[Located]) -> String {
     let mut out = String::new();
     for (index, file) in CONFIG_FILES.iter().enumerate() {
@@ -67,6 +68,9 @@ fn listing(located: &[Located]) -> String {
                 state_label(&entry.state),
                 location(entry)
             );
+        }
+        if let Some(format) = file.format {
+            let _ = writeln!(out, "  {FORMAT:<LABEL_WIDTH$}version {}", format.latest);
         }
         let _ = writeln!(out, "  {DOCS:<LABEL_WIDTH$}{}", file.docs_url());
         if file.example.is_some() {
@@ -107,7 +111,7 @@ mod tests {
     use caudra_config::files::{self, CONFIG_FILES};
     use tempfile::TempDir;
 
-    use super::{MISSING, listing};
+    use super::{FORMAT, LABEL_WIDTH, MISSING, listing};
     #[cfg(unix)]
     use super::{PRESENT, SYMLINK};
 
@@ -142,6 +146,10 @@ mod tests {
             }
             if file.example.is_some() {
                 assert!(listing.contains(&file.example_command()), "{}", file.name);
+            }
+            if let Some(format) = file.format {
+                let version = format!("{FORMAT:<LABEL_WIDTH$}version {}", format.latest);
+                assert!(listing.contains(&version), "{}", file.name);
             }
         }
     }

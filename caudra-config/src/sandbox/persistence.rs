@@ -528,7 +528,7 @@ mod tests {
             store.load().unwrap_err(),
             SandboxStoreError::File(PrivateFileError::TooLarge)
         );
-        write(temp.path(), "token = 'secret-not-allowed'");
+        write(temp.path(), "version = 1\ntoken = 'secret-not-allowed'");
         let error = store.load().unwrap_err();
         assert!(matches!(
             error,

@@ -7,17 +7,26 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU32, ParseIntError};
+use std::ops::Range;
 use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
 use workcell_tool_contract::shell_env::{EnvPatternError, ShellEnvironmentSelection};
 
+use crate::config_version::ConfigVersion;
+use crate::migration::{self, ConfigFormat, MigrationError};
 use crate::{ConfigField, ConfigValue};
 
 pub mod persistence;
 
 pub const SANDBOX_FILE: &str = "sandboxes.toml";
 pub const SANDBOX_VERSION: u32 = 1;
+pub const SANDBOX_FORMAT: ConfigFormat = ConfigFormat {
+    file: SANDBOX_FILE,
+    latest: SANDBOX_VERSION,
+    steps: &[],
+    requires_version: true,
+};
 pub const MAX_SANDBOX_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_SANDBOX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_SANDBOX_RECORDS: usize = 256;
@@ -984,24 +993,15 @@ impl SandboxDraft {
         if document.len() > MAX_SANDBOX_FILE_BYTES {
             return Err(SandboxError::Limit);
         }
-        let file: SandboxDocument =
-            toml::from_str(document).map_err(|error: toml::de::Error| {
-                let offset = error.span().map_or(0, |span| span.start);
-                let before = document.get(..offset).unwrap_or_default();
-                SandboxError::Parse {
-                    line: before.bytes().filter(|byte| *byte == b'\n').count() + 1,
-                    column: before
-                        .rsplit('\n')
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .count()
-                        + 1,
+        let loaded =
+            migration::upgrade_text(document.to_owned(), &SANDBOX_FORMAT).map_err(|error| {
+                match error {
+                    MigrationError::Parse { source, .. } => parse_error(document, source.span()),
+                    _ => SandboxError::Version,
                 }
             })?;
-        if file.version != SANDBOX_VERSION {
-            return Err(SandboxError::Version);
-        }
+        let file: SandboxDocument = toml::from_str(&loaded.text)
+            .map_err(|error: toml::de::Error| parse_error(&loaded.text, error.span()))?;
         file.sandbox.normalized()
     }
 
@@ -1012,7 +1012,7 @@ impl SandboxDraft {
     )]
     pub fn export(&self) -> Result<String, SandboxError> {
         let document = SandboxDocument {
-            version: SANDBOX_VERSION,
+            version: ConfigVersion::default(),
             sandbox: self.normalized()?,
         };
         let text = toml::to_string_pretty(&document).map_err(|_| SandboxError::Document)?;
@@ -1020,6 +1020,22 @@ impl SandboxDraft {
             return Err(SandboxError::Limit);
         }
         Ok(text)
+    }
+}
+
+/// Where in `document` a parse failed, without the parser's message, which quotes it.
+fn parse_error(document: &str, span: Option<Range<usize>>) -> SandboxError {
+    let offset = span.map_or(0, |span| span.start);
+    let before = document.get(..offset).unwrap_or_default();
+    SandboxError::Parse {
+        line: before.bytes().filter(|byte| *byte == b'\n').count() + 1,
+        column: before
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            + 1,
     }
 }
 
@@ -1039,7 +1055,7 @@ fn check_records<T: Serialize>(records: &BTreeMap<SandboxName, T>) -> Result<(),
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SandboxDocument {
-    version: u32,
+    version: ConfigVersion<SANDBOX_VERSION>,
     sandbox: SandboxDraft,
 }
 

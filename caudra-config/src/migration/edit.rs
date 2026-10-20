@@ -819,6 +819,7 @@ mod tests {
             file: FILE,
             latest: 2,
             steps,
+            requires_version: false,
         };
         let text = migrate(&format!("{VERSION_1}{body}"), &format, &test_stamp())?
             .text

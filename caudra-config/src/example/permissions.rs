@@ -49,6 +49,7 @@ fn tool_about() -> String {
 #[cfg(test)]
 mod tests {
     use super::{MCP_SERVER, TOOL, document};
+    use crate::config_version::CONFIG_VERSION_KEY;
     use crate::example::Render;
     use crate::{McpPermissions, PermissionsFileConfig, build_permissions};
 
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn every_rule_key_is_one_the_parser_takes() {
         let document = document();
-        let mut text = String::new();
+        let mut text = format!("{CONFIG_VERSION_KEY} = {}\n", document.version);
         for path in [TOOL, MCP_SERVER] {
             let table = document.table(path).unwrap();
             let names: Vec<&str> = table.entries.iter().map(|entry| entry.name).collect();

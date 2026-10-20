@@ -13,15 +13,22 @@ pub enum ConfigVersionError {
     Invalid,
     #[error("version {found} needs a newer Caudra: this build reads up to version {latest}")]
     Newer { found: i64, latest: u32 },
+    #[error(
+        "`{key}` is missing: add `{key} = {latest}` at the top of the file",
+        key = CONFIG_VERSION_KEY
+    )]
+    Missing { latest: u32 },
 }
 
 /// Format version of a config file whose newest shape is `LATEST`.
 ///
-/// A missing key means [`FIRST_VERSION`] rather than `LATEST`, so raising
-/// `LATEST` never changes what an unversioned file means. Raise a file's
-/// constant only when an older build would misread the new shape: new meaning
-/// for existing syntax, or a restrictive construct a lenient parser would
-/// skip. Optional fields an older build can ignore need no bump.
+/// Parsers require the key: they read text the migrator brought to `LATEST`,
+/// and only the migrator reads a file without it, as [`FIRST_VERSION`]. Raise
+/// a file's constant whenever its format gains a migration step, which is the
+/// upgrade from the shape before. A step is due when an older build would
+/// misread the new shape: new meaning for existing syntax, a renamed or
+/// retired key, or a restrictive construct a lenient parser would skip.
+/// Optional fields an older build can ignore need neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigVersion<const LATEST: u32>(u32);
 
@@ -30,14 +37,16 @@ impl<const LATEST: u32> ConfigVersion<LATEST> {
     pub fn take(table: &mut Table) -> Result<Self, ConfigVersionError> {
         table
             .remove(CONFIG_VERSION_KEY)
-            .as_ref()
-            .map_or(Ok(Self::default()), Self::from_value)
+            .ok_or(ConfigVersionError::Missing { latest: LATEST })
+            .and_then(|value| Self::from_value(&value))
     }
 
     /// For lenient parsers: checks the key alone, and errors keep the TOML
     /// line and column.
     pub fn check_document(document: &str) -> Result<Self, TomlError> {
-        toml::from_str::<VersionProbe<LATEST>>(document).map(|probe| probe.version)
+        toml::from_str::<VersionProbe<LATEST>>(document)?
+            .version
+            .ok_or_else(|| de::Error::custom(ConfigVersionError::Missing { latest: LATEST }))
     }
 
     fn from_value(value: &Value) -> Result<Self, ConfigVersionError> {
@@ -57,9 +66,10 @@ pub(crate) fn checked_version(found: i64, latest: u32) -> Result<u32, ConfigVers
         .ok_or(ConfigVersionError::Newer { found, latest })
 }
 
+/// A file built in memory is in the newest shape.
 impl<const LATEST: u32> Default for ConfigVersion<LATEST> {
     fn default() -> Self {
-        Self(FIRST_VERSION)
+        Self(LATEST)
     }
 }
 
@@ -79,8 +89,7 @@ impl<const LATEST: u32> Serialize for ConfigVersion<LATEST> {
 
 #[derive(Deserialize)]
 struct VersionProbe<const LATEST: u32> {
-    #[serde(default)]
-    version: ConfigVersion<LATEST>,
+    version: Option<ConfigVersion<LATEST>>,
 }
 
 #[cfg(test)]
@@ -104,7 +113,6 @@ mod tests {
         assert!(error.to_string().contains(&expected.to_string()), "{error}");
     }
 
-    #[test_case("", FIRST_VERSION ; "missing_key_is_the_first_version_not_the_latest")]
     #[test_case("version = 1", FIRST_VERSION ; "first_version")]
     #[test_case("version = 2", LATEST ; "latest_version")]
     fn take_accepts_known_versions_and_removes_the_key(version: &str, expected: u32) {
@@ -136,8 +144,18 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_key_is_refused() {
+        let expected = ConfigVersionError::Missing { latest: LATEST };
+        let document = format!("{OTHER_KEY} = true\n");
+
+        assert_eq!(Version::take(&mut table(&document)), Err(expected.clone()));
+        let error = Version::check_document(&document).unwrap_err();
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+    }
+
+    #[test]
     fn check_document_ignores_every_other_key() {
-        let document = "defer_tools = 3\n[mcp.server]\ncommand = ['x']\n";
+        let document = "version = 1\ndefer_tools = 3\n[mcp.server]\ncommand = ['x']\n";
 
         assert_eq!(
             Version::check_document(document).unwrap(),

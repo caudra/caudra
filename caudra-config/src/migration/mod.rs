@@ -7,6 +7,9 @@ mod edit;
 mod note;
 
 use std::borrow::Cow;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -32,6 +35,9 @@ pub struct ConfigFormat {
     pub file: &'static str,
     pub latest: u32,
     pub steps: &'static [Step],
+    /// Set for a file whose first version already required `version`, so one
+    /// without it is refused rather than read as that version.
+    pub requires_version: bool,
 }
 
 /// Brings a file from version `from` to `from + 1`.
@@ -89,6 +95,33 @@ pub enum MigrationError {
         "{file} lists an upgrade from version {from} out of order: this Caudra build is broken"
     )]
     StrayStep { file: &'static str, from: u32 },
+}
+
+/// A config file's text in its latest format, ready for its parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    /// The upgraded text, or the file's own when it was already current.
+    pub text: String,
+    /// The version the file declared, or the first one when it declared none.
+    pub from: u32,
+    /// Whether `text` differs from what the file holds.
+    pub migrated: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum ReadError {
+    #[error("read {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid {}: {source}", path.display())]
+    Invalid {
+        path: PathBuf,
+        #[source]
+        source: Box<MigrationError>,
+    },
 }
 
 /// The document a [`Step`] edits, and the changes it has made so far.
@@ -175,7 +208,7 @@ pub fn migrate(
     let document: DocumentMut = body
         .parse()
         .map_err(|source| MigrationError::Parse { file, source })?;
-    let declared = declared_version(&document, format.latest)
+    let declared = declared_version(&document, format)
         .map_err(|source| MigrationError::Version { file, source })?;
     if declared == Some(format.latest) {
         return Ok(Migrated {
@@ -212,6 +245,47 @@ pub fn migrate(
     })
 }
 
+/// The file at `path`, upgraded in memory. `None` when there is no file.
+pub fn read(path: &Path, format: &ConfigFormat) -> Result<Option<Loaded>, ReadError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ReadError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    upgrade_text(text, format)
+        .map(Some)
+        .map_err(|source| ReadError::Invalid {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+}
+
+/// `text`, a file in `format` already read, upgraded in memory.
+pub fn upgrade_text(text: String, format: &ConfigFormat) -> Result<Loaded, MigrationError> {
+    let Migrated {
+        from,
+        text: upgraded,
+        ..
+    } = migrate(&text, format, &Stamp::now())?;
+    Ok(match upgraded {
+        Some(upgraded) => Loaded {
+            text: upgraded,
+            from,
+            migrated: true,
+        },
+        None => Loaded {
+            text,
+            from,
+            migrated: false,
+        },
+    })
+}
+
 /// A file's line ending is the one its first line ends with.
 fn uses_crlf(text: &str) -> bool {
     text.find(LF).is_some_and(|end| text[..end].ends_with('\r'))
@@ -219,16 +293,18 @@ fn uses_crlf(text: &str) -> bool {
 
 fn declared_version(
     document: &DocumentMut,
-    latest: u32,
+    format: &ConfigFormat,
 ) -> Result<Option<u32>, ConfigVersionError> {
-    document
-        .get(CONFIG_VERSION_KEY)
-        .map(|item| {
-            Item::as_integer(item)
-                .ok_or(ConfigVersionError::Invalid)
-                .and_then(|found| checked_version(found, latest))
-        })
-        .transpose()
+    match document.get(CONFIG_VERSION_KEY) {
+        Some(item) => Item::as_integer(item)
+            .ok_or(ConfigVersionError::Invalid)
+            .and_then(|found| checked_version(found, format.latest))
+            .map(Some),
+        None if format.requires_version => Err(ConfigVersionError::Missing {
+            latest: format.latest,
+        }),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -244,11 +320,14 @@ fn test_stamp() -> Stamp {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::{
-        Change, ConfigFormat, ConfigVersionError, Migrated, MigrationError, Step, Upgrade, migrate,
-        test_stamp,
+        Change, ConfigFormat, ConfigVersionError, Loaded, Migrated, MigrationError, ReadError,
+        Step, Upgrade, migrate, read, test_stamp, upgrade_text,
     };
 
     macro_rules! added {
@@ -258,6 +337,7 @@ mod tests {
     }
 
     const FILE: &str = "test.toml";
+    const LINE_ONE: &str = "line 1";
     const RENAME_WHY: &str = "the `code` tool now runs plain computation";
     const RENAMED: &str = "renamed `ui.python_execution` to `code`";
     const RETIRED: &str = "retired `agent.defer_builtin_tools`";
@@ -277,6 +357,11 @@ mod tests {
         file: FILE,
         latest: 3,
         steps: STEPS,
+        requires_version: false,
+    };
+    const REQUIRED: ConfigFormat = ConfigFormat {
+        requires_version: true,
+        ..FORMAT
     };
     const GAP: ConfigFormat = ConfigFormat {
         file: FILE,
@@ -286,11 +371,11 @@ mod tests {
             why: None,
             apply: retire_defer,
         }],
+        requires_version: false,
     };
     const STRAY: ConfigFormat = ConfigFormat {
-        file: FILE,
         latest: 2,
-        steps: STEPS,
+        ..FORMAT
     };
 
     const LEGACY: &str = "\
@@ -419,6 +504,69 @@ model = 'a'
             migrate(text, &FORMAT, &test_stamp()),
             Err(MigrationError::Version { file: FILE, source })
         );
+    }
+
+    #[test]
+    fn a_format_that_requires_its_version_refuses_a_file_without_one() {
+        assert_eq!(
+            migrate(LEGACY, &REQUIRED, &test_stamp()),
+            Err(MigrationError::Version {
+                file: FILE,
+                source: ConfigVersionError::Missing { latest: 3 },
+            })
+        );
+        assert_eq!(
+            migrate(SECOND, &REQUIRED, &test_stamp()).unwrap().text,
+            Some(SECOND_UPGRADED.to_owned())
+        );
+    }
+
+    #[test]
+    fn upgrade_text_hands_over_a_current_file_as_it_is() {
+        assert_eq!(
+            upgrade_text(SECOND_UPGRADED.to_owned(), &FORMAT),
+            Ok(Loaded {
+                text: SECOND_UPGRADED.to_owned(),
+                from: 3,
+                migrated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn upgrade_text_upgrades_a_legacy_file() {
+        let loaded = upgrade_text(LEGACY.to_owned(), &FORMAT).unwrap();
+
+        assert_eq!((loaded.from, loaded.migrated), (1, true));
+        assert_eq!(
+            migrate(&loaded.text, &FORMAT, &test_stamp()).unwrap().text,
+            None
+        );
+    }
+
+    #[test]
+    fn read_upgrades_a_file_and_skips_a_missing_one() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(FILE);
+
+        assert_eq!(read(&path, &FORMAT).unwrap(), None);
+        fs::write(&path, SECOND).unwrap();
+        let loaded = read(&path, &FORMAT).unwrap().unwrap();
+        assert_eq!((loaded.from, loaded.migrated), (2, true));
+    }
+
+    #[test]
+    fn read_names_the_path_and_the_line_of_invalid_toml() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(FILE);
+        fs::write(&path, "model = \n").unwrap();
+
+        let error = read(&path, &FORMAT).unwrap_err();
+
+        assert!(matches!(error, ReadError::Invalid { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains(LINE_ONE), "{message}");
     }
 
     #[test]
