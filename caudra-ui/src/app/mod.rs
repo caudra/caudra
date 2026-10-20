@@ -92,6 +92,7 @@ use crate::components::input::{
 };
 use crate::components::keybindings::{self, KeybindContext, key, leader};
 use crate::components::learn_inspector::LearnInspector;
+use crate::components::learn_transcript::LearnTranscripts;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::logs_modal::{LogsAction, LogsModal};
 use crate::components::lua_float::FloatManager;
@@ -571,6 +572,7 @@ pub struct App {
     pub(super) memory_inspector: MemoryInspector,
     memory_reads: memory::MemoryReads,
     pub(super) learn_inspector: LearnInspector,
+    pub(super) learn_transcripts: LearnTranscripts,
     learn_reads: learning::LearnReads,
     /// The session's continual learner, while one runs.
     pub(crate) learner: Option<Arc<ArcSwapOption<LearnerHandle>>>,
@@ -921,6 +923,7 @@ impl App {
             memory_inspector: MemoryInspector::new(),
             memory_reads: memory::MemoryReads::default(),
             learn_inspector: LearnInspector::new(),
+            learn_transcripts: LearnTranscripts::default(),
             learn_reads: learning::LearnReads::default(),
             learner: None,
             summarize_memory: true,
@@ -2072,6 +2075,7 @@ impl App {
         self.skills_modal.close();
         self.storage_modal.close();
         self.learn_inspector.close();
+        self.learn_transcripts.close();
         self.system_prompt_modal.close();
         self.projection_modal.close();
         self.docs_modal.close();
@@ -2152,6 +2156,10 @@ impl App {
         }
         if self.storage_modal.is_open() {
             self.storage_modal.scroll(delta);
+            return None;
+        }
+        if self.learn_transcripts.is_open() {
+            self.learn_transcripts.scroll(delta);
             return None;
         }
         if self.learn_inspector.is_open() {
@@ -2580,6 +2588,11 @@ impl App {
         if self.storage_modal.is_open() {
             guard_repeat!(false);
             self.storage_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.learn_transcripts.is_open() {
+            self.learn_transcripts.handle_key(key);
             return Some(vec![]);
         }
 
@@ -5202,6 +5215,7 @@ impl App {
                     | AgentEvent::CacheHitSamples(_)
                     | AgentEvent::TokenCalibration(_)
                     | AgentEvent::Learned(_)
+                    | AgentEvent::LearnerActivity(_)
             )
         {
             let cancelled_terminal = envelope.subagent.is_none()
@@ -5499,7 +5513,10 @@ impl App {
             }
             AgentEvent::Learned(notice) => {
                 self.flash(format!("{} (/learn)", notice.headline()));
-                self.learning_changed();
+                return vec![];
+            }
+            AgentEvent::LearnerActivity(activity) => {
+                self.learner_activity(*activity);
                 return vec![];
             }
             AgentEvent::GoalEvaluating { evaluation } => {
@@ -6623,7 +6640,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 51] {
+    fn overlays(&self) -> [&dyn Overlay; 52] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6637,6 +6654,7 @@ impl App {
             &self.skills_modal,
             &self.storage_modal,
             &self.learn_inspector,
+            &self.learn_transcripts,
             &self.system_prompt_modal,
             &self.projection_modal,
             &self.goal_panel,
@@ -6679,7 +6697,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 51] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 52] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6693,6 +6711,7 @@ impl App {
             &mut self.skills_modal,
             &mut self.storage_modal,
             &mut self.learn_inspector,
+            &mut self.learn_transcripts,
             &mut self.system_prompt_modal,
             &mut self.projection_modal,
             &mut self.goal_panel,
@@ -7013,6 +7032,7 @@ impl App {
             | self.poll_automations()
             | self.poll_memory()
             | self.poll_learning()
+            | self.learn_transcripts.tick()
             | self.poll_task_controls()
             | self.poll_task_continuation()
             | self.poll_task_history()

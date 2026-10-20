@@ -1,7 +1,9 @@
 //! Continual learning's bookkeeping, per project: how far its history has
 //! been learned from, the lease that keeps two processes from learning it at
 //! once, every run with what it changed, and the before and after of each
-//! change so a run can be reverted.
+//! change so a run can be reverted. The newest runs also keep their learner's
+//! conversation, compressed and outside the history index, so no search finds
+//! it.
 //!
 //! A run is recorded `running` when it starts, so the memory entries it writes
 //! can name it. A run whose holder died is closed as `interrupted` by the next
@@ -10,6 +12,7 @@
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::sessions::{RuntimeRetry, SessionDatabase, SessionError};
+use crate::sessions::{compress_payload, decompress_payload};
 use crate::{StateClass, StateDir};
 
 const BEGIN_OPERATION: &str = "learning run begin";
@@ -22,6 +25,9 @@ const INTERRUPTED: &str = "interrupted";
 const RUN_COLUMNS: &str =
     "id, started_ms, finished_ms, from_ms, through_ms, outcome, model, tokens, summary, dropped";
 const EDIT_COLUMNS: &str = "run_id, seq, target, path, before, after, evidence, reverted_ms";
+const TRANSCRIPT_FIELD: &str = "learning_transcripts.body";
+/// Runs per project whose transcript is kept; older ones lose it.
+pub const KEPT_TRANSCRIPTS: i64 = 20;
 
 pub(crate) const TABLES: &str = r#"
 CREATE TABLE learning_projects (
@@ -59,6 +65,15 @@ CREATE TABLE learning_edits (
     reverted_ms INTEGER,
     PRIMARY KEY(run_id, seq)
 ) STRICT, WITHOUT ROWID;
+"#;
+
+/// Each run's learner conversation, a zstd-compressed JSON array of its
+/// messages. Nothing indexes it for search.
+pub(crate) const TRANSCRIPTS: &str = r#"
+CREATE TABLE learning_transcripts (
+    run_id INTEGER PRIMARY KEY REFERENCES learning_runs(id) ON DELETE CASCADE,
+    body   BLOB NOT NULL
+) STRICT;
 "#;
 
 /// A project's learning state. `None` fields mean no lease is held.
@@ -104,6 +119,8 @@ pub struct FinishedRun {
     pub dropped: String,
     pub through_ms: Option<i64>,
     pub edits: Vec<LearningEdit>,
+    /// The learner's conversation as a JSON array of messages, when it had one.
+    pub transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +270,17 @@ impl LearningStore {
                 ],
             )?;
         }
+        if let Some(transcript) = &finished.transcript {
+            transaction.execute(
+                "INSERT OR REPLACE INTO learning_transcripts (run_id, body) VALUES (?1, ?2)",
+                params![run_id, compress_payload(transcript)?],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM learning_transcripts WHERE run_id IN (SELECT id FROM learning_runs \
+             WHERE project = ?1 ORDER BY id DESC LIMIT -1 OFFSET ?2)",
+            params![project, KEPT_TRANSCRIPTS],
+        )?;
         transaction.execute(
             "UPDATE learning_projects SET through_ms = max(through_ms, coalesce(?3, through_ms)), \
              last_run_ms = CASE WHEN ?3 IS NULL THEN last_run_ms ELSE ?4 END, \
@@ -303,6 +331,22 @@ impl LearningStore {
         ))?;
         let rows = statement.query_map([run_id], edit_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The run's learner conversation as a JSON array of messages, `None`
+    /// when it kept none.
+    pub fn transcript(&self, run_id: i64) -> Result<Option<String>, SessionError> {
+        let stored: Option<Vec<u8>> = self
+            .connection()
+            .query_row(
+                "SELECT body FROM learning_transcripts WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored
+            .map(|body| decompress_payload(&body, TRANSCRIPT_FIELD))
+            .transpose()
     }
 
     /// Marks an edit reverted. False when it already was.
@@ -402,6 +446,7 @@ mod tests {
     const MODEL: &str = "anthropic/claude-opus-5-5";
     const NOTE: &str = "flaky-tests.md";
     const BLOCKED: &str = "another owner's live lease blocks a second run";
+    const TRANSCRIPT: &str = r#"[{"role":"user","content":"learn"}]"#;
 
     fn store() -> (TempDir, LearningStore) {
         let temp = TempDir::new().unwrap();
@@ -424,6 +469,7 @@ mod tests {
                 after: Some("# Flaky tests".to_owned()),
                 evidence: "[]".to_owned(),
             }],
+            transcript: Some(TRANSCRIPT.to_owned()),
         }
     }
 
@@ -473,6 +519,28 @@ mod tests {
         assert_eq!(edits[0].edit.path, NOTE);
         assert!(store.mark_reverted(begun.id, 0, NOW_MS).unwrap());
         assert!(!store.mark_reverted(begun.id, 0, NOW_MS).unwrap());
+    }
+
+    #[test]
+    fn only_the_newest_runs_keep_their_transcript() {
+        let (_temp, store) = store();
+        let runs: Vec<i64> = (0..=KEPT_TRANSCRIPTS)
+            .map(|offset| {
+                let begun = store
+                    .begin(PROJECT, OWNER, NOW_MS + offset, LEASE_MS, FIRST_FROM_MS)
+                    .unwrap()
+                    .unwrap();
+                store
+                    .finish(PROJECT, OWNER, begun.id, NOW_MS + offset, &finished(None))
+                    .unwrap();
+                begun.id
+            })
+            .collect();
+        assert_eq!(store.transcript(runs[0]).unwrap(), None);
+        assert_eq!(
+            store.transcript(*runs.last().unwrap()).unwrap().as_deref(),
+            Some(TRANSCRIPT)
+        );
     }
 
     #[test]

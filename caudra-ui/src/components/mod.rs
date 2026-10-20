@@ -32,6 +32,7 @@ pub(crate) mod json_tree;
 pub(crate) mod key_freshness;
 pub mod keybindings;
 pub(crate) mod learn_inspector;
+pub(crate) mod learn_transcript;
 pub(crate) mod list_picker;
 pub(crate) mod literal;
 pub(crate) mod login_picker;

@@ -22,11 +22,11 @@ use smol::Task;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::LearnedNotice;
 use super::apply::{self, ApplyError, Evidence, Report};
 use super::digest::{self, Digest};
 use super::runner::{self, Shown, Spend};
 use super::targets::{self, InstructionFile};
+use super::{LearnedNotice, LearnerActivity, LearnerStep};
 use crate::agent::LOCAL_INSTRUCTION_FILE;
 use crate::agent::task_runner::WorkflowHostContext;
 use crate::history::{HistoryProject, HistoryStore};
@@ -304,6 +304,7 @@ impl Shared {
                 dropped: "[]".to_owned(),
                 through_ms: Some(signed(digest.through_ms)),
                 edits: Vec::new(),
+                transcript: None,
             },
             _ => self.learn(begun.id, &digest, &scope).await,
         };
@@ -314,6 +315,7 @@ impl Shared {
         smol::unblock(move || store.finish(&project, &owner, begun.id, now_ms(), &finished))
             .await?;
         info!(project = %self.project.label, run = begun.id, outcome, "continual learning run finished");
+        self.announce(begun.id, LearnerStep::Finished { outcome });
         if notice.changed() {
             self.deps
                 .spend
@@ -346,6 +348,12 @@ impl Shared {
             files: &files,
             targets: &self.deps.targets,
         });
+        self.announce(
+            run_id,
+            LearnerStep::Started {
+                prompt: prompt.clone(),
+            },
+        );
         let ran = future::or(
             async {
                 Some(runner::run(Arc::clone(&self.host), run_id, prompt, &self.deps.spend).await)
@@ -356,21 +364,29 @@ impl Shared {
             },
         )
         .await;
-        let failed = |summary: String, model: String, tokens: u64| FinishedRun {
-            outcome: FAILED.to_owned(),
+        let failed =
+            |summary: String, model: String, tokens: u64, transcript: Option<String>| FinishedRun {
+                outcome: FAILED.to_owned(),
+                model,
+                tokens,
+                summary,
+                dropped: "[]".to_owned(),
+                through_ms: None,
+                edits: Vec::new(),
+                transcript,
+            };
+        let Some(runner::Ran {
+            report,
             model,
             tokens,
-            summary,
-            dropped: "[]".to_owned(),
-            through_ms: None,
-            edits: Vec::new(),
+            transcript,
+        }) = ran
+        else {
+            return failed(TIMED_OUT.to_owned(), String::new(), 0, None);
         };
-        let Some(ran) = ran else {
-            return failed(TIMED_OUT.to_owned(), String::new(), 0);
-        };
-        let report = match ran.report {
+        let report = match report {
             Ok(report) => report,
-            Err(error) => return failed(error, ran.model, ran.tokens),
+            Err(error) => return failed(error, model, tokens, transcript),
         };
         match self.apply(run_id, &report, files, memory, scope).await {
             Ok((applied, dropped)) => FinishedRun {
@@ -380,8 +396,8 @@ impl Shared {
                     (true, false) => LEARNED,
                 }
                 .to_owned(),
-                model: ran.model,
-                tokens: ran.tokens,
+                model,
+                tokens,
                 summary: report.summary.trim().to_owned(),
                 dropped,
                 through_ms: applied
@@ -389,8 +405,9 @@ impl Shared {
                     .is_empty()
                     .then_some(signed(digest.through_ms)),
                 edits: applied.edits,
+                transcript,
             },
-            Err(error) => failed(error.to_string(), ran.model, ran.tokens),
+            Err(error) => failed(error.to_string(), model, tokens, transcript),
         }
     }
 
@@ -468,6 +485,16 @@ impl Shared {
                 .collect()
         })
         .await
+    }
+
+    fn announce(&self, run_id: i64, step: LearnerStep) {
+        self.deps
+            .spend
+            .events
+            .try_send(AgentEvent::LearnerActivity(Box::new(LearnerActivity {
+                run_id,
+                step,
+            })));
     }
 
     async fn store(&self) -> Result<LearningStore, LearnError> {

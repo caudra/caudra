@@ -709,6 +709,12 @@ impl App {
         if self.learn_inspector.is_open() {
             claim!(self.learn_inspector.view(frame, full), self.learn_inspector);
         }
+        if self.learn_transcripts.is_open() {
+            claim!(
+                self.learn_transcripts.view(frame, full),
+                self.learn_transcripts
+            );
+        }
         if self.system_prompt_modal.is_open() {
             claim!(
                 self.system_prompt_modal.view(frame, full),

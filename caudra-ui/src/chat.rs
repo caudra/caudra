@@ -239,6 +239,21 @@ impl Chat {
         self.messages_panel.set_restore_channel(event_tx);
     }
 
+    /// The events the app routes itself, which never reach [`Self::handle_event`].
+    pub(crate) fn routed_before(event: &AgentEvent) -> bool {
+        matches!(
+            event,
+            AgentEvent::StreamReset
+                | AgentEvent::AccountRouted { .. }
+                | AgentEvent::AccountExhausted(_)
+                | AgentEvent::ModelRerouted(_)
+                | AgentEvent::TaskAdmitted(_)
+                | AgentEvent::Retry { .. }
+                | AgentEvent::SubagentProgress { .. }
+                | AgentEvent::Unrecorded { .. }
+        )
+    }
+
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
         match event {
             AgentEvent::ThinkingDelta { text } => {
@@ -330,7 +345,8 @@ impl Chat {
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::TokenCalibration(_)
-            | AgentEvent::Learned(_) => {}
+            | AgentEvent::Learned(_)
+            | AgentEvent::LearnerActivity(_) => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalSkipped { .. }
             | AgentEvent::GoalEvaluation { .. }

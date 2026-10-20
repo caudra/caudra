@@ -93,7 +93,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -872,6 +872,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 34,
         sql: crate::learning::TABLES,
     },
+    Migration {
+        from: 34,
+        to: 35,
+        sql: crate::learning::TRANSCRIPTS,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1150,7 +1155,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
@@ -1168,7 +1173,8 @@ fn full_schema() -> String {
         crate::account_switches::TABLE,
         crate::cache_warming::TABLES,
         crate::token_calibration::TABLE,
-        crate::learning::TABLES
+        crate::learning::TABLES,
+        crate::learning::TRANSCRIPTS
     )
 }
 
@@ -5823,7 +5829,7 @@ pub(crate) fn deserialize_json<T: DeserializeOwned>(
 /// The single point where a payload becomes stored bytes. Callers keep the
 /// uncompressed length for `byte_count`, which `logical_bytes`, the trim
 /// threshold and the history-discovery bounds all read.
-pub(super) fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
+pub(crate) fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
     zstd::bulk::compress(payload.as_bytes(), PAYLOAD_COMPRESSION_LEVEL).map_err(|error| {
         SessionError::CorruptDatabaseValue {
             field: "payload",
@@ -6985,25 +6991,26 @@ mod tests {
     /// Followed by [`crate::autopilot::DECISIONS_TABLE_V24`] in
     /// [`downgrade_autopilot_audit`], which every downgrade to schema 24, 25
     /// or 26 runs first.
-    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; \
+    const AUTOPILOT_AUDIT_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; \
          DROP TABLE goal_evaluations; DROP TABLE goals; \
          DROP TABLE autopilot_engagements; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_AUDIT_PREVIOUS_SCHEMA: i64 = 26;
-    const GOAL_LOG_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals;";
+    const GOAL_LOG_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals;";
     const GOAL_LOG_PREVIOUS_SCHEMA: i64 = 27;
-    const HISTORY_SEARCH_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs;";
+    const HISTORY_SEARCH_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs;";
     const HISTORY_SEARCH_PREVIOUS_SCHEMA: i64 = 28;
     const SOURCE_CODE_PREVIOUS_SCHEMA: i64 = 29;
     /// Followed by [`USAGE_LEDGER_BEFORE_ACCOUNTS`] in [`downgrade_accounts`].
-    const ACCOUNTS_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TABLE usage_ledger;";
+    const ACCOUNTS_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TABLE usage_ledger;";
     const ACCOUNTS_PREVIOUS_SCHEMA: i64 = 30;
-    const CACHE_WARMING_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes;";
+    const CACHE_WARMING_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes;";
     const CACHE_WARMING_PREVIOUS_SCHEMA: i64 = 31;
-    const CALIBRATION_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration;";
+    const CALIBRATION_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration;";
     const CALIBRATION_PREVIOUS_SCHEMA: i64 = 32;
-    const LEARNING_DOWNGRADE: &str =
-        "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects;";
+    const LEARNING_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects;";
     const LEARNING_PREVIOUS_SCHEMA: i64 = 33;
+    const LEARNING_TRANSCRIPTS_DOWNGRADE: &str = "DROP TABLE learning_transcripts;";
+    const LEARNING_TRANSCRIPTS_PREVIOUS_SCHEMA: i64 = 34;
     /// The ledger as schema 30 left it, keyed without the account.
     const USAGE_LEDGER_BEFORE_ACCOUNTS: &str = r#"
 CREATE TABLE usage_ledger (
@@ -7043,17 +7050,17 @@ CREATE TABLE usage_ledger (
     const AUDIT_COST: f64 = 0.0125;
     const MIGRATION_KEEPS_DECISIONS: &str =
         "rebuilding the decision log must keep every row, with nothing new recorded on it";
-    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
+    const AUTOPILOT_DECISIONS_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions;";
     const AUTOPILOT_DECISIONS_PREVIOUS_SCHEMA: i64 = 23;
-    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
+    const MEMORY_JOURNAL_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes;";
     const MEMORY_JOURNAL_PREVIOUS_SCHEMA: i64 = 22;
-    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
     const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
-    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
     const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
-    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE learning_transcripts; DROP TABLE learning_edits; DROP TABLE learning_runs; DROP TABLE learning_projects; DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TRIGGER history_search_docs_gone; DROP TABLE history_search; DROP TABLE history_search_cursors; DROP TABLE history_search_docs; DROP TABLE goal_evaluations; DROP TABLE goals; DROP TABLE autopilot_engagements; DROP TABLE session_purpose_usage; DROP TABLE engine_decisions; DROP TABLE autopilot_decisions; DROP TABLE memory_entries; DROP TABLE memory_nodes; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -12605,6 +12612,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(CACHE_WARMING_DOWNGRADE, CACHE_WARMING_PREVIOUS_SCHEMA; "cache_warming_from_thirty_one")]
     #[test_case(CALIBRATION_DOWNGRADE, CALIBRATION_PREVIOUS_SCHEMA; "token_calibration_from_thirty_two")]
     #[test_case(LEARNING_DOWNGRADE, LEARNING_PREVIOUS_SCHEMA; "learning_from_thirty_three")]
+    #[test_case(LEARNING_TRANSCRIPTS_DOWNGRADE, LEARNING_TRANSCRIPTS_PREVIOUS_SCHEMA; "learning_transcripts_from_thirty_four")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -13378,6 +13386,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")
                     .replace(crate::token_calibration::TABLE, "")
                     .replace(crate::cache_warming::TABLES, "")
@@ -13492,6 +13501,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")
                     .replace(crate::token_calibration::TABLE, "")
                     .replace(crate::cache_warming::TABLES, "")

@@ -3550,6 +3550,7 @@ impl EventPump {
             | AgentEvent::CacheWarmEpisode(_)
             | AgentEvent::CacheHitSamples(_)
             | AgentEvent::TokenCalibration(_)
+            | AgentEvent::LearnerActivity(_)
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Learned(notice) => self
                 .writer

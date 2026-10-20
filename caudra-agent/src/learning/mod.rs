@@ -10,9 +10,32 @@ pub mod pump;
 pub mod runner;
 pub mod targets;
 
+#[cfg(test)]
+mod end_to_end_tests;
+
 use serde::{Deserialize, Serialize};
 
+use crate::types::AgentEvent;
+
 pub use pump::{Learner, LearnerDeps, LearnerHandle};
+
+/// One step of a learner run, for a frontend that shows the run as it goes.
+#[derive(Debug, Serialize)]
+pub struct LearnerActivity {
+    pub run_id: i64,
+    pub step: LearnerStep,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearnerStep {
+    /// The run handed the learner this prompt.
+    Started { prompt: String },
+    /// What the learner did, as its own chat would show it.
+    Event(Box<AgentEvent>),
+    /// The run is recorded with this outcome.
+    Finished { outcome: String },
+}
 
 /// What one run changed, for the frontends to mention.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

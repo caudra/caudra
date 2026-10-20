@@ -28815,6 +28815,7 @@ mod theme_colours {
     use std::path::Path;
     use std::sync::Arc;
 
+    use caudra_agent::learning::{LearnerActivity, LearnerStep};
     use caudra_automation::snapshot::AutomationState;
     use caudra_config::ToolKey;
     use caudra_providers::Message;
@@ -28844,6 +28845,7 @@ mod theme_colours {
     };
     use crate::components::accounts_modal;
     use crate::components::docs_link::BADGE;
+    use crate::components::learn_inspector::LearnAction;
     use crate::components::messages::ASSISTANT_LABEL;
     use crate::components::permission_prompt::{MCP_NOTE, mcp_request};
     use crate::components::sandbox_manager::SandboxView;
@@ -28872,6 +28874,7 @@ mod theme_colours {
     const STREAM_ANSWER: &str = "Because it is one file.";
     const REVIEW_TEXT: &str = "A sentence to review.";
     const STASHED: &str = "a stashed draft";
+    const LEARNER_RUN: i64 = 1;
     const STASH_ID: &str = "stash-1";
     const REWIND_PROMPT: &str = "hello";
     const QUEUED: &str = "queued";
@@ -29246,6 +29249,19 @@ mod theme_colours {
                 app.execute_command(cmd("/learn"), 0);
             },
             shown: |app| app.learn_inspector.is_open(),
+        },
+        Surface {
+            name: "learn_transcripts",
+            open: |app, _| {
+                app.learner_activity(LearnerActivity {
+                    run_id: LEARNER_RUN,
+                    step: LearnerStep::Started {
+                        prompt: STASHED.into(),
+                    },
+                });
+                app.handle_learn_action(LearnAction::Transcript(LEARNER_RUN));
+            },
+            shown: |app| app.learn_transcripts.is_open(),
         },
         Surface {
             name: "task_picker",

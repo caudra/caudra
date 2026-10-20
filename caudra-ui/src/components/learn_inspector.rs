@@ -64,9 +64,11 @@ pub(crate) const REMOVED_NOTE: &str = "- note removed";
 const DROPPED_SECTION: &str = "Dropped";
 pub(crate) const NOTHING_SELECTED: &str = "This run changed nothing to revert";
 pub(crate) const ALREADY_REVERTED: &str = "That change is already reverted";
+pub(crate) const PAUSED_NO_RUN: &str = "Learning is paused for this project; press p to resume";
 const HINTS: &[Hint] = &[
     Hint::inert("\u{2191}\u{2193}", "run"),
     Hint::inert("\u{2190}\u{2192}", "change"),
+    Hint::char("t", "transcript"),
     Hint::char("n", "run now"),
     Hint::char("u", "revert"),
     Hint::char("p", "pause/resume"),
@@ -101,6 +103,8 @@ pub(crate) enum LearnAction {
     RunNow,
     Revert(StoredEdit),
     SetPaused(bool),
+    /// Open this run's conversation.
+    Transcript(i64),
     Flash(&'static str),
 }
 
@@ -153,18 +157,22 @@ impl LearnInspector {
         self.popup.contains(pos)
     }
 
-    /// Lands a read, keeping the selected run and change where they still exist.
+    /// Lands a read, keeping the selected run and change where they still
+    /// exist. A selection on the newest run follows a run that starts.
     pub fn fill(&mut self, snapshot: Result<LearnSnapshot, String>, live: bool) {
         let selected = self.selected_run().map(|run| run.run.id);
+        let on_newest = self.run == 0;
         self.live = live;
         self.snapshot = Some(snapshot);
         let runs = self.runs();
-        match selected.and_then(|id| runs.iter().position(|run| run.run.id == id)) {
-            Some(index) => self.run = index,
-            None => {
-                self.run = 0;
-                self.edit = 0;
-            }
+        self.run = match on_newest {
+            true => 0,
+            false => selected
+                .and_then(|id| runs.iter().position(|run| run.run.id == id))
+                .unwrap_or(0),
+        };
+        if self.selected_run().map(|run| run.run.id) != selected {
+            self.edit = 0;
         }
         self.edit = self.edit.min(
             self.selected_run()
@@ -194,8 +202,18 @@ impl LearnInspector {
             KeyCode::Down | KeyCode::Char('j') => self.select_run(1),
             KeyCode::Left | KeyCode::Char('h') => self.select_edit(-1),
             KeyCode::Right | KeyCode::Char('l') => self.select_edit(1),
-            KeyCode::Char('n') => return LearnAction::RunNow,
+            KeyCode::Char('n') => {
+                return match &self.snapshot {
+                    Some(Ok(snapshot)) if snapshot.paused() => LearnAction::Flash(PAUSED_NO_RUN),
+                    _ => LearnAction::RunNow,
+                };
+            }
             KeyCode::Char('u') => return self.revert(),
+            KeyCode::Enter | KeyCode::Char('t') => {
+                if let Some(run) = self.selected_run() {
+                    return LearnAction::Transcript(run.run.id);
+                }
+            }
             KeyCode::Char('p') => {
                 if let Some(Ok(snapshot)) = &self.snapshot {
                     return LearnAction::SetPaused(!snapshot.paused());
@@ -589,8 +607,8 @@ mod tests {
     use super::{
         ADDED, ALREADY_REVERTED, DETAIL_INDENT, KeyCode, KeyEvent, LEARNED, LearnAction,
         LearnInspector, LearnRun, LearnSnapshot, LearningProject, LearningRun, LearningTarget,
-        Line, NEW_NOTE, NO_CHANGES, NO_RUNS, NOTHING_SELECTED, REMOVED, REWROTE_NOTE, StoredEdit,
-        diff_lines, run_line, theme,
+        Line, NEW_NOTE, NO_CHANGES, NO_RUNS, NOTHING_SELECTED, PAUSED_NO_RUN, REMOVED,
+        REWROTE_NOTE, StoredEdit, diff_lines, run_line, theme,
     };
 
     const RUN_ID: i64 = 7;
@@ -744,6 +762,16 @@ mod tests {
     #[test_case(false => LearnAction::SetPaused(true); "running_pauses")]
     #[test_case(true => LearnAction::SetPaused(false); "paused_resumes")]
     fn pause_toggles_the_stored_state(paused: bool) -> LearnAction {
+        press(&mut inspector_paused(paused), KeyCode::Char('p'))
+    }
+
+    #[test_case(false => LearnAction::RunNow; "running_runs")]
+    #[test_case(true => LearnAction::Flash(PAUSED_NO_RUN); "paused_says_so")]
+    fn run_now_respects_a_pause(paused: bool) -> LearnAction {
+        press(&mut inspector_paused(paused), KeyCode::Char('n'))
+    }
+
+    fn inspector_paused(paused: bool) -> LearnInspector {
         let mut inspector = inspector(Vec::new());
         if let Some(Ok(snapshot)) = &mut inspector.snapshot {
             snapshot.state = Some(LearningProject {
@@ -751,7 +779,7 @@ mod tests {
                 ..LearningProject::default()
             });
         }
-        press(&mut inspector, KeyCode::Char('p'))
+        inspector
     }
 
     #[test]
@@ -772,6 +800,45 @@ mod tests {
             true,
         );
         assert_eq!(inspector.selected_run().map(|run| run.run.id), Some(RUN_ID));
+    }
+
+    #[test]
+    fn the_newest_selected_follows_a_run_that_starts() {
+        let older = run(Vec::new());
+        let mut inspector = inspector(vec![older.clone()]);
+        let mut started = run(Vec::new());
+        started.run.id = RUN_ID + 1;
+        inspector.fill(
+            Ok(LearnSnapshot {
+                project: PROJECT.to_owned(),
+                state: None,
+                runs: vec![started, older],
+            }),
+            true,
+        );
+        assert_eq!(
+            press(&mut inspector, KeyCode::Char('t')),
+            LearnAction::Transcript(RUN_ID + 1)
+        );
+    }
+
+    #[test]
+    fn a_reread_of_the_same_runs_keeps_the_selected_change() {
+        let edits = vec![
+            edit(0, LearningTarget::Memory, None, KEPT),
+            edit(1, LearningTarget::Memory, None, GAINED),
+        ];
+        let mut inspector = inspector(vec![run(edits.clone())]);
+        press(&mut inspector, KeyCode::Right);
+        inspector.fill(
+            Ok(LearnSnapshot {
+                project: PROJECT.to_owned(),
+                state: None,
+                runs: vec![run(edits.clone())],
+            }),
+            true,
+        );
+        assert_eq!(inspector.selected_edit(), edits.get(1));
     }
 
     #[test]

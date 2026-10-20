@@ -1,8 +1,8 @@
 //! One learner run: a headless, read-only child agent on the Learn job that
 //! reads the digest, corroborates it through `history` in `code`, and reports
 //! through `structured_output`. Its conversation never reaches the session:
-//! its history lives in memory only and its events stop here, apart from what
-//! it spent.
+//! its history lives in memory only, its events reach the frontends only as
+//! [`LearnerActivity`] to watch live, and its transcript is kept with the run.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use tracing::warn;
 use super::apply::{OUTPUT_SCHEMA, Report};
 use super::digest::Digest;
 use super::targets::{InstructionFile, heading};
+use super::{LearnerActivity, LearnerStep};
 use crate::AgentMode;
 use crate::agent::subagent::{TaskIdentity, TaskModel};
 use crate::agent::task_runner::{SubagentTaskRunner, TaskRequest, TaskRunner, WorkflowHostContext};
@@ -106,6 +107,8 @@ pub struct Ran {
     pub report: Result<Report, String>,
     pub model: String,
     pub tokens: u64,
+    /// The learner's conversation as JSON messages, when the child closed.
+    pub transcript: Option<String>,
 }
 
 /// Where a run's spend goes: an event for the runtime, and the ledger when
@@ -175,26 +178,19 @@ pub async fn run(
     };
     let runner = SubagentTaskRunner::new(host);
     let task = runner.run(request, cancel, EventSender::new(events_tx, 0));
-    let mut tokens = 0_u64;
-    let mut calls = 0_usize;
+    let mut watched = Watched {
+        spend,
+        run_id,
+        tokens: 0,
+        calls: 0,
+        transcript: None,
+    };
     let mut stopped: Option<&str> = None;
     let mut trigger = Some(trigger);
     let watch = async {
         while let Ok(envelope) = events_rx.recv_async().await {
-            match envelope.event {
-                AgentEvent::ToolStart(_) => calls += 1,
-                AgentEvent::TurnComplete(turn) => {
-                    tokens += u64::from(turn.usage.input) + u64::from(turn.usage.output);
-                    spend.report(&turn).await;
-                }
-                _ => continue,
-            }
-            let over = match () {
-                _ if calls > MAX_TOOL_CALLS => Some(TOO_MANY_CALLS),
-                _ if tokens > MAX_TOKENS => Some(TOO_MANY_TOKENS),
-                _ => None,
-            };
-            if let Some(reason) = over
+            watched.take(envelope.event).await;
+            if let Some(reason) = watched.over()
                 && let Some(trigger) = trigger.take()
             {
                 stopped = Some(reason);
@@ -205,10 +201,7 @@ pub async fn run(
     };
     let outcome = future::or(task, watch).await;
     while let Ok(envelope) = events_rx.try_recv() {
-        if let AgentEvent::TurnComplete(turn) = envelope.event {
-            tokens += u64::from(turn.usage.input) + u64::from(turn.usage.output);
-            spend.report(&turn).await;
-        }
+        watched.take(envelope.event).await;
     }
     let report = match (stopped, outcome.success) {
         (Some(reason), _) => Err(reason.to_owned()),
@@ -218,6 +211,53 @@ pub async fn run(
     Ran {
         report,
         model: outcome.model.unwrap_or_default(),
-        tokens: tokens.max(outcome.tokens_used),
+        tokens: watched.tokens.max(outcome.tokens_used),
+        transcript: watched.transcript,
+    }
+}
+
+/// What a run has done so far: its spend and calls against the caps, and its
+/// conversation once the child hands it back. Everything else it does goes
+/// on to the frontends as [`LearnerActivity`].
+struct Watched<'a> {
+    spend: &'a Spend,
+    run_id: i64,
+    tokens: u64,
+    calls: usize,
+    transcript: Option<String>,
+}
+
+impl Watched<'_> {
+    async fn take(&mut self, event: AgentEvent) {
+        match &event {
+            AgentEvent::SubagentHistory { messages, .. } => {
+                self.transcript = serde_json::to_string(messages)
+                    .inspect_err(
+                        |error| warn!(%error, run = self.run_id, "learner transcript not kept"),
+                    )
+                    .ok();
+                return;
+            }
+            AgentEvent::ToolStart(_) => self.calls += 1,
+            AgentEvent::TurnComplete(turn) => {
+                self.tokens += u64::from(turn.usage.input) + u64::from(turn.usage.output);
+                self.spend.report(turn).await;
+            }
+            _ => {}
+        }
+        self.spend
+            .events
+            .try_send(AgentEvent::LearnerActivity(Box::new(LearnerActivity {
+                run_id: self.run_id,
+                step: LearnerStep::Event(Box::new(event)),
+            })));
+    }
+
+    fn over(&self) -> Option<&'static str> {
+        match () {
+            _ if self.calls > MAX_TOOL_CALLS => Some(TOO_MANY_CALLS),
+            _ if self.tokens > MAX_TOKENS => Some(TOO_MANY_TOKENS),
+            _ => None,
+        }
     }
 }

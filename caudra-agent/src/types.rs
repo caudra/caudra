@@ -3213,6 +3213,7 @@ pub enum AgentEvent {
     /// A continual learning run changed instruction files or memory. Never
     /// a transcript row: the conversation it ran beside is left as it was.
     Learned(Box<crate::learning::LearnedNotice>),
+    LearnerActivity(Box<crate::learning::LearnerActivity>),
     ToolResultsSubmitted {
         message: Box<Message>,
     },
