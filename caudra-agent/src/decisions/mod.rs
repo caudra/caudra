@@ -2063,7 +2063,10 @@ mod tests {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let mut config = config(false);
-            config.timeout_ms = TEST_TIMEOUT_MS;
+            config.timeout_ms = match behavior {
+                Behavior::Pending => TEST_TIMEOUT_MS,
+                _ => TEST_NORMAL_TIMEOUT_MS,
+            };
             let service = Decisions::with_engine(
                 config,
                 &StateDir::from_path(root.path().into()),

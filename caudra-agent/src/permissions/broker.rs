@@ -299,6 +299,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     type PendingCall = (Task<Result<(), PermissionError>>, flume::Receiver<Envelope>);
 
@@ -310,6 +311,11 @@ mod tests {
     const SECOND_ANSWER_WON: &str = "the second answer must lose to the first";
     const DELEGATE_KEPT_RUNNING: &str = "autopilot's call must stop once the prompt is taken";
     const NOTE_UPDATE_MISSING: &str = "an autopilot note must reach frontends as an update";
+    /// How long a woken prompt has to announce its refresh. Generous, since a
+    /// refresh that drops the note announces nothing at all.
+    const REFRESH_DEADLINE: Duration = Duration::from_secs(10);
+    const REFRESH_DROPPED_NOTE: &str =
+        "a refresh of the waiting prompt must keep its autopilot note";
 
     #[test]
     fn duplicate_request_id_does_not_replace_the_pending_request() {
@@ -1516,6 +1522,30 @@ mod tests {
                 panic!("{NOTE_UPDATE_MISSING}");
             };
             assert_eq!(updated.presentation.autopilot.as_ref(), Some(&note));
+            let _ = manager.pending()[&manager.id][CONTROLLED_REQUEST]
+                .changed
+                .try_send(String::new());
+            let refreshed = futures_lite::future::or(
+                async {
+                    loop {
+                        if let AgentEvent::PermissionRequestUpdated(refreshed) =
+                            events.recv_async().await.unwrap().event
+                        {
+                            break refreshed;
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(REFRESH_DEADLINE).await;
+                    panic!("{REFRESH_DROPPED_NOTE}");
+                },
+            )
+            .await;
+            assert_eq!(
+                refreshed.presentation.autopilot.as_ref(),
+                Some(&note),
+                "{REFRESH_DROPPED_NOTE}"
+            );
             assert_eq!(
                 manager
                     .pending_request(CONTROLLED_REQUEST)

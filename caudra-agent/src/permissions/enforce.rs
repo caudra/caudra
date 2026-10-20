@@ -308,6 +308,10 @@ fn human_answer(answer: &PermissionAnswer) -> String {
 }
 
 impl PendingRegistration<'_> {
+    /// Re-explains the waiting prompt under `current`. The autopilot note is
+    /// the pending entry's own, set only by [`Self::note_autopilot`], so a
+    /// refresh carries it over rather than writing back a copy that predates
+    /// it.
     fn refresh(
         &self,
         request: &mut PermissionRequest,
@@ -331,6 +335,10 @@ impl PendingRegistration<'_> {
             .filter(|candidate| candidate.sender.same_channel(&self.sender));
         match candidate {
             Some(candidate) if !candidate.answering && !candidate.abandoned => {
+                updated
+                    .presentation
+                    .autopilot
+                    .clone_from(&candidate.request.presentation.autopilot);
                 let changed = request.presentation != updated.presentation
                     || request.options != updated.options;
                 candidate.request = updated.clone();
