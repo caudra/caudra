@@ -37,7 +37,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
-use caudra_storage::{StateClass, StateDir};
+use caudra_storage::{StateClass, StateDir, hold_instance};
 use caudra_terminal_host::reporter::Reporter;
 use caudra_ui::{
     AppSession, ChangeServiceFactory, ExitSummary, PatternDiscoveryMode, PatternDiscoveryOutcome,
@@ -1430,6 +1430,8 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         elapsed
     };
     let persistent_storage = StateDir::resolve().context("resolve data directory")?;
+    let _instance =
+        hold_instance(&persistent_storage).context("register this Caudra as running")?;
     let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&persistent_storage)
         .context("load model purpose bindings")?;
@@ -1491,6 +1493,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
 
     let _logging = setup::init_logging(&stack.config.storage);
     let init_logging_ms = lap();
+    cli.startup.upgrade.log();
     setup::apply_storage_limits(&stack.config.storage);
     setup::register_change_stores();
     setup::init_telemetry(&stack.config.telemetry);

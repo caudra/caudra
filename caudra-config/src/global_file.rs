@@ -1,43 +1,28 @@
 //! Edits to the global `caudra.toml` made from inside Caudra: read with the revision they commit
 //! against, checked to still load, and written atomically, so a concurrent edit is never lost.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf, absolute};
-use std::sync::{Mutex, PoisonError};
+use std::path::{Path, PathBuf};
 
 use caudra_storage::private_file::FileRevision;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use toml_edit::DocumentMut;
-use tracing::warn;
 
-use crate::config_file::{CONFIG_FORMAT, GlobalConfigFile};
-use crate::interpolation::Lookup;
-use crate::migration;
-use crate::own_writes;
+use crate::atomic_file::{self, AtomicFileError};
+use crate::config_file::{self, CONFIG_FORMAT};
+use crate::migration::{self, ConfigFormat, MigrationError};
 
-const STAGING_PREFIX: &str = ".caudra.toml.";
 const NOT_UTF8: &str = "the file is not valid UTF-8";
-
-/// Serializes this process's commits, so two edits from one process cannot both pass the
-/// revision check.
-static COMMITS: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Error)]
 pub enum GlobalFileError {
-    #[error("{} changed since it was loaded; reload it and make the change again", path.display())]
-    Conflict { path: PathBuf },
+    #[error(transparent)]
+    File(#[from] AtomicFileError),
     #[error("the change would leave {} invalid: {message}", path.display())]
     Invalid { path: PathBuf, message: String },
-    #[error("cannot update {}: {source}", path.display())]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("{} does not load, so it cannot be edited here: {message}", path.display())]
     Unparseable { path: PathBuf, message: String },
+    #[error(transparent)]
+    Format(#[from] MigrationError),
 }
 
 /// The global `caudra.toml` as written, `{env:NAME}` and `{file:PATH}` references unexpanded.
@@ -51,15 +36,12 @@ pub(crate) struct GlobalDocument {
 
 impl GlobalDocument {
     pub(crate) fn load(path: &Path) -> Result<Self, GlobalFileError> {
-        let bytes = read(path).map_err(|source| GlobalFileError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let bytes = atomic_file::read(path)?;
         let unparseable = |message: String| GlobalFileError::Unparseable {
             path: path.to_path_buf(),
             message,
         };
-        let revision = revision_of(bytes.as_deref());
+        let revision = atomic_file::revision_of(bytes.as_deref());
         let text = bytes
             .map(String::from_utf8)
             .transpose()
@@ -73,17 +55,26 @@ impl GlobalDocument {
         })
     }
 
-    /// Writes `document` only while the file still holds what [`Self::load`] read, and only
-    /// when it loads as a valid global config.
+    /// Writes `document` only while the file still holds what [`Self::load`] read, only
+    /// when it loads as a valid global config, and never over a file still waiting for its
+    /// format upgrade.
     pub(crate) fn commit(&self, document: &DocumentMut) -> Result<Self, GlobalFileError> {
+        self.commit_in(document, &CONFIG_FORMAT)
+    }
+
+    fn commit_in(
+        &self,
+        document: &DocumentMut,
+        format: &ConfigFormat,
+    ) -> Result<Self, GlobalFileError> {
+        migration::ensure_current(&self.document, format)?;
         let text = document.to_string();
         let document =
             validated(&self.path, &text).map_err(|message| GlobalFileError::Invalid {
                 path: self.path.clone(),
                 message,
             })?;
-        let revision = commit(&self.path, &self.revision, text.as_bytes())?;
-        own_writes::record(&self.path, text.as_bytes());
+        let revision = atomic_file::commit(&self.path, &self.revision, text.as_bytes())?;
         Ok(Self {
             path: self.path.clone(),
             revision,
@@ -97,76 +88,44 @@ impl GlobalDocument {
 fn validated(path: &Path, text: &str) -> Result<DocumentMut, String> {
     let loaded = migration::upgrade_text(text.to_owned(), &CONFIG_FORMAT)
         .map_err(|error| error.to_string())?;
-    GlobalConfigFile::parse(&loaded.text, Lookup::Global(path))
-        .map_err(|error| error.to_string())?
-        .settings
-        .into_config(false)
-        .map_err(|error| error.to_string())?;
+    config_file::validate_global(path, &loaded.text)?;
     text.parse().map_err(|error| format!("{error}"))
 }
 
-fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use std::fs;
 
-fn revision_of(bytes: Option<&[u8]>) -> FileRevision {
-    bytes.map_or(FileRevision::Missing, |bytes| {
-        FileRevision::Present(Sha256::digest(bytes).into())
-    })
-}
+    use tempfile::TempDir;
+    use toml_edit::DocumentMut;
 
-/// Writes through a symlink to the file it names, so a linked dotfile stays linked. The new
-/// file replaces the old one atomically and keeps its permissions; a new file is owner-only.
-fn commit(
-    path: &Path,
-    expected: &FileRevision,
-    contents: &[u8],
-) -> Result<FileRevision, GlobalFileError> {
-    let _serialized = COMMITS.lock().unwrap_or_else(PoisonError::into_inner);
-    let failed = |source: io::Error| GlobalFileError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let target = match fs::canonicalize(path) {
-        Ok(target) => target,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => absolute(path).map_err(failed)?,
-        Err(error) => return Err(failed(error)),
-    };
-    let current = read(&target).map_err(failed)?;
-    if revision_of(current.as_deref()) != *expected {
-        return Err(GlobalFileError::Conflict {
-            path: path.to_path_buf(),
-        });
+    use super::{GlobalDocument, GlobalFileError};
+    use crate::config_file::CONFIG_FILE;
+    use crate::migration::MigrationError;
+    use crate::migration::tests_support::BEHIND;
+
+    const ON_DISK: &str = "version = 1\nalways_yolo = false\n";
+    const EDITED: &str = "version = 1\nalways_yolo = true\n";
+
+    #[test]
+    fn a_commit_over_a_file_behind_its_format_is_refused() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        fs::write(&path, ON_DISK).unwrap();
+        let loaded = GlobalDocument::load(&path).unwrap();
+        let edited: DocumentMut = EDITED.parse().unwrap();
+
+        let error = loaded.commit_in(&edited, &BEHIND).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                GlobalFileError::Format(MigrationError::Pending { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), ON_DISK);
+        loaded.commit(&edited).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), EDITED);
     }
-    if current.as_deref().unwrap_or_default() == contents {
-        return Ok(expected.clone());
-    }
-    let directory = target
-        .parent()
-        .ok_or_else(|| failed(io::ErrorKind::InvalidInput.into()))?;
-    fs::create_dir_all(directory).map_err(failed)?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(STAGING_PREFIX)
-        .tempfile_in(directory)
-        .map_err(failed)?;
-    staged.write_all(contents).map_err(failed)?;
-    if current.is_some() {
-        let permissions = fs::metadata(&target).map_err(failed)?.permissions();
-        staged
-            .as_file()
-            .set_permissions(permissions)
-            .map_err(failed)?;
-    }
-    staged.as_file().sync_all().map_err(failed)?;
-    staged
-        .persist(&target)
-        .map_err(|error| failed(error.error))?;
-    if let Err(error) = File::open(directory).and_then(|directory| directory.sync_all()) {
-        warn!(path = %target.display(), %error, "config directory sync failed after an edit");
-    }
-    Ok(revision_of(Some(contents)))
 }

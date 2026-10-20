@@ -729,6 +729,7 @@ mod tests {
             let startup = Startup {
                 features,
                 config_dir: Some(root.path().join("config")),
+                ..Startup::default()
             };
             Self { root, startup }
         }

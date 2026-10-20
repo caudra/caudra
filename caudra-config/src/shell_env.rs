@@ -344,6 +344,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::atomic_file::AtomicFileError;
     use crate::config_file::{CONFIG_FILE, load_global_config};
     use crate::{ENV_FILE, PROJECT_DIR, RawConfig, load_env_files_scoped};
 
@@ -506,7 +507,7 @@ mod tests {
         fs::write(&path, &external).unwrap();
         assert!(matches!(
             loaded.apply(ShellEnvEdit::AddPass(pattern(DOCKER_HOST))),
-            Err(ShellEnvFileError::Conflict { .. })
+            Err(ShellEnvFileError::File(AtomicFileError::Conflict { .. }))
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), external);
     }

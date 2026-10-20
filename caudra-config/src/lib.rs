@@ -93,6 +93,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &["WORKCELL_MCP_CODE_WORKER"];
 static PROJECT_ENV_FALLBACKS: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 static ENV_FILE_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+pub mod atomic_file;
 pub mod config_file;
 pub mod config_version;
 pub mod decision_features_file;
@@ -4496,6 +4497,14 @@ fn try_load_permissions_scoped(
     let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
     let project_perms = read(&project_path, Lookup::Refused)?.unwrap_or_default();
     Ok(build_permissions(global_perms, project_perms))
+}
+
+/// Whether `text`, the global permissions file at `path` in the latest
+/// format, loads.
+pub fn validate_global_permissions(path: &Path, text: &str) -> Result<(), String> {
+    interpolation::from_str::<PermissionsFileConfig>(text, Lookup::Global(path))
+        .map(drop)
+        .map_err(|error| format!("cannot parse permissions: {error}"))
 }
 
 /// `lookup` is settled on the path as named, since a symlinked file still

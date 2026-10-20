@@ -5,10 +5,11 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::exclusive_state_lock;
 use crate::id::CaudraId;
-use crate::{StateDir, StorageError, shared_state_lock, try_exclusive_state_lock};
+use crate::{StateClass, StateDir, StorageError, shared_state_lock, try_exclusive_state_lock};
 
 use super::{SESSIONS_DB_LOCK_FILE, SessionError};
 
+pub const INSTANCES_LOCK_FILE: &str = "caudra.instances.lock";
 const ACTIVE_LEASE_PREFIX: &str = "caudra.db.active-";
 const ACTIVE_LEASE_SUFFIX: &str = ".lock";
 const ACTIVE_LEASE_CATALOG: &str = "caudra.db.active.lock";
@@ -122,29 +123,61 @@ impl Drop for SessionLease {
     }
 }
 
-/// Proof that no session is open on this state directory, in this process or
-/// any other: the exclusive hold on the lock every [`SessionLease`] shares.
-/// [`SessionLease::acquire`] waits until it is dropped.
+/// Proof that no other Caudra runs on this state directory: the exclusive
+/// hold on the lock every [`SessionLease`] shares, which older builds take
+/// too, and on the one every [`InstanceHold`] shares, which an ephemeral run
+/// takes although its sessions lock a volatile database. Both wait until it
+/// is dropped.
 #[derive(Debug)]
 pub struct InstanceLock {
+    _sessions: File,
+    _instances: File,
+}
+
+/// A running Caudra frontend's share of [`INSTANCES_LOCK_FILE`], held for the
+/// life of the process so [`try_instance_lock`] sees it even while it has no
+/// session open on the persistent database.
+#[derive(Debug)]
+pub struct InstanceHold {
     _file: File,
 }
 
-/// Takes the [`InstanceLock`] if no session is open, and returns `None`
-/// without waiting if one is.
+/// Takes the [`InstanceLock`] in the persistent root of `state_dir` if no
+/// other Caudra runs, and returns `None` without waiting if one does.
 pub fn try_instance_lock(state_dir: &StateDir) -> Result<Option<InstanceLock>, StorageError> {
-    Ok(try_exclusive_state_lock(
-        &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
-        OWNER_FILE_MODE,
-    )?
-    .map(|file| InstanceLock { _file: file }))
+    let root = state_dir.persistent_path();
+    let Some(sessions) =
+        try_exclusive_state_lock(&root.join(SESSIONS_DB_LOCK_FILE), OWNER_FILE_MODE)?
+    else {
+        return Ok(None);
+    };
+    Ok(
+        try_exclusive_state_lock(&root.join(INSTANCES_LOCK_FILE), OWNER_FILE_MODE)?.map(
+            |instances| InstanceLock {
+                _sessions: sessions,
+                _instances: instances,
+            },
+        ),
+    )
 }
 
-/// The sessions open right now, to name what holds the [`InstanceLock`].
-/// A bare reader holds the lock without a session, so this can be empty even
-/// when [`try_instance_lock`] returns `None`.
+/// Marks this process as a running Caudra until the hold is dropped, waiting
+/// while an [`InstanceLock`] is held.
+pub fn hold_instance(state_dir: &StateDir) -> Result<InstanceHold, StorageError> {
+    Ok(InstanceHold {
+        _file: shared_state_lock(
+            &state_dir.persistent_path().join(INSTANCES_LOCK_FILE),
+            OWNER_FILE_MODE,
+        )?,
+    })
+}
+
+/// The sessions open right now on the persistent database, to name what
+/// holds the [`InstanceLock`]. A bare reader or an ephemeral run holds it
+/// without one, so this can be empty even when [`try_instance_lock`] returns
+/// `None`.
 pub fn open_instances(state_dir: &StateDir) -> Vec<CaudraId> {
-    held_session_ids(state_dir)
+    held_session_ids(&state_dir.for_class(StateClass::Persistent))
 }
 
 fn process_leases() -> std::sync::MutexGuard<'static, HashSet<LeaseKey>> {
@@ -308,6 +341,39 @@ mod tests {
 
         drop(lease);
         assert!(try_instance_lock(&state_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn instance_lock_is_refused_while_an_instance_is_held() {
+        let (_temp, state_dir) = state_dir();
+        let hold = hold_instance(&state_dir).unwrap();
+
+        assert!(try_instance_lock(&state_dir).unwrap().is_none());
+        assert!(
+            try_exclusive_state_lock(
+                &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
+                OWNER_FILE_MODE
+            )
+            .unwrap()
+            .is_some(),
+            "a refused instance lock must release the sessions lock"
+        );
+
+        drop(hold);
+        assert!(try_instance_lock(&state_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_ephemeral_run_holds_the_persistent_instance_lock() {
+        let (_persistent_temp, persistent) = state_dir();
+        let volatile = TempDir::new().unwrap();
+        let ephemeral = StateDir::split(
+            volatile.path().to_path_buf(),
+            persistent.path().to_path_buf(),
+        );
+        let _hold = hold_instance(&ephemeral).unwrap();
+
+        assert!(try_instance_lock(&persistent).unwrap().is_none());
     }
 
     #[test]

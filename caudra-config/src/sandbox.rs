@@ -8,6 +8,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU32, ParseIntError};
 use std::ops::Range;
+use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
@@ -987,6 +988,14 @@ impl SandboxDraft {
             return Err(SandboxError::Limit);
         }
         Ok(draft)
+    }
+
+    /// Whether `document`, a sandbox file in the latest format, loads. It
+    /// reads no references, so the path does not matter.
+    pub fn validate_file(_: &Path, document: &str) -> Result<(), String> {
+        Self::import(document)
+            .map(drop)
+            .map_err(|error| error.to_string())
     }
 
     pub fn import(document: &str) -> Result<Self, SandboxError> {

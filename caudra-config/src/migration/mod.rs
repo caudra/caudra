@@ -4,6 +4,7 @@
 //! the day that changed it.
 
 mod edit;
+pub mod global;
 mod note;
 
 use std::borrow::Cow;
@@ -95,6 +96,10 @@ pub enum MigrationError {
         "{file} lists an upgrade from version {from} out of order: this Caudra build is broken"
     )]
     StrayStep { file: &'static str, from: u32 },
+    #[error(
+        "{file} cannot be saved until it is upgraded to this Caudra's format: close the other Caudra sessions and start Caudra again, or run `caudra config migrate`"
+    )]
+    Pending { file: &'static str },
 }
 
 /// A config file's text in its latest format, ready for its parser.
@@ -286,6 +291,20 @@ pub fn upgrade_text(text: String, format: &ConfigFormat) -> Result<Loaded, Migra
     })
 }
 
+/// Refuses a save over `on_disk`, a file in `format` as it is on disk, while
+/// it is behind `latest`. Writing it anyway would upgrade it with neither a
+/// backup nor notes, under any other Caudra still reading the old shape. A
+/// file that only lacks the `version` key is current.
+pub fn ensure_current(on_disk: &DocumentMut, format: &ConfigFormat) -> Result<(), MigrationError> {
+    let file = format.file;
+    let declared = declared_version(on_disk, format)
+        .map_err(|source| MigrationError::Version { file, source })?;
+    if declared.unwrap_or(FIRST_VERSION) < format.latest {
+        return Err(MigrationError::Pending { file });
+    }
+    Ok(())
+}
+
 /// A file's line ending is the one its first line ends with.
 fn uses_crlf(text: &str) -> bool {
     text.find(LF).is_some_and(|end| text[..end].ends_with('\r'))
@@ -318,16 +337,41 @@ fn test_stamp() -> Stamp {
     }
 }
 
+/// A format one version ahead of every file the tests write, so a writer's
+/// guard has a file behind it to refuse.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::{ConfigFormat, MigrationError, Step, Upgrade};
+
+    pub(crate) const BEHIND_FILE: &str = "behind.toml";
+    pub(crate) const BEHIND: ConfigFormat = ConfigFormat {
+        file: BEHIND_FILE,
+        latest: 2,
+        steps: &[Step {
+            from: 1,
+            why: None,
+            apply: unchanged,
+        }],
+        requires_version: false,
+    };
+
+    fn unchanged(_: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use tempfile::TempDir;
     use test_case::test_case;
+    use toml_edit::DocumentMut;
 
+    use super::tests_support::{BEHIND, BEHIND_FILE};
     use super::{
         Change, ConfigFormat, ConfigVersionError, Loaded, Migrated, MigrationError, ReadError,
-        Step, Upgrade, migrate, read, test_stamp, upgrade_text,
+        Step, Upgrade, ensure_current, migrate, read, test_stamp, upgrade_text,
     };
 
     macro_rules! added {
@@ -602,6 +646,30 @@ model = 'a'
                 from: 1
             })
         );
+    }
+
+    #[test_case("", Err(MigrationError::Pending { file: BEHIND_FILE }) ; "unstamped_and_behind")]
+    #[test_case("version = 1\n", Err(MigrationError::Pending { file: BEHIND_FILE }) ; "stamped_and_behind")]
+    #[test_case("version = 2\n", Ok(()) ; "current")]
+    #[test_case("version = 3\n", Err(MigrationError::Version { file: BEHIND_FILE, source: ConfigVersionError::Newer { found: 3, latest: 2 } }) ; "newer")]
+    fn ensure_current_refuses_a_file_behind_its_format(
+        on_disk: &str,
+        expected: Result<(), MigrationError>,
+    ) {
+        let on_disk: DocumentMut = on_disk.parse().unwrap();
+
+        assert_eq!(ensure_current(&on_disk, &BEHIND), expected);
+    }
+
+    #[test]
+    fn a_file_without_its_stamp_is_current_at_the_first_version() {
+        const FIRST: ConfigFormat = ConfigFormat {
+            latest: 1,
+            steps: &[],
+            ..BEHIND
+        };
+
+        assert_eq!(ensure_current(&DocumentMut::new(), &FIRST), Ok(()));
     }
 
     #[test_case(&FORMAT, Ok(()) ; "contiguous")]

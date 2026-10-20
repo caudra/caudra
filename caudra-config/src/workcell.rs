@@ -471,6 +471,13 @@ pub fn load_workcell_profiles_from(
     parse_profile_file(content, Lookup::Global(&path))
 }
 
+/// Whether `text`, the profile file at `path` in the latest format, loads.
+pub fn validate_workcell_profiles(path: &Path, text: &str) -> Result<(), String> {
+    parse_profile_file(text.to_owned(), Lookup::Global(path))
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
 /// Errors withhold the TOML parser's diagnostics, which quote the file.
 fn parse_profile_file(
     content: String,

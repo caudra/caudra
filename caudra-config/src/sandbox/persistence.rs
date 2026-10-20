@@ -1,7 +1,8 @@
 use super::{
-    MAX_SANDBOX_FILE_BYTES, RecordKind, SANDBOX_FILE, SandboxDraft, SandboxError, SandboxName,
-    SavedSandboxes,
+    MAX_SANDBOX_FILE_BYTES, RecordKind, SANDBOX_FILE, SANDBOX_FORMAT, SandboxDraft, SandboxError,
+    SandboxName, SavedSandboxes,
 };
+use crate::migration::{self, ConfigFormat, MigrationError};
 use crate::own_writes;
 use crate::toml_document::merge_table;
 use caudra_storage::paths;
@@ -22,6 +23,8 @@ pub enum SandboxStoreError {
     File(#[from] PrivateFileError),
     #[error(transparent)]
     Configuration(#[from] SandboxError),
+    #[error(transparent)]
+    Format(#[from] MigrationError),
 }
 
 pub struct SandboxStore(PrivateFile);
@@ -131,13 +134,30 @@ impl SandboxStore {
         })
     }
 
+    /// Refuses to replace a file still waiting for its format upgrade.
     pub fn save(
         &self,
         baseline: &LoadedSandboxes,
         draft: &SandboxDraft,
     ) -> Result<LoadedSandboxes, SandboxStoreError> {
+        self.save_in(baseline, draft, &SANDBOX_FORMAT)
+    }
+
+    fn save_in(
+        &self,
+        baseline: &LoadedSandboxes,
+        draft: &SandboxDraft,
+        format: &ConfigFormat,
+    ) -> Result<LoadedSandboxes, SandboxStoreError> {
         if baseline.path != self.0.path() {
             return Err(SandboxStoreError::WrongStore);
+        }
+        if let Some(bytes) = self.0.load()?.data {
+            let on_disk = String::from_utf8(bytes)
+                .ok()
+                .and_then(|source| source.parse::<DocumentMut>().ok())
+                .ok_or(SandboxError::Document)?;
+            migration::ensure_current(&on_disk, format)?;
         }
         let saved = SavedSandboxes::new(draft.clone())?;
         let source = baseline.export_draft(saved.configuration())?;
@@ -180,6 +200,8 @@ impl SandboxStore {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{SandboxStore, SandboxStoreError};
+    use crate::migration::MigrationError;
+    use crate::migration::tests_support::{BEHIND, BEHIND_FILE};
     use crate::sandbox::tests::{SAMPLE, draft, name};
     use crate::sandbox::{
         MAX_SANDBOX_FILE_BYTES, RecordKind, SANDBOX_FILE, SandboxDraft, SandboxError,
@@ -382,6 +404,25 @@ mod tests {
         );
         let exported = committed.draft().export().unwrap();
         assert_eq!(SandboxDraft::import(&exported).unwrap(), draft);
+    }
+
+    #[test]
+    fn a_save_over_a_file_behind_its_format_is_refused() {
+        let temp = tempdir().unwrap();
+        write(temp.path(), SAMPLE);
+        let store = SandboxStore::from_config_dir(temp.path()).unwrap();
+        let loaded = store.load().unwrap();
+        let mut draft = loaded.draft();
+        draft.profiles.get_mut(&name("dev")).unwrap().cpus = NonZeroU32::new(6).unwrap();
+
+        assert_eq!(
+            store.save_in(&loaded, &draft, &BEHIND).unwrap_err(),
+            SandboxStoreError::Format(MigrationError::Pending { file: BEHIND_FILE })
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join(SANDBOX_FILE)).unwrap(),
+            SAMPLE
+        );
     }
 
     #[test]

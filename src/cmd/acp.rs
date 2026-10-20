@@ -14,9 +14,9 @@ use caudra_lua::PluginHost;
 use caudra_providers::Timeouts;
 use caudra_providers::model::Model;
 use caudra_providers::provider::available_model_specs;
-use caudra_storage::StateDir;
 use caudra_storage::sessions::StoredMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_storage::{StateDir, hold_instance};
 
 use super::workcell_runtime::WorkcellRuntime;
 use crate::cli::{Cli, WorkcellSelectorArgs};
@@ -181,6 +181,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         elapsed
     };
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let _instance = hold_instance(&storage).context("register this Caudra as running")?;
     let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&storage)
         .context("load model purpose bindings")?;
@@ -220,6 +221,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
 
     let _logging = setup::init_logging(&config.storage);
     let init_logging_ms = lap();
+    cli.startup.upgrade.log();
     setup::apply_storage_limits(&config.storage);
     setup::register_change_stores();
     setup::init_telemetry(&config.telemetry);

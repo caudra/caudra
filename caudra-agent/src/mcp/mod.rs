@@ -1454,7 +1454,7 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
         && source != McpConfigSource::Runtime
         && !path.as_os_str().is_empty()
     {
-        spawn_persist_enabled(path, server_name.to_owned(), enabled);
+        spawn_persist_enabled(path, source, server_name.to_owned(), enabled);
     }
 
     if enabled {
@@ -2472,10 +2472,11 @@ fn transport_oauth(transport: &Transport) -> Option<OauthClientConfig> {
     }
 }
 
-fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
+fn spawn_persist_enabled(path: PathBuf, source: McpConfigSource, name: String, enabled: bool) {
     let log_name = name.clone();
     smol::spawn(async move {
-        if let Err(e) = smol::unblock(move || config::persist_enabled(&path, &name, enabled)).await
+        if let Err(e) =
+            smol::unblock(move || config::persist_enabled(&path, source, &name, enabled)).await
         {
             warn!(error = %e, server = %log_name, "failed to persist MCP toggle");
         }
@@ -3616,7 +3617,13 @@ mod tests {
             // leaves the file whole before it is read back.
             let origin = std::mem::take(&mut inner.entries[0].origin);
             handle_toggle(&mut inner, RELOAD_SERVER, !initially_enabled).await;
-            config::persist_enabled(&origin, RELOAD_SERVER, !initially_enabled).unwrap();
+            config::persist_enabled(
+                &origin,
+                McpConfigSource::Global,
+                RELOAD_SERVER,
+                !initially_enabled,
+            )
+            .unwrap();
             let status = entry(&inner, RELOAD_SERVER).status.clone();
             let shutdowns = transport.as_ref().map(|transport| transport.shutdowns());
 

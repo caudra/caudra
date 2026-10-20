@@ -97,6 +97,17 @@ pub fn load_global_config(path: &Path) -> Result<GlobalConfigFile, ConfigFileErr
     }
 }
 
+/// Whether `text`, the global `caudra.toml` at `path` in the latest format,
+/// loads into a valid config.
+pub fn validate_global(path: &Path, text: &str) -> Result<(), String> {
+    GlobalConfigFile::parse(text, Lookup::Global(path))
+        .map_err(|error| error.to_string())?
+        .settings
+        .into_config(false)
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
 /// A repository must never opt its users into an experiment or read their
 /// environment, so both are refused outright rather than ignored.
 pub fn load_project_config(path: &Path) -> Result<RawConfig, ConfigFileError> {
@@ -337,6 +348,27 @@ mod tests {
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("line 3"), "{message}");
         assert!(message.contains(MISSING_THEME), "{message}");
+    }
+
+    /// Every load and reload reads the file upgraded in memory; only the
+    /// startup upgrade writes it.
+    #[test_case(GLOBAL_SCOPE; "global")]
+    #[test_case(PROJECT_SCOPE; "project")]
+    fn a_load_never_writes_the_upgrade_back(scope: &str) {
+        const UNSTAMPED: &str = "[agent]\ntodo_reminder = false\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_config_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, UNSTAMPED).unwrap();
+
+        let settings = if scope == GLOBAL_SCOPE {
+            load_global_config(&path).unwrap().settings
+        } else {
+            load_project_config(&path).unwrap()
+        };
+
+        assert_eq!(settings.agent.todo_reminder, Some(false));
+        assert_eq!(fs::read_to_string(&path).unwrap(), UNSTAMPED);
     }
 
     #[test]

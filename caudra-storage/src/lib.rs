@@ -72,7 +72,10 @@ pub use words::{
     random_task_id,
 };
 
-pub use sessions::{InstanceLock, open_instances, try_instance_lock};
+pub use sessions::{
+    INSTANCES_LOCK_FILE, InstanceHold, InstanceLock, hold_instance, open_instances,
+    try_instance_lock,
+};
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

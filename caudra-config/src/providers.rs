@@ -18,11 +18,11 @@ use tracing::debug;
 use caudra_storage::paths;
 use caudra_storage::thinking::ReasoningOptions;
 
+use crate::atomic_file::{self, AtomicFileError};
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
 use crate::decisions::{DECISIONS_TABLE, DecisionEndpointDef};
 use crate::interpolation::{self, Lookup};
 use crate::migration::{self, ConfigFormat, MigrationError, ReadError};
-use crate::own_writes;
 use crate::toml_document::{merge_item, to_table};
 use crate::{ConfigField, ConfigValue};
 
@@ -1069,6 +1069,13 @@ impl ProvidersConfig {
             .map_err(|error| format!("{}: {error}", path.display()))
     }
 
+    /// Whether `text`, the providers file at `path` in the latest format, loads.
+    pub fn validate(path: &Path, text: &str) -> Result<(), String> {
+        interpolation::from_str::<Self>(text, Lookup::Global(path))
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
     fn parse_file(path: &Path) -> Result<Self, String> {
         match migration::read(path, &PROVIDERS_FORMAT) {
             Ok(Some(loaded)) => {
@@ -1144,12 +1151,10 @@ pub enum ProvidersFileError {
         #[source]
         source: Box<ProvidersParseError>,
     },
-    #[error("write {}: {source}", path.display())]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error(transparent)]
+    File(#[from] AtomicFileError),
+    #[error(transparent)]
+    Format(#[from] MigrationError),
     #[error("render {PROVIDERS_FILE}: {0}")]
     Render(#[from] toml::ser::Error),
     #[error("{PROVIDERS_FILE}: {0}")]
@@ -1191,17 +1196,25 @@ impl ProvidersFile {
         }
     }
 
+    /// Refuses to replace a file still waiting for its format upgrade, which the save would
+    /// upgrade with neither a backup nor notes.
     pub fn save(&self) -> Result<(), ProvidersFileError> {
-        let path = providers_file_path(paths::config_dir());
-        let content = self.render();
-        let written = path
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&path, &content));
-        if let Err(source) = written {
-            return Err(ProvidersFileError::Write { path, source });
+        self.save_to(&providers_file_path(paths::config_dir()), &PROVIDERS_FORMAT)
+    }
+
+    fn save_to(&self, path: &Path, format: &ConfigFormat) -> Result<(), ProvidersFileError> {
+        let on_disk = atomic_file::read(path)?;
+        if let Some(bytes) = &on_disk {
+            let document = String::from_utf8_lossy(bytes).parse().map_err(
+                |source: toml_edit::TomlError| ProvidersFileError::Invalid {
+                    path: path.to_path_buf(),
+                    source: Box::new(source.into()),
+                },
+            )?;
+            migration::ensure_current(&document, format)?;
         }
-        own_writes::record(&path, content.as_bytes());
+        let revision = atomic_file::revision_of(on_disk.as_deref());
+        atomic_file::commit(path, &revision, self.render().as_bytes())?;
         debug!(path = %path.display(), "saved providers config");
         Ok(())
     }
@@ -2225,5 +2238,29 @@ protocol = "anthropic"
         fs::write(&path, BROKEN_TOML).unwrap();
 
         assert!(ProvidersConfig::load_from(&path, &fresh_last_good()).is_err());
+    }
+
+    #[test]
+    fn a_save_over_a_file_behind_its_format_is_refused() {
+        const ON_DISK: &str = "version = 1\n[local]\nprotocol = \"openai\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        fs::write(&path, ON_DISK).unwrap();
+        let file = ProvidersFile::parse(ON_DISK).unwrap();
+
+        let error = file
+            .save_to(&path, &crate::migration::tests_support::BEHIND)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ProvidersFileError::Format(MigrationError::Pending { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), ON_DISK);
+        file.save_to(&path, &PROVIDERS_FORMAT).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ON_DISK);
     }
 }

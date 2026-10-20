@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,10 +15,10 @@ use super::error::McpError;
 use super::kind::McpServerKind;
 use super::protocol::ServerDiscovery;
 use crate::tools::is_builtin_tool;
+use caudra_config::atomic_file::{self, AtomicFileError};
 use caudra_config::interpolation::{self, Lookup};
 use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_FORMAT};
-use caudra_config::migration::{self, ReadError};
-use caudra_config::own_writes;
+use caudra_config::migration::{self, ConfigFormat, ReadError};
 use caudra_config::toml_document::set_value;
 use caudra_config::{global_config_dir, is_valid_server_name};
 
@@ -721,15 +720,38 @@ pub fn http_endpoints(config: &McpConfig) -> impl Iterator<Item = &str> {
         })
 }
 
+/// Turns `server_name` on or off in the file it came from. A global file waiting for its format
+/// upgrade is refused; a project file is edited at whatever version it declares.
 pub fn persist_enabled(
     config_path: &Path,
+    source: McpConfigSource,
     server_name: &str,
     enabled: bool,
 ) -> Result<(), McpError> {
-    let content = fs::read_to_string(config_path).unwrap_or_default();
+    let guard = (source == McpConfigSource::Global).then_some(&MCP_FORMAT);
+    write_enabled(config_path, guard, server_name, enabled)
+}
+
+fn write_enabled(
+    config_path: &Path,
+    guard: Option<&ConfigFormat>,
+    server_name: &str,
+    enabled: bool,
+) -> Result<(), McpError> {
+    let file_error = |error: AtomicFileError| McpError::Config(error.to_string());
+    let bytes = atomic_file::read(config_path).map_err(file_error)?;
+    let revision = atomic_file::revision_of(bytes.as_deref());
+    let content = bytes
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| McpError::Config(format!("{} is not valid UTF-8", config_path.display())))?
+        .unwrap_or_default();
     let mut doc: DocumentMut = content
         .parse()
         .map_err(|e| McpError::Config(format!("failed to parse {}: {e}", config_path.display())))?;
+    if let Some(format) = guard {
+        migration::ensure_current(&doc, format).map_err(|e| McpError::Config(e.to_string()))?;
+    }
 
     let mcp = doc
         .entry("mcp")
@@ -742,16 +764,14 @@ pub fn persist_enabled(
         .as_table_like_mut()
         .ok_or_else(|| McpError::Config(format!("[mcp.{server_name}] is not a table")))?;
     set_value(server, ENABLED_KEY, Value::from(enabled));
+    atomic_file::commit(config_path, &revision, doc.to_string().as_bytes())
+        .map(drop)
+        .map_err(file_error)
+}
 
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| McpError::Config(format!("cannot create dir: {e}")))?;
-    }
-    let rendered = doc.to_string();
-    fs::write(config_path, &rendered)
-        .map_err(|e| McpError::Config(format!("cannot write {}: {e}", config_path.display())))?;
-    own_writes::record(config_path, rendered.as_bytes());
-    Ok(())
+/// Whether `text`, the global MCP file at `path` in the latest format, loads.
+pub fn validate_global(path: &Path, text: &str) -> Result<(), String> {
+    parse(text, Lookup::Global(path)).map(drop)
 }
 
 /// Only the global file may read the environment: a project file runs no
@@ -812,29 +832,31 @@ fn read_config(path: &Path, source: McpConfigSource) -> Result<Option<McpConfig>
             });
         }
     };
-    if let Some(key) = removed_key(&content) {
-        return Err(McpConfigError::Parse {
-            path: path.into(),
-            error: format!("`{key}` {REMOVED_KEY_REASON}"),
-        });
-    }
-    interpolation::from_str(&content, lookup)
+    parse(&content, lookup)
         .inspect_err(|e| {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "failed to parse mcp config")
         })
-        .map_err(|e| McpConfigError::Parse {
+        .map_err(|error| McpConfigError::Parse {
             path: path.into(),
-            error: e.to_string(),
+            error,
         })
         .map(Some)
+}
+
+fn parse(content: &str, lookup: Lookup<'_>) -> Result<McpConfig, String> {
+    if let Some(key) = removed_key(content) {
+        return Err(format!("`{key}` {REMOVED_KEY_REASON}"));
+    }
+    interpolation::from_str(content, lookup).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
 
     use super::*;
     use caudra_config::ConfigField;
@@ -845,6 +867,7 @@ mod tests {
         DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, HTTP_FIELDS, MCP_VERSION, OAUTH_FIELDS,
         SERVER_FIELDS, STDIO_FIELDS,
     };
+    use caudra_config::migration::MigrationError;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -1127,7 +1150,7 @@ command = ["project"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.toml");
 
-        persist_enabled(&path, "srv", false).unwrap();
+        persist_enabled(&path, McpConfigSource::Global, "srv", false).unwrap();
         let doc: toml_edit::DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(doc["mcp"]["srv"]["enabled"].as_bool(), Some(false));
 
@@ -1140,7 +1163,7 @@ enabled = true
 "#,
         )
         .unwrap();
-        persist_enabled(&path, "srv", false).unwrap();
+        persist_enabled(&path, McpConfigSource::Global, "srv", false).unwrap();
         let doc: toml_edit::DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(doc["mcp"]["srv"]["enabled"].as_bool(), Some(false));
         assert!(doc["mcp"]["srv"]["command"].is_array());
@@ -1154,7 +1177,7 @@ enabled = true
         let path = dir.path().join(MCP_FILE);
         fs::write(&path, source).unwrap();
 
-        persist_enabled(&path, "srv", false).unwrap();
+        persist_enabled(&path, McpConfigSource::Global, "srv", false).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     }
@@ -1399,11 +1422,50 @@ command = ["echo", "hello"]
     }
 
     #[test]
+    fn persist_enabled_refuses_a_global_file_behind_its_format() {
+        const BEHIND: ConfigFormat = ConfigFormat {
+            file: MCP_FILE,
+            latest: 2,
+            steps: &[],
+            requires_version: false,
+        };
+        const ON_DISK: &str = "[mcp.srv]\ncommand = [\"echo\"]\nenabled = true\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        fs::write(&path, ON_DISK).unwrap();
+
+        let error = write_enabled(&path, Some(&BEHIND), "srv", false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&MigrationError::Pending { file: MCP_FILE }.to_string()),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), ON_DISK);
+    }
+
+    #[test]
+    fn persist_enabled_leaves_a_project_file_at_its_own_version() {
+        const ON_DISK: &str = "[mcp.srv]\ncommand = [\"echo\"]\nenabled = true\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        fs::write(&path, ON_DISK).unwrap();
+
+        persist_enabled(&path, McpConfigSource::Project, "srv", false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            ON_DISK.replace("enabled = true", "enabled = false")
+        );
+    }
+
+    #[test]
     fn persist_enabled_keeps_references() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_header_reference(dir.path());
 
-        persist_enabled(&path, GLOBAL_SERVER, false).unwrap();
+        persist_enabled(&path, McpConfigSource::Global, GLOBAL_SERVER, false).unwrap();
 
         let reference = format!("{{env:{TOKEN_VARIABLE}}}");
         assert!(fs::read_to_string(&path).unwrap().contains(&reference));

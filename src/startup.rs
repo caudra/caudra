@@ -1,7 +1,44 @@
 use std::path::PathBuf;
 
-use caudra_config::FeatureFlags;
-use caudra_config::config_file::{self, ConfigFileError};
+use caudra_agent::mcp::config as mcp_config;
+use caudra_config::config_file::{self, CONFIG_FORMAT, ConfigFileError};
+use caudra_config::mcp::MCP_FORMAT;
+use caudra_config::migration::Stamp;
+use caudra_config::migration::global::{GlobalFile, UpgradeReport, upgrade_global};
+use caudra_config::providers::{PROVIDERS_FORMAT, ProvidersConfig};
+use caudra_config::sandbox::{SANDBOX_FORMAT, SandboxDraft};
+use caudra_config::workcell::{WORKCELL_FORMAT, validate_workcell_profiles};
+use caudra_config::{FeatureFlags, PERMISSIONS_FORMAT, validate_global_permissions};
+use caudra_storage::StateDir;
+
+/// Every global TOML file, with the parser its upgraded text must pass
+/// before the startup upgrade writes it.
+const GLOBAL_FILES: &[GlobalFile] = &[
+    GlobalFile {
+        format: &CONFIG_FORMAT,
+        validate: config_file::validate_global,
+    },
+    GlobalFile {
+        format: &PERMISSIONS_FORMAT,
+        validate: validate_global_permissions,
+    },
+    GlobalFile {
+        format: &MCP_FORMAT,
+        validate: mcp_config::validate_global,
+    },
+    GlobalFile {
+        format: &PROVIDERS_FORMAT,
+        validate: ProvidersConfig::validate,
+    },
+    GlobalFile {
+        format: &WORKCELL_FORMAT,
+        validate: validate_workcell_profiles,
+    },
+    GlobalFile {
+        format: &SANDBOX_FORMAT,
+        validate: SandboxDraft::validate_file,
+    },
+];
 
 /// What this process read from the global `caudra.toml` before it parsed its
 /// arguments. The experimental switches hold for the life of the process;
@@ -13,15 +50,24 @@ use caudra_config::config_file::{self, ConfigFileError};
 pub struct Startup {
     pub features: FeatureFlags,
     pub config_dir: Option<PathBuf>,
+    /// What upgrading the global files on disk did, before anything read them.
+    pub upgrade: UpgradeReport,
 }
 
 impl Startup {
+    /// Upgrades the global config files on disk first, before this process
+    /// holds a session or reads any of them. Without a state directory there
+    /// is nowhere to back them up, so they are only read upgraded.
     pub fn load() -> Result<Self, ConfigFileError> {
         let config_dir = config_file::resolve_config_dir()?;
+        let upgrade = StateDir::resolve()
+            .map(|state_dir| upgrade_global(&config_dir, &state_dir, &Stamp::now(), GLOBAL_FILES))
+            .unwrap_or_default();
         let file = config_file::load_global_config(&config_file::global_config_path(&config_dir))?;
         Ok(Self {
             features: file.features,
             config_dir: Some(config_dir),
+            upgrade,
         })
     }
 
@@ -41,11 +87,25 @@ mod tests {
     use std::fs;
 
     use caudra_config::config_file::CONFIG_FILE;
+    use caudra_config::files::{CONFIG_FILES, Scope};
     use caudra_config::{Feature, FeatureFlags};
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::Startup;
+    use super::{GLOBAL_FILES, Startup};
+
+    #[test]
+    fn the_startup_upgrade_covers_every_global_toml_file() {
+        let registered: Vec<&str> = CONFIG_FILES
+            .iter()
+            .filter(|file| file.scopes.contains(&Scope::Global))
+            .filter_map(|file| file.format)
+            .map(|format| format.file)
+            .collect();
+        let upgraded: Vec<&str> = GLOBAL_FILES.iter().map(|file| file.format.file).collect();
+
+        assert_eq!(upgraded, registered);
+    }
 
     #[test_case(None, true; "file_removed")]
     #[test_case(Some("[experimental]\nworkflows = true\n"), false; "same_flags")]
@@ -59,6 +119,7 @@ mod tests {
         let startup = Startup {
             features: FeatureFlags::NONE.with(Feature::Workflows),
             config_dir: Some(dir.path().to_path_buf()),
+            ..Startup::default()
         };
         assert_eq!(startup.features_changed(), changed);
     }
