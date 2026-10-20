@@ -1722,8 +1722,8 @@ async fn resolve_provider(
     Ok((model, provider))
 }
 
-/// A standalone task shows its model via `SubagentInfo` on the header; a
-/// dispatching caller (batch) gets the same thing as a live annotation.
+/// The UI names a task's model from `SubagentInfo`; a dispatching caller with
+/// a live sink of its own, such as a Lua plugin, hears it as an annotation.
 fn announce_model(ctx: &ToolContext, model: &Model) {
     if let Some(sink) = &ctx.live_sink {
         let _ = sink.send(ToolLive::Annotation(model.spec()));

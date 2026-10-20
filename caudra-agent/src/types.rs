@@ -47,7 +47,7 @@ use crate::peers::{
 };
 use crate::permissions::PermissionRequest;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
-use crate::tools::{TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
+use crate::tools::{TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
@@ -153,8 +153,9 @@ const STATE_KIND_FIELD: &str = "kind";
 /// kept in the stored state so a restored session reports the same.
 const STATE_SUMMARY_FIELD: &str = "summary";
 /// Results sized by what they cost the model rather than by their lines: a
-/// page's line count only says how its extractor happened to wrap it.
-const TOKEN_SIZED_KINDS: &[&str] = &["webfetch", "websearch"];
+/// page's line count only says how its extractor happened to wrap it, and a
+/// subagent's answer is prose whose lines say nothing at all.
+const TOKEN_SIZED_KINDS: &[&str] = &["webfetch", "websearch", TASK_TOOL_NAME];
 
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -694,6 +695,15 @@ impl TextOutput {
     pub fn summarized(text: impl Into<String>, summary: String) -> Self {
         Self {
             state: Some(serde_json::json!({ STATE_SUMMARY_FIELD: summary })),
+            ..Self::from(text.into())
+        }
+    }
+
+    /// A text result that names the tool it came from in its stored state, so
+    /// a reopened session sizes its card the way the live run did.
+    pub fn of_kind(text: impl Into<String>, kind: &str) -> Self {
+        Self {
+            state: Some(json!({ STATE_KIND_FIELD: kind })),
             ..Self::from(text.into())
         }
     }
@@ -5257,8 +5267,10 @@ mod tests {
         assert_eq!(restored.as_text(), text);
     }
 
-    /// A web result is sized by what the model pays for it alone. Other text,
-    /// such as a `code` result, keeps its line count beside it.
+    /// A web result or a subagent's answer is sized by what the model pays for
+    /// it alone. Other text, such as a `code` result, keeps its line count
+    /// beside it.
+    #[test_case(ToolOutput::Markdown, TASK_TOOL_NAME, token_label(estimate_tokens(WEB_RESULT)) ; "a_task_answer_counts_tokens")]
     #[test_case(ToolOutput::Markdown, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_fetched_page_counts_tokens")]
     #[test_case(ToolOutput::Plain, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_page_fetched_as_text_counts_tokens")]
     #[test_case(ToolOutput::Markdown, "websearch", token_label(estimate_tokens(WEB_RESULT)) ; "search_results_count_tokens")]
@@ -5268,10 +5280,7 @@ mod tests {
         kind: &str,
         expected: String,
     ) {
-        let output = variant(TextOutput {
-            state: Some(serde_json::json!({ STATE_KIND_FIELD: kind })),
-            ..TextOutput::from(WEB_RESULT)
-        });
+        let output = variant(TextOutput::of_kind(WEB_RESULT, kind));
 
         assert_eq!(output.annotation(), Some(expected));
     }

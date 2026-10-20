@@ -20,7 +20,8 @@ use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
     header_workdir, inflected_header, label_spans, names_tool, progress_lines, raw_toggle_label,
-    repeats_tool, report_header, report_markdown, report_message, scroll_footer_text, title,
+    repeats_tool, report_header, report_markdown, report_message, scroll_footer_text,
+    subagent_annotation, title,
 };
 use super::{
     ToolProgress, code_card, environment_card, is_collapsible, json_text, json_tree, mcp_card,
@@ -1185,7 +1186,12 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             limits.cwd.as_deref(),
         );
         spans.extend(annotation_spans(
-            child_annotation(entry, limits.progress.get(&index)).as_deref(),
+            child_annotation(
+                entry,
+                limits.progress.get(&index),
+                limits.models.get(&index).map(String::as_str),
+            )
+            .as_deref(),
             workdir,
         ));
         if let Some(decisions) = limits.decisions.get(&index) {
@@ -1488,8 +1494,13 @@ fn holds_a_body(entry: &BatchToolEntry) -> bool {
 /// header does: what the run did, then what the call has to say about it. It
 /// rides the row running as well as settled, because hung off the child as a
 /// node it would be a branch of the tree holding nothing but a clock, with the
-/// child's own body drawn to the left of it.
-fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> Option<String> {
+/// child's own body drawn to the left of it. A subagent child's model follows
+/// the tally, as on a standalone card.
+fn child_annotation(
+    entry: &BatchToolEntry,
+    progress: Option<&ToolProgress>,
+    model: Option<&str>,
+) -> Option<String> {
     let own = match entry.output.as_ref() {
         Some(ToolOutput::Peers(output)) => Some(output.annotation()),
         _ => entry.annotation.clone(),
@@ -1504,11 +1515,7 @@ fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> 
     });
     let tally =
         progress.map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
-    let mut annotation = match (tally, own) {
-        (Some(tally), Some(own)) => Some(format!("{tally}{CHILD_ACTIVITY_SEPARATOR}{own}")),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    };
+    let mut annotation = subagent_annotation(tally, model, own);
     // The same deadline a standalone card names, on the same terms: a child is
     // a whole call, and the one folded out of its brackets to be said here.
     if let Some(timeout) = header_timeout(&entry.tool, entry.raw_input.as_ref()) {
@@ -3309,6 +3316,20 @@ pub type ChildLive = Arc<HashMap<usize, String>>;
 /// only those draw a clock worth counting up.
 pub type ChildStarted = Arc<HashMap<usize, Instant>>;
 
+/// The model each subagent child of one batch runs on, by index in the
+/// roster.
+pub type ChildModels = Arc<HashMap<usize, String>>;
+
+/// The model the subagent behind each call runs on. Kept apart from the
+/// annotation, which live usage and the call's answer both rewrite.
+#[derive(Default)]
+pub struct SubagentModels {
+    /// A call drawn as its own card, by its id.
+    pub cards: HashMap<String, String>,
+    /// A batch child, on its batch's roster, by the batch's id.
+    pub children: HashMap<String, ChildModels>,
+}
+
 /// A fixed-height window onto a body that may be longer than it. `follow`
 /// pins the window to the tail, so a body still arriving keeps its newest
 /// lines on screen; scrolling up drops the pin and `offset` takes over.
@@ -3447,6 +3468,7 @@ pub struct RenderLimits {
     /// in the roster.
     pub live: ChildLive,
     pub started: ChildStarted,
+    pub models: ChildModels,
     /// Every tool's budget rather than only this card's, because a batch child
     /// rests at the one its own tool would be drawn with.
     pub tool_lines: ToolOutputLines,
@@ -3477,6 +3499,7 @@ impl RenderLimits {
             progress: ChildProgress::default(),
             live: ChildLive::default(),
             started: ChildStarted::default(),
+            models: ChildModels::default(),
             tool_lines,
             width: UNCONSTRAINED_WIDTH,
             cwd: None,
@@ -3513,6 +3536,10 @@ impl RenderLimits {
             started,
             ..self
         }
+    }
+
+    pub fn with_models(self, models: ChildModels) -> Self {
+        Self { models, ..self }
     }
 
     pub fn with_width(self, width: u16) -> Self {
@@ -3636,6 +3663,7 @@ impl RenderLimits {
             progress: ChildProgress::default(),
             live: ChildLive::default(),
             started: ChildStarted::default(),
+            models: ChildModels::default(),
             tool_lines: self.tool_lines,
             width: self.width.saturating_sub(batch_child_indent_width()),
             cwd: self.cwd.clone(),

@@ -5882,8 +5882,8 @@ impl App {
         }
         if first_parent_event {
             self.chats[0].update_tool_summary(parent_tool_use_id, &subagent.name);
-            if let Some(ref model) = subagent.model {
-                self.chats[0].update_tool_model(parent_tool_use_id, model);
+            if let Some(model) = &subagent.model {
+                self.chats[0].set_tool_model(parent_tool_use_id, model);
             }
         }
 
@@ -5930,7 +5930,7 @@ impl App {
                 chat.fast = subagent.fast;
                 if chat.model_id.as_ref() != Some(model) {
                     chat.model_id = Some(model.clone());
-                    self.chats[0].update_tool_model(parent_tool_use_id, model);
+                    self.chats[0].set_tool_model(parent_tool_use_id, model);
                 }
             }
             return idx;

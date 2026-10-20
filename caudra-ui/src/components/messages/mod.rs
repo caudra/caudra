@@ -23,7 +23,7 @@ use super::{
     code_card,
     code_view::{
         self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
-        CardPolicy, Disclosure, RowTarget, ScrollSpan, ScrollWindow,
+        CardPolicy, Disclosure, RowTarget, ScrollSpan, ScrollWindow, SubagentModels,
     },
     command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
@@ -1042,6 +1042,7 @@ pub struct MessagesPanel {
     /// index. Live chrome like the two above, and emptied as each child lands,
     /// so a non-empty entry is exactly a card with a clock still counting.
     batch_child_started: BatchStartedMap,
+    subagent_models: SubagentModels,
     /// One bar per window on screen, keyed exactly as `card_scroll` is, since
     /// a bar holds the anchor of a drag in progress and several windows can be
     /// visible at once. Entries for windows that are no longer drawn are swept
@@ -1187,6 +1188,7 @@ impl MessagesPanel {
             task_cards: HashMap::new(),
             batch_child_output: BatchLiveMap::new(),
             batch_child_started: BatchStartedMap::new(),
+            subagent_models: SubagentModels::default(),
             card_bars: HashMap::new(),
             card_windows: Vec::new(),
             armed_card: None,
@@ -1879,6 +1881,7 @@ impl MessagesPanel {
         self.task_cards.clear();
         self.batch_child_output.clear();
         self.batch_child_started.clear();
+        self.subagent_models = SubagentModels::default();
         for scroll in self.card_scroll.values_mut() {
             scroll.history_base = None;
         }
@@ -2841,8 +2844,40 @@ impl MessagesPanel {
         self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
 
-    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    /// Names the model the subagent behind `tool_id` runs on. A batch child
+    /// has no card of its own, so its model goes on its batch's roster.
+    pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
+        if self.tool_card(tool_id).is_none()
+            && let Some((batch_id, index)) = batch_child_id(tool_id)
+            && self.tool_card(batch_id).is_some()
+        {
+            let children = self
+                .subagent_models
+                .children
+                .entry(batch_id.to_owned())
+                .or_default();
+            if children.get(&index).is_none_or(|known| known != model) {
+                Arc::make_mut(children).insert(index, model.to_owned());
+                self.mark_card_dirty(batch_id);
+            }
+        } else if self
+            .subagent_models
+            .cards
+            .get(tool_id)
+            .is_none_or(|known| known != model)
+        {
+            self.subagent_models
+                .cards
+                .insert(tool_id.to_owned(), model.to_owned());
+            self.mark_card_dirty(tool_id);
+        }
+    }
+
+    pub fn tool_model(&self, tool_id: &str) -> Option<&str> {
+        batch_child_id(tool_id)
+            .and_then(|(batch_id, index)| self.subagent_models.children.get(batch_id)?.get(&index))
+            .or_else(|| self.subagent_models.cards.get(tool_id))
+            .map(String::as_str)
     }
 
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
@@ -5038,6 +5073,10 @@ impl MessagesPanel {
                         metadata.push_str(" | Annotation: ");
                         metadata.push_str(&markdown_inline(annotation));
                     }
+                    if let Some(model) = self.tool_model(parent_id) {
+                        metadata.push_str(" | Model: ");
+                        metadata.push_str(&markdown_inline(model));
+                    }
                     // A batch copies as its children's sections, each already
                     // fenced where it needed to be, so fencing the card too
                     // would flatten the hierarchy back into one block. A
@@ -5302,6 +5341,7 @@ impl MessagesPanel {
             batch_progress: &self.batch_child_progress,
             batch_live: &self.batch_child_output,
             batch_started: &self.batch_child_started,
+            subagent_models: &self.subagent_models,
             task_cards: Some(&self.task_cards),
             cwd: self.cwd.clone(),
             show_decisions: self.show_decisions,

@@ -12234,7 +12234,7 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 }
 
 #[test]
-fn resolve_or_create_chat_sets_model_id_and_annotation() {
+fn resolve_or_create_chat_sets_model_id_and_card_model() {
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
 
     let mut app = test_app();
@@ -12269,10 +12269,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
 
     assert_eq!(app.chats.len(), 2);
     assert_eq!(app.chats[1].model_id.as_deref(), Some(MODEL));
-    assert_eq!(
-        app.chats[0].message_at(0).unwrap().annotation.as_deref(),
-        Some(MODEL)
-    );
+    assert_eq!(app.chats[0].tool_model(TASK_ID), Some(MODEL));
 }
 
 /// An admitted job opens its chat before the subagent has resolved a model,
@@ -12311,10 +12308,7 @@ fn a_task_chat_takes_the_model_its_subagent_reports(admitted: bool) {
     assert_eq!(app.chats.len(), 2);
     assert_eq!(app.chats[1].model_id.as_deref(), Some(MODEL));
     assert_eq!(app.chats[1].thinking.as_deref(), Some(THINKING));
-    assert_eq!(
-        app.chats[0].message_at(0).unwrap().annotation.as_deref(),
-        Some(MODEL)
-    );
+    assert_eq!(app.chats[0].tool_model(TASK_ID), Some(MODEL));
 }
 
 #[test]
@@ -15849,6 +15843,74 @@ fn typed_task_outputs_select_launch_versions_for_restore_and_fork(batch: bool) {
             .reserve(TASK)
             .is_err()
     );
+}
+
+/// A reloaded card has only its stored output to derive an annotation from,
+/// so the model comes back from the task's own record instead, on the card
+/// that launched it or on its batch's roster.
+#[test_case(false; "task_card")]
+#[test_case(true; "batch_child")]
+fn a_restored_task_names_its_model_on_the_call_that_launched_it(batch: bool) {
+    const TASK: &str = "calm-brave-otter";
+    const CALL: &str = "launch-call";
+    const MODEL: &str = "openai/gpt-6.1-sol";
+    const PROMPT: &str = "investigate";
+    let (_temp, _, _, mut app) = tempdir_app();
+    let launch = if batch {
+        format!("{CALL}:0")
+    } else {
+        CALL.into()
+    };
+    let messages = [
+        Message::user(PROMPT.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                CALL,
+                if batch { "batch" } else { "task" },
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: CALL.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        },
+    ];
+    let session = app.state.session_mut();
+    session.replace_messages(crate::history_items(&messages));
+    session.set_subagent_history(
+        launch.clone(),
+        crate::history_items(&[Message::user(PROMPT.into())]),
+        Some(caudra_storage::sessions::StoredSubagentTaskSpec::version()),
+    );
+    session.set_subagent_history(
+        TASK.into(),
+        crate::history_items(&[Message::user(PROMPT.into())]),
+        Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
+    );
+    session.set_subagents(vec![StoredSubagent {
+        tool_use_id: TASK.into(),
+        parent_tool_use_id: Some(launch.clone()),
+        root_tool_use_id: Some(CALL.into()),
+        name: PROMPT.into(),
+        model: Some(MODEL.into()),
+        thinking: None,
+        fast: false,
+        outcome: StoredSubagentOutcome::Done,
+    }]);
+
+    app.reset_ui_chrome();
+    app.restore_display();
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[0].tool_model(&launch), Some(MODEL));
 }
 
 #[test]

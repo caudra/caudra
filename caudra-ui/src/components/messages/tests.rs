@@ -2503,33 +2503,69 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
     assert_eq!(wrapped_line_count(&lines, width), expected);
 }
 
-#[test]
-fn update_tool_model_sets_annotation() {
-    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);
-    rebuild(&mut panel);
+const SUBAGENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const LIVE_USAGE: &str = "1.2k↑ 345↓ $0.010";
+const MODEL_WIDTH: u16 = 200;
+const MODEL_NAMED_ONCE: &str =
+    "a task's card names its subagent's model exactly once, however its annotation changes";
+const USAGE_SHOWN: &str = "the live usage still reaches the card beside the model";
 
-    panel.update_tool_model("t1", "anthropic/claude-sonnet-4-20250514");
+/// The model used to ride in the annotation, which a foreground task's live
+/// usage and a batch child's answer both replace, so only a background task
+/// ever kept it. The run also announces its model live, which must not make
+/// the card say it twice.
+#[test_case(false ; "standalone_task")]
+#[test_case(true ; "batch_child")]
+fn a_task_keeps_its_model_through_usage_and_settling(batched: bool) {
+    let mut panel = if batched {
+        let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
+        let mut event = start(TOOL_ID, BATCH_TOOL);
+        event.output = Some(ToolOutput::Batch {
+            entries: vec![running_child(TASK_TOOL_NAME)],
+            text: String::new(),
+        });
+        panel.tool_start(event);
+        panel
+    } else {
+        panel_with_tools(&[(TOOL_ID, TASK_TOOL_NAME)])
+    };
+    let call = if batched { EAGER_CHILD_ID } else { TOOL_ID };
+    let models = |panel: &mut MessagesPanel| {
+        render(panel, MODEL_WIDTH, 24);
+        seg_text(panel, TOOL_ID).matches(SUBAGENT_MODEL).count()
+    };
 
-    let msg = &panel.messages[0];
-    assert_eq!(
-        msg.annotation.as_deref(),
-        Some("anthropic/claude-sonnet-4-20250514")
-    );
+    panel.set_tool_model(call, SUBAGENT_MODEL);
+    panel.tool_annotation(call, SUBAGENT_MODEL.into());
+    assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
+
+    panel.tool_annotation(call, LIVE_USAGE.into());
+    assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
+    assert!(seg_text(&panel, TOOL_ID).contains(LIVE_USAGE), "{USAGE_SHOWN}");
+
+    if batched {
+        panel.batch_progress(TOOL_ID, 0, batch_child(TASK_TOOL_NAME, TOOL_ID));
+    } else {
+        panel.tool_done(ToolDoneEvent {
+            tool: TASK_TOOL_NAME.into(),
+            ..done(TOOL_ID)
+        });
+    }
+    assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
+    assert_eq!(panel.tool_model(call), Some(SUBAGENT_MODEL));
 }
 
 #[test]
-fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
-    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-    const USAGE: &str = "1.2k↑ 345↓ $0.010";
-
+fn set_tool_turn_usage_updates_exact_tool_and_keeps_model() {
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
-    panel.update_tool_model("t1", MODEL);
+    panel.set_tool_model("t1", SUBAGENT_MODEL);
 
-    panel.set_tool_turn_usage("t1", USAGE.into());
+    panel.set_tool_turn_usage("t1", LIVE_USAGE.into());
 
-    assert_eq!(panel.tool_turn_usage("t1"), Some(USAGE));
+    assert_eq!(panel.tool_turn_usage("t1"), Some(LIVE_USAGE));
     assert_eq!(panel.tool_turn_usage("t2"), None);
-    assert_eq!(panel.messages[0].annotation.as_deref(), Some(MODEL));
+    assert_eq!(panel.tool_model("t1"), Some(SUBAGENT_MODEL));
+    assert_eq!(panel.messages[0].annotation, None);
 }
 
 /// A long session runs well past 65535 rows. Both the document height and the

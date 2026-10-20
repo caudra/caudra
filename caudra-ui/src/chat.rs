@@ -956,8 +956,13 @@ impl Chat {
             .leave_stage(tool_id, CallStage::AwaitingApproval);
     }
 
-    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+    pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
+        self.messages_panel.set_tool_model(tool_id, model);
+    }
+
+    #[cfg(test)]
+    pub fn tool_model(&self, tool_id: &str) -> Option<&str> {
+        self.messages_panel.tool_model(tool_id)
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {

@@ -13,7 +13,8 @@ use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, STANDALONE_CHILD,
-    ScrollSpan, ScrollWindow, SourceTrace, ToolContent, UNCONSTRAINED_WIDTH, WrappedRows,
+    ScrollSpan, ScrollWindow, SourceTrace, SubagentModels, ToolContent, UNCONSTRAINED_WIDTH,
+    WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -36,6 +37,7 @@ use caudra_providers::{estimate_tokens_cached, token_label};
 use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::decisions::NoteOutcome;
+use caudra_agent::prompt::profile::BUILTIN_PROFILE_NAME;
 use caudra_agent::tools::native::peers::{
     LIST_NAME as LIST_SESSIONS_TOOL_NAME, PUBLISH_NAME as PUBLISH_MESSAGE_TOOL_NAME,
     READ_NAME as READ_TOPIC_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
@@ -173,6 +175,7 @@ pub struct RenderCtx<'a> {
     pub batch_live: &'a BatchLiveMap,
     /// When each batch's still-running children started, by parent tool id.
     pub batch_started: &'a BatchStartedMap,
+    pub subagent_models: &'a SubagentModels,
     pub task_cards: Option<&'a HashMap<String, TaskCard>>,
     /// The session's working directory, which a call's `workdir` argument is
     /// resolved against until its result says where the call ran. `None`
@@ -200,10 +203,15 @@ impl RenderCtx<'_> {
             .and_then(|id| self.batch_started.get(id))
             .cloned()
             .unwrap_or_default();
+        let models = tool_id
+            .and_then(|id| self.subagent_models.children.get(id))
+            .cloned()
+            .unwrap_or_default();
         RenderLimits::new(full, budget, views, *self.tool_output_lines)
             .with_scroll(self.card_scroll)
             .with_policy(self.policy.clone(), self.child_scroll.clone())
             .with_progress(progress, live, started)
+            .with_models(models)
             .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
             .with_cwd(self.cwd.clone())
     }
@@ -421,6 +429,9 @@ const DURATION_ARGS: &[(&str, &str, u64)] = &[
     ("webfetch", "timeout", MILLIS_PER_SECOND),
     ("websearch", "timeoutSec", MILLIS_PER_SECOND),
 ];
+/// Arguments that only spell out what the call would do anyway, so the
+/// brackets leave them out: a task on the built-in prompt is the common case.
+const DEFAULT_ARGS: &[(&str, &str, &str)] = &[(TASK_TOOL_NAME, "profile", BUILTIN_PROFILE_NAME)];
 /// What separates a server or namespace from the tool it qualifies.
 const QUALIFIER: [char; 3] = ['_', '.', '-'];
 
@@ -555,7 +566,9 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("source_code_context", '◇', LOCATE, &["task", "path"]),
     tool_row("source_code_refs", '◇', TRACE, &["symbol", "path"]),
     tool_row("execution_environment", '⌂', INSPECT, &[]),
-    tool_row("task", '❖', DELEGATE, &["prompt", "description"]),
+    // `model` is what the caller asked for, often a short name; the header
+    // names the model the subagent actually runs on instead.
+    tool_row("task", '❖', DELEGATE, &["prompt", "description", "model"]),
     tool_row("batch", '⇶', BATCH, &["invocations"]),
     tool_row("todo_write", '✓', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD_SKILL, &["name"]),
@@ -1237,6 +1250,14 @@ fn duration_millis(tool: Option<&str>, key: &str, value: &serde_json::Number) ->
     value.as_u64()?.checked_mul(*millis_per_unit)
 }
 
+fn is_default_arg(tool: Option<&str>, key: &str, value: &str) -> bool {
+    tool.is_some_and(|tool| {
+        DEFAULT_ARGS.iter().any(|(known, arg, default)| {
+            *known == tool && same_key(arg, key) && *default == value
+        })
+    })
+}
+
 /// The primitive inputs a compact header does not already show, rendered the
 /// way opencode does: `[offset=1, limit=260]`.
 ///
@@ -1274,6 +1295,7 @@ fn compact_args(
     }) {
         let scalar = match value {
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
+            serde_json::Value::String(text) if is_default_arg(tool, key, text) => continue,
             serde_json::Value::String(text) => {
                 let text = one_line(text);
                 if matches!(
@@ -2951,8 +2973,9 @@ pub(super) fn shell_clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> boo
 /// The card is rebuilt every frame for the spinner, so this is measured as
 /// often as it is drawn.
 /// An open task card names its one task's state in its body, so its header
-/// leaves out the state its folded row carries.
-fn header_annotation(msg: &DisplayMessage, open: bool) -> Option<String> {
+/// leaves out the state its folded row carries. `model` is the subagent's,
+/// which follows the tally on a running and a settled card alike.
+fn header_annotation(msg: &DisplayMessage, open: bool, model: Option<&str>) -> Option<String> {
     let tally = msg
         .progress
         .as_ref()
@@ -2967,11 +2990,22 @@ fn header_annotation(msg: &DisplayMessage, open: bool) -> Option<String> {
         }
         _ => msg.annotation.clone(),
     };
-    match (tally, own) {
-        (Some(tally), Some(spend)) => Some(format!("{tally}{ACTIVITY_SEPARATOR}{spend}")),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
+    subagent_annotation(tally, model, own)
+}
+
+/// A subagent's tally, then its model, then what the call has to say. The run
+/// also announces its model live to whoever dispatched it, which a Lua plugin
+/// reads, so an annotation that is only that model is not said twice.
+pub(super) fn subagent_annotation(
+    tally: Option<String>,
+    model: Option<&str>,
+    own: Option<String>,
+) -> Option<String> {
+    let own = own.filter(|own| Some(own.as_str()) != model);
+    [tally, model.map(str::to_owned), own]
+        .into_iter()
+        .flatten()
+        .reduce(|joined, part| format!("{joined}{ACTIVITY_SEPARATOR}{part}"))
 }
 
 /// An open task card draws its state among its facts, so the header keeps only
@@ -3054,7 +3088,8 @@ pub fn build_tool_lines(
     );
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
-    let mut report = header_annotation(msg, expansion.is_some());
+    let model = rctx.subagent_models.cards.get(call_id).map(String::as_str);
+    let mut report = header_annotation(msg, expansion.is_some(), model);
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
         append_annotation(&mut report, &timeout_annotation(timeout));
     }
@@ -3590,6 +3625,8 @@ mod tests {
     static NO_LIVE: std::sync::LazyLock<BatchLiveMap> = std::sync::LazyLock::new(BatchLiveMap::new);
     static NO_STARTED: std::sync::LazyLock<BatchStartedMap> =
         std::sync::LazyLock::new(BatchStartedMap::new);
+    static NO_MODELS: std::sync::LazyLock<SubagentModels> =
+        std::sync::LazyLock::new(SubagentModels::default);
 
     /// Wide enough that no card drawn in these tests has to break a row, for
     /// the tests whose subject is what a row says rather than how it breaks.
@@ -3610,6 +3647,7 @@ mod tests {
             batch_progress: &NO_PROGRESS,
             batch_live: &NO_LIVE,
             batch_started: &NO_STARTED,
+            subagent_models: &NO_MODELS,
             task_cards: None,
             cwd: None,
             show_decisions: true,
@@ -7789,6 +7827,27 @@ mod tests {
         );
     }
 
+    const SUBAGENT_MODEL: &str = "openai/gpt-6.1-sol";
+    const SUBAGENT_ORDER_MSG: &str =
+        "a subagent's header reads its tally, then its model once, then what the call says";
+
+    #[test_case(Some("2 tools · 3s"), Some(SUBAGENT_MODEL), Some("1.2k↑"), Some("2 tools · 3s · openai/gpt-6.1-sol · 1.2k↑") ; "all_three_in_order")]
+    #[test_case(None, Some(SUBAGENT_MODEL), Some(SUBAGENT_MODEL), Some(SUBAGENT_MODEL) ; "the_announced_model_is_not_repeated")]
+    #[test_case(None, None, Some("1.2k↑"), Some("1.2k↑") ; "no_model_leaves_the_annotation")]
+    #[test_case(None, None, None, None ; "nothing_says_nothing")]
+    fn a_subagent_annotation_names_its_model_once(
+        tally: Option<&str>,
+        model: Option<&str>,
+        own: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(
+            subagent_annotation(tally.map(str::to_owned), model, own.map(str::to_owned)).as_deref(),
+            expected,
+            "{SUBAGENT_ORDER_MSG}"
+        );
+    }
+
     const INSTRUCTION_TOKENS_MSG: &str =
         "a loaded instruction file says about what its text costs the context";
 
@@ -8421,6 +8480,18 @@ mod tests {
         serde_json::json!({ "output_id": OUTPUT_ID, "pattern": "error", "limit": 20 }),
         Some(" [limit=20, pattern=error]")
         ; "retrieval_keeps_a_query_missing_from_its_summary"
+    )]
+    #[test_case(
+        TASK_TOOL_NAME, "Calculate 5 times 9",
+        serde_json::json!({ "description": "Calculate 5 times 9", "prompt": "5*9", "mode": "plan", "profile": "builtin", "model": "openai/gpt-6-luna" }),
+        Some(" [mode=plan]")
+        ; "a_task_leaves_its_model_to_the_annotation_and_its_default_profile_out"
+    )]
+    #[test_case(
+        TASK_TOOL_NAME, "Review",
+        serde_json::json!({ "description": "Review", "prompt": "look", "profile": "review" }),
+        Some(" [profile=review]")
+        ; "a_task_keeps_a_profile_it_chose"
     )]
     fn the_brackets_never_repeat_the_header(
         tool: &str,

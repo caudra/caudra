@@ -13,6 +13,7 @@ const CACHE_CAPACITY: usize = 4096;
 /// Marks a count as an estimate: o200k is exact only for OpenAI models.
 const TOKEN_ESTIMATE_MARKER: &str = "~";
 const TOKEN_SUFFIX: &str = " tokens";
+const TOKEN_SUFFIX_SINGULAR: &str = " token";
 /// A rate with nothing to score, told apart from a rate of zero.
 const NO_RATE: &str = "—";
 const PERCENT: f64 = 100.0;
@@ -107,10 +108,11 @@ pub fn estimate_tokens_cached(text: &str) -> u32 {
 /// Renders a count for display. The marker is not decoration: every count this
 /// module produces is an estimate for any model outside the GPT-4o/5 family.
 pub fn token_label(tokens: u32) -> String {
-    format!(
-        "{TOKEN_ESTIMATE_MARKER}{}{TOKEN_SUFFIX}",
-        format_tokens(tokens)
-    )
+    let suffix = match tokens {
+        1 => TOKEN_SUFFIX_SINGULAR,
+        _ => TOKEN_SUFFIX,
+    };
+    format!("{TOKEN_ESTIMATE_MARKER}{}{suffix}", format_tokens(tokens))
 }
 
 /// [`format_tokens`] takes the `u32` a session counts in; a lifetime total
@@ -135,7 +137,7 @@ mod tests {
 
     use super::{
         CACHE_CAPACITY, NO_RATE, cut_middle, estimate_tokens, estimate_tokens_cached,
-        format_hit_rate, format_tokens_u64,
+        format_hit_rate, format_tokens_u64, token_label,
     };
 
     const HEAD: u32 = 8;
@@ -155,6 +157,13 @@ mod tests {
     #[test_case(u64::MAX, "18446744073709.6m" ; "largest_lifetime_total")]
     fn wide_token_counts_keep_their_value(value: u64, expected: &str) {
         assert_eq!(format_tokens_u64(value), expected);
+    }
+
+    #[test_case(0, "~0 tokens" ; "none")]
+    #[test_case(1, "~1 token" ; "one_is_singular")]
+    #[test_case(2, "~2 tokens" ; "two")]
+    fn token_labels_agree_with_their_count(tokens: u32, expected: &str) {
+        assert_eq!(token_label(tokens), expected);
     }
 
     #[test_case("", 0 ; "empty_text_costs_nothing")]

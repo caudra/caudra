@@ -897,6 +897,9 @@ impl App {
                 self.lua_event_handle.clone(),
             );
             if let Some(parent_tool_use_id) = sa.parent_tool_use_id {
+                if let Some(model) = &sa.model {
+                    self.main_chat().set_tool_model(&parent_tool_use_id, model);
+                }
                 chat.set_parent_tool_use_id(parent_tool_use_id);
             }
             chat.set_restore_channel(self.restore_event_tx.clone());
