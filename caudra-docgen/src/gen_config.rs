@@ -62,7 +62,10 @@ const VERSIONED_FILES: &[(&ConfigFormat, &str)] = &[
         "Servers from that file do not start, and Caudra shows the error",
     ),
     (&PROVIDERS_FORMAT, "Caudra stops with an error"),
-    (&MANIFEST_FORMAT, "Every permission of that plugin is denied"),
+    (
+        &MANIFEST_FORMAT,
+        "Every permission of that plugin is denied",
+    ),
     (&WORKCELL_FORMAT, "Rejected with an error"),
     (&SANDBOX_FORMAT, "Rejected with an error"),
 ];

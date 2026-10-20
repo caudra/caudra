@@ -10259,7 +10259,11 @@ mod tests {
             Message::user("read it".into()),
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::tool_use("t1", "file_read", json!({"path": "a"}))],
+                content: vec![ContentBlock::tool_use(
+                    "t1",
+                    "file_read",
+                    json!({"path": "a"}),
+                )],
                 ..Default::default()
             },
             Message {
@@ -10294,13 +10298,19 @@ mod tests {
             .unwrap();
         drop(agent);
 
-        let learned = drain_events(&event_rx).into_iter().find_map(|envelope| match envelope.event {
-            AgentEvent::TokenCalibration(learned) => Some(learned),
-            _ => None,
-        });
+        let learned =
+            drain_events(&event_rx)
+                .into_iter()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::TokenCalibration(learned) => Some(learned),
+                    _ => None,
+                });
         let learned = learned.expect(CALIBRATION_UNLEARNED);
         assert_eq!(learned.model, CALIBRATION_MODEL, "{CALIBRATION_UNLEARNED}");
-        assert!((learned.ratio - RATIO).abs() < 1e-9, "{CALIBRATION_UNLEARNED}");
+        assert!(
+            (learned.ratio - RATIO).abs() < 1e-9,
+            "{CALIBRATION_UNLEARNED}"
+        );
     }
 
     /// The estimate is only ever asked how much was appended, so a transcript it
@@ -10332,7 +10342,9 @@ mod tests {
             sent: None,
         };
 
-        let size = measured.extended_by(&history, TokenScale::UNIT).expect(GROWTH_UNCOUNTED);
+        let size = measured
+            .extended_by(&history, TokenScale::UNIT)
+            .expect(GROWTH_UNCOUNTED);
         assert_eq!(
             size,
             REPORTED + estimate_message_tokens(&history[1..]),

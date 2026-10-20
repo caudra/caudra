@@ -33,7 +33,6 @@ use caudra_agent::tools::{
     timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
-use caudra_providers::TokenScale;
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
     IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, McpHelper,
@@ -45,6 +44,7 @@ use caudra_config::{READ_ENTRIES, ToolOutputLines};
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
+use caudra_providers::TokenScale;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;

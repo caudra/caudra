@@ -6204,7 +6204,12 @@ mod telemetry_tests {
     fn accounting_records_the_outcome_and_what_the_result_costs_the_window() {
         let mut done =
             ToolDoneEvent::error(CALL_ID.into(), FAILURE_TEXT).with_failure(ToolFailure::NotFound);
-        account(&mut done, SOURCE_NATIVE, Duration::from_millis(42), TokenScale::UNIT);
+        account(
+            &mut done,
+            SOURCE_NATIVE,
+            Duration::from_millis(42),
+            TokenScale::UNIT,
+        );
 
         assert_eq!(done.accounting.duration_ms, 42);
         assert_eq!(done.accounting.outcome, Some(LedgerOutcome::NotFound));

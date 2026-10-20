@@ -63,8 +63,8 @@ use crate::{
 use caudra_config::{Feature, FeatureFlags, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_providers::RequestOptions;
 use caudra_providers::calibration;
-use caudra_providers::{Model, TokenScale};
 use caudra_providers::provider::Provider;
+use caudra_providers::{Model, TokenScale};
 use caudra_storage::StateDir;
 use caudra_storage::accounts::{StoredSecret, list_accounts};
 use caudra_storage::id::SessionRef;

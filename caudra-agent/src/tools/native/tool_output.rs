@@ -395,10 +395,10 @@ fn format_grep(call: &GrepCall, result: &ToolOutputGrepResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::TokenScale;
     use super::*;
     use crate::AgentMode;
     use crate::tools::test_support::stub_ctx;
+    use caudra_providers::TokenScale;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use test_case::test_case;
@@ -481,7 +481,10 @@ mod tests {
         );
         let restored: ToolOutput =
             serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
-        assert_eq!(restored.annotation(TokenScale::UNIT), output.annotation(TokenScale::UNIT));
+        assert_eq!(
+            restored.annotation(TokenScale::UNIT),
+            output.annotation(TokenScale::UNIT)
+        );
         assert_eq!(restored.as_text(), response);
     }
 

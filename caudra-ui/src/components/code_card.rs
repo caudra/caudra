@@ -7,11 +7,11 @@ use std::ops::Range;
 use caudra_agent::code::MODULE_DOCS;
 use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutcome, CodeOutput};
 use caudra_agent::tools::ToolEffect;
-use caudra_providers::TokenScale;
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, DecisionHelper, MCP_SUMMARY_PREFIX, McpBlock, McpHelper,
     McpOutput, ToolOutput, pretty_json,
 };
+use caudra_providers::TokenScale;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;

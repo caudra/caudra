@@ -130,25 +130,25 @@ pub fn observe(model: &Model, estimated: u32, reported: u32) -> Option<StoredCal
         .or_default()
         .entry(model.id.clone())
         .or_default();
-    calibration.observe(estimated, reported).then(|| StoredCalibration {
-        provider: model.provider.to_string(),
-        model: model.id.clone(),
-        ratio: calibration.ratio,
-        weight: calibration.weight,
-        samples: calibration.samples,
-        updated_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as u64),
-    })
+    calibration
+        .observe(estimated, reported)
+        .then(|| StoredCalibration {
+            provider: model.provider.to_string(),
+            model: model.id.clone(),
+            ratio: calibration.ratio,
+            weight: calibration.weight,
+            samples: calibration.samples,
+            updated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
 
-    use super::{
-        Calibration, HALF_LIFE_SAMPLES, MIN_SAMPLE_TOKENS, RATIO_MAX, RATIO_MIN, decay,
-    };
+    use super::{Calibration, HALF_LIFE_SAMPLES, MIN_SAMPLE_TOKENS, RATIO_MAX, RATIO_MIN, decay};
     use crate::tokens::TokenScale;
 
     const SAMPLE: u32 = 1_000;
@@ -196,7 +196,11 @@ mod tests {
         for _ in 0..20 {
             calibration.observe(SAMPLE, 1_400);
         }
-        assert!((calibration.ratio - 1.2).abs() < 0.02, "{HALFWAY}: {}", calibration.ratio);
+        assert!(
+            (calibration.ratio - 1.2).abs() < 0.02,
+            "{HALFWAY}: {}",
+            calibration.ratio
+        );
     }
 
     #[test]

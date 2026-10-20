@@ -1592,10 +1592,14 @@ fn a_card_keeps_the_token_count_it_arrived_with() {
         output: ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()),
         ..done("t1")
     });
-    let arrived = ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()).annotation(TokenScale::new(2.0));
+    let arrived =
+        ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()).annotation(TokenScale::new(2.0));
     panel.set_token_scale(TokenScale::UNIT);
     panel.set_view(ViewMode::Expanded);
-    assert_eq!(panel.messages[0].annotation, arrived, "{ARRIVAL_COUNT_KEPT}");
+    assert_eq!(
+        panel.messages[0].annotation, arrived,
+        "{ARRIVAL_COUNT_KEPT}"
+    );
     assert_ne!(
         arrived,
         ToolOutput::Plain(SCALED_OUTPUT.repeat(20).into()).annotation(TokenScale::UNIT),

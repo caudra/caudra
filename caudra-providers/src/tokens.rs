@@ -123,7 +123,9 @@ impl TokenScale {
         if self == Self::UNIT {
             return tokens;
         }
-        (f64::from(tokens) * self.0).round().min(f64::from(u32::MAX)) as u32
+        (f64::from(tokens) * self.0)
+            .round()
+            .min(f64::from(u32::MAX)) as u32
     }
 
     /// [`estimate_tokens_cached`] in this model's tokens.
