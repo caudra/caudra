@@ -3,6 +3,7 @@
 //! Reads and writes go through the app, which answers on a later tick.
 
 use std::mem;
+use std::ops::Range;
 
 use caudra_agent::learning::apply::Dropped;
 use caudra_agent::learning::pump::{CONFLICT, FAILED, LEARNED, PARTIAL};
@@ -11,7 +12,7 @@ use caudra_config::LearningTarget;
 use caudra_grab::grab_scope;
 use caudra_providers::token_label;
 use caudra_storage::learning::{LearningProject, LearningRun, StoredEdit};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -24,7 +25,8 @@ use crate::components::docs_link::DocsTopic;
 use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    Hint, ModalScroll, Overlay, escape_terminal_controls, format_elapsed, hint_line_hovered,
+    Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, format_elapsed, hover_style,
+    visual_rows,
 };
 use crate::theme::{self, Theme};
 
@@ -65,13 +67,13 @@ const DROPPED_SECTION: &str = "Dropped";
 pub(crate) const NOTHING_SELECTED: &str = "This run changed nothing to revert";
 pub(crate) const ALREADY_REVERTED: &str = "That change is already reverted";
 pub(crate) const PAUSED_NO_RUN: &str = "Learning is paused for this project; press p to resume";
+/// Fits the narrowest modal, so `Esc` is never the hint that is dropped.
 const HINTS: &[Hint] = &[
-    Hint::inert("\u{2191}\u{2193}", "run"),
-    Hint::inert("\u{2190}\u{2192}", "change"),
+    Hint::inert("\u{2191}\u{2193}\u{2190}\u{2192}", "select"),
     Hint::char("t", "transcript"),
     Hint::char("n", "run now"),
     Hint::char("u", "revert"),
-    Hint::char("p", "pause/resume"),
+    Hint::char("p", "pause"),
     Hint::key("Esc", KeyCode::Esc, "close"),
 ];
 
@@ -108,6 +110,34 @@ pub(crate) enum LearnAction {
     Flash(&'static str),
 }
 
+/// What a line of the modal answers the pointer for: a run's row, or one of
+/// the selected run's changes with the lines that show what it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTarget {
+    Run(usize),
+    Edit(usize),
+}
+
+/// The modal's lines, each with the row it belongs to.
+#[derive(Default)]
+struct Body {
+    lines: Vec<Line<'static>>,
+    targets: Vec<Option<RowTarget>>,
+}
+
+impl Body {
+    fn push(&mut self, line: Line<'static>, target: Option<RowTarget>) {
+        self.lines.push(line);
+        self.targets.push(target);
+    }
+
+    /// The line the selection is on: the selected change, else its run.
+    fn focus(&self, run: usize, edit: usize) -> Option<usize> {
+        let line_of = |target| self.targets.iter().position(|at| *at == Some(target));
+        line_of(RowTarget::Edit(edit)).or_else(|| line_of(RowTarget::Run(run)))
+    }
+}
+
 pub(crate) struct LearnInspector {
     open: bool,
     /// A learner runs for the session in front.
@@ -119,6 +149,11 @@ pub(crate) struct LearnInspector {
     follow: bool,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
+    footer: HintBar,
+    pointer: Option<Position>,
+    /// Where the last frame drew the lines, and the rows each target took.
+    content: Rect,
+    hits: Vec<(Range<u16>, RowTarget)>,
     popup: Rect,
 }
 
@@ -133,6 +168,10 @@ impl LearnInspector {
             follow: false,
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
+            footer: HintBar::default(),
+            pointer: None,
+            content: Rect::default(),
+            hits: Vec::new(),
             popup: Rect::default(),
         }
     }
@@ -209,11 +248,7 @@ impl LearnInspector {
                 };
             }
             KeyCode::Char('u') => return self.revert(),
-            KeyCode::Enter | KeyCode::Char('t') => {
-                if let Some(run) = self.selected_run() {
-                    return LearnAction::Transcript(run.run.id);
-                }
-            }
+            KeyCode::Enter | KeyCode::Char('t') => return self.transcript(),
             KeyCode::Char('p') => {
                 if let Some(Ok(snapshot)) = &self.snapshot {
                     return LearnAction::SetPaused(!snapshot.paused());
@@ -234,9 +269,18 @@ impl LearnInspector {
         }
     }
 
+    fn transcript(&self) -> LearnAction {
+        self.selected_run().map_or(LearnAction::Consumed, |run| {
+            LearnAction::Transcript(run.run.id)
+        })
+    }
+
     fn select_run(&mut self, delta: isize) {
-        let last = self.runs().len().saturating_sub(1);
-        let run = self.run.saturating_add_signed(delta).min(last);
+        self.pick_run(self.run.saturating_add_signed(delta));
+    }
+
+    fn pick_run(&mut self, run: usize) {
+        let run = run.min(self.runs().len().saturating_sub(1));
         if run != self.run {
             self.run = run;
             self.edit = 0;
@@ -245,10 +289,14 @@ impl LearnInspector {
     }
 
     fn select_edit(&mut self, delta: isize) {
+        self.pick_edit(self.edit.saturating_add_signed(delta));
+    }
+
+    fn pick_edit(&mut self, edit: usize) {
         let last = self
             .selected_run()
             .map_or(0, |run| run.edits.len().saturating_sub(1));
-        self.edit = self.edit.saturating_add_signed(delta).min(last);
+        self.edit = edit.min(last);
         self.follow = true;
     }
 
@@ -256,20 +304,47 @@ impl LearnInspector {
         self.scroll.scroll(delta);
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent) {
+    /// A click selects the run or change under it, and a click on the
+    /// selected run opens its transcript, as `Enter` does. A footer hint
+    /// presses its key.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> LearnAction {
         match self.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return,
+            ScrollbarMouse::Consumed => return LearnAction::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
-                return;
+                return LearnAction::Consumed;
             }
+        }
+        let at = Position::new(event.column, event.row);
+        self.pointer = Some(at);
+        if let Some(key) = self.footer.handle_mouse(event) {
+            return self.handle_key(key);
         }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll(-1),
             MouseEventKind::ScrollDown => self.scroll(1),
+            MouseEventKind::Down(MouseButton::Left) => match self.target_at(at) {
+                Some(RowTarget::Run(run)) if run == self.run => return self.transcript(),
+                Some(RowTarget::Run(run)) => self.pick_run(run),
+                Some(RowTarget::Edit(edit)) => self.pick_edit(edit),
+                None => {}
+            },
             _ => {}
         }
+        LearnAction::Consumed
+    }
+
+    /// The row under `at`, measured against the frame last drawn.
+    fn target_at(&self, at: Position) -> Option<RowTarget> {
+        if !self.content.contains(at) {
+            return None;
+        }
+        let row = (at.y - self.content.y).saturating_add(self.scroll.offset());
+        self.hits
+            .iter()
+            .find(|(rows, _)| rows.contains(&row))
+            .map(|(_, target)| *target)
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -279,17 +354,18 @@ impl LearnInspector {
         grab_scope!("learn_inspector", area);
 
         let theme = theme::current();
-        let (lines, focus) = self.lines(&theme, Timestamp::now().as_millisecond());
+        let hovered = self.pointer.and_then(|at| self.target_at(at));
+        let mut body = self.body(&theme, Timestamp::now().as_millisecond());
+        for (line, target) in body.lines.iter_mut().zip(&body.targets) {
+            if hovered.is_some() && *target == hovered {
+                line.style = hover_style(line.style, true);
+            }
+        }
         let width = Modal::inner_width(area.width, WIDTH_PERCENT)
             .saturating_sub(H_PAD * 2)
             .max(1);
-        let wrapped = |lines: &[Line<'static>]| {
-            let rows = Paragraph::new(lines.to_vec())
-                .wrap(Wrap { trim: false })
-                .line_count(width);
-            u16::try_from(rows).unwrap_or(u16::MAX)
-        };
-        let total = wrapped(&lines).min(u16::MAX - CHROME_LINES - FOOTER_ROWS);
+        let rows = visual_rows(&body.lines, width);
+        let total = rows.total.min(u16::MAX - CHROME_LINES - FOOTER_ROWS);
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
@@ -304,15 +380,24 @@ impl LearnInspector {
         };
         self.scroll.update_dimensions(total, content.height);
         if mem::take(&mut self.follow)
-            && let Some(focus) = focus
+            && let Some(focus) = body.focus(self.run, self.edit)
         {
-            let top = wrapped(&lines[..focus]);
-            let height = wrapped(&lines[focus..=focus]);
-            self.scroll.reveal_and_hold(top, height);
+            let focus = u16::try_from(focus).unwrap_or(u16::MAX);
+            self.scroll
+                .reveal_and_hold(rows.row_of(focus), rows.height_of(focus));
         }
+        self.hits = body
+            .targets
+            .iter()
+            .zip(0u16..)
+            .filter_map(|(target, line)| {
+                let top = rows.row_of(line);
+                Some((top..top.saturating_add(rows.height_of(line)), (*target)?))
+            })
+            .collect();
         let offset = self.scroll.offset();
         frame.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(body.lines)
                 .style(Style::new().fg(theme.foreground))
                 .wrap(Wrap { trim: false })
                 .scroll((offset, 0)),
@@ -324,41 +409,43 @@ impl LearnInspector {
             height: FOOTER_ROWS.min(inner.height),
             ..content
         };
-        frame.render_widget(Paragraph::new(hint_line_hovered(HINTS, None)), footer);
+        self.footer.draw(frame, footer, HINTS.to_vec());
 
+        self.content = content;
         self.popup = popup;
         popup
     }
 
-    /// The modal's lines, and which of them the selection is on.
-    fn lines(&self, theme: &Theme, now_ms: i64) -> (Vec<Line<'static>>, Option<usize>) {
+    fn body(&self, theme: &Theme, now_ms: i64) -> Body {
+        let mut body = Body::default();
         let snapshot = match &self.snapshot {
-            None => return (vec![Line::styled(READING, theme.status_dim)], None),
+            None => {
+                body.push(Line::styled(READING, theme.status_dim), None);
+                return body;
+            }
             Some(Err(error)) => {
                 let text = format!("{READ_FAILED}{}", escape_terminal_controls(error));
-                return (vec![Line::styled(text, theme.tool_error)], None);
+                body.push(Line::styled(text, theme.tool_error), None);
+                return body;
             }
             Some(Ok(snapshot)) => snapshot,
         };
-        let mut lines = header_lines(snapshot, self.live, now_ms, theme);
-        lines.push(Line::default());
-        if snapshot.runs.is_empty() {
-            lines.push(Line::styled(NO_RUNS, theme.status_dim));
-            return (lines, None);
+        for line in header_lines(snapshot, self.live, now_ms, theme) {
+            body.push(line, None);
         }
-        let mut focus = None;
+        body.push(Line::default(), None);
+        if snapshot.runs.is_empty() {
+            body.push(Line::styled(NO_RUNS, theme.status_dim), None);
+            return body;
+        }
         for (index, run) in snapshot.runs.iter().enumerate() {
             let selected = index == self.run;
+            body.push(run_line(run, selected, theme), Some(RowTarget::Run(index)));
             if selected {
-                focus = Some(lines.len());
-            }
-            lines.push(run_line(run, selected, theme));
-            if selected {
-                let edit_focus = detail_lines(run, self.edit, theme, &mut lines);
-                focus = edit_focus.or(focus);
+                detail_lines(run, self.edit, theme, &mut body);
             }
         }
-        (lines, focus)
+        body
     }
 }
 
@@ -476,54 +563,52 @@ fn edit_counts(edits: &[StoredEdit]) -> String {
     }
 }
 
-/// Pushes the run's summary, changes and dropped items, and answers the line
-/// of the selected change.
-fn detail_lines(
-    run: &LearnRun,
-    selected: usize,
-    theme: &Theme,
-    lines: &mut Vec<Line<'static>>,
-) -> Option<usize> {
+/// Pushes the run's summary, changes and dropped items.
+fn detail_lines(run: &LearnRun, selected: usize, theme: &Theme, body: &mut Body) {
     if !run.run.summary.is_empty() {
-        lines.push(Line::styled(
-            format!(
-                "{EDIT_INDENT}{}",
-                escape_terminal_controls(&run.run.summary)
+        body.push(
+            Line::styled(
+                format!(
+                    "{EDIT_INDENT}{}",
+                    escape_terminal_controls(&run.run.summary)
+                ),
+                theme.tool_dim,
             ),
-            theme.tool_dim,
-        ));
+            None,
+        );
     }
-    let mut focus = None;
     for (index, edit) in run.edits.iter().enumerate() {
-        if index == selected {
-            focus = Some(lines.len());
+        let target = Some(RowTarget::Edit(index));
+        body.push(edit_line(edit, index == selected, theme), target);
+        for line in diff_lines(edit, theme) {
+            body.push(line, target);
         }
-        lines.push(edit_line(edit, index == selected, theme));
-        lines.extend(diff_lines(edit, theme));
     }
     if !run.dropped.is_empty() {
-        lines.push(Line::styled(
-            format!("{EDIT_INDENT}{DROPPED_SECTION}"),
-            theme.keybind_key,
-        ));
+        body.push(
+            Line::styled(format!("{EDIT_INDENT}{DROPPED_SECTION}"), theme.keybind_key),
+            None,
+        );
         for dropped in &run.dropped {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{DETAIL_INDENT}{}: ",
-                        escape_terminal_controls(&dropped.target)
+            body.push(
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{DETAIL_INDENT}{}: ",
+                            escape_terminal_controls(&dropped.target)
+                        ),
+                        theme.tool_dim,
                     ),
-                    theme.tool_dim,
-                ),
-                Span::raw(escape_terminal_controls(&dropped.item)),
-                Span::styled(
-                    format!(" ({})", escape_terminal_controls(&dropped.reason)),
-                    theme.status_dim,
-                ),
-            ]));
+                    Span::raw(escape_terminal_controls(&dropped.item)),
+                    Span::styled(
+                        format!(" ({})", escape_terminal_controls(&dropped.reason)),
+                        theme.status_dim,
+                    ),
+                ]),
+                None,
+            );
         }
     }
-    focus
 }
 
 fn edit_line(edit: &StoredEdit, selected: bool, theme: &Theme) -> Line<'static> {
@@ -602,14 +687,21 @@ fn clock(at: i64) -> String {
 mod tests {
     use caudra_agent::learning::targets::{BLOCK_CLOSE, BLOCK_OPEN};
     use caudra_storage::learning::LearningEdit;
+    use crossterm::event::KeyModifiers;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Modifier;
     use test_case::test_case;
 
     use super::{
-        ADDED, ALREADY_REVERTED, DETAIL_INDENT, KeyCode, KeyEvent, LEARNED, LearnAction,
-        LearnInspector, LearnRun, LearnSnapshot, LearningProject, LearningRun, LearningTarget,
-        Line, NEW_NOTE, NO_CHANGES, NO_RUNS, NOTHING_SELECTED, PAUSED_NO_RUN, REMOVED,
-        REWROTE_NOTE, StoredEdit, diff_lines, run_line, theme,
+        ADDED, ALREADY_REVERTED, DETAIL_INDENT, H_PAD, HINTS, KeyCode, KeyEvent, LEARNED,
+        LearnAction, LearnInspector, LearnRun, LearnSnapshot, LearningProject, LearningRun,
+        LearningTarget, Line, Modal, MouseButton, MouseEvent, MouseEventKind, NEW_NOTE, NO_CHANGES,
+        NO_RUNS, NOTHING_SELECTED, PAUSED_NO_RUN, Position, REMOVED, REWROTE_NOTE, Rect, RowTarget,
+        StoredEdit, WIDTH_PERCENT, diff_lines, run_line, theme,
     };
+    use crate::components::hint_hits;
 
     const RUN_ID: i64 = 7;
     const PROJECT: &str = "/repo";
@@ -619,6 +711,13 @@ mod tests {
     const GAINED: &str = "Run nextest per crate";
     const LOST: &str = "Prefer cargo test";
     const REVERTED_AT: i64 = 5;
+    const SCREEN_WIDTH: u16 = 100;
+    const SCREEN_HEIGHT: u16 = 40;
+    const TRANSCRIPT_HINT: usize = 1;
+    const CLOSE_HINT: usize = 5;
+    const NARROW_TERMINAL: u16 = 80;
+    const GROUP_HINT: usize = 0;
+    const NOT_DRAWN: &str = "the row was drawn";
 
     fn block(bullets: &[&str]) -> String {
         let body: String = bullets
@@ -844,8 +943,125 @@ mod tests {
     #[test]
     fn no_runs_says_so() {
         let inspector = inspector(Vec::new());
-        let (lines, focus) = inspector.lines(&theme::current(), 0);
-        assert!(text(&lines).contains(NO_RUNS));
-        assert_eq!(focus, None);
+        let body = inspector.body(&theme::current(), 0);
+        assert!(text(&body.lines).contains(NO_RUNS));
+        assert_eq!(body.focus(0, 0), None);
+    }
+
+    fn draw(inspector: &mut LearnInspector) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                inspector.view(frame, frame.area());
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn mouse(kind: MouseEventKind, at: Position) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A press and its release, answering whichever of the two acted.
+    fn click(inspector: &mut LearnInspector, at: Position) -> LearnAction {
+        let pressed = inspector.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at));
+        let released = inspector.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), at));
+        match pressed {
+            LearnAction::Consumed => released,
+            acted => acted,
+        }
+    }
+
+    fn row_of(inspector: &LearnInspector, target: RowTarget) -> Position {
+        let (rows, _) = inspector
+            .hits
+            .iter()
+            .find(|(_, at)| *at == target)
+            .expect(NOT_DRAWN);
+        Position::new(
+            inspector.content.x,
+            inspector.content.y + rows.start - inspector.scroll.offset(),
+        )
+    }
+
+    fn two_runs() -> LearnInspector {
+        let older = run(Vec::new());
+        let mut newer = run(Vec::new());
+        newer.run.id = RUN_ID + 1;
+        inspector(vec![newer, older])
+    }
+
+    #[test]
+    fn a_click_selects_a_run_and_a_second_opens_its_transcript() {
+        let mut inspector = two_runs();
+        draw(&mut inspector);
+        let older = row_of(&inspector, RowTarget::Run(1));
+
+        assert_eq!(click(&mut inspector, older), LearnAction::Consumed);
+        assert_eq!(inspector.selected_run().map(|run| run.run.id), Some(RUN_ID));
+        draw(&mut inspector);
+        let older = row_of(&inspector, RowTarget::Run(1));
+        assert_eq!(
+            click(&mut inspector, older),
+            LearnAction::Transcript(RUN_ID)
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_change_or_what_it_did_selects_it() {
+        let edits = vec![
+            edit(0, LearningTarget::Memory, None, KEPT),
+            edit(1, LearningTarget::Memory, None, GAINED),
+        ];
+        let mut inspector = inspector(vec![run(edits.clone())]);
+        draw(&mut inspector);
+        let change = row_of(&inspector, RowTarget::Edit(1));
+        let diff = Position::new(change.x, change.y + 1);
+
+        click(&mut inspector, diff);
+        assert_eq!(inspector.selected_edit(), edits.get(1));
+    }
+
+    #[test]
+    fn the_row_under_the_pointer_is_marked() {
+        let mut inspector = two_runs();
+        draw(&mut inspector);
+        let (newer, older) = (
+            row_of(&inspector, RowTarget::Run(0)),
+            row_of(&inspector, RowTarget::Run(1)),
+        );
+        inspector.handle_mouse(mouse(MouseEventKind::Moved, older));
+        let buffer = draw(&mut inspector);
+
+        let reversed = |at: Position| buffer[at].modifier.contains(Modifier::REVERSED);
+        assert!(reversed(older));
+        assert!(!reversed(newer));
+    }
+
+    #[test_case(TRANSCRIPT_HINT => LearnAction::Transcript(RUN_ID + 1); "transcript")]
+    #[test_case(CLOSE_HINT => LearnAction::Close; "close")]
+    #[test_case(GROUP_HINT => LearnAction::Consumed; "group_hint_is_inert")]
+    fn a_footer_hint_presses_its_key(hint: usize) -> LearnAction {
+        let mut inspector = two_runs();
+        draw(&mut inspector);
+        let footer = Rect {
+            y: inspector.content.bottom(),
+            height: 1,
+            ..inspector.content
+        };
+        let hit = hint_hits(HINTS, footer)[hint];
+        click(&mut inspector, hit.as_position())
+    }
+
+    #[test]
+    fn every_hint_fits_the_narrowest_modal() {
+        let width = Modal::inner_width(NARROW_TERMINAL, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
+        let footer = Rect::new(0, 0, width, 1);
+        assert_eq!(hint_hits(HINTS, footer).len(), HINTS.len());
     }
 }

@@ -352,12 +352,12 @@ mod tests {
     use caudra_providers::Message;
     use caudra_storage::StateDir;
     use caudra_storage::learning::{FinishedRun, LearningEdit, LearningStore};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
     use test_case::test_case;
 
-    use super::{LearnAction, NO_TRANSCRIPT, OFF_HERE, REVERTED, RUN_ENDED};
+    use super::{LearnAction, LearnSnapshot, NO_TRANSCRIPT, OFF_HERE, REVERTED, RUN_ENDED};
     use crate::app::App;
-    use crate::app::tests::test_app;
+    use crate::app::tests::{mouse_event, rendered, test_app};
     use crate::components::Overlay;
     use crate::components::learn_inspector::ALREADY_REVERTED;
     use crate::components::learn_transcript::LIVE_RUNS;
@@ -370,6 +370,9 @@ mod tests {
     const PROMPT: &str = "## Digest";
     const REPLY: &str = "Reading the history first.";
     const LIVE_RUN: i64 = 7;
+    const CLOSE_HINT: &str = "Esc close";
+    const BACK_HINT: &str = "Esc back";
+    const LABEL_DRAWN: &str = "the label is on screen";
 
     fn seeded_run(
         state: &StateDir,
@@ -556,5 +559,50 @@ mod tests {
             ),
             false => assert_eq!(app.status_bar.flash_text(), Some(NO_TRANSCRIPT)),
         }
+    }
+
+    /// Presses and releases on the first cell of `label` as drawn.
+    fn click_label(app: &mut App, label: &str) {
+        let screen = rendered(app);
+        let (row, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(label))
+            .expect(LABEL_DRAWN);
+        let column = line[..line.find(label).unwrap_or_default()].chars().count();
+        let (column, row) = (column as u16, row as u16);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.update(mouse_event(kind, column, row));
+        }
+    }
+
+    #[test]
+    fn the_inspector_footer_answers_a_click() {
+        let mut app = test_app();
+        app.learn_inspector.open(false);
+        app.learn_inspector
+            .fill(Ok(LearnSnapshot::default()), false);
+
+        click_label(&mut app, CLOSE_HINT);
+        assert!(!app.learn_inspector.is_open());
+    }
+
+    #[test]
+    fn the_transcript_footer_answers_a_click() {
+        let mut app = test_app();
+        step(
+            &mut app,
+            LIVE_RUN,
+            LearnerStep::Started {
+                prompt: PROMPT.to_owned(),
+            },
+        );
+        app.handle_learn_action(LearnAction::Transcript(LIVE_RUN));
+
+        click_label(&mut app, BACK_HINT);
+        assert!(!app.learn_transcripts.is_open());
     }
 }

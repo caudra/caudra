@@ -3,17 +3,19 @@
 //! session's chats, so nothing here is saved with the session or searched.
 
 use std::collections::VecDeque;
+use std::mem;
+use std::path::Path;
 
 use caudra_grab::grab_scope;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::widgets::Paragraph;
 
 use crate::chat::Chat;
 use crate::components::docs_link::DocsTopic;
 use crate::components::modal::Modal;
-use crate::components::{Hint, Overlay, hint_line_hovered};
+use crate::components::tooltip::Tip;
+use crate::components::{Hint, HintBar, Overlay};
 use crate::repaint::{Cadence, Dirty};
 
 const TITLE: &str = " Learner transcript ";
@@ -33,6 +35,11 @@ pub(crate) struct LearnTranscripts {
     live: VecDeque<(i64, Chat)>,
     stored: Option<(i64, Chat)>,
     shown: Option<i64>,
+    footer: HintBar,
+    /// Where the chat was drawn, and whether a press landed in it, so only a
+    /// press and release both on the chat click it.
+    body: Rect,
+    pressed: bool,
     popup: Rect,
 }
 
@@ -120,20 +127,54 @@ impl LearnTranscripts {
         }
     }
 
-    pub fn scroll(&mut self, delta: i32) {
-        if let Some(chat) = self.shown_chat() {
+    /// An armed scroll card under the pointer takes the wheel first, as in
+    /// the main transcript, and hands back what it cannot use.
+    pub fn scroll_at(&mut self, at: Position, delta: i32) {
+        let Some(chat) = self.shown_chat() else {
+            return;
+        };
+        let delta = chat.scroll_card_at(at.x, at.y, delta);
+        if delta != 0 {
             chat.scroll(delta);
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent) {
+    /// The chat answers the pointer as the main transcript does: hovering
+    /// marks what a click acts on, a press arms a scroll card, and a click
+    /// folds or opens what it lands on. A footer hint presses its key.
+    pub fn handle_mouse(&mut self, event: MouseEvent, cwd: &Path) {
+        if let Some(key) = self.footer.handle_mouse(event) {
+            self.handle_key(key);
+            return;
+        }
+        let body = self.body;
+        let on_body = body.contains(Position::new(event.column, event.row));
+        let pressed = mem::replace(
+            &mut self.pressed,
+            on_body && event.kind == MouseEventKind::Down(MouseButton::Left),
+        );
         let Some(chat) = self.shown_chat() else {
             return;
         };
-        if chat.handle_scrollbar(&event) {
+        if chat.handle_card_scrollbar(&event) || chat.handle_scrollbar(&event) {
             return;
         }
         match event.kind {
+            MouseEventKind::Moved if on_body => {
+                chat.update_hover(event.row, event.column, body, false, cwd);
+            }
+            MouseEventKind::Moved => {
+                chat.clear_hover();
+                chat.disarm_card();
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_body => {
+                chat.arm_card_at(event.column, event.row);
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if pressed && on_body && !chat.armed_card_at(event.column, event.row) =>
+            {
+                chat.handle_click(event.row, body);
+            }
             MouseEventKind::ScrollUp => chat.scroll(-LINE_STEP),
             MouseEventKind::ScrollDown => chat.scroll(LINE_STEP),
             _ => {}
@@ -161,7 +202,8 @@ impl LearnTranscripts {
             height: FOOTER_ROWS.min(inner.height),
             ..inner
         };
-        frame.render_widget(Paragraph::new(hint_line_hovered(HINTS, None)), footer);
+        self.footer.draw(frame, footer, HINTS.to_vec());
+        self.body = body;
         self.popup = popup;
         popup
     }
@@ -173,8 +215,21 @@ impl Overlay for LearnTranscripts {
     }
 
     fn close(&mut self) {
+        if let Some(chat) = self.shown_chat() {
+            chat.clear_hover();
+            chat.disarm_card();
+        }
         self.shown = None;
+        self.footer.reset();
+        self.body = Rect::default();
+        self.pressed = false;
         self.popup = Rect::default();
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.shown
+            .and_then(|run_id| self.chat(run_id))
+            .and_then(Chat::hover_tip)
     }
 
     fn cadence(&self) -> Cadence {

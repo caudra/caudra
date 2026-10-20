@@ -286,13 +286,14 @@ impl App {
         }
         if self.learn_transcripts.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            self.learn_transcripts.handle_mouse(event);
+            let cwd = PathBuf::from(&self.state.session.cwd);
+            self.learn_transcripts.handle_mouse(event, &cwd);
             return Vec::new();
         }
         if self.learn_inspector.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            self.learn_inspector.handle_mouse(event);
-            return Vec::new();
+            let action = self.learn_inspector.handle_mouse(event);
+            return self.handle_learn_action(action);
         }
         if self.system_prompt_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();

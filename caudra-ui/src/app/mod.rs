@@ -2159,7 +2159,7 @@ impl App {
             return None;
         }
         if self.learn_transcripts.is_open() {
-            self.learn_transcripts.scroll(delta);
+            self.learn_transcripts.scroll_at(pos, delta);
             return None;
         }
         if self.learn_inspector.is_open() {
