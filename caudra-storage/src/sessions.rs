@@ -57,7 +57,7 @@ pub use database::{
     ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
     eager_load_limit, set_eager_load_limit,
 };
-pub use lease::SessionLease;
+pub use lease::{InstanceLock, SessionLease, open_instances, try_instance_lock};
 pub use prompts::SessionPreview;
 pub use types::PermissionMode;
 

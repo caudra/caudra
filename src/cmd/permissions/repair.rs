@@ -991,6 +991,7 @@ mod tests {
     };
     use caudra_agent::tools::native;
     use caudra_storage::StateDir;
+    use caudra_storage::backups::BACKUPS_DIR;
     use caudra_storage::id::CaudraId;
     use caudra_storage::permission_state::{
         PermissionResourceSelector, PermissionReviewSource, PermissionRuleRecord,
@@ -1504,6 +1505,10 @@ mod tests {
         drop(database);
         let backup = SessionDatabase::repair_permission_reviews(&state, &before, &after).unwrap();
         assert!(backup.is_file());
+        assert_eq!(
+            backup.parent(),
+            Some(state.path().join(BACKUPS_DIR).as_path())
+        );
         let rules = read_inventory(&state).unwrap();
         let typed: PermissionRuleRecord = serde_json::from_value(repaired[0].clone()).unwrap();
         assert_eq!(rules[0], typed);

@@ -122,6 +122,31 @@ impl Drop for SessionLease {
     }
 }
 
+/// Proof that no session is open on this state directory, in this process or
+/// any other: the exclusive hold on the lock every [`SessionLease`] shares.
+/// [`SessionLease::acquire`] waits until it is dropped.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: File,
+}
+
+/// Takes the [`InstanceLock`] if no session is open, and returns `None`
+/// without waiting if one is.
+pub fn try_instance_lock(state_dir: &StateDir) -> Result<Option<InstanceLock>, StorageError> {
+    Ok(try_exclusive_state_lock(
+        &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
+        OWNER_FILE_MODE,
+    )?
+    .map(|file| InstanceLock { _file: file }))
+}
+
+/// The sessions open right now, to name what holds the [`InstanceLock`].
+/// A bare reader holds the lock without a session, so this can be empty even
+/// when [`try_instance_lock`] returns `None`.
+pub fn open_instances(state_dir: &StateDir) -> Vec<CaudraId> {
+    held_session_ids(state_dir)
+}
+
 fn process_leases() -> std::sync::MutexGuard<'static, HashSet<LeaseKey>> {
     PROCESS_LEASES
         .get_or_init(Mutex::default)
@@ -272,6 +297,29 @@ mod tests {
 
         assert!(!lock_path.exists());
         assert_eq!(SessionLease::acquire(&state_dir, id).unwrap().id(), id);
+    }
+
+    #[test]
+    fn instance_lock_is_refused_while_a_session_is_open() {
+        let (_temp, state_dir) = state_dir();
+        let lease = SessionLease::acquire(&state_dir, CaudraId::generate()).unwrap();
+
+        assert!(try_instance_lock(&state_dir).unwrap().is_none());
+
+        drop(lease);
+        assert!(try_instance_lock(&state_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_instances_names_held_sessions() {
+        let (_temp, state_dir) = state_dir();
+        let id = CaudraId::generate();
+        let lease = SessionLease::acquire(&state_dir, id).unwrap();
+
+        assert_eq!(open_instances(&state_dir), [id]);
+
+        drop(lease);
+        assert!(open_instances(&state_dir).is_empty());
     }
 
     #[test]

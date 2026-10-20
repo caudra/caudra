@@ -11,6 +11,7 @@ pub mod automation;
 #[path = "sessions/autopilot.rs"]
 pub mod autopilot;
 pub mod background;
+pub mod backups;
 #[path = "sessions/cache_warming.rs"]
 pub mod cache_warming;
 pub mod changelog;
@@ -70,6 +71,8 @@ pub use words::{
     DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, derived_phrase,
     random_task_id,
 };
+
+pub use sessions::{InstanceLock, open_instances, try_instance_lock};
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

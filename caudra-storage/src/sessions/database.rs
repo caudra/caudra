@@ -68,6 +68,7 @@ use crate::automation::{
     trim_automations,
 };
 use crate::background::{JobOwner, accept_owned_job_event};
+use crate::backups::{database_migration_backup, permission_review_backup};
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::state::{
@@ -84,7 +85,7 @@ use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
     StateDir, StorageError, existing_state_lock, lock_session_artifacts,
     lock_session_artifacts_within, shared_existing_state_lock, shared_state_lock,
-    try_exclusive_existing_state_lock,
+    sync_parent_dir_durable, try_exclusive_existing_state_lock,
 };
 
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
@@ -2011,10 +2012,7 @@ impl SessionDatabase {
         if database.raw_permission_snapshot()? != *expected {
             return Err(invalid_permission_repair());
         }
-        let backup_path = state_dir.path().join(format!(
-            "{SESSIONS_DB_FILE}.permission-review-{}.bak",
-            CaudraId::generate()
-        ));
+        let backup_path = permission_review_backup(state_dir)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -2034,11 +2032,7 @@ impl SessionDatabase {
         quick_check_on(&destination)?;
         destination.close().map_err(|(_, error)| error)?;
         backup_file.sync_all().map_err(StorageError::from)?;
-        #[cfg(unix)]
-        File::open(state_dir.path())
-            .map_err(StorageError::from)?
-            .sync_all()
-            .map_err(StorageError::from)?;
+        sync_parent_dir_durable(&backup_path)?;
         let transaction = database
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -5266,16 +5260,14 @@ fn report_backup_progress(progress: BackupProgress) {
     });
 }
 
-/// Copies the database beside itself before the first migration step, so a
+/// Copies the database into `backups/` before the first migration step, so a
 /// failed upgrade leaves the original readable by the version that wrote it.
 fn back_up_before_migration(
     connection: &Connection,
     state_dir: &StateDir,
     from: i64,
 ) -> Result<PathBuf, SessionError> {
-    let path = state_dir
-        .path()
-        .join(format!("{SESSIONS_DB_FILE}.v{from}.bak"));
+    let path = database_migration_backup(state_dir, from)?;
     let mut destination = Connection::open(&path)?;
     Backup::new(connection, &mut destination)?.run_to_completion(
         BACKUP_PAGES_PER_STEP,
@@ -6807,6 +6799,7 @@ mod tests {
     };
     use crate::autopilot::{DECISIONS_TABLE_V24, StoredAutopilotDecision};
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
+    use crate::backups::BACKUPS_DIR;
     use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
     use crate::sessions::sweep::LEGACY_SNAPSHOT_DIRS;
@@ -6981,8 +6974,7 @@ mod tests {
     /// Followed by [`USAGE_LEDGER_BEFORE_ACCOUNTS`] in [`downgrade_accounts`].
     const ACCOUNTS_DOWNGRADE: &str = "DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes; DROP TABLE account_switches; DROP TABLE account_health; DROP TABLE usage_ledger;";
     const ACCOUNTS_PREVIOUS_SCHEMA: i64 = 30;
-    const CACHE_WARMING_DOWNGRADE: &str =
-        "DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes;";
+    const CACHE_WARMING_DOWNGRADE: &str = "DROP TABLE token_calibration; DROP TABLE cache_hit_baseline; DROP TABLE cache_warm_episodes;";
     const CACHE_WARMING_PREVIOUS_SCHEMA: i64 = 31;
     const CALIBRATION_DOWNGRADE: &str = "DROP TABLE token_calibration;";
     const CALIBRATION_PREVIOUS_SCHEMA: i64 = 32;
@@ -8276,6 +8268,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let backup = Connection::open(
             state
                 .path()
+                .join(BACKUPS_DIR)
                 .join(format!("{SESSIONS_DB_FILE}.v{version}.bak")),
         )
         .unwrap();
@@ -8379,7 +8372,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             assert_eq!(database.raw_permission_snapshot().unwrap(), before);
             assert_eq!(database.stats().unwrap().logical_bytes, stats.logical_bytes);
         } else {
-            let backup = Connection::open(result.unwrap()).unwrap();
+            let backup_path = result.unwrap();
+            assert_eq!(
+                backup_path.parent(),
+                Some(state.path().join(BACKUPS_DIR).as_path())
+            );
+            let backup = Connection::open(backup_path).unwrap();
             assert_eq!(raw_permission_snapshot_on(&backup).unwrap(), before);
             assert_eq!(protected(&backup), original);
             let current = database.raw_permission_snapshot().unwrap();
@@ -11779,6 +11777,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             assert!(
                 state
                     .path()
+                    .join(BACKUPS_DIR)
                     .join(format!(
                         "{SESSIONS_DB_FILE}.v{SHARED_REPOSITORIES_PREVIOUS_SCHEMA}.bak"
                     ))
@@ -13087,7 +13086,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         insert_root(&transaction, &session, &serialized).unwrap();
         transaction.commit().unwrap();
         let mut before = raw_permission_snapshot_on(&old).unwrap();
-        let backup_path = dir.path().join(format!(
+        let backup_path = dir.path().join(BACKUPS_DIR).join(format!(
             "{SESSIONS_DB_FILE}.v{PERMISSION_PREVIOUS_SCHEMA}.bak"
         ));
         if hold_reader {
@@ -13967,7 +13966,10 @@ CREATE TABLE subagents (
 
         SessionDatabase::open(&state_dir).unwrap();
 
-        let backup = state_dir.path().join(format!("{SESSIONS_DB_FILE}.v1.bak"));
+        let backup = state_dir
+            .path()
+            .join(BACKUPS_DIR)
+            .join(format!("{SESSIONS_DB_FILE}.v1.bak"));
         let connection = Connection::open(&backup).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
