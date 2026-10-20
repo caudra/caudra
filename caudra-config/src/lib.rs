@@ -96,6 +96,7 @@ pub mod files;
 pub mod global_file;
 pub mod interpolation;
 pub mod mcp;
+pub mod migration;
 pub mod own_writes;
 pub mod profile_tools;
 pub mod providers;

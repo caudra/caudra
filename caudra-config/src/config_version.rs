@@ -5,7 +5,7 @@ use toml::{Table, Value};
 
 pub const CONFIG_VERSION_KEY: &str = "version";
 /// Versions start here, and a file without the key predates versioning.
-const FIRST_VERSION: u32 = 1;
+pub(crate) const FIRST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ConfigVersionError {
@@ -42,18 +42,19 @@ impl<const LATEST: u32> ConfigVersion<LATEST> {
 
     fn from_value(value: &Value) -> Result<Self, ConfigVersionError> {
         let found = value.as_integer().ok_or(ConfigVersionError::Invalid)?;
-        if found < i64::from(FIRST_VERSION) {
-            return Err(ConfigVersionError::Invalid);
-        }
-        u32::try_from(found)
-            .ok()
-            .filter(|version| *version <= LATEST)
-            .map(Self)
-            .ok_or(ConfigVersionError::Newer {
-                found,
-                latest: LATEST,
-            })
+        checked_version(found, LATEST).map(Self)
     }
+}
+
+/// `found` as a version a build whose newest is `latest` reads.
+pub(crate) fn checked_version(found: i64, latest: u32) -> Result<u32, ConfigVersionError> {
+    if found < i64::from(FIRST_VERSION) {
+        return Err(ConfigVersionError::Invalid);
+    }
+    u32::try_from(found)
+        .ok()
+        .filter(|version| *version <= latest)
+        .ok_or(ConfigVersionError::Newer { found, latest })
 }
 
 impl<const LATEST: u32> Default for ConfigVersion<LATEST> {

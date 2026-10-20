@@ -84,7 +84,7 @@ fn merge_inline_table(table: &mut InlineTable, previous: &dyn TableLike, desired
     keeping_closing_space(table, |table| merge_table(table, previous, desired));
 }
 
-fn keeping_closing_space(table: &mut InlineTable, edit: impl FnOnce(&mut InlineTable)) {
+pub(crate) fn keeping_closing_space(table: &mut InlineTable, edit: impl FnOnce(&mut InlineTable)) {
     let closing = last_value(table).and_then(|value| {
         let closing = value.decor().suffix().cloned();
         value.decor_mut().set_suffix("");
