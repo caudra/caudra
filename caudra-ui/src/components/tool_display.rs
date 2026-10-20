@@ -333,15 +333,27 @@ const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
 /// Extensions whose file is worth more rendered than quoted.
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
-/// The tools whose header leads with a literal the model wrote, and the input
-/// key it wrote it under. One key per tool: a grep writes a pattern, a
-/// source-code lookup writes a symbol or a whole task.
-const QUERY_KEYS: &[(&str, &str)] = &[
-    ("file_grep", "pattern"),
-    ("file_glob", "pattern"),
-    (TOOL_OUTPUT_TOOL_NAME, "pattern"),
-    ("source_code_context", "task"),
-    ("source_code_refs", "symbol"),
+/// The inputs a tool's header spells verbatim, in the order it writes them:
+/// the literal the model searched for, then the path, note, skill, run, or task
+/// the call names.
+const LITERAL_KEYS: &[(&str, &[&str])] = &[
+    (FILE_READ_TOOL_NAME, &["file_path"]),
+    (FILE_WRITE_TOOL_NAME, &["file_path"]),
+    ("file_edit", &["file_path"]),
+    ("file_index", &["path"]),
+    ("file_grep", &["pattern", "path"]),
+    ("file_glob", &["pattern", "path"]),
+    (TOOL_OUTPUT_TOOL_NAME, &["pattern", "output_id"]),
+    ("source_code_context", &["task", "path"]),
+    ("source_code_refs", &["symbol", "path"]),
+    ("webfetch", &["url"]),
+    ("skill", &["name"]),
+    (MEMORY_TOOL_NAME, &["query", "path"]),
+    ("view_image", &["path"]),
+    (IMAGE_GENERATE_TOOL_NAME, &["out"]),
+    ("workflow", &["name", "run_id"]),
+    ("automation", &["name", "fire_id"]),
+    ("task_control", &["task_id"]),
 ];
 const SHELL_COMMAND_KEY: &str = "command";
 /// The tools whose streaming body is a source the call carries entire rather
@@ -489,7 +501,7 @@ const INSPECT: Inflection = ("Inspect", "Inspecting", "Inspected");
 const DELEGATE: Inflection = ("Delegate", "Delegating", "Delegated");
 const BATCH: Inflection = ("Batch", "Batching", "Batched");
 const UPDATE: Inflection = ("Update", "Updating", "Updated");
-const LOAD: Inflection = ("Load", "Loading", "Loaded");
+const LOAD_SKILL: Inflection = ("Load skill", "Loading skill", "Skill loaded");
 const ASK: Inflection = ("Ask", "Asking", "Asked");
 const REPORT: Inflection = ("Report", "Reporting", "Reported");
 const VIEW: Inflection = ("View", "Viewing", "Viewed");
@@ -542,7 +554,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("task", '❖', DELEGATE, &["prompt", "description"]),
     tool_row("batch", '⇶', BATCH, &["invocations"]),
     tool_row("todo_write", '✓', UPDATE, &["todos"]),
-    tool_row("skill", '→', LOAD, &["name"]),
+    tool_row("skill", '→', LOAD_SKILL, &["name"]),
     tool_row("question", '?', ASK, &["questions"]),
     tool_row(
         REPORT_TOOL_NAME,
@@ -665,11 +677,21 @@ fn compact_tool(name: &str) -> Option<&'static CompactTool> {
     compact_row(name).map(|(_, entry)| entry)
 }
 
-fn query_key(name: &str) -> Option<&'static str> {
-    let (tool, _) = compact_row(name)?;
-    QUERY_KEYS
+fn literal_keys(name: &str) -> &'static [&'static str] {
+    LITERAL_KEYS
         .iter()
-        .find_map(|(query_tool, key)| (*query_tool == tool).then_some(*key))
+        .find_map(|(tool, keys)| names_tool(tool, name).then_some(*keys))
+        .unwrap_or_default()
+}
+
+/// Where `literal` first stands as whole words in `text`: a path inside a
+/// longer one, or a name inside another, is not the one the call named.
+fn find_literal(text: &str, literal: &str) -> Option<usize> {
+    text.match_indices(literal).map(|(at, _)| at).find(|&at| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + literal.len()..].chars().next();
+        before.is_none_or(|c| c == ' ') && after.is_none_or(|c| c == ' ')
+    })
 }
 
 /// The activity as a row says it. A tool answers with the verb its own card
@@ -1093,13 +1115,14 @@ fn same_key(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
-/// A search header opens with the pattern and continues `in <path>`, so the
-/// text searched for and the sentence built around it arrive as one string.
-/// A pattern may hold spaces, the word `in`, or regex punctuation, so where it
-/// ends is not recoverable from the header; the input is what still has it
-/// verbatim. Italic rather than a colour because the query is a literal, which
-/// is what italic already marks everywhere else, and because a new colour would
-/// have to mean something in every theme.
+/// The literals the model wrote, set apart from the words around them: the
+/// text a search looked for, and the path, note, skill, run, or task a call
+/// names. A search header opens with the pattern and continues `in <path>`,
+/// and a pattern may hold spaces, the word `in`, or regex punctuation, so where
+/// a literal ends is not recoverable from the header; the input is what still
+/// has it verbatim. Italic rather than a colour because a literal is what
+/// italic already marks everywhere else, and because a new colour would have
+/// to mean something in every theme.
 ///
 /// A shell header that is its command's first line is coloured as shell.
 pub(super) fn header_spans(
@@ -1123,19 +1146,34 @@ pub(super) fn header_spans(
     if is_shell_command(tool, header, raw_input) {
         return overlay(command_spans(header), base);
     }
-    let query = query_key(tool)
-        .and_then(|key| raw_input?.get(key)?.as_str())
-        .filter(|query| !query.is_empty() && header.starts_with(query));
-    let Some(query) = query else {
-        return vec![Span::styled(header.to_owned(), base)];
-    };
-    let mut spans = vec![Span::styled(
-        query.to_owned(),
-        base.add_modifier(Modifier::ITALIC),
-    )];
-    let rest = &header[query.len()..];
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_owned(), base));
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    let literals = literal_keys(tool)
+        .iter()
+        .filter_map(|key| {
+            raw_input?
+                .as_object()?
+                .iter()
+                .find_map(|(sent, value)| same_key(key, sent).then_some(value))?
+                .as_str()
+        })
+        .filter(|literal| !literal.is_empty());
+    for literal in literals {
+        let Some(at) = find_literal(&header[cursor..], literal) else {
+            continue;
+        };
+        let start = cursor + at;
+        if start > cursor {
+            spans.push(Span::styled(header[cursor..start].to_owned(), base));
+        }
+        cursor = start + literal.len();
+        spans.push(Span::styled(
+            header[start..cursor].to_owned(),
+            base.add_modifier(Modifier::ITALIC),
+        ));
+    }
+    if cursor < header.len() || spans.is_empty() {
+        spans.push(Span::styled(header[cursor..].to_owned(), base));
     }
     spans
 }
@@ -4495,6 +4533,34 @@ mod tests {
             notice - location - 1,
             TOL.get(SKILL_TOOL_NAME),
             "{SKILL_BUDGET_MSG}: {rows:?}"
+        );
+    }
+
+    const SKILL_TITLE_MSG: &str = "a skill's title says it is a skill, and names it in italics";
+
+    #[test_case(ToolStatus::Success, "Skill loaded" ; "loaded")]
+    #[test_case(ToolStatus::InProgress, "Loading skill" ; "loading")]
+    #[test_case(ToolStatus::Error, "Load skill" ; "failed")]
+    fn a_skill_title_names_the_skill(status: ToolStatus, label: &str) {
+        let mut msg = skill_msg();
+        msg.tool_raw_input = Some(Arc::new(serde_json::json!({ "name": SKILL_NAME })));
+        let tl = build_tool_lines(
+            &msg,
+            status,
+            &test_rctx(UNBROKEN),
+            Some(Disclosure::default()),
+        );
+        let header = tl.lines.first().expect("header line");
+
+        assert!(
+            line_text(header).contains(&format!("{label} {SKILL_NAME}")),
+            "{SKILL_TITLE_MSG}: {}",
+            line_text(header)
+        );
+        assert!(
+            header.spans.iter().any(|span| span.content == SKILL_NAME
+                && span.style.add_modifier.contains(Modifier::ITALIC)),
+            "{SKILL_TITLE_MSG}"
         );
     }
 
@@ -7966,8 +8032,8 @@ mod tests {
 
     const GREP_TOOL: &str = "file_grep";
     const READ_TOOL: &str = "file_read";
-    const QUERY_MARK_MSG: &str =
-        "the text searched for must be marked off from the sentence built around it";
+    const LITERAL_MARK_MSG: &str =
+        "what the model wrote, searched for or named, must be marked off from the words around it";
 
     fn header_parts(
         tool: &str,
@@ -8034,17 +8100,51 @@ mod tests {
             .map(|(italic, text)| (*italic, (*text).to_owned()))
             .collect();
 
-        assert_eq!(parts, expected, "{QUERY_MARK_MSG}");
+        assert_eq!(parts, expected, "{LITERAL_MARK_MSG}");
+    }
+
+    /// The path, note, skill, run, or task a call names is the model's own
+    /// literal the same way a pattern is, and the input is what says where it
+    /// sits in the header.
+    #[test_case(READ_TOOL, "src/main.rs", serde_json::json!({ "file_path": "src/main.rs" }), &[(true, "src/main.rs")] ; "a_read_marks_its_path")]
+    #[test_case("mcp_File_read", "src/main.rs", serde_json::json!({ "filePath": "src/main.rs" }), &[(true, "src/main.rs")] ; "a_qualified_read_with_a_camel_case_key")]
+    #[test_case(GREP_TOOL, "needle in src", serde_json::json!({ "pattern": "needle", "path": "src" }), &[(true, "needle"), (false, " in "), (true, "src")] ; "a_search_marks_its_pattern_and_its_root")]
+    #[test_case(GREP_TOOL, "src in src", serde_json::json!({ "pattern": "src", "path": "src" }), &[(true, "src"), (false, " in "), (true, "src")] ; "a_root_spelled_like_the_pattern_is_found_after_it")]
+    #[test_case(TOOL_OUTPUT_TOOL_NAME, OUTPUT_ID, serde_json::json!({ "output_id": OUTPUT_ID }), &[(true, OUTPUT_ID)] ; "a_retrieval_marks_its_output")]
+    #[test_case("skill", SKILL_NAME, serde_json::json!({ "name": SKILL_NAME }), &[(true, SKILL_NAME)] ; "a_skill_marks_its_name")]
+    #[test_case(MEMORY_TOOL_NAME, "wrote notes/arch.md", serde_json::json!({ "command": "write", "path": "notes/arch.md" }), &[(false, "wrote "), (true, "notes/arch.md")] ; "a_memory_write_marks_its_note")]
+    #[test_case(MEMORY_TOOL_NAME, "searched cache bump", serde_json::json!({ "command": "search", "query": "cache bump" }), &[(false, "searched "), (true, "cache bump")] ; "a_memory_search_marks_its_query")]
+    #[test_case("workflow", "status run-1", serde_json::json!({ "action": "status", "run_id": "run-1" }), &[(false, "status "), (true, "run-1")] ; "a_workflow_marks_its_run")]
+    #[test_case("automation", "history greeter", serde_json::json!({ "action": "history", "name": "greeter" }), &[(false, "history "), (true, "greeter")] ; "an_automation_marks_its_name")]
+    #[test_case("task_control", "status t-1", serde_json::json!({ "action": "status", "task_id": "t-1" }), &[(false, "status "), (true, "t-1")] ; "a_task_control_marks_its_task")]
+    fn a_header_marks_what_the_call_names(
+        tool: &str,
+        header: &str,
+        raw_input: serde_json::Value,
+        expected: &[(bool, &str)],
+    ) {
+        let expected: Vec<(bool, String)> = expected
+            .iter()
+            .map(|(italic, text)| (*italic, (*text).to_owned()))
+            .collect();
+
+        assert_eq!(
+            header_parts(tool, header, Some(raw_input)),
+            expected,
+            "{LITERAL_MARK_MSG}"
+        );
     }
 
     /// Marking a run of the header only says something when it is known to be
-    /// the query, so everything else is left as the one span it was.
-    #[test_case(READ_TOOL, "src/main.rs", Some(serde_json::json!({ "file_path": "src/main.rs" })) ; "a path is not a query")]
+    /// a literal the call wrote, so everything else is left as the one span it was.
     #[test_case(GREP_TOOL, "needle in src", None ; "a session that kept no input")]
     #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "other" })) ; "a header that does not open with the pattern")]
     #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "" })) ; "an empty pattern marks nothing")]
-    #[test_case(TOOL_OUTPUT_TOOL_NAME, OUTPUT_ID, Some(serde_json::json!({ "output_id": OUTPUT_ID })) ; "retrieval_without_a_query")]
-    fn a_header_with_no_query_to_mark_stays_one_span(
+    #[test_case(READ_TOOL, "src/main.rs", Some(serde_json::json!({ "file_path": "main.rs" })) ; "a_name_inside_a_longer_path")]
+    #[test_case(MEMORY_TOOL_NAME, "viewed", Some(serde_json::json!({ "command": "view" })) ; "a_memory_view_names_nothing")]
+    #[test_case(MEMORY_TOOL_NAME, "zoomed 12+3", Some(serde_json::json!({ "command": "zoom", "id": 12, "n": 3 })) ; "a_memory_zoom_names_no_note")]
+    #[test_case("github.create_issue", "create issue", Some(serde_json::json!({ "title": "issue" })) ; "a_foreign_tool")]
+    fn a_header_with_no_literal_to_mark_stays_one_span(
         tool: &str,
         header: &str,
         raw_input: Option<serde_json::Value>,
@@ -8052,7 +8152,7 @@ mod tests {
         assert_eq!(
             header_parts(tool, header, raw_input),
             vec![(false, header.to_owned())],
-            "{QUERY_MARK_MSG}"
+            "{LITERAL_MARK_MSG}"
         );
     }
 
@@ -8091,7 +8191,7 @@ mod tests {
                 Some(serde_json::json!({ "pattern": "pub mod" })),
             ),
             vec![(true, "pub mod".to_owned()), (false, " in src".to_owned())],
-            "{QUERY_MARK_MSG}"
+            "{LITERAL_MARK_MSG}"
         );
     }
 
