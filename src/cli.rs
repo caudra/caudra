@@ -1388,7 +1388,7 @@ pub enum AuthAction {
         /// for copilot and copilot-enterprise
         #[arg(long, value_enum, requires = "provider")]
         method: Option<AuthMethod>,
-        /// GitHub Enterprise hostname for copilot-enterprise (e.g. company.ghe.com)
+        /// GitHub Enterprise hostname for copilot-enterprise (e.g. company or company.ghe.com)
         #[arg(long, requires = "provider")]
         hostname: Option<String>,
         /// Account to sign in as. A new login is named after who it signs in as, and a

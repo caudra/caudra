@@ -13,6 +13,7 @@ mod setup;
 mod startup;
 mod update;
 
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -71,21 +72,28 @@ fn report_parse_error(err: &clap::Error) -> ExitCode {
     ExitCode::from(err.exit_code() as u8)
 }
 
+/// Plain when stderr is a pipe, such as the TUI's login child, whose parent
+/// reads the report back.
 fn print_error(e: &color_eyre::Report) {
     const RED: &str = "\x1b[31m";
     const BOLD_RED: &str = "\x1b[1;31m";
     const DIM: &str = "\x1b[2m";
     const RESET: &str = "\x1b[0m";
 
+    let [red, bold_red, dim, reset] = if io::stderr().is_terminal() {
+        [RED, BOLD_RED, DIM, RESET]
+    } else {
+        [""; 4]
+    };
     let chain: Vec<String> = e.chain().map(ToString::to_string).collect();
     let causes = visible_causes(&chain);
 
     eprintln!();
-    eprintln!("{BOLD_RED}✖ {e}{RESET}");
+    eprintln!("{bold_red}✖ {e}{reset}");
     let last = causes.len().saturating_sub(1);
     for (i, cause) in causes.iter().enumerate() {
         let branch = if i == last { "└─" } else { "├─" };
-        eprintln!("{DIM}{branch}{RESET} {RED}{cause}{RESET}");
+        eprintln!("{dim}{branch}{reset} {red}{cause}{reset}");
     }
     eprintln!();
 }

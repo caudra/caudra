@@ -1464,8 +1464,14 @@ mod tests {
             &ThinkingConfig::Off,
         );
 
-        assert_eq!(body["system"][0]["cache_control"], ephemeral, "{MISSING_BREAKPOINT}");
-        assert_eq!(body["tools"][0]["cache_control"], ephemeral, "{MISSING_BREAKPOINT}");
+        assert_eq!(
+            body["system"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
+        assert_eq!(
+            body["tools"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"], ephemeral,
             "{MISSING_BREAKPOINT}"

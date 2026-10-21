@@ -232,7 +232,7 @@ Copilot lists a prompt limit for each model beside its total window, and refuses
 - **API**: `https://copilot-api.<enterprise-host>`
 - **Features**: Native Copilot Chat HTTP API for one GitHub Enterprise host
 
-Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
+Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. A name without a dot, such as `company`, means `company.ghe.com`. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
 
 Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
 

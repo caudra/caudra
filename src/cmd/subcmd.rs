@@ -66,7 +66,8 @@ const AUTH_STATUS_TOKEN: &str = "\x1b[32m✓ token\x1b[0m";
 const METHOD_SCOPE_ERR: &str = "--method is supported only for Anthropic, OpenAI, xAI, and Copilot";
 const COPILOT_METHOD_ERR: &str = "Copilot supports --method oauth or --method import";
 const HOSTNAME_SCOPE_ERR: &str = "--hostname is supported only for copilot-enterprise";
-const ENTERPRISE_HOST_PROMPT: &str = "  GitHub Enterprise hostname (e.g. company.ghe.com): ";
+const ENTERPRISE_HOST_PROMPT: &str =
+    "  GitHub Enterprise hostname (e.g. company or company.ghe.com): ";
 const ENTERPRISE_HOST_REQUIRED: &str =
     "copilot-enterprise needs a hostname; pass --hostname company.ghe.com";
 pub(super) const PROVIDER_SLUG_WIDTH: usize = 14;
