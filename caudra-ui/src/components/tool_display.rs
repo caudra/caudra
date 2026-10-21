@@ -50,9 +50,10 @@ use caudra_agent::{
     SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration, mcp_tool_parts, pretty_json,
     tools::{
-        CODE_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
-        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-        TOOL_OUTPUT_TOOL_NAME, humanize_duration, timeout_annotation,
+        AUTOMATION_TOOL_NAME, CODE_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
+        IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
+        TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, WORKFLOW_TOOL_NAME, humanize_duration,
+        timeout_annotation,
     },
 };
 use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
@@ -62,6 +63,7 @@ use serde_json::Value;
 
 const JSON_ESCAPE_CHARS: usize = 6;
 const REPORT_TOOL_NAME: &str = "report_to_parent";
+const TASK_CONTROL_TOOL_NAME: &str = "task_control";
 const REPORT_BLOCKED: &str = "Blocked";
 const IMAGE_MISSING_PREFIX: &str = "[image missing: ";
 const REPORT_TITLE_MAX_CHARS: usize = 80;
@@ -365,9 +367,9 @@ const LITERAL_KEYS: &[(&str, &[&str])] = &[
     (MEMORY_TOOL_NAME, &["query", "path"]),
     ("view_image", &["path"]),
     (IMAGE_GENERATE_TOOL_NAME, &["out"]),
-    ("workflow", &["name", "run_id"]),
-    ("automation", &["name", "fire_id"]),
-    ("task_control", &["task_id"]),
+    (WORKFLOW_TOOL_NAME, &["name", "run_id"]),
+    (AUTOMATION_TOOL_NAME, &["name", "fire_id"]),
+    (TASK_CONTROL_TOOL_NAME, &["task_id"]),
 ];
 const SHELL_COMMAND_KEY: &str = "command";
 /// The tools whose card keeps a clock: a command, and a `code` run, which can
@@ -533,18 +535,65 @@ const TRACE: Inflection = ("Trace", "Tracing", "Traced");
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
 const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 const PEERS: Inflection = ("Peers", "Peers", "Peers");
+const JOBS: Inflection = ("Jobs", "Jobs", "Jobs");
+const WORKFLOW: Inflection = ("Workflow", "Workflow", "Workflow");
+const AUTOMATION: Inflection = ("Automation", "Automation", "Automation");
 
-/// The verbs a store's header opens with. A tool reached by sub-command is the
+const LIST_ACTION: Inflection = ("list", "listing", "listed");
+const VALIDATE_ACTION: Inflection = ("validate", "validating", "validated");
+const CHECK_ACTION: Inflection = ("check", "checking", "checked");
+const HISTORY_ACTION: Inflection = ("read history", "reading history", "read history");
+
+/// The verbs the header of a tool reached by sub-command opens with. It is the
 /// one case where the label cannot carry the tense, because the verb is an
 /// argument and varies per call; the header carries it instead, and the tool
 /// emits the plain form once for the row to conjugate.
-const MEMORY_COMMANDS: &[(&str, Inflection)] = &[
-    ("view", ("view", "viewing", "viewed")),
-    ("zoom", ("zoom", "zooming", "zoomed")),
-    ("search", ("search", "searching", "searched")),
-    ("read", ("read", "reading", "read")),
-    ("write", ("write", "writing", "wrote")),
-    ("delete", ("delete", "deleting", "deleted")),
+const SUBCOMMANDS: &[(&str, &[(&str, Inflection)])] = &[
+    (
+        MEMORY_TOOL_NAME,
+        &[
+            ("view", ("view", "viewing", "viewed")),
+            ("zoom", ("zoom", "zooming", "zoomed")),
+            ("search", ("search", "searching", "searched")),
+            ("read", ("read", "reading", "read")),
+            ("write", ("write", "writing", "wrote")),
+            ("delete", ("delete", "deleting", "deleted")),
+        ],
+    ),
+    (
+        TASK_CONTROL_TOOL_NAME,
+        &[
+            ("list", LIST_ACTION),
+            ("status", CHECK_ACTION),
+            ("cancel", ("cancel", "cancelling", "cancelled")),
+            (
+                "background",
+                ("background", "backgrounding", "backgrounded"),
+            ),
+        ],
+    ),
+    (
+        WORKFLOW_TOOL_NAME,
+        &[
+            ("list", LIST_ACTION),
+            ("validate", VALIDATE_ACTION),
+            ("start", ("start", "starting", "started")),
+            ("status", CHECK_ACTION),
+            ("inspect", ("inspect", "inspecting", "inspected")),
+            ("history", HISTORY_ACTION),
+            ("pause", ("pause", "pausing", "paused")),
+            ("resume", ("resume", "resuming", "resumed")),
+            ("stop", ("stop", "stopping", "stopped")),
+        ],
+    ),
+    (
+        AUTOMATION_TOOL_NAME,
+        &[
+            ("list", LIST_ACTION),
+            ("validate", VALIDATE_ACTION),
+            ("history", HISTORY_ACTION),
+        ],
+    ),
 ];
 
 /// Header keys are matched ignoring case and underscores, so one spelling
@@ -574,6 +623,20 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     // `model` is what the caller asked for, often a short name; the header
     // names the model the subagent actually runs on instead.
     tool_row("task", '❖', DELEGATE, &["prompt", "description", "model"]),
+    // `action` is folded by name for the reason `memory` folds `command`.
+    tool_row(TASK_CONTROL_TOOL_NAME, '◷', JOBS, &["action", "task_id"]),
+    tool_row(
+        WORKFLOW_TOOL_NAME,
+        '⑂',
+        WORKFLOW,
+        &["action", "name", "run_id"],
+    ),
+    tool_row(
+        AUTOMATION_TOOL_NAME,
+        '↻',
+        AUTOMATION,
+        &["action", "name", "fire_id"],
+    ),
     tool_row("batch", '⇶', BATCH, &["invocations"]),
     tool_row("todo_write", '✓', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD_SKILL, &["name"]),
@@ -917,11 +980,14 @@ pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) ->
     if repeats_tool(tool, header) {
         return Cow::Borrowed("");
     }
-    if !names_tool(MEMORY_TOOL_NAME, tool) {
+    let Some((_, commands)) = SUBCOMMANDS
+        .iter()
+        .find(|(subcommanded, _)| names_tool(subcommanded, tool))
+    else {
         return Cow::Borrowed(header);
-    }
+    };
     let (verb, rest) = header.split_once(' ').unwrap_or((header, ""));
-    let Some((_, inflection)) = MEMORY_COMMANDS.iter().find(|(name, _)| *name == verb) else {
+    let Some((_, inflection)) = commands.iter().find(|(name, _)| *name == verb) else {
         return Cow::Borrowed(header);
     };
     let conjugated = match tense {
@@ -4310,6 +4376,53 @@ mod tests {
     fn a_store_header_already_names_what_the_call_reads(header: &str, raw: Value) {
         assert_eq!(
             compact_args_for(MEMORY_TOOL_NAME, header, Some(&raw), None),
+            None
+        );
+    }
+
+    const JOB_ID: &str = "shell-66";
+
+    /// A job, workflow, or automation call is reached by its `action` the way
+    /// a note is by its command, so its header conjugates that verb.
+    #[test_case(TASK_CONTROL_TOOL_NAME, "status shell-66", Tense::Present, "checking shell-66" ; "a_job_being_checked")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "status shell-66", Tense::Past, "checked shell-66" ; "a_checked_job")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "status shell-66", Tense::Plain, "check shell-66" ; "a_failed_check_claims_nothing")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "list", Tense::Past, "listed" ; "a_job_list")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "cancel t-1", Tense::Past, "cancelled t-1" ; "a_cancelled_job")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "background t-1", Tense::Present, "backgrounding t-1" ; "a_job_being_promoted")]
+    #[test_case("mcp_Task_control", "status shell-66", Tense::Past, "checked shell-66" ; "a_qualified_job_check")]
+    #[test_case(WORKFLOW_TOOL_NAME, "start review", Tense::Past, "started review" ; "a_started_workflow")]
+    #[test_case(WORKFLOW_TOOL_NAME, "history", Tense::Present, "reading history" ; "a_workflow_history")]
+    #[test_case(WORKFLOW_TOOL_NAME, "stop run-1", Tense::Past, "stopped run-1" ; "a_stopped_run")]
+    #[test_case(AUTOMATION_TOOL_NAME, "history greeter", Tense::Past, "read history greeter" ; "an_automation_history")]
+    #[test_case(AUTOMATION_TOOL_NAME, "validate greeter", Tense::Present, "validating greeter" ; "an_automation_being_validated")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "rewind t-1", Tense::Past, "rewind t-1" ; "an_unknown_action_stays_verbatim")]
+    fn a_subcommand_header_conjugates_its_action(
+        tool: &str,
+        header: &str,
+        tense: Tense,
+        expected: &str,
+    ) {
+        assert_eq!(inflected_header(tool, header, tense), expected);
+    }
+
+    #[test_case(TASK_CONTROL_TOOL_NAME, '◷', "Jobs" ; "jobs")]
+    #[test_case(WORKFLOW_TOOL_NAME, '⑂', "Workflow" ; "workflow")]
+    #[test_case(AUTOMATION_TOOL_NAME, '↻', "Automation" ; "automation")]
+    fn a_subcommand_tool_has_its_own_title(tool: &str, sigil: char, label: &str) {
+        assert_eq!(compact_sigil_label(tool, Tense::Past), (sigil, label));
+    }
+
+    #[test]
+    fn a_job_row_does_not_repeat_its_action_or_task_in_brackets() {
+        let raw = serde_json::json!({ "action": "status", "task_id": JOB_ID });
+        assert_eq!(
+            compact_args_for(
+                TASK_CONTROL_TOOL_NAME,
+                &format!("checked {JOB_ID}"),
+                Some(&raw),
+                None
+            ),
             None
         );
     }
@@ -8235,9 +8348,9 @@ mod tests {
     #[test_case("skill", SKILL_NAME, serde_json::json!({ "name": SKILL_NAME }), &[(true, SKILL_NAME)] ; "a_skill_marks_its_name")]
     #[test_case(MEMORY_TOOL_NAME, "wrote notes/arch.md", serde_json::json!({ "command": "write", "path": "notes/arch.md" }), &[(false, "wrote "), (true, "notes/arch.md")] ; "a_memory_write_marks_its_note")]
     #[test_case(MEMORY_TOOL_NAME, "searched cache bump", serde_json::json!({ "command": "search", "query": "cache bump" }), &[(false, "searched "), (true, "cache bump")] ; "a_memory_search_marks_its_query")]
-    #[test_case("workflow", "status run-1", serde_json::json!({ "action": "status", "run_id": "run-1" }), &[(false, "status "), (true, "run-1")] ; "a_workflow_marks_its_run")]
-    #[test_case("automation", "history greeter", serde_json::json!({ "action": "history", "name": "greeter" }), &[(false, "history "), (true, "greeter")] ; "an_automation_marks_its_name")]
-    #[test_case("task_control", "status t-1", serde_json::json!({ "action": "status", "task_id": "t-1" }), &[(false, "status "), (true, "t-1")] ; "a_task_control_marks_its_task")]
+    #[test_case(WORKFLOW_TOOL_NAME, "checked run-1", serde_json::json!({ "action": "status", "run_id": "run-1" }), &[(false, "checked "), (true, "run-1")] ; "a_workflow_marks_its_run")]
+    #[test_case(AUTOMATION_TOOL_NAME, "read history greeter", serde_json::json!({ "action": "history", "name": "greeter" }), &[(false, "read history "), (true, "greeter")] ; "an_automation_marks_its_name")]
+    #[test_case(TASK_CONTROL_TOOL_NAME, "checked t-1", serde_json::json!({ "action": "status", "task_id": "t-1" }), &[(false, "checked "), (true, "t-1")] ; "a_task_control_marks_its_task")]
     fn a_header_marks_what_the_call_names(
         tool: &str,
         header: &str,
