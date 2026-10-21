@@ -283,13 +283,18 @@ Some pickers add extra bindings on top of the defaults:
 | Environment | `d` | Delete the selected set value or pass pattern |
 | Environment | `v` | Reveal the selected value until the selection moves |
 | Environment | `Tab` | Switch between the Local and Sandbox tabs |
-| Settings | `Tab` / `Shift+Tab` | Switch to the next or previous tab, or press its number |
-| Settings | `Space` | Use the selected web search backend, or stop using it |
+| Settings | `Tab` / `Shift+Tab` | Switch to the next or previous tab, or press its number (0 for the tenth) |
+| Settings | `Space` | Use or drop the selected backend, flip a switch, or step to the next choice |
 | Settings | `[` / `]` | Move the selected backend up or down the list |
 | Settings | `m` | Switch web search to its next mode |
-| Settings | `Enter` | Edit the selected backend's settings, or change the selected setting |
+| Settings | `Enter` | Edit the selected backend or setting; a list opens its own form |
 | Settings | `d` | Leave the backends to the environment, or reset the selected setting |
 | Settings | `Ctrl+R` | Show or mask credentials in a backend's form |
+| Settings | `/` | Filter every tab by key or table name; Esc clears it |
+| Settings | `?` | Open the selected setting's docs, as its [?] does |
+| Settings | `Shift+↑↓` | Scroll the selected setting's description |
+| Settings | `Shift+↑↓` | Move the selected item in a list's form |
+| Settings | `Delete` | Remove the selected item in a list's form while its line is empty |
 | Peer Manager | `1` / `2` / `3` | Switch Sessions / Held messages / Messages outside filter editing |
 | Peer Manager | `/` | Edit the current view's filter; Enter keeps it, Esc clears it |
 | Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus, or move between This session's controls |

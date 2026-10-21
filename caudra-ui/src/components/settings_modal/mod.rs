@@ -1,12 +1,15 @@
-//! `/settings`: the `[websearch]` backends with whether each is ready, and a tab per plain
-//! table of the global `caudra.toml`. Edits go to a background thread that writes the file and
-//! keeps its comments; the config watcher puts them in force.
+//! `/settings`: the `[websearch]` backends with whether each is ready, and a tab per group of
+//! plain tables of the global `caudra.toml`. Edits go to a background thread that writes the
+//! file and keeps its comments; the config watcher puts them in force.
 
 mod fields;
 mod form;
+mod list_form;
+mod plain;
 mod websearch;
 
 use std::mem;
+use std::ops::Range;
 
 use caudra_config::interpolation::holds_reference;
 use caudra_config::settings_file::{GlobalSettingsFile, ProjectSettings};
@@ -15,11 +18,13 @@ use caudra_config::websearch::{
     is_secret_key,
 };
 use caudra_config::{
-    AgentConfig, ConfigField, StorageConfig, TOP_LEVEL_FIELDS, UiConfig, WorktreesConfig,
+    AgentConfig, AutomationsConfig, AutopilotConfig, ConfigField, MessagingConfig, ProviderConfig,
+    RetentionConfig, SKILL_OPTIONS, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, UiConfig,
+    WorktreesConfig,
 };
 use caudra_grab::grab_scope;
 use caudra_workcell::BackendStatus;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
@@ -33,10 +38,16 @@ use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::section_tabs::{SectionTab, tab_strip};
-use crate::components::{Overlay, ascii_key, hover_style, plain_char};
+use crate::components::{Overlay, ascii_key, plain_char, selectable_row};
+use crate::event_loop::config_reload::ApplyTiming;
 use crate::theme::{self, Theme};
-use fields::{ScalarKind, current_bool, field_info, field_row, name_cols, scalar_fields};
+use fields::{
+    DOCS_BADGE, DOCS_BADGE_GAP, FieldKind, FieldRow, FieldState, current_bool, current_choice,
+    current_list, field_info, field_row, key_path, list_value, name_cols, next_choice,
+};
 use form::{FormField, FormKey, SettingsForm};
+use list_form::{ListForm, ListKey};
+use plain::{Group, PlainRow, filtered_rows, heading, tab_rows, timing_of};
 use websearch::{
     BackendRow, RowColumns, backend_info, backend_line, backend_rows, literal_warning, mode_line,
 };
@@ -46,29 +57,47 @@ pub(crate) const MOVE_UP_LABEL: &str = "[";
 pub(crate) const MOVE_DOWN_LABEL: &str = "]";
 pub(crate) const MODE_LABEL: &str = "m";
 pub(crate) const RESET_LABEL: &str = "d";
+pub(crate) const FILTER_LABEL: &str = "/";
+pub(crate) const DOCS_LABEL: &str = "?";
 const TOGGLE_KEY: char = ' ';
 const MOVE_UP_KEY: char = ascii_key(MOVE_UP_LABEL);
 const MOVE_DOWN_KEY: char = ascii_key(MOVE_DOWN_LABEL);
 const MODE_KEY: char = ascii_key(MODE_LABEL);
 const RESET_KEY: char = ascii_key(RESET_LABEL);
+const FILTER_KEY: char = ascii_key(FILTER_LABEL);
+const DOCS_KEY: char = ascii_key(DOCS_LABEL);
 const TITLE: &str = " Settings ";
-const WIDTH_PERCENT: u16 = 80;
+const WIDTH_PERCENT: u16 = 90;
 const MAX_HEIGHT_PERCENT: u16 = 85;
 const H_PAD: u16 = 1;
 const INFO_MAX_ROWS: u16 = 9;
+const MORE_ABOVE: &str = "▴";
+const MORE_BELOW: &str = "▾";
 const CURSOR_MARK: &str = "\u{203a} ";
 const NO_MARK: &str = "  ";
 const UI_TABLE: &[&str] = &["ui"];
 const AGENT_TABLE: &[&str] = &["agent"];
+const MESSAGING_TABLE: &[&str] = &["agent", "messaging"];
+const SKILL_TABLE: &[&str] = &["plugins", "skill"];
+const PROVIDER_TABLE: &[&str] = &["provider"];
 const STORAGE_TABLE: &[&str] = &["storage"];
+const SNAPSHOTS_TABLE: &[&str] = &["storage", "snapshots"];
+const RETENTION_TABLE: &[&str] = &["storage", "retention"];
 const WORKTREES_TABLE: &[&str] = &["worktrees"];
+const AUTOPILOT_TABLE: &[&str] = &["autopilot"];
+const AUTOMATIONS_TABLE: &[&str] = &["automations"];
 const ROOT_LEAD: &str = "Top-level keys of the global caudra.toml";
-const TABLE_LEAD_SUFFIX: &str = "] of the global caudra.toml";
-const TABLE_LEAD_PREFIX: &str = "[";
-const TABLE_SEPARATOR: &str = ".";
+const TABLE_LEAD_SUFFIX: &str = " of the global caudra.toml";
+const LEAD_SEPARATOR: &str = ", ";
+const FILTER_PREFIX: &str = "Filter: ";
+const FILTER_CURSOR: &str = "▏";
+const FILTER_HINT: &str = "  type a key or table name";
+const NO_MATCHES: &str = "No key matches.";
 const LOADING: &str = "Loading…";
 const SAVING: &str = "Saving…";
 const SAVED: &str = "Saved to the global caudra.toml.";
+const SAVED_APPLIES: &str = "Saved to the global caudra.toml; it applies ";
+const SENTENCE_END: &str = ".";
 const BUSY: &str = "Wait for the last change to finish.";
 const NOT_LOADED: &str = "Wait for the settings to load.";
 pub(crate) const REMOTE: &str =
@@ -89,8 +118,12 @@ pub(crate) enum SettingsTab {
     General,
     Ui,
     Agent,
+    Skills,
+    Provider,
     Storage,
     Worktrees,
+    Autopilot,
+    Automations,
 }
 
 impl SectionTab for SettingsTab {
@@ -99,8 +132,12 @@ impl SectionTab for SettingsTab {
         Self::General,
         Self::Ui,
         Self::Agent,
+        Self::Skills,
+        Self::Provider,
         Self::Storage,
         Self::Worktrees,
+        Self::Autopilot,
+        Self::Automations,
     ];
 
     fn label(self) -> &'static str {
@@ -109,22 +146,95 @@ impl SectionTab for SettingsTab {
             Self::General => "General",
             Self::Ui => "UI",
             Self::Agent => "Agent",
+            Self::Skills => "Skills",
+            Self::Provider => "Provider",
             Self::Storage => "Storage",
             Self::Worktrees => "Worktrees",
+            Self::Autopilot => "Autopilot",
+            Self::Automations => "Automations",
         }
     }
 }
 
+const GENERAL_GROUPS: &[Group] = &[Group {
+    table: &[],
+    fields: TOP_LEVEL_FIELDS,
+    docs: DocsTopic::ConfigTopLevel,
+}];
+const UI_GROUPS: &[Group] = &[Group {
+    table: UI_TABLE,
+    fields: UiConfig::FIELDS,
+    docs: DocsTopic::ConfigUi,
+}];
+const AGENT_GROUPS: &[Group] = &[
+    Group {
+        table: AGENT_TABLE,
+        fields: AgentConfig::FIELDS,
+        docs: DocsTopic::ConfigAgent,
+    },
+    Group {
+        table: MESSAGING_TABLE,
+        fields: MessagingConfig::FIELDS,
+        docs: DocsTopic::ConfigMessaging,
+    },
+];
+const SKILL_GROUPS: &[Group] = &[Group {
+    table: SKILL_TABLE,
+    fields: SKILL_OPTIONS,
+    docs: DocsTopic::ConfigSkills,
+}];
+const PROVIDER_GROUPS: &[Group] = &[Group {
+    table: PROVIDER_TABLE,
+    fields: ProviderConfig::FIELDS,
+    docs: DocsTopic::ConfigProvider,
+}];
+const STORAGE_GROUPS: &[Group] = &[
+    Group {
+        table: STORAGE_TABLE,
+        fields: StorageConfig::FIELDS,
+        docs: DocsTopic::ConfigStorage,
+    },
+    Group {
+        table: SNAPSHOTS_TABLE,
+        fields: SnapshotsConfig::FIELDS,
+        docs: DocsTopic::ConfigSnapshots,
+    },
+    Group {
+        table: RETENTION_TABLE,
+        fields: RetentionConfig::FIELDS,
+        docs: DocsTopic::ConfigRetention,
+    },
+];
+const WORKTREES_GROUPS: &[Group] = &[Group {
+    table: WORKTREES_TABLE,
+    fields: WorktreesConfig::FIELDS,
+    docs: DocsTopic::ConfigWorktrees,
+}];
+const AUTOPILOT_GROUPS: &[Group] = &[Group {
+    table: AUTOPILOT_TABLE,
+    fields: AutopilotConfig::FIELDS,
+    docs: DocsTopic::ConfigAutopilot,
+}];
+const AUTOMATIONS_GROUPS: &[Group] = &[Group {
+    table: AUTOMATIONS_TABLE,
+    fields: AutomationsConfig::FIELDS,
+    docs: DocsTopic::ConfigAutomations,
+}];
+
 impl SettingsTab {
-    /// The table a plain tab edits and its keys, `None` for Web search.
-    fn table(self) -> Option<(&'static [&'static str], &'static [ConfigField])> {
+    /// The tables a plain tab edits, none for Web search.
+    fn groups(self) -> &'static [Group] {
         match self {
-            Self::Websearch => None,
-            Self::General => Some((&[], TOP_LEVEL_FIELDS)),
-            Self::Ui => Some((UI_TABLE, UiConfig::FIELDS)),
-            Self::Agent => Some((AGENT_TABLE, AgentConfig::FIELDS)),
-            Self::Storage => Some((STORAGE_TABLE, StorageConfig::FIELDS)),
-            Self::Worktrees => Some((WORKTREES_TABLE, WorktreesConfig::FIELDS)),
+            Self::Websearch => &[],
+            Self::General => GENERAL_GROUPS,
+            Self::Ui => UI_GROUPS,
+            Self::Agent => AGENT_GROUPS,
+            Self::Skills => SKILL_GROUPS,
+            Self::Provider => PROVIDER_GROUPS,
+            Self::Storage => STORAGE_GROUPS,
+            Self::Worktrees => WORKTREES_GROUPS,
+            Self::Autopilot => AUTOPILOT_GROUPS,
+            Self::Automations => AUTOMATIONS_GROUPS,
         }
     }
 }
@@ -177,6 +287,8 @@ pub(crate) enum SettingsAction {
     Consumed,
     Close,
     Request(SettingsRequest),
+    /// Opens the docs over the modal, which stays open beneath.
+    OpenDocs(DocsTopic),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,6 +305,8 @@ enum FooterCommand {
     MoveDown,
     Mode,
     Reset,
+    Filter,
+    Docs,
     Section,
     Close,
 }
@@ -206,19 +320,31 @@ impl FooterCommand {
             Self::MoveDown => (MOVE_DOWN_LABEL, "Down"),
             Self::Mode => (MODE_LABEL, "Mode"),
             Self::Reset => (RESET_LABEL, "Reset"),
+            Self::Filter => (FILTER_LABEL, "Filter"),
+            Self::Docs => (DOCS_LABEL, "Docs"),
             Self::Section => (key::TAB.label, "Section"),
             Self::Close => (ESC_LABEL, "Close"),
         }
     }
 }
 
+/// A plain key a form saves to.
+#[derive(Clone, Copy)]
+struct KeyTarget {
+    table: &'static [&'static str],
+    field: &'static ConfigField,
+}
+
 /// What an open form saves to.
 enum FormTarget {
     Backend(WebsearchBackendName),
-    Key {
-        table: &'static [&'static str],
-        field: &'static ConfigField,
-    },
+    Key(KeyTarget),
+}
+
+/// Text that narrows the plain keys of every tab, typed while `focused`.
+struct Filter {
+    query: String,
+    focused: bool,
 }
 
 pub(crate) struct SettingsModal {
@@ -229,19 +355,28 @@ pub(crate) struct SettingsModal {
     data: Option<SettingsData>,
     /// The backend the Web search tab has selected, followed across a reorder.
     backend: WebsearchBackendName,
-    /// The key a plain tab has selected, by its place among the tab's scalar keys.
+    /// The plain row selected, by its place among the rows shown; always a key, never a heading.
     field: usize,
+    filter: Option<Filter>,
     form: Option<(SettingsForm, FormTarget)>,
+    list_form: Option<(ListForm, KeyTarget)>,
     work: Option<Work>,
+    /// When the key being written applies, for the message once it is saved.
+    saving: Option<ApplyTiming>,
     message: Option<String>,
     error: Option<String>,
     offset: usize,
+    info_scroll: u16,
     /// The selection moved, so the next draw scrolls it into view.
     reveal_cursor: bool,
     pointer: Option<Position>,
     popup: Rect,
     list_area: Rect,
+    info_area: Rect,
+    docs_hit: Option<Rect>,
     row_columns: RowColumns,
+    /// Each drawn row's choice chips, by row, as columns after the cursor mark.
+    row_chips: Vec<Vec<(Range<u16>, &'static str)>>,
     tab_hits: Vec<(Rect, SettingsTab)>,
     mode_hits: Vec<(Rect, WebsearchMode)>,
     footer: Vec<FooterCommand>,
@@ -257,16 +392,23 @@ impl SettingsModal {
             data: None,
             backend: WebsearchBackendName::ALL[0],
             field: 0,
+            filter: None,
             form: None,
+            list_form: None,
             work: None,
+            saving: None,
             message: None,
             error: None,
             offset: 0,
+            info_scroll: 0,
             reveal_cursor: false,
             pointer: None,
             popup: Rect::default(),
             list_area: Rect::default(),
+            info_area: Rect::default(),
+            docs_hit: None,
             row_columns: RowColumns::default(),
+            row_chips: Vec::new(),
             tab_hits: Vec::new(),
             mode_hits: Vec::new(),
             footer: Vec::new(),
@@ -293,6 +435,7 @@ impl SettingsModal {
             return;
         }
         let wrote = self.work == Some(Work::Write);
+        let saving = self.saving.take();
         self.work = None;
         self.reveal_cursor = true;
         let failure = reply
@@ -308,18 +451,32 @@ impl SettingsModal {
             })
             .err();
         self.error = reply.error.or(failure);
-        self.message = reply
-            .note
-            .or_else(|| (wrote && self.error.is_none()).then(|| SAVED.to_owned()));
+        self.message = reply.note.or_else(|| {
+            (wrote && self.error.is_none()).then(|| match saving {
+                Some(timing) => format!("{SAVED_APPLIES}{}{SENTENCE_END}", timing.suffix()),
+                None => SAVED.to_owned(),
+            })
+        });
     }
 
+    /// Whether typed text belongs to a form or the filter, rather than to the list's keys.
     pub(crate) fn text_input_active(&self) -> bool {
         self.form.is_some()
+            || self
+                .list_form
+                .as_ref()
+                .is_some_and(|(form, _)| form.takes_text())
+            || self.filter.as_ref().is_some_and(|filter| filter.focused)
     }
 
     pub(crate) fn handle_text(&mut self, text: &str, paste: bool) {
         if let Some((form, _)) = self.form.as_mut() {
             form.handle_text(text, paste);
+        } else if let Some((form, _)) = self.list_form.as_mut() {
+            form.handle_text(text, paste);
+        } else if let Some(filter) = self.filter.as_mut().filter(|filter| filter.focused) {
+            filter.query.push_str(text.trim_end_matches(['\n', '\r']));
+            self.select_first_key();
         }
     }
 
@@ -337,13 +494,25 @@ impl SettingsModal {
                 || self
                     .form
                     .as_ref()
+                    .is_some_and(|(form, _)| form.contains(position))
+                || self
+                    .list_form
+                    .as_ref()
                     .is_some_and(|(form, _)| form.contains(position)))
     }
 
-    /// The wheel moves the list, leaving the selection where it is.
-    pub(crate) fn scroll(&mut self, delta: i32) {
-        if self.form.is_none() {
-            let delta = isize::try_from(delta).unwrap_or_default();
+    /// The wheel moves the info pane under the pointer, else the list, leaving the selection
+    /// where it is.
+    pub(crate) fn scroll_at(&mut self, position: Position, delta: i32) {
+        if self.form.is_some() || self.list_form.is_some() {
+            return;
+        }
+        let delta = isize::try_from(delta).unwrap_or_default();
+        if self.info_area.contains(position) {
+            self.info_scroll =
+                u16::try_from(usize::from(self.info_scroll).saturating_add_signed(-delta))
+                    .unwrap_or(u16::MAX);
+        } else {
             self.offset = self.offset.saturating_add_signed(-delta);
         }
     }
@@ -359,13 +528,33 @@ impl SettingsModal {
                 FormKey::Submit => self.submit_form(),
             };
         }
+        if let Some((form, _)) = self.list_form.as_mut() {
+            return match form.handle_key(key) {
+                ListKey::Consumed => SettingsAction::Consumed,
+                ListKey::Cancel => {
+                    self.list_form = None;
+                    SettingsAction::Consumed
+                }
+                ListKey::Save(items) => self.submit_list(items),
+            };
+        }
         self.message = None;
+        if self.filter.as_ref().is_some_and(|filter| filter.focused) {
+            return self.handle_filter_key(key);
+        }
+        if key.code == KeyCode::Esc && self.filter.is_some() {
+            self.clear_filter();
+            return SettingsAction::Consumed;
+        }
         if key.code == KeyCode::Esc || key::QUIT.matches(key) {
             return SettingsAction::Close;
         }
+        let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Tab => self.set_tab(self.tab.step(1)),
             KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
+            KeyCode::Up if shifted => self.scroll_info(-1),
+            KeyCode::Down if shifted => self.scroll_info(1),
             KeyCode::Up => self.step(-1),
             KeyCode::Down => self.step(1),
             KeyCode::PageUp => self.step(-self.page()),
@@ -380,6 +569,8 @@ impl SettingsModal {
                     Some(MOVE_DOWN_KEY) => self.command(FooterCommand::MoveDown),
                     Some(MODE_KEY) => self.command(FooterCommand::Mode),
                     Some(RESET_KEY) => self.command(FooterCommand::Reset),
+                    Some(FILTER_KEY) => self.command(FooterCommand::Filter),
+                    Some(DOCS_KEY) => self.command(FooterCommand::Docs),
                     Some(digit) => {
                         if let Some(tab) = SettingsTab::from_digit(digit) {
                             self.set_tab(tab);
@@ -393,10 +584,38 @@ impl SettingsModal {
         SettingsAction::Consumed
     }
 
+    fn handle_filter_key(&mut self, key: KeyEvent) -> SettingsAction {
+        match key.code {
+            KeyCode::Esc => self.clear_filter(),
+            KeyCode::Enter | KeyCode::Down => {
+                if let Some(filter) = self.filter.as_mut() {
+                    filter.focused = false;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(filter) = self.filter.as_mut() {
+                    filter.query.pop();
+                }
+                self.select_first_key();
+            }
+            KeyCode::Tab => self.set_tab(self.tab.step(1)),
+            KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
+            KeyCode::Char(typed)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.handle_text(typed.encode_utf8(&mut [0; 4]), false);
+            }
+            _ => {}
+        }
+        SettingsAction::Consumed
+    }
+
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> SettingsAction {
         let position = Position::new(event.column, event.row);
         self.pointer = Some(position);
-        if self.form.is_some() {
+        if self.form.is_some() || self.list_form.is_some() {
             return SettingsAction::Consumed;
         }
         if let Some(index) = self.footer_hits.handle_mouse(event) {
@@ -409,6 +628,9 @@ impl SettingsModal {
             return SettingsAction::Consumed;
         }
         self.message = None;
+        if self.docs_hit.is_some_and(|hit| hit.contains(position)) {
+            return self.command(FooterCommand::Docs);
+        }
         if let Some(&(_, mode)) = self
             .mode_hits
             .iter()
@@ -445,9 +667,8 @@ impl SettingsModal {
             ..inner
         };
         let info = Paragraph::new(self.info_lines(&theme)).wrap(Wrap { trim: false });
-        let info_rows = u16::try_from(info.line_count(padded.width.max(1)))
-            .unwrap_or(u16::MAX)
-            .min(INFO_MAX_ROWS);
+        let info_total = u16::try_from(info.line_count(padded.width.max(1))).unwrap_or(u16::MAX);
+        let info_rows = info_total.min(INFO_MAX_ROWS);
         let [tabs, lead, _, list, info_area, status, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -463,12 +684,15 @@ impl SettingsModal {
         frame.render_widget(Paragraph::new(strip), tabs);
         self.render_lead(frame, lead, &theme);
         self.render_list(frame, list, &theme);
-        frame.render_widget(info, info_area);
+        self.render_info(frame, info_area, info, info_total, &theme);
         if let Some(line) = self.status_line(&theme) {
             frame.render_widget(Paragraph::new(line), status);
         }
         self.render_footer(frame, footer, &theme);
         if let Some((form, _)) = self.form.as_mut() {
+            form.view(frame, area);
+        }
+        if let Some((form, _)) = self.list_form.as_mut() {
             form.view(frame, area);
         }
         popup
@@ -479,69 +703,130 @@ impl SettingsModal {
         self.tab
     }
 
+    /// Whether the Web search tab shows, which a filter hides.
+    fn websearch_shown(&self) -> bool {
+        self.tab == SettingsTab::Websearch && self.filter.is_none()
+    }
+
     fn set_tab(&mut self, tab: SettingsTab) {
-        if tab == self.tab {
+        if tab == self.tab && self.filter.is_none() {
             return;
         }
         self.tab = tab;
+        self.filter = None;
         self.field = 0;
         self.offset = 0;
+        self.info_scroll = 0;
         self.mode_hits.clear();
         self.footer_hits.clear();
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter = None;
+        self.field = 0;
+        self.offset = 0;
+        self.info_scroll = 0;
+        self.reveal_cursor = true;
     }
 
     fn page(&self) -> isize {
         isize::try_from(self.list_area.height.max(1)).unwrap_or(isize::MAX)
     }
 
+    fn scroll_info(&mut self, delta: i16) {
+        self.info_scroll = self.info_scroll.saturating_add_signed(delta);
+    }
+
+    /// The rows a plain tab or the filter shows.
+    fn plain_rows(&self) -> Vec<PlainRow> {
+        match &self.filter {
+            Some(filter) => filtered_rows(
+                SettingsTab::ALL.iter().flat_map(|tab| tab.groups()),
+                &filter.query,
+            ),
+            None => tab_rows(self.tab.groups()),
+        }
+    }
+
+    fn select_first_key(&mut self) {
+        self.field = self
+            .plain_rows()
+            .iter()
+            .position(PlainRow::is_key)
+            .unwrap_or_default();
+        self.offset = 0;
+        self.info_scroll = 0;
+        self.reveal_cursor = true;
+    }
+
     fn cursor(&self) -> usize {
-        match self.tab {
-            SettingsTab::Websearch => self
+        match self.websearch_shown() {
+            true => self
                 .backend_order()
                 .iter()
                 .position(|backend| *backend == self.backend)
                 .unwrap_or_default(),
-            _ => self.field,
-        }
-    }
-
-    fn row_count(&self) -> usize {
-        match self.tab.table() {
-            None => WebsearchBackendName::ALL.len(),
-            Some((_, fields)) => scalar_fields(fields).len(),
+            false => self.field,
         }
     }
 
     fn step(&mut self, delta: isize) {
-        let count = self.row_count();
-        if count == 0 {
+        if self.websearch_shown() {
+            let last = WebsearchBackendName::ALL.len() - 1;
+            self.select(self.cursor().saturating_add_signed(delta).min(last));
             return;
         }
-        self.select(self.cursor().saturating_add_signed(delta).min(count - 1));
+        let keys: Vec<usize> = self
+            .plain_rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.is_key())
+            .map(|(index, _)| index)
+            .collect();
+        let Some(last) = keys.len().checked_sub(1) else {
+            return;
+        };
+        let at = keys
+            .iter()
+            .position(|index| *index >= self.field)
+            .unwrap_or(last);
+        self.select(keys[at.saturating_add_signed(delta).min(last)]);
     }
 
     fn select(&mut self, index: usize) {
         self.reveal_cursor = true;
-        match self.tab {
-            SettingsTab::Websearch => {
+        self.info_scroll = 0;
+        match self.websearch_shown() {
+            true => {
                 if let Some(backend) = self.backend_order().get(index) {
                     self.backend = *backend;
                 }
             }
-            _ => self.field = index.min(self.row_count().saturating_sub(1)),
+            false => {
+                if self.plain_rows().get(index).is_some_and(PlainRow::is_key) {
+                    self.field = index;
+                }
+            }
         }
     }
 
     fn click_row(&mut self, position: Position) -> SettingsAction {
         let index = self.offset + usize::from(position.y - self.list_area.y);
-        if index >= self.row_count() {
+        let rows = match self.websearch_shown() {
+            true => WebsearchBackendName::ALL.len(),
+            false => self.plain_rows().len(),
+        };
+        if index >= rows {
             return SettingsAction::Consumed;
         }
         let selected = index == self.cursor();
         self.select(index);
-        if self.tab == SettingsTab::Websearch {
-            let column = (position.x - self.list_area.x)
-                .saturating_sub(u16::try_from(CURSOR_MARK.width()).unwrap_or(u16::MAX));
+        if index != self.cursor() {
+            return SettingsAction::Consumed;
+        }
+        let column = (position.x - self.list_area.x)
+            .saturating_sub(u16::try_from(CURSOR_MARK.width()).unwrap_or(u16::MAX));
+        if self.websearch_shown() {
             let columns = &self.row_columns;
             if columns.check.contains(&column) {
                 return self.command(FooterCommand::Toggle);
@@ -552,6 +837,13 @@ impl SettingsModal {
             if columns.down.contains(&column) {
                 return self.command(FooterCommand::MoveDown);
             }
+        } else if let Some(choice) = self
+            .row_chips
+            .get(index)
+            .and_then(|chips| chips.iter().find(|(columns, _)| columns.contains(&column)))
+            .map(|(_, choice)| *choice)
+        {
+            return self.pick_choice(choice);
         }
         match selected {
             true => self.command(FooterCommand::Edit),
@@ -560,18 +852,36 @@ impl SettingsModal {
     }
 
     fn command(&mut self, command: FooterCommand) -> SettingsAction {
-        match (command, self.tab) {
+        let websearch = self.websearch_shown();
+        match (command, websearch) {
             (FooterCommand::Section, _) => {
                 self.set_tab(self.tab.step(1));
                 SettingsAction::Consumed
             }
             (FooterCommand::Close, _) => SettingsAction::Close,
+            (FooterCommand::Docs, _) => match self.docs_topic() {
+                Some(topic) => SettingsAction::OpenDocs(topic),
+                None => SettingsAction::Consumed,
+            },
+            (FooterCommand::Filter, _) => {
+                match self.filter.as_mut() {
+                    Some(filter) => filter.focused = true,
+                    None => {
+                        self.filter = Some(Filter {
+                            query: String::new(),
+                            focused: true,
+                        });
+                        self.select_first_key();
+                    }
+                }
+                SettingsAction::Consumed
+            }
             _ if self.refused() => SettingsAction::Consumed,
-            (FooterCommand::Toggle, SettingsTab::Websearch) => self.toggle_backend(),
-            (FooterCommand::Edit, SettingsTab::Websearch) => self.open_backend_form(),
-            (FooterCommand::MoveUp, SettingsTab::Websearch) => self.move_backend(false),
-            (FooterCommand::MoveDown, SettingsTab::Websearch) => self.move_backend(true),
-            (FooterCommand::Mode, SettingsTab::Websearch) => {
+            (FooterCommand::Toggle, true) => self.toggle_backend(),
+            (FooterCommand::Edit, true) => self.open_backend_form(),
+            (FooterCommand::MoveUp, true) => self.move_backend(false),
+            (FooterCommand::MoveDown, true) => self.move_backend(true),
+            (FooterCommand::Mode, true) => {
                 let modes = WebsearchMode::ALL;
                 let current = modes
                     .iter()
@@ -579,10 +889,10 @@ impl SettingsModal {
                     .unwrap_or_default();
                 self.pick_mode(modes[(current + 1) % modes.len()])
             }
-            (FooterCommand::Reset, SettingsTab::Websearch) => self.reset_backends(),
-            (FooterCommand::Toggle | FooterCommand::Edit, _) => self.change_field(),
-            (FooterCommand::Reset, _) => self.reset_field(),
-            (FooterCommand::MoveUp | FooterCommand::MoveDown | FooterCommand::Mode, _) => {
+            (FooterCommand::Reset, true) => self.reset_backends(),
+            (FooterCommand::Toggle | FooterCommand::Edit, false) => self.change_field(),
+            (FooterCommand::Reset, false) => self.reset_field(),
+            (FooterCommand::MoveUp | FooterCommand::MoveDown | FooterCommand::Mode, false) => {
                 SettingsAction::Consumed
             }
         }
@@ -594,7 +904,7 @@ impl SettingsModal {
             Some(BUSY)
         } else if self.data.is_none() {
             Some(NOT_LOADED)
-        } else if self.tab == SettingsTab::Websearch && !self.local {
+        } else if self.websearch_shown() && !self.local {
             Some(REMOTE)
         } else {
             None
@@ -610,6 +920,10 @@ impl SettingsModal {
             return SettingsAction::Consumed;
         };
         let files = Box::new(data.files.clone());
+        self.saving = match &edit {
+            SettingsEdit::Key { table, key, .. } => Some(timing_of(table, key)),
+            SettingsEdit::Websearch(_) => None,
+        };
         self.work = Some(Work::Write);
         self.error = None;
         self.message = None;
@@ -737,48 +1051,100 @@ impl SettingsModal {
         SettingsAction::Consumed
     }
 
-    /// The selected key of a plain tab, the table it sits in, and what the file holds for it.
-    fn selected_field(&self) -> Option<(&'static [&'static str], &'static ConfigField)> {
-        let (table, fields) = self.tab.table()?;
-        scalar_fields(fields)
-            .get(self.field)
-            .map(|field| (table, *field))
+    /// The selected plain key and the section of the reference that documents it.
+    fn selected_key(&self) -> Option<(KeyTarget, DocsTopic)> {
+        if self.websearch_shown() {
+            return None;
+        }
+        match self.plain_rows().get(self.field)? {
+            &PlainRow::Key { table, field, docs } => Some((KeyTarget { table, field }, docs)),
+            PlainRow::Heading(_) => None,
+        }
     }
 
     fn change_field(&mut self) -> SettingsAction {
-        let Some((table, field)) = self.selected_field() else {
+        let Some((target, _)) = self.selected_key() else {
             return SettingsAction::Consumed;
         };
         let Some(data) = &self.data else {
             return SettingsAction::Consumed;
         };
+        let KeyTarget { table, field } = target;
         let written = data.files.settings.get(table, field.name);
-        if ScalarKind::of(field) == Some(ScalarKind::Bool) {
-            let value = Value::from(!current_bool(field, written));
-            return self.commit(SettingsEdit::Key {
-                table,
-                key: field.name,
-                value: Some(value),
-            });
-        }
-        let initial = written.map(fields::written_text).unwrap_or_default();
         let title = format!("{FORM_TITLE_PREFIX}{}{FORM_TITLE_SUFFIX}", field.name);
-        let input = FormField::new(field.name, field.env, field.description, false, &initial);
-        self.form = Some((
-            SettingsForm::new(title, vec![input], FIELD_HINT),
-            FormTarget::Key { table, field },
-        ));
-        SettingsAction::Consumed
+        let value = match FieldKind::of(field) {
+            Some(FieldKind::Bool) => Value::from(!current_bool(field, written)),
+            Some(FieldKind::Choice) => Value::from(next_choice(field, written)),
+            Some(FieldKind::List) => {
+                let items = current_list(field, written);
+                let form = ListForm::new(title, field.description, items, field.choices);
+                self.list_form = Some((form, target));
+                return SettingsAction::Consumed;
+            }
+            _ => {
+                let initial = written.map(fields::written_text).unwrap_or_default();
+                let input =
+                    FormField::new(field.name, field.env, field.description, false, &initial);
+                self.form = Some((
+                    SettingsForm::new(title, vec![input], FIELD_HINT),
+                    FormTarget::Key(target),
+                ));
+                return SettingsAction::Consumed;
+            }
+        };
+        self.commit(SettingsEdit::Key {
+            table,
+            key: field.name,
+            value: Some(value),
+        })
+    }
+
+    fn pick_choice(&mut self, choice: &'static str) -> SettingsAction {
+        let Some((KeyTarget { table, field }, _)) = self.selected_key() else {
+            return SettingsAction::Consumed;
+        };
+        let unchanged = current_choice(
+            field,
+            self.data
+                .as_ref()
+                .and_then(|data| data.files.settings.get(table, field.name)),
+        ) == Some(choice);
+        if unchanged || self.refused() {
+            return SettingsAction::Consumed;
+        }
+        self.commit(SettingsEdit::Key {
+            table,
+            key: field.name,
+            value: Some(Value::from(choice)),
+        })
     }
 
     fn reset_field(&mut self) -> SettingsAction {
-        let Some((table, field)) = self.selected_field() else {
+        let Some((KeyTarget { table, field }, _)) = self.selected_key() else {
             return SettingsAction::Consumed;
         };
         self.commit(SettingsEdit::Key {
             table,
             key: field.name,
             value: None,
+        })
+    }
+
+    fn submit_list(&mut self, items: Vec<String>) -> SettingsAction {
+        let Some((_, KeyTarget { table, field })) = self.list_form.take() else {
+            return SettingsAction::Consumed;
+        };
+        let written = self
+            .data
+            .as_ref()
+            .and_then(|data| data.files.settings.get(table, field.name));
+        if written.is_some() && items == current_list(field, written) {
+            return SettingsAction::Consumed;
+        }
+        self.commit(SettingsEdit::Key {
+            table,
+            key: field.name,
+            value: Some(list_value(&items)),
         })
     }
 
@@ -814,9 +1180,9 @@ impl SettingsModal {
                     false => Ok(SettingsEdit::Websearch(edits)),
                 }
             }
-            &FormTarget::Key { table, field } => {
+            &FormTarget::Key(KeyTarget { table, field }) => {
                 let text = changes[0].1.clone().unwrap_or_default();
-                match ScalarKind::of(field).map(|kind| kind.parse(field, &text)) {
+                match FieldKind::of(field).map(|kind| kind.parse(field, &text)) {
                     Some(Ok(value)) => Ok(SettingsEdit::Key {
                         table,
                         key: field.name,
@@ -847,82 +1213,121 @@ impl SettingsModal {
                 .map(|(_, mode)| *mode)
         });
         self.mode_hits.clear();
-        let line = match self.tab.table() {
-            None => {
-                let (line, chips) = mode_line(self.effective_mode(), hovered, theme);
-                if line.width() <= usize::from(area.width) {
-                    self.mode_hits = chips
-                        .into_iter()
-                        .map(|(columns, mode)| {
-                            let hit = Rect::new(
-                                area.x.saturating_add(columns.start),
-                                area.y,
-                                columns.end.saturating_sub(columns.start),
-                                1,
-                            );
-                            (hit, mode)
-                        })
-                        .collect();
+        let line = if let Some(filter) = &self.filter {
+            let mut spans = vec![
+                Span::styled(FILTER_PREFIX, theme.tool_dim),
+                Span::raw(filter.query.clone()),
+            ];
+            if filter.focused {
+                spans.push(Span::styled(FILTER_CURSOR, theme.accent));
+                if filter.query.is_empty() {
+                    spans.push(Span::styled(FILTER_HINT, theme.input_placeholder));
                 }
-                line
             }
-            Some(([], _)) => Line::styled(ROOT_LEAD, theme.tool_dim),
-            Some((table, _)) => Line::styled(
-                format!(
-                    "{TABLE_LEAD_PREFIX}{}{TABLE_LEAD_SUFFIX}",
-                    table.join(TABLE_SEPARATOR)
+            Line::from(spans)
+        } else if self.tab == SettingsTab::Websearch {
+            let (line, chips) = mode_line(self.effective_mode(), hovered, theme);
+            if line.width() <= usize::from(area.width) {
+                self.mode_hits = chips
+                    .into_iter()
+                    .map(|(columns, mode)| {
+                        let hit = Rect::new(
+                            area.x.saturating_add(columns.start),
+                            area.y,
+                            columns.end.saturating_sub(columns.start),
+                            1,
+                        );
+                        (hit, mode)
+                    })
+                    .collect();
+            }
+            line
+        } else {
+            let tables: Vec<String> = self
+                .tab
+                .groups()
+                .iter()
+                .map(|group| heading(group.table))
+                .collect();
+            match tables.iter().all(String::is_empty) {
+                true => Line::styled(ROOT_LEAD, theme.tool_dim),
+                false => Line::styled(
+                    format!("{}{TABLE_LEAD_SUFFIX}", tables.join(LEAD_SEPARATOR)),
+                    theme.tool_dim,
                 ),
-                theme.tool_dim,
-            ),
+            }
         };
         frame.render_widget(Paragraph::new(line), area);
     }
 
     fn list_rows(&mut self, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+        self.row_chips.clear();
         let Some(data) = &self.data else {
             return Vec::new();
         };
-        match self.tab.table() {
-            None => {
-                let listed = websearch_listed(data);
-                let rows = backend_rows(&listed, &data.statuses);
-                let mut columns = RowColumns::default();
-                let lines = rows
-                    .iter()
-                    .map(|row| {
-                        let (spans, row_columns) = backend_line(row, listed.len(), theme);
-                        columns = row_columns;
-                        spans
-                    })
-                    .collect();
-                self.row_columns = columns;
-                lines
-            }
-            Some((table, fields)) => {
-                let fields = scalar_fields(fields);
-                let width = name_cols(&fields);
-                fields
-                    .iter()
-                    .map(|field| {
-                        field_row(
-                            field,
-                            data.files.settings.get(table, field.name),
-                            data.project.sets(table, field.name),
-                            width,
-                            theme,
-                        )
-                    })
-                    .collect()
-            }
+        if self.websearch_shown() {
+            let listed = websearch_listed(data);
+            let rows = backend_rows(&listed, &data.statuses);
+            let mut columns = RowColumns::default();
+            let lines = rows
+                .iter()
+                .map(|row| {
+                    let (spans, row_columns) = backend_line(row, listed.len(), theme);
+                    columns = row_columns;
+                    spans
+                })
+                .collect();
+            self.row_columns = columns;
+            return lines;
         }
+        let rows = self.plain_rows();
+        let width = name_cols(rows.iter().filter_map(|row| match row {
+            PlainRow::Key { field, .. } => Some(*field),
+            PlainRow::Heading(_) => None,
+        }));
+        let mut chips = Vec::with_capacity(rows.len());
+        let lines = rows
+            .iter()
+            .map(|row| match *row {
+                PlainRow::Heading(table) => {
+                    chips.push(Vec::new());
+                    let text = match table.is_empty() {
+                        true => ROOT_LEAD.to_owned(),
+                        false => heading(table),
+                    };
+                    vec![Span::styled(text, theme.tool_dim)]
+                }
+                PlainRow::Key { table, field, .. } => {
+                    let FieldRow {
+                        spans,
+                        chips: row_chips,
+                    } = field_row(
+                        field,
+                        data.files.settings.get(table, field.name),
+                        data.project.sets(table, field.name),
+                        width,
+                        theme,
+                    );
+                    chips.push(row_chips);
+                    spans
+                }
+            })
+            .collect();
+        self.row_chips = chips;
+        lines
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.list_area = area;
         let rows = self.list_rows(theme);
         if rows.is_empty() {
-            if self.work == Some(Work::Load) {
-                frame.render_widget(Paragraph::new(Line::styled(LOADING, theme.tool_dim)), area);
+            let text = match (self.work, &self.filter) {
+                (Some(Work::Load), _) => Some(LOADING),
+                (_, Some(_)) if self.data.is_some() => Some(NO_MATCHES),
+                _ => None,
+            };
+            if let Some(text) = text {
+                frame.render_widget(Paragraph::new(Line::styled(text, theme.tool_dim)), area);
             }
             return;
         }
@@ -953,46 +1358,85 @@ impl SettingsModal {
                 };
                 let mut spans = vec![Span::styled(mark, theme.accent)];
                 spans.extend(row);
-                let style = match selected {
-                    true => theme.item_selected,
-                    false => Style::default(),
-                };
-                Line::from(ellipsize_spans(spans, width))
-                    .style(hover_style(style, hovered == Some(index)))
+                selectable_row(
+                    ellipsize_spans(spans, width),
+                    selected.then_some(theme.item_selected),
+                    hovered == Some(index),
+                )
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_info(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        info: Paragraph<'static>,
+        total: u16,
+        theme: &Theme,
+    ) {
+        self.info_area = area;
+        self.info_scroll = self.info_scroll.min(total.saturating_sub(area.height));
+        frame.render_widget(info.scroll((self.info_scroll, 0)), area);
+        if area.width > 0 && area.height > 0 {
+            let column = area.right() - 1;
+            if self.info_scroll > 0 {
+                let at = Rect::new(column, area.y, 1, 1);
+                frame.render_widget(Paragraph::new(Span::styled(MORE_ABOVE, theme.tool_dim)), at);
+            }
+            if self.info_scroll.saturating_add(area.height) < total {
+                let at = Rect::new(column, area.bottom() - 1, 1, 1);
+                frame.render_widget(Paragraph::new(Span::styled(MORE_BELOW, theme.tool_dim)), at);
+            }
+        }
+        self.docs_hit = self
+            .selected_key()
+            .filter(|_| self.info_scroll == 0 && area.height > 0)
+            .and_then(|(KeyTarget { table, field }, _)| {
+                let start = key_path(table, field).width() + DOCS_BADGE_GAP.width();
+                let end = start + DOCS_BADGE.width();
+                (end <= usize::from(area.width)).then(|| {
+                    Rect::new(
+                        area.x + u16::try_from(start).unwrap_or(u16::MAX),
+                        area.y,
+                        u16::try_from(DOCS_BADGE.width()).unwrap_or(u16::MAX),
+                        1,
+                    )
+                })
+            });
     }
 
     fn info_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
         let Some(data) = &self.data else {
             return Vec::new();
         };
-        match self.tab.table() {
-            None => {
-                let listed = websearch_listed(data);
-                let rows = backend_rows(&listed, &data.statuses);
-                rows.iter()
-                    .find(|row| row.backend == self.backend)
-                    .map(|row: &BackendRow| {
-                        let written = data.files.websearch.written();
-                        backend_info(row, written, written.backends.is_none(), theme)
-                    })
-                    .unwrap_or_default()
-            }
-            Some((table, _)) => self
-                .selected_field()
-                .map(|(_, field)| {
-                    field_info(
-                        field,
-                        table,
-                        data.files.settings.get(table, field.name),
-                        data.project.sets(table, field.name),
-                        theme,
-                    )
+        if self.websearch_shown() {
+            let listed = websearch_listed(data);
+            let rows = backend_rows(&listed, &data.statuses);
+            return rows
+                .iter()
+                .find(|row| row.backend == self.backend)
+                .map(|row: &BackendRow| {
+                    let written = data.files.websearch.written();
+                    backend_info(row, written, written.backends.is_none(), theme)
                 })
-                .unwrap_or_default(),
+                .unwrap_or_default();
         }
+        self.selected_key()
+            .map(|(KeyTarget { table, field }, _)| {
+                let state = FieldState {
+                    written: data.files.settings.get(table, field.name),
+                    overridden: data.project.sets(table, field.name),
+                    timing: timing_of(table, field.name),
+                    badge_hovered: self
+                        .pointer
+                        .zip(self.docs_hit)
+                        .is_some_and(|(at, hit)| hit.contains(at)),
+                };
+                field_info(field, table, state, theme)
+            })
+            .unwrap_or_default()
     }
 
     fn status_line(&self, theme: &Theme) -> Option<Line<'static>> {
@@ -1002,7 +1446,7 @@ impl SettingsModal {
             (error.clone(), theme.error)
         } else if let Some(message) = &self.message {
             (message.clone(), theme.tool_dim)
-        } else if self.tab == SettingsTab::Websearch && !self.local {
+        } else if self.websearch_shown() && !self.local {
             (REMOTE.to_owned(), theme.tool_warning)
         } else {
             return None;
@@ -1011,9 +1455,9 @@ impl SettingsModal {
     }
 
     fn footer_commands(&self) -> Vec<FooterCommand> {
-        let mut commands = match self.tab {
-            SettingsTab::Websearch if !self.local => Vec::new(),
-            SettingsTab::Websearch => vec![
+        let mut commands = match self.websearch_shown() {
+            true if !self.local => Vec::new(),
+            true => vec![
                 FooterCommand::Toggle,
                 FooterCommand::MoveUp,
                 FooterCommand::MoveDown,
@@ -1021,9 +1465,14 @@ impl SettingsModal {
                 FooterCommand::Edit,
                 FooterCommand::Reset,
             ],
-            _ => vec![FooterCommand::Edit, FooterCommand::Reset],
+            false => vec![FooterCommand::Edit, FooterCommand::Reset],
         };
-        commands.extend([FooterCommand::Section, FooterCommand::Close]);
+        commands.extend([
+            FooterCommand::Filter,
+            FooterCommand::Docs,
+            FooterCommand::Section,
+            FooterCommand::Close,
+        ]);
         commands
     }
 
@@ -1053,11 +1502,14 @@ impl Default for SettingsModal {
 }
 
 impl Overlay for SettingsModal {
+    /// The selected key's section of the reference, else the tab's first table's.
     fn docs_topic(&self) -> Option<DocsTopic> {
-        Some(match self.tab {
-            SettingsTab::Websearch => DocsTopic::WebSearch,
-            _ => DocsTopic::Settings,
-        })
+        if self.websearch_shown() {
+            return Some(DocsTopic::WebSearch);
+        }
+        self.selected_key()
+            .map(|(_, docs)| docs)
+            .or_else(|| self.tab.groups().first().map(|group| group.docs))
     }
 
     fn is_open(&self) -> bool {
@@ -1101,6 +1553,7 @@ fn footer_line(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     use caudra_config::config_file::CONFIG_VERSION;
     use crossterm::event::KeyModifiers;
@@ -1110,6 +1563,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use fields::editable_fields;
 
     const CONFIG_NAME: &str = "caudra.toml";
     const PROJECT_CONFIG_NAME: &str = "project.toml";
@@ -1123,9 +1577,48 @@ mod tests {
     const BRAVE_TABLE: &str = "\n[websearch.brave]\n";
     const BRAVE_ONLY: &str = "[websearch]\nbackends = [\"brave\"]\n";
 
+    const SMALL_WIDTH: u16 = 40;
+    /// Room for every tab's name in the strip.
+    const WIDE_WIDTH: u16 = 160;
+    const CACHE_WARMING: &str = "cache_warming";
+    const DISABLED_TOOLS: &str = "disabled_tools";
+    const SHOW_DECISIONS: &str = "show_decisions";
+    const UPDATE_CHECK: &str = "update_check";
+    const TOOL_NAME: &str = "shell";
+    const FILTER_QUERY: &str = "CACHE_WARM";
+    const PSTACK: &str = "pstack";
+    const TENTH_TAB_KEY: char = '0';
+
     struct Fixture {
         _dir: TempDir,
+        path: PathBuf,
         modal: SettingsModal,
+    }
+
+    impl Fixture {
+        /// Answers the request in flight with the file as it is now.
+        fn reload(&mut self) {
+            self.modal
+                .receive(reply(&self.path, ProjectSettings::default()));
+        }
+    }
+
+    fn reply(path: &Path, project: ProjectSettings) -> SettingsReply {
+        let files = SettingsFiles {
+            settings: GlobalSettingsFile::load(path).expect("settings file"),
+            websearch: GlobalWebsearchFile::load(path).expect("websearch file"),
+        };
+        SettingsReply {
+            data: Ok(Box::new(SettingsData {
+                files,
+                project,
+                statuses: Vec::new(),
+                default_backends: vec![WebsearchBackendName::ExaMcp],
+                default_mode: WebsearchMode::Fallback,
+            })),
+            error: None,
+            note: None,
+        }
     }
 
     fn opened(contents: &str, local: bool) -> Fixture {
@@ -1144,22 +1637,39 @@ mod tests {
         });
         let mut modal = SettingsModal::new();
         modal.open(local);
-        let files = SettingsFiles {
-            settings: GlobalSettingsFile::load(&path).expect("settings file"),
-            websearch: GlobalWebsearchFile::load(&path).expect("websearch file"),
-        };
-        modal.receive(SettingsReply {
-            data: Ok(Box::new(SettingsData {
-                files,
-                project,
-                statuses: Vec::new(),
-                default_backends: vec![WebsearchBackendName::ExaMcp],
-                default_mode: WebsearchMode::Fallback,
-            })),
-            error: None,
-            note: None,
-        });
-        Fixture { _dir: dir, modal }
+        modal.receive(reply(&path, project));
+        Fixture {
+            _dir: dir,
+            path,
+            modal,
+        }
+    }
+
+    /// Selects `table.name` on `tab`, returning its row.
+    fn select_key(
+        modal: &mut SettingsModal,
+        tab: SettingsTab,
+        table: &[&str],
+        name: &str,
+    ) -> usize {
+        modal.set_tab(tab);
+        let index = modal
+            .plain_rows()
+            .iter()
+            .position(|row| {
+                matches!(row, PlainRow::Key { table: shown, field, .. }
+                    if *shown == table && field.name == name)
+            })
+            .expect("the key on its tab");
+        modal.select(index);
+        index
+    }
+
+    fn agent_field(name: &str) -> &'static ConfigField {
+        AgentConfig::FIELDS
+            .iter()
+            .find(|field| field.name == name)
+            .expect("an [agent] key")
     }
 
     fn press(modal: &mut SettingsModal, code: KeyCode) -> SettingsAction {
@@ -1186,8 +1696,11 @@ mod tests {
     }
 
     fn screen(modal: &mut SettingsModal) -> String {
-        let mut terminal =
-            Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).expect("terminal");
+        screen_of(modal, SCREEN_WIDTH)
+    }
+
+    fn screen_of(modal: &mut SettingsModal, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, SCREEN_HEIGHT)).expect("terminal");
         terminal
             .draw(|frame| {
                 modal.view(frame, frame.area());
@@ -1335,10 +1848,15 @@ mod tests {
     }
 
     fn bool_field_index() -> usize {
-        scalar_fields(TOP_LEVEL_FIELDS)
-            .iter()
-            .position(|field| ScalarKind::of(field) == Some(ScalarKind::Bool))
+        editable_fields(TOP_LEVEL_FIELDS)
+            .position(|field| FieldKind::of(field) == Some(FieldKind::Bool))
             .expect("a top-level bool key")
+    }
+
+    fn top_level_field(index: usize) -> &'static ConfigField {
+        editable_fields(TOP_LEVEL_FIELDS)
+            .nth(index)
+            .expect("a top-level key")
     }
 
     #[test]
@@ -1350,7 +1868,7 @@ mod tests {
         for _ in 0..index {
             press(&mut fixture.modal, KeyCode::Down);
         }
-        let field = scalar_fields(TOP_LEVEL_FIELDS)[index];
+        let field = top_level_field(index);
         let (table, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Char(TOGGLE_KEY)));
         assert!(table.is_empty());
         assert_eq!(key, field.name);
@@ -1363,7 +1881,7 @@ mod tests {
     #[test_case(true; "a_key_the_project_sets")]
     #[test_case(false; "no_project_file")]
     fn a_project_override_is_marked(overridden: bool) {
-        let key = scalar_fields(TOP_LEVEL_FIELDS)[0].name;
+        let key = top_level_field(0).name;
         let project = format!("{key} = 1\n");
         let mut fixture = opened_in("", overridden.then_some(project.as_str()), true);
         press(&mut fixture.modal, KeyCode::Tab);
@@ -1378,7 +1896,7 @@ mod tests {
         let mut fixture = opened("", true);
         press(&mut fixture.modal, KeyCode::Tab);
         let (_, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Char(RESET_KEY)));
-        assert_eq!(key, scalar_fields(TOP_LEVEL_FIELDS)[0].name);
+        assert_eq!(key, top_level_field(0).name);
         assert!(value.is_none());
     }
 
@@ -1511,6 +2029,220 @@ mod tests {
         let mut fixture = opened("", true);
         assert_eq!(fixture.modal.docs_topic(), Some(DocsTopic::WebSearch));
         press(&mut fixture.modal, KeyCode::Tab);
-        assert_eq!(fixture.modal.docs_topic(), Some(DocsTopic::Settings));
+        assert_eq!(fixture.modal.docs_topic(), Some(DocsTopic::ConfigTopLevel));
+    }
+
+    #[test]
+    fn space_moves_a_choice_key_to_its_next_choice() {
+        let mut fixture = opened("", true);
+        select_key(
+            &mut fixture.modal,
+            SettingsTab::Agent,
+            AGENT_TABLE,
+            CACHE_WARMING,
+        );
+        let (table, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Char(TOGGLE_KEY)));
+        assert_eq!((table, key), (AGENT_TABLE, CACHE_WARMING));
+        assert_eq!(
+            value.as_ref().and_then(Value::as_str),
+            Some(next_choice(agent_field(CACHE_WARMING), None))
+        );
+    }
+
+    #[test]
+    fn clicking_a_chip_picks_its_choice() {
+        let mut fixture = opened("", true);
+        let index = select_key(
+            &mut fixture.modal,
+            SettingsTab::Agent,
+            AGENT_TABLE,
+            CACHE_WARMING,
+        );
+        screen(&mut fixture.modal);
+        let current = current_choice(agent_field(CACHE_WARMING), None);
+        let (columns, choice) = fixture.modal.row_chips[index]
+            .iter()
+            .find(|(_, choice)| Some(*choice) != current)
+            .cloned()
+            .expect("another chip");
+        let list = fixture.modal.list_area;
+        let at = Position::new(
+            list.x + u16::try_from(CURSOR_MARK.width()).expect("mark width") + columns.start,
+            list.y + u16::try_from(index - fixture.modal.offset).expect("visible row"),
+        );
+        let (_, _, value) = key_edit(click(&mut fixture.modal, at));
+        assert_eq!(value.as_ref().and_then(Value::as_str), Some(choice));
+    }
+
+    #[test]
+    fn the_list_editor_saves_a_typed_item() {
+        let mut fixture = opened("", true);
+        select_key(
+            &mut fixture.modal,
+            SettingsTab::Agent,
+            AGENT_TABLE,
+            DISABLED_TOOLS,
+        );
+        press(&mut fixture.modal, KeyCode::Enter);
+        assert!(fixture.modal.text_input_active());
+        type_text(&mut fixture.modal, TOOL_NAME);
+        press(&mut fixture.modal, KeyCode::Enter);
+        let (_, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Enter));
+        assert_eq!(key, DISABLED_TOOLS);
+        let items: Vec<&str> = value
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("a list")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(items, [TOOL_NAME]);
+    }
+
+    #[test]
+    fn the_filter_finds_a_key_on_another_tab() {
+        let mut fixture = opened("", true);
+        press(&mut fixture.modal, KeyCode::Char(FILTER_KEY));
+        assert!(fixture.modal.text_input_active());
+        type_text(&mut fixture.modal, FILTER_QUERY);
+        let keys: Vec<&str> = fixture
+            .modal
+            .plain_rows()
+            .iter()
+            .filter_map(|row| match row {
+                PlainRow::Key { field, .. } => Some(field.name),
+                PlainRow::Heading(_) => None,
+            })
+            .collect();
+        assert_eq!(keys, [CACHE_WARMING]);
+        press(&mut fixture.modal, KeyCode::Enter);
+        assert!(!fixture.modal.text_input_active());
+        let (table, key, _) = key_edit(press(&mut fixture.modal, KeyCode::Char(TOGGLE_KEY)));
+        assert_eq!((table, key), (AGENT_TABLE, CACHE_WARMING));
+    }
+
+    #[test]
+    fn zero_opens_the_tenth_tab() {
+        let mut fixture = opened("", true);
+        press(&mut fixture.modal, KeyCode::Char(TENTH_TAB_KEY));
+        assert_eq!(Some(&fixture.modal.tab()), SettingsTab::ALL.get(9));
+        let label = format!("{TENTH_TAB_KEY} {}", fixture.modal.tab().label());
+        assert!(screen_of(&mut fixture.modal, WIDE_WIDTH).contains(&label));
+    }
+
+    #[test]
+    fn space_turns_on_a_builtin_skill() {
+        let mut fixture = opened("", true);
+        select_key(&mut fixture.modal, SettingsTab::Skills, SKILL_TABLE, PSTACK);
+        let (table, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Char(TOGGLE_KEY)));
+        assert_eq!((table, key), (SKILL_TABLE, PSTACK));
+        assert_eq!(
+            value.and_then(|value| value.as_bool()),
+            Some(!caudra_config::DEFAULT_SKILL_PSTACK)
+        );
+    }
+
+    /// A terminal without enhanced keys sends typing as key presses, with no text.
+    #[test]
+    fn the_filter_takes_typed_keys() {
+        let mut fixture = opened("", true);
+        press(&mut fixture.modal, KeyCode::Char(FILTER_KEY));
+        for typed in FILTER_QUERY.chars() {
+            press(&mut fixture.modal, KeyCode::Char(typed));
+        }
+        press(&mut fixture.modal, KeyCode::Backspace);
+        let query = fixture
+            .modal
+            .filter
+            .as_ref()
+            .map(|filter| filter.query.as_str());
+        assert_eq!(query, FILTER_QUERY.get(..FILTER_QUERY.len() - 1));
+    }
+
+    #[test]
+    fn escape_clears_the_filter_before_closing() {
+        let mut fixture = opened("", true);
+        press(&mut fixture.modal, KeyCode::Char(FILTER_KEY));
+        type_text(&mut fixture.modal, FILTER_QUERY);
+        press(&mut fixture.modal, KeyCode::Enter);
+        assert!(matches!(
+            press(&mut fixture.modal, KeyCode::Esc),
+            SettingsAction::Consumed
+        ));
+        assert!(fixture.modal.filter.is_none());
+        assert_eq!(fixture.modal.tab(), SettingsTab::Websearch);
+        assert!(matches!(
+            press(&mut fixture.modal, KeyCode::Esc),
+            SettingsAction::Close
+        ));
+    }
+
+    #[test]
+    fn the_docs_key_opens_the_selected_keys_section() {
+        let mut fixture = opened("", true);
+        let name = editable_fields(SnapshotsConfig::FIELDS)
+            .next()
+            .expect("a snapshots key")
+            .name;
+        select_key(
+            &mut fixture.modal,
+            SettingsTab::Storage,
+            SNAPSHOTS_TABLE,
+            name,
+        );
+        assert!(matches!(
+            press(&mut fixture.modal, KeyCode::Char(DOCS_KEY)),
+            SettingsAction::OpenDocs(DocsTopic::ConfigSnapshots)
+        ));
+    }
+
+    #[test]
+    fn clicking_the_info_badge_opens_the_docs() {
+        let mut fixture = opened("", true);
+        press(&mut fixture.modal, KeyCode::Tab);
+        screen(&mut fixture.modal);
+        let hit = fixture.modal.docs_hit.expect("a docs badge");
+        assert!(matches!(
+            click(&mut fixture.modal, hit.as_position()),
+            SettingsAction::OpenDocs(DocsTopic::ConfigTopLevel)
+        ));
+    }
+
+    #[test_case(SettingsTab::Ui, UI_TABLE, SHOW_DECISIONS, ApplyTiming::Now; "a_key_read_at_once")]
+    #[test_case(SettingsTab::Skills, SKILL_TABLE, PSTACK, ApplyTiming::Now; "a_skill_switch")]
+    #[test_case(SettingsTab::Agent, AGENT_TABLE, CACHE_WARMING, ApplyTiming::NextTurn; "an_agent_key")]
+    #[test_case(SettingsTab::Ui, UI_TABLE, UPDATE_CHECK, ApplyTiming::Reload; "a_key_read_on_reload")]
+    fn a_saved_key_says_when_it_applies(
+        tab: SettingsTab,
+        table: &[&str],
+        name: &str,
+        timing: ApplyTiming,
+    ) {
+        let mut fixture = opened("", true);
+        select_key(&mut fixture.modal, tab, table, name);
+        key_edit(press(&mut fixture.modal, KeyCode::Char(RESET_KEY)));
+        fixture.reload();
+        assert_eq!(
+            fixture.modal.message,
+            Some(format!("{SAVED_APPLIES}{}{SENTENCE_END}", timing.suffix()))
+        );
+    }
+
+    #[test]
+    fn shift_down_scrolls_help_too_long_for_the_pane() {
+        let mut fixture = opened("", true);
+        select_key(
+            &mut fixture.modal,
+            SettingsTab::Ui,
+            UI_TABLE,
+            SHOW_DECISIONS,
+        );
+        let before = screen_of(&mut fixture.modal, SMALL_WIDTH);
+        assert!(before.contains(MORE_BELOW));
+        assert!(!before.contains(MORE_ABOVE));
+        fixture
+            .modal
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(screen_of(&mut fixture.modal, SMALL_WIDTH).contains(MORE_ABOVE));
     }
 }

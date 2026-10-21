@@ -10,6 +10,8 @@ Settings go in `caudra.toml`. It has two places, and both are optional:
 
 When both exist, project settings override global ones field by field. A few settings are global-only, and their descriptions say so. Caudra notices when either file changes while it runs, see [Hot reload](#hot-reload). `/reload` reads both files again, except for the [experimental switches](#experimental-features), which apply from startup.
 
+In the terminal UI, `/settings` edits most tables of the global `caudra.toml` for you and keeps your comments. Each key shows its description, its allowed values and default, and when an edit applies. Its `[?]` opens the key's section of this page, and `/` filters every tab by key or table name.
+
 Settings apply in this order, and each layer overrides the ones before it:
 
 1. Built-in defaults

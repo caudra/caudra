@@ -246,9 +246,48 @@ impl SettingsTables {
     }
 }
 
-/// When each changed key applies, by name only: `[decisions]`, `[web]`, `[websearch]` and `ui.show_decisions` at
-/// once, `[agent]` and `[autopilot]` from the next turn, `[experimental]` after a restart,
-/// everything else after `/reload`. `None` when no key changed, as for an edit to a comment.
+/// When a key that changed in the global or project `caudra.toml` takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyTiming {
+    Now,
+    NextTurn,
+    Reload,
+    Restart,
+}
+
+impl ApplyTiming {
+    /// In the order a note lists them, which is also their discriminant order.
+    const ALL: [Self; 4] = [Self::Now, Self::NextTurn, Self::Reload, Self::Restart];
+
+    /// How a sentence ends that says when the change applies, such as `after /reload`.
+    pub(crate) const fn suffix(self) -> &'static str {
+        match self {
+            Self::Now => NOW_SUFFIX,
+            Self::NextTurn => LIVE_SUFFIX,
+            Self::Reload => RELOAD_SUFFIX,
+            Self::Restart => RESTART_SUFFIX,
+        }
+    }
+}
+
+/// When `key` of the top-level table `table` applies: `[decisions]`, `[web]`, `[websearch]` and
+/// the [`NOW_KEYS`] at once, `[agent]` and `[autopilot]` from the next turn, `[experimental]`
+/// after a restart, everything else after `/reload`. A top-level key is its own `table` with an
+/// empty `key`, and `key` may be a dotted path into the table.
+pub(crate) fn apply_timing(table: &str, key: &str) -> ApplyTiming {
+    if NOW_TABLES.contains(&table) || NOW_KEYS.contains(&(table, key)) {
+        ApplyTiming::Now
+    } else if LIVE_TABLES.contains(&table) {
+        ApplyTiming::NextTurn
+    } else if table == STARTUP_TABLE {
+        ApplyTiming::Restart
+    } else {
+        ApplyTiming::Reload
+    }
+}
+
+/// When each changed key applies, by [`apply_timing`]. `None` when no key changed, as for an
+/// edit to a comment.
 fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
     let label = |key: &str, table: bool| {
         if table {
@@ -257,35 +296,17 @@ fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
             key.to_owned()
         }
     };
-    let applies_now = |key: &str| {
-        NOW_TABLES.contains(&key)
-            || key
-                .split_once('.')
-                .is_some_and(|split| NOW_KEYS.contains(&split))
-    };
-    let mut now = Vec::new();
-    let mut live = Vec::new();
-    let mut reload = Vec::new();
-    let mut restart = Vec::new();
+    let mut buckets: [Vec<String>; ApplyTiming::ALL.len()] = Default::default();
     for (key, &table) in changed {
-        let bucket = match key.as_str() {
-            key if applies_now(key) => &mut now,
-            key if LIVE_TABLES.contains(&key) => &mut live,
-            STARTUP_TABLE => &mut restart,
-            _ => &mut reload,
-        };
-        bucket.push(label(key, table));
+        let (top, rest) = key.split_once(KEY_PATH_SEPARATOR).unwrap_or((key, ""));
+        buckets[apply_timing(top, rest) as usize].push(label(key, table));
     }
-    let parts: Vec<String> = [
-        (now, NOW_SUFFIX),
-        (live, LIVE_SUFFIX),
-        (reload, RELOAD_SUFFIX),
-        (restart, RESTART_SUFFIX),
-    ]
-    .into_iter()
-    .filter(|(keys, _)| !keys.is_empty())
-    .map(|(keys, suffix)| format!("{} {suffix}", keys.join(LIST_SEPARATOR)))
-    .collect();
+    let parts: Vec<String> = ApplyTiming::ALL
+        .into_iter()
+        .zip(buckets)
+        .filter(|(_, keys)| !keys.is_empty())
+        .map(|(timing, keys)| format!("{} {}", keys.join(LIST_SEPARATOR), timing.suffix()))
+        .collect();
     (!parts.is_empty()).then(|| parts.join(LIST_SEPARATOR))
 }
 

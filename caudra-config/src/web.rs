@@ -87,6 +87,7 @@ impl WebConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Exact `HOST:PORT` targets on loopback or private networks that `webfetch` may reach, such as `\"localhost:3000\"` or `\"[fd7a::1]:80\"`. The port is required",
         },
         ConfigField {
@@ -96,6 +97,7 @@ impl WebConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Networks `webfetch` may reach on any port: `loopback`, `private`, `cgnat`, `tailscale`, or a CIDR such as `\"10.20.0.0/16\"`. Every private address a name resolves to must be inside one",
         },
     ];

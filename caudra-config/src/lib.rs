@@ -314,6 +314,60 @@ const LEGACY_PLUGIN_TOOLS: &[(&str, &[&str])] = &[
 /// stay out of the resolved list instead of sitting in it matching nothing.
 const TOOLLESS_PLUGINS: &[&str] = &["list", "sessions", "tool_output"];
 
+/// The builtin skills `[plugins.skill]` turns on and off.
+pub const SKILL_OPTIONS: &[ConfigField] = &[
+    ConfigField {
+        name: SKILL_PLUGIN_DEV_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_PLUGIN_DEV),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`.",
+    },
+    ConfigField {
+        name: SKILL_WORKFLOW_DEV_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_WORKFLOW_DEV),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`.",
+    },
+    ConfigField {
+        name: SKILL_AUTOMATION_DEV_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_AUTOMATION_DEV),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`.",
+    },
+    ConfigField {
+        name: SKILL_DOCS_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_DOCS),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time.",
+    },
+    ConfigField {
+        name: SKILL_PSTACK_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_PSTACK),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`.",
+    },
+];
+
 /// Options that native tools still read from the `plugins.<name>` table their
 /// Lua plugin was configured under, besides `enabled`.
 pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
@@ -326,59 +380,11 @@ pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
             min: Some(MIN_INDEX_MAX_FILE_SIZE_MB as u64),
             max: Some(MAX_INDEX_MAX_FILE_SIZE_MB as u64),
             env: None,
+            choices: &[],
             description: "Refuse to index files larger than this many MiB.",
         }],
     ),
-    (
-        "skill",
-        &[
-            ConfigField {
-                name: SKILL_PLUGIN_DEV_FIELD,
-                ty: "boolean",
-                default: ConfigValue::Bool(DEFAULT_SKILL_PLUGIN_DEV),
-                min: None,
-                max: None,
-                env: None,
-                description: "Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`.",
-            },
-            ConfigField {
-                name: SKILL_WORKFLOW_DEV_FIELD,
-                ty: "boolean",
-                default: ConfigValue::Bool(DEFAULT_SKILL_WORKFLOW_DEV),
-                min: None,
-                max: None,
-                env: None,
-                description: "Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`.",
-            },
-            ConfigField {
-                name: SKILL_AUTOMATION_DEV_FIELD,
-                ty: "boolean",
-                default: ConfigValue::Bool(DEFAULT_SKILL_AUTOMATION_DEV),
-                min: None,
-                max: None,
-                env: None,
-                description: "Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`.",
-            },
-            ConfigField {
-                name: SKILL_DOCS_FIELD,
-                ty: "boolean",
-                default: ConfigValue::Bool(DEFAULT_SKILL_DOCS),
-                min: None,
-                max: None,
-                env: None,
-                description: "Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time.",
-            },
-            ConfigField {
-                name: SKILL_PSTACK_FIELD,
-                ty: "boolean",
-                default: ConfigValue::Bool(DEFAULT_SKILL_PSTACK),
-                min: None,
-                max: None,
-                env: None,
-                description: "Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`.",
-            },
-        ],
-    ),
+    ("skill", SKILL_OPTIONS),
     (
         "task",
         &[ConfigField {
@@ -388,6 +394,7 @@ pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
             min: Some(MIN_TASK_MAX_CONCURRENT as u64),
             max: None,
             env: None,
+            choices: &[],
             description: "Max concurrently running subagents.",
         }],
     ),
@@ -597,6 +604,8 @@ pub struct ConfigField {
     pub min: Option<u64>,
     pub max: Option<u64>,
     pub env: Option<&'static str>,
+    /// Every value a string key accepts, as the file spells them; empty when any string goes.
+    pub choices: &'static [&'static str],
     pub description: &'static str,
 }
 
@@ -608,6 +617,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only",
     },
     ConfigField {
@@ -617,6 +627,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Screening runs only while a decision endpoint is active",
     },
     ConfigField {
@@ -626,6 +637,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Start every session with fast mode, on the models that sell a fast tier (ignored otherwise)",
     },
     ConfigField {
@@ -635,6 +647,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
 ];
@@ -1936,6 +1949,7 @@ impl PermissionsFileConfig {
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow` acts as `prompt` and waits in /permissions for review, and a project cannot weaken a global `deny`",
     }];
 }
@@ -1949,6 +1963,7 @@ impl ToolPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Scopes the tool may use without asking, such as `[\"git status *\"]`, or `true` for every call. Only shell allows grant access, and a project shell allow waits until you trust the project policy. Other allows wait in /permissions for review",
         },
         ConfigField {
@@ -1958,6 +1973,7 @@ impl ToolPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Scopes that always ask, such as `[\"git push *\"]`, or `true` for every call",
         },
         ConfigField {
@@ -1967,6 +1983,7 @@ impl ToolPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Scopes the tool may never use, such as `[\"rm -rf *\"]`, or `true` for every call. A deny in either file blocks the whole call",
         },
         ConfigField {
@@ -1976,6 +1993,7 @@ impl ToolPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "What a call of this tool that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default`",
         },
     ];
@@ -1990,6 +2008,7 @@ impl McpPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Tools to allow without asking: a list of names, one name, `\"*\"` for every tool, or `true` for every tool. MCP allows wait in /permissions for review",
         },
         ConfigField {
@@ -1999,6 +2018,7 @@ impl McpPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Tools that always ask, in the same forms as `allow`",
         },
         ConfigField {
@@ -2008,6 +2028,7 @@ impl McpPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Tools the model may never call, in the same forms as `allow`. `false` in any of the three adds nothing",
         },
         ConfigField {
@@ -2017,6 +2038,7 @@ impl McpPermissions {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "What a call to a tool of this server that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default`",
         },
     ];
@@ -2400,7 +2422,8 @@ pub struct UiConfig {
         default = TouchMode::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH"
+        desc = "Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH",
+        choices = ["auto", "on", "off"],
     )]
     pub touch: TouchMode,
 
@@ -2408,7 +2431,8 @@ pub struct UiConfig {
         default = NotificationMethod::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501 program status when supported, otherwise uses OSC 9 or BEL. Native Herdr or Orca reporting takes precedence in their panes. Explicit osc9, bell, and off skip program status detection"
+        desc = "Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501 program status when supported, otherwise uses OSC 9 or BEL. Native Herdr or Orca reporting takes precedence in their panes. Explicit osc9, bell, and off skip program status detection",
+        choices = ["auto", "osc9", "bell", "off"],
     )]
     pub notifications: NotificationMethod,
 
@@ -2416,7 +2440,8 @@ pub struct UiConfig {
         default = MathStyle::Unicode,
         ty = "string",
         default_doc = "unicode",
-        desc = "How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source)"
+        desc = "How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source)",
+        choices = ["unicode", "raw"],
     )]
     pub math: MathStyle,
 
@@ -2424,7 +2449,8 @@ pub struct UiConfig {
         default = MermaidStyle::Unicode,
         ty = "string",
         default_doc = "unicode",
-        desc = "How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code)"
+        desc = "How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code)",
+        choices = ["unicode", "off"],
     )]
     pub mermaid: MermaidStyle,
 
@@ -2432,7 +2458,8 @@ pub struct UiConfig {
         default = InlineImages::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "How the transcript draws images that `view_image` reads, `image_generate` saves, and markdown names with `![alt](path)`: auto (Kitty graphics where the terminal supports them, coloured quadrant blocks anywhere else), kitty, blocks, sextants (sharper blocks, for fonts and terminals that draw Unicode 13 sextants, such as Ghostty, kitty, WezTerm, and foot), or off (show only the caption; `false` also turns them off). Markdown images are read from local files only and never fetched"
+        desc = "How the transcript draws images that `view_image` reads, `image_generate` saves, and markdown names with `![alt](path)`: auto (Kitty graphics where the terminal supports them, coloured quadrant blocks anywhere else), kitty, blocks, sextants (sharper blocks, for fonts and terminals that draw Unicode 13 sextants, such as Ghostty, kitty, WezTerm, and foot), or off (show only the caption; `false` also turns them off). Markdown images are read from local files only and never fetched",
+        choices = ["auto", "kitty", "blocks", "sextants", "off"],
     )]
     pub inline_images: InlineImages,
 
@@ -2501,7 +2528,7 @@ pub struct UiConfig {
     )]
     pub show_decisions: bool,
 
-    #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
+    #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)", choices = ["12h", "24h", "system"])]
     pub clock_format: ClockFormat,
 
     #[config(
@@ -2511,7 +2538,7 @@ pub struct UiConfig {
     )]
     pub update_check: bool,
 
-    #[config(default = UpdateChannel::Auto, ty = "string", default_doc = "auto", desc = "Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases")]
+    #[config(default = UpdateChannel::Auto, ty = "string", default_doc = "auto", desc = "Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases", choices = ["auto", "stable", "preview"])]
     pub update_channel: UpdateChannel,
 
     #[config(
@@ -2524,7 +2551,8 @@ pub struct UiConfig {
         default = StoredMode::Plan,
         ty = "string",
         default_doc = "plan",
-        desc = "Mode a new terminal UI session opens in: `plan`, where the agent writes only the plan file until you switch, or `build`. A resumed session reopens in the mode it was left in, and `/new` in an idle tab keeps that tab's mode. `--print` and ACP always start in build"
+        desc = "Mode a new terminal UI session opens in: `plan`, where the agent writes only the plan file until you switch, or `build`. A resumed session reopens in the mode it was left in, and `/new` in an idle tab keeps that tab's mode. `--print` and ACP always start in build",
+        choices = ["plan", "build"],
     )]
     pub default_mode: StoredMode,
 
@@ -2769,7 +2797,8 @@ pub struct MessagingConfig {
         default = InboundPolicy::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns"
+        desc = "Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns",
+        choices = ["accept", "auto", "hold", "refuse"],
     )]
     pub inbound: InboundPolicy,
 
@@ -2895,7 +2924,7 @@ pub struct AgentConfig {
     )]
     pub work_nudge_compactions: u32,
 
-    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt")]
+    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt", choices = ["sync", "auto", "async"])]
     pub task_execution: ExecutionMode,
 
     #[config(
@@ -2910,7 +2939,7 @@ pub struct AgentConfig {
     )]
     pub deferred_questions: bool,
 
-    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt")]
+    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt", choices = ["sync", "auto", "async"])]
     pub shell_execution: ExecutionMode,
 
     #[config(default = DEFAULT_SHELL_ASYNC_THRESHOLD_SECS, min = MIN_SHELL_ASYNC_THRESHOLD_SECS, desc = "Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline")]
@@ -2968,7 +2997,8 @@ pub struct AgentConfig {
         default = ShellNativeRedirect::Enforce,
         ty = "string",
         default_doc = "enforce",
-        desc = "What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected"
+        desc = "What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected",
+        choices = ["enforce", "annotate", "off"],
     )]
     pub shell_native_redirect: ShellNativeRedirect,
 
@@ -2976,7 +3006,8 @@ pub struct AgentConfig {
         default = ImageModel::Sunburst,
         ty = "string",
         default_doc = "sunburst",
-        desc = "GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price"
+        desc = "GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price",
+        choices = ["sunburst", "flare"],
     )]
     pub image_model: ImageModel,
 
@@ -2984,7 +3015,8 @@ pub struct AgentConfig {
         default = CacheWarmingMode::Off,
         ty = "string",
         default_doc = "off",
-        desc = "Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only"
+        desc = "Keep the prompt cache from expiring by re-sending the last request with no output, on the Anthropic API only: `running` while a run waits on a long tool, subagent, question or permission prompt, `idle` also for up to 30 minutes after it ends, `off` never. Each refresh is billed as a cache read; global config only",
+        choices = ["off", "running", "idle"],
     )]
     pub cache_warming: CacheWarmingMode,
 
@@ -2998,7 +3030,8 @@ pub struct AgentConfig {
         ty = "string[]",
         default = "LearningTarget::ALL.to_vec()",
         default_doc = "[\"project\", \"local\", \"global\", \"memory\"]",
-        desc = "Where continual learning may write: `project` (the committed AGENTS.md), `local` (AGENTS.local.md), `global` (~/.config/caudra/AGENTS.md), `memory` (memory notes). A project list can only narrow the global one"
+        desc = "Where continual learning may write: `project` (the committed AGENTS.md), `local` (AGENTS.local.md), `global` (~/.config/caudra/AGENTS.md), `memory` (memory notes). A project list can only narrow the global one",
+        choices = ["project", "local", "global", "memory"],
     )]
     pub learning_targets: Vec<LearningTarget>,
 
@@ -3277,7 +3310,8 @@ pub struct StorageConfig {
     pub max_eager_load_bytes: u64,
 
     #[config(default = DEFAULT_LOG_LEVEL, ty = "string", default_doc = "info",
-             desc = "Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it")]
+             desc = "Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it",
+             choices = ["trace", "debug", "info", "warn", "error"])]
     pub log_level: LogLevel,
 
     #[config(default = DEFAULT_INPUT_HISTORY_SIZE, min = MIN_INPUT_HISTORY_SIZE,
@@ -3358,6 +3392,7 @@ impl SnapshotsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Record each tool call's file changes so file revert can undo them, locally and remotely. `false` turns recording and file revert off and keeps records already made. `--no-snapshots` overrides this for one run",
         },
         ConfigField {
@@ -3367,6 +3402,7 @@ impl SnapshotsConfig {
             min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
+            choices: &[],
             description: "Most file data one change record may cover, and the size each workspace's change store is trimmed to. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
         ConfigField {
@@ -3376,6 +3412,7 @@ impl SnapshotsConfig {
             min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
+            choices: &[],
             description: "Most files one change record may cover, counted after ignore rules. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
         ConfigField {
@@ -3385,6 +3422,7 @@ impl SnapshotsConfig {
             min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
+            choices: &[],
             description: "Largest file a change record stores. A larger file is left unrecorded, and a file revert across a call that changed it stops with a conflict. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
     ];
@@ -3442,6 +3480,7 @@ impl RetentionConfig {
             min: None,
             max: None,
             env: None,
+            choices: &["directory", "none"],
             description: "Evaluate policies per working directory (`directory`) or across every session (`none`)",
         },
         ConfigField {
@@ -3451,6 +3490,7 @@ impl RetentionConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Hours between background sweeps. A sweep reclaims freed space, and applies `trim` and `forget` when they are set. `0` disables the sweep; `caudra storage` commands still work",
         },
         ConfigField {
@@ -3460,6 +3500,7 @@ impl RetentionConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Sessions outside this policy lose file revert, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
         },
         ConfigField {
@@ -3469,6 +3510,7 @@ impl RetentionConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Sessions outside this policy are deleted. Empty means never delete automatically",
         },
     ];
@@ -3704,7 +3746,8 @@ pub enum WorktreeBackend {
 #[config(section = "worktrees")]
 pub struct WorktreesConfig {
     #[config(default = None, ty = "string", default_doc = "auto",
-             desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane, Orca inside an Orca terminal, and git elsewhere, `git` always runs git")]
+             desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane, Orca inside an Orca terminal, and git elsewhere, `git` always runs git",
+             choices = ["auto", "git"])]
     pub backend: Option<WorktreeBackend>,
 
     #[config(default = None, ty = "string", default_varies = "`<data dir>/worktrees`",
@@ -3756,6 +3799,7 @@ impl AutomationsConfig {
             min: Some(MIN_AUTOMATION_TURNS_PER_HOUR as u64),
             max: Some(MAX_AUTOMATION_TURNS_PER_HOUR as u64),
             env: None,
+            choices: &[],
             description: "Most turns automations may start in one session per rolling hour, shared by all of its automations",
         },
         ConfigField {
@@ -3765,6 +3809,7 @@ impl AutomationsConfig {
             min: Some(MIN_MAX_UNATTENDED_TURNS as u64),
             max: Some(MAX_MAX_UNATTENDED_TURNS as u64),
             env: None,
+            choices: &[],
             description: "Stop automation-started turns after this many since the last human input. Human input resets the count, and unset means no cap",
         },
         ConfigField {
@@ -3774,6 +3819,7 @@ impl AutomationsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Let `http()` in automations reach loopback and private network hosts. Without it, automations reach public hosts only",
         },
     ];
@@ -3861,6 +3907,7 @@ impl AutopilotConfig {
             min: Some(MIN_AUTOPILOT_MAX_CONTINUATIONS as u64),
             max: Some(MAX_AUTOPILOT_MAX_CONTINUATIONS as u64),
             env: None,
+            choices: &[],
             description: "Most continuations autopilot may send per engagement before it ends. `0` removes the limit",
         },
         ConfigField {
@@ -3870,6 +3917,7 @@ impl AutopilotConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Most spending in USD per autopilot engagement, counting API-billed spend only. Must be positive, and unset means no cap",
         },
         ConfigField {
@@ -3879,6 +3927,7 @@ impl AutopilotConfig {
             min: Some(MIN_AUTOPILOT_MAX_MINUTES as u64),
             max: Some(MAX_AUTOPILOT_MAX_MINUTES as u64),
             env: None,
+            choices: &[],
             description: "Most wall-clock minutes per autopilot engagement while the session is open. Unset means no cap",
         },
         ConfigField {
@@ -3888,6 +3937,7 @@ impl AutopilotConfig {
             min: Some(MIN_AUTOPILOT_ERROR_RETRIES as u64),
             max: Some(MAX_AUTOPILOT_ERROR_RETRIES as u64),
             env: None,
+            choices: &[],
             description: "Retries for transient provider errors during an autopilot engagement",
         },
     ];
@@ -5301,6 +5351,35 @@ mod tests {
                 error_retries: DEFAULT_AUTOPILOT_ERROR_RETRIES,
             }
         );
+    }
+
+    const NOT_A_CHOICE: &str = "not-a-choice";
+
+    /// The file text that sets `key` of `table` to `value`, a list when the key takes one.
+    fn choice_text(table: &str, field: &ConfigField, value: &str) -> String {
+        let value = match field.ty.ends_with("[]") {
+            true => format!("['{value}']"),
+            false => format!("'{value}'"),
+        };
+        format!("[{table}]\n{} = {value}", field.name)
+    }
+
+    #[test_case("ui", UiConfig::FIELDS; "ui")]
+    #[test_case("agent", AgentConfig::FIELDS; "agent")]
+    #[test_case("agent.messaging", MessagingConfig::FIELDS; "agent_messaging")]
+    #[test_case("storage", StorageConfig::FIELDS; "storage")]
+    #[test_case("storage.retention", RetentionConfig::FIELDS; "storage_retention")]
+    #[test_case("worktrees", WorktreesConfig::FIELDS; "worktrees")]
+    fn every_listed_choice_parses_and_nothing_else(table: &str, fields: &[ConfigField]) {
+        assert!(fields.iter().any(|field| !field.choices.is_empty()));
+        for field in fields.iter().filter(|field| !field.choices.is_empty()) {
+            for choice in field.choices {
+                let text = choice_text(table, field, choice);
+                assert!(toml::from_str::<RawConfig>(&text).is_ok(), "{text}");
+            }
+            let text = choice_text(table, field, NOT_A_CHOICE);
+            assert!(toml::from_str::<RawConfig>(&text).is_err(), "{text}");
+        }
     }
 
     #[test_case("", CacheWarmingMode::Off; "default_off")]

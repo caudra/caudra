@@ -1661,12 +1661,12 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
-        description: "Switch to the next or previous tab, or press its number",
+        description: "Switch to the next or previous tab, or press its number (0 for the tenth)",
         context: KeybindContext::Settings,
     },
     Keybind {
         label: KeyLabel::Single("Space"),
-        description: "Use the selected web search backend, or stop using it",
+        description: "Use or drop the selected backend, flip a switch, or step to the next choice",
         context: KeybindContext::Settings,
     },
     Keybind {
@@ -1684,7 +1684,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Edit the selected backend's settings, or change the selected setting",
+        description: "Edit the selected backend or setting; a list opens its own form",
         context: KeybindContext::Settings,
     },
     Keybind {
@@ -1695,6 +1695,31 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::REVEAL.label),
         description: "Show or mask credentials in a backend's form",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::FILTER_LABEL),
+        description: "Filter every tab by key or table name; Esc clears it",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::DOCS_LABEL),
+        description: "Open the selected setting's docs, as its [?] does",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+↑↓"),
+        description: "Scroll the selected setting's description",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+↑↓"),
+        description: "Move the selected item in a list's form",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single("Delete"),
+        description: "Remove the selected item in a list's form while its line is empty",
         context: KeybindContext::Settings,
     },
     Keybind {

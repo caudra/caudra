@@ -29,7 +29,7 @@ use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::section_tabs::{SectionTab, tab_strip};
-use crate::components::{ModalScroll, Overlay, PAN_STEP, bar_area, hover_style, now_secs};
+use crate::components::{ModalScroll, Overlay, PAN_STEP, bar_area, now_secs, selectable_row};
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
 use lines::ModeChips;
@@ -811,12 +811,11 @@ impl DecisionsModal {
                     };
                     let mut spans = vec![Span::styled(mark, theme.accent)];
                     spans.extend(row);
-                    let style = match selected {
-                        true => theme.item_selected,
-                        false => Style::default(),
-                    };
-                    Line::from(ellipsize_spans(spans, width))
-                        .style(hover_style(style, hovered == Some(index)))
+                    selectable_row(
+                        ellipsize_spans(spans, width),
+                        selected.then_some(theme.item_selected),
+                        hovered == Some(index),
+                    )
                 })
                 .collect(),
         };

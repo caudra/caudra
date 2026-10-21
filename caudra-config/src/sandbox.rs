@@ -312,6 +312,7 @@ impl SandboxProvider {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The provider type. `e2b-libvirt` is the only one",
         },
         ConfigField {
@@ -321,6 +322,7 @@ impl SandboxProvider {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The origin of the lifecycle API: HTTPS, or HTTP on a numeric loopback address, with no path, credentials, query, or fragment. Caudra refuses `http://localhost`",
         },
         ConfigField {
@@ -330,6 +332,7 @@ impl SandboxProvider {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The origin of the sandbox proxy, with the same rules as `api_endpoint`",
         },
         ConfigField {
@@ -339,6 +342,7 @@ impl SandboxProvider {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The lifecycle API key, as `sandbox-api:NAME`, not a Workcell `credential:NAME`. `caudra auth sandbox generate NAME` or `caudra auth sandbox set NAME` saves it",
         },
     ];
@@ -385,6 +389,7 @@ impl NetworkPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "`required` enforces the lists below, so empty lists deny all traffic. `off` enforces nothing, and then both lists must be empty and `tls_mode` must stay `sni-only`",
         },
         ConfigField {
@@ -394,6 +399,7 @@ impl NetworkPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "`sni-only` or `mitm`",
         },
         ConfigField {
@@ -403,6 +409,7 @@ impl NetworkPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Domains the sandbox may reach, such as `github.com` or `*.githubusercontent.com`",
         },
         ConfigField {
@@ -412,6 +419,7 @@ impl NetworkPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Address ranges the sandbox may reach, such as `10.0.0.0/8`",
         },
     ];
@@ -478,6 +486,7 @@ impl TransferPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Leave out the files that `.gitignore` ignores",
         },
         ConfigField {
@@ -487,6 +496,7 @@ impl TransferPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "`ask` offers to copy the project into a new sandbox, and `none` skips the offer. Later transfers work either way",
         },
         ConfigField {
@@ -496,6 +506,7 @@ impl TransferPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Only `false` works, because Caudra never deletes files on its own",
         },
         ConfigField {
@@ -507,6 +518,7 @@ impl TransferPolicy {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Relative globs of paths never to copy. A list you set replaces the one shown. A glob cannot start with `/` or `!`, or hold `.`, `..`, `\\`, or `:`",
         },
     ];
@@ -644,6 +656,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The name of a [sandbox.providers.NAME] record",
         },
         ConfigField {
@@ -653,6 +666,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "A template ID from the provider catalog. Each launch uses the revision the catalog lists at that time",
         },
         ConfigField {
@@ -662,6 +676,7 @@ impl SandboxProfile {
             min: Some(MIN_RESOURCE),
             max: None,
             env: None,
+            choices: &[],
             description: "Virtual CPUs",
         },
         ConfigField {
@@ -671,6 +686,7 @@ impl SandboxProfile {
             min: Some(MIN_RESOURCE),
             max: None,
             env: None,
+            choices: &[],
             description: "Memory in MiB",
         },
         ConfigField {
@@ -680,6 +696,7 @@ impl SandboxProfile {
             min: Some(MIN_RESOURCE),
             max: None,
             env: None,
+            choices: &[],
             description: "Virtual disk size in GiB. It reserves no host space",
         },
         ConfigField {
@@ -689,6 +706,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The working directory, relative to the Workcell root, where `.` is the root itself",
         },
         ConfigField {
@@ -698,6 +716,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The name of a [sandbox.networks.NAME] record",
         },
         ConfigField {
@@ -707,6 +726,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The name of a [sandbox.transfers.NAME] record",
         },
         ConfigField {
@@ -716,6 +736,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Keep the disk when the sandbox pauses or its lease ends. Only a persistent sandbox can pause",
         },
         ConfigField {
@@ -725,6 +746,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Seconds the sandbox may run before its lease ends. `0` never ends, which needs a provider without a lease cap",
         },
         ConfigField {
@@ -734,6 +756,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "What happens to the sandbox when Caudra exits. `detach` is the only value",
         },
         ConfigField {
@@ -743,6 +766,7 @@ impl SandboxProfile {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Guest variables forwarded to shell commands in this sandbox, resolved inside the guest: pass takes names, NAME_* or *; set takes literal non-secret values. Workcell's own settings, Bash startup names, and proxies are never forwarded",
         },
     ];

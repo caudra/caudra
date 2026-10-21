@@ -69,6 +69,7 @@ impl ShellEnvConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Host variables forwarded to local shell commands: exact names or NAME_* prefixes, never a bare *. Values come from Caudra's environment and the global .env, never a project .env",
         },
         ConfigField {
@@ -78,6 +79,7 @@ impl ShellEnvConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Values set for local shell commands; {env:NAME} reads Caudra's environment and {file:PATH} a file. Wins over pass",
         },
     ];

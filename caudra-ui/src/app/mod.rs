@@ -2216,7 +2216,12 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.env_modal);
-        try_picker!(self.settings_modal);
+        if self.settings_modal.is_open() {
+            if self.settings_modal.contains(pos) {
+                self.settings_modal.scroll_at(pos, delta);
+            }
+            return None;
+        }
         try_picker!(self.login_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);

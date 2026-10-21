@@ -96,6 +96,7 @@ impl AccountDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The account name, which `caudra auth login --name` saves a credential under and `caudra auth use` selects. It takes lowercase letters, digits, `-`, and `_`, and `auto` is reserved",
         },
         ConfigField {
@@ -105,6 +106,7 @@ impl AccountDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The environment variable that holds this account's API key. Leave it out to use the credential `caudra auth login` saved",
         },
         ConfigField {
@@ -114,6 +116,7 @@ impl AccountDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Let Auto move a subscription session onto this pay-per-token account, which it does only when every subscription is spent. A subscription account ignores it",
         },
     ];
@@ -240,6 +243,7 @@ impl SwitchingDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "How Auto picks an account. `ordered` takes the first usable account in `accounts` order and returns to it after its quota resets. `paced` takes the account furthest ahead of its quota schedule, so capacity that is about to reset gets used first",
         },
         ConfigField {
@@ -249,6 +253,7 @@ impl SwitchingDef {
             min: Some(0),
             max: Some(MAX_PERCENT as u64 - 1),
             env: None,
+            choices: &[],
             description: "The quota left in a watched window, in percent, below which a session moves to another account at its next request, even when that loses a warm prompt cache. It has to be lower than `prefer_below`",
         },
         ConfigField {
@@ -258,6 +263,7 @@ impl SwitchingDef {
             min: Some(1),
             max: Some(MAX_PERCENT as u64),
             env: None,
+            choices: &[],
             description: "The quota left in a watched window, in percent, below which a session moves to another account once its prompt cache is cold anyway, such as in a new session or after compaction",
         },
         ConfigField {
@@ -267,6 +273,7 @@ impl SwitchingDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The quota windows the thresholds watch: `5h`, `weekly`, and `monthly`",
         },
     ];
@@ -305,6 +312,7 @@ impl GlobalSwitchingDef {
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The provider slugs Auto may move a conversation across, in the order it tries them, when every subscription of the conversation's provider is spent or running low. The conversation moves to a subscription account of the next provider with quota left, on a model of the same size, and comes back once its own provider has quota again. Leave the table out to keep every conversation on its provider",
     }];
 

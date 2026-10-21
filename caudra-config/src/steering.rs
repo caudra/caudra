@@ -87,6 +87,7 @@ macro_rules! rule {
                 min: Some($min),
                 max: Some($max as u64),
                 env: None,
+                choices: &[],
                 description: $description,
             }),+];
 
@@ -185,6 +186,7 @@ impl SteeringRule {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Explicit `false` disables this rule.",
         },
         ConfigField {
@@ -194,6 +196,7 @@ impl SteeringRule {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes.",
         },
     ];
@@ -330,6 +333,7 @@ impl SteeringConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Master switch for automatic steering, including truncation recovery and repeat-policy blocking.",
         },
         ConfigField {
@@ -339,6 +343,7 @@ impl SteeringConfig {
             min: Some(0),
             max: Some(MAX_COUNT as u64),
             env: None,
+            choices: &[],
             description: "Corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations.",
         },
         ConfigField {
@@ -348,6 +353,7 @@ impl SteeringConfig {
             min: Some(0),
             max: Some(MAX_COUNT as u64),
             env: None,
+            choices: &[],
             description: "Advisory injections per invocation. Zero suppresses advisories.",
         },
         ConfigField {
@@ -357,6 +363,7 @@ impl SteeringConfig {
             min: Some(0),
             max: Some(MAX_COUNT as u64),
             env: None,
+            choices: &[],
             description: "Consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop.",
         },
         ConfigField {
@@ -366,6 +373,7 @@ impl SteeringConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Overrides by rule name, listed below. Omission uses built-in defaults.",
         },
         ConfigField {
@@ -375,6 +383,7 @@ impl SteeringConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Up to 256 exact `provider/model-id` keys, each with its own overrides.",
         },
     ];

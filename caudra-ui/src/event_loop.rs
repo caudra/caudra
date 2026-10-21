@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod config_reload;
+pub(crate) mod config_reload;
 mod fork_tab;
 mod peers;
 

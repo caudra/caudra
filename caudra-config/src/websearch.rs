@@ -195,6 +195,7 @@ impl WebsearchConfig {
             min: None,
             max: None,
             env: Some("WORKCELL_WEBSEARCH_MODE"),
+            choices: &[],
             description: "How the ready backends answer: `single` uses the first ready one, `fallback` tries them in order when one fails, and `all` lets the model pick one, trying them in order when it does not",
         },
         ConfigField {
@@ -206,6 +207,7 @@ impl WebsearchConfig {
             min: None,
             max: None,
             env: Some("WORKCELL_WEBSEARCH_BACKEND"),
+            choices: &[],
             description: "Backends in priority order: exa-mcp, searxng, exa, brave, kagi, or serpapi. A backend that is not set up correctly is skipped with a warning. An empty list turns websearch off",
         },
     ];
@@ -279,6 +281,7 @@ const fn field(name: &'static str, env: &'static str, description: &'static str)
         min: None,
         max: None,
         env: Some(env),
+        choices: &[],
         description,
     }
 }

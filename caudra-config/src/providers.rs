@@ -76,6 +76,7 @@ pub(crate) const PURPOSE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Model id prefixes for small, fast models, best first. A prefix covers every id that starts with it, and the first one also names the model that fills the slot, so it has to be a real id",
     },
     ConfigField {
@@ -85,6 +86,7 @@ pub(crate) const PURPOSE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Model id prefixes for flagship models, best first. A prefix cannot also be in `fast`. A model a job is bound to in the picker wins over both lists",
     },
 ];
@@ -320,6 +322,7 @@ impl ModelDef {
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The model id, which makes the spec `SLUG/ID`",
     }];
 }
@@ -379,6 +382,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Tokens of context",
         },
         ConfigField {
@@ -388,6 +392,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The most tokens one response may hold",
         },
         ConfigField {
@@ -397,6 +402,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Send tool examples as a structured field. It is off unless declared, because the protocol says nothing about the model behind it",
         },
         ConfigField {
@@ -406,6 +412,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The model accepts extended thinking. On `openai` and `openai-responses`, the default is on only when `reasoning_options` declares levels",
         },
         ConfigField {
@@ -415,6 +422,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "For an API that rejects requests with thinking off. It implies `supports_thinking` and raises thinking to minimal effort when it is off, compaction included",
         },
         ConfigField {
@@ -424,6 +432,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The model accepts images. When false, image input and `view_image` are off",
         },
         ConfigField {
@@ -433,6 +442,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "`anthropic` and `openai-responses` only. The model reads a PDF that `webfetch` attaches inside its tool result. When it is off, `webfetch` returns the text of the PDF instead",
         },
         ConfigField {
@@ -442,6 +452,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "`openai-responses` only. The endpoint honours an explicit `prompt_cache_breakpoint`, so the system prompt closes with one",
         },
         ConfigField {
@@ -451,6 +462,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The reasoning controls the model takes, such as `[{ type = \"effort\", values = [\"low\", \"high\"] }]`. A `type` is `toggle`, `effort` with `values`, or `budget_tokens` with an optional `min` and `max`. `[]` declares that it takes none, so Caudra sends no reasoning level",
         },
         ConfigField {
@@ -460,6 +472,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million input tokens",
         },
         ConfigField {
@@ -469,6 +482,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million output tokens",
         },
         ConfigField {
@@ -478,6 +492,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million tokens written to the prompt cache",
         },
         ConfigField {
@@ -487,6 +502,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million tokens read from the prompt cache",
         },
         ConfigField {
@@ -496,6 +512,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million input tokens in fast mode",
         },
         ConfigField {
@@ -505,6 +522,7 @@ impl ModelFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "USD per million output tokens in fast mode",
         },
     ];
@@ -675,6 +693,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Tokens of context",
         },
         ConfigField {
@@ -684,6 +703,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The most tokens one response may hold",
         },
         ConfigField {
@@ -693,6 +713,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The models accept extended thinking",
         },
         ConfigField {
@@ -702,6 +723,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The models accept images",
         },
         ConfigField {
@@ -711,6 +733,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The native provider an opaque upstream works like, such as `llama-cpp`, `google`, or `anthropic`. Caudra warns about a value it does not know and ignores it",
         },
         ConfigField {
@@ -722,6 +745,7 @@ impl OverrideFields {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The path Caudra sends ahead of each request, which Aperture appends to the upstream base URL. Set it to `\"\"` when that URL already has its own path",
         },
     ];
@@ -747,6 +771,7 @@ impl ProviderOverride {
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Overrides for single models, keyed by model id, which win key by key. Quote an id that holds a dot, such as `models.\"qwen-3.6\"`",
     }];
 }
@@ -807,6 +832,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The name pickers and auth status show",
         },
         ConfigField {
@@ -816,6 +842,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The wire format: `openai`, `openai-responses`, `anthropic`, or `google`",
         },
         ConfigField {
@@ -825,6 +852,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: Some("<SLUG>_BASE_URL"),
+            choices: &[],
             description: "The API origin. Caudra appends the protocol paths",
         },
         ConfigField {
@@ -834,6 +862,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "A built-in plan key, which sets the base URL and the default model",
         },
         ConfigField {
@@ -843,6 +872,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The environment variable that holds the API key",
         },
         ConfigField {
@@ -852,6 +882,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "An API key, stored as plain text unless you write `{env:NAME}` or `{file:PATH}` to read it from your environment or a file. Caudra tries the environment variable and saved credentials first",
         },
         ConfigField {
@@ -861,6 +892,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The model to use after login when none is saved yet, such as `my-provider/my-model`",
         },
         ConfigField {
@@ -870,6 +902,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Also list the models the provider's model endpoint reports",
         },
         ConfigField {
@@ -879,6 +912,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Opencode only. Show the free models of its catalog. Unset counts as `false`",
         },
         ConfigField {
@@ -888,6 +922,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Aperture only. Overrides for the upstream providers it routes, keyed by upstream id",
         },
         ConfigField {
@@ -897,6 +932,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Model keys for every model of the provider",
         },
         ConfigField {
@@ -906,6 +942,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Model id prefixes for the `fast` and `best` purposes",
         },
         ConfigField {
@@ -915,6 +952,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The models the provider serves",
         },
         ConfigField {
@@ -924,6 +962,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "When Auto moves a session to another of the provider's accounts",
         },
         ConfigField {
@@ -933,6 +972,7 @@ impl ProviderDef {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "The accounts to sign in with, highest priority first",
         },
     ];

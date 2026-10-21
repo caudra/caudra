@@ -34,6 +34,7 @@ pub const SERVER_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Start the server. `/mcp` sets this key when it turns a server on or off",
     },
     ConfigField {
@@ -43,6 +44,7 @@ pub const SERVER_FIELDS: &[ConfigField] = &[
         min: Some(MIN_TIMEOUT_MS),
         max: Some(MAX_TIMEOUT_MS),
         env: None,
+        choices: &[],
         description: "Milliseconds to wait for each response from the server",
     },
 ];
@@ -57,6 +59,7 @@ pub const STDIO_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Stdio servers: the program and its arguments. It must not be empty. When `url` is also set, `command` wins",
     },
     ConfigField {
@@ -66,6 +69,7 @@ pub const STDIO_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = \"{env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text",
     },
 ];
@@ -78,6 +82,7 @@ pub const HTTP_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "HTTP servers: the server URL. It must start with `http://` or `https://`",
     },
     ConfigField {
@@ -87,6 +92,7 @@ pub const HTTP_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "HTTP servers: headers sent with every request, such as `{ Authorization = \"Bearer {env:GITHUB_TOKEN}\" }`. In the global file, `{env:NAME}` reads a value from your environment and `{file:PATH}` reads a file. Other values are stored as plain text",
     },
     ConfigField {
@@ -96,6 +102,7 @@ pub const HTTP_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "HTTP servers: a static OAuth client, for a server Caudra cannot get a client from on its own",
     },
 ];
@@ -108,6 +115,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The client ID of the app you registered with the server",
     },
     ConfigField {
@@ -117,6 +125,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The client secret, for a confidential client. It is stored as plain text unless the global file reads it with `{env:NAME}` from your environment or with `{file:PATH}` from a file",
     },
     ConfigField {
@@ -126,6 +135,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: Some(u16::MAX as u64),
         env: None,
+        choices: &[],
         description: "Pin the loopback port of the redirect URI, so you can register the URI in advance. Unset tries the default port, then any free port, so the URI can change between runs",
     },
     ConfigField {
@@ -135,6 +145,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The path of the redirect URI. It must start with `/`",
     },
     ConfigField {
@@ -144,6 +155,7 @@ pub const OAUTH_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The host name of the redirect URI, such as `localhost` when the server registered that form. The listener still binds to 127.0.0.1",
     },
 ];

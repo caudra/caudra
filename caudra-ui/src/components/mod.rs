@@ -647,6 +647,27 @@ pub(crate) fn hover_style(style: Style, hovered: bool) -> Style {
     }
 }
 
+/// A list row whose spans carry their own colours, with the cursor's row in `selected` over
+/// every span: a colour picked for the plain background, such as the accent the selection
+/// itself is filled with, would otherwise vanish on it.
+pub(crate) fn selectable_row(
+    spans: Vec<Span<'static>>,
+    selected: Option<Style>,
+    hovered: bool,
+) -> Line<'static> {
+    let Some(selection) = selected else {
+        return Line::from(spans).style(hover_style(Style::default(), hovered));
+    };
+    let spans = spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.patch(selection);
+            span.style(style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans).style(hover_style(selection, hovered))
+}
+
 pub(crate) fn visual_line_count(text_len: usize, width: usize) -> usize {
     if width == 0 {
         return 1;
@@ -2169,6 +2190,7 @@ mod tool_progress_tests {
 mod tests {
     use super::keybindings::key;
     use super::*;
+    use crate::theme;
     use caudra_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
     use ratatui::style::Modifier;
     use test_case::test_case;
@@ -2181,6 +2203,31 @@ mod tests {
     const ACROSS_SPANS: Range<usize> = 2..9;
 
     const SNAPSHOT_GEN: u64 = 7;
+    const SELECTABLE_THEMES: [&str; 2] = ["caudra-dark", "caudra-light"];
+
+    #[test]
+    fn a_selected_row_wears_the_selection_over_every_span() {
+        for name in SELECTABLE_THEMES {
+            let theme = theme::load_by_name(name).expect("bundled theme");
+            let spans = vec![
+                Span::styled("mark", theme.accent),
+                Span::styled("value", theme.tool_dim.add_modifier(Modifier::BOLD)),
+            ];
+            let line = selectable_row(spans, Some(theme.item_selected), false);
+            for span in &line.spans {
+                assert_eq!(span.style.fg, theme.item_selected.fg, "{name}");
+                assert_eq!(span.style.bg, theme.item_selected.bg, "{name}");
+            }
+            assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn an_unselected_row_keeps_its_colours() {
+        let theme = theme::load_by_name(SELECTABLE_THEMES[0]).expect("bundled theme");
+        let line = selectable_row(vec![Span::styled("mark", theme.accent)], None, false);
+        assert_eq!(line.spans[0].style, theme.accent);
+    }
 
     fn snapshot() -> BufferSnapshot {
         BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {

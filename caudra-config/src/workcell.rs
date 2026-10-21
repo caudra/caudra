@@ -404,6 +404,7 @@ pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The Workcell endpoint: HTTPS with any host, or HTTP on a numeric loopback address such as `127.0.0.1`. Caudra refuses `localhost`, user information, a query, and a fragment",
     },
     ConfigField {
@@ -413,6 +414,7 @@ pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The working directory, relative to the Workcell root, where `.` is the root itself. It cannot start with `/` or hold `..`",
     },
     ConfigField {
@@ -422,6 +424,7 @@ pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "The saved bearer credential, as `credential:NAME`, which `caudra auth workcell set NAME` creates. A loopback profile needs one too",
     },
     ConfigField {
@@ -431,6 +434,7 @@ pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "An identity check: the connection fails unless the server reports this ID",
     },
     ConfigField {
@@ -440,6 +444,7 @@ pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
         min: None,
         max: None,
         env: None,
+        choices: &[],
         description: "An identity check: the connection fails unless the workspace reports this ID",
     },
 ];

@@ -341,6 +341,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Probability for a permission warning.",
         },
         ConfigField {
@@ -350,6 +351,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Probability for escalating an eligible Auto call.",
         },
         ConfigField {
@@ -359,6 +361,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Probability that sampled content attempts instruction injection.",
         },
         ConfigField {
@@ -368,6 +371,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Probability that sampled content addresses the agent.",
         },
         ConfigField {
@@ -377,6 +381,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Confidence required for skill suggestions. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. Memory recall, memory duplicates, and output pointers name a candidate only at or above this relevance probability.",
         },
         ConfigField {
@@ -386,6 +391,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Skip an evaluator at or below this completion probability, within the continuation budget.",
         },
         ConfigField {
@@ -395,6 +401,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
         },
         ConfigField {
@@ -404,6 +411,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Minimum noul score for a question-tool reminder. Provisional, not a calibrated probability; advise only, and errors or uncertainty never reopen the turn.",
         },
         ConfigField {
@@ -413,6 +421,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Relevance probability below which an enforcing rerank feature prunes or demotes a candidate. Memory search omits it, compaction retention keeps a newer result in its place, and tool search ranks it after the candidates judged relevant, in keyword order. A list the engine could not judge is never emptied.",
         },
     ];
@@ -649,6 +658,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead.",
         },
         ConfigField {
@@ -658,6 +668,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Positive deadline in milliseconds for tool search and the reranking features, per 16 candidates a request judges. A request holds up to 64, so a full one waits up to four budgets. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two.",
         },
         ConfigField {
@@ -667,6 +678,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Retain bounded decision records in the local `caudra.db`.",
         },
         ConfigField {
@@ -676,6 +688,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Positive retention period for decision records.",
         },
         ConfigField {
@@ -685,6 +698,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Per-feature modes below.",
         },
         ConfigField {
@@ -694,6 +708,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Probability thresholds, all finite and within 0–1 inclusive.",
         },
     ];
@@ -852,6 +867,7 @@ impl DecisionEndpoint {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Decision wire protocol: `typesafe` or `openai`. Never inferred from the URL or model.",
         },
         ConfigField {
@@ -861,6 +877,7 @@ impl DecisionEndpoint {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Decision API base URL. TypeSafe takes a root such as `https://api.typesafe.ai` and appends `/v1/systemone`. OpenAI takes a versioned base such as `https://api.openai.com/v1` and appends `/decisions`. A path prefix stays, and a full endpoint is rejected. `{env:NAME}` reads the base from the environment. HTTPS is required, except for numeric loopback HTTP or with `allow_http`. No credentials, query, fragment, whitespace, or control characters.",
         },
         ConfigField {
@@ -870,6 +887,7 @@ impl DecisionEndpoint {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Decision model identifier, nonblank and without control characters.",
         },
         ConfigField {
@@ -879,6 +897,7 @@ impl DecisionEndpoint {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Environment variable holding the credential when no key is saved for this endpoint, never the credential itself. Project environment values are excluded. The presets set `TYPESAFE_API_KEY` and `OPENAI_API_KEY`.",
         },
         ConfigField {
@@ -888,6 +907,7 @@ impl DecisionEndpoint {
             min: None,
             max: None,
             env: None,
+            choices: &[],
             description: "Opt-in for plain HTTP to a non-loopback host. Use only with transport protection you control, such as a trusted encrypted tunnel.",
         },
     ];

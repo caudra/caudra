@@ -10,6 +10,8 @@ use crate::components::hover_style;
 use crate::theme;
 
 const TAB_GAP: &str = "  ";
+/// The digits a strip counts with: `1` to `9`, then `0` for a tenth section.
+const DIGITS: usize = 10;
 
 /// A modal's sections in strip order, which is also the order the digit keys
 /// and Tab walk them in.
@@ -25,10 +27,15 @@ pub(crate) trait SectionTab: Copy + Eq + 'static {
             .unwrap_or_default()
     }
 
-    /// The section a digit key names, counting from one.
+    /// The section a digit key names, counting from one, with `0` for the tenth.
     fn from_digit(digit: char) -> Option<Self> {
         let number = digit.to_digit(10)? as usize;
-        Self::ALL.get(number.checked_sub(1)?).copied()
+        Self::ALL.get((number + DIGITS - 1) % DIGITS).copied()
+    }
+
+    /// The digit key that names this section.
+    fn digit(self) -> usize {
+        (self.index() + 1) % DIGITS
     }
 
     fn step(self, delta: isize) -> Self {
@@ -52,7 +59,7 @@ pub(crate) fn tab_strip<T: SectionTab>(
     let mut hits = Vec::with_capacity(T::ALL.len());
     let mut x = area.x;
     for &tab in T::ALL {
-        let digit = tab.index() + 1;
+        let digit = tab.digit();
         let text = match named {
             true => format!("{digit} {}", tab.label()),
             false => digit.to_string(),
@@ -81,7 +88,7 @@ pub(crate) fn tab_strip<T: SectionTab>(
 fn strip_cols<T: SectionTab>() -> u16 {
     let named: usize = T::ALL
         .iter()
-        .map(|tab| (tab.index() + 1).to_string().len() + 1 + tab.label().width() + TAB_GAP.width())
+        .map(|tab| tab.digit().to_string().len() + 1 + tab.label().width() + TAB_GAP.width())
         .sum();
     u16::try_from(named).unwrap_or(u16::MAX)
 }

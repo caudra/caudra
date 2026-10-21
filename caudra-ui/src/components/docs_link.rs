@@ -57,8 +57,19 @@ pub enum DocsTopic {
     Rewind,
     MessageActions,
     Queue,
-    Settings,
     WebSearch,
+    ConfigTopLevel,
+    ConfigUi,
+    ConfigAgent,
+    ConfigMessaging,
+    ConfigSkills,
+    ConfigProvider,
+    ConfigStorage,
+    ConfigSnapshots,
+    ConfigRetention,
+    ConfigWorktrees,
+    ConfigAutopilot,
+    ConfigAutomations,
 }
 
 impl DocsTopic {
@@ -103,8 +114,19 @@ impl DocsTopic {
             Self::Rewind => "sessions#conversation-revert",
             Self::MessageActions => "sessions#message-actions",
             Self::Queue => "queue",
-            Self::Settings => "configuration",
             Self::WebSearch => "web-search#edit-from-caudra",
+            Self::ConfigTopLevel => "configuration#top-level",
+            Self::ConfigUi => "configuration#ui",
+            Self::ConfigAgent => "configuration#agent",
+            Self::ConfigMessaging => "configuration#agent-messaging",
+            Self::ConfigSkills => "configuration#plugins-skill",
+            Self::ConfigProvider => "configuration#provider",
+            Self::ConfigStorage => "configuration#storage",
+            Self::ConfigSnapshots => "configuration#storage-snapshots",
+            Self::ConfigRetention => "configuration#storage-retention",
+            Self::ConfigWorktrees => "configuration#worktrees",
+            Self::ConfigAutopilot => "configuration#autopilot",
+            Self::ConfigAutomations => "configuration#automations",
         }
     }
 

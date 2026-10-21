@@ -58,6 +58,7 @@ struct FieldAttrs {
     key: Option<String>,
     ty_override: Option<String>,
     val: Option<String>,
+    choices: Option<Expr>,
 }
 
 fn parse_struct_attrs(input: &DeriveInput) -> syn::Result<StructAttrs> {
@@ -109,6 +110,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
         key: None,
         ty_override: None,
         val: None,
+        choices: None,
     };
 
     for attr in &field.attrs {
@@ -168,6 +170,17 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                         attrs.val = Some(lit.value());
                     }
                 }
+                "choices" => match item.value {
+                    ConfigAttrValue::Expr(expr) if matches!(*expr, Expr::Array(_)) => {
+                        attrs.choices = Some(*expr);
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            item.key.span(),
+                            "choices takes an array of strings",
+                        ));
+                    }
+                },
                 other => {
                     return Err(syn::Error::new(
                         item.key.span(),
@@ -295,6 +308,10 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
             Some(e) => quote! { Some(#e) },
             None => quote! { None },
         };
+        let choices_expr = match &attrs.choices {
+            Some(choices) => quote! { &#choices },
+            None => quote! { &[] },
+        };
 
         fields_entries.push(quote! {
             ConfigField {
@@ -304,6 +321,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 min: #min_expr,
                 max: None,
                 env: #env_expr,
+                choices: #choices_expr,
                 description: #desc,
             }
         });

@@ -54,6 +54,7 @@ impl App {
                 self.settings.reply = None;
             }
             SettingsAction::Request(request) => self.start_settings_request(request),
+            SettingsAction::OpenDocs(topic) => self.open_docs(topic),
         }
         Vec::new()
     }
