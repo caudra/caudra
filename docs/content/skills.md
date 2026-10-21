@@ -124,10 +124,9 @@ The skill uses addresses the way `caudra-docs` does:
 | `pstack` | the index: every skill with its summary, and the model roles in force |
 | `pstack/poteto-mode` | one skill |
 | `pstack/poteto-mode/playbooks/bug-fix.md` | a file inside a skill |
-| `pstack/adapter` | how Cursor's tools, paths and subagent fields map to Caudra's |
 | `pstack?flaky test` | the pages that contain every word |
 
-Upstream wrote the skills for Cursor, so the index tells the agent to load `pstack/adapter` once per session before it follows one. The adapter also lists the [automations](/docs/automations/) pstack ships for Caudra, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change.
+Upstream wrote the skills for Cursor. Caudra ships them translated: the pages name Caudra's tools, paths, models and commands, so the agent follows them as written. Pages that need an [automation](/docs/automations/) say how to install it, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change.
 
 `setup-pstack` picks a model for each role pstack's skills name and writes them to `~/.config/caudra/pstack/models.md`. The index reads that file each time it loads, so a change applies at once.
 

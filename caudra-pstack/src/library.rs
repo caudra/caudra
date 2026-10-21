@@ -10,6 +10,7 @@ use serde::Deserialize;
 use crate::models::Roles;
 
 static UPSTREAM: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/upstream");
+static TRANSLATED: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/translated");
 static AUTOMATIONS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/automations");
 static LIBRARY: LazyLock<Library> = LazyLock::new(Library::embedded);
 
@@ -18,8 +19,6 @@ pub const NAME: &str = "pstack";
 pub const SKILL_DESCRIPTION: &str = "poteto's pstack: rigorous engineering skills (poteto-mode, \
      bug fixes, plans, reviews, orchestration). Load only when the user asks for pstack, poteto, \
      or one of its skills, or sends a `/pstack:<skill>` command; the index lists every skill.";
-pub const ADAPTER: &str = include_str!("../adapter.md");
-pub const ADAPTER_PAGE: &str = "adapter";
 const PSTACK_ROOT: &str = "pstack";
 const TEAM_KIT_ROOT: &str = "cursor-team-kit";
 const MANIFEST: &str = "upstream.json";
@@ -96,19 +95,9 @@ pub fn library() -> &'static Library {
 impl Library {
     fn embedded() -> Self {
         let mut pages = BTreeMap::new();
-        let roots = [PSTACK_ROOT, TEAM_KIT_ROOT].map(|root| UPSTREAM.get_dir(root));
-        for (root, dir) in [PSTACK_ROOT, TEAM_KIT_ROOT].into_iter().zip(roots) {
-            let Some(dir) = dir else { continue };
-            for file in files(dir) {
-                let Some((path, text)) = text_file(file) else {
-                    continue;
-                };
-                let relative = path.strip_prefix(root).unwrap_or(path);
-                let relative = relative.trim_start_matches(PATH_SEPARATOR);
-                match root == TEAM_KIT_ROOT && !relative.starts_with(SKILLS_DIR) {
-                    true => pages.insert(path.to_owned(), text),
-                    false => pages.insert(relative.to_owned(), text),
-                };
+        for tree in [&UPSTREAM, &TRANSLATED] {
+            for (path, text) in vendored(tree) {
+                pages.insert(page_key(path), text);
             }
         }
         for (path, text) in files(&AUTOMATIONS).into_iter().filter_map(text_file) {
@@ -195,10 +184,8 @@ impl Library {
              Every file is a page of this skill: load `{NAME}/<skill>` for a skill, or \
              `{NAME}/<path>` for any file by its path in the plugin. `{NAME}?<words>` searches \
              every page.\n\n\
-             The skills are written for Cursor. Load `{NAME}/{ADAPTER_PAGE}` once per session \
-             before you follow one: it maps their Cursor tools, subagent fields, models, paths, \
-             and scripts to Caudra's. Run a skill only when the user asks for pstack or one of \
-             its skills, or sends a `/{NAME}:<skill>` command.\n\n## Start here\n\n"
+             Run a skill only when the user asks for pstack or one of its skills, or sends a \
+             `/{NAME}:<skill>` command.\n\n## Start here\n\n"
         );
         for name in START_HERE {
             if let Some(skill) = self.skill(name) {
@@ -235,8 +222,9 @@ impl Library {
         }
         index.push_str(&format!(
             "- `{NAME}/{BENNY}`: benny, triage and reproduction of Slack issue reports.\n\
-             - `{NAME}/{CAUDRA_AUTOMATIONS_DIR}`: benny and watch-pr's drive mode as Caudra \
-             automations; `{NAME}/{ADAPTER_PAGE}` says how to install them.\n\n## Model roles\n\n{}\n",
+             - `{NAME}/{CAUDRA_AUTOMATIONS_DIR}`: benny's Slack polling and watch-pr's drive mode \
+             as Caudra automations, installed by benny's setup and the babysit playbook.\n\n\
+             ## Model roles\n\n{}\n",
             roles.describe()
         ));
         index
@@ -248,9 +236,6 @@ impl Library {
             return Ok(self.search(words));
         }
         let requested = address.trim_start_matches(PATH_SEPARATOR);
-        if requested == ADAPTER_PAGE {
-            return Ok(ADAPTER.to_owned());
-        }
         let path = normalize(requested).ok_or_else(|| {
             format!("`{NAME}/{requested}` leaves pstack; addresses stay inside the plugin")
         })?;
@@ -371,6 +356,33 @@ fn text_file(file: &'static File<'static>) -> Option<(&'static str, &'static str
     Some((file.path().to_str()?, file.contents_utf8()?))
 }
 
+/// Every text file under the pstack and team-kit roots of a vendored tree, by its path in that
+/// tree. The manifests beside the roots are left out.
+fn vendored(tree: &'static Dir<'static>) -> Vec<(&'static str, &'static str)> {
+    [PSTACK_ROOT, TEAM_KIT_ROOT]
+        .into_iter()
+        .filter_map(|root| tree.get_dir(root))
+        .flat_map(files)
+        .filter_map(text_file)
+        .collect()
+}
+
+/// A vendored file's page: pstack's by its path in the plugin, a team-kit skill beside pstack's
+/// under `skills/`, and any other team-kit file under its own root.
+fn page_key(path: &str) -> String {
+    if let Some(relative) = path.strip_prefix(PSTACK_ROOT) {
+        return relative.trim_start_matches(PATH_SEPARATOR).to_owned();
+    }
+    let relative = path
+        .strip_prefix(TEAM_KIT_ROOT)
+        .unwrap_or(path)
+        .trim_start_matches(PATH_SEPARATOR);
+    match relative.starts_with(SKILLS_DIR) {
+        true => relative.to_owned(),
+        false => path.to_owned(),
+    }
+}
+
 /// `skills/<name>/SKILL.md`'s name, under either root.
 fn skill_of(path: &str) -> Option<&str> {
     let path = path.strip_prefix(TEAM_KIT_ROOT).unwrap_or(path);
@@ -423,10 +435,7 @@ fn normalize(path: &str) -> Option<String> {
 
 fn headed(path: &str, text: &str) -> String {
     let dir = path.rsplit_once(PATH_SEPARATOR).map_or("", |(dir, _)| dir);
-    format!(
-        "Page `{NAME}/{path}`. A relative path in it resolves against `{NAME}/{dir}/`. Map its \
-         Cursor names with `{NAME}/{ADAPTER_PAGE}`.\n\n{text}"
-    )
+    format!("Page `{NAME}/{path}`. A relative path in it resolves against `{NAME}/{dir}/`.\n\n{text}")
 }
 
 fn entry(skill: &Skill) -> String {
@@ -485,7 +494,14 @@ mod tests {
     const DANGLING_MSG: &str = "a relative link must resolve to a page";
     const NAME_MISMATCH_MSG: &str = "a skill's frontmatter name must be its directory";
     const DRIFT_MSG: &str = "upstream.json must hash every vendored file; run `make sync-pstack`";
-    const UNMAPPED_MSG: &str = "the adapter needs a row for a Cursor name the skills use";
+    const UNTRANSLATED_MSG: &str =
+        "these lines still name Cursor; translate them with the pstack-translate skill";
+    const BARE_COMMAND_MSG: &str = "a command the user types is `/pstack:<name>`";
+    const ORPHAN_MSG: &str = "a translation's upstream file is gone; delete or move it";
+    const STALE_MSG: &str = "upstream changed since this translation; retranslate it, then \
+         `scripts/sync-pstack.py --mark` it";
+    const TRANSLATIONS: &str = "translations.json";
+    const UNLISTED_MSG: &str = "translations.json must list exactly the translated files";
     /// Links upstream writes as templates for the model to fill in.
     const PLACEHOLDER_LINKS: &[&str] = &["url"];
 
@@ -509,13 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn the_adapter_page_is_served_whole() {
-        assert_eq!(library().load("/adapter").unwrap(), ADAPTER);
+    fn a_translation_replaces_its_upstream_page() {
+        for (path, text) in vendored(&TRANSLATED) {
+            assert_eq!(library().pages[&page_key(path)], text, "{path}");
+        }
     }
 
     #[test]
-    fn the_adapter_names_every_caudra_automation() {
-        const UNNAMED_MSG: &str = "the adapter must say how to install every Caudra automation";
+    fn some_page_says_how_to_install_each_caudra_automation() {
+        const UNNAMED_MSG: &str = "a translated page must say how to install every Caudra automation";
         let automations: Vec<&String> = library()
             .pages
             .keys()
@@ -523,7 +541,12 @@ mod tests {
             .collect();
         assert!(!automations.is_empty());
         for path in automations {
-            assert!(ADAPTER.contains(&format!("{NAME}/{path}")), "{UNNAMED_MSG}: {path}");
+            let address = format!("{NAME}/{path}");
+            let named = library()
+                .pages
+                .iter()
+                .any(|(page, text)| !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && text.contains(&address));
+            assert!(named, "{UNNAMED_MSG}: {address}");
         }
     }
 
@@ -624,43 +647,94 @@ mod tests {
         assert_eq!(vendored, listed, "{DRIFT_MSG}");
     }
 
-    /// The Cursor names upstream's Claude Code generator checks its adapter for, plus the ones
-    /// only Caudra maps. A skill that starts using one needs its row in `adapter.md`.
-    #[test_case(r"`Task`|\bTask (tool|subagent|call)", "`Task`")]
-    #[test_case("AskQuestion", "`AskQuestion`")]
-    #[test_case(r"\b[Tt]odo ?[Ll]ist\b", "todolist")]
-    #[test_case("generalPurpose", "generalPurpose")]
-    #[test_case("poteto-agent", "poteto-agent")]
-    #[test_case("comment-sicko", "comment-sicko")]
-    #[test_case(r"readonly: (true|false)", "`readonly: true`")]
-    #[test_case(r#"environment: "(cloud|local)""#, r#"`environment: "cloud"`"#)]
-    #[test_case("cloud_base_branch", "cloud_base_branch")]
-    #[test_case("run_in_background", "`run_in_background: true`")]
-    #[test_case("`resume`", "`resume`")]
-    #[test_case("file_attachments", "`file_attachments`")]
-    #[test_case(r"\bclaude-[a-z]+-\d", "claude-")]
-    #[test_case(r"\bgrok-\d", "grok-")]
-    #[test_case(r"\bgpt-\d", "gpt-")]
-    #[test_case("inherit-parent", "inherit-parent")]
-    #[test_case(r"pstack-models\.mdc", "pstack-models.mdc")]
-    #[test_case(r"\.cursor/skills", ".cursor/skills/")]
-    #[test_case(r"\.cursor/plugins|\.cursor-plugin", "~/.cursor/plugins/")]
-    #[test_case(r"\.cursor/rules|always-applied rule", ".cursor/rules/")]
-    #[test_case(r"agent-transcripts|\.cursor/projects", "agent-transcripts")]
-    #[test_case(r"Bugbot", "Bugbot")]
-    #[test_case(r"Cursor [Aa]utomation|cursor\.(sh|com)/automations", "Cursor Automations")]
-    #[test_case(r"[Cc]loud [Aa]gent", "Cursor cloud agents")]
-    #[test_case(r"built-in PR tool", "A built-in PR tool")]
-    #[test_case(r"create-skill", "`create-skill`")]
-    #[test_case(r"check-plan\.mjs", "check-plan.mjs")]
-    #[test_case(r"watch-pr", "watch-pr")]
-    #[test_case(r"worktree-audit\.sh", "worktree-audit.sh")]
-    #[test_case(r"log\.sh", "log.sh")]
-    #[test_case(r"`orch ", "`orch <command>")]
-    #[test_case(r"/loop\b", "/loop")]
-    fn the_adapter_maps_every_cursor_name(pattern: &str, row: &str) {
-        let term = Regex::new(pattern).unwrap();
-        let used = library().pages.values().any(|text| term.is_match(text));
-        assert!(!used || ADAPTER.contains(row), "{UNMAPPED_MSG}: {row}");
+    /// The upstream hash each translation was made from must still be upstream's, so a sync that
+    /// changes a translated file fails here until the translation follows it.
+    #[test]
+    fn every_translation_follows_its_upstream_file() {
+        let read = |dir: &Dir<'static>, file: &str| -> serde_json::Value {
+            serde_json::from_str(dir.get_file(file).unwrap().contents_utf8().unwrap()).unwrap()
+        };
+        let upstream = read(&UPSTREAM, MANIFEST);
+        let recorded = read(&TRANSLATED, TRANSLATIONS);
+        let recorded = recorded["files"].as_object().unwrap();
+        let translated: BTreeSet<&str> = vendored(&TRANSLATED).into_iter().map(|(path, _)| path).collect();
+        for path in &translated {
+            let base = &upstream["files"][*path];
+            assert!(!base.is_null(), "{ORPHAN_MSG}: {path}");
+            assert_eq!(recorded.get(*path), Some(base), "{STALE_MSG}: {path}");
+        }
+        let listed: BTreeSet<&str> = recorded.keys().map(String::as_str).collect();
+        assert_eq!(listed, translated, "{UNLISTED_MSG}");
+    }
+
+    /// Every served page reads as Caudra's: a page that still names one of these was not
+    /// translated. `.caudra/skills/pstack-translate` says what each becomes.
+    const CURSOR_TERMS: &[&str] = &[
+        r"`Task`|\bTask (tool|subagent|call)s?\b",
+        r"AskQuestion",
+        r"generalPurpose",
+        r"subagent_type",
+        r"readonly: ?(true|false)|\breadonly mode\b|\bAsk mode\b",
+        r"run_in_background|is_background",
+        r#"environment: ?"?(cloud|local)"#,
+        r"cloud_base_branch",
+        r"file_attachments",
+        r"\b(claude|grok|gpt|gemini)-[a-z0-9.-]*-(low|medium|high|xhigh|max)(-fast)?\b",
+        r"inherit-parent",
+        r"\.mdc\b|alwaysApply|always-applied rule",
+        r"\.cursor\b",
+        r"agent-transcripts",
+        r"[Cc]ursor [Aa]utomations?|cursor\.(sh|com)/automations|api2\.cursor|update_state|SendToUser",
+        r"[Cc]loud [Aa]gents?",
+        r"built-in PR tool",
+        r"\bcreate-skill\b",
+        r"check-plan\.mjs|worktree-audit\.sh|\blog\.sh\b|watch-pr/watch-pr|scripts/watch-pr|orch\.ts",
+        r"\bbunx?\b|\bnode [^ ]*\.m?js",
+        r"/loop\b",
+        r"cursor\.com/docs",
+        r"\bCursor\b",
+    ];
+    /// Pages that name a Cursor term on purpose, and the term.
+    const CURSOR_TERMS_ALLOWED: &[(&str, &str)] = &[("README.md", r"\bCursor\b")];
+    const LICENSE_FILE: &str = "LICENSE";
+
+    fn untranslated(term: &Regex) -> Vec<String> {
+        library()
+            .pages
+            .iter()
+            .filter(|(page, _)| !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && !page.ends_with(LICENSE_FILE))
+            .filter(|(page, _)| {
+                !CURSOR_TERMS_ALLOWED
+                    .iter()
+                    .any(|(allowed, pattern)| allowed == page && *pattern == term.as_str())
+            })
+            .flat_map(|(page, text)| {
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, line)| term.is_match(line))
+                    .map(move |(number, line)| format!("{page}:{}: {}", number + 1, line.trim()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_page_names_a_cursor_term() {
+        let found: Vec<String> = CURSOR_TERMS
+            .iter()
+            .flat_map(|pattern| untranslated(&Regex::new(pattern).unwrap()))
+            .collect();
+        assert!(found.is_empty(), "{UNTRANSLATED_MSG}:\n{}", found.join("\n"));
+    }
+
+    #[test]
+    fn a_skill_command_carries_the_pstack_scope() {
+        let names: Vec<String> = library()
+            .skills()
+            .iter()
+            .map(|skill| regex::escape(&skill.name))
+            .collect();
+        let bare = Regex::new(&format!(r"(?m)(^|[\s`(\[*'])/({})($|[^\w-])", names.join("|"))).unwrap();
+        let found = untranslated(&bare);
+        assert!(found.is_empty(), "{BARE_COMMAND_MSG}:\n{}", found.join("\n"));
     }
 }

@@ -41,8 +41,9 @@ impl Roles {
                         "`{path}` sets no roles, so every role uses its skill's default."
                     ),
                     false => format!(
-                        "From `{path}`. Each line overrides the skill default for its role; \
-                         map its slugs with the adapter's Models table.\n\n```\n{}\n```",
+                        "From `{path}`. Each line overrides the skill default for its role: \
+                         `<model> <thinking>` are the `task` call's `model` and `thinking`, and \
+                         `inherit` omits both.\n\n```\n{}\n```",
                         lines.join("\n")
                     ),
                 }
@@ -51,7 +52,7 @@ impl Roles {
     }
 }
 
-/// The `# budget` line and every `role: value` line, without comments or frontmatter.
+/// The `# budget` line and every `role: value` line, without the other comments.
 pub fn role_lines(text: &str) -> Vec<&str> {
     text.lines()
         .map(str::trim)
@@ -59,7 +60,6 @@ pub fn role_lines(text: &str) -> Vec<&str> {
             line.starts_with(BUDGET_PREFIX)
                 || (!line.starts_with(COMMENT) && line.contains(ROLE_SEPARATOR))
         })
-        .filter(|line| !line.starts_with("description:") && !line.starts_with("alwaysApply:"))
         .collect()
 }
 
@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     const PATH: &str = "/config/pstack/models.md";
-    const WRITTEN: &str = "---\ndescription: pstack per-role model choices\nalwaysApply: true\n---\n# pstack model configuration. One line per role.\n# budget: large (xhigh)\nbug-fix: grok-4.7-xhigh-fast\njudgment and prose: claude-opus-5-5-xhigh\n";
+    const WRITTEN: &str = "# pstack model configuration. One line per role.\n# budget: large (xhigh)\nbug-fix: grok-4.7 xhigh\njudgment and prose: claude-opus-5-5 xhigh\n";
 
     #[test]
     fn only_the_budget_and_role_lines_are_kept() {
@@ -76,8 +76,8 @@ mod tests {
             role_lines(WRITTEN),
             [
                 "# budget: large (xhigh)",
-                "bug-fix: grok-4.7-xhigh-fast",
-                "judgment and prose: claude-opus-5-5-xhigh"
+                "bug-fix: grok-4.7 xhigh",
+                "judgment and prose: claude-opus-5-5 xhigh"
             ]
         );
     }
@@ -96,7 +96,7 @@ mod tests {
             path: PATH.to_owned(),
             text: WRITTEN.to_owned(),
         };
-        assert!(roles.describe().contains("bug-fix: grok-4.7-xhigh-fast"));
+        assert!(roles.describe().contains("bug-fix: grok-4.7 xhigh"));
     }
 
     #[test]

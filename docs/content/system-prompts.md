@@ -221,10 +221,10 @@ With the [pstack skill](/docs/skills/#pstack) on, two more profiles appear in th
 
 | Profile | Does |
 |---|---|
-| `pstack-poteto-agent` | Writes code or runs a helper step that a poteto-mode run delegates. It loads `pstack/adapter` and `pstack/poteto-mode` before any work |
-| `pstack-comment-sicko` | Deletes comments in a diff or a set of files, apart from a short list of exceptions such as license headers and API docs, and marks code that needs a rename or refactor instead. It never writes application code. It loads `pstack/adapter` before any work |
+| `pstack-poteto-agent` | Writes code or runs a helper step that a poteto-mode run delegates. It loads `pstack/poteto-mode` before any work |
+| `pstack-comment-sicko` | Deletes comments in a diff or a set of files, apart from a short list of exceptions such as license headers and API docs, and marks code that needs a rename or refactor instead. It never writes application code |
 
-Their text is pstack's own agent files, with a first line that sends the agent to the adapter. A file of the same name in `system-prompts/` replaces one, even a file that fails to load. With `pstack = false` they are gone, and a task that names one fails as a missing profile does.
+Their text is pstack's own agent files, translated for Caudra. A file of the same name in `system-prompts/` replaces one, even a file that fails to load. With `pstack = false` they are gone, and a task that names one fails as a missing profile does.
 
 ## Select a profile
 

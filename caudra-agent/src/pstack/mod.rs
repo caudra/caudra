@@ -9,10 +9,6 @@ use crate::command::{ARGUMENTS_PLACEHOLDER, CommandScope, CommandSource, CustomC
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::skill::{BuiltinSkill, install_builtin_skill, remove_builtin_skill};
 
-const ADAPTER_ADDRESS: &str = "pstack/adapter";
-/// Skills an agent's body sends it to read first, loaded by address instead.
-const PRELOADS: &[(&str, &str)] = &[("poteto-agent", "pstack/poteto-mode")];
-
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Applied at startup and on every settings reload; while off, everything here is empty.
@@ -83,24 +79,7 @@ fn builtin_commands(library: &Library) -> Vec<CustomCommand> {
 fn profile(agent: &Agent) -> SystemPromptProfile {
     let name = format!("{NAME}-{}", agent.name);
     let address = format!("{NAME}/agents/{}.md", agent.name);
-    let preload = PRELOADS
-        .iter()
-        .find(|(agent_name, _)| *agent_name == agent.name)
-        .map(|(_, skill)| {
-            format!(
-                " Then load `{skill}` and read it in full: it is the skill the instructions \
-                 below send you to find by path."
-            )
-        })
-        .unwrap_or_default();
-    let body = format!(
-        "You run as pstack's `{agent}` agent. Before any work, load `{ADAPTER_ADDRESS}` with the \
-         `skill` tool: the instructions below are written for Cursor, and the adapter maps their \
-         tools, paths, and subagent fields to Caudra's.{preload}\n\n{body}",
-        agent = agent.name,
-        body = agent.body.trim(),
-    );
-    SystemPromptProfile::builtin(&name, &agent.description, body, &address)
+    SystemPromptProfile::builtin(&name, &agent.description, agent.body.trim().to_owned(), &address)
 }
 
 #[cfg(test)]
@@ -134,16 +113,15 @@ mod tests {
         assert_eq!(commands.len(), wanted);
     }
 
-    #[test_case(POTETO_PROFILE, true ; "poteto_agent_preloads_poteto_mode")]
-    #[test_case(SICKO_PROFILE, false ; "comment_sicko_loads_the_adapter_only")]
-    fn agents_become_profiles_that_load_the_adapter(name: &str, preloads: bool) {
+    #[test_case(POTETO_PROFILE, true ; "poteto_agent_reads_poteto_mode")]
+    #[test_case(SICKO_PROFILE, false ; "comment_sicko_reads_its_own_text")]
+    fn agents_become_profiles(name: &str, reads_poteto_mode: bool) {
         let profiles: Vec<SystemPromptProfile> = library().agents().iter().map(profile).collect();
         let found = profiles
             .iter()
             .find(|profile| profile.name() == name)
             .unwrap();
-        assert!(found.body().contains(ADAPTER_ADDRESS));
-        assert_eq!(found.body().contains("`pstack/poteto-mode`"), preloads);
+        assert_eq!(found.body().contains("`pstack/poteto-mode`"), reads_poteto_mode);
     }
 
     #[test]

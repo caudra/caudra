@@ -1,6 +1,6 @@
 [package]
 name = "caudra-pstack"
-description = "The bundled pstack: its skills as addressable pages, the Cursor-to-Caudra adapter, and Rust ports of its scripts."
+description = "The bundled pstack: its skills translated for Caudra as addressable pages, and Rust ports of its scripts."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

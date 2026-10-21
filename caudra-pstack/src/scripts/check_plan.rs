@@ -40,7 +40,11 @@ const PROGRAM_H3: [&str; 5] = [
     "Verdict and merge",
     "Boot recipe",
 ];
-const PROGRAM_MARKERS: [&str; 3] = ["git show origin/main:", "/loop 1h", "status message"];
+const PROGRAM_MARKERS: [&str; 3] = [
+    "git show origin/main:",
+    "`schedule` trigger every hour",
+    "status message",
+];
 const HOW_TO_READ_MARKERS: [&str; 5] = [
     "One box is one unit of work",
     "names the evidence",
@@ -623,7 +627,7 @@ One box is one unit of work and names the evidence. Check a box only when its ev
 ### PR mechanics
 ### Verdict and merge
 ### Boot recipe
-`git show origin/main:` /loop 1h status message
+`git show origin/main:` `schedule` trigger every hour status message
 
 ## PR 1
 **Depends on.** None.

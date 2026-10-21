@@ -1,8 +1,9 @@
-//! The bundled pstack: poteto's skills, served as pages of one `pstack` skill, the adapter that
-//! maps their Cursor names to Caudra's, and Rust ports of the scripts they run.
+//! The bundled pstack: poteto's skills, served as pages of one `pstack` skill, and Rust ports of
+//! the scripts they run.
 //!
-//! The skills are embedded verbatim from `upstream/` (see `upstream/upstream.json` and
-//! `make sync-pstack`); everything Caudra adds lives beside them.
+//! `upstream/` is the verbatim copy `make sync-pstack` writes. `translated/` replaces each file
+//! that names Cursor's tools, fields, paths, or features with its Caudra translation, so a served
+//! page needs no mapping (`.caudra/skills/pstack-translate`).
 
 #![forbid(unsafe_code)]
 
@@ -12,5 +13,5 @@ pub mod models;
 pub mod scripts;
 
 pub use host::{Cancelled, Host, Output};
-pub use library::{ADAPTER, Agent, Library, NAME, SKILL_DESCRIPTION, Skill, library};
+pub use library::{Agent, Library, NAME, SKILL_DESCRIPTION, Skill, library};
 pub use models::{ROLES_FILE, Roles};

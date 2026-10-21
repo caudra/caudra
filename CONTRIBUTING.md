@@ -158,6 +158,14 @@ The `model-watch` automation in `.caudra/automations/` runs that routine once a 
 
 Each run writes its report to `target/model-watch/<date>.md` in the worktree and notifies you when it lands, or when something needs a person.
 
+## Keeping pstack current
+
+`caudra-pstack/upstream/` is a verbatim copy of the pstack files Caudra bundles from [cursor/plugins](https://github.com/cursor/plugins). Never edit it by hand: `make sync-pstack ARGS='--source <cursor/plugins checkout>'` rewrites it. pstack is written for Cursor, so every file that names a Cursor tool, path, model, command, or feature has a Caudra translation in `caudra-pstack/translated/`, which replaces the upstream page. The agent reads the translated pages as written and never maps names itself.
+
+`translated/translations.json` records the upstream hash each translation was made from. After a sync, the script prints a line for each file that needs work: `TRANSLATE` when upstream changed a translated file, `NEW` when it added or changed one with no translation, `ORPHAN` when a translated file went away, and `PORT` when a script with a Rust port in `caudra-pstack/src/scripts/` changed. `cargo test -p caudra-pstack` fails while any page still names a Cursor term or any translation is stale. The `pstack-translate` skill in `.caudra/skills/` holds the rules for translating, and `python3 scripts/sync-pstack.py --mark <path>...` records a finished translation.
+
+The `pstack-sync` automation in `.caudra/automations/` runs that routine once a day: it merges `main` into its own branch, pulls your cursor/plugins clone, syncs, retranslates with the skill, validates, and fast-forwards your local `main`. Set it up as `model-watch` above, in its own worktree on a `pstack-sync` branch, and arm it with both paths: `/automations arm pstack-sync {"main_worktree": "/path/to/caudra", "plugins_checkout": "/path/to/cursor-plugins"}`. Each run writes its report to `target/pstack-sync/<date>.md` in the worktree.
+
 ## Working on Workcell
 
 The file, shell, web, Python, and source-code tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.

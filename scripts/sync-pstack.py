@@ -4,7 +4,13 @@
 The copy is verbatim apart from one rewrite: a relative Markdown link to a pstack file the copy
 leaves out points at that file on GitHub instead, the same rewrite upstream's own harness
 generator applies. Ported scripts are left out and recorded by hash, so a sync that changes one
-names the Rust port to revisit.
+names the Rust port to revisit, and an added or changed file without a translation is named for a
+look.
+
+caudra-pstack/translated/ holds the Caudra translation of every file that names Cursor, each
+recorded with the hash of the upstream file it was translated from. A sync names every
+translation whose upstream file changed or went away. `--mark` records a finished translation.
+The `.caudra/skills/pstack-translate` skill says how to translate.
 """
 
 import argparse
@@ -20,6 +26,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEST = ROOT / "caudra-pstack" / "upstream"
 MANIFEST = DEST / "upstream.json"
+TRANSLATED = ROOT / "caudra-pstack" / "translated"
+TRANSLATIONS = TRANSLATED / "translations.json"
+TERM_CHECK = "cargo test -p caudra-pstack --lib -- library::"
 GITHUB = "https://github.com/cursor/plugins"
 PSTACK = "pstack"
 TEAM_KIT = "cursor-team-kit"
@@ -93,13 +102,14 @@ def commit_of(source: Path) -> str:
     return result.stdout.strip()
 
 
-def previous_script_hashes() -> dict[str, str]:
+def previous_manifest() -> dict:
     if not MANIFEST.exists():
-        return {}
-    return json.loads(MANIFEST.read_text())["ported_scripts"]
+        return {"files": {}, "ported_scripts": {}}
+    return json.loads(MANIFEST.read_text())
 
 
 def sync(source: Path) -> int:
+    previous = previous_manifest()
     files = pstack_files(source)
     kept = set(files)
     if DEST.exists():
@@ -120,7 +130,7 @@ def sync(source: Path) -> int:
         shutil.copyfile(source / TEAM_KIT / name, target)
         entries[f"{TEAM_KIT}/{name}"] = sha256(target)
 
-    before = previous_script_hashes()
+    before = previous["ported_scripts"]
     scripts = {name: sha256(source / PSTACK / name) for name in PORTED_SCRIPTS}
     plugin = json.loads((source / PSTACK / "plugin.json").read_text())
     manifest = {
@@ -138,17 +148,72 @@ def sync(source: Path) -> int:
     print(f"pstack {plugin['version']}: {len(entries)} files")
     for name in changed:
         print(
-            f"PORT {name} changed upstream; update its Rust port in caudra-pstack/src"
+            f"PORT {name} changed upstream; update its Rust port in caudra-pstack/src/scripts"
         )
-    return 1 if changed else 0
+    stale = stale_translations(entries) + untranslated_changes(previous["files"], entries)
+    for line in stale:
+        print(line)
+    print(f"Then run `{TERM_CHECK}`: it lists every page that still names Cursor.")
+    return 1 if changed or stale else 0
+
+
+def recorded_translations() -> dict[str, str]:
+    if not TRANSLATIONS.exists():
+        return {}
+    return json.loads(TRANSLATIONS.read_text())["files"]
+
+
+def stale_translations(entries: dict[str, str]) -> list[str]:
+    lines = []
+    for name, digest in sorted(recorded_translations().items()):
+        if name not in entries:
+            lines.append(f"ORPHAN {name}: upstream removed it; delete or move the translation")
+        elif entries[name] != digest:
+            lines.append(
+                f"TRANSLATE {name}: upstream changed; see `git diff -- caudra-pstack/upstream/{name}`"
+            )
+    return lines
+
+
+def untranslated_changes(before: dict[str, str], entries: dict[str, str]) -> list[str]:
+    recorded = recorded_translations()
+    return [
+        f"NEW {name}: upstream added or changed it; translate it if the check names it"
+        for name, digest in sorted(entries.items())
+        if name not in recorded and before.get(name) != digest
+    ]
+
+
+def mark(names: list[str]) -> int:
+    entries = json.loads(MANIFEST.read_text())["files"]
+    recorded = recorded_translations()
+    for name in names:
+        if not (TRANSLATED / name).is_file():
+            print(f"no translation at caudra-pstack/translated/{name}", file=sys.stderr)
+            return 1
+        if name not in entries:
+            print(f"no upstream file {name} in {MANIFEST.name}", file=sys.stderr)
+            return 1
+        recorded[name] = entries[name]
+    TRANSLATIONS.write_text(
+        json.dumps({"files": dict(sorted(recorded.items()))}, indent=2) + "\n"
+    )
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--source", type=Path, required=True, help="a cursor/plugins checkout"
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--source", type=Path, help="a cursor/plugins checkout")
+    action.add_argument(
+        "--mark",
+        nargs="+",
+        metavar="PATH",
+        help="record translations as made from the current upstream files, such as pstack/skills/how/SKILL.md",
     )
     args = parser.parse_args()
+    if args.mark:
+        return mark(args.mark)
     return sync(args.source.resolve())
 
 

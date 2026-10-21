@@ -264,7 +264,7 @@ r["code"] == 0
 | `pstack.watch_pr("--pr", "123", "--status-only")` | `watch-pr` | Reports a pull request's checks and reviews through the GitHub CLI, `gh`. Without `--status-only` it polls until a verdict, so give the run a `timeoutSec` that covers the wait |
 | `pstack.orch("--store", dir, ...)` | `orch.ts` | Reads and writes the orchestrate store in the same file format. Every call names its store |
 
-`pstack.watch_pr("--help")` and `pstack.orch("--help")` list every option. A long-running call shows its latest line on the card. To watch a pull request without holding the turn, arm the `pstack-watch-pr` [automation](/docs/automations/) that `pstack/adapter` describes.
+`pstack.watch_pr("--help")` and `pstack.orch("--help")` list every option. A long-running call shows its latest line on the card. To watch a pull request without holding the turn, arm the `pstack-watch-pr` [automation](/docs/automations/) that `pstack/poteto-mode/playbooks/babysit.md` describes.
 
 The scripts run on this machine. In a [remote workspace](/docs/remote-workspaces/) the calls raise `RuntimeError`, and the agent follows the skill's steps with `shell` instead.
 

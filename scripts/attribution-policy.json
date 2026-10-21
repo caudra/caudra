@@ -33,7 +33,7 @@
     },
     "caudra-pstack@0.2.0-preview.11": {
       "expression": "Apache-2.0 AND MIT",
-      "reason": "The Caudra glue, library, and adapter remain Apache-2.0. The embedded pstack (Lauren Tan) and cursor-team-kit skills (Cursor) copied from cursor/plugins, and the Rust ports of pstack's scripts, remain MIT. Preserve both upstream licenses. This aggregate expression does not relicense individual files.",
+      "reason": "The Caudra glue and library remain Apache-2.0. The embedded pstack (Lauren Tan) and cursor-team-kit skills (Cursor) copied from cursor/plugins, their Caudra translations, and the Rust ports of pstack's scripts, remain MIT. Preserve both upstream licenses. This aggregate expression does not relicense individual files.",
       "files": [
         {
           "path": "THIRD_PARTY_LICENSES/Pstack.txt",
