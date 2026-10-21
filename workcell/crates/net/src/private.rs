@@ -273,7 +273,10 @@ mod tests {
     #[test_case("[fd7a::1]", 80, "http://[fd7a:0:0::1]/", true; "ipv6_compared_as_an_address")]
     #[test_case("100.64.0.2", 8787, "http://[::ffff:100.64.0.2]:8787/", true; "mapped_ipv6_literal")]
     fn host_entries_match_host_and_port(entry: &str, port: u16, url: &str, expected: bool) {
-        assert_eq!(host(entry, port).matches(&Url::parse(url).unwrap()), expected);
+        assert_eq!(
+            host(entry, port).matches(&Url::parse(url).unwrap()),
+            expected
+        );
     }
 
     #[test_case(PrivateNetwork::Loopback, "127.0.0.9", true; "loopback_v4")]

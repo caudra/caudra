@@ -127,9 +127,9 @@ use workcell::source_code_graph::{
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, PrivateAllowlist, PrivateHost, PrivateNetwork,
-    ProxyConfiguration, ProxyConfigurationError, SharedAllowlist, WebExecution, WebToolDependencies,
-    WebToolGroup, WebfetchError, WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration,
-    WebsearchInput, WebsearchOutput,
+    ProxyConfiguration, ProxyConfigurationError, SharedAllowlist, WebExecution,
+    WebToolDependencies, WebToolGroup, WebfetchError, WebfetchInput, WebfetchOutput,
+    WebsearchExecutionConfiguration, WebsearchInput, WebsearchOutput,
 };
 use workcell::{CodeToolGroup, ExecutionEnvironment};
 use workcell::{OwnedToolSpec, ToolSpec};
@@ -3363,10 +3363,10 @@ fn webfetch_error(error: WebfetchError) -> ToolError {
 /// public-internet rule refused. It names only the refused URL, so it reads the
 /// same whatever `[web]` holds.
 fn private_target_hint(url: &Url, redirected: bool) -> String {
-    let entry = url
-        .host_str()
-        .zip(url.port_or_known_default())
-        .map_or_else(|| WEB_ENTRY_FALLBACK.to_owned(), |(host, port)| format!("\"{host}:{port}\""));
+    let entry = url.host_str().zip(url.port_or_known_default()).map_or_else(
+        || WEB_ENTRY_FALLBACK.to_owned(),
+        |(host, port)| format!("\"{host}:{port}\""),
+    );
     if redirected {
         format!(
             "A redirect led to {url}. webfetch follows a redirect to a private target only when `[web]` admits both the target and the URL that redirected to it. Once the user adds {entry} to `allow_private_hosts` in the `[web]` table of their global caudra.toml, fetch {url} directly. See {WEB_DOCS_URL}"

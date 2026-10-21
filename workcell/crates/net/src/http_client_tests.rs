@@ -222,7 +222,10 @@ async fn rejects_redirect_to_private_literal_before_second_request() {
         client
             .get("https://example.com/start", FetchOptions::default())
             .await,
-        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
+        Err(NetError::RedirectRefused {
+            source: UrlPolicyError::NonPublicIp { .. },
+            ..
+        })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -312,7 +315,10 @@ async fn rejects_redirect_to_hostname_resolving_private_before_second_request() 
         client
             .get("https://public.example.com/start", FetchOptions::default())
             .await,
-        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
+        Err(NetError::RedirectRefused {
+            source: UrlPolicyError::NonPublicIp { .. },
+            ..
+        })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -978,7 +984,10 @@ async fn a_followed_307_hop_is_resolved_and_checked_again() {
 
     assert!(matches!(
         result,
-        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
+        Err(NetError::RedirectRefused {
+            source: UrlPolicyError::NonPublicIp { .. },
+            ..
+        })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -1418,10 +1427,7 @@ async fn the_allowlist_refuses_with_the_public_rules_error(
     hops: usize,
 ) {
     let (client, transport) = allowlisted(vec![PrivateNetwork::Private], &[LAN_ADDRESS], responses);
-    let error = client
-        .get(url, FetchOptions::default())
-        .await
-        .unwrap_err();
+    let error = client.get(url, FetchOptions::default()).await.unwrap_err();
     assert_eq!(error.to_string(), public_refusal(refused));
     let location = match &error {
         NetError::RedirectRefused { location, .. } => Some(location.clone()),

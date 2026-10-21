@@ -83,7 +83,11 @@ impl UrlPolicy {
 
     /// Parse or resolve `value` and refuse credentials in its raw form, leaving
     /// the host for a caller that validates it with a private allowlist.
-    pub(crate) fn parse_syntax(&self, value: &str, base: Option<&Url>) -> Result<Url, UrlPolicyError> {
+    pub(crate) fn parse_syntax(
+        &self,
+        value: &str,
+        base: Option<&Url>,
+    ) -> Result<Url, UrlPolicyError> {
         if raw_value_has_userinfo(value) && !self.operator_options().allow_url_credentials {
             return Err(UrlPolicyError::CredentialsNotAllowed);
         }
