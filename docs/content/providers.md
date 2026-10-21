@@ -195,6 +195,7 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
 | Small | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 100K out |
+| Small | mai-code-1.1-flash | $0.20 / $1.20 | 200K ctx / 100K out |
 | Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
 |  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |

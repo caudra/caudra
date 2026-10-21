@@ -69,9 +69,9 @@ const CONVERSATION_AGENT: &str = "conversation-agent";
 const ENDPOINT_NOT_RESOLVED: &str =
     "Copilot resolves its API endpoint on the first send; send a message first";
 
-/// OpenAI families Copilot serves over the Responses API. Matched as substrings
-/// so `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
-const RESPONSES_FAMILIES: &[&str] = &["gpt-5", "gpt-6", "codex"];
+/// Families Copilot serves over the Responses API. Matched as substrings so
+/// `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
+const RESPONSES_FAMILIES: &[&str] = &["gpt-5", "gpt-6", "codex", "mai-code"];
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
@@ -212,6 +212,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["mai-code-1.1-flash"],
+            small: true,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.20,
+                output: 1.20,
+                cache_write: 0.25,
+                cache_read: 0.02,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gemini-3.7-flash"],
@@ -1384,8 +1402,9 @@ mod tests {
     #[test_case("gpt-6.1-sol", Endpoint::Responses ; "gpt_6_point_release_takes_responses")]
     #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
     #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
+    #[test_case("mai-code-1.1-flash", Endpoint::Responses ; "mai_code_takes_responses")]
     #[test_case("gemini-4-argon", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
-    fn guess_endpoint_covers_every_openai_family(model_id: &str, expected: Endpoint) {
+    fn guess_endpoint_covers_every_responses_family(model_id: &str, expected: Endpoint) {
         assert_eq!(guess_endpoint(model_id), expected);
     }
 
