@@ -215,6 +215,8 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 |  | claude-opus-5.5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Best | **claude-opus-5, claude-opus-4.8** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
 |  | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | claude-fable-5.1 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | gpt-6-astra | $10.00 / $50.00 | 200K ctx / 100K out |
 |  | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
 |  | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
 |  | grok-4.7 | $2.00 / $6.00 | 200K ctx / 100K out |

@@ -36,6 +36,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 ### Models
 
 - **MAI-Code-1.1-Flash on GitHub Copilot.** `copilot/mai-code-1.1-flash` and `copilot-enterprise/mai-code-1.1-flash` now have their price and size class before Copilot's model list arrives: $0.20 per million input tokens and $1.20 per million output tokens, with cache reads at $0.02 and cache writes at $0.25. GitHub lists it as a lightweight model, so Caudra counts it among the Fast models. Thinking takes `low`, `medium`, and `high`. See [Copilot](/docs/providers/#copilot).
+- **GPT-6 Astra and Claude Fable 5.1 on GitHub Copilot.** `gpt-6-astra` costs $10 per million input tokens and $50 per million output tokens on Copilot, with cache reads at $1 and cache writes at $12.50. `claude-fable-5.1` costs the same, except cache reads at $0.25. Caudra used to bill it at Fable 5's $1, so a Fable 5.1 session's cost in `/usage` comes out lower from now on. Both take thinking levels from `low` to `max`.
 
 ### Changes
 
