@@ -7,11 +7,13 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use caudra_config::LearningTarget;
 use caudra_storage::checkout;
 use caudra_storage::paths::canonicalize_clean;
 use caudra_storage::{StorageError, atomic_write, atomic_write_permissions};
+use tracing::info;
 
 use crate::agent::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 
@@ -25,6 +27,8 @@ const NEW_FILE_MODE: u32 = 0o644;
 const PROJECT_HEADING: &str = "## Learned workspace facts";
 const LOCAL_HEADING: &str = "## Learned local setup";
 const GLOBAL_HEADING: &str = "## Learned user preferences";
+const GITIGNORE: &str = ".gitignore";
+const GIT: &str = "git";
 
 /// The heading a target's block opens with.
 pub fn heading(target: LearningTarget) -> &'static str {
@@ -145,6 +149,53 @@ impl InstructionFile {
     }
 }
 
+/// Makes sure version control leaves the file at `path` out, by a line in the
+/// `.gitignore` beside it, created when there is none, inside a repository or
+/// not. Answers whether it wrote one.
+pub fn ensure_ignored(path: &Path) -> Result<bool, StorageError> {
+    let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(false);
+    };
+    if git_ignores(root, name) {
+        return Ok(false);
+    }
+    let gitignore = root.join(GITIGNORE);
+    let content = read_optional(&gitignore)?;
+    let existing = content.as_deref().unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| line.trim().trim_start_matches('/') == name)
+    {
+        return Ok(false);
+    }
+    let separator = match existing.is_empty() || existing.ends_with('\n') {
+        true => "",
+        false => "\n",
+    };
+    let updated = format!("{existing}{separator}{name}\n");
+    match content {
+        Some(_) => atomic_write(&gitignore, updated.as_bytes())?,
+        None => atomic_write_permissions(&gitignore, updated.as_bytes(), NEW_FILE_MODE)?,
+    }
+    info!(path = %gitignore.display(), ignored = name, "learner added a .gitignore entry");
+    Ok(true)
+}
+
+/// Whether git already leaves `name` at `root` out, by any of its ignore
+/// rules, tracked or not. Outside a repository git has no say.
+fn git_ignores(root: &Path, name: &str) -> bool {
+    checkout::discover(root).is_some()
+        && Command::new(GIT)
+            .args(["check-ignore", "-q", "--no-index", "--", name])
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
 /// The bullets of the block in `content`.
 pub fn bullets(content: &str) -> Vec<String> {
     let Some((start, end)) = block_span(content) else {
@@ -196,6 +247,12 @@ mod tests {
     const FIRST: &str = "Use nextest, not cargo test";
     const SECOND: &str = "Docs regenerate with make gen-docs";
     const EDITED_ELSEWHERE: &str = "someone else's edit\n";
+    const IGNORE_LINE: &str = "AGENTS.local.md\n";
+    const ANCHORED: &str = "/AGENTS.local.md";
+    const OTHER_RULES: &str = "target/\n*.log\n";
+    const UNTERMINATED: &str = "target/";
+    const NO_EXCLUDES: &str = "/dev/null";
+    const GIT_EXCLUDE: &str = ".git/info/exclude";
 
     fn file(content: Option<&str>) -> InstructionFile {
         InstructionFile {
@@ -263,6 +320,72 @@ mod tests {
             bullets(&fs::read_to_string(&path).unwrap()),
             learned(&[FIRST])
         );
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new(GIT)
+            .args(args)
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A repository that answers only to its own rules, whatever the
+    /// machine's global excludes say.
+    fn repository() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "--quiet"]);
+        git(dir.path(), &["config", "core.excludesFile", NO_EXCLUDES]);
+        dir
+    }
+
+    fn local(dir: &TempDir) -> PathBuf {
+        target_path(LearningTarget::Local, dir.path(), None).unwrap()
+    }
+
+    fn gitignore(dir: &TempDir) -> Option<String> {
+        read_optional(&dir.path().join(GITIGNORE)).unwrap()
+    }
+
+    #[test_case(None, IGNORE_LINE ; "a_missing_file_is_created")]
+    #[test_case(Some(OTHER_RULES), &format!("{OTHER_RULES}{IGNORE_LINE}") ; "a_file_gains_the_line")]
+    #[test_case(Some(UNTERMINATED), &format!("{UNTERMINATED}\n{IGNORE_LINE}") ; "a_last_line_is_ended_first")]
+    fn the_local_file_is_added_to_gitignore(before: Option<&str>, after: &str) {
+        let dir = TempDir::new().unwrap();
+        if let Some(before) = before {
+            fs::write(dir.path().join(GITIGNORE), before).unwrap();
+        }
+        assert!(ensure_ignored(&local(&dir)).unwrap());
+        assert_eq!(gitignore(&dir).as_deref(), Some(after));
+    }
+
+    #[test_case(LOCAL_INSTRUCTION_FILE ; "by_name")]
+    #[test_case(ANCHORED ; "anchored")]
+    fn a_gitignore_that_names_it_is_left_alone(line: &str) {
+        let dir = TempDir::new().unwrap();
+        let before = format!("{OTHER_RULES}{line}\n");
+        fs::write(dir.path().join(GITIGNORE), &before).unwrap();
+        assert!(!ensure_ignored(&local(&dir)).unwrap());
+        assert_eq!(gitignore(&dir), Some(before));
+    }
+
+    #[test]
+    fn a_file_git_already_ignores_needs_no_gitignore() {
+        let dir = repository();
+        let exclude = dir.path().join(GIT_EXCLUDE);
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, IGNORE_LINE).unwrap();
+        assert!(!ensure_ignored(&local(&dir)).unwrap());
+        assert_eq!(gitignore(&dir), None);
+    }
+
+    #[test]
+    fn a_repository_without_a_rule_gets_one() {
+        let dir = repository();
+        assert!(ensure_ignored(&local(&dir)).unwrap());
+        assert_eq!(gitignore(&dir).as_deref(), Some(IGNORE_LINE));
     }
 
     #[test]

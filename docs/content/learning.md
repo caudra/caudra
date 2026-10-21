@@ -55,7 +55,8 @@ Caudra applies these rules:
 - A bullet in the committed project file needs evidence from at least two sessions.
 - Text that looks like a secret, and text that holds a block marker, is refused.
 - A note is at most 4 KiB.
-- `AGENTS.local.md` is created only where git ignores it, or outside a repository.
+- A file is created only when the learner has something to write to it.
+- Before it writes `AGENTS.local.md`, Caudra adds the file to the `.gitignore` beside it, creating `.gitignore` if there is none, even outside a git repository. It skips this when git already ignores the file. The line stays when you revert a change, and `/learn` doesn't list it.
 
 An item that breaks a rule is dropped with its reason, and the rest still apply. Before each write Caudra compares the file with the copy the learner was shown. A file you changed meanwhile is left alone, and that history is read again on the next run.
 

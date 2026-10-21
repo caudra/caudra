@@ -6,8 +6,7 @@
 //! The cursor moves only for a run that finished and applied all it could,
 //! so a failed or conflicting run leaves its history for the next one.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +26,6 @@ use super::digest::{self, Digest};
 use super::runner::{self, Shown, Spend};
 use super::targets::{self, InstructionFile};
 use super::{LearnedNotice, LearnerActivity, LearnerStep};
-use crate::agent::LOCAL_INSTRUCTION_FILE;
 use crate::agent::task_runner::WorkflowHostContext;
 use crate::history::{HistoryProject, HistoryStore};
 use crate::memory::store::{MemoryStore, now_ms};
@@ -60,7 +58,6 @@ pub const TIMED_OUT: &str = "the learner timed out";
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Items one run reads, oldest first; the rest wait for the next.
 const TIMELINE_LIMIT: usize = 20_000;
-const GIT: &str = "git";
 
 /// Why a project's learner waits rather than runs, `None` when it may run.
 /// A forced run skips the spacing between runs but never a pause or the
@@ -462,9 +459,8 @@ impl Shared {
         Ok(Evidence::new(resolved))
     }
 
-    /// The instruction files of the enabled targets, as they are now. A
-    /// local file that does not exist yet is offered only where version
-    /// control would ignore it.
+    /// The instruction files of the enabled targets, as they are now. The
+    /// local file is ignored by version control before it is first written.
     async fn files(&self) -> Vec<InstructionFile> {
         let targets: Vec<LearningTarget> = self.deps.targets.clone();
         let root = self.root.clone();
@@ -474,13 +470,9 @@ impl Shared {
                 .into_iter()
                 .filter_map(|target| {
                     let path = targets::target_path(target, &root, config_dir.as_deref())?;
-                    let file = InstructionFile::read(target, path)
+                    InstructionFile::read(target, path)
                         .map_err(|error| warn!(%error, target = target.as_str(), "instruction file unreadable"))
-                        .ok()?;
-                    let unignored = target == LearningTarget::Local
-                        && file.content.is_none()
-                        && !ignored(&root, LOCAL_INSTRUCTION_FILE);
-                    (!unignored).then_some(file)
+                        .ok()
                 })
                 .collect()
         })
@@ -519,22 +511,6 @@ fn notice(run_id: i64, finished: &FinishedRun) -> LearnedNotice {
         local: count(LearningTarget::Local),
         global: count(LearningTarget::Global),
     }
-}
-
-/// Whether git would leave `name` at `root` out of version control. Outside
-/// a repository nothing is committed, so everything counts as ignored.
-fn ignored(root: &Path, name: &str) -> bool {
-    if caudra_storage::checkout::discover(root).is_none() {
-        return true;
-    }
-    Command::new(GIT)
-        .args(["check-ignore", "-q", "--", name])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 fn millis(duration: Duration) -> i64 {
@@ -595,11 +571,5 @@ mod tests {
             ..LearningProject::default()
         };
         assert_eq!(waiting(Some(&paused), None, 0, NOW_MS, true), Some(PAUSED));
-    }
-
-    #[test]
-    fn outside_a_repository_a_local_file_counts_as_ignored() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert!(ignored(dir.path(), LOCAL_INSTRUCTION_FILE));
     }
 }

@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use super::targets::{
     BLOCK_CLOSE, BLOCK_OPEN, InstructionFile, MAX_BULLET_BYTES, MAX_BULLETS, Written, bullets,
+    ensure_ignored,
 };
 use crate::memory::store::{MemoryError, MemoryStore, journal_body, note_name};
 use crate::permissions::review::redact_text;
@@ -336,7 +337,8 @@ impl Applied {
 }
 
 /// Applies the plan: each block through a compare-and-write against the file
-/// the learner was shown, each note through the journal as `run`'s.
+/// the learner was shown, each note through the journal as `run`'s. The local
+/// file is kept out of version control before anything is written to it.
 pub fn apply(
     plan: &Plan,
     files: &[InstructionFile],
@@ -352,6 +354,9 @@ pub fn apply(
             continue;
         }
         let after = file.rewritten(&block.bullets);
+        if block.target == LearningTarget::Local {
+            ensure_ignored(&file.path)?;
+        }
         match file.write_if_unchanged(&after)? {
             Written::Conflict => applied.conflicts.push(block.target),
             Written::Wrote => applied.edits.push(LearningEdit {
@@ -454,6 +459,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::learning::targets::target_path;
 
     const RULE: &str = "Run cargo nextest, never cargo test";
     const OTHER_RULE: &str = "Regenerate docs with make gen-docs";
@@ -461,6 +467,8 @@ mod tests {
     const NOTE: &str = "testing.md";
     const NOTE_BODY: &str = "# Testing\n\nnextest is the runner.";
     const HAND_WRITTEN: &str = "# Project\n";
+    const GITIGNORE: &str = ".gitignore";
+    const IGNORE_LINE: &str = "AGENTS.local.md\n";
 
     fn reference(session: CaudraId) -> HistoryRef {
         HistoryRef {
@@ -571,6 +579,48 @@ mod tests {
         assert_eq!(applied.conflicts, vec![LearningTarget::Project]);
         assert_eq!(applied.count(LearningTarget::Local), 1);
         assert_eq!(fs::read_to_string(&files[0].path).unwrap(), OTHER_RULE);
+    }
+
+    fn named(dir: &TempDir, target: LearningTarget) -> InstructionFile {
+        let path = target_path(target, dir.path(), None).unwrap();
+        InstructionFile::read(target, path).unwrap()
+    }
+
+    #[test_case(LearningTarget::Local, Some(IGNORE_LINE) ; "a_local_write_ignores_the_file_first")]
+    #[test_case(LearningTarget::Project, None ; "a_project_write_leaves_gitignore_alone")]
+    fn writing_a_block_to_a_new_file(target: LearningTarget, gitignore: Option<&str>) {
+        let dir = TempDir::new().unwrap();
+        let (evidence, refs) = evidence();
+        let files = [named(&dir, target)];
+        let plan = validate(&block_report(target, RULE, refs), &files, true, &evidence);
+
+        let applied = apply(&plan, &files, None, 1).unwrap();
+
+        assert_eq!(applied.count(target), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(GITIGNORE))
+                .ok()
+                .as_deref(),
+            gitignore
+        );
+    }
+
+    #[test]
+    fn nothing_to_write_creates_no_file() {
+        let dir = TempDir::new().unwrap();
+        let files = [
+            named(&dir, LearningTarget::Project),
+            named(&dir, LearningTarget::Local),
+        ];
+        let mut report = Report::default();
+        report.instructions.project = Some(Block::default());
+        report.instructions.local = Some(Block::default());
+        let plan = validate(&report, &files, true, &Evidence::default());
+
+        let applied = apply(&plan, &files, None, 1).unwrap();
+
+        assert!(applied.edits.is_empty());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
