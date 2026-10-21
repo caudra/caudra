@@ -18,7 +18,10 @@ pub const PREDICATE: &str = "predicate";
 pub const CHOICE: &str = "choice";
 pub const SCORE: &str = "score";
 pub const MIN_DECISION_CHOICES: usize = 2;
-pub const MAX_RERANK_BATCH: usize = 16;
+/// Candidates one rerank request judges: a whole pool in one request, so the engine prefills the
+/// shared statement and query once.
+pub const MAX_RERANK_BATCH: usize = 64;
+const _: () = assert!(MAX_RERANK_BATCH <= MAX_DECISION_QUESTIONS);
 pub const PROBABILITY: RangeInclusive<f64> = 0.0..=1.0;
 
 pub(crate) const TYPE_FIELD: &str = "type";
@@ -443,7 +446,7 @@ fn label_id(id: &str) -> &str {
     if plain { id } else { ELIDED_LABEL_ID }
 }
 
-/// `rerank: 17 candidates · batch 2 of 2`, without the batch when one call holds them all.
+/// `rerank: 65 candidates · batch 2 of 2`, without the batch when one call holds them all.
 pub fn rerank_label(candidates: usize, batch: usize, batches: usize) -> String {
     let noun = if candidates == 1 {
         CANDIDATE_NOUN

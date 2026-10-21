@@ -57,8 +57,8 @@ pub use permission::{
 };
 pub(crate) use rerank::join_answered;
 pub use rerank::{
-    CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH, Relevance,
-    Rerank, Reranked, Reranking, candidate_text, changed_from,
+    CANDIDATE_KEY, CANDIDATE_TEXT_OMITTED, MAX_CANDIDATE_INPUT_BYTES, MAX_RERANK_BATCH,
+    RERANK_POOL, Relevance, Rerank, Reranked, Reranking, candidate_text, changed_from,
 };
 pub use source_code_context::{
     CodeSymbol, reordered_note, rerank_source_code_context, source_code_context_out_of_deadline,
@@ -79,6 +79,9 @@ const ENGINE_HTTP: &str = "engine returned HTTP";
 const ENGINE_INVALID: &str = "engine answer was invalid";
 const REQUEST_REJECTED: &str = "request rejected before sending";
 const ENGINE_REFUSED: &str = "engine refused";
+/// The candidates one deadline budget covers. A request judging more waits one budget per this
+/// many, because the engine's time grows with the questions it answers.
+pub const RERANK_BUDGET_CANDIDATES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DecisionFeature {
@@ -235,16 +238,12 @@ impl DecisionFeature {
         }
     }
 
-    /// The deadline for each of a rerank's `batches` concurrent requests. History search gives
-    /// every request one budget per batch, because an engine that answers one request at a
-    /// time, in whatever order they arrive, would otherwise spend a single budget on the pool.
-    pub fn rerank_batch_timeout_ms(&self, config: &DecisionsConfig, batches: usize) -> u64 {
-        match self {
-            Self::HistorySearch => config
-                .rerank_timeout_ms
-                .saturating_mul(u64::try_from(batches).unwrap_or(u64::MAX)),
-            _ => self.timeout_ms(config),
-        }
+    /// The deadline for one request judging `candidates`: one budget per
+    /// [`RERANK_BUDGET_CANDIDATES`], so a whole pool in one request gets the time its batches
+    /// would have had.
+    pub fn rerank_request_timeout_ms(&self, config: &DecisionsConfig, candidates: usize) -> u64 {
+        self.timeout_ms(config)
+            .saturating_mul(rerank_budget_units(candidates))
     }
 
     /// The relevance probability a reranked candidate needs before the
@@ -271,6 +270,13 @@ impl DecisionFeature {
             | Self::QuestionToolNudge => None,
         }
     }
+}
+
+/// How many deadline budgets a request judging `candidates` gets: one per
+/// [`RERANK_BUDGET_CANDIDATES`], and at least one.
+pub fn rerank_budget_units(candidates: usize) -> u64 {
+    let units = candidates.div_ceil(RERANK_BUDGET_CANDIDATES).max(1);
+    u64::try_from(units).unwrap_or(u64::MAX)
 }
 
 /// The thresholds the live feature applies, so agreement in `caudra decisions

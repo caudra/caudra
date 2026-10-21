@@ -17,7 +17,7 @@ const DEFAULT_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
 const OPENAI_DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const DEFAULT_TIMEOUT_MS: u64 = 800;
-const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_RERANK_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_LOG_RETENTION_DAYS: u32 = 90;
 const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.9;
@@ -299,7 +299,7 @@ features! {
     output_pointers: [Advise],
         "When a saved tool output was truncated, point the agent to at most two omitted line ranges likely to matter. Nothing extra is removed. Sends redacted excerpts of the in-progress todos, latest request, tool input, and omitted lines.";
     source_code_context: [Enforce],
-        "In local sessions, reorder the first code-context rows by relevance to the task, without pruning. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text.";
+        "In local sessions, judge the first 64 code-context rows against the task and keep only those judged relevant, best first. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text.";
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -658,7 +658,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
-            description: "Positive deadline in milliseconds for tool search and the reranking features, which judge at most 16 candidates per request and send their requests concurrently. History search lets each request wait one budget per request in its pool, so an engine that answers one request at a time still gets through its pool. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two.",
+            description: "Positive deadline in milliseconds for tool search and the reranking features, per 16 candidates a request judges. A request holds up to 64, so a full one waits up to four budgets. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two.",
         },
         ConfigField {
             name: "log",
@@ -1043,7 +1043,7 @@ mod tests {
     const CUSTOM_MODEL: &str = "custom-model";
     const CUSTOM_API_KEY_ENV: &str = "CUSTOM_DECISION_API_KEY";
     const CUSTOM_TIMEOUT_MS: u64 = 500;
-    const CUSTOM_RERANK_TIMEOUT_MS: u64 = 3_000;
+    const CUSTOM_RERANK_TIMEOUT_MS: u64 = 4_000;
     const STORED_KEY: &str = "stored-test-credential";
     const ENV_KEY: &str = "env-test-credential";
 

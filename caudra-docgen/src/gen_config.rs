@@ -722,8 +722,9 @@ fn write_decisions_section(out: &mut String) {
          backoff that starts near half a second. No retry waits past the request deadline, so under \
          the default {timeout_ms} ms `timeout_ms` most retries need a short server-requested delay. \
          Connection failures, 401, 422, and other client errors fail at once.\n\n\
-         Tool search and the [reranking features](#reranking) judge up to 16 candidates in one \
-         request and use `rerank_timeout_ms` (default {rerank_timeout_ms} ms) instead. Memory recall \
+         Tool search and the [reranking features](#reranking) judge up to 64 candidates in one \
+         request and use `rerank_timeout_ms` (default {rerank_timeout_ms} ms) for every 16 of them \
+         instead. Memory recall \
          keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call \
          from a workflow or an MCP snippet may ask for up to the larger of the two.\n\n\
          Redaction is best effort. Decision context can include commands, task text, tool output, \
@@ -795,14 +796,18 @@ fn write_decisions_section(out: &mut String) {
          reranker. A cheap first pass, such as keyword matching, picks the candidates. The engine then answers one true or false \
          relevance question per candidate, and Caudra orders, prunes, or names candidates by the \
          probability it returns. The feature table above lists what each one sends.\n\n\
-         One request holds up to 16 candidates, each with an opaque ID such as `c00`. Larger lists \
-         go out as concurrent requests under one deadline. Candidate text is redacted and cut to a \
+         One request holds up to 64 candidates, each with an opaque ID such as `c00`, so the \
+         engine reads the shared question and query once. `memory_search`, `history_search`, and \
+         `source_code_context` judge up to 64 candidates; the others judge up to 16. A request \
+         waits one `rerank_timeout_ms` for every 16 candidates it holds. Candidate text is redacted and cut to a \
          fixed size before it is sent, and every question tells the engine to treat the candidate as \
          data rather than instructions. The request state, such as the query, task, or goal, stays \
          within the 1,500-byte state limit.\n\n\
          Enforcing features compare each probability with `thresholds.relevance_floor` (default \
-         `0.1`). Tool search and `source_code_context` only reorder, putting candidates at or above the \
-         floor first. `memory_search` omits matches below the floor and names them. \
+         `0.1`). Tool search only reorders, putting candidates at or above the floor first. \
+         `source_code_context` keeps the rows at or above the floor, best first, and leaves out the \
+         rest and the rows past the first 64, unless none clears the floor. \
+         `memory_search` omits matches below the floor and names them. \
          `history_search` drops matches below the floor and returns the rest best first, as \
          [Ranking](/docs/code/#ranking) describes. \
          `compaction_retention` keeps the same number of tool results as without the engine, \

@@ -14,13 +14,14 @@ use super::search::{Candidate, Hit, MAX_HITS, name_words, significant_words};
 use super::store::{MemoryStore, journal_body};
 use crate::CancelToken;
 use crate::decisions::{
-    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, NoteDraft, NoteOutcome,
+    DecisionContext, DecisionFeature, Decisions, NoteDraft, NoteOutcome, RERANK_BUDGET_CANDIDATES,
     Relevance, Rerank, Reranked, candidate_text, counted, placement, redacted_excerpt, score_line,
 };
 use crate::permissions::PermissionManager;
 
-/// Most notes one recall weighs.
-pub const RECALL_CANDIDATES: usize = MAX_RERANK_BATCH;
+/// Most notes one recall weighs: one deadline budget's worth, because it delays
+/// the start of a turn.
+pub const RECALL_CANDIDATES: usize = RERANK_BUDGET_CANDIDATES;
 /// Most notes one recall names.
 pub const MAX_RECALLED: usize = 3;
 /// Most existing notes a new one is compared with.

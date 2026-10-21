@@ -5,9 +5,9 @@ use std::ops::RangeInclusive;
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, DecisionState, Decisions, MAX_RERANK_BATCH, NoteDraft,
-    NoteOutcome, Relevance, Rerank, Reranked, candidate_text, counted, redacted_excerpt,
-    redacted_leaves, score_line,
+    DecisionContext, DecisionFeature, DecisionState, Decisions, NoteDraft, NoteOutcome,
+    RERANK_BUDGET_CANDIDATES, Relevance, Rerank, Reranked, candidate_text, counted,
+    redacted_excerpt, redacted_leaves, score_line,
 };
 use crate::CancelToken;
 use crate::memory::search::significant_words;
@@ -17,6 +17,8 @@ use crate::tools::native::tool_output::MAX_READ_LIMIT;
 use crate::types::{TodoItem, TodoStatus};
 
 pub(super) const MIN_WINDOW_LINES: usize = 200;
+/// Most windows one pointer advice weighs: one deadline budget's worth.
+pub(super) const MAX_WINDOWS: usize = RERANK_BUDGET_CANDIDATES;
 const MAX_POINTERS: usize = 2;
 const MAX_FOCUS_BYTES: usize = 900;
 const MAX_FOCUS_TODOS: usize = 3;
@@ -236,11 +238,11 @@ fn pointer(output_id: &str, lines: &RangeInclusive<usize>) -> String {
     )
 }
 
-/// The omitted lines in at most [`MAX_RERANK_BATCH`] windows of at least
+/// The omitted lines in at most [`MAX_WINDOWS`] windows of at least
 /// [`MIN_WINDOW_LINES`] lines, each with its excerpt.
 fn windows(text: &str, omitted: &RangeInclusive<usize>, words: &BTreeSet<String>) -> Vec<Window> {
     let (first, last) = (*omitted.start(), *omitted.end());
-    let size = MIN_WINDOW_LINES.max((last + 1 - first).div_ceil(MAX_RERANK_BATCH));
+    let size = MIN_WINDOW_LINES.max((last + 1 - first).div_ceil(MAX_WINDOWS));
     let mut lines = text.split(LINE_BREAK).skip(first - 1);
     (first..=last)
         .step_by(size)
@@ -390,13 +392,13 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        EXCERPT_KEY, LINE_BREAK, MAX_POINTERS, MIN_WINDOW_LINES, OPEN_TODOS_KEY, OmittedOutput,
+        EXCERPT_KEY, LINE_BREAK, MAX_POINTERS, MAX_WINDOWS, MIN_WINDOW_LINES, OPEN_TODOS_KEY,
+        OmittedOutput,
         POINTED_NOWHERE, REQUEST_KEY, output_focus, pointer, pointer_lines, windows, words,
     };
     use crate::CancelToken;
     use crate::decisions::{
-        CANDIDATE_KEY, DecisionContext, Decisions, ENGINE_UNREACHABLE, MAX_RERANK_BATCH, NoteDraft,
-        NoteOutcome,
+        CANDIDATE_KEY, DecisionContext, Decisions, ENGINE_UNREACHABLE, NoteDraft, NoteOutcome,
     };
     use crate::memory::relevance::tests::assert_effects;
     use crate::tools::native::tests::tempdir;
@@ -732,7 +734,7 @@ mod tests {
 
     #[test_case(1, 50, 1; "short_omission_is_one_window")]
     #[test_case(OMITTED_FIRST, OMITTED_LAST, 5; "windows_keep_the_minimum_size")]
-    #[test_case(1, HUGE_OMISSION, MAX_RERANK_BATCH; "huge_omission_fills_one_batch")]
+    #[test_case(1, HUGE_OMISSION, MAX_WINDOWS; "huge_omission_fills_one_batch")]
     fn windows_tile_the_omitted_lines(first: usize, last: usize, count: usize) {
         let text = vec!["step ok"; last + 1].join(LINE_BREAK);
 

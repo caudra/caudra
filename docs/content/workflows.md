@@ -224,9 +224,9 @@ An option is a string, or a map with a `value` and a `description`. A level is a
 
 The result is `#{ model, answers, by_name }`. `answers` lists one answer per question, in question order, and each answer repeats its question's `type` and `name`. `by_name` holds the same answers keyed by name. Both protocols return this shape, so switching protocols does not change the example above.
 
-The optional third argument accepts `model` and `timeout_ms`. Without a timeout, a call uses `timeout_ms` from the [decisions configuration](/docs/configuration/#decisions). A positive timeout is capped at the larger of `timeout_ms` and `rerank_timeout_ms`. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option, a level, or a question name. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+The optional third argument accepts `model` and `timeout_ms`. Without a timeout, a call of up to 16 questions uses `timeout_ms` from the [decisions configuration](/docs/configuration/#decisions). A positive timeout is capped at the larger of `timeout_ms` and `rerank_timeout_ms`, once for every 16 questions, and a call of more questions waits that whole cap by default. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option, a level, or a question name. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
 
-Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The inspector names the call by its first three question names, as in `decide: ready, route`, or by its candidates and batch, as in `rerank: 17 candidates · batch 2 of 2`. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
+Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The inspector names the call by its first three question names, as in `decide: ready, route`, or by its candidates and batch, as in `rerank: 65 candidates · batch 2 of 2`. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
 
 While the engine switch is off, a new `decide()` call raises a catchable error before anything reaches the journal. A decision the run already recorded still replays as its saved value, so resuming an older run works.
 
@@ -251,12 +251,12 @@ complete(picked);
 
 The result holds one `#{ index, score }` for each kept candidate. `index` is the position in `candidates`, and `score` is the probability that it is relevant. Entries are sorted by score, highest first, and equal scores keep their input order. An empty `candidates` array returns `[]` without calling the endpoint.
 
-Candidates go out in batches of 16. Each batch is one decision call with its own journal entry, and the batches run one after another. A resumed run replays the batches that were already committed and asks only for the rest. Each batch counts as one host call.
+Candidates go out in batches of 64. Each batch is one decision call with its own journal entry, and the batches run one after another. A resumed run replays the batches that were already committed and asks only for the rest. Each batch counts as one host call.
 
 | Option | Meaning |
 |--------|---------|
 | `model` | The decision model, as for `decide()` |
-| `timeout_ms` | A positive deadline for each batch, capped as for `decide()`. Long candidate lists may need `rerank_timeout_ms` |
+| `timeout_ms` | A positive deadline for each batch, capped as for `decide()`. Without it, a batch of more than 16 candidates waits the whole cap |
 | `threshold` | Drops candidates that score below this number, from 0 to 1 |
 | `top_k` | Keeps at most this many candidates after the threshold |
 

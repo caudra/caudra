@@ -158,7 +158,7 @@ Without reranking, matches come back in keyword order. Items that contain every 
 With a [decision endpoint](/docs/providers/#decision-endpoints) active and the `history_search` feature set to `enforce`, Caudra reranks:
 
 1. Keyword search picks a pool of up to 64 matches, at most 8 from any one session when the scope spans sessions. With `sort="newest"`, the pool is the 64 newest matches.
-2. The engine judges each match against the query: does this excerpt help answer it? It answers 16 matches to a request, all four requests at once. Because an engine may answer one request at a time, in any order, each request waits up to one [`rerank_timeout_ms`](/docs/configuration/#decisions) per request in the pool, so four requests wait up to four budgets.
+2. The engine judges each match against the query: does this excerpt help answer it? The whole pool goes in one request, so the engine reads the query once. The request waits up to one [`rerank_timeout_ms`](/docs/configuration/#decisions) for every 16 matches, so a full pool waits up to four budgets.
 3. Matches below `thresholds.relevance_floor` are dropped. The rest come back best first, or in time order with `sort="newest"`, 10 to a page by default.
 
 After reranking, `ranking` is `"reranked"`, `score` is the probability of relevance, `judged_unrelated` counts the dropped matches, and `more` says whether kept matches remain in the pool. When every match was judged unrelated, `hits` is empty and `note` suggests a new query or `rerank=False`.
@@ -211,7 +211,7 @@ ranked = await decisions.rerank("crashes when saving a file", titles, threshold=
 
 `decide()` takes the same questions as a workflow's [`decide()`](/docs/workflows/#typed-decisions): a list of `predicate`, `choice`, and `score` questions in the shape of OpenAI Decisions, each with a `name`. `input` is the state the questions are about, and it must stay within 1,500 bytes as JSON. Read an answer by its question's name, as in `result["by_name"]["urgent"]["probability"]`.
 
-`rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 16 to a request, with up to 4 requests at once. Each request waits up to [`rerank_timeout_ms`](/docs/configuration/#decisions), like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
+`rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 64 to a request, with up to 4 requests at once. Each request waits up to one [`rerank_timeout_ms`](/docs/configuration/#decisions) for every 16 candidates it holds, like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
 
 The model learns how to use both from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without an endpoint, a call raises `RuntimeError` that names `/decision-model`.
 

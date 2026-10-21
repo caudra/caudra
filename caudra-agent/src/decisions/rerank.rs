@@ -3,6 +3,7 @@ use std::task::Poll;
 
 use caudra_config::decisions::FeatureMode;
 use caudra_decision::{Answer, Question, QuestionSet, QuestionType, Questions};
+use caudra_decision::wire::MAX_QUESTIONS;
 use caudra_storage::decision_log::DecisionEffect;
 use serde_json::{Value, json};
 
@@ -13,7 +14,11 @@ use super::{
 use crate::CancelToken;
 use crate::permissions::PermissionManager;
 
-pub const MAX_RERANK_BATCH: usize = 16;
+pub use caudra_workflow::decision::MAX_RERANK_BATCH;
+
+const _: () = assert!(MAX_RERANK_BATCH <= MAX_QUESTIONS);
+/// The candidates a tool-call surface hands the engine: one request's worth.
+pub const RERANK_POOL: usize = MAX_RERANK_BATCH;
 pub const MAX_CANDIDATE_INPUT_BYTES: usize = 8_192;
 pub const CANDIDATE_TEXT_OMITTED: &str = "[omitted: oversized text]";
 const CANDIDATE_ID_PREFIX: &str = "c";
@@ -94,8 +99,9 @@ struct Batch {
 
 impl Decisions {
     /// One `noul` question per candidate, in concurrent batches of at most
-    /// [`MAX_RERANK_BATCH`], each gated like any other passive decision. The
-    /// first batch without an answer ends the rerank for all of them.
+    /// [`MAX_RERANK_BATCH`], each gated like any other passive decision and
+    /// given one budget per [`super::RERANK_BUDGET_CANDIDATES`] of its candidates.
+    /// The first batch without an answer ends the rerank for all of them.
     pub async fn rerank(
         &self,
         request: Rerank<'_>,
@@ -119,9 +125,9 @@ impl Decisions {
             self.mode(&feature),
             FeatureMode::Advise | FeatureMode::Enforce
         );
-        let timeout_ms = feature.rerank_batch_timeout_ms(self.config(), batches.len());
         let answered = join_answered(batches.iter().map(|batch| {
             let feature = feature.clone();
+            let timeout_ms = feature.rerank_request_timeout_ms(self.config(), batch.ids.len());
             async move {
                 let Some(Some(outcome)) = admit(
                     permissions,
@@ -363,6 +369,7 @@ mod tests {
     use crate::CancelToken;
     use crate::decisions::{
         DecisionContext, DecisionFeature, Decisions, ENGINE_REFUSED, ENGINE_UNREACHABLE,
+        rerank_budget_units,
     };
     use crate::permissions::PermissionManager;
 
@@ -609,9 +616,9 @@ mod tests {
         });
     }
 
-    #[test_case(DecisionFeature::MemorySearch, 1; "one_budget_for_all_batches")]
-    #[test_case(DecisionFeature::HistorySearch, 2; "history_search_gives_each_batch_the_pool_budget")]
-    fn batches_run_concurrently_within_the_rerank_deadline(feature: DecisionFeature, budgets: u32) {
+    #[test_case(DecisionFeature::MemorySearch; "memory_search")]
+    #[test_case(DecisionFeature::HistorySearch; "history_search")]
+    fn each_batch_gets_one_rerank_budget_per_sixteen_candidates(feature: DecisionFeature) {
         smol::block_on(async {
             let fixture = Fixture::for_feature(feature, FeatureMode::Enforce, false, Some(2));
             let scores: Vec<f64> = (0..SPLIT)
@@ -633,6 +640,7 @@ mod tests {
             let rerank_budget = Duration::from_millis(RERANK_TIMEOUT_MS);
             for (request, budget) in &requests {
                 assert_eq!(request.questions.keys().next().unwrap(), FIRST_ID);
+                let budgets = u32::try_from(rerank_budget_units(request.questions.len())).unwrap();
                 assert!(
                     *budget
                         > rerank_budget * (budgets - 1) + Duration::from_millis(SHORT_TIMEOUT_MS)

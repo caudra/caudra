@@ -31,11 +31,13 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use test_case::test_case;
 
-use super::output_pointers::{MIN_WINDOW_LINES, OmittedOutput, advise_pointers, output_focus};
+use super::output_pointers::{
+    MAX_WINDOWS, MIN_WINDOW_LINES, OmittedOutput, advise_pointers, output_focus,
+};
 use super::state::MAX_STATE_BYTES;
 use super::{
     CodeSymbol, DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions,
-    MAX_RERANK_BATCH, PermissionAction, content, permission, question_tool_nudge, questions,
+    PermissionAction, content, permission, question_tool_nudge, questions,
     rerank_source_code_context, shell_effect,
 };
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
@@ -64,6 +66,8 @@ const FEATURE_DISABLED: &str = "the evaluation service has the feature disabled"
 const UNREACHED: &str = "this case never reaches the engine";
 const REGRESSED: &str = "a feature scored fewer right or more wrong actions than its baseline";
 const TIMEOUT_MS: u64 = 10_000;
+/// The pool every reranking surface judged before pools were widened.
+const NARROW_POOL: usize = 16;
 /// A yes/no answer at or past this probability, or at or below its
 /// complement, counts as decided where the feature has no threshold of its
 /// own to act on.
@@ -417,6 +421,29 @@ fn decision_eval() {
             .await,
         ]
     });
+    smol::block_on(async {
+        report_narrowed(
+            "memory_search",
+            include_str!("eval/memory_search.json"),
+            NARROW_POOL,
+            |case| memory_search_case(judge, case),
+        )
+        .await;
+        report_narrowed(
+            "history_search",
+            include_str!("eval/history_search.json"),
+            NARROW_POOL,
+            |case| history_search_case(judge, case),
+        )
+        .await;
+        report_narrowed(
+            "source_code_context",
+            include_str!("eval/source_code_context.json"),
+            NARROW_POOL,
+            |case| source_code_context_case(decisions, case),
+        )
+        .await;
+    });
     assert!(passed.iter().all(|passed| *passed), "{REGRESSED}");
 }
 
@@ -569,6 +596,34 @@ async fn run_ranked<F: Future<Output = Ranking>>(
                 .false_advice_rate
                 .is_some_and(|rate| rate <= baseline)
         })
+}
+
+/// Prints how the surface ranks each case when it judges only the first `pool`
+/// candidates and the rest follow in lexical order, as it did before pools
+/// were widened. Never gates the run.
+async fn report_narrowed<F: Future<Output = Ranking>>(
+    feature: &str,
+    fixture: &str,
+    pool: usize,
+    rank: impl Fn(RankCase) -> F,
+) {
+    let fixture = rank_fixture(fixture)
+        .unwrap_or_else(|error| panic!("{feature} fixture is invalid: {error}"));
+    let mut narrowed = RankMeter::default();
+    for mut case in fixture.cases {
+        let relevant = case.relevant.clone();
+        let total = case.candidates.len();
+        case.candidates.truncate(pool);
+        case.relevant.retain(|index| *index < pool);
+        let mut ranking = rank(case).await;
+        ranking.order.extend(pool.min(total)..total);
+        narrowed.add(&ranking, &relevant, fixture.k);
+    }
+    println!(
+        "{feature} judging only the first {pool} at k={}\n  measured {}",
+        fixture.k,
+        narrowed.tally(false).summary()
+    );
 }
 
 /// Parses a ranking fixture and checks its shape offline, so a malformed
@@ -1243,7 +1298,7 @@ fn pointer_query(query: &str) -> Result<(&str, &str), &'static str> {
 }
 
 fn pointer_windows(candidates: &[Value]) -> Result<Vec<&str>, &'static str> {
-    if candidates.len() > MAX_RERANK_BATCH {
+    if candidates.len() > MAX_WINDOWS {
         return Err(POINTER_WINDOW_INVALID);
     }
     candidates

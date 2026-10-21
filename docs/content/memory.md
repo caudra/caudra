@@ -119,7 +119,7 @@ Three [decision features](/docs/configuration/#reranking) can judge which notes 
 
 | Feature | Mode | Effect |
 |---------|------|--------|
-| `memory_search` | `enforce` | `search` takes up to 32 word matches and shows the ones the engine scores at or above `relevance_floor`, most relevant first, up to 10. A notice names the matches it left out, and `read` still opens any of them |
+| `memory_search` | `enforce` | `search` takes up to 64 word matches and shows the ones the engine scores at or above `relevance_floor`, most relevant first, up to 10. A notice names the matches it left out, and `read` still opens any of them |
 | `memory_recall` | `advise` | At each new user message in the main session, a reminder names up to 3 notes that the engine scores at or above `routing_confidence` for that message. A note is named once per conversation, and the agent reads it before relying on it |
 | `memory_duplicates` | `advise` | After `write` creates a note under a new name, the receipt names existing notes that may cover the same topic and suggests rewriting one of them instead |
 

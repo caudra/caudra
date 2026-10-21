@@ -118,7 +118,7 @@ use workcell::shell::{
 };
 use workcell::source_code_graph::{
     Direction, GraphProgress, GraphProgressSink, ModelText as SourceCodeGraphModelText,
-    RankedSymbol, SelectorRefusal, SourceCodeContextInput, SourceCodeContextOutput,
+    RankedSymbol, SelectorRefusal, Shrinkable, SourceCodeContextInput, SourceCodeContextOutput,
     SourceCodeGraphError, SourceCodeGraphLimits, SourceCodeGraphToolGroup, SourceCodeRefsInput,
     SourceCodeRefsOutput, crawl_filesystem_limits, fit, site_label,
 };
@@ -4273,10 +4273,11 @@ fn source_code_graph_result(
     .with_model_output(Some(exact))
 }
 
-/// Moves the rows the decision engine judges relevant to the task to the top
-/// before `fit` keeps a prefix, within the call's own deadline. Workcell's
-/// headline and confidence still describe its own ranking; the returned note
-/// tells the model which rows moved, and a row after the card tells the user.
+/// Keeps the rows the decision engine judges relevant to the task, best first,
+/// before `fit` keeps a prefix, within the call's own deadline. `shown` and
+/// `truncated` follow the rows kept; Workcell's headline and confidence still
+/// describe its own ranking. The returned note tells the model what was kept
+/// and left out, and the card's decision tells the user.
 async fn rerank_context_rows(
     ctx: &ToolContext,
     output: &mut SourceCodeContextOutput,
@@ -4315,6 +4316,9 @@ async fn rerank_context_rows(
         None => rerank.await,
     };
     pending.settle(note);
+    if reordered.is_some() {
+        output.retain_prefix(output.results.len());
+    }
     reordered
 }
 
@@ -4807,7 +4811,7 @@ mod tests {
         ReplLease, ReplSlot, ScriptCall, ScriptHost, ScriptInvocation, ScriptName, ScriptRun,
         ScriptStatus,
     };
-    use caudra_agent::decisions::{Decisions, MAX_RERANK_BATCH, reordered_note};
+    use caudra_agent::decisions::{Decisions, RERANK_POOL};
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
         AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
@@ -4921,7 +4925,9 @@ mod tests {
     const UNRELATED_SCORE: f64 = 0.0;
     const NOTHING_TO_REORDER: &str = "the task must match more than one symbol";
     const ONE_HOP_HAS_NO_DISTANCE: &str = "a direct caller row reports no hop distance";
-    const REORDER_ONLY: &str = "reranking reorders rows and never adds or drops one";
+    const KEEPS_ONLY: &str = "reranking keeps rows and never adds or changes one";
+    const PRUNED_NOTE_OPEN: &str = "[Decision-engine relevance to the task judged";
+    const TRUNCATED_LINE_OPEN: &str = "[truncated:";
     const LEARNED_TEMPLATE: &str = "cargo check -p <value> --tests";
     const INTERPRETER_SIBLING: &str = "cargo check -p core && python3 -c 'print(1)'";
     const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
@@ -8052,9 +8058,9 @@ mod tests {
         )
     }
 
-    #[test_case(FeatureMode::Enforce, true; "enforced_moves_the_relevant_row_first")]
+    #[test_case(FeatureMode::Enforce, true; "enforced_keeps_only_the_relevant_row")]
     #[test_case(FeatureMode::Off, false; "off_keeps_workcells_order")]
-    fn source_code_context_rows_follow_decision_relevance(mode: FeatureMode, reordered: bool) {
+    fn source_code_context_rows_follow_decision_relevance(mode: FeatureMode, pruned: bool) {
         let root = TempDir::new().expect("tempdir");
         let state_dir = TempDir::new().expect("state tempdir");
         source_code_graph_tree(root.path());
@@ -8086,22 +8092,30 @@ mod tests {
 
         assert!(names.len() > 1, "{NOTHING_TO_REORDER}: {names:?}");
         assert_eq!(suffix, None);
-        for field in SOURCE_CODE_CONTEXT_COUNTS {
-            assert_eq!(actual_state[field], state[field], "{field}");
-        }
-        if reordered {
-            let head = names.len().min(MAX_RERANK_BATCH);
-            let mut expected = names.clone();
-            let moved = expected.remove(head - 1);
-            expected.insert(0, moved);
-            assert_eq!(actual_names, expected);
-            assert_eq!(actual_suffix, Some(reordered_note(head)));
-            let mut lines: Vec<&str> = text.lines().collect();
-            let mut actual_lines: Vec<&str> = actual_text.lines().collect();
-            lines.sort_unstable();
-            actual_lines.sort_unstable();
-            assert_eq!(actual_lines, lines, "{REORDER_ONLY}");
+        if pruned {
+            let head = names.len().min(RERANK_POOL);
+            assert_eq!(actual_names, [names[head - 1].clone()]);
+            assert_eq!(actual_state["shown"], 1);
+            assert_eq!(actual_state["totalMatched"], state["totalMatched"]);
+            assert_eq!(actual_state["truncated"], true);
+            assert!(
+                actual_suffix
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with(PRUNED_NOTE_OPEN)),
+                "{actual_suffix:?}"
+            );
+            let lines: HashSet<&str> = text.lines().collect();
+            assert!(
+                actual_text
+                    .lines()
+                    .filter(|line| !line.starts_with(TRUNCATED_LINE_OPEN))
+                    .all(|line| lines.contains(line)),
+                "{KEEPS_ONLY}"
+            );
         } else {
+            for field in SOURCE_CODE_CONTEXT_COUNTS {
+                assert_eq!(actual_state[field], state[field], "{field}");
+            }
             assert_eq!(actual_names, names);
             assert_eq!(actual_text, text);
             assert_eq!(actual_suffix, None);

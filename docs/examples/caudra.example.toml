@@ -994,14 +994,12 @@ version = 3
 # timeout_ms = 800
 
 # Positive deadline in milliseconds for tool search and the reranking features,
-# which judge at most 16 candidates per request and send their requests
-# concurrently. History search lets each request wait one budget per request in
-# its pool, so an engine that answers one request at a time still gets through
-# its pool. Memory recall keeps `timeout_ms` because it delays the start of a
-# turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may
-# ask for up to the larger of the two.
+# per 16 candidates a request judges. A request holds up to 64, so a full one
+# waits up to four budgets. Memory recall keeps `timeout_ms` because it delays
+# the start of a turn. A `decide()` or `rerank()` call from a workflow or a
+# `code` snippet may ask for up to the larger of the two.
 # Type: integer.
-# rerank_timeout_ms = 2000
+# rerank_timeout_ms = 3000
 
 # Retain bounded decision records in the local `caudra.db`.
 # Type: boolean.
@@ -1109,10 +1107,10 @@ version = 3
 # Type: string.
 # output_pointers = "off"
 
-# In local sessions, reorder the first code-context rows by relevance to the
-# task, without pruning. Sends the task and each row's symbol name, kind, path,
-# line span, and reference counts, never source text. Modes: off, shadow,
-# enforce.
+# In local sessions, judge the first 64 code-context rows against the task and
+# keep only those judged relevant, best first. Sends the task and each row's
+# symbol name, kind, path, line span, and reference counts, never source text.
+# Modes: off, shadow, enforce.
 # Type: string.
 # source_code_context = "off"
 

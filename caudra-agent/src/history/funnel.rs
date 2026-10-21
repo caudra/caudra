@@ -15,9 +15,10 @@ use crate::decisions::{
 };
 use crate::memory::relevance::Judge;
 
-/// Four batches of 16, so one concurrent wave even on an engine that answers one at a time; BM25
-/// matches past about 50 are mostly single-term noise in conversational text anyway.
-pub const RERANK_POOL: usize = 64;
+/// One request's worth of keyword matches; BM25 matches past about 50 are mostly single-term
+/// noise in conversational text anyway.
+pub use crate::decisions::RERANK_POOL;
+
 /// At most this many pool slots for one session, so one long session never fills the pool.
 /// Applies only to scopes that span sessions.
 pub const MAX_POOL_PER_SESSION: usize = 8;
@@ -379,7 +380,7 @@ mod tests {
     const BASE_MS: u64 = 1_767_225_600_000;
     const SECRET: &str = "do-not-send-this-value";
     const TOKEN_PREFIX: &str = "TOKEN=";
-    const BATCHES_IN_A_FULL_POOL: usize = 4;
+    const REQUESTS_FOR_A_FULL_POOL: usize = 1;
 
     struct Fixture {
         state: TempDir,
@@ -566,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pool_is_one_wave_of_four_batches() {
+    fn a_full_pool_is_one_request() {
         let fixture = fixture(RERANK_POOL + MAX_POOL_PER_SESSION);
         let engine = NoteEngine::scoring(&[]);
         let calls = Arc::clone(&engine.calls);
@@ -581,7 +582,7 @@ mod tests {
                 kept: 0
             }
         );
-        assert_eq!(calls.load(Ordering::Relaxed), BATCHES_IN_A_FULL_POOL);
+        assert_eq!(calls.load(Ordering::Relaxed), REQUESTS_FOR_A_FULL_POOL);
     }
 
     #[test]

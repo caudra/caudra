@@ -5,8 +5,8 @@
 use caudra_decision::DecisionError;
 use caudra_workflow::DecisionRequest;
 use caudra_workflow::decision::{
-    PROBABILITY, RERANK_CANDIDATES_TYPE, RERANK_QUERY_TYPE, RERANK_THRESHOLD_RANGE,
-    RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, decide_label, ranked, rerank_batches,
+    MAX_RERANK_BATCH, PROBABILITY, RERANK_CANDIDATES_TYPE, RERANK_QUERY_TYPE,
+    RERANK_THRESHOLD_RANGE, RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, decide_label, ranked, rerank_batches,
     rerank_label, rerank_scores,
 };
 use serde_json::{Map, Value, json};
@@ -20,7 +20,9 @@ use super::names::{DECIDE_HELPER, DECISIONS_MODULE, RERANK_HELPER};
 use super::output::CodeCall;
 use super::runner::{ScriptCall, ScriptError, ScriptErrorKind, ScriptInvocation};
 use crate::CancelToken;
-use crate::decisions::{DecisionContext, DecisionFeature, Decisions, join_answered};
+use crate::decisions::{
+    DecisionContext, DecisionFeature, Decisions, join_answered, rerank_budget_units,
+};
 use crate::mcp::output::{DecisionHelper, McpBlock, McpHelper, McpOutput};
 use crate::tools::{ToolContext, ToolFailure};
 
@@ -54,7 +56,7 @@ pub static DOC: ModuleDoc = ModuleDoc {
             signature: "rerank(query: str, candidates: list[Any], threshold: float | None = None, top_k: int | None = None, model: str | None = None, timeout_ms: int | None = None) -> list[dict[str, Any]]",
             awaited: true,
             read_first: false,
-            page: "Returns `[{\"index\", \"score\"}]` best first, keeping only scores at or above `threshold` and at most `top_k`. Judges up to 256 strings or small dicts, 16 to a request. Without `timeout_ms` each request waits the engine's rerank budget.",
+            page: "Returns `[{\"index\", \"score\"}]` best first, keeping only scores at or above `threshold` and at most `top_k`. Judges up to 256 strings or small dicts, 64 to a request. Without `timeout_ms` each request waits the engine's rerank budget once per 16 candidates.",
         },
     ],
 };
@@ -71,7 +73,7 @@ const RERANK_PARAMS: &[&str] = &[
     MODEL_PARAM,
     TIMEOUT_PARAM,
 ];
-/// The most candidates one `rerank()` call judges: 16 requests of 16.
+/// The most candidates one `rerank()` call judges: four requests of 64, all in flight at once.
 pub const MAX_RERANK_CANDIDATES: usize = 256;
 /// Batch requests one `rerank()` call keeps in flight at once.
 const MAX_RERANK_INFLIGHT: usize = 4;
@@ -328,17 +330,22 @@ pub async fn ask(
 
 /// Judges every candidate, a few batches at a time, and returns `[{index, score}]` best first.
 /// One batch without an answer fails the call. Without a timeout, each batch gets the rerank
-/// budget the built-in reranking features use, since a batch of 16 outlasts a single decision.
+/// budget the built-in reranking features use, once per 16 candidates of the largest batch,
+/// since a batch outlasts a single decision.
 pub async fn rerank(
     decisions: &Decisions,
     context: &DecisionContext,
     request: &RerankRequest,
     cancel: &CancelToken,
 ) -> Result<Value, ScriptError> {
+    let largest_batch = request.candidates.len().min(MAX_RERANK_BATCH);
     let request = RerankRequest {
-        timeout_ms: request
-            .timeout_ms
-            .or(Some(decisions.config().rerank_timeout_ms)),
+        timeout_ms: request.timeout_ms.or(Some(
+            decisions
+                .config()
+                .rerank_timeout_ms
+                .saturating_mul(rerank_budget_units(largest_batch)),
+        )),
         ..request.clone()
     };
     let request = &request;

@@ -3,10 +3,12 @@
 
 use std::collections::BTreeSet;
 
+use crate::decisions::RERANK_POOL;
+
 /// Most hits one search returns.
 pub const MAX_HITS: usize = 10;
 /// Most keyword matches a search hands the decision engine to rank.
-pub const POOL_HITS: usize = 32;
+pub const POOL_HITS: usize = RERANK_POOL;
 /// Most bytes of a candidate's body excerpt.
 pub const EXCERPT_BYTES: usize = 800;
 /// Most bytes of a hit's matching line.

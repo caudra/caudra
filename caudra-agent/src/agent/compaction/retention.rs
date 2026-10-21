@@ -13,14 +13,16 @@ use super::{
 use crate::CancelToken;
 use crate::agent::{GoalHandle, History};
 use crate::decisions::{
-    DecisionContext, DecisionFeature, DecisionState, Decisions, MAX_RERANK_BATCH, NoteDraft,
-    NoteOutcome, Relevance, Rerank, Reranked, candidate_text, counted, push_fitting,
+    DecisionContext, DecisionFeature, DecisionState, Decisions, NoteDraft, NoteOutcome,
+    RERANK_BUDGET_CANDIDATES, Relevance, Rerank, Reranked, candidate_text, counted, push_fitting,
     redacted_excerpt, redacted_leaves, score_line,
 };
 use crate::memory::search::significant_words;
 use crate::permissions::PermissionManager;
 use crate::types::TodoItem;
 
+/// Most tool results, and most excerpt windows, one compaction weighs: one deadline budget's worth.
+const MAX_RETAINED_CANDIDATES: usize = RERANK_BUDGET_CANDIDATES;
 const MAX_OPEN_TODOS: usize = 3;
 const GOAL_BYTES: usize = 400;
 const REQUEST_BYTES: usize = 500;
@@ -296,14 +298,14 @@ impl<'a> Layout<'a> {
 
     fn windows(&self, words: &BTreeSet<String>) -> Vec<Range<usize>> {
         let mut windows = split_windows(self.content, self.head_end..self.tail_start);
-        if windows.len() > MAX_RERANK_BATCH {
+        if windows.len() > MAX_RETAINED_CANDIDATES {
             windows.sort_by_cached_key(|window| {
                 let matched = significant_words(&self.content[window.clone()])
                     .intersection(words)
                     .count();
                 (Reverse(matched), window.start)
             });
-            windows.truncate(MAX_RERANK_BATCH);
+            windows.truncate(MAX_RETAINED_CANDIDATES);
             windows.sort_unstable_by_key(|window| window.start);
         }
         windows
@@ -392,7 +394,7 @@ pub(crate) async fn select_tool_results(
     if !swappable(results) {
         return Err(None);
     }
-    let candidates = &results[..results.len().min(MAX_RERANK_BATCH)];
+    let candidates = &results[..results.len().min(MAX_RETAINED_CANDIDATES)];
     let defaults = candidates.len().min(KEEP_LAST_TOOL_RESULTS);
     let mut kept: Vec<usize> = (0..defaults)
         .filter(|index| candidates[*index].output_id.is_none())
@@ -498,7 +500,7 @@ fn newest_tool_results(head: &[Message]) -> Vec<ToolResultView<'_>> {
             }
             _ => None,
         })
-        .take(MAX_RERANK_BATCH)
+        .take(MAX_RETAINED_CANDIDATES)
         .collect()
 }
 

@@ -2,15 +2,18 @@ use caudra_config::decisions::FeatureMode;
 use serde_json::{Value, json};
 
 use super::{
-    DecisionContext, DecisionFeature, Decisions, MAX_RERANK_BATCH, NoteDraft, NoteOutcome,
-    Relevance, Rerank, candidate_text, placement, redacted_excerpt, score_line,
+    DecisionContext, DecisionFeature, Decisions, NoteDraft, NoteOutcome, RERANK_POOL, Relevance,
+    Rerank, candidate_text, placement, redacted_excerpt, score_line,
 };
 use crate::CancelToken;
 use crate::permissions::PermissionManager;
 
 const KEPT_WORKCELL_ORDER: &str = "kept Workcell's order";
 const OUT_OF_DEADLINE: &str = "ran out of the call's deadline";
+const LEFT_OUT: &str = "left out";
 const MIN_RERANKED_ROWS: usize = 2;
+/// Most rows judged unrelated that the model's note names; the rest are counted.
+const MAX_NAMED_OMISSIONS: usize = 8;
 const MAX_TASK_BYTES: usize = 700;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_KIND_BYTES: usize = 32;
@@ -40,11 +43,12 @@ pub struct CodeSymbol<'a> {
     pub calls: usize,
 }
 
-/// Reorders the first [`MAX_RERANK_BATCH`] rows by relevance to `task`: the
-/// rows at or above the relevance floor first, most relevant first, then the
-/// rest of that head in its original order. Nothing is dropped and later rows
-/// never move. Returns the note for the model when the order changed, and the
-/// transcript row for a move, a shadow move or a fresh failure.
+/// Judges the first [`RERANK_POOL`] rows against `task` and, when enforcing, keeps
+/// only those at or above the relevance floor, most relevant first. Rows judged
+/// unrelated and rows past the pool are left out. When none clears the floor,
+/// Workcell's order stands, since an empty answer helps no one. Returns the note
+/// for the model when the rows changed, and the transcript row for a change, a
+/// shadow change or a fresh failure.
 pub async fn rerank_source_code_context<T>(
     rows: &mut Vec<T>,
     describe: impl Fn(&T) -> CodeSymbol<'_>,
@@ -54,7 +58,8 @@ pub async fn rerank_source_code_context<T>(
     permissions: Option<&PermissionManager>,
     cancel: &CancelToken,
 ) -> (Option<String>, Option<NoteDraft>) {
-    let head = rows.len().min(MAX_RERANK_BATCH);
+    let total = rows.len();
+    let head = total.min(RERANK_POOL);
     let feature = DecisionFeature::SourceCodeContext;
     let Some(floor) = feature
         .rerank_threshold(&decisions.config().thresholds)
@@ -88,35 +93,117 @@ pub async fn rerank_source_code_context<T>(
             return (None, note);
         }
     };
-    let (mut order, below) = reranked.split_at_floor(floor);
-    order.extend(below);
-    if !reranked.record_rerouted(&order, head) {
+    let (kept, unrelated) = reranked.split_at_floor(floor);
+    if kept.is_empty() || !reranked.record_rerouted(&kept, total) {
         return (None, None);
     }
-    let moved: Vec<String> = order
+    let label = |index: usize| {
+        let symbol = describe(&rows[index]);
+        format!("{}:{} {}", symbol.path, symbol.line_start, symbol.name)
+    };
+    let scores = reranked.scores();
+    let moved_rows = kept
         .iter()
         .enumerate()
         .filter(|(to, from)| to < from)
-        .map(|(to, from)| {
-            let symbol = describe(&rows[*from]);
-            score_line(
-                reranked.scores()[*from],
-                &format!("{}:{} {}", symbol.path, symbol.line_start, symbol.name),
-                &placement(*from, to),
-            )
-        })
-        .collect();
-    let summary = format!("moved {} of {head} rows up", moved.len());
-    let note = Some(NoteDraft::new(decisions, feature, outcome, &summary, moved));
+        .map(|(to, from)| score_line(scores[*from], &label(*from), &placement(*from, to)));
+    let left_out_rows = unrelated
+        .iter()
+        .map(|index| score_line(scores[*index], &label(*index), LEFT_OUT));
+    let details: Vec<String> = moved_rows.chain(left_out_rows).collect();
+    let moved = details.len() - unrelated.len();
+    let pruning = Pruning {
+        total,
+        head,
+        kept: kept.len(),
+        unrelated: unrelated.len(),
+    };
+    let note = Some(NoteDraft::new(
+        decisions,
+        feature,
+        outcome,
+        &pruning.summary(moved),
+        details,
+    ));
     if outcome != NoteOutcome::Acted {
         return (None, note);
     }
-    let mut original: Vec<Option<T>> = rows.drain(..head).map(Some).collect();
-    rows.splice(
-        0..0,
-        order.iter().filter_map(|index| original[*index].take()),
-    );
-    (Some(reordered_note(head)), note)
+    let named: Vec<String> = unrelated
+        .iter()
+        .take(MAX_NAMED_OMISSIONS)
+        .map(|index| label(*index))
+        .collect();
+    let model_note = pruning.model_note(&named);
+    let mut original: Vec<Option<T>> = rows.drain(..).map(Some).collect();
+    rows.extend(kept.iter().filter_map(|index| original[*index].take()));
+    (Some(model_note), note)
+}
+
+/// How a rerank changed `total` rows: it judged the first `head`, kept `kept`
+/// and left out `unrelated` of them, and left out the rest unjudged.
+struct Pruning {
+    total: usize,
+    head: usize,
+    kept: usize,
+    unrelated: usize,
+}
+
+impl Pruning {
+    fn unjudged(&self) -> usize {
+        self.total - self.head
+    }
+
+    /// `moved 3 of 12 rows up`, or `kept 12 of 200 rows; left out 52 judged
+    /// unrelated; left out 136 past the first 64, not judged`.
+    fn summary(&self, moved: usize) -> String {
+        if self.kept == self.total {
+            return format!("moved {moved} of {} rows up", self.head);
+        }
+        let mut summary = format!("kept {} of {} rows", self.kept, self.total);
+        if self.unrelated > 0 {
+            summary.push_str(&format!("; left out {} judged unrelated", self.unrelated));
+        }
+        if self.unjudged() > 0 {
+            summary.push_str(&format!(
+                "; left out {} past the first {}, not judged",
+                self.unjudged(),
+                self.head
+            ));
+        }
+        summary
+    }
+
+    /// What the model reads after the rows: what was judged, kept and left
+    /// out, naming the first rows judged unrelated.
+    fn model_note(&self, named: &[String]) -> String {
+        let (total, head) = (self.total, self.head);
+        if self.kept == total {
+            return reordered_note(head);
+        }
+        let judged = match head == total {
+            true => format!("all {total} rows"),
+            false => format!("the first {head} of {total} rows"),
+        };
+        let mut note = format!(
+            "[Decision-engine relevance to the task judged {judged} and kept {}, best first.",
+            self.kept
+        );
+        if self.unrelated > 0 {
+            note.push_str(&format!(" Left out as unrelated: {}", named.join(", ")));
+            if self.unrelated > named.len() {
+                note.push_str(&format!(" and {} more", self.unrelated - named.len()));
+            }
+            note.push('.');
+        }
+        if self.unjudged() > 0 {
+            note.push_str(&format!(
+                " The {} rows after the first {head} were not judged and are left out.",
+                self.unjudged()
+            ));
+        }
+        note.push_str(" The confidence above describes the source-code graph's own ranking.]");
+        note
+    }
 }
 
 /// The row for a rerank the call's own deadline cut short, reported like an
@@ -167,13 +254,13 @@ mod tests {
 
     use super::{
         CALLEES_KEY, CALLERS_KEY, CodeSymbol, KEPT_WORKCELL_ORDER, KIND_KEY, LINES_KEY,
-        MAX_RERANK_BATCH, OUT_OF_DEADLINE, PATH_KEY, SYMBOL_KEY, TASK_KEY, reordered_note,
+        MAX_NAMED_OMISSIONS, OUT_OF_DEADLINE, PATH_KEY, SYMBOL_KEY, TASK_KEY, reordered_note,
         rerank_source_code_context, source_code_context_out_of_deadline,
     };
     use crate::CancelToken;
     use crate::decisions::rerank::CANDIDATE_KEY;
     use crate::decisions::{
-        DecisionContext, Decisions, ENGINE_UNREACHABLE, NoteDraft, NoteOutcome,
+        DecisionContext, Decisions, ENGINE_UNREACHABLE, NoteDraft, NoteOutcome, RERANK_POOL,
     };
 
     const BASE_URL: &str = "http://127.0.0.1:1";
@@ -181,8 +268,14 @@ mod tests {
     const TASK: &str = "where do we invalidate the cache after a write";
     const SECRET: &str = "do-not-send-this-value";
     const MOVED_ONE: &str = "moved 1 of 5 rows up";
-    const SHADOW_MOVED_ONE: &str = "would have moved 1 of 5 rows up";
+    const KEPT_ONE: &str = "kept 1 of 5 rows; left out 4 judged unrelated";
+    const SHADOW_KEPT_ONE: &str = "would have kept 1 of 5 rows; left out 4 judged unrelated";
+    const KEPT_TWO_OF_LONG: &str =
+        "kept 2 of 68 rows; left out 62 judged unrelated; left out 4 past the first 64, not judged";
     const MOVED_ROW: &str = "0.90  src/store/cache.rs:12 symbol_03  moved 4th to 1st";
+    const LEFT_OUT_ROW: &str = "0.00  src/store/cache.rs:12 symbol_00  left out";
+    const IN_ORDER: &[(usize, f64)] = &[(0, 0.9), (1, 0.8), (2, 0.7), (3, 0.6), (4, 0.5)];
+    const REORDERED: &[(usize, f64)] = &[(0, 0.5), (1, 0.5), (2, 0.5), (3, 0.9), (4, 0.5)];
     const KIND: &str = "function";
     const PATH: &str = "src/store/cache.rs";
     const LINE_START: usize = 12;
@@ -190,7 +283,7 @@ mod tests {
     const CALLERS: usize = 3;
     const CALLS: usize = 5;
     const SHORT: usize = 5;
-    const LONG: usize = MAX_RERANK_BATCH + 4;
+    const LONG: usize = RERANK_POOL + 4;
 
     struct ScoringEngine {
         scores: BTreeMap<usize, f64>,
@@ -303,40 +396,74 @@ mod tests {
             .collect()
     }
 
-    #[test_case(&[(3, 0.9), (1, 0.3)], SHORT, &[3, 1]; "rows_above_the_floor_lead_and_the_rest_keep_workcell_order")]
+    fn label(index: usize) -> String {
+        format!("{PATH}:{LINE_START} symbol_{index:02}")
+    }
+
+    #[test_case(&[(3, 0.9), (1, 0.3)], SHORT, &[3, 1]; "only_rows_at_or_above_the_floor_are_kept_best_first")]
     #[test_case(&[(4, FLOOR), (2, 0.05)], SHORT, &[4]; "the_floor_is_inclusive")]
-    #[test_case(&[(1, 0.6), (12, 0.9)], LONG, &[12, 1]; "only_the_head_moves")]
-    fn relevant_head_rows_move_first(scores: &[(usize, f64)], count: usize, lead: &[usize]) {
+    #[test_case(&[(1, 0.6), (12, 0.9)], LONG, &[12, 1]; "rows_past_the_pool_are_left_out_unjudged")]
+    #[test_case(REORDERED, SHORT, &[3, 0, 1, 2, 4]; "every_row_relevant_is_a_reorder")]
+    fn enforce_keeps_the_relevant_rows(scores: &[(usize, f64)], count: usize, kept: &[usize]) {
         let fixture = Fixture::new(FeatureMode::Enforce, scores, false);
         let mut reranked = rows(count);
         let (note, row) = fixture.rerank(&mut reranked, TASK, &CancelToken::none());
-        let head = count.min(MAX_RERANK_BATCH);
         let original = rows(count);
-        let expected: Vec<String> = lead
-            .iter()
-            .copied()
-            .chain((0..count).filter(|index| !lead.contains(index)))
-            .map(|index| original[index].clone())
-            .collect();
+        let expected: Vec<String> = kept.iter().map(|index| original[*index].clone()).collect();
         assert_eq!(reranked, expected);
-        assert_eq!(note, Some(reordered_note(head)));
+        assert!(note.is_some());
         assert_eq!(row.map(|row| row.outcome), Some(NoteOutcome::Acted));
         let requests = fixture.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].questions.len(), head);
+        assert_eq!(requests[0].questions.len(), count.min(RERANK_POOL));
+    }
+
+    #[test_case(REORDERED, SHORT, MOVED_ONE, &[MOVED_ROW]; "a_reorder_names_each_row_that_moved_up")]
+    #[test_case(&[(3, 0.9)], SHORT, KEPT_ONE, &[MOVED_ROW, LEFT_OUT_ROW]; "a_prune_names_the_rows_it_left_out")]
+    fn a_row_says_what_changed(
+        scores: &[(usize, f64)],
+        count: usize,
+        summary: &str,
+        leading: &[&str],
+    ) {
+        let fixture = Fixture::new(FeatureMode::Enforce, scores, false);
+        let (_, row) = fixture.rerank(&mut rows(count), TASK, &CancelToken::none());
+        let row = row.unwrap();
+        assert_eq!(row.summary, summary);
+        assert_eq!(&row.details[..leading.len()], leading);
     }
 
     #[test]
-    fn a_move_names_each_row_that_moved_up() {
-        let fixture = Fixture::new(FeatureMode::Enforce, &[(3, 0.9)], false);
-        let (_, row) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
-        let row = row.unwrap();
-        assert_eq!(row.summary, MOVED_ONE);
-        assert_eq!(row.details, [MOVED_ROW]);
+    fn a_reorder_tells_the_model_only_that_rows_moved() {
+        let fixture = Fixture::new(FeatureMode::Enforce, REORDERED, false);
+        let (note, _) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
+        assert_eq!(note, Some(reordered_note(SHORT)));
+    }
+
+    #[test]
+    fn a_prune_tells_the_model_what_it_left_out() {
+        let fixture = Fixture::new(FeatureMode::Enforce, &[(1, 0.6), (12, 0.9)], false);
+        let (note, row) = fixture.rerank(&mut rows(LONG), TASK, &CancelToken::none());
+        let unrelated = RERANK_POOL - 2;
+        let named: Vec<String> = (0..RERANK_POOL)
+            .filter(|index| ![1, 12].contains(index))
+            .take(MAX_NAMED_OMISSIONS)
+            .map(label)
+            .collect();
+        assert_eq!(
+            note.unwrap(),
+            format!(
+                "[Decision-engine relevance to the task judged the first {RERANK_POOL} of {LONG} rows and kept 2, best first. Left out as unrelated: {} and {} more. The {} rows after the first {RERANK_POOL} were not judged and are left out. The confidence above describes the source-code graph's own ranking.]",
+                named.join(", "),
+                unrelated - MAX_NAMED_OMISSIONS,
+                LONG - RERANK_POOL,
+            )
+        );
+        assert_eq!(row.unwrap().summary, KEPT_TWO_OF_LONG);
     }
 
     #[test_case(FeatureMode::Enforce, &[(1, 0.05)], SHORT, false, 1, None; "everything_below_the_floor")]
-    #[test_case(FeatureMode::Enforce, &[(0, 0.9), (1, 0.5)], SHORT, false, 1, None; "already_in_workcell_order")]
+    #[test_case(FeatureMode::Enforce, IN_ORDER, SHORT, false, 1, None; "already_in_workcell_order")]
     #[test_case(FeatureMode::Enforce, &[(0, 0.9)], 1, false, 0, None; "a_single_row")]
     #[test_case(FeatureMode::Enforce, &[(3, 0.9)], SHORT, true, 1, Some(NoteOutcome::FellBack); "engine_failure")]
     #[test_case(FeatureMode::Off, &[(3, 0.9)], SHORT, false, 0, None; "off")]
@@ -359,12 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn a_shadow_row_says_what_would_have_moved() {
+    fn a_shadow_row_says_what_it_would_have_kept() {
         let fixture = Fixture::new(FeatureMode::Shadow, &[(3, 0.9)], false);
         let (_, row) = fixture.rerank(&mut rows(SHORT), TASK, &CancelToken::none());
         let row = row.unwrap();
-        assert_eq!(row.summary, SHADOW_MOVED_ONE);
-        assert_eq!(row.details, [MOVED_ROW]);
+        assert_eq!(row.summary, SHADOW_KEPT_ONE);
+        assert_eq!(row.details[..2], [MOVED_ROW, LEFT_OUT_ROW]);
     }
 
     #[test]

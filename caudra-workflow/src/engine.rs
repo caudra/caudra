@@ -1545,8 +1545,8 @@ mod tests {
     #[test_case(1 => vec!["rerank: 1 candidate"]; "one_candidate")]
     #[test_case(5 => vec!["rerank: 5 candidates"]; "one_batch")]
     #[test_case(MAX_RERANK_BATCH + 1 => vec![
-        "rerank: 17 candidates · batch 1 of 2",
-        "rerank: 17 candidates · batch 2 of 2",
+        "rerank: 65 candidates · batch 1 of 2",
+        "rerank: 65 candidates · batch 2 of 2",
     ]; "two_batches")]
     fn rerank_labels_count_candidates_and_batches(count: usize) -> Vec<String> {
         let host = FakeHost::echo();

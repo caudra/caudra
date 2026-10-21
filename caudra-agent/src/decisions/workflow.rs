@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use super::state::MAX_STATE_BYTES;
 use super::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions, error_kind,
+    rerank_budget_units,
 };
 
 const QUESTION_SET_ID: &str = "workflow.v1";
@@ -17,7 +18,9 @@ const UNSAFE_MODEL: &str =
 
 impl Decisions {
     /// A script's own request, from a workflow or a `code` run: `feature` names the
-    /// caller in the log and sets the deadline ceiling.
+    /// caller in the log and sets the deadline ceiling, one budget per
+    /// [`super::RERANK_BUDGET_CANDIDATES`] questions. Without a timeout, a request of more
+    /// questions than one budget covers waits the whole ceiling.
     pub async fn scripted(
         &self,
         feature: DecisionFeature,
@@ -73,13 +76,16 @@ impl Decisions {
             questions: questions.questions().clone(),
         };
         request_wire.validate()?;
+        let asked = request_wire.questions.len();
+        let ceiling = feature.rerank_request_timeout_ms(self.config(), asked);
+        let default = match rerank_budget_units(asked) {
+            1 => self.config().timeout_ms,
+            _ => ceiling,
+        };
         Ok((
             request_wire,
             questions,
-            request
-                .timeout_ms
-                .unwrap_or(self.config().timeout_ms)
-                .min(feature.timeout_ms(self.config())),
+            request.timeout_ms.unwrap_or(default).min(ceiling),
         ))
     }
 }

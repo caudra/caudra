@@ -207,9 +207,10 @@ mod tests {
         DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE, REVIEW_CHANGES_NAME, REVIEW_CHANGES_SOURCE,
         ROOT_CAUSE_NAME, ROOT_CAUSE_SOURCE,
     };
+    use crate::decision::MAX_RERANK_BATCH;
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
-    const RERANK_CANDIDATES: usize = 17;
+    const RERANK_CANDIDATES: usize = MAX_RERANK_BATCH + 1;
     const RERANK_BATCHES: u64 = 2;
 
     #[test]
