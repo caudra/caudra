@@ -129,6 +129,7 @@ use caudra_storage::sessions::SessionRelocation;
 use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -1397,7 +1398,10 @@ pub struct DisplayMessage {
     /// [`Self::turn_usage`].
     pub progress: Option<ToolProgress>,
     pub plan_path: Option<String>,
-    pub timestamp: Option<String>,
+    /// When the message was made: stamped as it reaches the transcript, or
+    /// read from its history id on restore.
+    pub created: Option<Timestamp>,
+    /// The usage and cost of the model request this card closed.
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
     pub render_snapshot: Option<BufferSnapshot>,
@@ -1481,7 +1485,7 @@ impl DisplayMessage {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
@@ -1511,7 +1515,7 @@ impl DisplayMessage {
             annotation: None,
             progress: None,
             plan_path: Some(plan_path),
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,

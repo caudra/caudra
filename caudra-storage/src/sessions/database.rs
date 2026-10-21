@@ -187,12 +187,6 @@ const UNKNOWN_SESSION_TITLE: &str = "<untitled>";
 const MAX_HOLDER_TITLE_BYTES: usize = 60;
 const TITLE_ELLIPSIS: &str = "...";
 const MAX_BASE58_UUID_BYTES: usize = 22;
-const UUID_VERSION_BYTE: usize = 6;
-const UUID_VARIANT_BYTE: usize = 8;
-const UUID_VERSION_SHIFT: u32 = 4;
-const UUID_VARIANT_SHIFT: u32 = 6;
-const UUID_V7: u8 = 7;
-const UUID_RFC4122_VARIANT: u8 = 2;
 /// Rich tool output rows at or below this size survive a trim so old
 /// transcripts keep their todo panels and other small structured records.
 const TRIM_KEEP_OUTPUT_BYTES: i64 = 4096;
@@ -1943,7 +1937,7 @@ impl SessionDatabase {
                 continue;
             }
             let session_id = id_from_row(session, 0)?;
-            if history_uuid_timestamp(session_id).is_none() {
+            if session_id.created_ms().is_none() {
                 report.invalid_records += 1;
                 continue;
             }
@@ -4129,21 +4123,7 @@ fn history_record_identity(payload: &Value) -> Option<(CaudraId, u64)> {
     if id.to_string() != text {
         return None;
     }
-    Some((id, history_uuid_timestamp(id)?))
-}
-
-/// The UNIX millisecond an id was generated at, when it is a UUIDv7.
-pub(crate) fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
-    let bytes = id.as_bytes();
-    if bytes[UUID_VERSION_BYTE] >> UUID_VERSION_SHIFT != UUID_V7
-        || bytes[UUID_VARIANT_BYTE] >> UUID_VARIANT_SHIFT != UUID_RFC4122_VARIANT
-    {
-        return None;
-    }
-    let timestamp = u64::from_be_bytes([
-        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-    ]);
-    (timestamp != 0).then_some(timestamp)
+    Some((id, id.created_ms()?))
 }
 
 fn invalid_permission_repair() -> SessionError {
@@ -6866,6 +6846,7 @@ mod tests {
     use crate::autopilot::{DECISIONS_TABLE_V24, StoredAutopilotDecision};
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::backups::BACKUPS_DIR;
+    use crate::id::{UUID_VARIANT_BYTE, UUID_VERSION_BYTE};
     use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
     use crate::sessions::sweep::LEGACY_SNAPSHOT_DIRS;

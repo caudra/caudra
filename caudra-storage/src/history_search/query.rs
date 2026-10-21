@@ -22,8 +22,8 @@ use super::{
 };
 use crate::id::CaudraId;
 use crate::sessions::{
-    SessionDatabase, SessionError, decompress_payload, from_i64, from_i64_usize,
-    history_uuid_timestamp, id_from_row, to_i64,
+    SessionDatabase, SessionError, decompress_payload, from_i64, from_i64_usize, id_from_row,
+    to_i64,
 };
 
 /// BM25 is scaled by these, so what people said and what compaction kept
@@ -527,7 +527,7 @@ fn neighbours(
             },
             kind,
             tool,
-            at_ms: history_uuid_timestamp(item).unwrap_or_default(),
+            at_ms: item.created_ms().unwrap_or_default(),
             preview: text[..end].to_owned(),
             truncated: end < text.len(),
         };

@@ -25,7 +25,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const NO_MATCHES: &str = "No matches";
+pub(crate) const NO_MATCHES: &str = "No matches";
 const LABEL_INDENT: &str = "  ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;

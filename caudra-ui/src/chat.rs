@@ -12,7 +12,7 @@ use crossterm::event::MouseEvent;
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::card_decisions::{CardDecision, DecisionState};
 use crate::components::commit_popup::CommitIndex;
-use crate::components::messages::MessagesPanel;
+use crate::components::messages::{MessageActionTarget, MessageDetails, MessagesPanel};
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
 use crate::components::tooltip::Tip;
@@ -50,6 +50,7 @@ use caudra_storage::engine_decisions::{StoredDecisionAnchor, StoredEngineDecisio
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::view::ViewMode;
 use caudra_workflow::RunSnapshot;
+use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -712,15 +713,17 @@ impl Chat {
         ])
     }
 
+    /// `message_actions` draws the `⋮` handles, which only a transcript the
+    /// app routes clicks to can answer.
     pub fn view(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         has_selection: bool,
-        message_actions_enabled: bool,
+        message_actions: bool,
     ) {
         self.messages_panel
-            .view(frame, area, has_selection, message_actions_enabled);
+            .view(frame, area, has_selection, message_actions);
     }
 
     pub fn scroll_top(&self) -> u32 {
@@ -810,12 +813,20 @@ impl Chat {
         self.messages_panel.set_commit_index(index);
     }
 
-    pub(crate) fn message_action_at(
+    pub(crate) fn message_action_at(&self, row: u16, col: u16) -> Option<MessageActionTarget> {
+        self.messages_panel.message_action_at(row, col)
+    }
+
+    pub(crate) fn message_target_at_row(
         &self,
         row: u16,
-        col: u16,
-    ) -> Option<crate::components::messages::MessageActionTarget> {
-        self.messages_panel.message_action_at(row, col)
+        area: Rect,
+    ) -> Option<MessageActionTarget> {
+        self.messages_panel.message_target_at_row(row, area)
+    }
+
+    pub(crate) fn message_details(&self, target: MessageActionTarget) -> MessageDetails {
+        self.messages_panel.message_details(target)
     }
 
     pub(crate) fn pan_hovered_diagram(&mut self, delta: i32) -> bool {
@@ -842,10 +853,6 @@ impl Chat {
     #[cfg(debug_assertions)]
     pub fn grab_provenance_at(&self, row: u16, area: Rect) -> Option<String> {
         self.messages_panel.grab_provenance_at(row, area)
-    }
-
-    pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
-        self.messages_panel.source_at(row, area)
     }
 
     pub fn last_assistant_source(&self) -> Option<DisplaySource> {
@@ -1370,6 +1377,7 @@ pub fn interleaved_history_to_display(
         while let Some((_, row)) = inserts.next_if(|(position, _)| *position <= index) {
             display.push(row);
         }
+        let first_row = display.len();
         match &item.kind {
             HistoryItemKind::User {
                 text,
@@ -1583,7 +1591,7 @@ pub fn interleaved_history_to_display(
                     annotation,
                     progress: None,
                     plan_path: None,
-                    timestamp: None,
+                    created: None,
                     turn_usage: None,
                     truncated_lines,
                     render_snapshot: None,
@@ -1602,9 +1610,20 @@ pub fn interleaved_history_to_display(
             | HistoryItemKind::Reasoning { .. }
             | HistoryItemKind::ToolResult { .. } => {}
         }
+        let created = item_created(item);
+        for row in &mut display[first_row..] {
+            row.created = created;
+        }
     }
     display.extend(inserts.map(|(_, row)| row));
     (display, restore_items)
+}
+
+/// A compaction copy is new, but it stands for something said when its
+/// original was.
+fn item_created(item: &HistoryItem) -> Option<Timestamp> {
+    let millis = item.stands_for.unwrap_or(item.id).created_ms()?;
+    Timestamp::from_millisecond(i64::try_from(millis).ok()?).ok()
 }
 
 /// The text a prompt's bubble shows, live and restored alike, so the two can
@@ -3454,6 +3473,35 @@ mod tests {
         assert_eq!(display[1].role, DisplayRole::Injected);
         assert_eq!(display[2].role, DisplayRole::Injected);
         assert_eq!(display[3].role, DisplayRole::Assistant);
+    }
+
+    fn id_time(id: CaudraId) -> Option<Timestamp> {
+        Timestamp::from_millisecond(i64::try_from(id.created_ms()?).ok()?).ok()
+    }
+
+    #[test_case(false ; "an_item_is_as_old_as_its_id")]
+    #[test_case(true ; "a_compaction_copy_is_as_old_as_its_original")]
+    fn a_restored_message_keeps_its_time(copied: bool) {
+        const ORIGINAL_MS: u64 = 1_700_000_000_000;
+        const TIME_BYTES: usize = 6;
+        let mut bytes = *CaudraId::generate().as_bytes();
+        bytes[..TIME_BYTES].copy_from_slice(&ORIGINAL_MS.to_be_bytes()[2..]);
+        let original = CaudraId::from_bytes(bytes);
+        let mut items = crate::history_items(&[Message::user(USER_TEXT.into())]);
+        if copied {
+            items[0].stands_for = Some(original);
+        }
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+
+        let expected = if copied {
+            id_time(original)
+        } else {
+            id_time(items[0].id)
+        };
+        assert_eq!(display[0].created, expected);
+        assert!(expected.is_some());
     }
 
     /// An arrival is written above the message because it landed before it, and

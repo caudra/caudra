@@ -15,7 +15,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use super::change_stores::ChangeStores;
-use super::database::{WORKSPACE_CHANGES_DIR, directory_bytes, history_uuid_timestamp};
+use super::database::{WORKSPACE_CHANGES_DIR, directory_bytes};
 use super::lease::SessionLease;
 use super::progress::{PRUNE, PruneEvent};
 use super::{
@@ -633,7 +633,7 @@ impl StorePrune<'_> {
             return false;
         };
         !self.known.contains(&id)
-            && history_uuid_timestamp(id).is_some_and(|millis| {
+            && id.created_ms().is_some_and(|millis| {
                 self.now
                     .duration_since(UNIX_EPOCH + Duration::from_millis(millis))
                     .is_ok_and(|age| age >= ORPHAN_GRACE)

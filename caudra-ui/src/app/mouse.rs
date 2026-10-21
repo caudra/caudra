@@ -639,7 +639,7 @@ impl App {
                 let Some(zone) = self.zone_at(event.row, event.column) else {
                     return Vec::new();
                 };
-                if zone.zone != SelectionZone::Messages || !self.is_main_chat() {
+                if zone.zone != SelectionZone::Messages {
                     self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
                     return Vec::new();
                 }
@@ -648,11 +648,13 @@ impl App {
                     self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
                     return Vec::new();
                 }
-                let Some(source) = self.chats[0].source_at(event.row, area) else {
+                let Some(target) =
+                    self.chats[self.active_chat].message_target_at_row(event.row, area)
+                else {
                     self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
                     return Vec::new();
                 };
-                self.open_message_actions(source);
+                self.open_message_actions(target);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.admission_mouse_down = None;
@@ -686,10 +688,9 @@ impl App {
                         SelectionZone::Overlay => {}
                     }
                     if zone.zone == SelectionZone::Messages
-                        && self.is_main_chat()
                         && !self.has_modal_overlay()
                         && let Some(target) =
-                            self.chats[0].message_action_at(event.row, event.column)
+                            self.chats[self.active_chat].message_action_at(event.row, event.column)
                     {
                         self.message_action_mouse_down = Some(target);
                         return Vec::new();
@@ -813,13 +814,14 @@ impl App {
                         .zone_at(event.row, event.column)
                         .is_some_and(|zone| zone.zone == SelectionZone::Messages)
                     && let Some(pressed) = self.message_action_mouse_down.take()
-                    && self.chats[0].message_action_at(event.row, event.column) == Some(pressed)
+                    && self.chats[self.active_chat].message_action_at(event.row, event.column)
+                        == Some(pressed)
                 {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
-                    self.open_message_actions(pressed.source());
+                    self.open_message_actions(pressed);
                     return Vec::new();
                 }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {

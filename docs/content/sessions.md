@@ -178,9 +178,11 @@ Caudra sets the terminal window title to the title of the focused session. It up
 
 ## Message actions
 
-Click `⋮` in the gutter beside a message to open Message Actions. Right-clicking the message also works when the terminal forwards it. Clicks in the message body still select text, expand reasoning, and interact with tool output.
+Click `⋮` in the gutter beside a prompt, a reply, reasoning, or a tool call to open Message Actions. Right-clicking the message also works when the terminal forwards it. Clicks in the message body still select text, expand reasoning, and interact with tool output.
 
-The menu offers:
+The first line of the menu says when the message was sent, or when the tool call started, with its date when that was not today. A tool call that ended a model request also shows the request's tokens and cost, such as `135.9k↑ 872↓ $0.055`. Card headers do not show either. A restored session reads each time from the message's saved ID. Usage shows only for requests made since the session was opened.
+
+In the main chat, the menu offers:
 
 - **Fork here** creates and focuses a new session. Inside Herdr or Orca it opens in a new tab there. See [Forks in Herdr and Orca](#forks-in-herdr-and-orca).
 - **Revert both** moves the conversation head and reverts the file changes recorded after the message.
@@ -189,6 +191,8 @@ The menu offers:
 - **Unrevert** puts back the head and the files from before the revert.
 
 **Revert both** and **Revert files** appear only when a [file revert](#file-revert) can run from that message. Otherwise the menu title says why. Revert and unrevert require every live session in the workspace to be idle. Active shell commands and subagents also block them. Forking never starts a model request.
+
+A message from the turn that is still running shows its details now, and the actions once the turn is saved. A subagent's transcript has the same `⋮` on its messages, with the details and no actions, because fork and revert work from the main chat.
 
 ## Fork boundaries
 

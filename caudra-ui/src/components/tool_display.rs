@@ -1685,46 +1685,6 @@ pub fn format_timestamp_now(format: ClockFormat) -> String {
     zoned.strftime(crate::clock::hms(format)).to_string()
 }
 
-pub fn append_right_info(
-    line: &mut Line<'static>,
-    usage: Option<&str>,
-    timestamp: Option<&str>,
-    width: u16,
-) {
-    if usage.is_none() && timestamp.is_none() {
-        return;
-    }
-    let separator = if usage.is_some() && timestamp.is_some() {
-        2
-    } else {
-        0
-    };
-    let suffix_len =
-        usage.map_or(0, UnicodeWidthStr::width) + timestamp.map_or(0, str::len) + separator + 1;
-    let header_width: usize = line
-        .spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    let w = width as usize;
-    if header_width + 1 + suffix_len > w {
-        return;
-    }
-    let pad = w - header_width - suffix_len;
-    line.spans.push(Span::raw(" ".repeat(pad)));
-    if let Some(u) = usage {
-        line.spans
-            .push(Span::styled(u.to_owned(), theme::current().tool_dim));
-        if timestamp.is_some() {
-            line.spans.push(Span::raw("  "));
-        }
-    }
-    if let Some(ts) = timestamp {
-        line.spans
-            .push(Span::styled(ts.to_owned(), theme::current().timestamp));
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Indicator {
     InProgress,
@@ -3788,7 +3748,7 @@ mod tests {
             progress: None,
             plan_path: None,
             truncated_lines: 0,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
@@ -3880,7 +3840,7 @@ mod tests {
             progress: None,
             plan_path: None,
             truncated_lines: 0,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
@@ -5099,27 +5059,6 @@ mod tests {
         bash_msg("cmd", ToolStatus::Success, None, None)
     }
 
-    #[test_case(80, true  ; "shown_when_width_sufficient")]
-    #[test_case(10, false ; "hidden_when_too_narrow")]
-    fn append_right_info_timestamp_visibility(width: u16, expect_timestamp: bool) {
-        let msg = tool_msg();
-        let mut tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80),
-            Some(Disclosure::default()),
-        );
-        let span_count_before = tl.lines[0].spans.len();
-        append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
-        if expect_timestamp {
-            let last = tl.lines[0].spans.last().unwrap();
-            assert_eq!(last.style, theme::current().timestamp);
-            assert!(tl.lines[0].spans.len() > span_count_before);
-        } else {
-            assert_eq!(tl.lines[0].spans.len(), span_count_before);
-        }
-    }
-
     #[test]
     fn annotation_rendered_on_header() {
         let mut msg = tool_msg();
@@ -5352,7 +5291,7 @@ mod tests {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
@@ -5457,7 +5396,7 @@ mod tests {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
@@ -5559,7 +5498,7 @@ mod tests {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
@@ -5877,7 +5816,7 @@ mod tests {
             progress: None,
             plan_path: None,
             truncated_lines,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
@@ -6521,7 +6460,7 @@ mod tests {
             progress: None,
             plan_path: None,
             truncated_lines: 0,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
@@ -7975,7 +7914,7 @@ mod tests {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
@@ -8024,7 +7963,7 @@ mod tests {
             annotation: None,
             progress: None,
             plan_path: None,
-            timestamp: None,
+            created: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),

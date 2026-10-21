@@ -26,11 +26,17 @@ use caudra_workspace::{
     WorkspaceChangeService, WorkspaceSession,
 };
 use futures_lite::future;
+use jiff::Timestamp;
+use ratatui::text::Line;
 use serde_json::Value;
 use tracing::warn;
 
 use super::App;
 use super::session::{RevertTarget, resolve_revert_target, source_target_id};
+use crate::components::message_actions::{
+    ACTIONS_AFTER_SAVE, ACTIONS_MAIN_CHAT_ONLY, Offer, details_line,
+};
+use crate::components::messages::MessageActionTarget;
 use crate::components::{DisplaySource, RestoreMode};
 use crate::repaint::Dirty;
 use crate::{AppSession, ChangeServiceFactory};
@@ -653,12 +659,36 @@ impl App {
         self.record_index.as_ref()?.as_ref().err().cloned()
     }
 
-    pub(super) fn open_message_actions(&mut self, source: DisplaySource) {
+    pub(super) fn open_message_actions(&mut self, target: MessageActionTarget) {
+        let details = details_line(
+            &self.chats[self.active_chat].message_details(target),
+            self.ui_config.clock_format,
+            Timestamp::now(),
+        );
+        match target.source() {
+            _ if self.active_chat != 0 => self
+                .message_actions
+                .open(Offer::Nothing(ACTIONS_MAIN_CHAT_ONLY), details),
+            None => self
+                .message_actions
+                .open(Offer::Nothing(ACTIONS_AFTER_SAVE), details),
+            Some(source) => self.open_message_actions_at(source, details),
+        }
+    }
+
+    pub(super) fn open_message_actions_at(
+        &mut self,
+        source: DisplaySource,
+        details: Option<Line<'static>>,
+    ) {
         let withheld = self.file_revert_withheld(source);
         self.message_actions.open(
-            source,
-            self.state.session.meta.pending_revert.is_some(),
-            withheld.as_deref(),
+            Offer::Actions {
+                source,
+                pending_revert: self.state.session.meta.pending_revert.is_some(),
+                files_withheld: withheld.as_deref(),
+            },
+            details,
         );
     }
 
@@ -1669,7 +1699,7 @@ mod tests {
         changes.script().records.truncate(recorded);
         read_index(&mut app);
 
-        app.open_message_actions(DisplaySource::User(turns.second_prompt));
+        app.open_message_actions_at(DisplaySource::User(turns.second_prompt), None);
 
         for kind in [
             MessageActionKind::RevertBoth,
@@ -1699,7 +1729,7 @@ mod tests {
             turns.second_prompt
         };
 
-        app.open_message_actions(DisplaySource::User(message));
+        app.open_message_actions_at(DisplaySource::User(message), None);
 
         assert_eq!(
             app.message_actions.offers(MessageActionKind::RevertFiles),
@@ -1827,7 +1857,7 @@ mod tests {
 
         assert_eq!(head(&app), source);
         assert!(flash(&app).contains(PARTIAL));
-        app.open_message_actions(DisplaySource::User(turns.second_prompt));
+        app.open_message_actions_at(DisplaySource::User(turns.second_prompt), None);
         assert!(app.message_actions.offers(MessageActionKind::Unrevert));
     }
 

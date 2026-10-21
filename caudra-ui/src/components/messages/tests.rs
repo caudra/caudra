@@ -1036,7 +1036,7 @@ fn panel_with_tools(ids: &[(&str, &'static str)]) -> MessagesPanel {
 }
 
 #[test]
-fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
+fn message_target_maps_every_source_kind_and_tool_segment_to_display_message() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let ids = std::array::from_fn::<_, 5, _>(|_| caudra_storage::id::CaudraId::generate());
     let sources = [
@@ -1074,7 +1074,12 @@ fn source_at_maps_every_source_kind_and_tool_segment_to_display_message() {
     let mut row = 0;
     for (segment, source) in panel.cache.segments().iter().zip(sources) {
         row += segment.chrome(panel.viewport_width).content_start();
-        assert_eq!(panel.source_at(row, area), Some(source));
+        assert_eq!(
+            panel
+                .message_target_at_row(row, area)
+                .and_then(MessageActionTarget::source),
+            Some(source)
+        );
         row += segment.content_height(panel.viewport_width)
             + segment.chrome(panel.viewport_width).bottom;
     }
@@ -1125,7 +1130,7 @@ fn message_action_handles_map_every_source_kind() {
             (area.x..area.right()).any(|col| {
                 panel
                     .message_action_at(row, col)
-                    .is_some_and(|target| target.source() == source)
+                    .is_some_and(|target| target.source() == Some(source))
             })
         }));
     }
@@ -1301,22 +1306,33 @@ fn bind_sources_crosses_a_compaction_seam(
     assert_eq!(bound, expected, "{SEAM_MSG}");
 }
 
+fn action_targets(panel: &MessagesPanel, area: Rect) -> Vec<MessageActionTarget> {
+    (area.y..area.bottom())
+        .filter_map(|row| (area.x..area.right()).find_map(|col| panel.message_action_at(row, col)))
+        .collect()
+}
+
+fn action_rows(panel: &MessagesPanel, area: Rect) -> Vec<Option<DisplaySource>> {
+    action_targets(panel, area)
+        .into_iter()
+        .map(MessageActionTarget::source)
+        .collect()
+}
+
+/// Sources bind once the turn is saved, and a subagent's transcript has none,
+/// but the menu still has the message's time and usage to show.
 #[test]
-fn message_action_handles_are_disabled_without_main_chat_access() {
+fn a_message_without_a_source_still_has_its_handle() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let mut message = DisplayMessage::new(DisplayRole::Assistant, "reply".into());
-    message.source = Some(DisplaySource::AssistantText(
-        caudra_storage::id::CaudraId::generate(),
-    ));
-    panel.push(message);
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
 
-    let terminal = render(&mut panel, 80, 24);
-    let area = terminal.backend().buffer().area;
+    let terminal = render_actions(&mut panel, 80, 24);
 
-    assert!(!(area.y..area.bottom()).any(|row| {
-        (area.x..area.right()).any(|col| panel.message_action_at(row, col).is_some())
-    }));
-    assert!(!buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
+    assert_eq!(
+        action_rows(&panel, terminal.backend().buffer().area),
+        vec![None]
+    );
+    assert!(buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
 }
 
 #[test]
@@ -1355,18 +1371,28 @@ fn message_action_hover_reverses_only_the_glyph() {
     );
 }
 
+/// A transcript drawn inside a modal, such as a learning run's, gets no
+/// clicks routed to its handles, so it draws none.
 #[test]
-fn source_less_and_streaming_messages_have_no_action_handle() {
+fn message_action_handles_stay_off_where_nothing_answers_them() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.push(DisplayMessage::new(DisplayRole::Assistant, "cached".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+
+    let terminal = render(&mut panel, 80, 24);
+
+    assert!(action_rows(&panel, terminal.backend().buffer().area).is_empty());
+    assert!(!buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
+}
+
+#[test]
+fn notices_and_streaming_text_have_no_action_handle() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Notice, "notice".into()));
     panel.text_delta("streaming");
 
     let terminal = render_actions(&mut panel, 80, 24);
-    let area = terminal.backend().buffer().area;
 
-    assert!(!(area.y..area.bottom()).any(|row| {
-        (area.x..area.right()).any(|col| panel.message_action_at(row, col).is_some())
-    }));
+    assert!(action_rows(&panel, terminal.backend().buffer().area).is_empty());
     assert!(!buffer_text(&terminal).contains(render::MESSAGE_ACTION_GLYPH));
 }
 
@@ -2650,6 +2676,29 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_model() {
     assert_eq!(panel.tool_turn_usage("t2"), None);
     assert_eq!(panel.tool_model("t1"), Some(SUBAGENT_MODEL));
     assert_eq!(panel.messages[0].annotation, None);
+}
+
+const USAGE_IN_HEADER: &str = "a card's usage belongs in its ⋮ menu, not its header";
+
+#[test]
+fn a_stamped_card_leaves_its_usage_and_time_to_the_menu() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, "read")]);
+    panel.set_tool_turn_usage(TOOL_ID, LIVE_USAGE.into());
+
+    let terminal = render_actions(&mut panel, MODEL_WIDTH, 24);
+    let target = action_targets(&panel, terminal.backend().buffer().area)
+        .into_iter()
+        .next()
+        .unwrap();
+    let details = panel.message_details(target);
+
+    assert!(
+        !seg_text(&panel, TOOL_ID).contains(LIVE_USAGE),
+        "{USAGE_IN_HEADER}"
+    );
+    assert_eq!(details.usage.as_deref(), Some(LIVE_USAGE));
+    assert_eq!(details.created, panel.messages[0].created);
+    assert!(details.created.is_some());
 }
 
 /// A long session runs well past 65535 rows. Both the document height and the

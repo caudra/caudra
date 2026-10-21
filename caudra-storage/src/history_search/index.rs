@@ -16,8 +16,8 @@ use super::extract::{call_id, classify, index_body, item_id};
 use super::{CatchUp, HistoryKind, HistoryScope, INDEX_VERSION, source};
 use crate::id::CaudraId;
 use crate::sessions::{
-    RuntimeRetry, SessionDatabase, SessionError, decompress_payload, from_i64_usize,
-    history_uuid_timestamp, id_from_row, to_i64,
+    RuntimeRetry, SessionDatabase, SessionError, decompress_payload, from_i64_usize, id_from_row,
+    to_i64,
 };
 
 const BATCH_ITEMS: usize = 256;
@@ -413,7 +413,7 @@ fn index_item(
         },
         _ => None,
     };
-    let at_ms = history_uuid_timestamp(item).unwrap_or_default();
+    let at_ms = item.created_ms().unwrap_or_default();
     let inserted = transaction.execute(
         "INSERT INTO history_search_docs \
              (session_id, stream, ordinal, item_id, kind, tool, at_ms) \

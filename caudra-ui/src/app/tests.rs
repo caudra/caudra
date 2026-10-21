@@ -22,6 +22,7 @@ use crate::components::help_modal::HelpTarget;
 use crate::components::input::ChordHint;
 use crate::components::key_freshness::QUIET_GAP;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
+use crate::components::message_actions::ACTIONS_MAIN_CHAT_ONLY;
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::peer_manager::SubscriptionChange;
 use crate::components::projection_modal::UNPREPARED as PROJECTION_UNPREPARED;
@@ -5755,6 +5756,10 @@ fn arming_a_window_still_lets_a_sweep_start_in_it() {
     assert!(app.selection_state.is_some(), "{ARM_SWEEP_MSG}");
 }
 
+/// A transcript column past the gutter, whose `⋮` handle takes a press on any
+/// row of its message.
+const PAST_THE_GUTTER: u16 = 4;
+
 /// Renders, then clicks the roster row `child_id` was drawn on. The row has to
 /// be found after the frame it is measured in, since the roster only takes its
 /// shape once the card is laid out.
@@ -5766,12 +5771,12 @@ fn click_roster_row(app: &mut App, child_id: &str) {
         .expect("the roster drew a row for the child");
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
+        area.x + PAST_THE_GUTTER,
         row,
     ));
     app.update(mouse_event(
         MouseEventKind::Up(MouseButton::Left),
-        area.x + 2,
+        area.x + PAST_THE_GUTTER,
         row,
     ));
 }
@@ -7612,17 +7617,17 @@ fn the_transcript_can_be_selected_while_a_question_is_open() {
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        msg_area.x + 1,
+        msg_area.x + PAST_THE_GUTTER,
         row,
     ));
     app.update(mouse_event(
         MouseEventKind::Drag(MouseButton::Left),
-        msg_area.x + 6,
+        msg_area.x + PAST_THE_GUTTER + 5,
         row,
     ));
     app.update(mouse_event(
         MouseEventKind::Up(MouseButton::Left),
-        msg_area.x + 6,
+        msg_area.x + PAST_THE_GUTTER + 5,
         row,
     ));
     assert!(
@@ -8142,6 +8147,46 @@ fn left_click_message_action_handle_opens_message_actions() {
     assert_eq!(after.normalized(), before.normalized());
     assert_eq!(after.area, before.area);
     assert_eq!(after.zone, before.zone);
+}
+
+#[test]
+fn a_subagent_message_menu_shows_its_details_without_actions() {
+    const TOOL_ID: &str = "sub_bash";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(
+        tool_start(TOOL_ID, "bash"),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+    app.update(sub_turn_complete());
+    app.update(subagent_msg(
+        tool_results_submitted(),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+    app.active_chat = 1;
+    let (column, row) = message_action_position(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.message_actions.is_open());
+    assert!(!app.message_actions.offers(MessageActionKind::Fork));
+    let info = app.message_actions.info_text().unwrap_or_default();
+    assert!(
+        info.contains(&SUB_TOKENS.format(SUB_COST)),
+        "the menu names the call's usage: {info}"
+    );
+    assert!(rendered(&mut app).contains(ACTIONS_MAIN_CHAT_ONLY));
 }
 
 #[test]
@@ -9219,7 +9264,11 @@ fn message_action_position(app: &mut App) -> (u16, u16) {
     let area = app.msg_area();
     (area.y..area.bottom())
         .flat_map(|row| (area.x..area.right()).map(move |column| (column, row)))
-        .find(|&(column, row)| app.chats[0].message_action_at(row, column).is_some())
+        .find(|&(column, row)| {
+            app.chats[app.active_chat]
+                .message_action_at(row, column)
+                .is_some()
+        })
         .expect("message action handle was not rendered")
 }
 
@@ -15525,7 +15574,7 @@ fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
         result_id: None,
     };
     app.state.session_mut().replace_messages(items.clone());
-    app.message_actions.open(source, false, None);
+    app.open_message_actions_at(source, None);
     app.update(Msg::Key(key(KeyCode::Down)));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -29187,9 +29236,8 @@ mod theme_colours {
         Surface {
             name: "message_actions",
             open: |app, _| {
-                app.message_actions.open(
+                app.open_message_actions_at(
                     DisplaySource::AssistantText(CaudraId::generate()),
-                    false,
                     None,
                 );
             },

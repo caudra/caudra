@@ -12,10 +12,9 @@ use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
     AUTOPILOT_BODY_INDENT, DECISION_PREFIX, RenderCtx, ScrollTail, ToolLines, append_annotation,
-    append_right_info, assistant_style, autopilot_style, build_instructions_lines,
-    build_tool_lines, clock_ticks, done_style, draws_live_script, error_style,
-    format_timestamp_now, keeps_clock, names_tool, notice_style, thinking_style,
-    truncate_to_header, user_style,
+    assistant_style, autopilot_style, build_instructions_lines, build_tool_lines, clock_ticks,
+    done_style, draws_live_script, error_style, keeps_clock, names_tool, notice_style,
+    thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
@@ -47,7 +46,7 @@ use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use caudra_agent::types::WorkflowRunCard;
-use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
+use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
 use caudra_providers::{AutomationEventOrigin, TokenScale};
@@ -63,6 +62,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::MouseEvent;
+use jiff::Timestamp;
 
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
@@ -91,14 +91,14 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
-/// The actions glyph is a bare `⋮`, so its tooltip names what is behind it.
 /// The headings a copied selection names the turns it covers under.
 pub(crate) const USER_HEADING: &str = "User";
 pub(crate) const ASSISTANT_HEADING: &str = "Assistant";
 pub(crate) const THINKING_HEADING: &str = "Thinking";
 pub(crate) const ERROR_HEADING: &str = "Error";
 
-const MESSAGE_ACTION_TIP: &str = "Message actions: review, fork or revert from here";
+/// The actions glyph is a bare `⋮`, so its tooltip names what is behind it.
+const MESSAGE_ACTION_TIP: &str = "Message details and actions";
 const THOUGHT_PREFIX: &str = "Thought";
 const INJECTED_FALLBACK_TITLE: &str = "injected message";
 const INJECTED_SEARCH_PREFIX: &str = "injected> ";
@@ -193,16 +193,27 @@ enum HoverTarget {
     Diagram(DiagramKey),
 }
 
+/// A conversation message the `⋮` menu opens on. `source` is its history
+/// item, which a live message gains only once its turn is saved, and which
+/// fork and revert need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MessageActionTarget {
-    source: DisplaySource,
+    source: Option<DisplaySource>,
+    message: usize,
     segment_index: usize,
 }
 
 impl MessageActionTarget {
-    pub(crate) fn source(self) -> DisplaySource {
+    pub(crate) fn source(self) -> Option<DisplaySource> {
         self.source
     }
+}
+
+/// What the `⋮` menu says about its message above the actions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MessageDetails {
+    pub created: Option<Timestamp>,
+    pub usage: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1101,7 +1112,6 @@ pub struct MessagesPanel {
     /// Set when a density switch drops the cache under a scrolled-up reader,
     /// and applied once the next rebuild gives the segment a height again.
     pending_scroll_segment: Option<usize>,
-    clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
@@ -1220,7 +1230,6 @@ impl MessagesPanel {
             view: ViewMode::default(),
             auto_open: None,
             pending_scroll_segment: None,
-            clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
             prompt_rate: PromptRate::default(),
@@ -1775,7 +1784,8 @@ impl MessagesPanel {
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
     /// correct it later.
-    pub fn push(&mut self, msg: DisplayMessage) -> usize {
+    pub fn push(&mut self, mut msg: DisplayMessage) -> usize {
+        msg.created.get_or_insert_with(Timestamp::now);
         self.messages.push(msg);
         self.messages.len() - 1
     }
@@ -1990,8 +2000,7 @@ impl MessagesPanel {
         let mut msg = DisplayMessage::new(role, String::new());
         msg.tool_preview_pending = true;
         msg.tool_stage = Some(CallStage::Drafting);
-        msg.timestamp = Some(format_timestamp_now(self.clock_format));
-        self.messages.push(msg);
+        self.push(msg);
     }
 
     /// The call has moved past `stage`: its arguments closed, or its prompt
@@ -2165,9 +2174,8 @@ impl MessagesPanel {
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
-        msg.timestamp = Some(format_timestamp_now(self.clock_format));
         msg.tool_started = Some(Instant::now());
-        self.messages.push(msg);
+        self.push(msg);
         self.sync_child_clocks(&id);
     }
 
@@ -3249,10 +3257,8 @@ impl MessagesPanel {
         self.prompt_progress = None;
         self.prompt_rate.reset();
         if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                self.streaming_role.clone(),
-                self.streaming_text.take_all(),
-            ));
+            let text = self.streaming_text.take_all();
+            self.push(DisplayMessage::new(self.streaming_role.clone(), text));
         }
         self.streaming_role = DisplayRole::Assistant;
     }
@@ -3453,38 +3459,49 @@ impl MessagesPanel {
         Some(format!("{tool_id}:{index}"))
     }
 
-    pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
+    /// The message whose `⋮` menu a right-click at `row` opens.
+    pub(crate) fn message_target_at_row(
+        &self,
+        row: u16,
+        area: Rect,
+    ) -> Option<MessageActionTarget> {
         if area.height == 0 || row < area.y || row >= area.bottom() {
             return None;
         }
         let doc_row = self.doc_row(row, area);
-        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let (index, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         if rel < segment.chrome(self.viewport_width).margin_top {
             return None;
         }
-        self.segment_source(segment)
+        self.message_action_target(segment, index)
     }
 
-    fn segment_source(&self, segment: &Segment) -> Option<DisplaySource> {
+    fn segment_message(&self, segment: &Segment) -> Option<usize> {
         if let Some(index) = segment.msg_index {
-            return self.messages.get(index)?.source;
+            return (index < self.messages.len()).then_some(index);
         }
         let tool_id = segment
             .tool_id
             .as_deref()
             .and_then(segment::instruction_parent)
             .or(segment.tool_id.as_deref())?;
-        // `rfind`, not `find_map`: a card whose message carries no source is
-        // the answer, not a reason to keep walking to the front of the
-        // transcript.
-        self.messages
-            .iter()
-            .rfind(|message| matches!(&message.role, DisplayRole::Tool(tool) if tool.id == tool_id))
-            .and_then(|message| message.source)
+        self.messages.iter().rposition(
+            |message| matches!(&message.role, DisplayRole::Tool(tool) if tool.id == tool_id),
+        )
     }
 
-    fn message_action_source(&self, segment: &Segment) -> Option<DisplaySource> {
+    fn segment_source(&self, segment: &Segment) -> Option<DisplaySource> {
+        self.messages.get(self.segment_message(segment)?)?.source
+    }
+
+    /// Prompts, replies, reasoning and calls, whether or not their turn is
+    /// saved yet. Notices and the rows Caudra adds itself are not messages.
+    fn message_action_target(
+        &self,
+        segment: &Segment,
+        segment_index: usize,
+    ) -> Option<MessageActionTarget> {
         if segment
             .tool_id
             .as_deref()
@@ -3492,7 +3509,30 @@ impl MessagesPanel {
         {
             return None;
         }
-        self.segment_source(segment)
+        let message = self.segment_message(segment)?;
+        let msg = &self.messages[message];
+        matches!(
+            msg.role,
+            DisplayRole::User
+                | DisplayRole::Assistant
+                | DisplayRole::Thinking
+                | DisplayRole::Tool(_)
+        )
+        .then_some(MessageActionTarget {
+            source: msg.source,
+            message,
+            segment_index,
+        })
+    }
+
+    pub(crate) fn message_details(&self, target: MessageActionTarget) -> MessageDetails {
+        self.messages
+            .get(target.message)
+            .map(|msg| MessageDetails {
+                created: msg.created,
+                usage: msg.turn_usage.clone(),
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn update_hover(
@@ -4376,7 +4416,7 @@ impl MessagesPanel {
         frame: &mut Frame,
         area: Rect,
         has_selection: bool,
-        message_actions_enabled: bool,
+        message_actions: bool,
     ) {
         self.terminal_links.clear();
         self.message_action_hits.clear();
@@ -4551,10 +4591,10 @@ impl MessagesPanel {
             let hover = self
                 .hover_feedback_for_segment(seg)
                 .map(|feedback| (feedback, accent));
-            let source = message_actions_enabled
-                .then(|| self.message_action_source(seg))
+            let target = message_actions
+                .then(|| self.message_action_target(seg, i))
                 .flatten();
-            let message_action = source.map(|_| {
+            let message_action = target.map(|_| {
                 (
                     matches!(self.hover, Some(HoverTarget::MessageAction(index)) if index == i),
                     accent,
@@ -4581,14 +4621,8 @@ impl MessagesPanel {
                     collect_card_windows(seg, &key, placement, width, viewport, &mut windows);
                 }
             }
-            if let (Some(area), Some(source)) = (action_area, source) {
-                message_action_hits.push(MessageActionHit {
-                    area,
-                    target: MessageActionTarget {
-                        source,
-                        segment_index: i,
-                    },
-                });
+            if let (Some(area), Some(target)) = (action_area, target) {
+                message_action_hits.push(MessageActionHit { area, target });
             }
         }
         self.message_action_hits = message_action_hits;
@@ -5431,30 +5465,6 @@ impl MessagesPanel {
         dirty
     }
 
-    fn build_tool_segment_lines(
-        msg: &DisplayMessage,
-        status: ToolStatus,
-        rctx: &RenderCtx,
-        exp: Option<Disclosure>,
-    ) -> ToolLines {
-        let mut tl = build_tool_lines(msg, status, rctx, exp);
-        // A compact row is meant to be scannable, and a right-aligned clock
-        // on every line is the opposite of that.
-        if let Some(ts) = &msg.timestamp
-            && !rctx.compact
-            && !tl.lines.is_empty()
-        {
-            append_right_info(
-                &mut tl.lines[0],
-                msg.turn_usage.as_deref(),
-                Some(ts),
-                rctx.width,
-            );
-            tl.links.rows[0] = vec![None; tl.lines[0].spans.len()];
-        }
-        tl
-    }
-
     /// Builds a card, holding a still-running one to the tallest it has
     /// already drawn.
     ///
@@ -5471,7 +5481,7 @@ impl MessagesPanel {
         exp: Option<Disclosure>,
         floor: usize,
     ) -> ToolLines {
-        let tl = Self::build_tool_segment_lines(msg, status, rctx, exp);
+        let tl = build_tool_lines(msg, status, rctx, exp);
         if status != ToolStatus::InProgress {
             return tl;
         }
@@ -5479,7 +5489,7 @@ impl MessagesPanel {
         if plan.is_empty() {
             return tl;
         }
-        Self::build_tool_segment_lines(msg, status, &rctx.with_windows_opened(&plan), exp)
+        build_tool_lines(msg, status, &rctx.with_windows_opened(&plan), exp)
     }
 
     fn build_anchored_tool_lines(
@@ -5551,7 +5561,7 @@ impl MessagesPanel {
             &ThinkingWindow::Live.key(),
             ThinkingWindow::Settled(self.messages.len()).key(),
         );
-        self.messages.push(msg);
+        self.push(msg);
     }
 
     /// The two halves the reveal has earned so far. The buffer decides which
@@ -6839,7 +6849,7 @@ mod shell_receipt_tests {
             ctx.width = 100;
             ctx.policy.expanded = true;
             ctx.policy.scroll_card_lines = 0;
-            let rendered = MessagesPanel::build_tool_segment_lines(
+            let rendered = super::build_tool_lines(
                 panel.messages.last().unwrap(),
                 ToolStatus::Success,
                 &ctx,
@@ -6949,12 +6959,8 @@ mod retained_progress_tests {
     fn only_pure_output_root_windows_offer_refill_rows(history_start: Option<usize>) {
         let panel = panel(false);
         let rctx = panel.rctx(TASK_TOOL_NAME, ToolEffect::Orchestrator, PARENT_ID);
-        let mut lines = MessagesPanel::build_tool_segment_lines(
-            &panel.messages[0],
-            ToolStatus::InProgress,
-            &rctx,
-            None,
-        );
+        let mut lines =
+            super::build_tool_lines(&panel.messages[0], ToolStatus::InProgress, &rctx, None);
         lines.scroll_spans = vec![history_span(history_start)];
         let expected = if history_start.is_some() {
             Vec::new()

@@ -6,6 +6,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const UUID_BYTES: usize = 16;
+pub(crate) const UUID_VERSION_BYTE: usize = 6;
+pub(crate) const UUID_VARIANT_BYTE: usize = 8;
+const UUID_VERSION_SHIFT: u32 = 4;
+const UUID_VARIANT_SHIFT: u32 = 6;
+const UUID_V7: u8 = 7;
+const UUID_RFC4122_VARIANT: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CaudraIdParseError {
@@ -46,6 +52,20 @@ impl CaudraId {
 
     pub fn from_bytes(bytes: [u8; UUID_BYTES]) -> Self {
         Self(bytes)
+    }
+
+    /// The UNIX millisecond the id was generated at, when it is a UUIDv7.
+    pub fn created_ms(&self) -> Option<u64> {
+        let bytes = &self.0;
+        if bytes[UUID_VERSION_BYTE] >> UUID_VERSION_SHIFT != UUID_V7
+            || bytes[UUID_VARIANT_BYTE] >> UUID_VARIANT_SHIFT != UUID_RFC4122_VARIANT
+        {
+            return None;
+        }
+        let timestamp = u64::from_be_bytes([
+            0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+        ]);
+        (timestamp != 0).then_some(timestamp)
     }
 }
 
@@ -200,6 +220,21 @@ mod tests {
             ids.windows(2).all(|pair| pair[0] < pair[1]),
             "{NOT_MONOTONIC}"
         );
+    }
+
+    #[test]
+    fn a_generated_id_knows_when_it_was_made() {
+        let before = jiff::Timestamp::now().as_millisecond();
+        let created = CaudraId::generate().created_ms().unwrap();
+        assert!(created as i64 >= before);
+    }
+
+    #[test_case(UUID_VERSION_BYTE ; "not_v7")]
+    #[test_case(UUID_VARIANT_BYTE ; "not_rfc4122")]
+    fn a_non_v7_id_has_no_creation_time(byte: usize) {
+        let mut bytes = *CaudraId::generate().as_bytes();
+        bytes[byte] = 0;
+        assert_eq!(CaudraId::from_bytes(bytes).created_ms(), None);
     }
 
     #[test]

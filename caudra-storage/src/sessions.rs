@@ -48,7 +48,7 @@ mod types;
 
 pub(crate) use database::{
     AFTER_SEPARATOR, compress_payload, decompress_payload, deserialize_json, from_i64,
-    from_i64_usize, history_uuid_timestamp, id_from_row, to_i64,
+    from_i64_usize, id_from_row, to_i64,
 };
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
