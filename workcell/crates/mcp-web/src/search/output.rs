@@ -1,5 +1,5 @@
 use crate::WebsearchBackend;
-use crate::types::{WebsearchOutput, WebsearchResult};
+use crate::types::{WebsearchFallback, WebsearchOutput, WebsearchResult};
 
 const MAX_MODEL_OUTPUT_BYTES: usize = 50 * 1024;
 
@@ -19,6 +19,7 @@ pub(super) fn success(
         formatted_results,
         error: None,
         error_message: None,
+        fallbacks: Vec::new(),
     }
 }
 
@@ -38,7 +39,56 @@ pub(super) fn error(
         formatted_results: format!("Error: {message}"),
         error: Some(true),
         error_message: Some(message.to_owned()),
+        fallbacks: Vec::new(),
     }
+}
+
+/// Name the backends that failed before `output.backend` answered, in the
+/// structured output and ahead of the model-facing results.
+pub(super) fn with_fallbacks(
+    mut output: WebsearchOutput,
+    fallbacks: Vec<WebsearchFallback>,
+) -> WebsearchOutput {
+    if fallbacks.is_empty() {
+        return output;
+    }
+    let answered = output.backend.map_or("", WebsearchBackend::as_str);
+    let notes = fallbacks
+        .iter()
+        .map(|fallback| {
+            format!(
+                "Note: {} failed ({}); results from {answered}.\n",
+                fallback.backend.as_str(),
+                fallback.error
+            )
+        })
+        .collect::<String>();
+    output.formatted_results.insert_str(0, &notes);
+    output.fallbacks = fallbacks;
+    output
+}
+
+/// A lone failure keeps the single-backend error shape; several are reported together.
+pub(super) fn all_failed(
+    primary: Option<WebsearchBackend>,
+    query: String,
+    fallbacks: Vec<WebsearchFallback>,
+) -> WebsearchOutput {
+    if let [fallback] = fallbacks.as_slice() {
+        return error(Some(fallback.backend), query, &fallback.error);
+    }
+    let failures = fallbacks
+        .iter()
+        .map(|fallback| format!("{}: {}", fallback.backend.as_str(), fallback.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut output = error(
+        primary,
+        query,
+        &format!("Every websearch backend failed. {failures}"),
+    );
+    output.fallbacks = fallbacks;
+    output
 }
 
 fn format_results(results: &[WebsearchResult]) -> String {

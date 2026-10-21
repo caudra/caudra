@@ -28,6 +28,7 @@ use crate::config_version::ConfigVersion;
 use crate::interpolation::Lookup;
 use crate::migration::{ConfigFormat, MigrationError, Step, Upgrade};
 use crate::shell_env::{ShellEnvConfig, ShellEnvError, ShellEnvFileConfig};
+use crate::websearch::WebsearchConfig;
 
 pub const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
@@ -116,9 +117,11 @@ pub mod own_writes;
 pub mod profile_tools;
 pub mod providers;
 pub mod sandbox;
+pub mod settings_file;
 pub mod shell_env;
 pub mod steering;
 pub mod toml_document;
+pub mod websearch;
 pub mod workcell;
 
 pub use caudra_proxy::{ProxyEnv, ProxyRoute};
@@ -655,6 +658,12 @@ pub enum ConfigError {
         "invalid project config: agent.cache_warming is global-only because it spends quota; move it to the global caudra.toml"
     )]
     ProjectCacheWarming,
+    #[error(
+        "invalid project config: [websearch] is global-only because it holds credentials and decides where search queries go; move it to the global caudra.toml"
+    )]
+    ProjectWebsearch,
+    #[error("invalid config: websearch.backends lists {0} more than once")]
+    WebsearchDuplicateBackend(websearch::WebsearchBackendName),
     #[error("invalid config: {key}: {source}")]
     ShellEnv {
         key: String,
@@ -802,6 +811,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_cache_warming_override: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_websearch_override: bool,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -817,6 +829,9 @@ pub struct RawConfig {
     /// `Some` for any `[autopilot]` table, even an empty one, so a project
     /// layer that holds one is refused.
     pub autopilot: Option<AutopilotFileConfig>,
+    /// `Some` for any `[websearch]` table, even an empty one, so a project
+    /// layer that holds one is refused.
+    pub websearch: Option<WebsearchConfig>,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
@@ -838,6 +853,8 @@ impl RawConfig {
         let holds_cache_warming = overlay.agent.cache_warming.take().is_some();
         self.project_cache_warming_override |=
             overlay.project_cache_warming_override || holds_cache_warming;
+        self.project_websearch_override |=
+            overlay.project_websearch_override || overlay.websearch.take().is_some();
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
         self.project_message_history_override = self
@@ -892,7 +909,11 @@ impl RawConfig {
         self.project_autopilot_override |= overlay.project_autopilot_override;
         self.project_shell_env_override |= overlay.project_shell_env_override;
         self.project_cache_warming_override |= overlay.project_cache_warming_override;
+        self.project_websearch_override |= overlay.project_websearch_override;
         merge_option!(self, overlay, always_yolo, always_auto);
+        if let Some(websearch) = overlay.websearch.take() {
+            self.websearch.get_or_insert_default().merge(websearch);
+        }
         if let Some(automations) = overlay.automations.take() {
             self.automations.get_or_insert_default().merge(automations);
         }
@@ -939,6 +960,11 @@ impl RawConfig {
         if self.project_cache_warming_override {
             return Err(ConfigError::ProjectCacheWarming);
         }
+        if self.project_websearch_override {
+            return Err(ConfigError::ProjectWebsearch);
+        }
+        let websearch = self.websearch.take().unwrap_or_default();
+        websearch.validate()?;
         let shell_env = ShellEnvConfig::from_file(self.agent.shell_env.take().unwrap_or_default())?;
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
@@ -972,6 +998,7 @@ impl RawConfig {
             autopilot: AutopilotConfig::from_file(self.autopilot.unwrap_or_default()),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
+            websearch,
         };
         config.automations.validate()?;
         config.autopilot.validate()?;
@@ -2299,6 +2326,7 @@ pub struct Config {
     pub autopilot: AutopilotConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
+    pub websearch: WebsearchConfig,
 }
 
 /// Whether the pointer driving Caudra is a finger. Tri-state because the only
@@ -6297,6 +6325,7 @@ mod tests {
             autopilot: AutopilotConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
+            websearch: WebsearchConfig::default(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {

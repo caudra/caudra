@@ -96,7 +96,7 @@ use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::worktrees;
 use caudra_workbench::WorkbenchAction;
-use caudra_workcell::ShellEnvironmentTarget;
+use caudra_workcell::{ShellEnvironmentTarget, WebsearchControl};
 use caudra_workspace::WorkspaceControlCommand;
 use crossterm::event::KeyEventKind;
 use crossterm::event::{
@@ -380,6 +380,9 @@ pub struct EventLoopParams {
     /// says.
     pub host_workspaces: Option<Arc<dyn Workspaces>>,
     pub workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    /// The local Workcell's web search, which `[websearch]` edits apply to. `None` when the
+    /// web tools run on a remote Workcell, which keeps its own environment.
+    pub websearch: Option<WebsearchControl>,
     pub remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     pub local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
@@ -1230,6 +1233,7 @@ struct SpawnCtx {
     update_notice: Arc<UpdateNotice>,
     config_problems: Arc<ConfigProblems>,
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    websearch: Option<WebsearchControl>,
     /// The directory Caudra itself runs in, kept only for a sandbox session:
     /// there `{cwd}` names a path inside the VM, and the host checkout is a
     /// second, separate source of instruction files.
@@ -1921,6 +1925,7 @@ impl<'t> EventLoop<'t> {
             worktrees,
             host_workspaces,
             workspace_session,
+            websearch,
             remote_project_context: _,
             local_documents,
         } = params;
@@ -2028,6 +2033,7 @@ impl<'t> EventLoop<'t> {
             config_problems: Arc::default(),
             host_cwd: workspace_session.as_ref().map(|_| cwd.clone()),
             workspace_session,
+            websearch,
             local_documents,
         };
 
@@ -5744,6 +5750,7 @@ mod tests {
             update_notice: Arc::default(),
             config_problems: Arc::default(),
             workspace_session: None,
+            websearch: None,
             host_cwd: None,
             local_documents: None,
         }

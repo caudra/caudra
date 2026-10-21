@@ -15,6 +15,7 @@ mod transfer;
 mod transfer_authorization;
 mod transfer_inventory;
 mod transfer_session;
+mod websearch;
 
 pub use automation_http::{AutomationHttpClient, automation_http_client};
 pub use changes::{ChangeInventory, LocalChangeStore, LocalChangeStores, PreparedStoreCleanup};
@@ -41,6 +42,7 @@ pub use transfer_inventory::{
 pub use transfer_session::{
     TransferReport, TransferSession, TransferSessionHost, TransferValidity,
 };
+pub use websearch::{BackendStatus, SettingSource, WebsearchControl, WebsearchReport};
 pub use workcell::host_contract;
 
 use std::borrow::Cow;
@@ -150,6 +152,9 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "source_code_refs",
     "execution_environment",
 ];
+const WEBSEARCH_TOOL: &str = "websearch";
+/// The year a description states when the clock cannot be read.
+const FALLBACK_YEAR: i32 = 2026;
 const REFS_REACHED_UNIT: &str = "reached";
 const REFS_DECLINED: &str = "same-name calls declined";
 const CODE_WORKER_WARNING: &str = "The code tool is unavailable";
@@ -290,25 +295,43 @@ struct HostInner {
     runtime: Runtime,
     projects: tokio::sync::Mutex<HashMap<PathBuf, ProjectGroups>>,
     web: WebToolGroup,
+    /// The `websearch` spec of the configuration revision it was built for.
+    websearch_spec: Mutex<Option<(u64, ToolSpec)>>,
+    websearch_fingerprint: Mutex<Option<[u8; 32]>>,
     code: Option<Arc<CodeToolGroup>>,
 }
 
 impl HostInner {
     fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = workcell::files::specs(ALLOW_WRITE);
-        let year = jiff::Timestamp::now()
-            .strftime("%Y")
-            .to_string()
-            .parse()
-            .unwrap_or(2026);
         specs.extend(workcell::web::specs(
-            year,
+            current_year(),
             &self.web.snapshot().configuration,
         ));
         specs.extend(workcell::shell::specs());
         specs.extend(workcell::source_code_graph::specs());
         specs.push(workcell::environment::spec());
         specs
+    }
+
+    /// `websearch` as the backends in force now describe it.
+    fn websearch_spec(&self) -> ToolSpec {
+        let snapshot = self.web.snapshot();
+        let mut cached = self
+            .websearch_spec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((revision, spec)) = cached.as_ref()
+            && *revision == snapshot.revision
+        {
+            return spec.clone();
+        }
+        let spec = workcell::web::specs(current_year(), &snapshot.configuration)
+            .into_iter()
+            .find(|spec| spec.name == WEBSEARCH_TOOL)
+            .expect("web specs include websearch");
+        *cached = Some((snapshot.revision, spec.clone()));
+        spec
     }
 
     async fn project_groups(&self, cwd: PathBuf) -> Result<ProjectGroups, String> {
@@ -486,6 +509,8 @@ impl WorkcellHost {
                     SOURCE_ICONS_ENABLED,
                     &proxy,
                 ),
+                websearch_spec: Mutex::new(None),
+                websearch_fingerprint: Mutex::new(None),
                 code,
             }),
             warnings,
@@ -519,6 +544,11 @@ impl WorkcellHost {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Changes the backends of this host's `websearch` tool, including once it is registered.
+    pub fn websearch(&self) -> WebsearchControl {
+        WebsearchControl::new(Arc::clone(&self.inner))
     }
 
     /// Runs `code` snippets on this host's runtime and worker pool.
@@ -650,15 +680,18 @@ where
     })
 }
 
-fn canonical_remote_specs() -> Vec<ToolSpec> {
-    let mut expected = workcell::files::specs(ALLOW_WRITE);
-    let year = jiff::Timestamp::now()
+fn current_year() -> i32 {
+    jiff::Timestamp::now()
         .strftime("%Y")
         .to_string()
         .parse()
-        .unwrap_or(2026);
+        .unwrap_or(FALLBACK_YEAR)
+}
+
+fn canonical_remote_specs() -> Vec<ToolSpec> {
+    let mut expected = workcell::files::specs(ALLOW_WRITE);
     expected.extend(workcell::web::specs(
-        year,
+        current_year(),
         &WebsearchExecutionConfiguration::default(),
     ));
     expected.extend(workcell::shell::specs());
@@ -858,17 +891,31 @@ struct WorkcellTool {
     host: Arc<HostInner>,
 }
 
+impl WorkcellTool {
+    /// The spec in force: `websearch` follows the backends configured now.
+    fn live_spec(&self) -> Cow<'_, ToolSpec> {
+        if self.kind == ToolKind::Websearch {
+            Cow::Owned(self.host.websearch_spec())
+        } else {
+            Cow::Borrowed(&self.spec)
+        }
+    }
+}
+
 impl Tool for WorkcellTool {
     fn name(&self) -> &str {
         self.spec.name
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(&self.spec.description)
+        match self.live_spec() {
+            Cow::Borrowed(spec) => Cow::Borrowed(&spec.description),
+            Cow::Owned(spec) => Cow::Owned(spec.description),
+        }
     }
 
     fn schema(&self) -> Value {
-        Value::Object(self.spec.input_schema.clone())
+        Value::Object(self.live_spec().input_schema.clone())
     }
 
     fn audience(&self) -> ToolAudience {
@@ -884,7 +931,7 @@ impl Tool for WorkcellTool {
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        reject_unknown_fields(&self.spec, input).map_err(ParseError::custom)?;
+        reject_unknown_fields(&self.live_spec(), input).map_err(ParseError::custom)?;
         let raw_input = (self.kind == ToolKind::Shell).then(|| input.clone());
         let input = Input::parse(self.kind, input.clone()).map_err(ParseError::custom)?;
         Ok(Box::new(WorkcellInvocation {

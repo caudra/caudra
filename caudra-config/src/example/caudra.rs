@@ -4,6 +4,7 @@ use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
 use crate::shell_env::ShellEnvConfig;
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
+use crate::websearch::{WEBSEARCH_KEY, WebsearchBackendName, WebsearchConfig};
 use crate::{
     AgentConfig, AutomationsConfig, AutopilotConfig, ConfigValue, DEFAULT_BUILTINS,
     MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig,
@@ -20,7 +21,8 @@ const USAGE: &str = "To change a setting, copy its line into your caudra.toml un
      [table] header, remove the \"#\", and set your value. A value in angle brackets, such as \
      <string>, marks a setting that has no default.";
 const PROJECT_SCOPE: &str = "A project .caudra/caudra.toml takes the same settings, except \
-     [experimental], [automations], [agent.shell_env], and the ones marked global-only.";
+     [experimental], [automations], [agent.shell_env], [websearch], and the ones marked \
+     global-only.";
 const SHELL_ENV_ABOUT: &str = "Variables local shell commands receive beyond the fixed \
      allowlist. Only the global caudra.toml may hold this table.";
 const EXPERIMENTAL_ABOUT: &str = "Experimental features stay off until you turn them on, and each \
@@ -46,6 +48,11 @@ const THRESHOLDS_ABOUT: &str = "Probabilities between 0 and 1. Flags trigger at 
      prune or demote candidates below the relevance floor.";
 const AUTOMATIONS_ABOUT: &str = "Limits for automations, which need `automations = true` under \
      [experimental]. Only the global caudra.toml may hold this table.";
+const WEBSEARCH_ABOUT: &str = "Backends of the websearch tool. Only the global caudra.toml may \
+     hold this table and its backend tables, because they hold credentials and decide where \
+     search queries go. A key left unset reads the variable in its Env column, from Caudra's \
+     environment or the global .env; prefer {env:NAME} references over credentials written \
+     out. Changes apply at once.";
 const AUTOPILOT_ABOUT: &str = "Limits for autopilot, which needs `autopilot = true` under \
      [experimental]. Only the global caudra.toml may hold this table.";
 
@@ -148,8 +155,22 @@ fn tables() -> Vec<Table> {
         .about(AUTOMATIONS_ABOUT),
         Table::of(Header::Fixed("autopilot".into()), AutopilotConfig::FIELDS)
             .about(AUTOPILOT_ABOUT),
-        Table::new(Header::Fixed("plugins".into()), Vec::new()).about(plugins_about()),
+        Table::of(Header::Fixed(WEBSEARCH_KEY.into()), WebsearchConfig::FIELDS)
+            .about(WEBSEARCH_ABOUT),
     ]);
+    tables.extend(
+        WebsearchBackendName::ALL
+            .into_iter()
+            .filter(|backend| !backend.fields().is_empty())
+            .map(|backend| {
+                Table::of(
+                    Header::Fixed(format!("{WEBSEARCH_KEY}.{backend}")),
+                    backend.fields(),
+                )
+                .about(format!("Settings of the {} backend.", backend.label()))
+            }),
+    );
+    tables.push(Table::new(Header::Fixed("plugins".into()), Vec::new()).about(plugins_about()));
     tables.extend(
         NATIVE_PLUGIN_OPTIONS
             .iter()
@@ -247,6 +268,7 @@ mod tests {
                 &config.automations,
                 &config.decisions,
                 &config.plugins,
+                &config.websearch,
             )
         )
     }

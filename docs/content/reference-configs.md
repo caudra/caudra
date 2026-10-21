@@ -18,8 +18,8 @@ description: "Every TOML config file in full, with each key commented out and de
 # brackets, such as <string>, marks a setting that has no default. The global
 # file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
 # Windows. A project .caudra/caudra.toml takes the same settings, except
-# [experimental], [automations], [agent.shell_env], and the ones marked
-# global-only.
+# [experimental], [automations], [agent.shell_env], [websearch], and the ones
+# marked global-only.
 #
 # caudra.toml holds the settings only you write. Other files hold what Caudra
 # writes itself, or what needs rules of its own: permissions.toml (permission
@@ -1220,6 +1220,84 @@ version = 3
 # Retries for transient provider errors during an autopilot engagement.
 # Type: u32, 0 to 20.
 # error_retries = 5
+
+[websearch]
+# Backends of the websearch tool. Only the global caudra.toml may hold this
+# table and its backend tables, because they hold credentials and decide where
+# search queries go. A key left unset reads the variable in its Env column,
+# from Caudra's environment or the global .env; prefer {env:NAME} references
+# over credentials written out. Changes apply at once.
+
+# How the ready backends answer: `single` uses the first ready one, `fallback`
+# tries them in order when one fails, and `all` lets the model pick one, trying
+# them in order when it does not.
+# Type: string. Env: WORKCELL_WEBSEARCH_MODE.
+# mode = "fallback"
+
+# Backends in priority order: exa-mcp, searxng, exa, brave, kagi, or serpapi. A
+# backend that is not set up correctly is skipped with a warning. An empty list
+# turns websearch off.
+# Type: string[]. Default: the comma-separated list in
+# WORKCELL_WEBSEARCH_BACKEND, else ["exa-mcp"]. Env:
+# WORKCELL_WEBSEARCH_BACKEND.
+# backends = <string[]>
+
+[websearch.searxng]
+# Settings of the SearXNG backend.
+
+# SearXNG base URL, HTTPS when a credential is set and never with credentials
+# in it.
+# Type: string. Default: unset. Env: SEARXNG_URL.
+# url = <string>
+
+# API key sent to SearXNG; set at most one of api_key, bearer_token, or user
+# and password.
+# Type: string. Default: unset. Env: SEARXNG_API_KEY.
+# api_key = <string>
+
+# Bearer token sent to SearXNG.
+# Type: string. Default: unset. Env: SEARXNG_BEARER_TOKEN.
+# bearer_token = <string>
+
+# Basic authentication user, set with password.
+# Type: string. Default: unset. Env: SEARXNG_USER.
+# user = <string>
+
+# Basic authentication password, set with user.
+# Type: string. Default: unset. Env: SEARXNG_PASSWORD.
+# password = <string>
+
+[websearch.exa]
+# Settings of the Exa backend.
+
+# Exa API key.
+# Type: string. Default: unset. Env: EXA_API_KEY.
+# api_key = <string>
+
+[websearch.brave]
+# Settings of the Brave backend.
+
+# Brave Search API key.
+# Type: string. Default: unset. Env: BRAVE_API_KEY.
+# api_key = <string>
+
+[websearch.kagi]
+# Settings of the Kagi backend.
+
+# Kagi API key.
+# Type: string. Default: unset. Env: KAGI_API_KEY.
+# api_key = <string>
+
+[websearch.serpapi]
+# Settings of the SerpApi backend.
+
+# SerpApi API key.
+# Type: string. Default: unset. Env: SERPAPI_API_KEY.
+# api_key = <string>
+
+# SerpApi engine: google or bing.
+# Type: string. Default: unset. Env: SERPAPI_ENGINE.
+# engine = <string>
 
 [plugins]
 # Bundled tools are on by default. Turn one off with `enabled = false` in its

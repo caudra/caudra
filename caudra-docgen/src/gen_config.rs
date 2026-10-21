@@ -17,6 +17,7 @@ use caudra_config::providers::PROVIDERS_FORMAT;
 use caudra_config::sandbox::SANDBOX_FORMAT;
 use caudra_config::shell_env::ShellEnvConfig;
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
+use caudra_config::websearch::{WebsearchBackendName, WebsearchConfig};
 use caudra_config::workcell::WORKCELL_FORMAT;
 use caudra_config::{
     AgentConfig, AutomationsConfig, AutopilotConfig, ConfigField, ConfigValue,
@@ -524,6 +525,25 @@ fn write_worktrees_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_websearch_section(out: &mut String) {
+    write_section(out, "[websearch]", WebsearchConfig::FIELDS);
+    writeln!(
+        out,
+        "Global-only: a project `caudra.toml` that sets `[websearch]` fails to load, because the \
+         table holds credentials and decides where search queries go. Each backend reads its \
+         settings from its own table below. A key left unset reads the variable in its Env \
+         column, from Caudra's environment or the global `.env`, never a project `.env`. \
+         Prefer `{{env:NAME}}` or `{{file:PATH}}` references over a credential written in the \
+         file. Edits apply at once while the terminal UI runs. See [Web search](/docs/web-search/).\n"
+    )
+    .unwrap();
+    for backend in WebsearchBackendName::ALL {
+        if !backend.fields().is_empty() {
+            write_section(out, &format!("[websearch.{backend}]"), backend.fields());
+        }
+    }
+}
+
 fn write_automations_section(out: &mut String) {
     write_section(out, "[automations]", AutomationsConfig::FIELDS);
     writeln!(
@@ -928,7 +948,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -939,7 +959,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 | Workflows and automations | Caudra reads them again each time it lists, launches, or arms one. |
 | `workcell.toml` and `sandboxes.toml` | After `/reload`. |
 | `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
-| Global `.env` | `{env:NAME}` references follow it at once. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Global `.env` | `{env:NAME}` references follow it at once, and `[websearch]` takes them up when it changes. Shell commands and keys read from the environment keep their startup values until a restart. |
 | Files that `{file:PATH}` reads | When the config file that names them reloads. Caudra does not watch them. |
 | Project `.env` | After a restart. |
 
@@ -1313,6 +1333,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_snapshots_section(&mut out);
     write_telemetry_section(&mut out);
     write_worktrees_section(&mut out);
+    write_websearch_section(&mut out);
     write_decisions_section(&mut out);
     write_automations_section(&mut out);
     write_autopilot_section(&mut out);

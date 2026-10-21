@@ -24,6 +24,7 @@ use crate::types::{
 };
 use crate::{
     ProxyConfiguration, WebToolDependencies, WebsearchBackend, WebsearchExecutionConfiguration,
+    WebsearchMode,
 };
 
 pub struct PreparedWebsearch {
@@ -246,6 +247,8 @@ impl WebOperationError {
 
 pub const STALE_WEBSEARCH_CONFIGURATION_ERROR: &str =
     "Prepared websearch is stale because the search configuration revision changed";
+pub const BACKEND_OUTSIDE_ALL_MODE_ERROR: &str =
+    "Invalid arguments: backend is accepted only when several websearch backends are active";
 
 /// Cloneable composition unit for the MCP server. Clones share immutable
 /// configuration and dependency handles but no mutable invocation state.
@@ -386,7 +389,7 @@ impl WebToolGroup {
         input.query = input.query.trim().to_owned();
         Ok(PreparedWebsearch {
             permission_query: input.query.clone(),
-            backend: snapshot.configuration.backend(),
+            backend: input.backend.or_else(|| snapshot.configuration.backend()),
             input,
             configuration: snapshot.configuration,
             configuration_source: snapshot.source,
@@ -603,7 +606,32 @@ fn validate_websearch(
     if input.safesearch.is_some_and(|value| value > 2) {
         return Err("Invalid arguments: safesearch must be 0, 1, or 2".to_owned());
     }
-    if let Some(provider) = configuration.provider() {
+    let provider = match input.backend {
+        None => configuration.provider(),
+        Some(_) if configuration.mode() != WebsearchMode::All => {
+            return Err(BACKEND_OUTSIDE_ALL_MODE_ERROR.to_owned());
+        }
+        Some(backend) => {
+            let Some(provider) = configuration
+                .providers()
+                .iter()
+                .find(|provider| provider.backend() == backend)
+            else {
+                let ready = configuration
+                    .ready_backends()
+                    .iter()
+                    .map(|backend| backend.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "Invalid arguments: backend {} is not active; choose one of: {ready}",
+                    backend.as_str()
+                ));
+            };
+            Some(provider.as_ref())
+        }
+    };
+    if let Some(provider) = provider {
         provider.validate_input(&input)?;
     } else if input.country.is_some()
         || input.categories.is_some()

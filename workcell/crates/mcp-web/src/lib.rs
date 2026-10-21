@@ -17,6 +17,7 @@ mod blocking;
 mod catalog;
 mod config;
 mod dependencies;
+mod environment;
 mod fetch;
 mod group;
 mod html;
@@ -29,23 +30,31 @@ pub use catalog::catalog;
 pub use catalog::specs;
 pub use config::{
     SerpApiEngine, WebsearchBackend, WebsearchConfigurationIssue, WebsearchExecutionConfiguration,
+    WebsearchMode,
 };
 pub use dependencies::{
     Clock, IconProvider, IconRequest, ProductionIconProvider, ProductionWebHttpTransport,
     SystemClock, WebHttpError, WebHttpRequest, WebHttpRequestKind, WebHttpResponse,
     WebHttpTransport, WebToolDependencies,
 };
+pub use environment::{
+    BRAVE_API_KEY_VARIABLE, EXA_API_KEY_VARIABLE, KAGI_API_KEY_VARIABLE, SEARXNG_API_KEY_VARIABLE,
+    SEARXNG_BEARER_TOKEN_VARIABLE, SEARXNG_PASSWORD_VARIABLE, SEARXNG_URL_VARIABLE,
+    SEARXNG_USER_VARIABLE, SERPAPI_API_KEY_VARIABLE, SERPAPI_ENGINE_VARIABLE,
+    WEB_CONFIGURATION_VARIABLES, WEBSEARCH_BACKEND_VARIABLE, WEBSEARCH_MODE_VARIABLE,
+    resolve_web_configuration_with,
+};
 pub use fetch::WebfetchError;
 pub use group::{
-    PreparedWebOperation, PreparedWebfetch, PreparedWebfetchOperation, PreparedWebsearch,
-    PreparedWebsearchOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, WebOperationError,
-    WebOperationExecution, WebToolGroup, WebsearchConfigurationSnapshot,
-    WebsearchConfigurationSource,
+    BACKEND_OUTSIDE_ALL_MODE_ERROR, PreparedWebOperation, PreparedWebfetch,
+    PreparedWebfetchOperation, PreparedWebsearch, PreparedWebsearchOperation,
+    STALE_WEBSEARCH_CONFIGURATION_ERROR, WebOperationError, WebOperationExecution, WebToolGroup,
+    WebsearchConfigurationSnapshot, WebsearchConfigurationSource,
 };
 pub use pdf::{NativePdfExtractor, PdfExtraction, PdfExtractionError, PdfExtractor};
 pub use types::{
     TimeRange, WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfAttachment,
-    WebfetchPdfMode, WebsearchInput, WebsearchOutput, WebsearchResult,
+    WebfetchPdfMode, WebsearchFallback, WebsearchInput, WebsearchOutput, WebsearchResult,
 };
 // Re-exported so a host configuring outbound egress needs only this crate.
 pub use workcell_net::{

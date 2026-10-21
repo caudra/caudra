@@ -793,6 +793,21 @@ anonymous rate limits. Set `WORKCELL_WEBSEARCH_BACKEND=disabled` to disable sear
 | Brave | `WORKCELL_WEBSEARCH_BACKEND=brave`, `BRAVE_API_KEY` |
 | Kagi | `WORKCELL_WEBSEARCH_BACKEND=kagi`, `KAGI_API_KEY` |
 | SerpApi | `WORKCELL_WEBSEARCH_BACKEND=serpapi`, `SERPAPI_API_KEY`, `SERPAPI_ENGINE=google|bing` |
+| Several | A comma-separated list in preference order, such as `WORKCELL_WEBSEARCH_BACKEND=searxng,exa-mcp`, each configured as above |
+
+A list must not repeat a backend or contain an empty entry, and `disabled` stands alone. Only listed
+backends whose configuration is complete and valid are used; the others are skipped, and when none is
+usable the first one's diagnostic reaches the model. `WORKCELL_WEBSEARCH_MODE` decides how the usable
+ones share the one `websearch` tool:
+
+| Mode | Behavior |
+| --- | --- |
+| `fallback` (default) | The first backend answers; when it fails, the next one is tried. The catalog is the first backend's, and results name every backend that failed before them. |
+| `single` | Only the first usable backend is used. |
+| `all` | The catalog merges every backend's parameters and adds a `backend` argument, so the model picks one per call or omits it to fall back in order. |
+
+Zero results is an answer, not a failure, so it never falls back. A fallback backend receives only
+the parameters its own schema declares.
 
 Source-icon resolution is disabled by default for both `websearch` and `webfetch`. Enable it with
 `--web-icons` or `WORKCELL_WEB_ICONS=true`. Opting in may issue additional requests to result/page
