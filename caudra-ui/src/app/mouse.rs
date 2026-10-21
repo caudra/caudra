@@ -9,6 +9,7 @@ use crate::components::input::{ChordHint, InputHit, image_chip_label};
 use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
+use crate::components::settings_modal::SettingsAction;
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::components::stream_modal::StreamAction;
 use crate::components::usage_modal::UsageMouse;
@@ -452,6 +453,14 @@ impl App {
                 event,
                 |app, event| app.env_modal.handle_mouse(event),
                 |app, action| app.handle_env_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.settings_modal.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.settings_modal.handle_mouse(event),
+                |app, action| app.handle_settings_action(action),
             ) {
                 return actions;
             }
@@ -1559,6 +1568,10 @@ impl App {
         dismiss!(
             self.env_modal,
             self.handle_env_action(crate::components::env_modal::EnvAction::Close)
+        );
+        dismiss!(
+            self.settings_modal,
+            self.handle_settings_action(SettingsAction::Close)
         );
         dismiss!(
             self.login_picker,

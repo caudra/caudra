@@ -1466,6 +1466,7 @@ dependencies = [
  "termini",
  "test-case",
  "toml",
+ "toml_edit",
  "tracing",
  "unicode-segmentation",
  "unicode-width",

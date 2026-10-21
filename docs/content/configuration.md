@@ -714,7 +714,7 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 | `mode` | string | `fallback` | `WORKCELL_WEBSEARCH_MODE` | How the ready backends answer: `single` uses the first ready one, `fallback` tries them in order when one fails, and `all` lets the model pick one, trying them in order when it does not |
 | `backends` | string[] | the comma-separated list in WORKCELL_WEBSEARCH_BACKEND, else ["exa-mcp"] | `WORKCELL_WEBSEARCH_BACKEND` | Backends in priority order: exa-mcp, searxng, exa, brave, kagi, or serpapi. A backend that is not set up correctly is skipped with a warning. An empty list turns websearch off |
 
-Global-only: a project `caudra.toml` that sets `[websearch]` fails to load, because the table holds credentials and decides where search queries go. Each backend reads its settings from its own table below. A key left unset reads the variable in its Env column, from Caudra's environment or the global `.env`, never a project `.env`. Prefer `{env:NAME}` or `{file:PATH}` references over a credential written in the file. Edits apply at once while the terminal UI runs. See [Web search](/docs/web-search/).
+Global-only: a project `caudra.toml` that sets `[websearch]` fails to load, because the table holds credentials and decides where search queries go. Each backend reads its settings from its own table below. A key left unset reads the variable in its Env column, from Caudra's environment or the global `.env`, never a project `.env`. Prefer `{env:NAME}` or `{file:PATH}` references over a credential written in the file. Edits apply at once while the terminal UI runs, and `/settings` edits them for you. See [Web search](/docs/web-search/).
 
 ### `[websearch.searxng]`
 

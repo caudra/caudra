@@ -435,6 +435,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/settings",
+        description: "Choose web search backends and change plain settings in the global caudra.toml",
+        max_args: 0,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/permissions",
         description: "Inspect active conversation permission rules",
         max_args: 0,

@@ -283,6 +283,13 @@ Some pickers add extra bindings on top of the defaults:
 | Environment | `d` | Delete the selected set value or pass pattern |
 | Environment | `v` | Reveal the selected value until the selection moves |
 | Environment | `Tab` | Switch between the Local and Sandbox tabs |
+| Settings | `Tab` / `Shift+Tab` | Switch to the next or previous tab, or press its number |
+| Settings | `Space` | Use the selected web search backend, or stop using it |
+| Settings | `[` / `]` | Move the selected backend up or down the list |
+| Settings | `m` | Switch web search to its next mode |
+| Settings | `Enter` | Edit the selected backend's settings, or change the selected setting |
+| Settings | `d` | Leave the backends to the environment, or reset the selected setting |
+| Settings | `Ctrl+R` | Show or mask credentials in a backend's form |
 | Peer Manager | `1` / `2` / `3` | Switch Sessions / Held messages / Messages outside filter editing |
 | Peer Manager | `/` | Edit the current view's filter; Enter keeps it, Esc clears it |
 | Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus, or move between This session's controls |
@@ -409,7 +416,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Environment, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel, Goal Panel
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Environment, Settings, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions, Autopilot Panel, Goal Panel
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

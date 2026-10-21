@@ -1499,6 +1499,7 @@ impl SpawnCtx {
         app.sandbox_live.readiness = self.sandbox_readiness.clone();
         app.sandbox_live.name = self.sandbox_name.clone();
         app.shell_env.target = self.shell_environment.clone();
+        app.settings.websearch = self.websearch.clone();
         app.sandbox_live.network_gate = self.network_gate.clone();
         app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();

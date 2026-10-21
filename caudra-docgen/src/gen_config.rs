@@ -534,7 +534,8 @@ fn write_websearch_section(out: &mut String) {
          settings from its own table below. A key left unset reads the variable in its Env \
          column, from Caudra's environment or the global `.env`, never a project `.env`. \
          Prefer `{{env:NAME}}` or `{{file:PATH}}` references over a credential written in the \
-         file. Edits apply at once while the terminal UI runs. See [Web search](/docs/web-search/).\n"
+         file. Edits apply at once while the terminal UI runs, and `/settings` edits them for \
+         you. See [Web search](/docs/web-search/).\n"
     )
     .unwrap();
     for backend in WebsearchBackendName::ALL {

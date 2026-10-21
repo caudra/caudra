@@ -59,6 +59,12 @@ Fallback can send a query to a backend you did not mean as your main one. When t
 
 `backends = []` turns `websearch` off, and so does `WORKCELL_WEBSEARCH_BACKEND=disabled`. `webfetch` keeps working either way.
 
+## Edit from Caudra
+
+`/settings` opens on the Web search tab. It lists every backend with whether it is ready and where its settings come from: the config, the environment, or nowhere. Check a backend with `Space` to use it, move it up or down with `[` and `]` to change its place in the order, and click a mode or press `m` to switch to it. `d` clears your list so the default applies again. Opening a backend with `Enter` shows a form for its settings. Credentials stay masked, and saving one as plain text asks first, as `/env` does. Caudra writes the global `caudra.toml` and keeps your comments.
+
+When Caudra runs its tools on a remote Workcell, the tab is read-only, since web tools run there.
+
 ## When changes apply
 
 While the terminal UI runs, a saved edit to `[websearch]` applies at once, in every open session, and so does a change to the global `.env` that one of its `{env:NAME}` references reads. The footer says which backends are now in use. A save that changes no setting keeps searches already waiting for your approval valid. One that changes a setting makes them fail, and the model searches again. Headless runs and ACP read the settings at startup. See [Hot reload](/docs/configuration/#hot-reload).

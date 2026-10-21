@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::components::{
     audit_log, automation_inspector, autopilot_panel, decisions_modal, env_modal, goal_panel,
-    workflow_inspector,
+    settings_modal, workflow_inspector,
 };
 
 /// Spelled once because three tables quote it.
@@ -337,6 +337,7 @@ pub mod key {
         label: "Space",
     };
     pub const REFRESH: Bind = ctrl_bind!('r');
+    pub const REVEAL: Bind = ctrl_bind!('r');
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const RECENT_HISTORY: Bind = ctrl_bind!('r');
     pub const OLDER_HISTORY: Bind = ctrl_bind!('o');
@@ -455,6 +456,7 @@ pub enum KeybindContext {
     FilePicker,
     StashPicker,
     EnvModal,
+    Settings,
     SessionPicker,
     SessionRelocation,
     WorktreePicker,
@@ -500,6 +502,7 @@ impl KeybindContext {
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
             Self::EnvModal => "Environment",
+            Self::Settings => "Settings",
             Self::SessionPicker => "Session Picker",
             Self::SessionRelocation => "Session Relocation",
             Self::WorktreePicker => "Worktree Picker",
@@ -544,6 +547,7 @@ impl KeybindContext {
             | Self::FilePicker
             | Self::StashPicker
             | Self::EnvModal
+            | Self::Settings
             | Self::SessionPicker
             | Self::SessionRelocation
             | Self::WorktreePicker
@@ -1654,6 +1658,44 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Tab"),
         description: "Switch between the Local and Sandbox tabs",
         context: KeybindContext::EnvModal,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Switch to the next or previous tab, or press its number",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single("Space"),
+        description: "Use the selected web search backend, or stop using it",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Alt(
+            settings_modal::MOVE_UP_LABEL,
+            settings_modal::MOVE_DOWN_LABEL,
+        ),
+        description: "Move the selected backend up or down the list",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::MODE_LABEL),
+        description: "Switch web search to its next mode",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Edit the selected backend's settings, or change the selected setting",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::RESET_LABEL),
+        description: "Leave the backends to the environment, or reset the selected setting",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::REVEAL.label),
+        description: "Show or mask credentials in a backend's form",
+        context: KeybindContext::Settings,
     },
     Keybind {
         label: KeyLabel::Multi(&["1", "2", "3"]),
