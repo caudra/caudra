@@ -387,7 +387,9 @@ mod tests {
     use super::{
         Outcome, Planned, UpgradableFile, UpgradeReport, plan, upgrade_global, upgrade_holding,
     };
-    use crate::migration::{Change, ConfigFormat, MigrationError, Step, Upgrade, read, test_stamp};
+    #[cfg(unix)]
+    use crate::migration::read;
+    use crate::migration::{Change, ConfigFormat, MigrationError, Step, Upgrade, test_stamp};
 
     const BEHIND_FILE: &str = "behind.toml";
     const UNSTAMPED_FILE: &str = "unstamped.toml";

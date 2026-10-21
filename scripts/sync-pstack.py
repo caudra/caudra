@@ -150,7 +150,9 @@ def sync(source: Path) -> int:
         print(
             f"PORT {name} changed upstream; update its Rust port in caudra-pstack/src/scripts"
         )
-    stale = stale_translations(entries) + untranslated_changes(previous["files"], entries)
+    stale = stale_translations(entries) + untranslated_changes(
+        previous["files"], entries
+    )
     for line in stale:
         print(line)
     print(f"Then run `{TERM_CHECK}`: it lists every page that still names Cursor.")
@@ -167,7 +169,9 @@ def stale_translations(entries: dict[str, str]) -> list[str]:
     lines = []
     for name, digest in sorted(recorded_translations().items()):
         if name not in entries:
-            lines.append(f"ORPHAN {name}: upstream removed it; delete or move the translation")
+            lines.append(
+                f"ORPHAN {name}: upstream removed it; delete or move the translation"
+            )
         elif entries[name] != digest:
             lines.append(
                 f"TRANSLATE {name}: upstream changed; see `git diff -- caudra-pstack/upstream/{name}`"
