@@ -294,21 +294,19 @@ pub(crate) fn render(
         };
         identity.extend(WrappedRows::new(vec![fact(label, value, t.tool)], 1, width).lines());
         let mut body = shell_facts(task, script);
-        if let Some(result) = &task.result {
-            if let Some(duration) = result.get("duration_ms").and_then(|value| value.as_u64()) {
-                body.push(fact(
-                    "Duration",
-                    &format_settled_duration(Duration::from_millis(duration)),
-                    t.tool,
-                ));
-            }
-            if let Some(tokens) = result.get("tokens_used").and_then(|value| value.as_u64()) {
-                body.push(fact(
-                    "Usage",
-                    &format!("{} tokens", format_compact(tokens)),
-                    t.tool,
-                ));
-            }
+        if let Some(duration) = task.duration() {
+            body.push(fact("Duration", &format_settled_duration(duration), t.tool));
+        }
+        if let Some(tokens) = task
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tokens_used")?.as_u64())
+        {
+            body.push(fact(
+                "Usage",
+                &format!("{} tokens", format_compact(tokens)),
+                t.tool,
+            ));
         }
         let mut body = WrappedRows::new(body, 0, width).lines();
         let mut body_links = LinkMap::none_for(&body);

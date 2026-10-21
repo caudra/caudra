@@ -149,6 +149,8 @@ const PEER_WORK_QUEUED_NOTE: &str =
     "Queued work waits for a member of its group to complete it; queued is not done.";
 const PEER_ASSIGNMENT_NOUN: &str = "assignment";
 const TASK_NOUN: &str = "task";
+/// Where a job's outcome records how long it ran.
+pub const TASK_DURATION_FIELD: &str = "duration_ms";
 const PEER_NO_ASSIGNMENTS: &str = "This session holds no work assignment.";
 const PEER_WORK_NOTICE: &str = "Work this session holds, then paused work it last owned. Report an outcome by work name; a paused item waits for a person, though you may still report it.";
 
@@ -1997,6 +1999,10 @@ pub struct TaskCard {
     pub reports: Vec<String>,
     #[serde(default)]
     pub reports_truncated: bool,
+    /// What the finished job measured, kept apart from `result`, which a
+    /// card can drop for size or strip for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 pub type TaskOutput = Vec<TaskCard>;
@@ -2004,6 +2010,14 @@ pub type TaskOutput = Vec<TaskCard>;
 impl TaskCard {
     pub fn active(&self) -> bool {
         matches!(self.state.as_str(), "queued" | "running" | "cancelling")
+    }
+
+    /// A card saved before `duration_ms` was its own field still has the
+    /// time in its result.
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration_ms
+            .or_else(|| self.result.as_ref()?.get(TASK_DURATION_FIELD)?.as_u64())
+            .map(Duration::from_millis)
     }
 
     pub fn model_value(&self) -> Value {
@@ -2230,11 +2244,17 @@ fn written_size(byte_count: usize, lines: &[String]) -> String {
 
 impl ToolOutput {
     /// How long the call took by its own measure, stored with the output so a restored card keeps
-    /// its clock: a command's own time, or a `code` run's wall time.
+    /// its clock: a command's own time, a `code` run's wall time, or a
+    /// background command's time once its job settles. An agent task's card
+    /// counts its own time in its tally, so it has none here.
     pub fn duration(&self) -> Option<Duration> {
         match self {
             Self::Shell(output) => Some(Duration::from_millis(output.duration_ms)),
             Self::Code(output) => output.duration_ms.map(Duration::from_millis),
+            Self::Tasks(cards) => match cards.as_slice() {
+                [card] if card.kind == JobKind::Shell => card.duration(),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -5313,6 +5333,21 @@ mod tests {
     #[test_case(ToolOutput::Plain("ok".into()), None ; "other_results_are_untimed")]
     fn a_result_keeps_how_long_its_call_took(output: ToolOutput, millis: Option<u64>) {
         assert_eq!(output.duration(), millis.map(Duration::from_millis));
+    }
+
+    #[test_case(JobKind::Shell, Some(RAN_FOR_MS) ; "a_settled_background_command_keeps_its_time")]
+    #[test_case(JobKind::Agent, None ; "an_agent_task_counts_time_in_its_tally")]
+    #[test_case(JobKind::Question, None ; "a_deferred_question_is_untimed")]
+    fn a_job_card_keeps_only_a_commands_time(kind: JobKind, millis: Option<u64>) {
+        let card = TaskCard {
+            kind,
+            duration_ms: Some(RAN_FOR_MS),
+            ..task(DONE_STATE)
+        };
+        assert_eq!(
+            ToolOutput::Tasks(vec![card]).duration(),
+            millis.map(Duration::from_millis)
+        );
     }
 
     #[test_case(Vec::new(), None ; "a_run_without_calls_reports_its_tokens_alone")]

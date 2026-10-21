@@ -1538,10 +1538,11 @@ fn child_annotation(
 /// child that started before the roster was being timed has no clock rather
 /// than a wrong one.
 fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Duration> {
+    if !keeps_clock(&entry.tool) {
+        return None;
+    }
     if entry.status == BatchToolStatus::Running {
-        return started
-            .filter(|_| keeps_clock(&entry.tool))
-            .map(|started| live_elapsed(*started));
+        return started.map(|started| live_elapsed(*started));
     }
     entry.output.as_ref().and_then(ToolOutput::duration)
 }

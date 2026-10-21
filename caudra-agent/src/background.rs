@@ -39,7 +39,7 @@ use crate::{
     },
     background_reminder::{RuntimeHealth, RuntimeSnapshot},
     tools::{Deadline, ToolContext, native::question},
-    types::{BACKGROUND_EVENT_RUN_ID, task_output_access},
+    types::{BACKGROUND_EVENT_RUN_ID, TASK_DURATION_FIELD, task_output_access},
 };
 
 const MAX_ACTIVE: usize = 32;
@@ -160,6 +160,14 @@ impl TaskCard {
             result_truncated: false,
             reports: Vec::new(),
             reports_truncated: false,
+            // An archived record keeps only a summary of its request, which
+            // carries the duration its dropped outcome measured.
+            duration_ms: record
+                .outcome
+                .as_ref()
+                .unwrap_or(&record.request)
+                .get(TASK_DURATION_FIELD)
+                .and_then(Value::as_u64),
         }
     }
 }
@@ -679,6 +687,10 @@ impl BackgroundTasks {
                         "label": record.request.get("label"),
                         "owner_call_id": record.request.get("owner_call_id"),
                         "owner_task_id": record.request.get("owner_task_id"),
+                        TASK_DURATION_FIELD: record
+                            .outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.get(TASK_DURATION_FIELD)),
                     });
                     record.history = Value::Null;
                     record.spec = Value::Null;
@@ -2373,8 +2385,8 @@ mod tests {
         ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, EMPTY_CONTINUATION,
         FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_HISTORY_PAGE, MAX_INVOCATIONS, MAX_REPORT_BYTES,
         MAX_REPORTS, MAX_RESULT_BYTES, RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION,
-        TASK_ASYNC, TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SETTLING, TASK_SYNC, TRANSITION,
-        TaskDelivery, TaskReporter, TaskStatus, ran_on,
+        TASK_ASYNC, TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SETTLING,
+        TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter, TaskStatus, ran_on,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -3134,6 +3146,18 @@ mod tests {
         assert_eq!(record.outcome, Some(output));
         let wire = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<TaskStatus>(&wire).unwrap(), status);
+    }
+
+    #[test_case(MAX_RESULT_BYTES ; "oversized")]
+    #[test_case(1 ; "complete")]
+    fn a_status_keeps_the_measured_duration_whatever_the_result_size(output_bytes: usize) {
+        const RAN_FOR_MS: u64 = 4_100;
+        let mut record = projection_record();
+        record.outcome = Some(json!({
+            "output": "x".repeat(output_bytes),
+            TASK_DURATION_FIELD: RAN_FOR_MS,
+        }));
+        assert_eq!(TaskStatus::from(&record).duration_ms, Some(RAN_FOR_MS));
     }
 
     #[test_case(false, false; "delayed_cancel_old_invocation")]

@@ -13,7 +13,7 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     AUTOPILOT_BODY_INDENT, DECISION_PREFIX, RenderCtx, ScrollTail, ToolLines, append_annotation,
     assistant_style, autopilot_style, build_instructions_lines, build_tool_lines, clock_ticks,
-    done_style, draws_live_script, error_style, keeps_clock, names_tool, notice_style,
+    done_style, draws_live_script, error_style, keeps_clock, names_tool, notice_style, shell_job,
     thinking_style, truncate_to_header, user_style,
 };
 use super::{
@@ -2264,6 +2264,7 @@ impl MessagesPanel {
         let call_id = card.call_id.clone();
         let active = card.active();
         let shell = card.kind == JobKind::Shell;
+        let background = card.background;
         let dependents: Vec<_> = self
             .messages
             .iter()
@@ -2278,6 +2279,7 @@ impl MessagesPanel {
             .collect();
         self.task_cards.insert(call_id.clone(), card);
         let parent = batch_child_id(&call_id);
+        let scale = self.token_scale;
         if !active {
             if shell {
                 self.live_bufs.remove(&call_id);
@@ -2287,6 +2289,16 @@ impl MessagesPanel {
                 } else if let Some(msg) = self.find_tool_msg_mut(&call_id) {
                     msg.live_output = None;
                     msg.render_snapshot = None;
+                    // The estimate the call started with is spent, and its
+                    // event to say so is dropped once the job is not running.
+                    // What is left is what a restored card reads. A foreground
+                    // call clears its own and has yet to land its result.
+                    if background {
+                        msg.annotation = msg
+                            .tool_output
+                            .as_deref()
+                            .and_then(|output| output.annotation(scale));
+                    }
                 }
             }
             if let Some((parent, index)) = parent {
@@ -5748,6 +5760,7 @@ impl MessagesPanel {
     fn refresh_live_progress(&mut self) {
         let progress = &self.batch_child_progress;
         let started = &self.batch_child_started;
+        let task_cards = &self.task_cards;
         let live: Vec<String> = self
             .messages
             .iter()
@@ -5761,7 +5774,13 @@ impl MessagesPanel {
                 // refreshed here cannot drift from the set whose clock moves.
                 // Every settled clocked call draws a clock too, and counting
                 // those rebuilt each one in the transcript on every frame.
-                let ticking = clock_ticks(msg, tool.status)
+                // A background command's card asks about the job the panel
+                // knows now, as the renderer's projection does.
+                let job = task_cards
+                    .get(&tool.id)
+                    .filter(|task| task.kind == JobKind::Shell)
+                    .or_else(|| shell_job(msg.tool_output.as_deref()));
+                let ticking = clock_ticks(msg, tool.status, job)
                     || msg.progress.as_ref().is_some_and(ToolProgress::is_live)
                     || progress
                         .get(&tool.id)

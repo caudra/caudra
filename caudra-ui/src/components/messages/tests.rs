@@ -8105,6 +8105,72 @@ fn a_settled_shell_card_swaps_the_live_clock_for_the_measured_one() {
     assert!(!text.contains(SHELL_LIVE_CLOCK), "{text}");
 }
 
+const RECEIPT_STATE: &str = "queued";
+const JOB_SUCCEEDED: &str = "succeeded";
+const SHELL_ETA: &str = "ETA ~40s";
+const JOB_RAN_FOR_MS: u64 = 4_100;
+const JOB_MEASURED_CLOCK: &str = "· 4.1s";
+const BACKGROUND_CLOCK_MSG: &str = "a background command's card keeps its clock running until the \
+                                    job settles, then reads the job's own time and state, with no \
+                                    estimate left over";
+
+/// The receipt settles the call at once, so the card is cached as settled
+/// and the clock reaches the screen only if the refresh asks about the job.
+#[test]
+fn a_background_shell_card_ticks_until_its_job_settles() {
+    let _clock = FrozenClock::at(Duration::ZERO);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(ToolStartEvent {
+        annotation: Some(SHELL_ETA.into()),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    let receipt = TaskCard {
+        state: RECEIPT_STATE.into(),
+        ..shell_job(TOOL_ID)
+    };
+    panel.tool_done(ToolDoneEvent {
+        output: ToolOutput::Tasks(vec![receipt.clone()]),
+        ..done(TOOL_ID)
+    });
+    panel.task_card_update(TaskCard {
+        state: LIVE_STATE.into(),
+        ..receipt.clone()
+    });
+    render(&mut panel, 120, 20);
+
+    let ticked = FrozenClock::at(SHELL_RAN_FOR);
+    let running = buffer_text(&render(&mut panel, 120, 20));
+    assert!(
+        running.contains(SHELL_LIVE_CLOCK),
+        "{BACKGROUND_CLOCK_MSG}: {running}"
+    );
+    assert!(running.contains(SHELL_ETA), "{running}");
+    assert!(!running.contains(RECEIPT_STATE), "{running}");
+    drop(ticked);
+
+    panel.task_card_update(TaskCard {
+        state: JOB_SUCCEEDED.into(),
+        duration_ms: Some(JOB_RAN_FOR_MS),
+        ..receipt
+    });
+    let settled = buffer_text(&render(&mut panel, 120, 20));
+    assert!(
+        settled.contains(JOB_MEASURED_CLOCK),
+        "{BACKGROUND_CLOCK_MSG}: {settled}"
+    );
+    assert!(settled.contains(JOB_SUCCEEDED), "{settled}");
+    for stale in [SHELL_LIVE_CLOCK, SHELL_ETA, RECEIPT_STATE] {
+        assert!(
+            !settled.contains(stale),
+            "{BACKGROUND_CLOCK_MSG}: {settled}"
+        );
+    }
+    assert!(
+        !panel.has_in_progress(),
+        "a settled job owes no repaint as time passes"
+    );
+}
+
 /// Written into a settled shell's output behind its cached card, so the card
 /// draws it only if something rebuilds the card.
 const RESTAMPED_DURATION_MS: u64 = 20;

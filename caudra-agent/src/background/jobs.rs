@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES, STALE_INVOCATION, State, TRANSITION, TaskHistoryPage, bounded, deliverable,
-    shells::ShellExecutions,
+    MAX_RESULT_BYTES, STALE_INVOCATION, State, TASK_DURATION_FIELD, TRANSITION, TaskHistoryPage,
+    bounded, deliverable, shells::ShellExecutions,
 };
 use crate::{
     CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
@@ -697,7 +697,7 @@ impl JobScope {
             JobKind::Question => QUESTION_OUTCOME_FIELD,
             JobKind::Agent | JobKind::Shell => SHELL_OUTCOME_FIELD,
         };
-        let mut outcome = json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "is_error": done.is_error, "duration_ms": done.accounting.duration_ms, "outcome": done.accounting.outcome});
+        let mut outcome = json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "is_error": done.is_error, TASK_DURATION_FIELD: done.accounting.duration_ms, "outcome": done.accounting.outcome});
         outcome[output_field] = json!(done.output);
         record.outcome = Some(outcome);
         let suppressed = self.current().is_err();
@@ -1152,6 +1152,50 @@ mod tests {
             drop(restored.archive_settled(gate, None).await.unwrap());
             assert!(restored.lock().records.is_empty());
             assert_archive_count(&restored, count + 1).await;
+        });
+    }
+
+    /// A settled command's record is archived without its outcome, so the
+    /// card the panel is handed afterwards, live or after a resume, must
+    /// still carry the time the command took.
+    #[test]
+    fn an_archived_shell_keeps_its_measured_duration() {
+        const RAN_FOR_MS: u64 = 4_100;
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let card = scope
+                .admit_shell(metadata(), &fixture.history, |_, _| async {
+                    let mut done = done();
+                    done.accounting.duration_ms = RAN_FOR_MS;
+                    done
+                })
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            scope.settle_launches(&[receipt()]).await.unwrap();
+            let messages = scope.claim_messages().unwrap();
+            fixture
+                .session
+                .replace_messages(History::new(messages.clone()).into_items());
+            fixture.session.save(&fixture.dir).unwrap();
+            scope.accept_messages(&messages).await.unwrap();
+            assert!(fixture.tasks.lock().records.is_empty());
+            let listed = |tasks: &BackgroundTasks| {
+                tasks
+                    .list()
+                    .into_iter()
+                    .find(|listed| listed.task_id == card.task_id)
+                    .unwrap()
+                    .duration_ms
+            };
+            assert_eq!(listed(&fixture.tasks), Some(RAN_FOR_MS));
+            fixture.tasks.shutdown().await.unwrap();
+            let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            assert_eq!(listed(&restored), Some(RAN_FOR_MS));
+            restored.shutdown().await.unwrap();
         });
     }
 

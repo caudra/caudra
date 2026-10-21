@@ -2979,23 +2979,50 @@ pub(super) fn keeps_clock(tool_name: &str) -> bool {
 /// it and so can step down slightly on settle.
 ///
 /// That duration is persisted with the output, so the card reads the same
-/// restored as it did live. The running branch has to ask the tool's name;
-/// the settled one does not, because only a clocked tool measures one.
-fn call_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
-    if status == ToolStatus::InProgress {
-        return msg
-            .tool_started
-            .filter(|_| keeps_clock(msg.role.tool_name().unwrap_or_default()))
-            .map(live_elapsed);
+/// restored as it did live. Both ask the tool's name: a status call about a
+/// background command carries the command's time, which is not its own.
+///
+/// `job` is the command a background call handed off, as it stands now. Its
+/// call settled on the receipt, but the clock runs until the job does.
+fn call_elapsed(
+    msg: &DisplayMessage,
+    status: ToolStatus,
+    job: Option<&TaskCard>,
+) -> Option<Duration> {
+    if !keeps_clock(msg.role.tool_name().unwrap_or_default()) {
+        return None;
+    }
+    if runs_clock(status, job) {
+        return msg.tool_started.map(live_elapsed);
     }
     msg.tool_output.as_deref().and_then(ToolOutput::duration)
+}
+
+fn runs_clock(status: ToolStatus, job: Option<&TaskCard>) -> bool {
+    status == ToolStatus::InProgress || job.is_some_and(TaskCard::active)
 }
 
 /// Whether [`call_elapsed`] reads the wall clock for this card. A settled
 /// call draws its measured duration, which never moves, so only a running
 /// one owes a repaint as time passes.
-pub(super) fn clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> bool {
-    status == ToolStatus::InProgress && call_elapsed(msg, status).is_some()
+pub(super) fn clock_ticks(
+    msg: &DisplayMessage,
+    status: ToolStatus,
+    job: Option<&TaskCard>,
+) -> bool {
+    runs_clock(status, job) && call_elapsed(msg, status, job).is_some()
+}
+
+/// The one shell job a call's output stands for: a background command's
+/// receipt, or a status call about it.
+pub(super) fn shell_job(output: Option<&ToolOutput>) -> Option<&TaskCard> {
+    match output? {
+        ToolOutput::Tasks(tasks) => match tasks.as_slice() {
+            [task] if task.kind == JobKind::Shell => Some(task),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// What the header says in parentheses: how much work the call has done, then
@@ -3005,22 +3032,31 @@ pub(super) fn clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> bool {
 /// counting past its last report and a stored string would show it stopped.
 /// The card is rebuilt every frame for the spinner, so this is measured as
 /// often as it is drawn.
-/// An open task card names its one task's state in its body, so its header
-/// leaves out the state its folded row carries. `model` is the subagent's,
-/// which follows the tally on a running and a settled card alike.
-fn header_annotation(msg: &DisplayMessage, open: bool, model: Option<&str>) -> Option<String> {
+/// A task card's annotation was written when its receipt landed, so the state
+/// it names is `receipt_state`, which the job has since moved on from. A
+/// folded row says the state the job is in now; an open card names it in its
+/// body, so its header leaves it out. `model` is the subagent's, which follows
+/// the tally on a running and a settled card alike.
+fn header_annotation(
+    msg: &DisplayMessage,
+    receipt_state: Option<&str>,
+    open: bool,
+    model: Option<&str>,
+) -> Option<String> {
     let tally = msg
         .progress
         .as_ref()
         .map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
     let own = match msg.tool_output.as_deref() {
         Some(ToolOutput::Peers(output)) => Some(output.annotation()),
-        Some(ToolOutput::Tasks(tasks)) if open => {
-            match (tasks.as_slice(), msg.annotation.as_deref()) {
-                ([task], Some(annotation)) => without_state(annotation, &task.state),
-                (_, annotation) => annotation.map(str::to_owned),
-            }
-        }
+        Some(ToolOutput::Tasks(tasks)) => match (tasks.as_slice(), msg.annotation.as_deref()) {
+            ([task], Some(annotation)) => restated(
+                annotation,
+                receipt_state.unwrap_or(&task.state),
+                (!open).then_some(task.state.as_str()),
+            ),
+            (_, annotation) => annotation.map(str::to_owned),
+        },
         _ => msg.annotation.clone(),
     };
     subagent_annotation(tally, model, own)
@@ -3041,15 +3077,22 @@ pub(super) fn subagent_annotation(
         .reduce(|joined, part| format!("{joined}{ACTIVITY_SEPARATOR}{part}"))
 }
 
-/// An open task card draws its state among its facts, so the header keeps only
-/// what follows it, such as what the answer costs the context.
-fn without_state(annotation: &str, state: &str) -> Option<String> {
-    let rest = match annotation.strip_prefix(state) {
-        Some("") => return None,
-        Some(rest) => rest.strip_prefix(ACTIVITY_SEPARATOR),
-        None => None,
-    };
-    Some(rest.unwrap_or(annotation).to_owned())
+/// The annotation with its part that names `stale` replaced by `current`, or
+/// dropped without one, keeping what surrounds it: an estimate before it, what
+/// the answer costs the context after it.
+fn restated(annotation: &str, stale: &str, current: Option<&str>) -> Option<String> {
+    let mut found = false;
+    let parts: Vec<&str> = annotation
+        .split(ACTIVITY_SEPARATOR)
+        .filter_map(|part| match part == stale && !found {
+            true => {
+                found = true;
+                current
+            }
+            false => Some(part),
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(ACTIVITY_SEPARATOR))
 }
 
 /// `expansion` is `None` on a compact row the reader has not opened, which is
@@ -3081,7 +3124,15 @@ pub fn build_tool_lines(
             truncate_to_header(&mut projected.text);
             projected
         });
+    let receipt_state = match msg.tool_output.as_deref() {
+        Some(ToolOutput::Tasks(tasks)) => match tasks.as_slice() {
+            [task] => Some(task.state.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
     let msg = projected.as_ref().unwrap_or(msg);
+    let job = shell_job(msg.tool_output.as_deref());
     let tool_name = msg.role.tool_name().unwrap_or("?");
     let (mut header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
@@ -3122,7 +3173,7 @@ pub fn build_tool_lines(
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
     let model = rctx.subagent_models.cards.get(call_id).map(String::as_str);
-    let mut report = header_annotation(msg, expansion.is_some(), model);
+    let mut report = header_annotation(msg, receipt_state, expansion.is_some(), model);
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
         append_annotation(&mut report, &timeout_annotation(timeout));
     }
@@ -3166,7 +3217,7 @@ pub fn build_tool_lines(
         );
         b.prepend_indicator(rctx.started_at);
     }
-    if let Some(elapsed) = call_elapsed(msg, status) {
+    if let Some(elapsed) = call_elapsed(msg, status, job) {
         b.append_duration(elapsed);
     }
     let progress_body = msg
@@ -3371,6 +3422,7 @@ fn project_task_output(
                 task.state = card.state.clone();
                 task.background = card.background;
                 task.updated_at = card.updated_at;
+                task.duration_ms = card.duration_ms;
             }
             let current = projected.as_ref().map_or(task, |tasks| &tasks[index]);
             let live = if task.call_id == call_id {
@@ -6738,6 +6790,104 @@ mod tests {
         assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
     }
 
+    const RECEIPT_STATE: &str = "queued";
+    const JOB_RUNNING: &str = "running";
+    const JOB_SUCCEEDED: &str = "succeeded";
+    const SHELL_ETA: &str = "ETA ~40s";
+    const JOB_RAN_FOR_MS: u64 = 4_100;
+    const JOB_CLOCK_MSG: &str = "a background command's clock runs until its job settles, then \
+                                 reads the time the job measured";
+    const JOB_STATE_MSG: &str = "a folded background command names the state its job is in now, \
+                                 an open one leaves it to the body, and neither says the receipt's";
+
+    fn shell_receipt() -> TaskCard {
+        serde_json::from_value(serde_json::json!({
+            "kind": "shell", "task_id": "shell-task", "invocation_id": "invocation",
+            "call_id": "t1", "root_call_id": "t1", "label": "cargo test", "state": RECEIPT_STATE,
+            "mode": "build", "background": true, "generation": 1, "created_at": 1, "updated_at": 1,
+        }))
+        .unwrap()
+    }
+
+    /// The header of a background command whose receipt landed with an
+    /// estimate, drawn against the job as the panel knows it now.
+    fn background_shell_header(job: TaskCard, open: bool) -> String {
+        let mut msg = clocked_call(
+            SHELL_TOOL_NAME,
+            ToolStatus::Success,
+            Some(ToolOutput::Tasks(vec![shell_receipt()])),
+            true,
+        );
+        msg.annotation = Some(format!("{SHELL_ETA}{ACTIVITY_SEPARATOR}{RECEIPT_STATE}"));
+        let cards = HashMap::from([(job.call_id.clone(), job)]);
+        let rctx = RenderCtx {
+            task_cards: Some(&cards),
+            ..test_rctx(120)
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &rctx,
+            open.then(Disclosure::default),
+        );
+        line_text(&tl.lines[0])
+    }
+
+    #[test_case(JOB_RUNNING, None, LIVE_CLOCK.to_owned(), false ; "running_folded")]
+    #[test_case(JOB_RUNNING, None, LIVE_CLOCK.to_owned(), true ; "running_open")]
+    #[test_case(JOB_SUCCEEDED, Some(JOB_RAN_FOR_MS), format!("{DURATION_SEPARATOR}{}", format_settled_duration(Duration::from_millis(JOB_RAN_FOR_MS))), false ; "settled_folded")]
+    #[test_case(JOB_SUCCEEDED, Some(JOB_RAN_FOR_MS), format!("{DURATION_SEPARATOR}{}", format_settled_duration(Duration::from_millis(JOB_RAN_FOR_MS))), true ; "settled_open")]
+    fn a_background_command_header_follows_its_job(
+        state: &str,
+        duration_ms: Option<u64>,
+        clock: String,
+        open: bool,
+    ) {
+        let _clock = FrozenClock::at(SHELL_RAN_FOR);
+        let job = TaskCard {
+            state: state.into(),
+            duration_ms,
+            ..shell_receipt()
+        };
+        let header = background_shell_header(job, open);
+
+        assert!(header.ends_with(&clock), "{JOB_CLOCK_MSG}: {header}");
+        assert!(header.contains(SHELL_ETA), "{header}");
+        assert_eq!(header.contains(state), !open, "{JOB_STATE_MSG}: {header}");
+        assert!(!header.contains(RECEIPT_STATE), "{JOB_STATE_MSG}: {header}");
+    }
+
+    #[test]
+    fn a_restored_receipt_without_its_job_draws_no_clock() {
+        let msg = clocked_call(
+            SHELL_TOOL_NAME,
+            ToolStatus::Success,
+            Some(ToolOutput::Tasks(vec![shell_receipt()])),
+            false,
+        );
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
+
+        assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
+    }
+
+    #[test]
+    fn a_status_call_does_not_wear_the_commands_time() {
+        let mut msg = clocked_call(
+            TASK_CONTROL_TOOL_NAME,
+            ToolStatus::Success,
+            Some(ToolOutput::Tasks(vec![TaskCard {
+                state: JOB_SUCCEEDED.into(),
+                duration_ms: Some(JOB_RAN_FOR_MS),
+                ..shell_receipt()
+            }])),
+            true,
+        );
+        msg.text = JOB_SUCCEEDED.into();
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
+
+        assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
+    }
+
     fn code_child() -> BatchToolEntry {
         BatchToolEntry {
             tool: FILE_READ_TOOL_NAME.into(),
@@ -7894,13 +8044,28 @@ mod tests {
 
     #[test_case("completed", None ; "a_bare_state_leaves_nothing")]
     #[test_case("completed · ~1.2k tokens", Some("~1.2k tokens") ; "the_cost_stays")]
+    #[test_case("ETA ~40s · completed", Some("ETA ~40s") ; "the_estimate_stays")]
     #[test_case("completedness", Some("completedness") ; "a_longer_word_is_not_the_state")]
     #[test_case("2 tasks", Some("2 tasks") ; "a_listing_keeps_its_count")]
     fn an_open_task_header_drops_its_state(annotation: &str, expected: Option<&str>) {
         assert_eq!(
-            without_state(annotation, "completed").as_deref(),
+            restated(annotation, "completed", None).as_deref(),
             expected,
             "{STATE_ONCE_MSG}"
+        );
+    }
+
+    const STATE_NOW_MSG: &str = "a folded task row says the state its job is in now, not the \
+                                 one its receipt landed with";
+
+    #[test_case("queued", "succeeded" ; "a_bare_state")]
+    #[test_case("ETA ~40s · queued", "ETA ~40s · succeeded" ; "after_the_estimate")]
+    #[test_case("queued · ~1.2k tokens", "succeeded · ~1.2k tokens" ; "before_the_cost")]
+    fn a_folded_task_header_says_its_current_state(annotation: &str, expected: &str) {
+        assert_eq!(
+            restated(annotation, "queued", Some("succeeded")).as_deref(),
+            Some(expected),
+            "{STATE_NOW_MSG}"
         );
     }
 

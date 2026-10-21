@@ -1189,6 +1189,7 @@ mod tests {
             result_truncated: false,
             reports: Vec::new(),
             reports_truncated: false,
+            duration_ms: None,
         }
     }
 
