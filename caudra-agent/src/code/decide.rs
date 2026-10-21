@@ -6,8 +6,8 @@ use caudra_decision::DecisionError;
 use caudra_workflow::DecisionRequest;
 use caudra_workflow::decision::{
     MAX_RERANK_BATCH, PROBABILITY, RERANK_CANDIDATES_TYPE, RERANK_QUERY_TYPE,
-    RERANK_THRESHOLD_RANGE, RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, decide_label, ranked, rerank_batches,
-    rerank_label, rerank_scores,
+    RERANK_THRESHOLD_RANGE, RERANK_TOP_K_TYPE, RerankRequest, ScriptQuestions, decide_label,
+    ranked, rerank_batches, rerank_label, rerank_scores,
 };
 use serde_json::{Map, Value, json};
 
@@ -36,7 +36,7 @@ For good answers:\n\
 - Describe each choice or level by what sets it apart.\n\
 - Write `query` as the need, not keywords, and pass short labels as candidates. `index` maps back to the full item.\n\
 - Act on about 0.85 or more; below 0.6 is a guess.\n\
-- `decide` judges `input` as one item: call it once per item. A local engine queues overlapping calls, and each waits only `timeout_ms` (800 by default), so raise it to `gather` many.\n\
+- `decide` judges `input` as one item: call it once per item. A local engine queues overlapping calls, each waiting only `timeout_ms` (10 s by default), so raise it to `gather` many.\n\
 Examples: `await decisions.decide({\"body\": b}, [{\"type\": \"score\", \"name\": \"severity\", \"instructions\": \"How severe is the bug `body` reports?\", \"levels\": [\"cosmetic\", {\"label\": \"blocking\", \"description\": \"no workaround\"}]}])`, `await decisions.rerank(\"issues reporting a crash at startup\", titles, top_k=10)`.";
 
 pub static DOC: ModuleDoc = ModuleDoc {

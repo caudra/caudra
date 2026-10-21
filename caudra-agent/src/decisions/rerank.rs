@@ -2,8 +2,8 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, Question, QuestionSet, QuestionType, Questions};
 use caudra_decision::wire::MAX_QUESTIONS;
+use caudra_decision::{Answer, Question, QuestionSet, QuestionType, Questions};
 use caudra_storage::decision_log::DecisionEffect;
 use serde_json::{Value, json};
 

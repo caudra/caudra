@@ -393,8 +393,8 @@ mod tests {
 
     use super::{
         EXCERPT_KEY, LINE_BREAK, MAX_POINTERS, MAX_WINDOWS, MIN_WINDOW_LINES, OPEN_TODOS_KEY,
-        OmittedOutput,
-        POINTED_NOWHERE, REQUEST_KEY, output_focus, pointer, pointer_lines, windows, words,
+        OmittedOutput, POINTED_NOWHERE, REQUEST_KEY, output_focus, pointer, pointer_lines, windows,
+        words,
     };
     use crate::CancelToken;
     use crate::decisions::{

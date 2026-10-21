@@ -991,7 +991,7 @@ version = 3
 # execution timeouts. Tool search and every reranking feature except memory
 # recall use `rerank_timeout_ms` instead.
 # Type: integer.
-# timeout_ms = 800
+# timeout_ms = 10000
 
 # Positive deadline in milliseconds for tool search and the reranking features,
 # per 16 candidates a request judges. A request holds up to 64, so a full one

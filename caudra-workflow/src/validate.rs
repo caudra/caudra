@@ -203,11 +203,11 @@ pub fn validate(source: &str) -> Result<ValidationReport, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::MAX_RERANK_BATCH;
     use crate::{
         DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE, REVIEW_CHANGES_NAME, REVIEW_CHANGES_SOURCE,
         ROOT_CAUSE_NAME, ROOT_CAUSE_SOURCE,
     };
-    use crate::decision::MAX_RERANK_BATCH;
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
     const RERANK_CANDIDATES: usize = MAX_RERANK_BATCH + 1;

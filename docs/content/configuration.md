@@ -761,7 +761,7 @@ These settings are global-only. Projects may set individual features to `"off"`,
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
+| `timeout_ms` | integer | `10000` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. Tool search and every reranking feature except memory recall use `rerank_timeout_ms` instead. |
 | `rerank_timeout_ms` | integer | `3000` | Positive deadline in milliseconds for tool search and the reranking features, per 16 candidates a request judges. A request holds up to 64, so a full one waits up to four budgets. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or a `code` snippet may ask for up to the larger of the two. |
 | `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
@@ -770,7 +770,7 @@ These settings are global-only. Projects may set individual features to `"off"`,
 
 Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, so workflows and MCP snippets read the same answers under either protocol. A refusal fails the whole evaluation without applying partial answers.
 
-Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past the request deadline, so under the default 800 ms `timeout_ms` most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
+Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past the request deadline, so under the default 10000 ms `timeout_ms` most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
 
 Tool search and the [reranking features](#reranking) judge up to 64 candidates in one request and use `rerank_timeout_ms` (default 3000 ms) for every 16 of them instead. Memory recall keeps `timeout_ms` because it delays the start of a turn. A `decide()` or `rerank()` call from a workflow or an MCP snippet may ask for up to the larger of the two.
 

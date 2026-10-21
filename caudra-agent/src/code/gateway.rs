@@ -1644,6 +1644,7 @@ mod tests {
     const DECISION_MODEL: &str = "mcp-decision-model";
     const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
     const EXPLICIT_TIMEOUT_MS: u64 = 100;
+    const SCHEDULING_SLACK_MS: u64 = 1_000;
     const RELEVANT: &str = "parser";
     const RELEVANT_SCORE: f64 = 0.9;
     const UNRELATED_SCORE: f64 = 0.1;
@@ -1844,9 +1845,12 @@ mod tests {
         );
     }
 
-    /// A batch of 16 outlasts one decision, so a rerank without a timeout gets the rerank
-    /// budget rather than the shorter decision deadline, and an explicit timeout still wins.
-    #[test_case(None, |budget| budget > Duration::from_millis(DecisionsConfig::default().timeout_ms) ; "rerank_budget_by_default")]
+    /// A rerank without a timeout waits one rerank budget per 16 candidates rather than the
+    /// decision deadline, and an explicit timeout still wins.
+    #[test_case(None, |budget| {
+        let rerank = Duration::from_millis(DecisionsConfig::default().rerank_timeout_ms);
+        budget <= rerank && budget > rerank - Duration::from_millis(SCHEDULING_SLACK_MS)
+    } ; "rerank_budget_by_default")]
     #[test_case(Some(EXPLICIT_TIMEOUT_MS), |budget| budget <= Duration::from_millis(EXPLICIT_TIMEOUT_MS) ; "explicit_timeout")]
     fn rerank_waits_for_the_rerank_budget(timeout_ms: Option<u64>, fits: fn(Duration) -> bool) {
         let engine = TypedEngine::default();
