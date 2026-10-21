@@ -33,7 +33,7 @@ Pages that render with JavaScript may need `webfetch` with `format: "text"`, or 
 
 ## Survey
 
-1. Run `make model-watch ARGS='-- --since <YYYY-MM-DD>'`. It prints new models released since that date, deprecated models, changed prices and limits, table models that models.dev does not list, and stale acceptances.
+1. Run `make model-watch ARGS='-- --since <YYYY-MM-DD>'`. It prints new models released since that date, older models no table names, deprecated models, changed prices and limits, table models that models.dev does not list, and stale acceptances. An older model is a finding like a new one: add it, or accept its omission as an `ACCEPTED` row with `Field::Unlisted`, the catalog id, and its release date as printed. Leaving it unsettled reports it again every run.
 2. Read every source above for entries since the same date. A release the catalog has not picked up yet still counts.
 3. Write `target/model-watch/<run date>.md`:
    - A table with one row per finding: kind (new, deprecated, retired, price, limit, default, thinking), provider, model, ours, theirs, the source URL, and `apply`, `due <date>`, or `unconfirmed`.

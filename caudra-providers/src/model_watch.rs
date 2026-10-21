@@ -39,6 +39,8 @@ const NOT_LISTED: &str = "-";
 const NO_TIERS: &str = "none";
 const TIER_SEPARATOR: &str = "; ";
 const NO_DIFFERENCES: &str = "No differences.";
+const NEW_MODELS_HEADING: &str = "## New models\n";
+const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `ACCEPTED` as `Field::Unlisted` with the reason.\n";
 const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
 const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
 const XAI_LONG_PROMPT: &str = "xAI bills a prompt of 200,000 tokens or more at the long-context rate (docs.x.ai/developers/models), and a tier's `above` is exclusive, so the table's sits at 199,999.";
@@ -244,8 +246,10 @@ pub fn fetch_catalog() -> Result<String, AgentError> {
 }
 
 /// Every divergence between the built-in tables and `catalog_json`, minus
-/// [`ACCEPTED`]. Prices are compared as they stand on `today`, and only models
-/// released on or after `since` count as new.
+/// [`ACCEPTED`]. Prices are compared as they stand on `today`. Every model no
+/// table names reports, whenever it was released: a run's window only moves
+/// forward, so one released before the first run would otherwise never show.
+/// The report lists those released before `since` apart from the new ones.
 pub fn audit(catalog_json: &str, today: Date, since: Date) -> Result<Audit, serde_json::Error> {
     audit_with(catalog_json, today, since, ACCEPTED)
 }
@@ -257,7 +261,6 @@ fn audit_with(
     accepted: &'static [Accepted],
 ) -> Result<Audit, serde_json::Error> {
     let catalog = parse(catalog_json)?;
-    let since_text = since.to_string();
     let mut seen = HashSet::new();
     let raw: Vec<Finding> = ManifestRegistry::builtins()
         .iter()
@@ -268,7 +271,7 @@ fn audit_with(
             let listed = catalog.get(slug);
             let mut findings = table_findings(manifest, listed, today);
             if NEW_MODELS_FROM.contains(&slug) {
-                findings.extend(new_models(manifest, listed, &since_text));
+                findings.extend(unlisted_models(manifest, listed));
             }
             findings
         })
@@ -433,17 +436,16 @@ fn entry_findings(
     findings
 }
 
-fn new_models(
+fn unlisted_models(
     manifest: &'static ProviderManifest,
     listed: Option<&HashMap<String, CatalogEntry>>,
-    since: &str,
 ) -> Vec<Finding> {
     let Some(models) = listed else {
         return Vec::new();
     };
     let mut findings: Vec<Finding> = models
         .iter()
-        .filter(|(_, entry)| is_new_tool_model(&entry.listing, since))
+        .filter(|(_, entry)| is_live_tool_model(&entry.listing))
         .filter(|(id, _)| !covered(manifest.models, id))
         .map(|(id, entry)| Finding {
             provider: manifest.slug,
@@ -461,14 +463,13 @@ fn new_models(
     findings
 }
 
-fn is_new_tool_model(listing: &Listing, since: &str) -> bool {
+fn is_live_tool_model(listing: &Listing) -> bool {
     listing.tool_call
         && listing.status.as_deref() != Some(DEPRECATED)
         && listing
             .modalities
             .as_ref()
             .is_some_and(|modalities| modalities.output.iter().any(|kind| kind == TEXT_OUTPUT))
-        && listing.release_date.as_str() >= since
 }
 
 /// Whether a table already serves `id`, as one of its prefixes or a dated
@@ -566,12 +567,19 @@ impl fmt::Display for Audit {
         if self.findings.is_empty() && self.stale.is_empty() {
             return writeln!(f, "{NO_DIFFERENCES}");
         }
-        let new = self.section(&[Field::Unlisted]);
-        if !new.is_empty() {
-            writeln!(f, "## New models\n")?;
+        let since = self.since.to_string();
+        let (new, older): (Vec<&Finding>, Vec<&Finding>) = self
+            .section(&[Field::Unlisted])
+            .into_iter()
+            .partition(|finding| finding.catalog >= since);
+        for (heading, rows) in [(NEW_MODELS_HEADING, new), (OLDER_MODELS_HEADING, older)] {
+            if rows.is_empty() {
+                continue;
+            }
+            writeln!(f, "{heading}")?;
             writeln!(f, "| Provider | Model | Released | Resolves to today |")?;
             writeln!(f, "|---|---|---|---|")?;
-            for finding in new {
+            for finding in rows {
                 writeln!(
                     f,
                     "| {} | `{}` | {} | {} |",
@@ -671,6 +679,7 @@ mod tests {
     const NOVEL: &str = "claude-novel-1";
     const RELEASED: &str = "2026-09-01";
     const RELEASED_BEFORE_SINCE: &str = "2026-06-30";
+    const SECTION_START: &str = "\n## ";
     const LISTED_RELEASE: &str = "2025-11-24";
     const IMAGE_OUTPUT: &str = "image";
     const CHANGED_RATE: f64 = 99.0;
@@ -868,13 +877,12 @@ mod tests {
         );
     }
 
-    #[test_case(false, TEXT_OUTPUT, RELEASED ; "without_tools")]
-    #[test_case(true, IMAGE_OUTPUT, RELEASED ; "without_text_output")]
-    #[test_case(true, TEXT_OUTPUT, RELEASED_BEFORE_SINCE ; "released_before_since")]
-    fn a_catalog_id_outside_the_scope_is_not_new(tool_call: bool, output: &str, released: &str) {
+    #[test_case(false, TEXT_OUTPUT ; "without_tools")]
+    #[test_case(true, IMAGE_OUTPUT ; "without_text_output")]
+    fn a_catalog_id_outside_the_scope_is_not_new(tool_call: bool, output: &str) {
         let json = catalog(
             PROVIDER,
-            serde_json::json!({ NOVEL: new_model(tool_call, output, released) }),
+            serde_json::json!({ NOVEL: new_model(tool_call, output, RELEASED) }),
         );
         let audit = audit_with(&json, TODAY, SINCE, &[]).unwrap();
         assert_eq!(
@@ -882,6 +890,30 @@ mod tests {
             Vec::<Field>::new(),
             "{SKIPPED}"
         );
+    }
+
+    /// A run's window only moves forward, so a model released before the
+    /// first one has to report too, or no run ever sees it.
+    #[test_case(RELEASED, NEW_MODELS_HEADING ; "released_in_the_window")]
+    #[test_case(RELEASED_BEFORE_SINCE, OLDER_MODELS_HEADING ; "released_before_the_window")]
+    fn an_unlisted_model_reports_under_its_release(released: &str, heading: &str) {
+        let json = catalog(
+            PROVIDER,
+            serde_json::json!({ NOVEL: new_model(true, TEXT_OUTPUT, released) }),
+        );
+        let audit = audit_with(&json, TODAY, SINCE, &[]).unwrap();
+        assert_eq!(
+            fields_of(&audit, PROVIDER, NOVEL),
+            vec![Field::Unlisted],
+            "{REPORTED}"
+        );
+        let report = audit.to_string();
+        let section = report
+            .split(heading)
+            .nth(1)
+            .and_then(|rest| rest.split(SECTION_START).next())
+            .expect(REPORTED);
+        assert!(section.contains(NOVEL), "{REPORTED}");
     }
 
     #[test_case("claude-opus-4-1-20250805", "claude-opus-4-1" => true ; "compact_date")]
