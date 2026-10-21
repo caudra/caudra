@@ -92,6 +92,13 @@
                 "string",
                 "null"
               ]
+            },
+            "fallbacks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/WebsearchFallback"
+              },
+              "description": "Backends tried before the one that answered, or every backend when all failed."
             }
           },
           "required": [
@@ -151,6 +158,21 @@
                 "title",
                 "url",
                 "snippet"
+              ]
+            },
+            "WebsearchFallback": {
+              "type": "object",
+              "properties": {
+                "backend": {
+                  "$ref": "#/definitions/WebsearchBackend"
+                },
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "backend",
+                "error"
               ]
             }
           }

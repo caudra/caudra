@@ -72,6 +72,7 @@ pub(crate) mod search_modal;
 pub(crate) mod section_tabs;
 pub(crate) mod session_picker;
 pub(crate) mod session_relocation;
+pub(crate) mod settings_modal;
 pub(crate) mod shell_modal;
 pub(crate) mod skills_modal;
 pub(crate) mod split_layout;

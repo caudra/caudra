@@ -1501,6 +1501,9 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let init_logging_ms = lap();
     cli.startup.upgrade.log();
     let mut config_notices = cli.startup.upgrade_notices();
+    if let Some(host) = workcell_runtime.local_host() {
+        config_notices.extend(host.websearch().apply(&stack.config.websearch).warnings());
+    }
     let mut notified_project_files = HashSet::new();
     if !workcell_runtime.is_remote() {
         config_notices.extend(project_notices(&cwd, &mut notified_project_files));
@@ -1709,6 +1712,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut launch_autopilot = std::mem::take(&mut cli.autopilot);
 
     loop {
+        if let Some(host) = workcell_runtime.local_host() {
+            let applied = host.websearch().apply(&stack.config.websearch);
+            if applied.changed {
+                warnings.extend(applied.warnings());
+            }
+        }
         let runtime_cwd = if workcell_runtime.is_remote() {
             cwd.clone()
         } else {
@@ -1888,6 +1897,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 worktrees: worktrees.clone(),
                 host_workspaces,
                 workspace_session: workcell_runtime.workspace_session().cloned(),
+                websearch: workcell_runtime.local_host().map(|host| host.websearch()),
                 remote_project_context: workcell_runtime.remote_project_context().cloned(),
                 local_documents: workcell_runtime.local_documents().cloned(),
             },

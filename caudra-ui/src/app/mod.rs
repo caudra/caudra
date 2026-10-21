@@ -29,6 +29,7 @@ mod sandbox;
 mod search;
 mod session;
 pub(crate) mod session_state;
+mod settings;
 pub(crate) mod shell;
 mod shells;
 mod stash;
@@ -58,6 +59,7 @@ use crate::agent::SharedMode;
 use crate::agent::ToolsPreviewSource;
 use crate::app::decisions::decision_choices;
 use crate::app::env::ShellEnvLink;
+use crate::app::settings::SettingsLink;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::{MountScope, StoredDocument};
 use crate::chat::Chat;
@@ -122,6 +124,7 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal, SearchTab};
 use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::session_relocation::SessionRelocationPicker;
+use crate::components::settings_modal::SettingsModal;
 use crate::components::shell_modal::ShellModal;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
@@ -510,6 +513,8 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) env_modal: EnvModal,
     pub(crate) shell_env: ShellEnvLink,
+    pub(super) settings_modal: SettingsModal,
+    pub(crate) settings: SettingsLink,
     pub(super) rewind_picker: RewindPicker,
     pub(super) message_actions: MessageActions,
     pub(super) queue_actions: QueueActions,
@@ -872,6 +877,8 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             env_modal: EnvModal::new(),
             shell_env: ShellEnvLink::default(),
+            settings_modal: SettingsModal::new(),
+            settings: SettingsLink::default(),
             rewind_picker: RewindPicker::new(),
             message_actions: MessageActions::new(),
             queue_actions: QueueActions::new(),
@@ -2209,6 +2216,7 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.env_modal);
+        try_picker!(self.settings_modal);
         try_picker!(self.login_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
@@ -2837,6 +2845,13 @@ impl App {
             guard_repeat!(self.env_modal.text_input_active());
             let action = self.env_modal.handle_key(key);
             return Some(self.handle_env_action(action));
+        }
+
+        if self.settings_modal.is_open() {
+            keyboard_text!(settings_modal, self.settings_modal.text_input_active());
+            guard_repeat!(self.settings_modal.text_input_active());
+            let action = self.settings_modal.handle_key(key);
+            return Some(self.handle_settings_action(action));
         }
 
         if self.permissions_picker.is_open() {
@@ -6247,6 +6262,7 @@ impl App {
                 vec![]
             }
             "/env" => self.open_env(),
+            "/settings" => self.open_settings(),
             "/permissions" => {
                 match self.open_permissions_picker() {
                     Ok(()) => {
@@ -6660,7 +6676,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 52] {
+    fn overlays(&self) -> [&dyn Overlay; 53] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6698,6 +6714,7 @@ impl App {
             &self.login_picker,
             &self.mcp_picker,
             &self.env_modal,
+            &self.settings_modal,
             &self.permissions_picker,
             &self.sandbox_manager,
             &self.stash_picker,
@@ -6717,7 +6734,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 52] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 53] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6755,6 +6772,7 @@ impl App {
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.env_modal,
+            &mut self.settings_modal,
             &mut self.permissions_picker,
             &mut self.sandbox_manager,
             &mut self.stash_picker,
@@ -7031,6 +7049,7 @@ impl App {
             | self.poll_permission_editor()
             | self.poll_sandbox()
             | self.poll_env()
+            | self.poll_settings()
             | self.model_picker.refresh()
             | self.poll_usage()
             | self.storage_modal.poll(&self.storage_slot)
@@ -7673,6 +7692,7 @@ impl App {
         try_picker!(self.thinking_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.env_modal);
+        try_picker!(self.settings_modal);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
         if let Some(action) = self.memory_inspector.handle_paste(text) {

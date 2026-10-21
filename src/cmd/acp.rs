@@ -130,6 +130,9 @@ fn runtime_resolver(
                 super::apply_startup_policy(&mut config, startup.features);
                 config.permissions.yolo |= config.always_yolo;
                 config.validate()?;
+                if let Some(host) = runtime.local_host() {
+                    host.websearch().apply(&config.websearch);
+                }
                 super::configure_native_tools(&config);
                 super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
                 plugin_host.load_production_builtins(&config.plugins)?;

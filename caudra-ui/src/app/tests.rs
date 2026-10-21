@@ -29324,6 +29324,13 @@ mod theme_colours {
             shown: |app| app.env_modal.is_open(),
         },
         Surface {
+            name: "settings_modal",
+            open: |app, _| {
+                let _ = app.settings_modal.open(true);
+            },
+            shown: |app| app.settings_modal.is_open(),
+        },
+        Surface {
             name: "permissions_picker",
             open: |app, _| {
                 app.execute_command(cmd("/permissions"), 0);

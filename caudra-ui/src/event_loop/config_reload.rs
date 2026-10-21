@@ -21,6 +21,7 @@ use caudra_config::config_file::{global_config_path, project_config_path};
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::own_writes::{self, fingerprint};
 use caudra_config::providers::ProvidersConfig;
+use caudra_config::websearch::WebsearchConfig;
 use caudra_config::{Config, PermissionsConfig, fail_closed_permissions, try_load_permissions};
 use toml::Table;
 use tracing::{debug, info, warn};
@@ -50,8 +51,11 @@ const DECISION_ENGINE: &str = "decision engine";
 const DECISION_ENGINE_KEPT: &str = "keeping the running decision engine";
 const DECISIONS_TURNED_OFF: &str =
     "the active decision endpoint is gone from providers.toml, so decisions are off";
-/// The tables every session screens or fetches with as soon as the file is saved.
-const NOW_TABLES: [&str; 2] = ["decisions", "web"];
+/// The tables every session screens, fetches or searches with as soon as the file is saved.
+const NOW_TABLES: [&str; 3] = ["decisions", "web", WEBSEARCH_TABLE];
+const WEBSEARCH_TABLE: &str = "websearch";
+const WEBSEARCH_REMOTE: &str =
+    "[websearch] does not apply here: web tools run on the remote Workcell";
 /// Keys that apply as soon as the file is saved, in a table whose other keys wait. A key
 /// may be a dotted path into the table.
 const NOW_KEYS: [(&str, &str); 2] = [("ui", "show_decisions"), ("plugins", "skill.pstack")];
@@ -241,7 +245,7 @@ impl SettingsTables {
     }
 }
 
-/// When each changed key applies, by name only: `[decisions]`, `[web]` and `ui.show_decisions` at
+/// When each changed key applies, by name only: `[decisions]`, `[web]`, `[websearch]` and `ui.show_decisions` at
 /// once, `[agent]` and `[autopilot]` from the next turn, `[experimental]` after a restart,
 /// everything else after `/reload`. `None` when no key changed, as for an edit to a comment.
 fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
@@ -482,7 +486,10 @@ impl EventLoop<'_> {
             ConfigSource::Workcell => report.note(WORKCELL_CHANGED),
             ConfigSource::Sandboxes => report.note(SANDBOXES_CHANGED),
             ConfigSource::InitLua => report.note(INIT_LUA_CHANGED),
-            ConfigSource::GlobalEnv => report.note(GLOBAL_ENV_CHANGED),
+            ConfigSource::GlobalEnv => {
+                report.note(GLOBAL_ENV_CHANGED);
+                self.reapply_websearch(cwd, report);
+            }
             ConfigSource::ProjectEnv => report.note(PROJECT_ENV_CHANGED),
         }
         false
@@ -657,7 +664,11 @@ impl EventLoop<'_> {
                     report,
                 );
                 self.apply_show_decisions(config.ui.show_decisions);
-                if let Some(note) = settings_note(&self.config_reload.settings_changes(local)) {
+                let changed = self.config_reload.settings_changes(local);
+                if changed.contains_key(WEBSEARCH_TABLE) || self.ctx.websearch.is_some() {
+                    self.apply_websearch(&config.websearch, report);
+                }
+                if let Some(note) = settings_note(&changed) {
                     report.reloaded.push(SETTINGS_FILE);
                     report.note(note);
                 }
@@ -671,6 +682,33 @@ impl EventLoop<'_> {
                     .set(SETTINGS_FILE, error, SETTINGS_KEPT);
                 false
             }
+        }
+    }
+
+    /// `[websearch]` as saved, on the local Workcell's `websearch` tool. A save that leaves every
+    /// setting it reads alone says nothing, and keeps searches prepared before it valid.
+    fn apply_websearch(&mut self, config: &WebsearchConfig, report: &mut Report) {
+        let Some(control) = &self.ctx.websearch else {
+            report.note(WEBSEARCH_REMOTE);
+            return;
+        };
+        let applied = control.apply(config);
+        if applied.changed {
+            report.problems.extend(applied.warnings());
+            report.note(applied.summary());
+        }
+    }
+
+    /// The global `.env` changed, which `{env:NAME}` references in `[websearch]` follow.
+    fn reapply_websearch(&mut self, cwd: Option<&Path>, report: &mut Report) {
+        if self.ctx.websearch.is_none() {
+            return;
+        }
+        let Some(cwd) = cwd else {
+            return;
+        };
+        if let Ok(config) = (self.config_reload.reloader)(cwd) {
+            self.apply_websearch(&config.websearch, report);
         }
     }
 
@@ -815,8 +853,8 @@ mod tests {
 
     use super::{
         Change, Fingerprints, LIST_SEPARATOR, LIVE_SUFFIX, NOW_SUFFIX, RELOAD_SUFFIX, RELOADED,
-        RESTART_SUFFIX, Report, SEPARATOR, SETTINGS_FILE, SettingsTables, profile_problem,
-        settings_note,
+        RESTART_SUFFIX, Report, SEPARATOR, SETTINGS_FILE, SettingsTables, WEBSEARCH_TABLE,
+        profile_problem, settings_note,
     };
 
     const PROBLEM: &str = "providers.toml: expected `=`";
@@ -1034,6 +1072,19 @@ mod tests {
         assert_eq!(
             settings_note(&changed).unwrap(),
             format!("[web] {NOW_SUFFIX}{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}")
+        );
+    }
+
+    #[test]
+    fn websearch_settings_apply_at_once() {
+        let changed = BTreeMap::from([
+            ("agent".to_owned(), true),
+            (WEBSEARCH_TABLE.to_owned(), true),
+        ]);
+
+        assert_eq!(
+            settings_note(&changed).unwrap(),
+            format!("[{WEBSEARCH_TABLE}] {NOW_SUFFIX}{LIST_SEPARATOR}[agent] {LIVE_SUFFIX}")
         );
     }
 

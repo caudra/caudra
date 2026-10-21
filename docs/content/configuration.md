@@ -117,7 +117,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -128,7 +128,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 | Workflows and automations | Caudra reads them again each time it lists, launches, or arms one. |
 | `workcell.toml` and `sandboxes.toml` | After `/reload`. |
 | `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
-| Global `.env` | `{env:NAME}` references follow it at once. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Global `.env` | `{env:NAME}` references follow it at once, and `[websearch]` takes them up when it changes. Shell commands and keys read from the environment keep their startup values until a restart. |
 | Files that `{file:PATH}` reads | When the config file that names them reloads. Caudra does not watch them. |
 | Project `.env` | After a restart. |
 
@@ -706,6 +706,50 @@ Every field also has an environment variable, shown in the Env column, and the v
 | `directory` | string | `<data dir>/worktrees` | Where git-created worktrees go, as `<directory>/<repository>/<branch>`. A leading `~/` is your home directory |
 
 Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each one opens as a grouped Herdr workspace. Inside an Orca terminal, `auto` asks Orca, so each one appears in Orca's worktree list. `directory` applies only to worktrees git creates. See [Worktrees](/docs/worktrees/) for what `/worktree` does with each backend.
+
+### `[websearch]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `mode` | string | `fallback` | `WORKCELL_WEBSEARCH_MODE` | How the ready backends answer: `single` uses the first ready one, `fallback` tries them in order when one fails, and `all` lets the model pick one, trying them in order when it does not |
+| `backends` | string[] | the comma-separated list in WORKCELL_WEBSEARCH_BACKEND, else ["exa-mcp"] | `WORKCELL_WEBSEARCH_BACKEND` | Backends in priority order: exa-mcp, searxng, exa, brave, kagi, or serpapi. A backend that is not set up correctly is skipped with a warning. An empty list turns websearch off |
+
+Global-only: a project `caudra.toml` that sets `[websearch]` fails to load, because the table holds credentials and decides where search queries go. Each backend reads its settings from its own table below. A key left unset reads the variable in its Env column, from Caudra's environment or the global `.env`, never a project `.env`. Prefer `{env:NAME}` or `{file:PATH}` references over a credential written in the file. Edits apply at once while the terminal UI runs, and `/settings` edits them for you. See [Web search](/docs/web-search/).
+
+### `[websearch.searxng]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `url` | string | unset | `SEARXNG_URL` | SearXNG base URL, HTTPS when a credential is set and never with credentials in it |
+| `api_key` | string | unset | `SEARXNG_API_KEY` | API key sent to SearXNG; set at most one of api_key, bearer_token, or user and password |
+| `bearer_token` | string | unset | `SEARXNG_BEARER_TOKEN` | Bearer token sent to SearXNG |
+| `user` | string | unset | `SEARXNG_USER` | Basic authentication user, set with password |
+| `password` | string | unset | `SEARXNG_PASSWORD` | Basic authentication password, set with user |
+
+### `[websearch.exa]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `api_key` | string | unset | `EXA_API_KEY` | Exa API key |
+
+### `[websearch.brave]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `api_key` | string | unset | `BRAVE_API_KEY` | Brave Search API key |
+
+### `[websearch.kagi]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `api_key` | string | unset | `KAGI_API_KEY` | Kagi API key |
+
+### `[websearch.serpapi]`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `api_key` | string | unset | `SERPAPI_API_KEY` | SerpApi API key |
+| `engine` | string | unset | `SERPAPI_ENGINE` | SerpApi engine: google or bing |
 
 ### `decisions`
 

@@ -1,4 +1,6 @@
 use std::fmt;
+use std::slice;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use http::HeaderValue;
@@ -10,7 +12,9 @@ use crate::search::{
 };
 
 /// Search provider represented in normalized output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, schemars::JsonSchema, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, schemars::JsonSchema, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum WebsearchBackend {
     Searxng,
@@ -39,6 +43,15 @@ impl SerpApiEngine {
 }
 
 impl WebsearchBackend {
+    pub const ALL: [Self; 6] = [
+        Self::ExaMcp,
+        Self::Searxng,
+        Self::Exa,
+        Self::Brave,
+        Self::Kagi,
+        Self::Serpapi,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -52,10 +65,58 @@ impl WebsearchBackend {
     }
 }
 
+impl FromStr for WebsearchBackend {
+    type Err = WebsearchConfigurationIssue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.as_str() == value)
+            .ok_or(WebsearchConfigurationIssue::InvalidBackend)
+    }
+}
+
+/// How several configured backends share one `websearch` tool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WebsearchMode {
+    /// Only the first ready backend is used.
+    Single,
+    /// The ready backends are tried in order until one answers.
+    #[default]
+    Fallback,
+    /// The model picks a ready backend per call, or omits it to fall back in order.
+    All,
+}
+
+impl WebsearchMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Fallback => "fallback",
+            Self::All => "all",
+        }
+    }
+}
+
+impl FromStr for WebsearchMode {
+    type Err = WebsearchConfigurationIssue;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [Self::Single, Self::Fallback, Self::All]
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .ok_or(WebsearchConfigurationIssue::InvalidMode)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebsearchConfigurationIssue {
     MissingBackend,
     InvalidBackend,
+    InvalidBackendList,
+    DuplicateBackend,
+    InvalidMode,
     InvalidUnicode,
     MissingSearxngEndpoint,
     InvalidSearxngEndpoint,
@@ -76,6 +137,9 @@ impl WebsearchConfigurationIssue {
         match self {
             Self::MissingBackend => "missing-backend",
             Self::InvalidBackend => "invalid-backend",
+            Self::InvalidBackendList => "invalid-backend-list",
+            Self::DuplicateBackend => "duplicate-backend",
+            Self::InvalidMode => "invalid-mode",
             Self::InvalidUnicode => "invalid-unicode",
             Self::MissingSearxngEndpoint => "missing-searxng-endpoint",
             Self::InvalidSearxngEndpoint => "invalid-searxng-endpoint",
@@ -98,8 +162,15 @@ impl WebsearchConfigurationIssue {
                 "WORKCELL_WEBSEARCH_BACKEND is not configured. Use exa-mcp for credential-free hosted search, or configure searxng, exa, brave, kagi, or serpapi."
             }
             Self::InvalidBackend => {
-                "WORKCELL_WEBSEARCH_BACKEND must be disabled, exa-mcp, searxng, exa, brave, kagi, or serpapi."
+                "WORKCELL_WEBSEARCH_BACKEND must be disabled, or one or a comma-separated list of exa-mcp, searxng, exa, brave, kagi, and serpapi."
             }
+            Self::InvalidBackendList => {
+                "WORKCELL_WEBSEARCH_BACKEND must not contain empty entries, and disabled cannot be combined with other backends."
+            }
+            Self::DuplicateBackend => {
+                "WORKCELL_WEBSEARCH_BACKEND must not list the same backend more than once."
+            }
+            Self::InvalidMode => "WORKCELL_WEBSEARCH_MODE must be single, fallback, or all.",
             Self::InvalidUnicode => {
                 "The selected websearch environment variables must contain valid UTF-8."
             }
@@ -176,6 +247,11 @@ pub(crate) enum ConfigurationState {
     },
     Disabled(WebsearchBackend),
     Ready(Arc<dyn WebsearchProvider>),
+    /// Two or more ready providers in configured order; `mode` is never `Single`.
+    Combined {
+        mode: WebsearchMode,
+        providers: Vec<Arc<dyn WebsearchProvider>>,
+    },
 }
 
 impl fmt::Debug for ConfigurationState {
@@ -188,14 +264,24 @@ impl fmt::Debug for ConfigurationState {
                 .finish(),
             Self::Disabled(backend) => formatter.debug_tuple("Disabled").field(backend).finish(),
             Self::Ready(provider) => formatter.debug_tuple("Ready").field(provider).finish(),
+            Self::Combined { mode, providers } => formatter
+                .debug_struct("Combined")
+                .field("mode", mode)
+                .field("providers", providers)
+                .finish(),
         }
     }
+}
+
+struct Configuration {
+    state: ConfigurationState,
+    skipped: Vec<(WebsearchBackend, WebsearchConfigurationIssue)>,
 }
 
 /// Immutable, cloneable provider selection. Secret fields are private and
 /// redacted from `Debug`; construction is the only way to set configuration.
 #[derive(Clone)]
-pub struct WebsearchExecutionConfiguration(Arc<ConfigurationState>);
+pub struct WebsearchExecutionConfiguration(Arc<Configuration>);
 
 impl Default for WebsearchExecutionConfiguration {
     fn default() -> Self {
@@ -205,27 +291,32 @@ impl Default for WebsearchExecutionConfiguration {
 
 impl fmt::Debug for WebsearchExecutionConfiguration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("WebsearchExecutionConfiguration")
-            .field(&self.0)
-            .finish()
+        let mut tuple = formatter.debug_tuple("WebsearchExecutionConfiguration");
+        tuple.field(&self.0.state);
+        if !self.0.skipped.is_empty() {
+            tuple.field(&self.0.skipped);
+        }
+        tuple.finish()
     }
 }
 
 impl WebsearchExecutionConfiguration {
+    /// The primary backend: the first ready one when several are combined.
     #[must_use]
     pub fn backend(&self) -> Option<WebsearchBackend> {
         match self.state() {
             ConfigurationState::Unavailable { backend, .. } => *backend,
             ConfigurationState::Disabled(backend) => Some(*backend),
-            ConfigurationState::Ready(provider) => Some(provider.backend()),
+            ConfigurationState::Ready(_) | ConfigurationState::Combined { .. } => {
+                self.provider().map(|provider| provider.backend())
+            }
         }
     }
 
     #[must_use]
     pub fn status(&self) -> &'static str {
         match self.state() {
-            ConfigurationState::Ready(_) => "ready",
+            ConfigurationState::Ready(_) | ConfigurationState::Combined { .. } => "ready",
             ConfigurationState::Disabled(_) => "disabled",
             ConfigurationState::Unavailable { .. } => "unavailable",
         }
@@ -235,8 +326,85 @@ impl WebsearchExecutionConfiguration {
     pub fn issue(&self) -> Option<WebsearchConfigurationIssue> {
         match self.state() {
             ConfigurationState::Unavailable { issue, .. } => Some(*issue),
-            ConfigurationState::Disabled(_) | ConfigurationState::Ready(_) => None,
+            ConfigurationState::Disabled(_)
+            | ConfigurationState::Ready(_)
+            | ConfigurationState::Combined { .. } => None,
         }
+    }
+
+    /// Listed backends left out because their configuration is incomplete or invalid.
+    #[must_use]
+    pub fn skipped(&self) -> &[(WebsearchBackend, WebsearchConfigurationIssue)] {
+        &self.0.skipped
+    }
+
+    /// Ready backends in the order they are tried; empty when search is not ready.
+    #[must_use]
+    pub fn ready_backends(&self) -> Vec<WebsearchBackend> {
+        self.providers()
+            .iter()
+            .map(|provider| provider.backend())
+            .collect()
+    }
+
+    /// `Single` whenever at most one backend is ready.
+    #[must_use]
+    pub fn mode(&self) -> WebsearchMode {
+        match self.state() {
+            ConfigurationState::Combined { mode, .. } => *mode,
+            ConfigurationState::Unavailable { .. }
+            | ConfigurationState::Disabled(_)
+            | ConfigurationState::Ready(_) => WebsearchMode::Single,
+        }
+    }
+
+    /// Combine separately resolved backends in order. Members that are not ready
+    /// are reported by [`Self::skipped`]; when none is ready the first member's
+    /// state is kept so its diagnostic still reaches the model.
+    #[must_use]
+    pub fn combined(mode: WebsearchMode, members: Vec<Self>) -> Self {
+        let mut providers = Vec::new();
+        let mut not_ready = Vec::new();
+        let mut first = None;
+        for member in members {
+            match member.state() {
+                ConfigurationState::Ready(provider) => providers.push(provider.clone()),
+                ConfigurationState::Combined {
+                    providers: nested, ..
+                } => providers.extend(nested.iter().cloned()),
+                ConfigurationState::Unavailable {
+                    backend: Some(backend),
+                    issue,
+                } => not_ready.push((*backend, *issue)),
+                ConfigurationState::Unavailable { backend: None, .. }
+                | ConfigurationState::Disabled(_) => {}
+            }
+            not_ready.extend_from_slice(member.skipped());
+            first.get_or_insert(member);
+        }
+        let Some(first) = first else {
+            return Self::unconfigured();
+        };
+        if providers.is_empty() {
+            let reported_by_state = usize::from(matches!(
+                first.state(),
+                ConfigurationState::Unavailable {
+                    backend: Some(_),
+                    ..
+                }
+            ));
+            not_ready.drain(..reported_by_state);
+            return Self::with_skipped(first.state().clone(), not_ready);
+        }
+        if mode == WebsearchMode::Single {
+            providers.truncate(1);
+        }
+        let state = if providers.len() == 1 {
+            ConfigurationState::Ready(providers.remove(0))
+        } else {
+            ConfigurationState::Combined { mode, providers }
+        };
+        Self::with_skipped(state, not_ready)
     }
 
     #[must_use]
@@ -249,12 +417,15 @@ impl WebsearchExecutionConfiguration {
         backend: Option<WebsearchBackend>,
         issue: WebsearchConfigurationIssue,
     ) -> Self {
-        Self(Arc::new(ConfigurationState::Unavailable { backend, issue }))
+        Self::with_skipped(
+            ConfigurationState::Unavailable { backend, issue },
+            Vec::new(),
+        )
     }
 
     #[must_use]
     pub fn disabled(backend: WebsearchBackend) -> Self {
-        Self(Arc::new(ConfigurationState::Disabled(backend)))
+        Self::with_skipped(ConfigurationState::Disabled(backend), Vec::new())
     }
 
     #[must_use]
@@ -299,17 +470,13 @@ impl WebsearchExecutionConfiguration {
                 WebsearchConfigurationIssue::InvalidCredential,
             );
         }
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            ExaProvider::new(Secret(api_key)),
-        ))))
+        Self::ready(ExaProvider::new(Secret(api_key)))
     }
 
     /// Use Exa's credential-free hosted MCP search endpoint.
     #[must_use]
     pub fn exa_mcp() -> Self {
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            ExaMcpProvider,
-        ))))
+        Self::ready(ExaMcpProvider)
     }
 
     /// Represents an Exa slot selected without a stored key.
@@ -333,9 +500,7 @@ impl WebsearchExecutionConfiguration {
                 WebsearchConfigurationIssue::InvalidCredential,
             );
         }
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            BraveProvider::new(Secret(api_key)),
-        ))))
+        Self::ready(BraveProvider::new(Secret(api_key)))
     }
 
     #[must_use]
@@ -358,9 +523,7 @@ impl WebsearchExecutionConfiguration {
                 WebsearchConfigurationIssue::InvalidCredential,
             );
         }
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            KagiProvider::new(Secret(api_key)),
-        ))))
+        Self::ready(KagiProvider::new(Secret(api_key)))
     }
 
     #[must_use]
@@ -377,9 +540,7 @@ impl WebsearchExecutionConfiguration {
         if api_key.trim().is_empty() {
             return Self::serpapi_without_api_key();
         }
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            SerpApiProvider::new(Secret(api_key), engine),
-        ))))
+        Self::ready(SerpApiProvider::new(Secret(api_key), engine))
     }
 
     #[must_use]
@@ -398,15 +559,32 @@ impl WebsearchExecutionConfiguration {
         )
     }
 
+    /// The primary provider: the first one tried when several are combined.
     pub(crate) fn provider(&self) -> Option<&dyn WebsearchProvider> {
+        self.providers().first().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn providers(&self) -> &[Arc<dyn WebsearchProvider>] {
         match self.state() {
-            ConfigurationState::Ready(provider) => Some(provider.as_ref()),
-            ConfigurationState::Disabled(_) | ConfigurationState::Unavailable { .. } => None,
+            ConfigurationState::Ready(provider) => slice::from_ref(provider),
+            ConfigurationState::Combined { providers, .. } => providers,
+            ConfigurationState::Disabled(_) | ConfigurationState::Unavailable { .. } => &[],
         }
     }
 
     pub(crate) fn state(&self) -> &ConfigurationState {
-        &self.0
+        &self.0.state
+    }
+
+    fn ready(provider: impl WebsearchProvider + 'static) -> Self {
+        Self::with_skipped(ConfigurationState::Ready(Arc::new(provider)), Vec::new())
+    }
+
+    fn with_skipped(
+        state: ConfigurationState,
+        skipped: Vec<(WebsearchBackend, WebsearchConfigurationIssue)>,
+    ) -> Self {
+        Self(Arc::new(Configuration { state, skipped }))
     }
 
     fn searxng_with_credential(
@@ -426,9 +604,7 @@ impl WebsearchExecutionConfiguration {
                 WebsearchConfigurationIssue::InvalidSearxngEndpoint,
             );
         }
-        Self(Arc::new(ConfigurationState::Ready(Arc::new(
-            SearxngProvider::new(endpoint, credential),
-        ))))
+        Self::ready(SearxngProvider::new(endpoint, credential))
     }
 }
 

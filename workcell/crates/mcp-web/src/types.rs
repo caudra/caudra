@@ -33,6 +33,8 @@ pub struct WebsearchInput {
     pub limit: Option<u64>,
     #[serde(rename = "timeoutSec")]
     pub timeout_sec: Option<u64>,
+    /// Accepted only when several backends are active in `all` mode.
+    pub backend: Option<WebsearchBackend>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +85,16 @@ pub struct WebsearchOutput {
     pub error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Backends tried before the one that answered, or every backend when all failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<WebsearchFallback>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebsearchFallback {
+    pub backend: WebsearchBackend,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]

@@ -15,13 +15,14 @@ use serde_json::{Map, Value, json};
 use test_case::test_case;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
-    NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
-    PreparedWebOperation, PrivateAllowlist, PrivateHost, PrivateNetwork,
-    STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, SharedAllowlist, UrlPolicy, WebExecution,
-    WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution, WebToolGroup,
-    WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
+    BACKEND_OUTSIDE_ALL_MODE_ERROR, NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction,
+    PdfExtractionError, PdfExtractor, PreparedWebOperation, PrivateAllowlist, PrivateHost,
+    PrivateNetwork, STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, SharedAllowlist, UrlPolicy,
+    WebExecution, WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution,
+    WebToolGroup, WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
     WebsearchBackend, WebsearchConfigurationIssue, WebsearchConfigurationSource,
-    WebsearchExecutionConfiguration, WebsearchInput, catalog, specs,
+    WebsearchExecutionConfiguration, WebsearchInput, WebsearchMode, catalog,
+    resolve_web_configuration_with, specs,
 };
 
 use support::*;
@@ -215,6 +216,7 @@ async fn native_preparation_normalizes_permissions_without_network_io() {
             safesearch: None,
             limit: None,
             timeout_sec: None,
+            backend: None,
         })
         .expect("prepared search");
     let fetch = group
@@ -324,6 +326,7 @@ async fn prepared_websearch_rejects_configuration_revision_drift_without_network
             safesearch: None,
             limit: None,
             timeout_sec: None,
+            backend: None,
         })
         .unwrap();
     let PreparedWebOperation::Websearch(operation) = &prepared else {
@@ -2593,4 +2596,301 @@ async fn raw_reddit_html_is_fetched_unchanged() {
     let requests = http.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url.as_str(), REDDIT_THREAD_URL);
+}
+
+const SEARXNG_ENDPOINT: &str = "https://search.example.test/search";
+const EXA_MCP_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
+const FALLBACK_QUERY: &str = "fallback query";
+const EXA_MCP_RESULT_TEXT: &str = "1. Hosted result [exa]\n   URL: https://result.example.test/hosted\n   Credential-free search context.";
+const NO_RESULTS_TEXT: &str = "No results found for the given query.";
+const SEARXNG_UNAVAILABLE_ERROR: &str = "Failed to search SearXNG: SearXNG returned HTTP 503.";
+const CATALOG_YEAR: i32 = 2026;
+const YEAR_PLACEHOLDER: &str = "{{CURRENT_YEAR}}";
+
+fn exa_mcp_success() -> Result<workcell_mcp_web::WebHttpResponse, WebHttpError> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"content": [{
+            "type": "text",
+            "text": "Title: Hosted result\nURL: https://result.example.test/hosted\nPublished: N/A\nAuthor: N/A\nHighlights:\nCredential-free search context."
+        }]}
+    });
+    Ok(response(
+        EXA_MCP_ENDPOINT,
+        StatusCode::OK,
+        Some("text/event-stream"),
+        Bytes::from(format!("event: message\r\ndata: {payload}\r\n\r\n")),
+    ))
+}
+
+fn searxng_status(status: StatusCode) -> Result<workcell_mcp_web::WebHttpResponse, WebHttpError> {
+    Ok(response(
+        SEARXNG_ENDPOINT,
+        status,
+        Some("application/json"),
+        Bytes::from_static(br#"{"query":"fallback query","results":[]}"#),
+    ))
+}
+
+fn searxng_then_exa_mcp(mode: WebsearchMode) -> WebsearchExecutionConfiguration {
+    WebsearchExecutionConfiguration::combined(
+        mode,
+        vec![
+            WebsearchExecutionConfiguration::searxng(SEARXNG_ENDPOINT),
+            WebsearchExecutionConfiguration::exa_mcp(),
+        ],
+    )
+}
+
+fn combined_group(
+    configuration: WebsearchExecutionConfiguration,
+    responses: Vec<Result<workcell_mcp_web::WebHttpResponse, WebHttpError>>,
+) -> (WebToolGroup, Arc<FakeHttp>) {
+    let http = Arc::new(FakeHttp::with_responses(responses));
+    let group = WebToolGroup::with_dependencies(
+        configuration,
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    (group, http)
+}
+
+#[tokio::test]
+async fn a_server_error_from_the_first_backend_falls_back_to_the_next_with_a_note() {
+    let (group, http) = combined_group(
+        searxng_then_exa_mcp(WebsearchMode::Fallback),
+        vec![
+            searxng_status(StatusCode::SERVICE_UNAVAILABLE),
+            exa_mcp_success(),
+        ],
+    );
+    let result = call(
+        &group,
+        "websearch",
+        json!({"query": FALLBACK_QUERY, "categories": "news", "limit": 2}),
+    )
+    .await;
+
+    assert_eq!(result.is_error, None);
+    assert_eq!(
+        text(&result),
+        format!(
+            "Note: searxng failed ({SEARXNG_UNAVAILABLE_ERROR}); results from exa-mcp.\n{EXA_MCP_RESULT_TEXT}"
+        )
+    );
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["backend"], json!("exa-mcp"));
+    assert_eq!(
+        structured["fallbacks"],
+        json!([{"backend": "searxng", "error": SEARXNG_UNAVAILABLE_ERROR}])
+    );
+    let requests = http.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].url.as_str(), EXA_MCP_ENDPOINT);
+}
+
+#[tokio::test]
+async fn empty_results_are_an_answer_and_do_not_fall_back() {
+    let (group, http) = combined_group(
+        searxng_then_exa_mcp(WebsearchMode::Fallback),
+        vec![searxng_status(StatusCode::OK), exa_mcp_success()],
+    );
+    let result = call(&group, "websearch", json!({"query": FALLBACK_QUERY})).await;
+
+    assert_eq!(text(&result), NO_RESULTS_TEXT);
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["backend"], json!("searxng"));
+    assert!(structured.get("fallbacks").is_none());
+    assert_eq!(http.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn when_every_backend_fails_each_failure_is_reported() {
+    let (group, http) = combined_group(
+        searxng_then_exa_mcp(WebsearchMode::Fallback),
+        vec![
+            searxng_status(StatusCode::SERVICE_UNAVAILABLE),
+            Err(WebHttpError::RequestFailed),
+        ],
+    );
+    let result = call(&group, "websearch", json!({"query": FALLBACK_QUERY})).await;
+
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["error"], json!(true));
+    assert_eq!(structured["backend"], json!("searxng"));
+    let message = structured["errorMessage"].as_str().expect("error message");
+    assert!(message.contains(&format!("searxng: {SEARXNG_UNAVAILABLE_ERROR}")));
+    assert!(message.contains("exa-mcp: Failed to search Exa MCP"));
+    assert_eq!(
+        structured["fallbacks"]
+            .as_array()
+            .expect("fallbacks")
+            .iter()
+            .map(|fallback| fallback["backend"].clone())
+            .collect::<Vec<_>>(),
+        [json!("searxng"), json!("exa-mcp")]
+    );
+    assert_eq!(http.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn all_mode_routes_a_search_to_the_chosen_backend_only() {
+    let (group, http) = combined_group(
+        searxng_then_exa_mcp(WebsearchMode::All),
+        vec![exa_mcp_success()],
+    );
+    let prepared = group
+        .prepare_websearch(WebsearchInput {
+            query: FALLBACK_QUERY.into(),
+            country: None,
+            categories: None,
+            language: None,
+            pageno: None,
+            time_range: None,
+            safesearch: None,
+            limit: None,
+            timeout_sec: None,
+            backend: Some(WebsearchBackend::ExaMcp),
+        })
+        .expect("prepared search");
+    assert_eq!(prepared.backend, Some(WebsearchBackend::ExaMcp));
+
+    let result = call(
+        &group,
+        "websearch",
+        json!({"query": FALLBACK_QUERY, "backend": "exa-mcp"}),
+    )
+    .await;
+    assert_eq!(text(&result), EXA_MCP_RESULT_TEXT);
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.as_str(), EXA_MCP_ENDPOINT);
+}
+
+#[test_case(searxng_then_exa_mcp(WebsearchMode::Fallback) ; "fallback mode")]
+#[test_case(WebsearchExecutionConfiguration::exa_mcp() ; "a single backend")]
+#[test_case(WebsearchExecutionConfiguration::unconfigured() ; "no backend")]
+#[tokio::test]
+async fn backend_is_refused_outside_all_mode(configuration: WebsearchExecutionConfiguration) {
+    let (group, http) = combined_group(configuration, Vec::new());
+    let result = call(
+        &group,
+        "websearch",
+        json!({"query": FALLBACK_QUERY, "backend": "exa-mcp"}),
+    )
+    .await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result), BACKEND_OUTSIDE_ALL_MODE_ERROR);
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn all_mode_refuses_a_backend_that_is_not_ready() {
+    let (group, http) = combined_group(searxng_then_exa_mcp(WebsearchMode::All), Vec::new());
+    let result = call(
+        &group,
+        "websearch",
+        json!({"query": FALLBACK_QUERY, "backend": "brave"}),
+    )
+    .await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("brave is not active"));
+    assert!(text(&result).ends_with("searxng, exa-mcp"));
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn all_mode_catalog_unions_parameters_and_offers_a_backend_selector() {
+    let configuration = WebsearchExecutionConfiguration::combined(
+        WebsearchMode::All,
+        vec![
+            WebsearchExecutionConfiguration::exa_mcp(),
+            WebsearchExecutionConfiguration::brave("brave-secret"),
+        ],
+    );
+    let tools = serde_json::to_value(catalog(CATALOG_YEAR, &configuration)).unwrap();
+    let websearch = &tools[0];
+    let properties = websearch["inputSchema"]["properties"]
+        .as_object()
+        .expect("properties");
+
+    assert_eq!(websearch["inputSchema"]["required"], json!(["query"]));
+    assert_eq!(properties["backend"]["enum"], json!(["exa-mcp", "brave"]));
+    assert_eq!(properties["query"]["maxLength"], json!(512));
+    assert_eq!(properties["limit"]["maximum"], json!(25));
+    assert!(
+        properties["country"]["description"]
+            .as_str()
+            .unwrap()
+            .ends_with(" Accepted by: brave.")
+    );
+    assert!(
+        !properties["limit"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Accepted by")
+    );
+    let description = websearch["description"].as_str().unwrap();
+    assert!(
+        description.contains(
+            "\n- exa-mcp: Search the web using Exa's credential-free hosted MCP service.\n"
+        )
+    );
+    assert!(
+        description
+            .contains("\n- brave: Search the web using the configured Brave Search API backend.")
+    );
+    let year_sentence = format!("The current year is {CATALOG_YEAR}.");
+    assert_eq!(description.matches(&year_sentence).count(), 1);
+    assert!(description.ends_with(&year_sentence));
+}
+
+#[test]
+fn fallback_catalog_keeps_the_primary_contract_and_names_the_fallbacks() {
+    let brave = WebsearchExecutionConfiguration::brave("brave-secret");
+    let configuration = WebsearchExecutionConfiguration::combined(
+        WebsearchMode::Fallback,
+        vec![brave.clone(), WebsearchExecutionConfiguration::exa_mcp()],
+    );
+    let combined = serde_json::to_value(catalog(CATALOG_YEAR, &configuration)).unwrap();
+    let primary = serde_json::to_value(catalog(CATALOG_YEAR, &brave)).unwrap();
+
+    assert_eq!(combined[0]["inputSchema"], primary[0]["inputSchema"]);
+    assert_eq!(
+        combined[0]["description"].as_str().unwrap(),
+        format!(
+            "{}\n\nIf brave fails, this search falls back to exa-mcp.",
+            primary[0]["description"].as_str().unwrap()
+        )
+    );
+}
+
+#[test]
+fn an_unset_environment_keeps_the_exa_mcp_catalog() {
+    let configuration = resolve_web_configuration_with(|_| Ok(None));
+    assert_eq!(
+        serde_json::to_value(catalog(CATALOG_YEAR, &configuration)).unwrap(),
+        serde_json::to_value(catalog(
+            CATALOG_YEAR,
+            &WebsearchExecutionConfiguration::exa_mcp()
+        ))
+        .unwrap()
+    );
+    assert!(configuration.skipped().is_empty());
+}
+
+#[test]
+fn the_default_catalog_matches_the_committed_fixture() {
+    let fixture = fs::read_to_string(conformance_root().join("catalog/v1/web-tools.json"))
+        .expect("web catalog fixture")
+        .replace(YEAR_PLACEHOLDER, &CATALOG_YEAR.to_string());
+    let fixture: Value = serde_json::from_str(&fixture).expect("parse web catalog fixture");
+    let actual = serde_json::to_value(catalog(
+        CATALOG_YEAR,
+        &WebsearchExecutionConfiguration::exa_mcp(),
+    ))
+    .unwrap();
+    assert_eq!(actual, fixture["expected"]["tools"]);
 }

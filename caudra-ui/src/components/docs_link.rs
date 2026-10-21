@@ -57,6 +57,8 @@ pub enum DocsTopic {
     Rewind,
     MessageActions,
     Queue,
+    Settings,
+    WebSearch,
 }
 
 impl DocsTopic {
@@ -101,6 +103,8 @@ impl DocsTopic {
             Self::Rewind => "sessions#conversation-revert",
             Self::MessageActions => "sessions#message-actions",
             Self::Queue => "queue",
+            Self::Settings => "configuration",
+            Self::WebSearch => "web-search#edit-from-caudra",
         }
     }
 
