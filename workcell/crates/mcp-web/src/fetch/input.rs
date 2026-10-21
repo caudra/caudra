@@ -4,6 +4,7 @@ use http::{HeaderMap, Method};
 use url::Url;
 use workcell_net::{PrivateAllowlist, UrlPolicy, UrlPolicyError};
 
+use super::sites::{self, SitePlan};
 use super::{MAX_PDF_RESPONSE_BYTES, MAX_REDIRECTS, WebfetchError, content};
 use crate::WebHttpRequestKind;
 use crate::types::{WebfetchFormat, WebfetchInput, WebfetchPdfMode};
@@ -29,6 +30,9 @@ pub(crate) struct NormalizedWebfetchInput {
     /// Host-set page limit for PDF attachments. `None` attaches any PDF that
     /// fits the response bound; `Some(0)` always extracts text instead.
     pub pdf_attachment_page_limit: Option<usize>,
+    /// Where a site rule reads this page instead of `url`. `url` stays the
+    /// page the caller named, for permission, output, and source icons.
+    pub site: Option<Box<SitePlan>>,
 }
 
 /// Plain HTTP is upgraded to HTTPS, except for a target `private` admits by its
@@ -59,6 +63,12 @@ pub(crate) fn normalize_input(
     private
         .validate_url(policy, &url)
         .map_err(|error| policy_error(error, &requested, false))?;
+    let site = sites::plan(&url, input.format).map(Box::new);
+    for attempt in site.iter().flat_map(|plan| &plan.attempts) {
+        private
+            .validate_url(policy, &attempt.url)
+            .map_err(|error| policy_error(error, &attempt.url, false))?;
+    }
     let timeout_seconds = input
         .timeout
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
@@ -81,6 +91,7 @@ pub(crate) fn normalize_input(
         max_redirects: MAX_REDIRECTS,
         max_body_bytes: MAX_PDF_RESPONSE_BYTES,
         pdf_attachment_page_limit: None,
+        site,
     })
 }
 

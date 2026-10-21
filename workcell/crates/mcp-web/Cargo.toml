@@ -29,6 +29,7 @@ pdf_oxide.workspace = true
 regex = { workspace = true, default-features = true }
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true }
+roxmltree.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

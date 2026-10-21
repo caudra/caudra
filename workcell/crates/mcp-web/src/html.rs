@@ -83,20 +83,7 @@ pub(crate) fn extract_html_for_prompt(
         return extracted.clone();
     }
 
-    let fallback = catch_unwind(AssertUnwindSafe(|| {
-        let document = sanitized_document(&normalized, base_url);
-        let body = document.body();
-        if markdown {
-            let html = body.map_or_else(|| document.html(), |body| body.html());
-            convert_to_markdown(html.as_ref())
-                .map(|output| clean_markdown(&output))
-                .unwrap_or_default()
-        } else {
-            let text = body.map_or_else(|| document.formatted_text(), |body| body.formatted_text());
-            clean_text(text.as_ref())
-        }
-    }))
-    .unwrap_or_default();
+    let fallback = normalized_fragment(&normalized, markdown, base_url);
     if fallback.is_empty() {
         return HtmlExtraction {
             output: "Content extraction was limited for this page.".to_owned(),
@@ -111,6 +98,29 @@ pub(crate) fn extract_html_for_prompt(
         title: readability.and_then(|value| value.title).or(fallback_title),
         method: "fallback",
     }
+}
+
+/// Sanitizes an HTML document or fragment and renders it as cleaned Markdown or
+/// text, with links resolved against `base_url`. Empty when nothing survives.
+pub(crate) fn html_fragment(html: &str, markdown: bool, base_url: &str) -> String {
+    normalized_fragment(&normalize_source_text(html), markdown, base_url)
+}
+
+fn normalized_fragment(normalized: &str, markdown: bool, base_url: &str) -> String {
+    catch_unwind(AssertUnwindSafe(|| {
+        let document = sanitized_document(normalized, base_url);
+        let body = document.body();
+        if markdown {
+            let html = body.map_or_else(|| document.html(), |body| body.html());
+            convert_to_markdown(html.as_ref())
+                .map(|output| clean_markdown(&output))
+                .unwrap_or_default()
+        } else {
+            let text = body.map_or_else(|| document.formatted_text(), |body| body.formatted_text());
+            clean_text(text.as_ref())
+        }
+    }))
+    .unwrap_or_default()
 }
 
 fn extract_title(html: &str) -> Option<String> {

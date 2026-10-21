@@ -1,0 +1,74 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "title": "Which allocator do you ship with?",
+            "subreddit_name_prefixed": "r/rustexample",
+            "author": "example_author",
+            "score": 42,
+            "upvote_ratio": 0.93,
+            "num_comments": 5,
+            "link_flair_text": "Discussion",
+            "selftext": "We switched our service to a **custom allocator** last month.\n\nWhich one do you ship with, and why?",
+            "selftext_html": "<div class=\"md\"><p>We switched our service to a <strong>custom allocator</strong> last month.</p><p>Which one do you ship with, and why?</p></div>",
+            "url": "https://www.reddit.com/r/rustexample/comments/abc123/which_allocator/",
+            "is_self": true,
+            "permalink": "/r/rustexample/comments/abc123/which_allocator/",
+            "created_utc": 1774311770.0
+          }
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "author": "first_reply",
+            "score": 17,
+            "body": "The system allocator, until a profile says otherwise.",
+            "created_utc": 1774318132.0,
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "author": "nested_reply",
+                      "score": 4,
+                      "body": "Agreed, measure first.",
+                      "created_utc": 1774320000.0,
+                      "replies": ""
+                    }
+                  },
+                  {
+                    "kind": "more",
+                    "data": { "count": 2, "children": ["m1", "m2"] }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "author": "second_reply",
+            "score": null,
+            "body": "An arena per request worked well for us.",
+            "created_utc": 1774430100.0,
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+]

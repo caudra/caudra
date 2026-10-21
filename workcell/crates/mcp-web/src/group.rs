@@ -70,21 +70,33 @@ impl PreparedWebfetch {
     pub fn retained_bytes(&self) -> usize {
         const HEADER_ENTRY_OVERHEAD: usize = 128;
 
+        let header_bytes = |headers: &HeaderMap| {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    name.as_str()
+                        .len()
+                        .saturating_add(value.as_bytes().len())
+                        .saturating_add(HEADER_ENTRY_OVERHEAD)
+                })
+                .fold(0, usize::saturating_add)
+        };
+        let site_bytes = self
+            .input
+            .site
+            .iter()
+            .flat_map(|plan| &plan.attempts)
+            .map(|attempt| {
+                size_of_val(attempt)
+                    .saturating_add(attempt.url.as_str().len())
+                    .saturating_add(header_bytes(&attempt.headers))
+            })
+            .fold(0, usize::saturating_add);
         size_of::<Self>()
             .saturating_add(self.permission_url.capacity())
             .saturating_add(self.input.url.as_str().len().saturating_mul(2))
-            .saturating_add(
-                self.input
-                    .headers
-                    .iter()
-                    .map(|(name, value)| {
-                        name.as_str()
-                            .len()
-                            .saturating_add(value.as_bytes().len())
-                            .saturating_add(HEADER_ENTRY_OVERHEAD)
-                    })
-                    .fold(0, usize::saturating_add),
-            )
+            .saturating_add(header_bytes(&self.input.headers))
+            .saturating_add(site_bytes)
     }
 }
 

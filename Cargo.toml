@@ -328,6 +328,7 @@ pdf_oxide = { version = "0.3.74", default-features = false }
 proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 resvg = { version = "=0.48.1", default-features = false }
+roxmltree = "0.21.1"
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1.2.1"
 subtle = "2.6.1"

@@ -17,9 +17,9 @@ use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
     NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
     PreparedWebOperation, PrivateAllowlist, PrivateHost, PrivateNetwork,
-    STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, SharedAllowlist, UrlPolicy,
-    WebExecution, WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution,
-    WebToolGroup, WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
+    STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, SharedAllowlist, UrlPolicy, WebExecution,
+    WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution, WebToolGroup,
+    WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
     WebsearchBackend, WebsearchConfigurationIssue, WebsearchConfigurationSource,
     WebsearchExecutionConfiguration, WebsearchInput, catalog, specs,
 };
@@ -2418,4 +2418,179 @@ fn json_contains(actual: &Value, expected: &Value) -> bool {
         }
         _ => actual == expected,
     }
+}
+
+const REDDIT_THREAD_URL: &str =
+    "https://www.reddit.com/r/rustexample/comments/abc123/which_allocator/";
+const REDDIT_THREAD_RSS_URL: &str =
+    "https://www.reddit.com/r/rustexample/comments/abc123/.rss?limit=100";
+const REDDIT_THREAD_JSON_URL: &str =
+    "https://www.reddit.com/r/rustexample/comments/abc123/.json?raw_json=1&limit=100";
+const REDDIT_THREAD_RSS: &str = include_str!("fixtures/reddit/thread.rss");
+const REDDIT_THREAD_JSON: &str = include_str!("fixtures/reddit/thread.json");
+const REDDIT_RSS_METHOD: &str = "reddit-rss";
+const REDDIT_JSON_METHOD: &str = "reddit-json";
+const REDDIT_RSS_ACCEPT: &str = "application/atom+xml";
+const REDDIT_USER_AGENT_PREFIX: &str = "workcell:webfetch:";
+const RATE_LIMITED_MESSAGE: &str = "webfetch returned 429 Too Many Requests; retry after 35s";
+const FORBIDDEN_MESSAGE: &str = "webfetch returned 403 Forbidden";
+
+fn reddit_group(
+    responses: Vec<Result<workcell_mcp_web::WebHttpResponse, WebHttpError>>,
+) -> (WebToolGroup, Arc<FakeHttp>, Arc<FakeIcons>) {
+    let http = Arc::new(FakeHttp::with_responses(responses));
+    let icons = Arc::new(FakeIcons::default());
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http.clone(), icons.clone(), default_pdf()),
+    );
+    (group, http, icons)
+}
+
+async fn fetch_reddit(
+    group: &WebToolGroup,
+    format: WebfetchFormat,
+) -> Result<WebExecution<WebfetchOutput>, WebfetchError> {
+    group
+        .webfetch(
+            WebfetchInput {
+                url: REDDIT_THREAD_URL.into(),
+                format,
+                pdf_mode: WebfetchPdfMode::Extract,
+                timeout: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+}
+
+fn forbidden() -> Result<workcell_mcp_web::WebHttpResponse, WebHttpError> {
+    Ok(response(
+        REDDIT_THREAD_RSS_URL,
+        StatusCode::FORBIDDEN,
+        Some("text/html"),
+        Bytes::from_static(b"<p>blocked</p>"),
+    ))
+}
+
+#[tokio::test]
+async fn a_reddit_thread_is_read_from_its_feed() {
+    let (group, http, icons) = reddit_group(vec![Ok(response(
+        REDDIT_THREAD_RSS_URL,
+        StatusCode::OK,
+        Some("application/atom+xml; charset=UTF-8"),
+        REDDIT_THREAD_RSS,
+    ))]);
+    let execution = fetch_reddit(&group, WebfetchFormat::Markdown)
+        .await
+        .expect("reddit thread");
+
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.as_str(), REDDIT_THREAD_RSS_URL);
+    assert_eq!(requests[0].headers[http::header::ACCEPT], REDDIT_RSS_ACCEPT);
+    assert!(
+        requests[0].headers[http::header::USER_AGENT]
+            .to_str()
+            .unwrap()
+            .starts_with(REDDIT_USER_AGENT_PREFIX)
+    );
+    let output = &execution.output;
+    assert_eq!(output.url, REDDIT_THREAD_URL);
+    assert_eq!(output.final_url.as_deref(), Some(REDDIT_THREAD_RSS_URL));
+    assert_eq!(output.extraction_method, Some(REDDIT_RSS_METHOD));
+    assert!(
+        execution
+            .model_text
+            .starts_with("# Which allocator do you ship with?\n\nr/rustexample · u/example_author")
+    );
+    assert!(execution.model_text.contains("- **u/first_reply**"));
+    let icon_requests = icons.requests.lock().expect("icon requests");
+    assert_eq!(icon_requests[0].page_url, REDDIT_THREAD_URL);
+    assert!(
+        icon_requests[0]
+            .html
+            .as_deref()
+            .is_some_and(|html| html.contains("redditstatic.com"))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_reddit_feed_falls_back_to_the_api() {
+    let (group, http, _) = reddit_group(vec![
+        forbidden(),
+        Ok(response(
+            REDDIT_THREAD_JSON_URL,
+            StatusCode::OK,
+            Some("application/json"),
+            REDDIT_THREAD_JSON,
+        )),
+    ]);
+    let execution = fetch_reddit(&group, WebfetchFormat::Markdown)
+        .await
+        .expect("reddit API fallback");
+
+    let urls = http
+        .requests()
+        .iter()
+        .map(|request| request.url.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(urls, [REDDIT_THREAD_RSS_URL, REDDIT_THREAD_JSON_URL]);
+    assert_eq!(execution.output.extraction_method, Some(REDDIT_JSON_METHOD));
+    assert!(execution.model_text.contains("42 points"));
+    assert!(
+        execution
+            .model_text
+            .contains("  - **u/nested_reply** · 4 points")
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_reddit_feed_says_when_to_retry_without_trying_the_api() {
+    let mut limited = response(
+        REDDIT_THREAD_RSS_URL,
+        StatusCode::TOO_MANY_REQUESTS,
+        None,
+        Bytes::new(),
+    );
+    limited
+        .headers
+        .insert("x-ratelimit-reset", http::HeaderValue::from_static("35"));
+    let (group, http, _) = reddit_group(vec![Ok(limited)]);
+    let error = fetch_reddit(&group, WebfetchFormat::Markdown)
+        .await
+        .expect_err("rate limited");
+
+    assert_eq!(http.requests().len(), 1);
+    assert_eq!(error.code(), OPERATION_FAILED_CODE);
+    assert_eq!(error.to_string(), RATE_LIMITED_MESSAGE);
+}
+
+#[tokio::test]
+async fn a_reddit_refusal_on_both_attempts_reports_the_last_one() {
+    let (group, http, _) = reddit_group(vec![forbidden(), forbidden()]);
+    let error = fetch_reddit(&group, WebfetchFormat::Markdown)
+        .await
+        .expect_err("refused twice");
+
+    assert_eq!(http.requests().len(), 2);
+    assert_eq!(error.code(), OPERATION_FAILED_CODE);
+    assert_eq!(error.to_string(), FORBIDDEN_MESSAGE);
+}
+
+#[tokio::test]
+async fn raw_reddit_html_is_fetched_unchanged() {
+    let (group, http, _) = reddit_group(vec![Ok(response(
+        REDDIT_THREAD_URL,
+        StatusCode::OK,
+        Some("text/html"),
+        Bytes::from_static(b"<html><body><p>page</p></body></html>"),
+    ))]);
+    fetch_reddit(&group, WebfetchFormat::Html)
+        .await
+        .expect("raw html");
+
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.as_str(), REDDIT_THREAD_URL);
 }

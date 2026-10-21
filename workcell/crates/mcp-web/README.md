@@ -79,6 +79,31 @@ Search provider selection is immutable process configuration, never model-contro
   handling.
 - Already-fetched HTML is reused during source-icon discovery.
 
+## Site rules
+
+Some sites serve their HTML behind a script challenge but publish the same content as a feed or an
+API. A site rule in `src/fetch/sites/` reads those instead. Each rule is one module implementing
+`SiteRule::plan`, which turns a URL and format into ordered attempts: a target URL, request headers
+(such as the site's User-Agent and Accept), the statuses that move on to the next attempt, and an
+optional renderer that turns the response into Markdown or text. An attempt without a renderer goes
+through the ordinary HTML, text, and PDF pipeline, so a rule that only rewrites a URL or changes a
+header needs no rendering code.
+
+- Every attempt URL passes the same URL policy as the caller's URL when the fetch is prepared, and
+  every attempt shares the fetch's single deadline.
+- The output keeps the caller's URL as `url`; `finalUrl` is the address that answered, and
+  `extractionMethod` names the renderer, such as `reddit-rss`.
+- Renderers run in the bounded blocking pool and must not panic on hostile input; a renderer error
+  moves on to the next attempt, and on the last one fails the fetch.
+- A rule may declare an icon URL so icon discovery never fetches the rate-limited page again.
+
+To add a site, write `src/fetch/sites/<site>.rs` and list it in `RULES` in `src/fetch/sites/mod.rs`.
+
+`reddit.rs` reads threads, comment permalinks, `redd.it` links, subreddits, user pages, and searches
+from Reddit's Atom feed, and from its JSON API only when the feed answers 403. A 429 does not fall
+back, since both share one rate limit; its error says when to retry. `format: "html"` and paths the
+rule does not know are fetched unchanged.
+
 ## Parser Containment
 
 HTML, PDF, search JSON, and image work run outside async executor threads behind a shared four-job

@@ -188,7 +188,7 @@ fn parse_error() -> WebfetchError {
     WebfetchError::Operation("Failed to parse HTML content.".to_owned())
 }
 
-fn blocking_error(error: BlockingError, timeout_seconds: u64) -> WebfetchError {
+pub(super) fn blocking_error(error: BlockingError, timeout_seconds: u64) -> WebfetchError {
     match error {
         BlockingError::Cancelled => WebfetchError::Aborted,
         BlockingError::TimedOut => WebfetchError::timed_out(timeout_seconds),
