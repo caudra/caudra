@@ -319,6 +319,10 @@ httpdate = "1.0.3"
 lru = "0.18.1"
 monty-pool = "=1.2.0"
 monty-types-registry = { package = "monty-types", version = "=1.2.0" }
+# The parser Monty runs snippets with: keep in lockstep with Monty's own `ruff_*` versions.
+ruff_python_ast = "=0.0.14"
+ruff_python_parser = "=0.0.14"
+ruff_text_size = "=0.0.14"
 notify-8 = { package = "notify", version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 pdf_oxide = { version = "0.3.74", default-features = false }
 proptest = "1.11.0"

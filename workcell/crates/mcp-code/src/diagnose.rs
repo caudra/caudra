@@ -22,6 +22,14 @@ const INVALID_SYNTAX_RULE: &str = "[invalid-syntax]";
 const RETURN_OUTSIDE_FUNCTION: &str = "`return` statement outside of a function";
 const TOP_LEVEL_RETURN_GUIDANCE: &str = "A snippet is module code, not a function body, so nothing ran. End on the value you want back instead of returning it, and keep `return` inside functions.";
 const SYNTAX_GUIDANCE: &str = "The snippet is not valid Python, so nothing ran.";
+/// The parser's words for an indentation error, as `Unexpected indentation`, `unindent does not
+/// match any outer indentation level`, and `Expected an indented block after ...`.
+const INDENTATION_ERRORS: [&str; 3] = [
+    "Unexpected indentation",
+    "unindent does not match",
+    "Expected an indented block",
+];
+const INDENTATION_GUIDANCE: &str = "The snippet's indentation is not valid Python, so nothing ran. A line goes deeper only after one ending in `:`, every line of a block starts at the same column, and a dedent returns to a column an outer block used. Indent with spaces.";
 /// How the interpreter's `NameError` starts, before the name.
 const NAME_ERROR_PREFIX: &str = "name '";
 const NAME_ERROR_QUOTE: char = '\'';
@@ -238,6 +246,11 @@ pub(crate) fn diagnose_type_errors_for(diagnostics: &str, surface: Surface) -> S
     if surface == Surface::Hosted && trimmed.contains(INVALID_SYNTAX_RULE) {
         let guidance = if trimmed.contains(RETURN_OUTSIDE_FUNCTION) {
             TOP_LEVEL_RETURN_GUIDANCE
+        } else if INDENTATION_ERRORS
+            .iter()
+            .any(|error| trimmed.contains(error))
+        {
+            INDENTATION_GUIDANCE
         } else {
             SYNTAX_GUIDANCE
         };
@@ -440,6 +453,9 @@ mod tests {
     /// Syntax errors get no advice about arguments or annotations, which cannot be their cause.
     #[test_case("snippet.py:3:1: error[invalid-syntax] `return` statement outside of a function", TOP_LEVEL_RETURN_GUIDANCE ; "a_return_outside_a_function")]
     #[test_case("snippet.py:1:7: error[invalid-syntax] Simple statements must be separated by newlines or semicolons", SYNTAX_GUIDANCE ; "other_syntax")]
+    #[test_case("snippet.py:3:1: error[invalid-syntax] unindent does not match any outer indentation level", INDENTATION_GUIDANCE ; "a_dedent_between_levels")]
+    #[test_case("snippet.py:2:1: error[invalid-syntax] Unexpected indentation", INDENTATION_GUIDANCE ; "an_unexpected_indent")]
+    #[test_case("snippet.py:2:1: error[invalid-syntax] Expected an indented block after `if` statement", INDENTATION_GUIDANCE ; "an_empty_block")]
     fn a_hosted_syntax_error_says_what_kind_of_code_a_snippet_is(
         diagnostics: &str,
         guidance: &str,

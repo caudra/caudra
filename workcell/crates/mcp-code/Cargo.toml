@@ -16,6 +16,9 @@ mcp = ["dep:rmcp"]
 monty-pool.workspace = true
 monty-types-registry.workspace = true
 rmcp = { workspace = true, optional = true }
+ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
+ruff_text_size.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

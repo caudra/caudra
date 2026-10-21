@@ -7,6 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use ruff_python_ast::PySourceType;
+use ruff_python_ast::token::{Token, TokenKind};
+use ruff_python_parser::{parse_module, parse_unchecked_source};
+use ruff_text_size::{Ranged, TextRange};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::subset::SUBSET_MODULES;
@@ -70,11 +74,6 @@ const BODY_FIELD: &str = "body";
 const LEFT_FIELD: &str = "left";
 const RIGHT_FIELD: &str = "right";
 const TYPE_FIELD: &str = "type";
-const COMMENT: &str = "comment";
-const LINE_CONTINUATION: &str = "line_continuation";
-const BLOCK_OPENER: &str = ":";
-const OPENING_BRACKETS: [&str; 3] = ["(", "[", "{"];
-const CLOSING_BRACKETS: [&str; 3] = [")", "]", "}"];
 const INDENT: u8 = b' ';
 
 /// One change made to a snippet before it ran.
@@ -266,21 +265,21 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
 }
 
 /// A snippet Python cannot read, with its Markdown fence blanked, JavaScript's declarations dropped,
-/// and over-indented lines lined up with their blocks: kept only when together they leave one the
-/// parser reads whole, else returned as it came. The parser reads an over-indented line as Python
-/// does not, so indentation is checked even in a snippet it reads.
+/// and over-indented blocks lined up: kept only when together they leave one Python reads whole,
+/// else returned as it came.
 fn syntax_repaired(code: String) -> (String, Vec<Repair>) {
+    if reads_as_python(&code) {
+        return (code, Vec::new());
+    }
     let mut repairs = Vec::new();
     let mut candidate = None;
-    if !reads_as_python(&code) {
-        if let Some(unfenced) = unfenced(&code) {
-            repairs.push(Repair::Unfenced);
-            candidate = Some(unfenced);
-        }
-        if let Some((undeclared, keywords)) = undeclared(candidate.as_deref().unwrap_or(&code)) {
-            repairs.extend(keywords.into_iter().map(Repair::Undeclared));
-            candidate = Some(undeclared);
-        }
+    if let Some(unfenced) = unfenced(&code) {
+        repairs.push(Repair::Unfenced);
+        candidate = Some(unfenced);
+    }
+    if let Some((undeclared, keywords)) = undeclared(candidate.as_deref().unwrap_or(&code)) {
+        repairs.extend(keywords.into_iter().map(Repair::Undeclared));
+        candidate = Some(undeclared);
     }
     if let Some(dedented) = dedented(candidate.as_deref().unwrap_or(&code)) {
         repairs.push(Repair::Dedented);
@@ -567,133 +566,115 @@ fn undeclared(code: &str) -> Option<(String, Vec<&'static str>)> {
     (!keywords.is_empty()).then(|| (applied(code, edits), keywords))
 }
 
-/// The snippet with each line indented deeper than its block lined up with it, and the lines
-/// under it moved by as much: Python goes deeper only after a line ending in `:`, so the block is
-/// the only place such a line can belong. Indentation is followed as Python follows it, and any
-/// other mismatch, or a tab, leaves the snippet as it came. Strings, comments, and lines continued
-/// inside brackets or after `\` keep their indentation.
+/// The snippet with each over-indented block lined up with the block around it, as the parser
+/// Monty runs reads it: Python goes deeper only after a line ending in `:`, so the block around a
+/// stray indent is the only place it can belong. Each pass lines up the block whose stray indent
+/// the first error sits on, and the snippet is read again; any other first error, a tab, or a pass
+/// that leaves nothing to change returns `None`. The lexer never starts a statement inside
+/// brackets, a string, a comment, or after `\`, so those lines keep their indentation.
 fn dedented(code: &str) -> Option<String> {
-    let tree = parse(code)?;
-    let mut levels = vec![0];
-    let mut strays: Vec<Stray> = Vec::new();
-    let mut opens_block = false;
-    let mut edits = Vec::new();
-    for line in logical_lines(code, &tree)? {
-        while strays
-            .last()
-            .is_some_and(|stray| line.width < stray.written)
-        {
-            strays.pop();
-        }
-        let mut width = line
-            .width
-            .checked_sub(strays.iter().map(|stray| stray.removed).sum())?;
-        let level = *levels.last()?;
-        if width > level && opens_block {
-            levels.push(width);
-        } else if width > level {
-            strays.push(Stray {
-                written: line.width,
-                removed: width - level,
-            });
-            width = level;
-        } else if opens_block {
+    let mut current = code.to_owned();
+    for _ in 0..=code.lines().count() {
+        let parsed = parse_unchecked_source(&current, PySourceType::Python);
+        let Some(first) = parsed
+            .errors()
+            .iter()
+            .min_by_key(|error| error.location.start())
+        else {
+            return (current != code).then_some(current);
+        };
+        if !is_stray_indent(parsed.tokens(), first.location) {
             return None;
-        } else {
-            while levels.last().is_some_and(|open| *open > width) {
-                levels.pop();
-            }
-            if levels.last() != Some(&width) {
-                return None;
-            }
         }
-        if width < line.width {
-            edits.push(Edit::remove(line.start, line.start + line.width - width));
-        }
-        opens_block = line.opens_block;
+        let edits = lined_up(&current, parsed.tokens(), first.location.start().to_usize())?;
+        current = applied(&current, edits);
     }
-    (!edits.is_empty()).then(|| applied(code, edits))
+    None
 }
 
-/// An over-indented line: how deep it was written, and how much was taken off it and the lines
-/// under it.
-struct Stray {
-    written: usize,
-    removed: usize,
+/// Whether an error sits on an `Indent` that no line ending in `:` opened. The parser names it
+/// `Unexpected indentation`, or by what it expected there instead, as a definition after a
+/// decorator or `except` after `try`.
+fn is_stray_indent(tokens: &[Token], location: TextRange) -> bool {
+    let Some(indent) = tokens
+        .iter()
+        .position(|token| token.kind() == TokenKind::Indent && token.range() == location)
+    else {
+        return false;
+    };
+    tokens[..indent].iter().map(Token::kind).rfind(|kind| {
+        !matches!(
+            kind,
+            TokenKind::Newline | TokenKind::NonLogicalNewline | TokenKind::Comment
+        )
+    }) != Some(TokenKind::Colon)
 }
 
-/// Where a statement starts a line, as Python's indentation sees it.
-struct LogicalLine {
+/// The edits taking the stray statement whose indentation starts at `at`, and the statements
+/// after it as deep or deeper, back to the indentation of the statement before it: the deepest
+/// block open there, since everything before the first error is valid.
+fn lined_up(code: &str, tokens: &[Token], at: usize) -> Option<Vec<Edit>> {
+    let starts = statement_starts(code, tokens)?;
+    let first = starts.iter().position(|start| start.token >= at)?;
+    let enclosing = first
+        .checked_sub(1)
+        .map_or(0, |previous| starts[previous].width);
+    let written = starts[first].width;
+    let shift = written.checked_sub(enclosing).filter(|shift| *shift > 0)?;
+    Some(
+        starts[first..]
+            .iter()
+            .take_while(|start| start.width >= written)
+            .map(|start| Edit::remove(start.line, start.line + shift))
+            .collect(),
+    )
+}
+
+/// A token that starts a statement on its own line.
+struct StatementStart {
     /// The byte its line starts at.
-    start: usize,
+    line: usize,
     /// Its indentation, in spaces.
     width: usize,
-    /// Whether it ends in `:`, so the next one may go deeper.
-    opens_block: bool,
+    /// The byte the token starts at.
+    token: usize,
 }
 
-/// The lines that start a statement: not inside brackets, a string, or after `\`, and not only a
-/// comment. `None` when one is indented with anything but spaces.
-fn logical_lines(code: &str, tree: &Tree) -> Option<Vec<LogicalLine>> {
-    let mut lines: Vec<LogicalLine> = Vec::new();
-    let mut depth = 0_usize;
-    let mut previous: Option<Node<'_>> = None;
-    for lexeme in lexemes(tree) {
-        let kind = lexeme.kind();
-        let starts_row = previous.is_none_or(|previous| {
-            previous.end_position().row < lexeme.start_position().row
-                && previous.kind() != LINE_CONTINUATION
-        });
-        if starts_row && depth == 0 && kind != COMMENT {
-            let start = lexeme.start_byte() - lexeme.start_position().column;
-            let indent = &code.as_bytes()[start..lexeme.start_byte()];
-            if indent.iter().any(|byte| *byte != INDENT) {
-                return None;
+/// Every token after a `Newline` that is neither indentation nor a comment, with its line's
+/// indentation: an indentation the lexer rejected comes as an `Unknown` token, so the width is
+/// read from the line. `None` when one is indented with anything but spaces.
+fn statement_starts(code: &str, tokens: &[Token]) -> Option<Vec<StatementStart>> {
+    let mut starts = Vec::new();
+    let mut at_line_start = true;
+    for token in tokens {
+        match token.kind() {
+            TokenKind::Newline => at_line_start = true,
+            TokenKind::Indent
+            | TokenKind::Dedent
+            | TokenKind::Comment
+            | TokenKind::NonLogicalNewline
+            | TokenKind::EndOfFile => {}
+            _ if at_line_start => {
+                at_line_start = false;
+                let token = token.start().to_usize();
+                let line = code[..token].rfind('\n').map_or(0, |newline| newline + 1);
+                let indentation = code[line..]
+                    .bytes()
+                    .take_while(u8::is_ascii_whitespace)
+                    .take_while(|byte| !matches!(byte, b'\n' | b'\r'));
+                let mut width = 0;
+                for byte in indentation {
+                    if byte != INDENT {
+                        return None;
+                    }
+                    width += 1;
+                }
+                starts.push(StatementStart { line, width, token });
             }
-            lines.push(LogicalLine {
-                start,
-                width: indent.len(),
-                opens_block: false,
-            });
-        }
-        if OPENING_BRACKETS.contains(&kind) {
-            depth += 1;
-        } else if CLOSING_BRACKETS.contains(&kind) {
-            depth = depth.saturating_sub(1);
-        }
-        if kind != COMMENT
-            && kind != LINE_CONTINUATION
-            && let Some(line) = lines.last_mut()
-        {
-            line.opens_block = kind == BLOCK_OPENER;
-        }
-        previous = Some(lexeme);
-    }
-    Some(lines)
-}
-
-/// The tree's tokens in source order, with each string whole, so nothing inside one is a token.
-fn lexemes(tree: &Tree) -> Vec<Node<'_>> {
-    let mut lexemes = Vec::new();
-    let mut cursor = tree.walk();
-    loop {
-        let node = cursor.node();
-        let whole = node.kind() == STRING || node.child_count() == 0;
-        if whole && !node.is_missing() {
-            lexemes.push(node);
-        }
-        if !whole && cursor.goto_first_child() || cursor.goto_next_sibling() {
-            continue;
-        }
-        loop {
-            if !cursor.goto_parent() {
-                return lexemes;
-            }
-            if cursor.goto_next_sibling() {
-                break;
-            }
+            _ => {}
         }
     }
+    Some(starts)
 }
 
 /// `gh.list({state: "open"})`, JavaScript's single object argument to a host call, as
@@ -779,9 +760,10 @@ fn names_outside_keys<'code>(root: Node<'_>, code: &'code str) -> HashSet<&'code
     names
 }
 
-/// Whether the parser reads the repaired snippet as Python throughout.
+/// Whether the parser Monty runs a snippet with reads it whole. Tree-sitter, which the repairs walk,
+/// accepts some code that one rejects, such as an over-indented line.
 pub(crate) fn reads_as_python(code: &str) -> bool {
-    parse(code).is_some_and(|tree| !tree.root_node().has_error())
+    parse_module(code).is_ok()
 }
 
 fn parse(code: &str) -> Option<Tree> {
@@ -977,6 +959,9 @@ mod tests {
 
     use super::*;
 
+    const CORPUS_VARIABLE: &str = "WORKCELL_PYTHON_CORPUS";
+    const MAX_STRAYS_PER_FILE: usize = 40;
+    const STRAY_WIDTHS: [usize; 2] = [1, 4];
     const STUBS: &str = "class _Gh:\n    async def list(self) -> list[str]: ...\n    def nope(self) -> int: ...\ngh: _Gh\ndef search(query: str) -> list[str]: ...\ndef servers() -> list[str]: ...\nasync def resources(server: str) -> list[str]: ...\n";
 
     fn repaired(code: &str) -> Repaired {
@@ -1226,6 +1211,12 @@ mod tests {
     #[test_case("x = 1\n  y = '''\n    z = 1\n'''", "x = 1\ny = '''\n    z = 1\n'''" ; "a_string_is_never_touched")]
     #[test_case("x = 1\n  y = 1 + \\\n    2", "x = 1\ny = 1 + \\\n    2" ; "a_continued_line_keeps_its_indentation")]
     #[test_case("```python\nx = 1\n  x\n```", "\nx = 1\nx\n" ; "inside_a_fence")]
+    #[test_case("x = 1\n  y = 2\n    z = 3", "x = 1\ny = 2\nz = 3" ; "a_stray_inside_a_stray")]
+    #[test_case("x = 1\n  if x:\n      y = 2\nz = 3", "x = 1\nif x:\n    y = 2\nz = 3" ; "a_stray_block_header")]
+    #[test_case("x = 1\n    y = 2\n  z = 3", "x = 1\ny = 2\nz = 3" ; "a_shallower_stray_after_a_deeper_one")]
+    #[test_case("import datetime\r\n datetime.datetime.now()", "import datetime\r\ndatetime.datetime.now()" ; "crlf")]
+    #[test_case("@a\n @b\nclass C: pass", "@a\n@b\nclass C: pass" ; "between_decorators")]
+    #[test_case("try: a()\n except OSError: pass", "try: a()\nexcept OSError: pass" ; "a_clause_after_a_one_line_block")]
     fn an_over_indented_line_is_lined_up_with_its_block(code: &str, expected: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, expected);
@@ -1245,6 +1236,7 @@ mod tests {
     #[test_case("if x: y = 1\nz = 2" ; "a_one_line_block")]
     #[test_case("try:\n    a()\nexcept Exception as error:\n    b(error)\nfinally:\n    c()" ; "a_try")]
     #[test_case("x = 1 + \\\n        2\ny = f'''{x}\n   {x}'''" ; "continued_lines")]
+    #[test_case("if x:\n\ty = 1\n\tz = 2" ; "tabs")]
     fn valid_python_keeps_its_indentation(code: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, code);
@@ -1254,12 +1246,83 @@ mod tests {
     #[test_case("if x:\n    a = 1\n  b = 2" ; "an_unindent_that_matches_no_block")]
     #[test_case("if x:\ny = 1" ; "a_block_left_empty")]
     #[test_case("x = 1\n\ty = 2" ; "a_tab")]
+    #[test_case("if x:\n\ty = 1\n  \tz = 2" ; "a_stray_among_tabs")]
+    #[test_case("if x:\n    if y:\n        a = 1\n      b = 2" ; "a_dedent_between_levels")]
     #[test_case("x = 1\n  y = (" ; "still_broken_after")]
     #[test_case("x = '''\n  a\n'''" ; "a_string_alone")]
     fn other_indentation_is_left_alone(code: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, code);
         assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+    }
+
+    /// Over real Python: `WORKCELL_PYTHON_CORPUS=/usr/lib/python3.12 cargo nextest run -p
+    /// workcell-mcp-code --run-ignored only corpus`. Every file the parser reads is left alone, and
+    /// every statement after one as deep and before one no deeper, pushed right, comes back as it
+    /// was written. Only those: pushed after a deeper block, a statement lands on or between that
+    /// block's levels, where it reads as part of it or is ambiguous.
+    #[test]
+    #[ignore = "reads a Python corpus named by WORKCELL_PYTHON_CORPUS"]
+    fn corpus_strays_come_back_as_written() {
+        let corpus = std::env::var_os(CORPUS_VARIABLE).expect(CORPUS_VARIABLE);
+        let mut pending = vec![std::path::PathBuf::from(corpus)];
+        let (mut files, mut cases, mut failures) = (0, 0, Vec::new());
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if path.extension().is_none_or(|extension| extension != "py") || !reads_as_python(&code)
+            {
+                continue;
+            }
+            files += 1;
+            if syntax_repaired(code.clone()) != (code.clone(), Vec::new()) {
+                failures.push(format!("{}: valid file changed", path.display()));
+            }
+            let parsed = parse_unchecked_source(&code, PySourceType::Python);
+            let Some(starts) = statement_starts(&code, parsed.tokens()) else {
+                continue;
+            };
+            let movable: Vec<&StatementStart> = starts
+                .iter()
+                .enumerate()
+                .filter(|(index, start)| {
+                    let previous = index.checked_sub(1).map(|previous| &starts[previous]);
+                    previous.is_none_or(|previous| previous.width == start.width)
+                        && starts
+                            .get(index + 1)
+                            .is_none_or(|next| next.width <= start.width)
+                })
+                .map(|(_, start)| start)
+                .collect();
+            let step = movable.len().div_ceil(MAX_STRAYS_PER_FILE).max(1);
+            for start in movable.into_iter().step_by(step) {
+                for spaces in STRAY_WIDTHS {
+                    cases += 1;
+                    let mut stray = code.clone();
+                    stray.insert_str(start.line, &" ".repeat(spaces));
+                    let (repaired, repairs) = syntax_repaired(stray);
+                    if repaired != code || repairs != [Repair::Dedented] {
+                        let line = code[..start.line].lines().count() + 1;
+                        failures.push(format!("{}:{line} +{spaces}: {repairs:?}", path.display()));
+                    }
+                }
+            }
+        }
+        eprintln!("{files} files, {cases} strays, {} failures", failures.len());
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures[..failures.len().min(30)].join("\n")
+        );
     }
 
     #[test_case("```js\nx = 1\n```" ; "another_language")]
