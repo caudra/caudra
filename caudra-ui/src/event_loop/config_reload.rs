@@ -23,6 +23,7 @@ use caudra_config::own_writes::{self, fingerprint};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::websearch::WebsearchConfig;
 use caudra_config::{Config, PermissionsConfig, fail_closed_permissions, try_load_permissions};
+use caudra_workcell::WebsearchControl;
 use toml::Table;
 use tracing::{debug, info, warn};
 
@@ -71,7 +72,7 @@ const RESTART_SUFFIX: &str = "after a restart";
 const INIT_LUA_CHANGED: &str = "init.lua changed; /reload runs it again";
 const WORKCELL_CHANGED: &str = "workcell.toml changed; /reload to apply it";
 const SANDBOXES_CHANGED: &str = "sandboxes.toml changed; /reload to apply it";
-const GLOBAL_ENV_CHANGED: &str = "the global .env changed: {env:NAME} references in config files follow it, but shell commands and keys read from the environment keep their startup values until Caudra restarts";
+const GLOBAL_ENV_CHANGED: &str = "the global .env changed: {env:NAME} references in config files and websearch backend variables follow it, but shell commands and other keys read from the environment keep their startup values until Caudra restarts";
 const PROJECT_ENV_CHANGED: &str = "the project .env changed; restart Caudra to apply it";
 const REMOTE_PROJECT: &str = "project files of a remote workspace apply after /reload";
 /// Sources read from files, as opposed to directories, so their bytes tell
@@ -366,6 +367,55 @@ fn watch(cwd: &Path, changed: &flume::Sender<BTreeSet<ConfigSource>>) -> Option<
     .ok()
 }
 
+/// A saved `caudra.toml`, on the local Workcell's `websearch` tool. `[websearch]` is read again
+/// even when the table is unchanged, since a variable it leaves to the environment may have
+/// moved; a remote Workcell is named only when the table changed.
+fn websearch_saved(
+    control: Option<&WebsearchControl>,
+    changed: &BTreeMap<String, bool>,
+    config: &WebsearchConfig,
+    report: &mut Report,
+) {
+    if changed.contains_key(WEBSEARCH_TABLE) || control.is_some() {
+        apply_websearch(control, config, report);
+    }
+}
+
+/// The global `.env` changed, which `{env:NAME}` references in `[websearch]` and the variables
+/// it leaves unset both follow. Settings that do not load keep what is in force; the
+/// `caudra.toml` reload reports why.
+fn websearch_env_changed(
+    control: Option<&WebsearchControl>,
+    reloader: &SettingsReloader,
+    cwd: Option<&Path>,
+    report: &mut Report,
+) {
+    let (Some(control), Some(cwd)) = (control, cwd) else {
+        return;
+    };
+    if let Ok(config) = reloader(cwd) {
+        apply_websearch(Some(control), &config.websearch, report);
+    }
+}
+
+/// `[websearch]` as it reads now. A reading that leaves every setting alone says nothing, and
+/// keeps searches prepared before it valid.
+fn apply_websearch(
+    control: Option<&WebsearchControl>,
+    config: &WebsearchConfig,
+    report: &mut Report,
+) {
+    let Some(control) = control else {
+        report.note(WEBSEARCH_REMOTE);
+        return;
+    };
+    let applied = control.apply(config);
+    if applied.changed {
+        report.problems.extend(applied.warnings());
+        report.note(applied.summary());
+    }
+}
+
 /// What one reload did, as the single line the user is shown.
 #[derive(Default)]
 struct Report {
@@ -488,7 +538,12 @@ impl EventLoop<'_> {
             ConfigSource::InitLua => report.note(INIT_LUA_CHANGED),
             ConfigSource::GlobalEnv => {
                 report.note(GLOBAL_ENV_CHANGED);
-                self.reapply_websearch(cwd, report);
+                websearch_env_changed(
+                    self.ctx.websearch.as_ref(),
+                    &self.config_reload.reloader,
+                    cwd,
+                    report,
+                );
             }
             ConfigSource::ProjectEnv => report.note(PROJECT_ENV_CHANGED),
         }
@@ -665,9 +720,12 @@ impl EventLoop<'_> {
                 );
                 self.apply_show_decisions(config.ui.show_decisions);
                 let changed = self.config_reload.settings_changes(local);
-                if changed.contains_key(WEBSEARCH_TABLE) || self.ctx.websearch.is_some() {
-                    self.apply_websearch(&config.websearch, report);
-                }
+                websearch_saved(
+                    self.ctx.websearch.as_ref(),
+                    &changed,
+                    &config.websearch,
+                    report,
+                );
                 if let Some(note) = settings_note(&changed) {
                     report.reloaded.push(SETTINGS_FILE);
                     report.note(note);
@@ -682,33 +740,6 @@ impl EventLoop<'_> {
                     .set(SETTINGS_FILE, error, SETTINGS_KEPT);
                 false
             }
-        }
-    }
-
-    /// `[websearch]` as saved, on the local Workcell's `websearch` tool. A save that leaves every
-    /// setting it reads alone says nothing, and keeps searches prepared before it valid.
-    fn apply_websearch(&mut self, config: &WebsearchConfig, report: &mut Report) {
-        let Some(control) = &self.ctx.websearch else {
-            report.note(WEBSEARCH_REMOTE);
-            return;
-        };
-        let applied = control.apply(config);
-        if applied.changed {
-            report.problems.extend(applied.warnings());
-            report.note(applied.summary());
-        }
-    }
-
-    /// The global `.env` changed, which `{env:NAME}` references in `[websearch]` follow.
-    fn reapply_websearch(&mut self, cwd: Option<&Path>, report: &mut Report) {
-        if self.ctx.websearch.is_none() {
-            return;
-        }
-        let Some(cwd) = cwd else {
-            return;
-        };
-        if let Ok(config) = (self.config_reload.reloader)(cwd) {
-            self.apply_websearch(&config.websearch, report);
         }
     }
 
@@ -844,17 +875,24 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use caudra_agent::config_watch::{ConfigSource, WatchRoots};
     use caudra_agent::prompt::profile::{PROFILE_DIR, PROFILE_EXTENSION, PromptProfileCatalog};
+    use caudra_config::RawConfig;
     use caudra_config::own_writes;
+    use caudra_config::websearch::{
+        SearxngSettings, SecretValue, WebsearchBackendName, WebsearchConfig,
+    };
+    use caudra_workcell::{WebsearchControl, WorkcellHost};
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::{
         Change, Fingerprints, LIST_SEPARATOR, LIVE_SUFFIX, NOW_SUFFIX, RELOAD_SUFFIX, RELOADED,
-        RESTART_SUFFIX, Report, SEPARATOR, SETTINGS_FILE, SettingsTables, WEBSEARCH_TABLE,
-        profile_problem, settings_note,
+        RESTART_SUFFIX, Report, SEPARATOR, SETTINGS_FILE, SettingsReloader, SettingsTables,
+        WEBSEARCH_REMOTE, WEBSEARCH_TABLE, profile_problem, settings_note, websearch_env_changed,
+        websearch_saved,
     };
 
     const PROBLEM: &str = "providers.toml: expected `=`";
@@ -1086,6 +1124,113 @@ mod tests {
             settings_note(&changed).unwrap(),
             format!("[{WEBSEARCH_TABLE}] {NOW_SUFFIX}{LIST_SEPARATOR}[agent] {LIVE_SUFFIX}")
         );
+    }
+
+    const SEARXNG_URL_VARIABLE: &str = "SEARXNG_URL";
+    const SEARXNG_URL: &str = "http://100.64.0.2:8788";
+    const USES_SEARXNG: &str = "websearch uses searxng";
+    const OTHER_TABLE: &str = "ui";
+
+    fn searxng_only(url: Option<&str>) -> WebsearchConfig {
+        WebsearchConfig {
+            backends: Some(vec![WebsearchBackendName::Searxng]),
+            searxng: SearxngSettings {
+                url: url.map(SecretValue::new),
+                ..SearxngSettings::default()
+            },
+            ..WebsearchConfig::default()
+        }
+    }
+
+    fn local_websearch(root: &TempDir) -> (WorkcellHost, Arc<Mutex<Option<String>>>) {
+        let host = WorkcellHost::new(root.path(), None).expect("workcell host");
+        (host, Arc::new(Mutex::new(None)))
+    }
+
+    /// `SEARXNG_URL` as the global `.env` holds it, shared with the test that edits it.
+    fn reading(host: &WorkcellHost, url: &Arc<Mutex<Option<String>>>) -> WebsearchControl {
+        let url = Arc::clone(url);
+        host.websearch().with_environment(move |name| {
+            (name == SEARXNG_URL_VARIABLE)
+                .then(|| url.lock().expect("url").clone())
+                .flatten()
+        })
+    }
+
+    fn settings_with(websearch: WebsearchConfig) -> SettingsReloader {
+        Arc::new(move |_| {
+            let mut config = RawConfig::default()
+                .into_config(false)
+                .map_err(|error| error.to_string())?;
+            config.websearch = websearch.clone();
+            Ok(config)
+        })
+    }
+
+    #[test]
+    fn a_saved_websearch_table_applies_at_once_and_a_repeat_says_nothing() {
+        let root = TempDir::new().unwrap();
+        let (host, url) = local_websearch(&root);
+        let control = reading(&host, &url);
+        let changed = BTreeMap::from([(WEBSEARCH_TABLE.to_owned(), true)]);
+        let config = searxng_only(Some(SEARXNG_URL));
+
+        let mut saved = Report::default();
+        websearch_saved(Some(&control), &changed, &config, &mut saved);
+        let mut repeated = Report::default();
+        websearch_saved(Some(&control), &changed, &config, &mut repeated);
+
+        assert_eq!(saved.notes, [USES_SEARXNG]);
+        assert!(saved.problems.is_empty());
+        assert!(repeated.notes.is_empty());
+        assert!(repeated.problems.is_empty());
+    }
+
+    #[test]
+    fn an_edited_global_env_variable_applies_without_a_save() {
+        let root = TempDir::new().unwrap();
+        let (host, url) = local_websearch(&root);
+        let control = reading(&host, &url);
+        let reloader = settings_with(searxng_only(None));
+
+        let mut startup = Report::default();
+        websearch_env_changed(Some(&control), &reloader, Some(root.path()), &mut startup);
+        *url.lock().unwrap() = Some(SEARXNG_URL.to_owned());
+        let mut edited = Report::default();
+        websearch_env_changed(Some(&control), &reloader, Some(root.path()), &mut edited);
+
+        assert!(!startup.problems.is_empty());
+        assert!(startup.notes.iter().all(|note| note != USES_SEARXNG));
+        assert_eq!(edited.notes, [USES_SEARXNG]);
+        assert!(edited.problems.is_empty());
+        assert!(
+            startup
+                .problems
+                .iter()
+                .chain(&edited.notes)
+                .all(|line| !line.contains(SEARXNG_URL))
+        );
+    }
+
+    #[test_case(WEBSEARCH_TABLE, &[WEBSEARCH_REMOTE]; "a_websearch_edit_names_the_remote_workcell")]
+    #[test_case(OTHER_TABLE, &[]; "another_edit_says_nothing")]
+    fn a_remote_workcell_keeps_its_own_websearch(edited: &str, notes: &[&str]) {
+        let root = TempDir::new().unwrap();
+        let changed = BTreeMap::from([(edited.to_owned(), true)]);
+        let config = searxng_only(Some(SEARXNG_URL));
+
+        let mut saved = Report::default();
+        websearch_saved(None, &changed, &config, &mut saved);
+        let mut env_changed = Report::default();
+        websearch_env_changed(
+            None,
+            &settings_with(config),
+            Some(root.path()),
+            &mut env_changed,
+        );
+
+        assert_eq!(saved.notes, notes);
+        assert!(env_changed.notes.is_empty());
     }
 
     #[test]

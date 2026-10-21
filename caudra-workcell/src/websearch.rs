@@ -1,6 +1,7 @@
 //! The backends the embedded `websearch` tool uses: the global `[websearch]` table first, then
-//! Workcell's own variables, read through `caudra_config::global_env_value` so a project `.env`
-//! never supplies one. Workcell's parser decides what each setting means.
+//! Workcell's own variables, read through `caudra_config::current_global_env_value` so an edit to
+//! the global `.env` applies at the next reload and a project `.env` never supplies one.
+//! Workcell's parser decides what each setting means.
 
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ const UNREADABLE: u8 = 3;
 
 /// What a variable reads as: `Err` for a value that is not valid UTF-8.
 pub(crate) type EnvRead<'a> = &'a dyn Fn(&str) -> Result<Option<String>, ()>;
+type Environment = Arc<dyn Fn(&str) -> Result<Option<String>, ()> + Send + Sync>;
 
 pub(crate) struct Resolution {
     pub(crate) configuration: WebsearchExecutionConfiguration,
@@ -83,8 +85,8 @@ fn configured(config: &WebsearchConfig, name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn production_env(name: &str) -> Result<Option<String>, ()> {
-    caudra_config::global_env_value(name).map_err(|_| ())
+fn production_env(name: &str) -> Result<Option<String>, ()> {
+    caudra_config::current_global_env_value(name).map_err(|_| ())
 }
 
 /// Where a backend's settings come from.
@@ -171,17 +173,32 @@ impl WebsearchReport {
 #[derive(Clone)]
 pub struct WebsearchControl {
     host: Arc<HostInner>,
+    env: Environment,
 }
 
 impl WebsearchControl {
     pub(crate) fn new(host: Arc<HostInner>) -> Self {
-        Self { host }
+        Self {
+            host,
+            env: Arc::new(production_env),
+        }
+    }
+
+    /// Reads Workcell's variables through `env` instead of the process and the global `.env`.
+    pub fn with_environment(
+        self,
+        env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            env: Arc::new(move |name| Ok(env(name))),
+            ..self
+        }
     }
 
     /// Puts `config` in force, unless every setting it reads is what is already in force: a
     /// change bumps the configuration revision, which fails a search prepared before it.
     pub fn apply(&self, config: &WebsearchConfig) -> WebsearchReport {
-        self.apply_with(config, &production_env)
+        self.apply_with(config, &*self.env)
     }
 
     pub(crate) fn apply_with(&self, config: &WebsearchConfig, env: EnvRead<'_>) -> WebsearchReport {
@@ -224,7 +241,7 @@ impl WebsearchControl {
 
     /// Every backend as `config` and the environment set it up, each resolved on its own.
     pub fn status(&self, config: &WebsearchConfig) -> Vec<BackendStatus> {
-        statuses(config, &production_env)
+        statuses(config, &*self.env)
     }
 }
 

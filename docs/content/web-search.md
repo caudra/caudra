@@ -67,7 +67,9 @@ When Caudra runs its tools on a remote Workcell, the tab is read-only, since web
 
 ## When changes apply
 
-While the terminal UI runs, a saved edit to `[websearch]` applies at once, in every open session, and so does a change to the global `.env` that one of its `{env:NAME}` references reads. The footer says which backends are now in use. A save that changes no setting keeps searches already waiting for your approval valid. One that changes a setting makes them fail, and the model searches again. Headless runs and ACP read the settings at startup. See [Hot reload](/docs/configuration/#hot-reload).
+While the terminal UI runs, a saved edit to `[websearch]` applies at once, in every open session. So does an edit to the global `.env` that changes a value `[websearch]` reads, whether through an `{env:NAME}` reference or a variable such as `SEARXNG_URL` that stands in for a key you left out. A variable Caudra inherited from the shell that started it keeps its value until a restart. The footer says which backends are now in use. A save that changes no setting keeps searches already waiting for your approval valid. One that changes a setting makes them fail, and the model searches again.
+
+`caudra prompt` and other headless runs, and ACP sessions, read the settings once, at startup. Restart an ACP session for an edit to apply there. See [Hot reload](/docs/configuration/#hot-reload).
 
 These settings drive the Workcell embedded in Caudra. A [remote workspace](/docs/remote-workspaces/) or [sandbox](/docs/sandboxes/) runs its own Workcell, which reads `WORKCELL_WEBSEARCH_BACKEND` and the other variables from its own environment.
 

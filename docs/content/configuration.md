@@ -128,7 +128,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 | Workflows and automations | Caudra reads them again each time it lists, launches, or arms one. |
 | `workcell.toml` and `sandboxes.toml` | After `/reload`. |
 | `init.lua` | After `/reload`, which runs it again. A changed script never runs by itself. |
-| Global `.env` | `{env:NAME}` references follow it at once, and `[websearch]` takes them up when it changes. Shell commands and keys read from the environment keep their startup values until a restart. |
+| Global `.env` | `{env:NAME}` references follow it at once. `[websearch]` takes up both its references and the backend variables it leaves to the environment, such as `SEARXNG_URL`. Shell commands and other keys read from the environment keep their startup values until a restart. |
 | Files that `{file:PATH}` reads | When the config file that names them reloads. Caudra does not watch them. |
 | Project `.env` | After a restart. |
 

@@ -4563,6 +4563,27 @@ fn inherited_env_value(key: &str) -> Result<Option<String>, std::env::VarError> 
     global_env_value(key)
 }
 
+/// `key` as the process inherited it, else as the global `.env` holds it now. Unlike
+/// [`global_env_value`], an edit to the global `.env` shows on the next read, and the process
+/// environment stays as it was. A project `.env` never supplies a value.
+pub fn current_global_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
+    current_env_value_in(key, global_dir().as_deref())
+}
+
+fn current_env_value_in(
+    key: &str,
+    global: Option<&Path>,
+) -> Result<Option<String>, std::env::VarError> {
+    if let Some(value) = inherited_env_value(key)? {
+        return Ok(Some(value));
+    }
+    let mut vars = HashMap::new();
+    if let Some(dir) = global {
+        collect_env_vars(&dir.join(ENV_FILE), &mut vars);
+    }
+    Ok(vars.remove(key).filter(|_| env_file_var_is_allowed(key)))
+}
+
 pub fn load_global_env_file() {
     load_env_files_scoped(Path::new("."), global_dir().as_deref(), false);
 }
@@ -7269,6 +7290,74 @@ allow = [\"list_issues\"]
         assert_eq!(env::var(KEY).unwrap(), PROJECT_CREDENTIAL);
         assert_eq!(decision_env_key(&endpoint), None);
         unsafe { env::remove_var(KEY) };
+    }
+
+    const CURRENT_STARTUP: &str = "http://startup.test";
+    const CURRENT_EDITED: &str = "http://edited.test";
+    const CURRENT_PROJECT: &str = "http://project.test";
+    const CURRENT_PROCESS: &str = "http://process.test";
+
+    fn env_layers(dir: &TempDir) -> (PathBuf, PathBuf) {
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        let project = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        (global.join(ENV_FILE), project.join(ENV_FILE))
+    }
+
+    #[test]
+    fn an_edit_to_the_global_env_shows_on_the_next_read() {
+        const KEY: &str = "CAUDRA_TEST_CURRENT_GLOBAL_EDITED";
+        let dir = TempDir::new().unwrap();
+        let (global_env, _) = env_layers(&dir);
+        let global = global_env.parent().unwrap();
+        fs::write(&global_env, format!("{KEY}={CURRENT_STARTUP}")).unwrap();
+        load_env_files_scoped(dir.path(), Some(global), true);
+
+        fs::write(&global_env, format!("{KEY}={CURRENT_EDITED}")).unwrap();
+        let edited = current_env_value_in(KEY, Some(global)).unwrap();
+        fs::write(&global_env, "").unwrap();
+        let removed = current_env_value_in(KEY, Some(global)).unwrap();
+        let process = env::var(KEY).unwrap();
+        unsafe { env::remove_var(KEY) };
+
+        assert_eq!(edited.as_deref(), Some(CURRENT_EDITED));
+        assert_eq!(removed, None);
+        assert_eq!(process, CURRENT_STARTUP);
+    }
+
+    #[test]
+    fn a_project_env_never_supplies_a_current_value() {
+        const KEY: &str = "CAUDRA_TEST_CURRENT_PROJECT_ONLY";
+        let dir = TempDir::new().unwrap();
+        let (global_env, project_env) = env_layers(&dir);
+        let global = global_env.parent().unwrap();
+        fs::write(&project_env, format!("{KEY}={CURRENT_PROJECT}")).unwrap();
+        load_env_files_scoped(dir.path(), Some(global), true);
+
+        let project_only = current_env_value_in(KEY, Some(global)).unwrap();
+        fs::write(&global_env, format!("{KEY}={CURRENT_EDITED}")).unwrap();
+        let global_added = current_env_value_in(KEY, Some(global)).unwrap();
+        unsafe { env::remove_var(KEY) };
+
+        assert_eq!(project_only, None);
+        assert_eq!(global_added.as_deref(), Some(CURRENT_EDITED));
+    }
+
+    #[test]
+    fn an_inherited_variable_wins_over_the_global_env() {
+        const KEY: &str = "CAUDRA_TEST_CURRENT_INHERITED";
+        let dir = TempDir::new().unwrap();
+        let (global_env, _) = env_layers(&dir);
+        let global = global_env.parent().unwrap();
+        fs::write(&global_env, format!("{KEY}={CURRENT_EDITED}")).unwrap();
+        unsafe { env::set_var(KEY, CURRENT_PROCESS) };
+        load_env_files_scoped(dir.path(), Some(global), true);
+
+        let current = current_env_value_in(KEY, Some(global)).unwrap();
+        unsafe { env::remove_var(KEY) };
+
+        assert_eq!(current.as_deref(), Some(CURRENT_PROCESS));
     }
 
     #[test]

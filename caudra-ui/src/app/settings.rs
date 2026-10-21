@@ -199,7 +199,7 @@ fn environment(key: &str) -> Option<String> {
         .iter()
         .find(|field| field.name == key)
         .and_then(|field| field.env)
-        .and_then(|name| caudra_config::global_env_value(name).ok().flatten())
+        .and_then(|name| caudra_config::current_global_env_value(name).ok().flatten())
 }
 
 #[cfg(test)]
