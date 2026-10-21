@@ -647,12 +647,12 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, pstack: bool) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    command::discover_commands(&cwd)
+    command::discover_commands(&cwd, pstack)
 }
 
 fn login_placeholder_model() -> Result<Model> {
@@ -701,9 +701,9 @@ fn build_stack(
     let loaded = load_recorded_settings(&plugin_host, &cli.startup, cwd, remote).and_then(
         |(settings, lua_layers)| {
             let config = resolve_config(settings, &ConfigFlags::of(cli), cwd, remote)?;
-            // The catalog holds pstack's task profiles only while pstack is on.
-            caudra_agent::pstack::configure(config.agent.builtin_skills.pstack);
-            let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
+            let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user(
+                config.agent.builtin_skills.pstack,
+            ));
             let selected_name = cli
                 .system_prompt_profile
                 .as_deref()
@@ -741,7 +741,10 @@ fn build_stack(
         }
     }
 
-    let commands = discover_commands(cli.no_commands || remote);
+    let commands = discover_commands(
+        cli.no_commands || remote,
+        config.agent.builtin_skills.pstack,
+    );
 
     // A fresh session opens in `ui.default_mode`; a resumed one overrides this
     // with the model it stored.
@@ -2082,8 +2085,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                         if tabs.is_empty() {
                             tabs.push(fresh_tab(&stack.model.spec(), &runtime_cwd, &storage)?);
                         }
-                        stack.commands =
-                            discover_commands(cli.no_commands || workcell_runtime.is_remote());
+                        stack.commands = discover_commands(
+                            cli.no_commands || workcell_runtime.is_remote(),
+                            stack.config.agent.builtin_skills.pstack,
+                        );
                         committed_relocation = None;
                         continue;
                     }
@@ -2139,7 +2144,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     ),
                     None => resolved.warnings,
                 });
-                stack.commands = discover_commands(cli.no_commands || workcell_runtime.is_remote());
+                stack.commands = discover_commands(
+                    cli.no_commands || workcell_runtime.is_remote(),
+                    stack.config.agent.builtin_skills.pstack,
+                );
                 committed_relocation = None;
                 continue;
             }

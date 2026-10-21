@@ -87,11 +87,15 @@ pub fn run(host: &dyn Host, argv: &[String]) -> Output {
     let Some(file) = argv.first().filter(|file| !file.is_empty()) else {
         return Output::failure(2, USAGE);
     };
-    let content = match fs::read(host.resolve(file)) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(error) => return Output::failure(1, format!("Error: {error}, open '{file}'\n")),
-    };
-    let checked = check(file, &content);
+    match fs::read(host.resolve(file)) {
+        Ok(bytes) => check_text(file, &String::from_utf8_lossy(&bytes)),
+        Err(error) => Output::failure(1, format!("Error: {error}, open '{file}'\n")),
+    }
+}
+
+/// Checks a plan already in hand, naming it `label` in every problem as the file name would be.
+pub fn check_text(label: &str, content: &str) -> Output {
+    let checked = check(label, content);
     Output {
         code: i32::from(!checked.problems.is_empty()),
         stdout: checked.stdout,

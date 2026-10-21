@@ -636,10 +636,7 @@ impl EventLoop<'_> {
                     self.ctx.config.builtin_skills.pstack != config.agent.builtin_skills.pstack;
                 self.ctx.config = config.agent;
                 if pstack_switched {
-                    self.reload_prompt_profiles(report);
-                    if local {
-                        self.reload_commands(cwd);
-                    }
+                    self.apply_pstack(cwd, local, report);
                 }
                 for runtime in &self.sessions {
                     runtime
@@ -677,11 +674,28 @@ impl EventLoop<'_> {
         }
     }
 
+    /// `builtin_skills.pstack` turned on or off: the skill and bundled automations the reloader
+    /// installed or removed, which each automation runtime lists at its next scan, the
+    /// `pstack-*` profiles, and the `/pstack:` commands of every tab, local or remote.
+    fn apply_pstack(&mut self, cwd: &Path, local: bool, report: &mut Report) {
+        skill::refresh(ToolRegistry::global());
+        self.reload_prompt_profiles(report);
+        if local {
+            self.reload_commands(cwd);
+        }
+        let pstack = self.ctx.config.builtin_skills.pstack;
+        for runtime in &mut self.sessions {
+            runtime.app.set_pstack(pstack);
+        }
+    }
+
     /// A session keeps a profile that is gone from disk, or broken, as it was
     /// loaded. Every tab takes the rest, so an agent it spawns later builds
     /// from what is on disk now.
     fn reload_prompt_profiles(&mut self, report: &mut Report) {
-        let catalog = Arc::new(PromptProfileCatalog::discover_user());
+        let catalog = Arc::new(PromptProfileCatalog::discover_user(
+            self.ctx.config.builtin_skills.pstack,
+        ));
         catalog.refresh(&mut self.ctx.default_prompt_profile);
         for runtime in &mut self.sessions {
             runtime.app.adopt_prompt_profiles(&catalog);
@@ -730,7 +744,10 @@ impl EventLoop<'_> {
         let commands: Arc<[CustomCommand]> = if self.ctx.no_commands {
             Arc::from([])
         } else {
-            Arc::from(discover_commands(cwd))
+            Arc::from(discover_commands(
+                cwd,
+                self.ctx.config.builtin_skills.pstack,
+            ))
         };
         for runtime in &mut self.sessions {
             runtime.app.reload_commands(Arc::clone(&commands));
@@ -1022,7 +1039,7 @@ mod tests {
         for (name, text) in saved {
             fs::write(profiles.join(format!("{name}.{PROFILE_EXTENSION}")), text).unwrap();
         }
-        PromptProfileCatalog::discover_with(Some(dir.path()))
+        PromptProfileCatalog::discover_with(Some(dir.path()), false)
     }
 
     #[test_case(&[LOADING_PROFILE], &[] ; "every_profile_loads")]

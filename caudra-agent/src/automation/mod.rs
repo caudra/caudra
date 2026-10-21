@@ -12,6 +12,7 @@
 //! [`frontend`] holds what every frontend tells its runtime. The runtime refuses to start while
 //! `experimental.automations` is off.
 
+pub mod bundled;
 pub mod busy;
 pub mod catalog;
 pub mod clock;

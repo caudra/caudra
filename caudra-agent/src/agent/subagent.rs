@@ -2741,7 +2741,7 @@ mod tests {
             format!("{frontmatter}{PROFILE_BODY}"),
         )
         .unwrap();
-        crate::prompt::profile::PromptProfileCatalog::discover_with(Some(dir.path()))
+        crate::prompt::profile::PromptProfileCatalog::discover_with(Some(dir.path()), false)
             .get(PINNING_PROFILE)
             .expect(PROFILE_MISSING)
     }

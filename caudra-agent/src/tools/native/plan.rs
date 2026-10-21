@@ -42,7 +42,7 @@ const REMOTE_REQUIRED: &str = "local document tools require a remote workspace s
 const STORE_UNAVAILABLE: &str = "local document store is unavailable";
 const INVALID_TARGET: &str =
     "the active plan target is not a validated host workspace or owned plan path";
-const CWD: &str = "{cwd}";
+pub(crate) const CWD: &str = "{cwd}";
 const PLANS_DIR: &str = "plans";
 
 static PERMISSION_CONTRACT: LazyLock<String> =

@@ -13,7 +13,7 @@ pub const AUTOMATION_LANGUAGE_VERSION: u32 = 1;
 pub const AUTOMATION_ABI_VERSION: u32 = 1;
 pub const STEM_MISMATCH: &str = "the file name must equal meta.name";
 pub const ALWAYS_OUTSIDE_USER_SCOPE: &str =
-    "arm: \"always\" is allowed only in user scope; arm a project script by hand";
+    "arm: \"always\" is allowed only in user scope; arm this script by hand";
 pub const ALWAYS_WITH_SCHEDULE: &str = "arm: \"always\" runs this schedule in every open session; \
      consider arming it by hand in one session instead";
 
@@ -22,12 +22,14 @@ pub const ALWAYS_WITH_SCHEDULE: &str = "arm: \"always\" runs this schedule in ev
 pub enum Scope {
     User,
     Project,
+    /// Shipped in the binary by a provider such as pstack, and listed while it is on.
+    Bundled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
-    /// A user script, trusted where it lives.
+    /// A user or bundled script, trusted where it lives.
     Location,
     /// A project script whose exact digest was approved.
     Approved,
@@ -61,8 +63,8 @@ pub struct InvalidEntry {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AutomationCatalog {
-    /// One per name: a project script hides a user script of the same name, and lists its
-    /// scope in `shadowed`.
+    /// One per name: a project script hides a user script of the same name, either hides a
+    /// bundled one, and the winner lists the hidden scopes in `shadowed`.
     pub entries: Vec<CatalogEntry>,
     pub invalid: Vec<InvalidEntry>,
 }
@@ -70,7 +72,7 @@ pub struct AutomationCatalog {
 impl Trust {
     pub const fn assess(scope: Scope, digest_approved: bool) -> Self {
         match (scope, digest_approved) {
-            (Scope::User, _) => Self::Location,
+            (Scope::User | Scope::Bundled, _) => Self::Location,
             (Scope::Project, true) => Self::Approved,
             (Scope::Project, false) => Self::Required,
         }
@@ -152,6 +154,8 @@ mod tests {
     #[test_case(Scope::User, true => Trust::Location; "approved_user_scope")]
     #[test_case(Scope::Project, true => Trust::Approved; "approved_project")]
     #[test_case(Scope::Project, false => Trust::Required; "unapproved_project")]
+    #[test_case(Scope::Bundled, false => Trust::Location; "bundled")]
+    #[test_case(Scope::Bundled, true => Trust::Location; "approved_bundled")]
     fn trust_follows_scope_and_approval(scope: Scope, approved: bool) -> Trust {
         Trust::assess(scope, approved)
     }
@@ -179,6 +183,8 @@ mod tests {
     #[test_case(Scope::User, ArmMode::Always, vec![Trigger::Armed] => Ok(Vec::new()); "always_user")]
     #[test_case(Scope::User, ArmMode::Always, polling() => Ok(vec![ALWAYS_WITH_SCHEDULE.to_owned()]); "always_user_schedule")]
     #[test_case(Scope::Project, ArmMode::Always, vec![Trigger::Armed] => Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "always_project")]
+    #[test_case(Scope::Bundled, ArmMode::Manual, polling() => Ok(Vec::new()); "manual_bundled_schedule")]
+    #[test_case(Scope::Bundled, ArmMode::Always, vec![Trigger::Armed] => Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "always_bundled")]
     fn arming_always_is_for_user_scope(
         scope: Scope,
         arm: ArmMode,

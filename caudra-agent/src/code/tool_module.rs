@@ -216,7 +216,7 @@ Answers are the runtime's own records as dicts.",
             signature: "list() -> dict[str, Any]",
             awaited: true,
             read_first: false,
-            page: "Returns `{\"automations\", \"project_dir\", \"user_dir\"}`: every automation this session can arm, with its scope, availability, status, triggers, args and warnings, and files that cannot load with the reason, then the directories scripts go in.",
+            page: "Returns `{\"automations\", \"project_dir\", \"user_dir\"}`: every automation this session can arm, with its scope (`project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack), availability, status, triggers, args and warnings, and files that cannot load with the reason, then the directories scripts go in.",
         },
         MemberDoc {
             name: "validate",

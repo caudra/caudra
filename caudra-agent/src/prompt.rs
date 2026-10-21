@@ -959,7 +959,7 @@ mod tests {
             let profiles = dir.path().join(PROFILE_DIR);
             fs::create_dir(&profiles).unwrap();
             fs::write(profiles.join(format!("{COMPLETION_PROFILE}.md")), body).unwrap();
-            PromptProfileCatalog::discover_with(Some(dir.path()))
+            PromptProfileCatalog::discover_with(Some(dir.path()), false)
                 .get(COMPLETION_PROFILE)
                 .unwrap()
         });

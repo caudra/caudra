@@ -4,7 +4,7 @@
 use std::fmt::Write;
 
 use crate::{
-    DocsError, Heading, Library, NAME, PAGE_TITLE_LEVEL, Page, SECTION_LEVEL, SITE_DOCS_URL,
+    DocsError, Heading, Library, NAME, PAGE_TITLE_LEVEL, Page, SECTION_LEVEL, SITE_DOCS_URL, Search,
 };
 
 const BYTES_PER_TOKEN: usize = 4;
@@ -12,6 +12,8 @@ const TOKENS_PER_K: usize = 1_000;
 const NESTED_LISTING_TOKENS: usize = 3_000;
 const SUBSECTION_LEVEL: u8 = 3;
 const MODEL_SEARCH_LIMIT: usize = 8;
+const CORPUS: &str = "the docs";
+const RESULT_UNIT: &str = "section";
 const ADDRESSING: &str = "This build's user documentation. Load a page with the skill name \
 `caudra-docs/<page>`, or one section with `caudra-docs/<page>#<section>`, which costs far less. A link such as \
 `/docs/<page>/#<section>` in the text means `caudra-docs/<page>#<section>`, and a heading ending in `{#id}` is the \
@@ -64,34 +66,10 @@ pub(crate) fn search_report(library: &Library, query: &str) -> Result<String, Do
         return Err(DocsError::EmptyQuery);
     }
     let search = library.search(query, MODEL_SEARCH_LIMIT);
-    let mut report = String::new();
-    for correction in &search.corrections {
-        let _ = writeln!(
-            report,
-            "No word in the docs starts with \"{}\", so it also matched \"{}\".",
-            correction.typed, correction.used
-        );
-    }
-    let shown = search.hits.len();
-    let _ = match shown {
-        0 => writeln!(
-            report,
-            "No section contains every term of \"{query}\". Use fewer terms, or load {NAME} for the index."
-        ),
-        1 => writeln!(
-            report,
-            "1 section matches \"{query}\". Load it by its address."
-        ),
-        _ if shown < search.matched => writeln!(
-            report,
-            "{shown} of {} sections match \"{query}\". Load one by its address.",
-            search.matched
-        ),
-        _ => writeln!(
-            report,
-            "{shown} sections match \"{query}\". Load one by its address."
-        ),
-    };
+    let no_match = format!(
+        "No section contains every term of \"{query}\". Use fewer terms, or load {NAME} for the index."
+    );
+    let mut report = SearchReport::new(&search, query, CORPUS, RESULT_UNIT, &no_match);
     for hit in &search.hits {
         let page = &library.pages()[hit.page];
         let heading = &page.headings[hit.heading];
@@ -100,18 +78,69 @@ pub(crate) fn search_report(library: &Library, query: &str) -> Result<String, Do
         } else {
             format!("{} › {}", page.title, heading.title)
         };
-        let _ = writeln!(
-            report,
-            "- {NAME}/{}#{} ({place}, {} tokens)",
-            page.slug,
-            heading.anchor,
-            approx_tokens(page.section(hit.heading).len())
+        report.entry(
+            &format!("{NAME}/{}#{}", page.slug, heading.anchor),
+            Some(&place),
+            page.section(hit.heading).len(),
+            &hit.snippet,
         );
-        if !hit.snippet.is_empty() {
-            let _ = writeln!(report, "  {}", hit.snippet);
+    }
+    Ok(report.finish())
+}
+
+/// A search's answer for the model: a line per correction, how many results it lists, then each result with its
+/// address, size, and snippet.
+pub struct SearchReport {
+    text: String,
+}
+
+impl SearchReport {
+    /// The report's head for a search over `corpus` whose results are each a `unit`. `no_match` replaces the count
+    /// when `search` has no hits.
+    pub fn new(search: &Search, query: &str, corpus: &str, unit: &str, no_match: &str) -> Self {
+        let mut text = String::new();
+        for correction in &search.corrections {
+            let _ = writeln!(
+                text,
+                "No word in {corpus} starts with \"{}\", so it also matched \"{}\".",
+                correction.typed, correction.used
+            );
+        }
+        let shown = search.hits.len();
+        let _ = match shown {
+            0 => writeln!(text, "{no_match}"),
+            1 => writeln!(
+                text,
+                "1 {unit} matches \"{query}\". Load it by its address."
+            ),
+            _ if shown < search.matched => writeln!(
+                text,
+                "{shown} of {} {unit}s match \"{query}\". Load one by its address.",
+                search.matched
+            ),
+            _ => writeln!(
+                text,
+                "{shown} {unit}s match \"{query}\". Load one by its address."
+            ),
+        };
+        Self { text }
+    }
+
+    /// One result: its address, where it sits when the address alone does not say, its size, and its snippet.
+    pub fn entry(&mut self, address: &str, place: Option<&str>, bytes: usize, snippet: &str) {
+        let tokens = approx_tokens(bytes);
+        let _ = match place {
+            Some(place) => writeln!(self.text, "- {address} ({place}, {tokens} tokens)"),
+            None => writeln!(self.text, "- {address} ({tokens} tokens)"),
+        };
+        if !snippet.is_empty() {
+            let _ = writeln!(self.text, "  {snippet}");
         }
     }
-    Ok(report.trim_end().to_owned())
+
+    pub fn finish(self) -> String {
+        self.text.trim_end().to_owned()
+    }
 }
 
 fn for_each_page(

@@ -60,6 +60,7 @@ pub mod pstack;
 pub mod remote_project_context;
 pub mod scratch;
 pub mod session_fork;
+pub mod shell_environment;
 pub mod shell_eta;
 mod stored_session;
 mod subagent_history;

@@ -10,7 +10,6 @@ use caudra_agent::mcp::call::{ElicitMode, ElicitRequest};
 use caudra_agent::permissions::{
     EngineFlag, PermissionAdvisory, PermissionManager, PermissionRequest,
 };
-use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
 use caudra_providers::{
@@ -210,7 +209,6 @@ fn test_params(accounts: Arc<TestAccounts>) -> AcpParams {
         model: Model::from_spec(SELECTED_SPEC).unwrap(),
         timeouts: Timeouts::default(),
         thinking: Default::default(),
-        prompt_profiles: Arc::new(PromptProfileCatalog::default()),
         system_prompt_profile_override: None,
         permission_mode: None,
         model_policy: Arc::new(ModelPolicy::default()),

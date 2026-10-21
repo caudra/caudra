@@ -146,7 +146,7 @@ macro_rules! mirrored {
 }
 
 mirrored! {
-    Scope = AutomationScope { User, Project }
+    Scope = AutomationScope { User, Project, Bundled }
     ArmOrigin = AutomationOrigin { Cli, Profile, Manual, Always, Sdk }
     TriggerKind = AutomationTrigger {
         Armed, Idle, NeedsInput, GoalFinished, MessageReceived, WorkFinished, WorkflowFinished,

@@ -93,6 +93,8 @@ Apps change, and feature maps go out of date. Run this at least once a day, idea
 
 [`/pstack:maintain-verification-skill`](../../skills/maintain-verification-skill/SKILL.md) audits the generated skill: one read-only source reader per feature in parallel, then one live pass that drives every mapped feature. It ends in exactly one of three outcomes. `clean` means full coverage and nothing to ship. `changed` means one PR of proven corrections, confined to the verification skill's own directory. `blocked` names the blocker. It never edits product code. If the live pass catches a product regression, it reports the regression instead of hiding it with a doc edit.
 
+To schedule it, ask the agent to write an automation with the `caudra-automation-dev` skill: user scope, in the `user_dir` that `await automation.list()` reports, triggers `[#{ kind: "schedule", at: "09:00" }]`, and a body of `message("Load pstack/maintain-verification-skill with the skill tool and follow it.")`. It validates it with `await automation.validate("<name>")`, and you arm it in the session that should run it with `/automations arm <name>`. When you no longer need it, `/automations disarm <name>` stops it.
+
 ## Prove a property with a formal verification skill
 
 A verification skill proves the paths you drive. Some bugs live on paths nobody drives: two retries that overlap, a lock that expires mid-write, a state change that arrives out of order. Tests rarely reach those cases. For code where such a bug is costly, run:

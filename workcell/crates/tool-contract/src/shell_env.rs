@@ -4,6 +4,7 @@
 //! shell drops at launch.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,38 @@ const ENV_REFERENCE_PREFIX: &str = "{env:";
 #[must_use]
 pub fn is_shell_startup_variable(name: &str) -> bool {
     name.starts_with(BASH_VARIABLE_PREFIX) || STARTUP_VARIABLES.contains(&name)
+}
+
+/// The whole environment a command starts with, for a caller that clears its own first: the
+/// allowlisted names `read` answers, then `overlay` in order, a later entry replacing an earlier
+/// one, minus the names that decide how Bash starts, then [`FORCED_VARIABLES`].
+///
+/// The forced names come last, so no forwarded name can replace them. A cleared environment has
+/// no inherited `NO_COLOR`, `FORCE_COLOR`, or `CLICOLOR_FORCE`, so they set a default rather than
+/// override an operator's choice, and an explicit `--color=always` still wins. They describe the
+/// environment a command runs in, not how its output is rendered, so no output setting turns them
+/// off.
+#[must_use]
+pub fn command_environment(
+    overlay: &[(String, OsString)],
+    read: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(String, OsString)> {
+    let mut environment: BTreeMap<String, OsString> = BASE_ALLOWLIST
+        .iter()
+        .filter_map(|&name| read(name).map(|value| (name.to_owned(), value)))
+        .collect();
+    environment.extend(
+        overlay
+            .iter()
+            .filter(|(name, _)| !is_shell_startup_variable(name))
+            .cloned(),
+    );
+    environment.extend(
+        FORCED_VARIABLES
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), OsString::from(value))),
+    );
+    environment.into_iter().collect()
 }
 
 #[must_use]
@@ -380,6 +413,43 @@ mod tests {
                 bytes: MAX_SET_VALUE_BYTES + 1
             })
         );
+    }
+
+    const HOST: &[(&str, &str)] = &[
+        ("PATH", "/usr/bin"),
+        ("HOME", "/home/user"),
+        ("GH_TOKEN", "token-canary"),
+        ("NO_COLOR", "0"),
+    ];
+
+    fn environment(overlay: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let overlay: Vec<(String, OsString)> = overlay
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), OsString::from(value)))
+            .collect();
+        let read = |name: &str| {
+            HOST.iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| OsString::from(*value))
+        };
+        command_environment(&overlay, read)
+            .into_iter()
+            .map(|(name, value)| (name, value.to_string_lossy().into_owned()))
+            .collect()
+    }
+
+    #[test_case(&[], "GH_TOKEN", None ; "unlisted_dropped")]
+    #[test_case(&[], "PATH", Some("/usr/bin") ; "allowlisted_kept")]
+    #[test_case(&[("GH_TOKEN", "token-canary")], "GH_TOKEN", Some("token-canary") ; "passed_forwarded")]
+    #[test_case(&[("RUST_LOG", "debug"), ("RUST_LOG", "info")], "RUST_LOG", Some("info") ; "set_beats_pass")]
+    #[test_case(&[("HOME", "/elsewhere")], "HOME", Some("/elsewhere") ; "overlay_beats_allowlist")]
+    #[test_case(&[("BASH_ENV", "/tmp/rc")], "BASH_ENV", None ; "startup_variable_refused")]
+    #[test_case(&[("IFS", "/")], "IFS", None ; "startup_name_refused")]
+    #[test_case(&[], "NO_COLOR", Some("1") ; "no_color_forced")]
+    #[test_case(&[("NO_COLOR", "0")], "NO_COLOR", Some("1") ; "forwarded_no_color_replaced")]
+    #[test_case(&[], "CLICOLOR", Some("0") ; "clicolor_forced")]
+    fn command_environment_matrix(overlay: &[(&str, &str)], name: &str, expected: Option<&str>) {
+        assert_eq!(environment(overlay).get(name).map(String::as_str), expected);
     }
 
     #[test]

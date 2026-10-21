@@ -394,7 +394,7 @@ fn configure_native_tools(agent: &AgentConfig) {
     if agent.builtin_skills.docs {
         install_builtin_skill(docs::skill());
     }
-    caudra_agent::pstack::configure(agent.builtin_skills.pstack);
+    caudra_agent::pstack::install(agent.builtin_skills.pstack);
     if let Some(skill) = caudra_terminal_host::detect().and_then(|host| host.skill()) {
         install_builtin_skill(host_skill(skill));
     }

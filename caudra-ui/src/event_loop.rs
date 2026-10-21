@@ -1407,7 +1407,10 @@ impl SpawnCtx {
             if self.no_commands {
                 Arc::from([])
             } else if let Some(context) = &remote_project_context {
-                Arc::from(caudra_agent::command::discover_remote_commands(context))
+                Arc::from(caudra_agent::command::discover_remote_commands(
+                    context,
+                    self.config.builtin_skills.pstack,
+                ))
             } else {
                 Arc::clone(&self.custom_commands)
             },
@@ -1419,6 +1422,7 @@ impl SpawnCtx {
         );
         app.local_documents = self.local_documents.clone();
         app.summarize_memory = self.config.summarize_memory;
+        app.pstack = self.config.builtin_skills.pstack;
         app.sandbox_live.connector = self.sandbox_connector.clone();
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();

@@ -999,6 +999,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "url",
+ "workcell-tool-contract",
  "yaml_serde",
 ]
 
@@ -1314,6 +1315,7 @@ name = "caudra-pstack"
 version = "0.2.0-preview.11"
 dependencies = [
  "caudra-automation",
+ "caudra-docs",
  "include_dir",
  "jiff",
  "regex",

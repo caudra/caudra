@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+caudra-docs = { workspace = true }
 include_dir = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }

@@ -31,9 +31,9 @@ Launch all reviewers in a single message with the `task` tool, one per entry on 
 | Reviewer A | `claude-opus-5-5 xhigh` |
 | Reviewer B | `grok-4.7 xhigh` |
 
-Each reviewer is a plain `task` (no `profile`) with `mode: "plan"`, and `model` and `thinking` set to its configured entry, or its table default when there is no configured line. Omit `model` and `thinking` for an `inherit` entry, so that reviewer runs on the session's Subagent model.
+Each reviewer is a `task` with `profile: "builtin"` and `mode: "plan"`, and `model` and `thinking` set to its configured entry, or its table default when there is no configured line. Omit `model` and `thinking` for an `inherit` entry, so that reviewer runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else the user's Subagent model.
 
-If `task` rejects a configured entry, run that reviewer on its family's table default and say so. Families go by prefix: `claude-*` and `grok-*`. With no family match, use Reviewer A's default. If it rejects a table default, omit `model`, keep `thinking`, and say so. Do not block the review on the model issue. Never treat an `inherit` entry as a rejected model or apply either fallback to it.
+If `task` rejects a configured entry, run that reviewer on its family's table default and say so. Families go by prefix: `claude-*` and `grok-*`. With no family match, use Reviewer A's default. If it rejects a table default, omit `model`, keep `thinking`, and say so. Do not block the review on the model issue. Never treat an `inherit` entry as a rejected model or apply either fallback to it. If `task` has no `model` or `thinking` argument, omit both for every reviewer and say so. Each entry still gets its own reviewer.
 
 Read `references/reviewer-prompt.md` and fill in the same template for every reviewer with the stated intent, the diff or file contents, the rubric from `references/rubric.md`, and the code-quality lens from `references/code-quality-review.md`. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 

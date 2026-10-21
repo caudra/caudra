@@ -1471,7 +1471,7 @@ mod tests {
             }
             None => fs::remove_file(&file).unwrap(),
         }
-        PromptProfileCatalog::discover_with(Some(dir.path()))
+        PromptProfileCatalog::discover_with(Some(dir.path()), false)
     }
 
     /// What the event loop does once the profiles are read again: every tab

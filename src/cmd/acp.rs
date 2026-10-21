@@ -140,6 +140,9 @@ fn runtime_resolver(
                             .event_handle()
                             .collect_prompt_slots(&config.agent),
                     ),
+                    prompt_profiles: Arc::new(PromptProfileCatalog::discover_user(
+                        config.agent.builtin_skills.pstack,
+                    )),
                     config: config.agent,
                     permissions_config: config.permissions,
                     decisions_config: config.decisions,
@@ -237,7 +240,6 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         "startup phases"
     );
 
-    let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
     let thinking = config
         .always_thinking
         .clone()
@@ -254,7 +256,6 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         model,
         timeouts,
         thinking,
-        prompt_profiles,
         system_prompt_profile_override: cli.system_prompt_profile.clone(),
         permission_mode: cli.permission_mode_override(),
         model_policy: Arc::new(config.provider.model_policy.clone()),

@@ -13,5 +13,5 @@ pub mod models;
 pub mod scripts;
 
 pub use host::{Cancelled, Host, Output};
-pub use library::{Agent, Library, NAME, SKILL_DESCRIPTION, Skill, library};
+pub use library::{Agent, Library, NAME, SKILL_DESCRIPTION, Skill, automations, library};
 pub use models::{ROLES_FILE, Roles};

@@ -2,25 +2,30 @@
 //! the command line upstream takes. It joins a run only while the bundled pstack is on, and stays
 //! out of the `code` tool's description, so a session without pstack never reads about it.
 //!
-//! Every call asks as the `code` tool, naming the script and its arguments. A script that writes
-//! files, `log` and `orch`, is held out of plan and read-only modes. Commands a script runs, such
-//! as `git` and `gh`, start on this machine in the session's project, and a cancelled call kills
+//! Every call asks as the `code` tool, naming the script, its arguments, and the files they name.
+//! A call that writes files, `log` and orch's commands that change the store, is held out of plan
+//! and read-only modes. Commands a script runs, such as `git` and `gh`, start on this machine in
+//! the session's project with the environment a `shell` command gets, and the call ending kills
 //! them.
 
+mod process;
+
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use caudra_config::ToolKey;
-use caudra_pstack::scripts::Script;
+use caudra_config::shell_env::ShellEnvConfig;
+use caudra_pstack::scripts::{Script, check_plan, orch};
 use caudra_pstack::{Cancelled, Host, NAME, Output};
 use caudra_storage::StateDir;
 use caudra_storage::sessions::SessionDatabase;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 use smol::Timer;
-use smol::process::{Command, Stdio};
 
 use super::gateway::Permission;
 use super::module::{CallRun, HostCallPlan, HostModule, MemberDoc, ModuleDoc, Prepared};
@@ -30,8 +35,9 @@ use crate::cancel::CancelToken;
 use crate::mcp::output::{McpBlock, McpOutput};
 use crate::permissions::{
     PermissionExecutorKind, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
-    PermissionRisk, PermissionSubject,
+    PermissionRisk, PermissionSubject, filesystem_permission_resource,
 };
+use crate::shell_environment::local_command_environment;
 use crate::tools::registry::{PermissionIntent, PermissionScopes};
 use crate::tools::{CODE_TOOL_NAME, ToolContext, ToolLive, native};
 
@@ -42,16 +48,26 @@ const STDERR_FIELD: &str = "stderr";
 const PERMISSION_SCOPE_PREFIX: &str = "pstack:";
 const RUNS: &str = "Runs pstack's";
 const EMPTY_COMMAND: &str = "empty command";
-const COMMAND_CANCELLED: &str = "cancelled";
-/// What a command killed by a signal exits with, as a shell reports it.
-const SIGNALLED: i32 = 128;
+/// `check_plan`'s one argument that checks the session plan instead of a file.
+const SESSION_PLAN_FLAG: &str = "--plan";
+/// What the session plan's problems are reported against, where a file's name would be.
+const SESSION_PLAN_LABEL: &str = "plan";
+/// Set on every command after the shell environment, so neither CLI waits on a prompt nobody sees.
+const PROMPTS_OFF: &[(&str, &str)] = &[("GIT_TERMINAL_PROMPT", "0"), ("GH_PROMPT_DISABLED", "1")];
+const GH: &str = "gh";
+/// What `gh` prints when it has no credentials it can use.
+const GH_SIGNED_OUT: &[&str] = &["gh auth login", "GH_TOKEN", "HTTP 401"];
+const GH_SIGNED_OUT_HINT: &str = "Caudra: `gh` could not authenticate. Commands pstack runs get the \
+     environment shell commands get, which does not inherit GH_TOKEN, GITHUB_TOKEN, or the \
+     variables a keyring needs, such as DBUS_SESSION_BUS_ADDRESS; the user can forward them with \
+     /env or `[agent.shell_env] pass`.\n";
 /// Why the namespace answers nothing in a session whose commands run on another machine.
 pub const ELSEWHERE: &str = "pstack's scripts run on this machine, and this session's workspace is \
      elsewhere; follow the skill's steps with `shell` instead";
 pub static DOC: ModuleDoc = ModuleDoc {
     namespace: NAME,
     summary: "`pstack`: Rust ports of the scripts pstack's skills run; `pstack.log`, `pstack.check_plan`, `pstack.worktree_audit`, `pstack.watch_pr`, `pstack.orch`.",
-    page: "pstack: the scripts pstack's skills run, ported to Rust. Each call takes the arguments upstream's command line takes, as strings, and returns `{\"code\", \"stdout\", \"stderr\"}`: a nonzero `code` is the script's own verdict, not an error. `log` and `orch` write files, so plan mode refuses them.\n\
+    page: "pstack: the scripts pstack's skills run, ported to Rust. Each call takes the arguments upstream's command line takes, as strings, and returns `{\"code\", \"stdout\", \"stderr\"}`: a nonzero `code` is the script's own verdict, not an error. `log` and the `orch` commands that change the store write files, so plan mode refuses them; `orch`'s help and read-only commands run there. Commands a script runs get the environment shell commands get.\n\
 Example: `r = await pstack.check_plan(\"plans/feature.md\")`, then `r[\"code\"] == 0`.",
     members: &[
         MemberDoc {
@@ -66,14 +82,14 @@ Example: `r = await pstack.check_plan(\"plans/feature.md\")`, then `r[\"code\"] 
             signature: "check_plan(*argv: str) -> dict[str, Any]",
             awaited: true,
             read_first: false,
-            page: "`poteto-mode/scripts/check-plan.mjs`: `pstack.check_plan(plan_md)` checks a plan's structure and verification boxes.",
+            page: "`poteto-mode/scripts/check-plan.mjs`: `pstack.check_plan(plan_md)` checks a plan file's structure and verification boxes. `pstack.check_plan(\"--plan\")` checks the session plan, the one the `plan` tool writes.",
         },
         MemberDoc {
             name: "worktree_audit",
             signature: "worktree_audit(*argv: str) -> dict[str, Any]",
             awaited: true,
             read_first: false,
-            page: "`poteto-mode/scripts/worktree-audit.sh`: `pstack.worktree_audit(\"-b\", \"origin/main\", repo_path)` tables every worktree; LAST_CHAT is the newest Caudra session that worked there.",
+            page: "`poteto-mode/scripts/worktree-audit.sh`: `pstack.worktree_audit(\"-b\", \"origin/main\", repo_path)` fetches the base, best effort, then tables every worktree; LAST_CHAT is the newest Caudra session that worked there.",
         },
         MemberDoc {
             name: "watch_pr",
@@ -120,9 +136,8 @@ impl HostModule for PstackModule {
 }
 
 fn plan(cwd: PathBuf, call: ScriptCall) -> Result<HostCallPlan, ScriptError> {
-    let script = Script::parse(&call.name).ok_or_else(|| {
-        ScriptError::new(ScriptErrorKind::Attribute, DOC.no_member(&call.name))
-    })?;
+    let script = Script::parse(&call.name)
+        .ok_or_else(|| ScriptError::new(ScriptErrorKind::Attribute, DOC.no_member(&call.name)))?;
     let qualified = format!("{NAME}.{}", script.name());
     let argv = arguments(&qualified, &call)?;
     let row = CodeCall {
@@ -132,25 +147,61 @@ fn plan(cwd: PathBuf, call: ScriptCall) -> Result<HostCallPlan, ScriptError> {
         input: json!({ ARGV_FIELD: argv }),
         ..CodeCall::default()
     };
-    let permission = permission(script, &qualified, &argv);
+    let writes = script.writes(&argv, &global_env);
+    let permission = permission(script, &qualified, &argv, &cwd, writes);
+    let session_plan = script == Script::CheckPlan && argv == [SESSION_PLAN_FLAG];
     let run: CallRun = Box::new(move |ctx: ToolContext| {
         Box::pin(async move {
+            if session_plan {
+                return Ok(answered(check_session_plan(&ctx)));
+            }
+            let (_stop_on_drop, cancel) = ctx.cancel.child();
             let host = LocalHost {
                 cwd,
-                cancel: ctx.cancel.clone(),
+                cancel,
                 live: ctx.live_sink.clone(),
-                state: StateDir::resolve().ok().filter(|state| !state.is_ephemeral()),
+                state: StateDir::resolve()
+                    .ok()
+                    .filter(|state| !state.is_ephemeral()),
+                environment: command_environment(&ctx.config.shell_env),
+                gh_signed_out: AtomicBool::new(false),
             };
-            let output = smol::unblock(move || script.run(&host, &argv)).await;
+            let output = smol::unblock(move || {
+                let output = script.run(&host, &argv);
+                host.hinted(output)
+            })
+            .await;
             Ok(answered(output))
         })
     });
     Ok(HostCallPlan {
         row,
         permission,
-        read_only: !script.writes(),
+        read_only: !writes,
         run,
     })
+}
+
+fn global_env(name: &str) -> Option<String> {
+    caudra_config::global_env_value(name).ok().flatten()
+}
+
+fn check_session_plan(ctx: &ToolContext) -> Output {
+    match native::plan::read(ctx) {
+        Ok(content) => check_plan::check_text(SESSION_PLAN_LABEL, &content),
+        Err(error) => Output::failure(1, format!("{}\n", error.message)),
+    }
+}
+
+/// What a `shell` command gets, then [`PROMPTS_OFF`].
+fn command_environment(config: &ShellEnvConfig) -> Vec<(String, OsString)> {
+    let mut environment = local_command_environment(config);
+    environment.extend(
+        PROMPTS_OFF
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), OsString::from(value))),
+    );
+    environment
 }
 
 /// The command line as strings, positional only, as upstream's scripts take it.
@@ -172,27 +223,36 @@ fn arguments(qualified: &str, call: &ScriptCall) -> Result<Vec<String>, ScriptEr
         .collect()
 }
 
-fn permission(script: Script, qualified: &str, argv: &[String]) -> Permission {
+fn permission(
+    script: Script,
+    qualified: &str,
+    argv: &[String],
+    cwd: &Path,
+    writes: bool,
+) -> Permission {
     let command = std::iter::once(qualified.to_owned())
         .chain(argv.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ");
-    let (access, risk) = match script.writes() {
+    let (access, risk) = match writes {
         true => (PermissionResourceAccess::Write, PermissionRisk::Medium),
         false => (PermissionResourceAccess::Execute, PermissionRisk::Low),
     };
+    let script_resource = PermissionResource {
+        kind: PermissionResourceKind::Custom {
+            name: NAME.to_owned(),
+        },
+        value: command,
+        access: Some(access),
+        protected: false,
+        requires_prompt: false,
+        attributes: BTreeMap::new(),
+    };
     let intent = PermissionIntent::new(
         PermissionScopes::single(format!("{PERMISSION_SCOPE_PREFIX}{}", script.name())),
-        vec![PermissionResource {
-            kind: PermissionResourceKind::Custom {
-                name: NAME.to_owned(),
-            },
-            value: command,
-            access: Some(access),
-            protected: false,
-            requires_prompt: false,
-            attributes: BTreeMap::new(),
-        }],
+        std::iter::once(script_resource)
+            .chain(path_resource(script, argv, cwd, writes))
+            .collect(),
         risk,
     );
     let identity = (
@@ -202,10 +262,38 @@ fn permission(script: Script, qualified: &str, argv: &[String]) -> Permission {
         },
         PermissionExecutorKind::Native,
     );
-    Permission::ask(ToolKey::native(CODE_TOOL_NAME), intent, Some(identity)).with_context(format!(
-        "{RUNS} `{}` script",
-        script.upstream()
-    ))
+    Permission::ask(ToolKey::native(CODE_TOOL_NAME), intent, Some(identity))
+        .with_context(format!("{RUNS} `{}` script", script.upstream()))
+}
+
+/// The file or directory a call's arguments name, so file rules, protected paths, and the
+/// outside-project check hold it as they would a file tool's.
+fn path_resource(
+    script: Script,
+    argv: &[String],
+    cwd: &Path,
+    writes: bool,
+) -> Option<PermissionResource> {
+    let access = match writes {
+        true => PermissionResourceAccess::Write,
+        false => PermissionResourceAccess::Read,
+    };
+    let (kind, path) = match script {
+        Script::Log => (PermissionResourceKind::File, argv.first().cloned()),
+        Script::CheckPlan => (
+            PermissionResourceKind::File,
+            argv.first()
+                .filter(|path| *path != SESSION_PLAN_FLAG)
+                .cloned(),
+        ),
+        Script::Orch => (
+            PermissionResourceKind::Directory,
+            orch::store_use(argv, &global_env).map(|used| used.store),
+        ),
+        Script::WorktreeAudit | Script::WatchPr => return None,
+    };
+    path.filter(|path| !path.is_empty())
+        .map(|path| filesystem_permission_resource(kind, &cwd.join(path), access, cwd))
 }
 
 /// The row shows what the script printed; the snippet gets the exit code and both streams.
@@ -233,13 +321,36 @@ fn answered(output: Output) -> (McpOutput, Value) {
     (row, value)
 }
 
-/// Commands start on this machine with stdin closed, and the call's cancellation kills them and
-/// ends any wait.
+/// Commands start on this machine with stdin closed and the environment a `shell` command gets,
+/// and the call's cancellation kills them and ends any wait.
 struct LocalHost {
     cwd: PathBuf,
     cancel: CancelToken,
     live: Option<flume::Sender<ToolLive>>,
     state: Option<StateDir>,
+    environment: Vec<(String, OsString)>,
+    /// Whether a `gh` command failed for want of credentials, which the output then explains.
+    gh_signed_out: AtomicBool,
+}
+
+fn gh_signed_out(program: &str, output: &Output) -> bool {
+    program == GH
+        && output.code != 0
+        && GH_SIGNED_OUT
+            .iter()
+            .any(|marker| output.stderr.contains(marker))
+}
+
+impl LocalHost {
+    fn hinted(&self, mut output: Output) -> Output {
+        if self.gh_signed_out.load(Ordering::Relaxed) {
+            if !output.stderr.is_empty() && !output.stderr.ends_with('\n') {
+                output.stderr.push('\n');
+            }
+            output.stderr.push_str(GH_SIGNED_OUT_HINT);
+        }
+        output
+    }
 }
 
 impl Host for LocalHost {
@@ -247,27 +358,24 @@ impl Host for LocalHost {
         &self.cwd
     }
 
+    /// Never a value only the project's `.env` set, so a repository cannot point `orch` at a
+    /// store or repository of its choosing.
     fn env_var(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
+        global_env(name)
     }
 
     fn run(&self, argv: &[&str], cwd: Option<&Path>) -> io::Result<Output> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, EMPTY_COMMAND))?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(cwd.unwrap_or(&self.cwd))
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        let output = smol::block_on(self.cancel.race(command.output()))
-            .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, COMMAND_CANCELLED))??;
-        Ok(Output {
-            code: output.status.code().unwrap_or(SIGNALLED),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        let mut command =
+            process::command(program, args, cwd.unwrap_or(&self.cwd), &self.environment);
+        caudra_config::proxy_env().configure_command(&mut command);
+        let output = smol::block_on(process::run(command, &self.cancel))?;
+        if gh_signed_out(program, &output) {
+            self.gh_signed_out.store(true, Ordering::Relaxed);
+        }
+        Ok(output)
     }
 
     fn now(&self) -> Timestamp {
@@ -299,12 +407,35 @@ impl Host for LocalHost {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    use caudra_config::PermissionsConfig;
+    use caudra_storage::plans::PlanFile;
+    use tempfile::TempDir;
     use test_case::test_case;
 
+    use super::super::gateway::Gateway;
+    use super::super::runner::{ScriptHost, ScriptInvocation, ScriptReply};
+    use super::process::COMMAND_CANCELLED;
     use super::*;
+    use crate::AgentMode;
+    use crate::permissions::{PermissionManager, PermissionMode};
+    use crate::tools::native::tests::tempdir;
+    use crate::tools::test_support::stub_ctx_with_permissions;
 
     const PLAN: &str = "plan.md";
     const WORK: &str = "/work";
+    const STORE: &str = "store";
+    const ORCH_STORE: &str = "ORCH_STORE";
+    const PLANTED_STORE: &str = "/planted";
+    const DOTENV_CHILD: &str = "CAUDRA_PSTACK_DOTENV_TEST";
+    const DOTENV_TEST: &str =
+        "code::pstack::tests::a_project_env_file_cannot_set_what_scripts_read";
+    const PROJECT_ENV: &str = ".caudra/.env";
+    const VALID_PLAN_HEAD: &str = "# Plan";
 
     fn call(name: &str, args: Vec<Value>, kwargs: &[(&str, Value)]) -> ScriptCall {
         ScriptCall {
@@ -318,6 +449,10 @@ mod tests {
         }
     }
 
+    fn strings(argv: &[&str]) -> Vec<Value> {
+        argv.iter().map(|arg| json!(arg)).collect()
+    }
+
     #[test]
     fn every_script_is_a_documented_member() {
         let members: Vec<&str> = DOC.member_names().collect();
@@ -325,15 +460,55 @@ mod tests {
         assert_eq!(members, scripts);
     }
 
-    #[test_case("log", false ; "log_writes")]
-    #[test_case("orch", false ; "orch_writes")]
-    #[test_case("check_plan", true ; "check_plan_reads")]
-    #[test_case("worktree_audit", true ; "worktree_audit_reads")]
-    #[test_case("watch_pr", true ; "watch_pr_reads")]
-    fn only_writing_scripts_leave_plan_mode(name: &str, read_only: bool) {
-        let plan = plan(PathBuf::from(WORK), call(name, vec![json!(PLAN)], &[])).unwrap();
+    #[test_case("log", &[PLAN], false ; "log_writes")]
+    #[test_case("orch", &["--store", STORE, "unit", "add", "u1", "--track", "t"], false ; "orch_add_writes")]
+    #[test_case("orch", &["--store", STORE, "unit", "list"], true ; "orch_list_reads")]
+    #[test_case("orch", &["--help"], true ; "orch_help_reads")]
+    #[test_case("check_plan", &[PLAN], true ; "check_plan_reads")]
+    #[test_case("worktree_audit", &[PLAN], true ; "worktree_audit_reads")]
+    #[test_case("watch_pr", &[PLAN], true ; "watch_pr_reads")]
+    fn only_writing_calls_leave_plan_mode(name: &str, argv: &[&str], read_only: bool) {
+        let plan = plan(PathBuf::from(WORK), call(name, strings(argv), &[])).unwrap();
         assert_eq!(plan.read_only, read_only);
-        assert_eq!(plan.row.input, json!({ ARGV_FIELD: [PLAN] }));
+        assert_eq!(plan.row.input, json!({ ARGV_FIELD: argv }));
+    }
+
+    #[test_case("log", &[PLAN, "p", "d", "w", "e", "r"], Some((PermissionResourceKind::File, PLAN, PermissionResourceAccess::Write)) ; "log_writes_its_logfile")]
+    #[test_case("orch", &["--store", STORE, "init"], Some((PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Write)) ; "orch_writes_its_store")]
+    #[test_case("orch", &["--store", STORE, "gate", "list"], Some((PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Read)) ; "orch_reads_its_store")]
+    #[test_case("orch", &["--help"], None ; "orch_help_names_no_store")]
+    #[test_case("check_plan", &[PLAN], Some((PermissionResourceKind::File, PLAN, PermissionResourceAccess::Read)) ; "check_plan_reads_its_plan")]
+    #[test_case("check_plan", &[SESSION_PLAN_FLAG], None ; "the_session_plan_names_no_file")]
+    #[test_case("watch_pr", &["--pr", "1"], None ; "watch_pr_names_no_file")]
+    fn calls_name_the_paths_they_touch(
+        name: &str,
+        argv: &[&str],
+        expected: Option<(PermissionResourceKind, &str, PermissionResourceAccess)>,
+    ) {
+        let script = Script::parse(name).unwrap();
+        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+        let writes = script.writes(&argv, &global_env);
+        let resource = path_resource(script, &argv, Path::new(WORK), writes);
+        assert_eq!(
+            resource.map(|resource| (resource.kind, resource.value, resource.access)),
+            expected.map(|(kind, path, access)| (
+                kind,
+                Path::new(WORK).join(path).to_string_lossy().into_owned(),
+                Some(access)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_project_asks() {
+        let resource = path_resource(
+            Script::Log,
+            &["/elsewhere/log.tsv".to_owned()],
+            Path::new(WORK),
+            true,
+        )
+        .unwrap();
+        assert!(resource.requires_prompt);
     }
 
     #[test_case(vec![json!(1)], &[] ; "non_string_argument")]
@@ -358,10 +533,12 @@ mod tests {
 
     fn local_host(cancel: CancelToken) -> LocalHost {
         LocalHost {
-            cwd: std::env::temp_dir(),
+            cwd: env::temp_dir(),
             cancel,
             live: None,
             state: None,
+            environment: command_environment(&ShellEnvConfig::default()),
+            gh_signed_out: AtomicBool::new(false),
         }
     }
 
@@ -381,6 +558,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test_case("GIT_TERMINAL_PROMPT", "0" ; "git_never_prompts")]
+    #[test_case("GH_PROMPT_DISABLED", "1" ; "gh_never_prompts")]
+    #[test_case("NO_COLOR", "1" ; "colour_is_off")]
+    fn commands_get_the_shell_environment_without_prompts(name: &str, value: &str) {
+        let output = local_host(CancelToken::none())
+            .run(&["sh", "-c", &format!("printf %s \"${name}\"")], None)
+            .unwrap();
+        assert_eq!(output.stdout, value);
+    }
+
+    const GH_LOGIN: &str = "To get started with GitHub CLI, please run:  gh auth login";
+
+    #[test_case(GH, 4, GH_LOGIN, true ; "signed_out")]
+    #[test_case(GH, 1, "HTTP 401: Bad credentials", true ; "rejected_token")]
+    #[test_case(GH, 1, "no pull requests found", false ; "another_failure")]
+    #[test_case(GH, 0, GH_LOGIN, false ; "a_success")]
+    #[test_case("git", 1, GH_LOGIN, false ; "another_program")]
+    fn a_signed_out_gh_explains_where_its_token_went(
+        program: &str,
+        code: i32,
+        stderr: &str,
+        hinted: bool,
+    ) {
+        let host = local_host(CancelToken::none());
+        host.gh_signed_out.store(
+            gh_signed_out(program, &Output::failure(code, stderr)),
+            Ordering::Relaxed,
+        );
+        let output = host.hinted(Output::failure(1, stderr));
+        assert_eq!(output.stderr.ends_with(GH_SIGNED_OUT_HINT), hinted);
+        assert!(output.stderr.starts_with(stderr));
+    }
+
     #[test]
     fn a_cancelled_call_ends_its_commands_and_waits_at_once() {
         let (trigger, cancel) = CancelToken::new();
@@ -388,6 +599,7 @@ mod tests {
         let host = local_host(cancel);
         let error = host.run(&["sh", "-c", "exit 0"], None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), COMMAND_CANCELLED);
         assert_eq!(host.sleep(Duration::from_secs(3_600)), Err(Cancelled));
     }
 
@@ -399,6 +611,39 @@ mod tests {
         );
     }
 
+    /// Runs itself again with a project `.env` loaded and nothing else, since the process
+    /// environment cannot be changed from a test.
+    #[test]
+    fn a_project_env_file_cannot_set_what_scripts_read() {
+        let Some(root) = env::var_os(DOTENV_CHILD) else {
+            let home = TempDir::new().unwrap();
+            let project = home.path().join("project");
+            fs::create_dir_all(project.join(".caudra")).unwrap();
+            fs::write(
+                project.join(PROJECT_ENV),
+                format!("{ORCH_STORE}={PLANTED_STORE}\n"),
+            )
+            .unwrap();
+            let status = Command::new(env::current_exe().unwrap())
+                .args(["--exact", DOTENV_TEST, "--nocapture"])
+                .env_clear()
+                .env(DOTENV_CHILD, &project)
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path())
+                .env("XDG_DATA_HOME", home.path())
+                .env("XDG_STATE_HOME", home.path())
+                .env("XDG_CACHE_HOME", home.path())
+                .current_dir(home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        };
+        caudra_config::load_env_files(Path::new(&root));
+        assert_eq!(env::var(ORCH_STORE).as_deref(), Ok(PLANTED_STORE));
+        assert_eq!(local_host(CancelToken::none()).env_var(ORCH_STORE), None);
+    }
+
     #[test]
     fn the_snippet_receives_the_code_and_both_streams() {
         let (row, value) = answered(Output {
@@ -406,7 +651,85 @@ mod tests {
             stdout: "out".to_owned(),
             stderr: "err".to_owned(),
         });
-        assert_eq!(value, json!({ CODE_FIELD: 1, STDOUT_FIELD: "out", STDERR_FIELD: "err" }));
+        assert_eq!(
+            value,
+            json!({ CODE_FIELD: 1, STDOUT_FIELD: "out", STDERR_FIELD: "err" })
+        );
         assert!(matches!(&row.blocks[0], McpBlock::Text { text } if text == "exit 1\nout\nerr"));
+    }
+
+    /// A gateway for a session whose project is the returned directory, planning into its
+    /// `PLAN` when `planning`.
+    fn gateway(planning: bool) -> (TempDir, Gateway) {
+        let dir = tempdir();
+        let permissions = Arc::new(PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            dir.path().to_path_buf(),
+            Arc::default(),
+        ));
+        permissions.set_session_mode(Some(PermissionMode::Yolo));
+        let mode = match planning {
+            true => AgentMode::Plan(dir.path().join(PLAN)),
+            false => AgentMode::Build,
+        };
+        let mut ctx = stub_ctx_with_permissions(&mode, permissions);
+        ctx.task_environment = ctx
+            .task_environment
+            .set(native::plan::CWD, dir.path().to_str().unwrap());
+        let module = PstackModule { unavailable: None };
+        (dir, Gateway::new(ctx, vec![Arc::new(module)]))
+    }
+
+    fn invoke(gateway: &Gateway, name: &str, argv: &[&str]) -> ScriptReply {
+        match gateway.call(call(name, strings(argv), &[])) {
+            ScriptInvocation::Ready(reply) => reply,
+            ScriptInvocation::Deferred(future) => smol::block_on(future),
+        }
+    }
+
+    #[test]
+    fn orch_help_runs_in_plan_mode() {
+        let (_dir, gateway) = gateway(true);
+        let reply = invoke(&gateway, "orch", &["--help"]).unwrap();
+        assert_eq!(reply[CODE_FIELD], 0);
+    }
+
+    #[test]
+    fn an_orch_write_is_refused_in_plan_mode() {
+        let (_dir, gateway) = gateway(true);
+        let error = invoke(&gateway, "orch", &["--store", STORE, "init"]).unwrap_err();
+        assert_eq!(error.kind, ScriptErrorKind::Permission);
+    }
+
+    #[test]
+    fn an_orch_write_runs_in_build_mode() {
+        let (dir, gateway) = gateway(false);
+        let reply = invoke(&gateway, "orch", &["--store", STORE, "init"]).unwrap();
+        assert_eq!(reply[CODE_FIELD], 0, "{reply}");
+        assert!(dir.path().join(STORE).is_dir());
+    }
+
+    #[test]
+    fn check_plan_reads_the_session_plan() {
+        let (dir, gateway) = gateway(true);
+        let plan = format!("{VALID_PLAN_HEAD}\n");
+        PlanFile::new(dir.path().join(PLAN))
+            .unwrap()
+            .write(&plan)
+            .unwrap();
+        let reply = invoke(&gateway, "check_plan", &[SESSION_PLAN_FLAG]).unwrap();
+        let expected = check_plan::check_text(SESSION_PLAN_LABEL, &plan);
+        assert_eq!(
+            reply,
+            json!({ CODE_FIELD: expected.code, STDOUT_FIELD: expected.stdout, STDERR_FIELD: expected.stderr })
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_plan_fails_cleanly() {
+        let (_dir, gateway) = gateway(false);
+        let reply = invoke(&gateway, "check_plan", &[SESSION_PLAN_FLAG]).unwrap();
+        assert_eq!(reply[CODE_FIELD], 1);
+        assert!(!reply[STDERR_FIELD].as_str().unwrap().is_empty());
     }
 }

@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use caudra_automation::catalog::Trust;
+use caudra_automation::catalog::{Scope, Trust};
 use caudra_automation::request::{
     AutomationError, AutomationRequest, AutomationResponse, DropTarget,
 };
@@ -1566,6 +1566,7 @@ impl AutomationInspector {
 
     /// The script behind what the cursor is on, at the line that matters: an
     /// action's call, a failed firing's error, or none for the script itself.
+    /// A bundled script ships inside Caudra, so it has no file to open.
     fn script(&self, item: Option<&Item>) -> Option<(PathBuf, Option<u32>)> {
         let shown = self.shown().and_then(Shown::loaded);
         let traced = shown.map(|detail| &detail.firing);
@@ -1594,7 +1595,7 @@ impl AutomationInspector {
             Some(firing) => self.state.find(&firing.automation)?,
             None => self.selected_automation()?,
         };
-        Some((automation.path.clone(), line))
+        (automation.scope != Scope::Bundled).then(|| (automation.path.clone(), line))
     }
 
     /// The open trace's firing, with everything it loaded; the dry run, open
@@ -2270,7 +2271,6 @@ mod tests {
     use caudra_agent::automation::testing::settled_run;
     use caudra_agent::peers::handle_address;
     use caudra_automation::args::{ArgDecl, ArgSpec, ArgType, ArgsError, ValueError};
-    use caudra_automation::catalog::Scope;
     use caudra_automation::event::TurnOutcome;
     use caudra_automation::host::{ActionKind, DeliveryMode};
     use caudra_automation::limits::{ActingMarks, LimitReason, LimitRefusal};
@@ -2450,6 +2450,7 @@ mod tests {
     const NO_BODY: &str = "a dry run's action asks for no body";
     const BACK_TO_DRY_RUN: &str = "Esc steps out of the dry run onto its row";
     const PATCH_DRAWN: &str = "the dry run shows the state change it would commit";
+    const BUNDLED_HAS_NO_FILE: &str = "the footer greys o on a bundled script, which has no file";
 
     fn script(name: &str, availability: Availability) -> AutomationSnapshot {
         AutomationSnapshot {
@@ -3213,11 +3214,17 @@ mod tests {
         assert!(row.starts_with(&lead) && row.contains(SCRIPT), "{row}");
     }
 
-    #[test]
-    fn a_script_row_names_its_scope_and_when_its_last_firing_ended_and_how() {
+    #[test_case(Scope::Project, "project"; "project")]
+    #[test_case(Scope::User, "user"; "user")]
+    #[test_case(Scope::Bundled, "bundled"; "bundled")]
+    fn a_script_row_names_its_scope_and_when_its_last_firing_ended_and_how(
+        scope: Scope,
+        label: &str,
+    ) {
         let finished_at = NOW - 5 * MINUTE_MS;
         let state = AutomationState {
             automations: vec![AutomationSnapshot {
+                scope,
                 last_firing: Some(FiringSummary {
                     finished_at: Some(finished_at),
                     ..firing(FIRE_ID, FiringStatus::Completed, finished_at - MINUTE_MS)
@@ -3234,7 +3241,8 @@ mod tests {
             NOW,
         ));
 
-        assert!(row.contains(scope_text(Scope::Project)), "{row}");
+        assert_eq!(scope_text(scope), label);
+        assert!(row.contains(label), "{row}");
         assert!(row.contains(&relative(finished_at, NOW)), "{row}");
         assert!(row.ends_with(FiringStatus::Completed.as_str()), "{row}");
     }
@@ -3897,6 +3905,22 @@ mod tests {
                 path: PathBuf::from(SCRIPT_PATH),
                 line,
             }
+        );
+    }
+
+    #[test]
+    fn o_opens_nothing_for_a_bundled_script() {
+        let mut state = catalog();
+        state.automations[0].scope = Scope::Bundled;
+        let mut inspector = opened(state, Some(SCRIPT));
+
+        assert!(
+            !inspector.enabled(FooterCommand::Script, inspector.cursor_item().as_ref()),
+            "{BUNDLED_HAS_NO_FILE}"
+        );
+        assert_eq!(
+            press_char(&mut inspector, SCRIPT_KEY),
+            AutomationAction::Flash(NO_SCRIPT.to_owned())
         );
     }
 

@@ -16,9 +16,9 @@ Before fanning out, write a tight digest of this conversation: its opening user 
 
 ## 2. Spawn three reviewers in parallel
 
-One message, three plain `task` calls (no `profile`), `mode: "build"`. Reviewers need MCP access to look up the tickets, chat threads, and observability traces the transcript references, and plan mode strips most MCP tools.
+One message, three `task` calls with `profile: "builtin"` and `mode: "build"`. A task's mode is capped by the caller's, so the session must be in Build mode. Reviewers need MCP access to look up the tickets, chat threads, and observability traces the transcript references, and plan mode strips most MCP tools.
 
-Each reviewer and the synthesizer name a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
+Each reviewer and the synthesizer name a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
 | Lens | Role line | Default | Prompt template |
 |---|---|---|---|
@@ -30,7 +30,7 @@ Pass each template verbatim, substituting the digest where marked. Reviewers ret
 
 ## 3. Synthesize
 
-One plain `task` call (no `profile`), `model` and `thinking` from the `reflect judgment, divergent, synthesizer` line (default `claude-opus-5-5 xhigh`), `mode: "build"`. It spot-verifies citations through MCP, and plan mode strips most MCP tools. Pass `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. It returns an Accepted / Rejected / Backlog list.
+One `task` call with `profile: "builtin"`, `model` and `thinking` from the `reflect judgment, divergent, synthesizer` line (default `claude-opus-5-5 xhigh`), and `mode: "build"`, which again needs the session in Build mode. It spot-verifies citations through MCP, and plan mode strips most MCP tools. Pass `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. It returns an Accepted / Rejected / Backlog list.
 
 ## 4. Structural enforcement check
 

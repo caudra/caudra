@@ -15,7 +15,6 @@ use std::thread;
 use std::time::Duration;
 
 use caudra_agent::AgentConfig;
-use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock, NamedMock};
 use caudra_config::ModelPolicy;
@@ -272,7 +271,6 @@ impl Client {
             model: Model::from_spec(spec).unwrap(),
             timeouts: Timeouts::default(),
             thinking: Default::default(),
-            prompt_profiles: Arc::new(PromptProfileCatalog::default()),
             system_prompt_profile_override: None,
             permission_mode: None,
             model_policy: Arc::new(ModelPolicy::default()),

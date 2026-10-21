@@ -12,7 +12,7 @@ pstack (cursor/plugins) is written for Cursor. Caudra bundles it as the `pstack`
 - `caudra-pstack/upstream/` is the verbatim copy `make sync-pstack` writes. Never edit it by hand. It is the base for the next translation and the license record.
 - `caudra-pstack/translated/` has the same layout (`pstack/...`, `cursor-team-kit/...`). A file there replaces its upstream page. Copy a file here only when it needs a change.
 - `caudra-pstack/translated/translations.json` records, for each translated file, the hash of the upstream file it was translated from. `python3 scripts/sync-pstack.py --mark <path>...` writes it, with paths as in the overlay, such as `pstack/skills/how/SKILL.md`.
-- `caudra-pstack/automations/*.rhai` are Caudra's own ports of pstack's automations, served as `pstack/caudra/automations/<file>`.
+- `caudra-pstack/automations/*.rhai` are Caudra's own ports of pstack's automations, served as `pstack/caudra/automations/<file>` and bundled as `/automations` entries while pstack is on, so users arm them without writing a file.
 
 ## The check
 
@@ -82,12 +82,12 @@ A completion notification is the background task's final report, which arrives i
 
 ## Scripts
 
-pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Each takes the upstream command line's arguments as strings and returns `{"code", "stdout", "stderr"}`; a nonzero `code` is the script's verdict, not an exception. `log` and `orch` write files, so plan mode refuses them. In a remote session the calls raise, and the step runs with `shell` instead.
+pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Each takes the upstream command line's arguments as strings and returns `{"code", "stdout", "stderr"}`; a nonzero `code` is the script's verdict, not an exception. `log` and the `orch` commands that change the store write files, so plan mode refuses them; `orch`'s help and read-only commands run there. Commands a script runs get the shell tool's environment, so `gh` needs its token or keyring variables forwarded with `/env` or `[agent.shell_env] pass`. In a remote session the calls raise, and the step runs with `shell` instead.
 
 | Upstream | Caudra |
 | --- | --- |
 | `scripts/log.sh <logfile> <phase> <decision> <why> <evidence> <result>` | `await pstack.log(logfile, phase, decision, why, evidence, result)` |
-| `node .../check-plan.mjs <plan.md>`, `bun ...` | `await pstack.check_plan("plan.md")` |
+| `node .../check-plan.mjs <plan.md>`, `bun ...` | `await pstack.check_plan("plan.md")`, or `await pstack.check_plan("--plan")` for the session plan (see Plan mode) |
 | `scripts/worktree-audit.sh [-b <ref>] [repo]` | `await pstack.worktree_audit("-b", "origin/main")`. `LAST_CHAT` is the last Caudra session that worked in the worktree. |
 | `scripts/watch-pr/watch-pr <args>` | `await pstack.watch_pr("--pr", "123", "--status-only")`, same flags. A polling run streams its lines to the call's row and ends at the run's `timeoutSec`, at most 3600: raise `timeoutSec` for drive mode, or arm the `pstack-watch-pr` automation for a long wait. |
 | `orch <command> <args>` | `await pstack.orch("--store", store, "unit", "add", ...)`. Every call passes `--store`, `init` included. |
@@ -114,7 +114,7 @@ Map first. Remove a step only when Caudra has nothing like it, and then remove i
 | Cursor | Caudra |
 | --- | --- |
 | `/loop until X`, the loop skill | `/goal X`, which the user sets (autopilot answers for them). Within a turn, keep working until X holds. |
-| Cursor Automations, routine wakes, `update_state`, `api2.cursor.sh/automations` webhooks | Caudra automations (`experimental.automations`): a script from `pstack/caudra/automations/`, or one written with the `caudra-automation-dev` skill, with a `schedule` or `message_received` trigger. The agent writes and validates it; the user trusts and arms it. |
+| Cursor Automations, routine wakes, `update_state`, `api2.cursor.sh/automations` webhooks | Caudra automations (`experimental.automations`) with a `schedule` or `message_received` trigger. A script from `pstack/caudra/automations/` is bundled: with pstack on it is already listed in `/automations`, so the page gives the arm line and args and never a write, validate, or trust step, and says a project or user script of the same name overrides it. Any other script is written with the `caudra-automation-dev` skill: the agent writes and validates it; the user trusts and arms it. |
 | `SendToUser` secret requests | the user sets the variable in their environment or the global `.env` |
 | a frontier watcher or heartbeat armed through the loop skill | an automation with a `schedule` trigger that messages the session, such as `pstack-watch-pr`; without automations, drain when a report arrives |
 | agents in other chats reporting to an orchestrator | cross-session messaging (`send_message`, `list_sessions`) when the user has it on; otherwise every worker is a `task` of this session |
@@ -125,6 +125,10 @@ Map first. Remove a step only when Caudra has nothing like it, and then remove i
 
 Cursor's product name: where the text means the agent host, write Caudra. Where it credits where pstack comes from (its README, the license), keep it.
 
+## Plan mode
+
+Caudra opens sessions in Plan mode, where only the session plan changes. A step that writes a plan says: in Plan mode, write it with the `plan` tool (Caudra's session plan; Ctrl+O opens it, and autopilot can review it) and check it with `await pstack.check_plan("--plan")`; in Build mode, write the file under `.caudra/pstack/docs/` for hand-off to another session and check it by path. A playbook that builds, edits, or commits needs Build mode: the user switches with Tab, and a task's mode is capped by its caller's, so `mode: "build"` cannot lift a task out of Plan mode.
+
 ## Benny
 
-benny's pack is not copied into the project. Its skills stay pages, such as `pstack/automations/benny/skills/triage-issue-reports/SKILL.md`. Its Slack trigger is the `benny-triage` and `benny-reproduce` automations (`pstack/caudra/automations/benny-triage.rhai`, `pstack/caudra/automations/benny-reproduce.rhai`), written to the project's automation directory (from `await automation.list()`), polling Slack with `BENNY_SLACK_BOT_TOKEN` and armed with `/automations arm benny-triage {"channel_id": "C…", "triage_user_id": "U…"}` and `/automations arm benny-reproduce {"channel_id": "C…", "triage_user_id": "U…"}`. Slack actions (`read_action`, `thread_post_action`, reactions, file downloads) use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and the same token. Every rule about posting only in the report's thread stands.
+benny's pack is not copied into the project. Its skills stay pages, such as `pstack/automations/benny/skills/triage-issue-reports/SKILL.md`. Its Slack trigger is the `benny-triage` and `benny-reproduce` automations (`pstack/caudra/automations/benny-triage.rhai`, `pstack/caudra/automations/benny-reproduce.rhai`), bundled with pstack and already listed in `/automations` with pstack and `experimental.automations` on, so setup writes, validates, and trusts nothing (a project or user script of the same name overrides one), polling Slack with `BENNY_SLACK_BOT_TOKEN` and armed with `/automations arm benny-triage {"channel_id": "C…", "triage_user_id": "U…"}` and `/automations arm benny-reproduce {"channel_id": "C…", "triage_user_id": "U…"}`. Slack actions (`read_action`, `thread_post_action`, reactions, file downloads) use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and the same token. Every rule about posting only in the report's thread stands.

@@ -37,9 +37,9 @@ impl Roles {
             Self::Found { path, text } => {
                 let lines = role_lines(text);
                 match lines.is_empty() {
-                    true => format!(
-                        "`{path}` sets no roles, so every role uses its skill's default."
-                    ),
+                    true => {
+                        format!("`{path}` sets no roles, so every role uses its skill's default.")
+                    }
                     false => format!(
                         "From `{path}`. Each line overrides the skill default for its role: \
                          `<model> <thinking>` are the `task` call's `model` and `thinking`, and \

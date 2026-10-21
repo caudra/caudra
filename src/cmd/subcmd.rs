@@ -1709,7 +1709,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         StoredMode::Build,
     )?;
     caudra_providers::provider::adjust_model(&mut model, Timeouts::default())?;
-    let profiles = PromptProfileCatalog::discover_user();
+    let profiles = PromptProfileCatalog::discover_user(config.agent.builtin_skills.pstack);
     let profile = profiles
         .resolve(
             cli.system_prompt_profile
@@ -1947,7 +1947,7 @@ pub fn prompt(
         load_instruction_text(&cwd_str)
     };
     let slots = host.event_handle().collect_prompt_slots(&config.agent);
-    let prompt_profiles = PromptProfileCatalog::discover_user();
+    let prompt_profiles = PromptProfileCatalog::discover_user(config.agent.builtin_skills.pstack);
     let profile_name = cli
         .system_prompt_profile
         .as_deref()

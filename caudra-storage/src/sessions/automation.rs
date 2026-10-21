@@ -67,16 +67,28 @@ const WAITING_STATUSES: &str = "('queued', 'deferred')";
 const KEEPING_STATUSES: &str = "('completed', 'skipped')";
 const SUPERSEDED_TRIGGERS: &str = "('armed', 'idle', 'needs_input', 'schedule')";
 
-/// The bindings of every automation a session armed, the script versions its
-/// firings ran, the firings, and the actions each took. Small columns come
-/// before the bodies so reading a row's status or `bytes` never walks its
-/// overflow pages. Byte bounds live in this module rather than in CHECKs, so
-/// raising one needs no table rebuild.
-pub(crate) const TABLES: &str = r#"
+/// The scopes a binding's CHECK allows: `v36` before bundled scripts, then
+/// `current`.
+macro_rules! binding_scopes {
+    (v36) => {
+        "'user', 'project'"
+    };
+    (current) => {
+        "'user', 'project', 'bundled'"
+    };
+}
+pub(crate) use binding_scopes;
+
+macro_rules! bindings_table {
+    ($scopes:ident) => {
+        concat!(
+            r#"
 CREATE TABLE automation_bindings (
     session_id       BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     automation       TEXT NOT NULL,
-    scope            TEXT NOT NULL CHECK(scope IN ('user', 'project')),
+    scope            TEXT NOT NULL CHECK(scope IN ("#,
+            $crate::automation::binding_scopes!($scopes),
+            r#")),
     origin           TEXT NOT NULL CHECK(origin IN ('cli', 'profile', 'manual', 'always', 'sdk')),
     armed            INTEGER NOT NULL CHECK(armed IN (0, 1)),
     args_digest      TEXT,
@@ -99,7 +111,47 @@ CREATE TABLE automation_bindings (
     work_cursor      TEXT NOT NULL CHECK(json_valid(work_cursor)),
     PRIMARY KEY(session_id, automation)
 ) STRICT;
+"#
+        )
+    };
+}
+pub(crate) use bindings_table;
 
+/// Moves every binding out of `$previous` into a fresh `automation_bindings`
+/// whose CHECK allows `$scopes`, since a CHECK cannot change in place. The
+/// generated `bytes` is recomputed by the insert.
+macro_rules! rebuild_bindings {
+    ($scopes:ident, $previous:literal) => {
+        concat!(
+            "\nALTER TABLE automation_bindings RENAME TO ",
+            $previous,
+            ";\n",
+            $crate::automation::bindings_table!($scopes),
+            r#"
+INSERT INTO automation_bindings (
+    session_id, automation, scope, origin, armed, args_digest, state_revision, state_writer,
+    state_digest, state_written_ms, created_ms, updated_ms, args, state, limiter, schedule,
+    work_cursor
+)
+SELECT session_id, automation, scope, origin, armed, args_digest, state_revision, state_writer,
+    state_digest, state_written_ms, created_ms, updated_ms, args, state, limiter, schedule,
+    work_cursor
+FROM "#,
+            $previous,
+            ";\n\nDROP TABLE ",
+            $previous,
+            ";\n"
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use rebuild_bindings;
+
+macro_rules! tables {
+    ($scopes:ident) => {
+        concat!(
+            $crate::automation::bindings_table!($scopes),
+            r#"
 CREATE TABLE automation_sources (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     digest     TEXT NOT NULL,
@@ -181,7 +233,23 @@ CREATE TABLE automation_actions (
 ) STRICT;
 
 CREATE INDEX automation_actions_queued ON automation_actions(fire_id, seq) WHERE status = 'queued';
-"#;
+"#
+        )
+    };
+}
+
+/// The bindings of every automation a session armed, the script versions its
+/// firings ran, the firings, and the actions each took. Small columns come
+/// before the bodies so reading a row's status or `bytes` never walks its
+/// overflow pages. Byte bounds live in this module rather than in CHECKs, so
+/// raising one needs no table rebuild.
+pub(crate) const TABLES: &str = tables!(current);
+/// [`TABLES`] as schema 21 created them, before bundled scripts. Only that
+/// step still does: the schema 37 step rebuilds the bindings as [`TABLES`]
+/// has them.
+pub(crate) const TABLES_V21: &str = tables!(v36);
+pub(crate) const BUNDLED_SCOPE_MIGRATION: &str =
+    rebuild_bindings!(current, "automation_bindings_v36");
 /// Per-session automation row bytes, as a scalar over the `sessions` alias.
 pub(crate) const SESSION_AUTOMATION_BYTES: &str = "coalesce((SELECT sum(bytes) \
         FROM automation_bindings WHERE session_id = sessions.id), 0) \
@@ -211,6 +279,7 @@ text_enum! {
     AutomationScope as "automation scope" {
         User = "user",
         Project = "project",
+        Bundled = "bundled",
     }
 }
 
@@ -2446,6 +2515,22 @@ mod tests {
             result,
             Err(SessionError::Storage(StorageError::NotFound(_)))
         )
+    }
+
+    #[test_case(AutomationScope::User; "user")]
+    #[test_case(AutomationScope::Project; "project")]
+    #[test_case(AutomationScope::Bundled; "bundled")]
+    fn a_binding_keeps_its_scope(scope: AutomationScope) {
+        let (_temp, _state_dir, database, session_id) = open();
+
+        database
+            .upsert_automation_binding(&AutomationArming {
+                scope,
+                ..arming(session_id, AUTOMATION)
+            })
+            .unwrap();
+
+        assert_eq!(binding(&database, session_id).scope, scope);
     }
 
     #[test]

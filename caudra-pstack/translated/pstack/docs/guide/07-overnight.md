@@ -29,7 +29,7 @@ if you're truly stuck after a few hours, stop and write up why.
 Then hand it the finish condition as a goal:
 
 ```text
-/autopilot zero old callers, all parser fixtures pass, old api deleted
+/goal zero old callers, all parser fixtures pass, old api deleted
 ```
 
 Walk through what each line buys you:
@@ -38,7 +38,7 @@ Walk through what each line buys you:
 - "done means..." turns the goal into checks every iteration can run.
 - "fresh worktree off `<base>`" keeps the run from colliding with anything else you have open.
 - "don't ask me before committing" pre-answers the permission the agent would otherwise block on.
-- `/autopilot <condition>` is Caudra's own, not a pstack skill. It sets the condition as the session's `/goal`, which is re-checked after every turn and starts another turn until it holds, and it answers the prompts and questions that would otherwise wait for you. [Autopilot](https://caudra.ai/docs/autopilot/) is experimental. Without it, `/goal <condition>` alone keeps the run going. The [Autonomous run playbook](../../skills/poteto-mode/playbooks/autonomous-run.md) drives to the same condition within each turn.
+- `/goal <condition>` is Caudra's own, not a pstack skill. The goal is re-checked after every turn and starts another turn until it holds. To also have the prompts and questions that would otherwise wait for you answered, use `/autopilot <condition>` instead, which sets the same goal. [Autopilot](https://caudra.ai/docs/autopilot/) is experimental: `/autopilot` exists only with `experimental.autopilot = true` in your global `caudra.toml`, after a restart. The [Autonomous run playbook](../../skills/poteto-mode/playbooks/autonomous-run.md) drives to the same condition within each turn.
 - The escape hatch lets it stop at a genuine dead end and write up why, which beats eight hours of creative goal reinterpretation.
 
 Because you'll review this work after stepping away, `/pstack:poteto-mode` routes it through [`/pstack:figure-it-out`](../../skills/figure-it-out/SKILL.md), which designs the run's phases before any code and wires in the decision log.

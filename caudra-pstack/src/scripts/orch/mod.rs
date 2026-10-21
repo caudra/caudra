@@ -81,6 +81,54 @@ enum Action {
     StandingAdd,
 }
 
+impl Action {
+    /// Whether the action can change the store. `status` rewrites `status.md`, and `inbox drain`
+    /// empties the inbox unless it only peeks.
+    fn writes(self, peek: bool) -> bool {
+        match self {
+            Self::RequireSubcommand
+            | Self::UnitGet
+            | Self::UnitList
+            | Self::UnitCounts
+            | Self::LedgerCheck
+            | Self::LedgerSummary
+            | Self::InboxCount
+            | Self::GateList
+            | Self::FrontierShow
+            | Self::StandingShow => false,
+            Self::InboxDrain => !peek,
+            Self::Init
+            | Self::UnitAdd
+            | Self::UnitSet
+            | Self::LedgerRecord
+            | Self::InboxPush
+            | Self::GatePark
+            | Self::GateResolve
+            | Self::FrontierSet
+            | Self::Status
+            | Self::StandingAdd => true,
+        }
+    }
+}
+
+/// The store a command line opens, by `--store` or `ORCH_STORE`, and whether it can change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreUse {
+    pub store: String,
+    pub writes: bool,
+}
+
+/// What `argv` would do to a store, read without running it. Help, a command line that does not
+/// parse, and one that names no store open none.
+pub fn store_use(argv: &[String], env: &dyn Fn(&str) -> Option<String>) -> Option<StoreUse> {
+    let invocation = parse(&PROGRAM, argv, env).ok()?;
+    let store = store_directory(&invocation).ok()?.to_owned();
+    Some(StoreUse {
+        store,
+        writes: invocation.action.writes(invocation.flag(PEEK)),
+    })
+}
+
 fn positive_integer(value: &str) -> Result<Value, String> {
     let canonical = value.starts_with(|first: char| ('1'..='9').contains(&first))
         && value.bytes().all(|byte| byte.is_ascii_digit());
@@ -901,6 +949,34 @@ Options:
         assert_eq!(
             orch(&host, args),
             Output::failure(1, format!("{error}\n\n{help}"))
+        );
+    }
+
+    const STORE_DIR: &str = "/s";
+    const ENV_STORE: &str = "/from-env";
+
+    #[test_case(&["--help"], None ; "help_opens_nothing")]
+    #[test_case(&["--store", STORE_DIR, "unit", "list", "--help"], None ; "leaf_help_opens_nothing")]
+    #[test_case(&["unit", "foo"], None ; "a_parse_error_opens_nothing")]
+    #[test_case(&["--store", STORE_DIR, "unit", "list"], Some((STORE_DIR, false)) ; "unit_list_reads")]
+    #[test_case(&["--store", STORE_DIR, "unit", "get", "u1"], Some((STORE_DIR, false)) ; "unit_get_reads")]
+    #[test_case(&["--store", STORE_DIR, "gate", "list"], Some((STORE_DIR, false)) ; "gate_list_reads")]
+    #[test_case(&["--store", STORE_DIR, "frontier", "show"], Some((STORE_DIR, false)) ; "frontier_show_reads")]
+    #[test_case(&["--store", STORE_DIR, "inbox", "drain", "--peek"], Some((STORE_DIR, false)) ; "a_peek_reads")]
+    #[test_case(&["--store", STORE_DIR, "inbox", "drain"], Some((STORE_DIR, true)) ; "a_drain_writes")]
+    #[test_case(&["--store", STORE_DIR, "status"], Some((STORE_DIR, true)) ; "status_renders_a_file")]
+    #[test_case(&["--store", STORE_DIR, "init"], Some((STORE_DIR, true)) ; "init_writes")]
+    #[test_case(&["--store=/s", "unit", "add", "u1", "--track", "t"], Some((STORE_DIR, true)) ; "unit_add_writes")]
+    #[test_case(&["standing", "add", "x"], Some((ENV_STORE, true)) ; "the_store_can_come_from_the_environment")]
+    fn store_use_reads_the_command_line(args: &[&str], expected: Option<(&str, bool)>) {
+        let argv: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let env = |name: &str| (name == "ORCH_STORE").then(|| ENV_STORE.to_owned());
+        assert_eq!(
+            super::store_use(&argv, &env),
+            expected.map(|(store, writes)| super::StoreUse {
+                store: store.to_owned(),
+                writes,
+            })
         );
     }
 

@@ -59,6 +59,7 @@ use serde_json::{Map, Value};
 use smol::Task;
 use tracing::{debug, warn};
 
+use super::bundled::{BundledAutomation, bundled_automations};
 use super::catalog::{AutomationDirs, Catalog, CatalogError, Frontend, ResolvedAutomation};
 use super::clock::{Clock, millis};
 use super::dry_run::{DryRunJob, DryRuns, replayed_event, replayed_trigger};
@@ -120,7 +121,11 @@ pub struct RuntimeDeps {
     /// The user's config directory, whose `automations/` scope the catalog scans. `None` uses
     /// the real one; tests point at a tempdir.
     pub user_config_dir: Option<PathBuf>,
-    /// The project lives on another machine, so only the user's own scripts apply.
+    /// The scripts the bundled scope lists. `None` lists the ones installed at each scan, as
+    /// [`bundled_automations`] has them; tests pass their own.
+    pub bundled: Option<Vec<BundledAutomation>>,
+    /// The project lives on another machine, so only the user's own and the bundled scripts
+    /// apply.
     pub remote: bool,
     pub features: FeatureFlags,
     /// Refuses the scripts this frontend cannot serve.
@@ -292,6 +297,7 @@ struct Manager {
     state_dir: StateDir,
     cwd: PathBuf,
     user_config_dir: Option<PathBuf>,
+    bundled: Option<Vec<BundledAutomation>>,
     remote: bool,
     features: FeatureFlags,
     frontend: Frontend,
@@ -436,6 +442,7 @@ impl Manager {
             state_dir: deps.state_dir,
             cwd: deps.cwd,
             user_config_dir,
+            bundled: deps.bundled,
             remote: deps.remote,
             features: deps.features,
             frontend: deps.frontend,
@@ -2805,9 +2812,18 @@ impl Manager {
     }
 
     fn rescan(&mut self) {
+        let installed;
+        let bundled = match &self.bundled {
+            Some(bundled) => bundled.as_slice(),
+            None => {
+                installed = bundled_automations();
+                installed.as_slice()
+            }
+        };
         self.catalog = if self.remote {
             Catalog::scan_user_only(
                 self.user_config_dir.as_deref(),
+                bundled,
                 self.features,
                 self.frontend,
             )
@@ -2816,6 +2832,7 @@ impl Manager {
                 &self.state_dir,
                 &self.cwd,
                 self.user_config_dir.as_deref(),
+                bundled,
                 self.features,
                 self.frontend,
             )
@@ -3282,6 +3299,7 @@ pub(super) fn delivery_terms(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::env;
     use std::fs;
     use std::path::Path;
@@ -3472,6 +3490,10 @@ state.seen = seen;"#;
         "a disarmed binding must stay disarmed unless the command line names it";
     const KEPT_FOR_TUI: &str =
         "a binding only the SDK refuses must not arm there and must stay armed for the TUI";
+    const BUNDLED_PROVIDER: &str = "manager-test";
+    const BUNDLED_ARMS: &str = "a bundled script must arm without trust or a file";
+    const PROVIDER_OFF_DISARMS: &str =
+        "a bundled script gone at restore must disarm its binding and keep its args";
     const PROFILE_SEEDS: &str =
         "a profile's args must seed a new binding that a bare command-line entry also names";
     const SAME_PROFILE_IDLE: &str = "the same profile list again must change nothing";
@@ -3747,6 +3769,7 @@ state.seen = seen;"#;
                 session_id: self.session.id,
                 cwd: self.temp.path().join(PROJECT_DIR),
                 user_config_dir: Some(self.temp.path().join(CONFIG_DIR)),
+                bundled: Some(Vec::new()),
                 remote: false,
                 features: FeatureFlags::all(),
                 frontend: Frontend::Tui,
@@ -4024,14 +4047,29 @@ state.seen = seen;"#;
 
     /// Writes `<name>.rhai` into the `automations` directory under `root`.
     fn write_script(root: &Path, name: &str, triggers: &[&str], fields: &[&str], body: &str) {
-        let fields: String = fields.iter().map(|field| format!(", {field}")).collect();
-        let source = format!(
-            "let meta = #{{ name: \"{name}\", description: \"{DESCRIPTION}\", triggers: [{}]{fields} }};\n{body}",
-            triggers.join(", ")
-        );
         let dir = root.join(AUTOMATIONS_DIR);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(format!("{name}.{SCRIPT_EXTENSION}")), source).unwrap();
+        fs::write(
+            dir.join(format!("{name}.{SCRIPT_EXTENSION}")),
+            script_source(name, triggers, fields, body),
+        )
+        .unwrap();
+    }
+
+    fn script_source(name: &str, triggers: &[&str], fields: &[&str], body: &str) -> String {
+        let fields: String = fields.iter().map(|field| format!(", {field}")).collect();
+        format!(
+            "let meta = #{{ name: \"{name}\", description: \"{DESCRIPTION}\", triggers: [{}]{fields} }};\n{body}",
+            triggers.join(", ")
+        )
+    }
+
+    fn bundled(name: &str, triggers: &[&str], fields: &[&str], body: &str) -> BundledAutomation {
+        BundledAutomation {
+            provider: BUNDLED_PROVIDER,
+            name: name.to_owned(),
+            source: Cow::Owned(script_source(name, triggers, fields, body)),
+        }
     }
 
     async fn boot(deps: RuntimeDeps) -> Live {
@@ -5525,6 +5563,62 @@ state.seen = seen;"#
                 "{KEPT_FOR_TUI}"
             );
             resumed.stop().await;
+        });
+    }
+
+    #[test]
+    fn a_bundled_script_arms_without_trust() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let live = boot(RuntimeDeps {
+                bundled: Some(vec![bundled(BRIEFED, &[ARMED], &[], RECORD_BODY)]),
+                ..fixture.deps(&[BRIEFED])
+            })
+            .await;
+
+            live.firing(BRIEFED, FiringStatus::Completed).await;
+
+            let snapshot = live.snapshot(BRIEFED);
+            assert_eq!(
+                (snapshot.scope, snapshot.trust, snapshot.armed),
+                (Scope::Bundled, Trust::Location, Some(ArmOrigin::Cli)),
+                "{BUNDLED_ARMS}"
+            );
+            live.stop().await;
+        });
+    }
+
+    #[test]
+    fn a_bundled_script_gone_at_restore_disarms_and_keeps_its_args() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let shipped = || Some(vec![bundled(BRIEFED, &[ARMED], &[TOPIC_ARGS], RECORD_BODY)]);
+            let first = boot(RuntimeDeps {
+                bundled: shipped(),
+                launch: vec![launching(BRIEFED, Some(SEED), ArmOrigin::Cli)],
+                ..fixture.deps(&[])
+            })
+            .await;
+            first.firing(BRIEFED, FiringStatus::Completed).await;
+            first.stop().await;
+
+            let off = boot(fixture.deps(&[])).await;
+            off.barrier().await;
+            off.stop().await;
+
+            let on = boot(RuntimeDeps {
+                bundled: shipped(),
+                ..fixture.deps(&[])
+            })
+            .await;
+            on.barrier().await;
+            let snapshot = on.snapshot(BRIEFED);
+            assert_eq!(
+                (snapshot.armed, snapshot.args),
+                (None, Some(topic(SEED))),
+                "{PROVIDER_OFF_DISARMS}"
+            );
+            on.stop().await;
         });
     }
 

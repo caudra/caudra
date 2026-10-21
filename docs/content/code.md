@@ -259,14 +259,16 @@ r["code"] == 0
 | Call | Upstream script | Does |
 |---|---|---|
 | `pstack.log(logfile, phase, decision, why, evidence, result)` | `log.sh` | Appends one tab-separated row to a work log, writing the header first |
-| `pstack.check_plan(plan_md)` | `check-plan.mjs` | Checks a plan's structure and its verification boxes |
-| `pstack.worktree_audit("-b", "origin/main", repo)` | `worktree-audit.sh` | Lists every worktree with its branch state. `LAST_CHAT` names the newest Caudra session that worked there |
+| `pstack.check_plan(plan_md)` | `check-plan.mjs` | Checks a plan's structure and its verification boxes. `pstack.check_plan("--plan")` checks the [session plan](/docs/permissions/#plan-mode) instead, the one the `plan` tool writes |
+| `pstack.worktree_audit("-b", "origin/main", repo)` | `worktree-audit.sh` | Fetches the base branch, best effort, then lists every worktree with its branch state. `LAST_CHAT` names the newest Caudra session that worked there |
 | `pstack.watch_pr("--pr", "123", "--status-only")` | `watch-pr` | Reports a pull request's checks and reviews through the GitHub CLI, `gh`. Without `--status-only` it polls until a verdict, so give the run a `timeoutSec` that covers the wait |
 | `pstack.orch("--store", dir, ...)` | `orch.ts` | Reads and writes the orchestrate store in the same file format. Every call names its store |
 
-`pstack.watch_pr("--help")` and `pstack.orch("--help")` list every option. A long-running call shows its latest line on the card. To watch a pull request without holding the turn, arm the `pstack-watch-pr` [automation](/docs/automations/) that `pstack/poteto-mode/playbooks/babysit.md` describes.
+`pstack.watch_pr("--help")` and `pstack.orch("--help")` list every option. A long-running call shows its latest line on the card. A run that reaches its `timeoutSec` stops its calls too, so a `watch_pr` still polling ends with it. To watch a pull request without holding the turn, arm the `pstack-watch-pr` [automation](/docs/automations/) that `pstack/poteto-mode/playbooks/babysit.md` describes.
 
 The scripts run on this machine. In a [remote workspace](/docs/remote-workspaces/) the calls raise `RuntimeError`, and the agent follows the skill's steps with `shell` instead.
+
+The commands a script runs, such as `git` and `gh`, get the same environment as [shell commands](/docs/cli/#shell-host-configuration): a fixed set of variables plus what `/env` or `[agent.shell_env]` forwards, with Git's and the GitHub CLI's prompts turned off and the [proxy](/docs/cli/#network-proxies) Caudra's own requests use. `GH_TOKEN`, `GITHUB_TOKEN`, and the variables a keyring needs, such as `DBUS_SESSION_BUS_ADDRESS`, are not among them, so when `gh` keeps its login in a keyring or a token variable, forward those with `/env` or `[agent.shell_env] pass`. A call whose `gh` could not sign in says so at the end of its `stderr`. A login `gh auth login` saved to its config file works as it is. `ORCH_STORE` and `ORCH_REPO` are read from Caudra's own environment, never from the project's `.env`.
 
 ## Permissions
 
@@ -280,8 +282,8 @@ Starting a run never asks: the `code` tool is allowed by default, because a snip
 | `history` in another project, or `scope="all"` | Asks, as [Privacy and permissions](#privacy-and-permissions) describes |
 | `decisions.decide()`, `decisions.rerank()` | Allowed |
 | `image`, `host`, `workflow`, `automation` | Under the rules of the tool the call runs, such as `image_generate`. The prompt shows the call as the snippet made it |
-| `pstack.log()`, `pstack.orch()` | Asks, scoped to `pstack:<script>`. Plan mode refuses them, because they write files |
-| `pstack.check_plan()`, `pstack.worktree_audit()`, `pstack.watch_pr()` | Asks, scoped to `pstack:<script>` |
+| `pstack.log()`, an `orch` command that changes the store | Asks, scoped to `pstack:<script>`, naming the log file or store directory, so file rules and protected paths apply. Plan mode refuses them, because they write files |
+| `pstack.check_plan()`, `pstack.worktree_audit()`, `pstack.watch_pr()`, `orch`'s help and read-only commands such as `unit list`, `gate list`, and `frontier show` | Asks, scoped to `pstack:<script>`, naming the file or store a call reads. Plan mode allows them. `worktree_audit` still fetches the base branch |
 | `help()`, `mcp.search()`, `mcp.servers()` | Allowed |
 
 A deny rule for `code` itself blocks every run. `code` cannot be disabled with `disabled_tools` or a profile, because the modules live in it. Turn off a module's [tool group](/docs/system-prompts/#tool-groups) instead.

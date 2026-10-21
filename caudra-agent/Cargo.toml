@@ -30,6 +30,7 @@ caudra-storage = { workspace = true }
 caudra-terminal-host = { workspace = true }
 caudra-workspace = { workspace = true }
 caudra-workflow = { workspace = true }
+workcell-tool-contract = { workspace = true }
 grep-regex = { workspace = true }
 regex = { workspace = true }
 globset = { workspace = true }

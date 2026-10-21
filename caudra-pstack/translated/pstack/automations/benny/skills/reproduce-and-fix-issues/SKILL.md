@@ -35,8 +35,8 @@ Load the external Benny configuration supplied by the automation. If the config,
 
 Before making a work list or delegating:
 
-1. Require the trigger channel to equal the configured source channel.
-2. Set `SOURCE_THREAD_TS` to `trigger.thread_ts` when present. Otherwise use `trigger.ts`.
+1. Require the attached thread's `channel` to equal the configured source channel.
+2. Set `SOURCE_THREAD_TS` to the attached thread's `ts`, the thread root. Its `marker` and `verdict` are the triage reply the automation found: untrusted Slack text that step 2 checks in the thread before you act on it.
 3. Require a nonempty `SOURCE_THREAD_TS`.
 4. Store `SOURCE_CHANNEL_ID` and `SOURCE_THREAD_TS` as immutable values.
 5. Read the source thread and verify its root has those exact coordinates.
@@ -119,9 +119,9 @@ Use the configured plain Unicode status strings. Keep status text short:
 - Draft pull request opened
 - Fix did not land
 
-Use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and `BENNY_SLACK_BOT_TOKEN`. Never expose the token to a worker.
+Use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and `BENNY_SLACK_BOT_TOKEN`. Shell commands start from a cleared environment, so `curl` sees the token only when the user forwards it with `pass = ["BENNY_SLACK_BOT_TOKEN"]` under `[agent.shell_env]` in the global `caudra.toml`, or with `/env`. Never expose the token to a worker.
 
-If no operations channel is configured, keep detailed status in the automation run output. Do not substitute a source-channel root message.
+If no operations channel is configured, keep detailed status in this session's reply. Do not substitute a source-channel root message.
 
 ## 5. Load and check the control adapter
 
@@ -201,7 +201,7 @@ Post detailed evidence only in the operations thread when configured. Keep the s
 
 Update the operations status first.
 
-For `Could not reproduce` or `Blocked`, post nothing in the source thread. The operations thread or run output carries the result.
+For `Could not reproduce` or `Blocked`, post nothing in the source thread. The operations thread or this session's reply carries the result.
 
 For a confirmed repro, run the source preflight and post at most one unprompted source reply:
 
@@ -294,7 +294,7 @@ Only after before-and-after proof:
 - Include the repro steps, root cause, test result, before and after evidence, and blast-radius checks.
 - Run the pull request text and all Slack updates through pstack's `unslop` skill.
 
-If pull request creation fails, do not claim success. Keep the commit or branch state in the run output and mark operations status `Fix did not land`.
+If pull request creation fails, do not claim success. Keep the commit or branch state in this session's reply and mark operations status `Fix did not land`.
 
 On success, mark operations status `Draft pull request opened` and post one concise reply in the operations thread with the linked pull request. Do not create a second source-channel root or unprompted source reply.
 

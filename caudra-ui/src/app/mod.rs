@@ -579,6 +579,8 @@ pub struct App {
     /// Set by the event loop after construction: whether a summarizer writes
     /// the memory's lines, which the inspector says when it does not.
     pub(crate) summarize_memory: bool,
+    /// Set by the event loop: `builtin_skills.pstack`, for the commands a remote `cd` rediscovers.
+    pub(crate) pstack: bool,
     pub(super) task_picker: TaskPicker,
     pub(super) shell_modal: ShellModal,
     pub(crate) peer_manager: PeerManager,
@@ -927,6 +929,7 @@ impl App {
             learn_reads: learning::LearnReads::default(),
             learner: None,
             summarize_memory: true,
+            pstack: false,
             task_picker: TaskPicker::new(),
             shell_modal: ShellModal::new(),
             peer_manager: PeerManager::new(),
@@ -6311,14 +6314,14 @@ impl App {
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
             "/workbench" => self.run_builtin(BuiltinAction::Workbench),
-            name if name.starts_with("/project:")
-                || name.starts_with("/user:")
-                || self.command_palette.find_custom_command(name).is_some() =>
-            {
+            name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
             name if self.command_palette.find_mcp_prompt(name).is_some() => {
                 self.execute_mcp_prompt(name, &cmd.args)
+            }
+            name if self.command_palette.find_custom_command(name).is_some() => {
+                self.execute_custom_command(name, &cmd.args)
             }
             name if self.command_palette.find_lua_command(name).is_some() => {
                 self.run_lua_command(name, cmd.args, depth);
@@ -6536,6 +6539,19 @@ impl App {
         }
     }
 
+    /// `builtin_skills.pstack` as saved now. A remote tab reads its commands from its own
+    /// project, so it rediscovers them here; a local one takes them from [`Self::reload_commands`].
+    pub(crate) fn set_pstack(&mut self, on: bool) {
+        self.pstack = on;
+        if !self.no_commands
+            && let Some(context) = &self.remote_project_context
+        {
+            self.command_palette.set_custom_commands(Arc::from(
+                caudra_agent::command::discover_remote_commands(context, on),
+            ));
+        }
+    }
+
     pub(crate) fn set_mcp_config_errors(&mut self, errors: McpConfigErrors) {
         self.mcp_picker.set_config_errors(errors);
     }
@@ -6582,6 +6598,7 @@ impl App {
             } else {
                 Arc::from(caudra_agent::command::discover_remote_commands(
                     &change.context,
+                    self.pstack,
                 ))
             });
         self.workspace_session = Some(change.workspace);

@@ -1,38 +1,39 @@
-//! The bundled pstack, off unless `[plugins.skill] pstack = true`: its `pstack` skill, the
-//! `/pstack:<skill>` commands, and the `pstack-<agent>` task profiles.
+//! The bundled pstack, off unless `[plugins.skill] pstack = true`: its `pstack` skill, its
+//! bundled automations, the `/pstack:<skill>` commands, and the `pstack-<agent>` task profiles.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use caudra_pstack::{Agent, Library, NAME, Roles, SKILL_DESCRIPTION, automations, library};
 
-use caudra_pstack::{Agent, Library, NAME, Roles, SKILL_DESCRIPTION, library};
-
+use crate::automation::bundled::{install_bundled_automations, remove_bundled_automations};
 use crate::command::{ARGUMENTS_PLACEHOLDER, CommandScope, CommandSource, CustomCommand};
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::skill::{BuiltinSkill, install_builtin_skill, remove_builtin_skill};
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Applied at startup and on every settings reload; while off, everything here is empty.
-pub fn configure(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
+/// Applied at startup and on every settings reload. The skill and automation registries are
+/// process-wide; the commands and profiles follow the config each caller holds.
+pub fn install(on: bool) {
     match on {
         true => install_builtin_skill(skill()),
         false => remove_builtin_skill(NAME),
     }
+    install_automations(on);
 }
 
-pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+fn install_automations(on: bool) {
+    match on {
+        true => install_bundled_automations(NAME, automations()),
+        false => remove_bundled_automations(NAME),
+    }
 }
 
-pub fn commands() -> Vec<CustomCommand> {
-    match enabled() {
+pub fn commands(on: bool) -> Vec<CustomCommand> {
+    match on {
         true => builtin_commands(library()),
         false => Vec::new(),
     }
 }
 
-pub fn profiles() -> Vec<SystemPromptProfile> {
-    match enabled() {
+pub fn profiles(on: bool) -> Vec<SystemPromptProfile> {
+    match on {
         true => library().agents().iter().map(profile).collect(),
         false => Vec::new(),
     }
@@ -79,7 +80,12 @@ fn builtin_commands(library: &Library) -> Vec<CustomCommand> {
 fn profile(agent: &Agent) -> SystemPromptProfile {
     let name = format!("{NAME}-{}", agent.name);
     let address = format!("{NAME}/agents/{}.md", agent.name);
-    SystemPromptProfile::builtin(&name, &agent.description, agent.body.trim().to_owned(), &address)
+    SystemPromptProfile::builtin(
+        &name,
+        &agent.description,
+        agent.body.trim().to_owned(),
+        &address,
+    )
 }
 
 #[cfg(test)]
@@ -87,12 +93,18 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use caudra_config::FeatureFlags;
 
+    use crate::automation::bundled::{BundledAutomation, bundled_automations};
+    use crate::automation::catalog::{Catalog, Frontend};
+
+    const SHIPPED_AUTOMATIONS: [&str; 3] = ["benny-reproduce", "benny-triage", "pstack-watch-pr"];
     const POTETO_MODE: &str = "poteto-mode";
     const PRINCIPLE: &str = "principle-";
     const POTETO_PROFILE: &str = "pstack-poteto-agent";
     const SICKO_PROFILE: &str = "pstack-comment-sicko";
     const FIX: &str = "fix the flaky test";
+    const FOLLOW_IT: &str = "and follow it.";
 
     #[test]
     fn every_user_facing_skill_has_a_command() {
@@ -103,8 +115,15 @@ mod tests {
             .unwrap();
         assert_eq!(poteto.display_name(), "/pstack:poteto-mode");
         let sent = poteto.render(FIX);
-        assert!(sent.contains("`pstack/poteto-mode`") && sent.ends_with(FIX), "{sent}");
-        assert!(!commands.iter().any(|command| command.name.starts_with(PRINCIPLE)));
+        assert!(
+            sent.contains("`pstack/poteto-mode`") && sent.ends_with(FIX),
+            "{sent}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.name.starts_with(PRINCIPLE))
+        );
         let wanted = library()
             .skills()
             .iter()
@@ -121,12 +140,58 @@ mod tests {
             .iter()
             .find(|profile| profile.name() == name)
             .unwrap();
-        assert_eq!(found.body().contains("`pstack/poteto-mode`"), reads_poteto_mode);
+        assert_eq!(
+            found.body().contains("`pstack/poteto-mode`"),
+            reads_poteto_mode
+        );
+    }
+
+    #[test_case(false ; "off")]
+    #[test_case(true ; "on")]
+    fn commands_and_profiles_follow_the_switch(on: bool) {
+        let poteto_command = commands(on)
+            .iter()
+            .any(|command| command.name == POTETO_MODE);
+        let poteto_profile = profiles(on)
+            .iter()
+            .any(|profile| profile.name() == POTETO_PROFILE);
+        assert_eq!((poteto_command, poteto_profile), (on, on));
     }
 
     #[test]
-    fn everything_is_empty_while_off() {
-        assert!(!enabled());
-        assert!(commands().is_empty() && profiles().is_empty());
+    fn the_switch_installs_exactly_the_shipped_automations() {
+        let installed = || -> Vec<BundledAutomation> {
+            bundled_automations()
+                .iter()
+                .filter(|script| script.provider == NAME)
+                .cloned()
+                .collect()
+        };
+
+        install_automations(true);
+        let shipped = installed();
+        let names: Vec<&str> = shipped.iter().map(|script| script.name.as_str()).collect();
+        assert_eq!(names, SHIPPED_AUTOMATIONS);
+        let listed = Catalog::scan_user_only(None, &shipped, FeatureFlags::all(), Frontend::Tui)
+            .to_catalog();
+        assert!(listed.invalid.is_empty(), "{:?}", listed.invalid);
+        assert_eq!(listed.entries.len(), SHIPPED_AUTOMATIONS.len());
+
+        install_automations(false);
+        assert!(installed().is_empty());
+    }
+
+    #[test]
+    fn a_command_without_arguments_ends_on_its_instruction() {
+        let commands = commands(true);
+        let poteto = commands
+            .iter()
+            .find(|command| command.name == POTETO_MODE)
+            .unwrap();
+        assert!(
+            poteto.render("").ends_with(FOLLOW_IT),
+            "{:?}",
+            poteto.render("")
+        );
     }
 }

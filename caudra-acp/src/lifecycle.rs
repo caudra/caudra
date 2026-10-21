@@ -519,11 +519,7 @@ impl Starter<'_> {
     async fn launch(&mut self, launch: Launch) -> Result<SessionState, AcpError> {
         let params = &self.ctx.params;
         let mut runtime = launch.runtime;
-        let profile = resolve_prompt_profile(
-            params,
-            launch.stored_profile.as_deref(),
-            runtime.config.system_prompt_profile.as_deref(),
-        )?;
+        let profile = resolve_prompt_profile(params, &runtime, launch.stored_profile.as_deref())?;
         let remote = runtime.remote_environment.is_some();
         preflight_mcp(&launch.cwd, &launch.mcp_servers, remote).await?;
         let cwd = runtime.remote_environment.as_ref().map_or_else(
@@ -656,7 +652,7 @@ fn interactive_params(
         thinking: start.thinking,
         system_prompt_profile,
         system_prompt_profile_name: Some(system_prompt_profile_name),
-        prompt_profiles: Arc::clone(&params.prompt_profiles),
+        prompt_profiles: Arc::clone(&runtime.prompt_profiles),
         excluded_tools,
         registry: Arc::clone(&runtime.registry),
         mcp_handle: None,
@@ -694,15 +690,15 @@ fn interactive_params(
 
 fn resolve_prompt_profile(
     params: &AcpParams,
+    runtime: &AcpRuntime,
     stored_name: Option<&str>,
-    configured_name: Option<&str>,
 ) -> Result<(String, Option<Arc<SystemPromptProfile>>), AcpError> {
     let requested_name = params
         .system_prompt_profile_override
         .as_deref()
         .or(stored_name)
-        .or(configured_name);
-    let profile = params
+        .or(runtime.config.system_prompt_profile.as_deref());
+    let profile = runtime
         .prompt_profiles
         .resolve(requested_name)
         .map_err(|e| internal(&e))?;

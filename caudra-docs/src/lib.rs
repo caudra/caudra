@@ -19,8 +19,9 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub use index::SearchReport;
 pub use release_notes::{RELEASES_URL, Release, ReleaseNotes, ReleaseNotesSource};
-pub use search::{Correction, Hit, Search};
+pub use search::{Correction, Hit, Search, SearchIndex};
 
 pub const NAME: &str = "caudra-docs";
 pub const SKILL_DESCRIPTION: &str = "Caudra's own user documentation for this build: caudra.toml \
@@ -41,7 +42,7 @@ pub type DocsLibrary = fn() -> &'static Library;
 
 pub struct Library {
     pages: Vec<Page>,
-    search: OnceLock<search::SearchIndex>,
+    search: OnceLock<SearchIndex>,
 }
 
 #[derive(Debug)]
@@ -245,7 +246,9 @@ impl Library {
     /// Sections that contain every term of `query`, best first. The index behind it is built on the first call.
     pub fn search(&self, query: &str, limit: usize) -> Search {
         self.search
-            .get_or_init(|| search::SearchIndex::build(&self.pages))
+            .get_or_init(|| {
+                SearchIndex::from_markdown(self.pages.iter().map(|page| page.body.as_ref()))
+            })
             .search(query, limit)
     }
 

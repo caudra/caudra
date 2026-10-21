@@ -39,9 +39,9 @@ When the role file is missing and it matters, ask whether the user wants to pick
 2. Run [`/pstack:setup-pstack`](../setup-pstack/SKILL.md). It asks for a reasoning budget, maps a model to each role, and writes the role file. Its lines apply the next time the `pstack` skill is loaded. Then it offers once each to generate a verification skill and a formal verification skill for the project, unless the project already has one.
 3. Start a real task with `/pstack:poteto-mode`, a goal, and a check that can pass or fail.
 
-Turning it on changes nothing until the user invokes a skill. Only `setup-pstack` loads from the user's words. The [README](../../README.md) and [guide page 1](../../docs/guide/01-setup.md) have the details. Offer to word their first prompt with them, per [`references/prompting.md`](references/prompting.md).
+Turning it on changes nothing until the user invokes a skill. A pstack skill loads when the user types `/pstack:<name>` or asks for it by name. The [README](../../README.md) and [guide page 1](../../docs/guide/01-setup.md) have the details. Offer to word their first prompt with them, per [`references/prompting.md`](references/prompting.md).
 
-If cost is the worry, say where the tokens go and how to spend fewer. pstack spends extra tokens on subagents and review panels. Rerun `/pstack:setup-pstack` and pick a smaller budget or cheaper models. A role set to `inherit` runs on the session's Subagent model, which saves tokens when that is a cheaper model. A shorter panel list runs fewer subagents, one for each entry. Save `/pstack:poteto-mode` for work that needs rigor.
+If cost is the worry, say where the tokens go and how to spend fewer. pstack spends extra tokens on subagents and review panels. Rerun `/pstack:setup-pstack` and pick a smaller budget or cheaper models. A role set to `inherit` omits `model` and `thinking`, so it runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else the user's Subagent model. That saves tokens when it is a cheaper model. A shorter panel list runs fewer subagents, one for each entry. Save `/pstack:poteto-mode` for work that needs rigor.
 
 ## Start a task with `/pstack:poteto-mode`
 
@@ -72,7 +72,7 @@ The default answer is `/pstack:poteto-mode`, which runs most of the others when 
 | Know what a small diff could break outside itself | [`/pstack:blast-radius`](../blast-radius/SKILL.md) |
 | Settle types and module shape before code that crosses a function boundary | [`/pstack:architect`](../architect/SKILL.md) |
 | Get several attempts at one brief, merged into the best one | [`/pstack:arena`](../arena/SKILL.md) |
-| Run parallel checks over slices, or race workers, as worktree tasks | [`/pstack:swarm`](../swarm/SKILL.md) |
+| Run parallel checks over slices, or race workers, as tasks whose briefs tell them to `git worktree add` a new branch under the scratch directory and work only there | [`/pstack:swarm`](../swarm/SKILL.md) |
 | Have different models review a diff and try to break it | [`/pstack:interrogate`](../interrogate/SKILL.md) |
 | Fix a bug test-first when a cheap local test exists | [`/pstack:tdd`](../tdd/SKILL.md) |
 | Apply TypeScript rules to `.ts` or `.tsx` work | [`/pstack:typescript-best-practices`](../typescript-best-practices/SKILL.md) |
@@ -109,7 +109,7 @@ Not in pstack:
 
 - `/pstack:deslop`, `control-cli`, and `control-ui` come from the `cursor-team-kit` plugin, bundled beside pstack's skills.
 - `/goal` is a Caudra command, and writing a skill is the `caudra-docs/skills` page.
-- pstack has no `/orchestrate` skill. Orchestrate is a `/pstack:poteto-mode` playbook. If the command palette shows `/orchestrate`, another skill or plugin provides it.
+- pstack has no `/orchestrate` skill. Orchestrate is a `/pstack:poteto-mode` playbook. If the command palette shows `/orchestrate`, a custom command or plugin provides it.
 
 ## Playbooks and principles
 
@@ -134,9 +134,9 @@ Principles are one-rule skills that `/pstack:poteto-mode` reads and cites in its
 |---|---|
 | The mode stopped applying after a few turns | It was started with `/pstack:poteto-mode` on one message. Keep it on with a system prompt profile, or start each task with `/pstack:poteto-mode`. |
 | A question got treated as the next step of the last task | Say "new task", or say the turn doesn't need the mode. |
-| A new model choice had no effect | The role file from `/pstack:setup-pstack` applies the next time the `pstack` skill is loaded. Load it again, or start a new chat. |
+| A new model choice had no effect | The role file from `/pstack:setup-pstack` applies the next time the `pstack` skill is loaded. Load it again. |
 | Runs cost more than expected | See the cost paragraph under Get set up. |
-| A skill didn't load on its own | Only `setup-pstack` loads from the user's words. The others load when the user types them or when `/pstack:poteto-mode` runs them, and it doesn't run every skill. |
+| A skill didn't load on its own | A pstack skill loads only when the user types `/pstack:<name>` or asks for it by name, or when `/pstack:poteto-mode` runs it, and it doesn't run every skill. |
 | Parallel agents overwrote each other | Give each agent its own git worktree. |
 | An overnight run moved but finished nothing | `/goal` needs a check that can pass or fail, not a duration. See [guide page 7](../../docs/guide/07-overnight.md). |
 | The reply claims success from a green build | Ask for the real command, flow, stored value, or profile. That's the prove-it-works principle. |

@@ -21,7 +21,6 @@ use serde_json::Value;
 use super::args::{bind, text};
 use super::decide::DecisionsModule;
 use super::history::HistoryModule;
-use super::pstack::PstackModule;
 use super::hosted::HostedCall;
 use super::module::{
     AbsentModule, CallFailure, HostCallPlan, HostModule, ModuleDoc, Prepared, ToolCallPlan,
@@ -31,6 +30,7 @@ use super::output::{
     CALL_SOURCE, CodeCall, CodeCallStatus, CodeOutcome, CodeOutput, CodeProgressEvent,
     HostedResult, repaired_lines, written_call,
 };
+use super::pstack::PstackModule;
 use super::repeats::{Answer, printed_repeats, result_repeats};
 use super::runner::{
     ReplLease, ReplNote, ScriptCall, ScriptError, ScriptErrorKind, ScriptHost, ScriptInvocation,
@@ -39,6 +39,7 @@ use super::runner::{
 use super::tool_module::{ToolModule, output_value};
 use crate::agent::change_recording::{self, Recording};
 use crate::agent::tool_dispatch::{self, Emit, error_type};
+use crate::cancel::{CancelToken, CancelTrigger};
 use crate::mcp::code::module::{DOC as MCP_DOC, McpModule};
 use crate::mcp::output::{McpBlock, McpInteraction, McpOutput};
 use crate::permissions::{PermissionExecutorKind, PermissionSubject};
@@ -100,18 +101,17 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration
     };
     let gateway = Gateway::new(ctx.clone(), modules);
     let host: Arc<dyn ScriptHost> = Arc::new(gateway.clone());
-    let (deadline, cancel) = ctx.cancel.child();
     let running = runner.run(ScriptRun {
         code: code.clone(),
         host,
         state: lease,
-        cancel,
+        cancel: gateway.cancel(),
     });
     let timed_out = AtomicBool::new(false);
     let outcome = future::or(running, async {
         Timer::after(timeout).await;
         timed_out.store(!ctx.cancel.is_cancelled(), Ordering::Relaxed);
-        deadline.cancel();
+        gateway.expire();
         future::pending().await
     })
     .await;
@@ -179,7 +179,7 @@ async fn modules(ctx: &ToolContext) -> Option<Vec<Arc<dyn HostModule>>> {
         Arc::new(ToolModule::workflow(ctx)),
         Arc::new(ToolModule::automation(ctx)),
     ];
-    if crate::pstack::enabled() {
+    if ctx.config.builtin_skills.pstack {
         modules.push(Arc::new(PstackModule::for_session(ctx)));
     }
     Some(modules)
@@ -302,7 +302,13 @@ impl Permission {
 pub(super) struct Gateway(Arc<Inner>);
 
 struct Inner {
+    /// The run's context. Its token is the user stopping the run, which tells a cancelled run from
+    /// one that timed out.
     ctx: ToolContext,
+    /// Fires at the run's deadline; `None` once fired.
+    deadline: Mutex<Option<CancelTrigger>>,
+    /// What the run and every call it makes stop on: the user stopping it or its deadline.
+    cancel: CancelToken,
     modules: Vec<Arc<dyn HostModule>>,
     calls: Mutex<Vec<CodeCall>>,
     /// What each call that succeeded handed the snippet, kept for the run so the card can tell a
@@ -316,14 +322,34 @@ struct Inner {
 
 impl Gateway {
     pub(super) fn new(ctx: ToolContext, modules: Vec<Arc<dyn HostModule>>) -> Self {
+        let (deadline, cancel) = ctx.cancel.child();
         Self(Arc::new(Inner {
             ctx,
+            deadline: Mutex::new(Some(deadline)),
+            cancel,
             modules,
             calls: Mutex::new(Vec::new()),
             answers: Mutex::new(Vec::new()),
             record: AsyncMutex::new(None),
             waits: AtomicUsize::new(0),
         }))
+    }
+
+    pub(super) fn cancel(&self) -> CancelToken {
+        self.0.cancel.clone()
+    }
+
+    /// Stops the run and every call still going, as its deadline does.
+    pub(super) fn expire(&self) {
+        let deadline = self
+            .0
+            .deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(deadline) = deadline {
+            deadline.cancel();
+        }
     }
 
     /// What the run's card says beside its header while the run goes on; empty clears it.
@@ -532,10 +558,11 @@ impl Gateway {
             })));
     }
 
-    /// The context a call runs under: the run's, with the call's own id.
+    /// The context a call runs under: the run's, with the call's own id, stopped with the run.
     fn child(&self, index: usize) -> ToolContext {
         let ctx = &self.0.ctx;
         let mut child = ctx.clone();
+        child.cancel = self.cancel();
         child.tool_use_id = Some(child_tool_use_id(ctx.tool_use_id.as_deref(), index));
         child.local_root_tool_use_id = ctx
             .local_root_tool_use_id
@@ -2010,6 +2037,8 @@ mod tests {
     #[derive(Default)]
     struct FakeModule {
         runs: Arc<AtomicUsize>,
+        /// Whether a call answers only once its context is cancelled.
+        awaits_cancel: bool,
     }
 
     static FAKE_DOC: ModuleDoc = ModuleDoc {
@@ -2041,8 +2070,12 @@ mod tests {
 
         fn prepare(&self, _ctx: &ToolContext, call: ScriptCall) -> Prepared {
             let runs = Arc::clone(&self.runs);
-            let run: CallRun = Box::new(move |_ctx: ToolContext| {
+            let awaits_cancel = self.awaits_cancel;
+            let run: CallRun = Box::new(move |ctx: ToolContext| {
                 Box::pin(async move {
+                    if awaits_cancel {
+                        ctx.cancel.cancelled().await;
+                    }
                     runs.fetch_add(1, Ordering::SeqCst);
                     Ok((McpOutput::default(), json!(LOOKUP_RESULT)))
                 })
@@ -2114,6 +2147,35 @@ mod tests {
             usize::from(expected == Verdict::Ran)
         );
         assert_eq!(gateway.finish().len(), 1);
+    }
+
+    /// A call still going when the run's deadline passes is stopped with the run, so a blocking
+    /// wait such as `pstack.watch_pr` cannot outlive it; the user did not stop the run.
+    #[test]
+    fn a_call_awaiting_cancellation_ends_at_the_run_deadline() {
+        let module = FakeModule {
+            awaits_cancel: true,
+            ..FakeModule::default()
+        };
+        let runs = Arc::clone(&module.runs);
+        let (_dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
+        let gateway = Gateway::new(
+            stub_ctx_with_permissions(&AgentMode::Build, permissions),
+            vec![Arc::new(module)],
+        );
+        let call = ScriptCall {
+            namespace: Some(FAKE_MODULE.to_owned()),
+            name: FAKE_METHOD.to_owned(),
+            args: Vec::new(),
+            kwargs: Map::new(),
+        };
+        let (reply, ()) = smol::block_on(future::zip(invoke(&gateway, call), async {
+            gateway.expire();
+        }));
+        assert_eq!(verdict(&reply), Verdict::Ran);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(gateway.cancel().is_cancelled());
+        assert!(!gateway.0.ctx.cancel.is_cancelled());
     }
 
     fn read_first_gateway() -> (tempfile::TempDir, Gateway, Arc<AtomicUsize>) {
@@ -2392,5 +2454,17 @@ mod tests {
         ));
         assert!(done.is_error);
         assert!(done.composed_model_output().contains(ENVIRONMENT_CALL));
+    }
+
+    #[test_case(false ; "off")]
+    #[test_case(true ; "on")]
+    fn the_pstack_module_follows_the_sessions_config(pstack: bool) {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.config.builtin_skills.pstack = pstack;
+        let modules = smol::block_on(modules(&ctx)).expect("not cancelled");
+        let reached = modules
+            .iter()
+            .any(|module| module.doc().namespace == caudra_pstack::NAME);
+        assert_eq!(reached, pstack);
     }
 }

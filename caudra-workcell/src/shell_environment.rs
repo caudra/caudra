@@ -2,12 +2,11 @@
 //! environment tool describes it to the model by name only.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
 
+use caudra_agent::shell_environment::local_shell_overlay;
 use caudra_config::sandbox::SandboxName;
-use caudra_config::shell_env::{ShellEnvConfig, shell_env_overlay};
+use caudra_config::shell_env::ShellEnvConfig;
 use caudra_config::shell_visible_environment;
-use caudra_terminal_host::PANE_ENVIRONMENT;
 use workcell::host_contract::{
     EnvironmentListResponse, ShellEnvironmentCapability, ShellEnvironmentSelection,
 };
@@ -23,14 +22,8 @@ const GUEST_LISTING_UNAVAILABLE: &str =
 pub(crate) const BUILT_IN_ONLY: &str =
     "built-in only; the user can forward more with /env or [agent.shell_env]";
 
-/// The terminal host's pane names first, then the user's configuration, so a configured value wins.
 pub(crate) fn local_shell_environment(config: &ShellEnvConfig) -> ShellEnvironment {
-    PANE_ENVIRONMENT
-        .iter()
-        .filter_map(|&name| std::env::var_os(name).map(|value| (name.to_owned(), value)))
-        .chain(shell_env_overlay(config))
-        .collect::<Vec<(String, OsString)>>()
-        .into()
+    local_shell_overlay(config).into()
 }
 
 /// Names and counts, never values: `DOCKER_HOST, AWS_* (3 names), SSH_AUTH_SOCK (unset)`.

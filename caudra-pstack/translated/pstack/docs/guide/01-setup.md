@@ -27,7 +27,7 @@ The defaults run at `xhigh` reasoning, the same as the `large` budget. `unlimite
 
 You only override what you care about. A role with no line in the file keeps the skill's default. To restore a default, delete that role's line. A rerun of `/pstack:setup-pstack` keeps any role whose model differs from the default. When a default changes, a file written before the change still pins the old default, so delete those role lines, or delete the file, then run `/pstack:setup-pstack` again.
 
-You might be wondering how to let a role follow your own model setup. Set a role to `inherit` and pstack omits the task's `model` and `thinking`, so the task runs on your Subagent model. `inherit` isn't a model name. For a panel role the value is a list, and one task runs per entry, so the list length sets the panel size. Setup also configures `swarm workers`, the default model for every `/pstack:swarm` worker unless a race names a model for each arm.
+You might be wondering how to let a role follow your own model setup. Set a role to `inherit` and pstack omits the task's `model` and `thinking`, so the task runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else your Subagent model. `inherit` isn't a model name. For a panel role the value is a list, and one task runs per entry, so the list length sets the panel size. Setup also configures `swarm workers`, the default model for every `/pstack:swarm` worker unless a race names a model for each arm.
 
 ## Accept the verification offers, or don't
 
@@ -46,7 +46,7 @@ The models apply at once, because the `pstack` skill reads the file each time it
 pstack spends extra tokens on subagents and review panels. That's the price of the rigor. To spend fewer:
 
 - Rerun `/pstack:setup-pstack` and pick a smaller reasoning budget or cheaper models. A strong model in the main chat with cheaper, faster models in the code roles is a good split.
-- Set a role to `inherit` so it runs on your Subagent model.
+- Set a role to `inherit` so it runs on the profile's `subagent_model`, else your Subagent model.
 - Shorten a panel list. Each entry runs one subagent.
 - Save `/pstack:poteto-mode` for work that needs rigor. A small, obvious edit doesn't.
 

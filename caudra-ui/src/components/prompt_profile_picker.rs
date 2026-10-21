@@ -169,9 +169,10 @@ mod tests {
         )
         .unwrap();
 
-        picker.set_catalog(Arc::new(PromptProfileCatalog::discover_with(Some(
-            dir.path(),
-        ))));
+        picker.set_catalog(Arc::new(PromptProfileCatalog::discover_with(
+            Some(dir.path()),
+            false,
+        )));
         picker.open(SAVED_LATER);
 
         assert!(matches!(

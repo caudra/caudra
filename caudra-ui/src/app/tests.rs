@@ -8003,6 +8003,36 @@ fn an_mcp_prompt_is_bound_to_the_message_the_agent_records() {
     );
 }
 
+/// A server named `pstack` keeps its prompts reachable beside the bundled `/pstack:` commands.
+#[test]
+fn an_mcp_prompt_wins_over_a_builtin_command_of_the_same_name() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let builtin = caudra_agent::pstack::commands(true);
+    let shadowed = builtin[0].display_name();
+    app.command_palette = CommandPalette::new(
+        Arc::from(builtin),
+        McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: Vec::new(),
+            prompts: vec![McpPromptInfo {
+                display_name: shadowed.trim_start_matches('/').into(),
+                qualified_name: MCP_PROMPT_QUALIFIED_NAME.into(),
+                description: MCP_PROMPT_DESCRIPTION.into(),
+                completions: false,
+                arguments: Vec::new(),
+            }],
+            resources: Vec::new(),
+            pids: Vec::new(),
+            generation: 0,
+        }),
+        LuaCommandReader::empty(),
+        FeatureFlags::all(),
+    );
+
+    let actions = app.execute_command(cmd(&shadowed), 0);
+
+    assert!(sent_input(&actions).prompt.is_some());
+}
+
 /// A compaction draws its summary below the turns it keeps, and the history
 /// re-adds those turns below the summary with fresh ids. Turns the summary
 /// replaced keep the sources they had.
@@ -14478,6 +14508,48 @@ fn remote_cd_persistence_failure_preserves_live_state() {
             .map(|entry| (entry.origin, entry.rule))
             .collect::<Vec<_>>(),
         old_policy
+    );
+}
+
+/// The live `builtin_skills.pstack` flip reaches a remote tab, whose commands come from its
+/// own project rather than the ones the event loop rediscovers locally.
+#[test_case(false ; "off")]
+#[test_case(true ; "on")]
+fn a_remote_tab_follows_the_pstack_switch(on: bool) {
+    let mut app = test_app();
+    let original = remote_workspace_session();
+    let workspace = WorkspaceSession::new(
+        WorkspaceHandle::new(
+            original.binding().authority().clone(),
+            WorkspaceCapabilities::default(),
+            WorkspaceServices {
+                assets: Some(Arc::new(EmptyRemoteAssets)),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+        original.binding().clone(),
+        original.cursor().clone(),
+    )
+    .unwrap();
+    app.remote_project_context = Some(
+        smol::block_on(
+            caudra_agent::remote_project_context::load_remote_project_context(
+                &workspace,
+                FeatureFlags::all(),
+            ),
+        )
+        .unwrap(),
+    );
+    app.workspace_session = Some(workspace);
+    let poteto = caudra_agent::pstack::commands(true)[0].display_name();
+
+    app.set_pstack(!on);
+    app.set_pstack(on);
+
+    assert_eq!(
+        app.command_palette.find_custom_command(&poteto).is_some(),
+        on
     );
 }
 

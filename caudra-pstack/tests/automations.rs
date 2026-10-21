@@ -102,6 +102,11 @@ const MERGED: &str = "merged";
 const MERGED_NOTICE: &str =
     "Pull request acme/app#42 was merged, so pstack-watch-pr stopped watching it";
 const ALREADY_MERGED: &str = "the pull request was merged";
+const OTHER_PR: &str = "43";
+const OTHER_PR_NAME: &str = "acme/app#43";
+const OTHER_PULL_URL: &str = "https://api.github.com/repos/acme/app/pulls/43";
+const OTHER_REVIEWS_URL: &str = "https://api.github.com/repos/acme/app/pulls/43/reviews";
+const OTHER_RECORDED_FIRST: &str = "recorded the first state of acme/app#43";
 
 const MUST_PARSE: &str = "the script's header parses";
 const MUST_RESOLVE: &str = "the args resolve";
@@ -128,6 +133,12 @@ impl Armed {
             args,
             state: json!({}),
         }
+    }
+
+    /// Arms the script again with other args. The binding's state carries over, as it does in a
+    /// session.
+    fn rearm(&mut self, args: Value) {
+        self.args = resolve(&self.meta.args, &args).expect(MUST_RESOLVE);
     }
 
     /// Replays a schedule firing whose `http` requests the journal answers, keeps the state it
@@ -338,23 +349,38 @@ fn check_run(status: &str, conclusion: Option<&str>) -> Value {
     json!({ "status": status, "conclusion": conclusion })
 }
 
+fn running_checks() -> Vec<Value> {
+    vec![
+        check_run("in_progress", None),
+        check_run("completed", Some("success")),
+    ]
+}
+
 /// The pull request's three polls, answered with these check runs and no reviews.
 fn polled(runs: Vec<Value>) -> Vec<(Value, HttpResponse)> {
+    polled_at(PULL_URL, REVIEWS_URL, runs)
+}
+
+fn polled_at(pull_url: &str, reviews_url: &str, runs: Vec<Value>) -> Vec<(Value, HttpResponse)> {
     vec![
-        (github_request(PULL_URL, false), ok(pull(false))),
+        (github_request(pull_url, false), ok(pull(false))),
         (
             github_request(CHECKS_URL, true),
             ok(json!({ "total_count": runs.len(), "check_runs": runs })),
         ),
-        (github_request(REVIEWS_URL, true), ok(json!([]))),
+        (github_request(reviews_url, true), ok(json!([]))),
     ]
 }
 
 fn poll_requests() -> Vec<Value> {
+    poll_requests_at(PULL_URL, REVIEWS_URL)
+}
+
+fn poll_requests_at(pull_url: &str, reviews_url: &str) -> Vec<Value> {
     vec![
-        github_request(PULL_URL, false),
+        github_request(pull_url, false),
         github_request(CHECKS_URL, true),
-        github_request(REVIEWS_URL, true),
+        github_request(reviews_url, true),
     ]
 }
 
@@ -514,17 +540,13 @@ fn reproduce_queues_bug_verdicts_and_decides_other_ones_silently() {
 #[test]
 fn watch_pr_messages_only_when_the_pull_request_changes() {
     let mut watch = watch_pr();
-    let running = || {
-        polled(vec![
-            check_run("in_progress", None),
-            check_run("completed", Some("success")),
-        ])
-    };
+    let running = || polled(running_checks());
     assert_eq!(
         watch.fire(&running()),
         (skipped(RECORDED_FIRST), poll_requests())
     );
-    let recorded = json!({ "signature": RUNNING_SIGNATURE, "head": untrusted(HEAD_SHA) });
+    let recorded =
+        json!({ "watching": PR_NAME, "signature": RUNNING_SIGNATURE, "head": untrusted(HEAD_SHA) });
     assert_eq!(watch.state, recorded);
     assert_eq!(
         watch.fire(&running()),
@@ -549,7 +571,7 @@ fn watch_pr_messages_only_when_the_pull_request_changes() {
     assert_eq!(watch.fire(&failed), (FiringEnd::Completed, changed));
     assert_eq!(
         watch.state,
-        json!({ "signature": FAILED_SIGNATURE, "head": untrusted(HEAD_SHA) })
+        json!({ "watching": PR_NAME, "signature": FAILED_SIGNATURE, "head": untrusted(HEAD_SHA) })
     );
 
     let merged = [(github_request(PULL_URL, false), ok(pull(true)))];
@@ -562,7 +584,32 @@ fn watch_pr_messages_only_when_the_pull_request_changes() {
     );
     assert_eq!(
         watch.state,
-        json!({ "signature": FAILED_SIGNATURE, "head": untrusted(HEAD_SHA), "done": MERGED })
+        json!({ "watching": PR_NAME, "signature": FAILED_SIGNATURE, "head": untrusted(HEAD_SHA), "done": MERGED })
     );
     assert_eq!(watch.fire(&merged), (skipped(ALREADY_MERGED), Vec::new()));
+}
+
+#[test]
+fn watch_pr_armed_again_for_another_pull_request_starts_over() {
+    let mut watch = watch_pr();
+    watch.fire(&polled(running_checks()));
+    watch.fire(&[(github_request(PULL_URL, false), ok(pull(true)))]);
+
+    watch.rearm(json!({ "owner": OWNER, "repo": REPO, "pr": OTHER_PR }));
+
+    assert_eq!(
+        watch.fire(&polled_at(
+            OTHER_PULL_URL,
+            OTHER_REVIEWS_URL,
+            running_checks()
+        )),
+        (
+            skipped(OTHER_RECORDED_FIRST),
+            poll_requests_at(OTHER_PULL_URL, OTHER_REVIEWS_URL)
+        )
+    );
+    assert_eq!(
+        watch.state,
+        json!({ "watching": OTHER_PR_NAME, "signature": RUNNING_SIGNATURE, "head": untrusted(HEAD_SHA) })
+    );
 }

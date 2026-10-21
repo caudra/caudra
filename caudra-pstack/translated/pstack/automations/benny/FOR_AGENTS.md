@@ -61,9 +61,9 @@ the human enters setup by pointing caudra at this page, `pstack/automations/benn
 3. never overwrite user-owned configuration, feature maps, or routing maps in the target's `.caudra/benny/`. if ownership of an existing file is ambiguous, stop and ask before replacing it.
 4. load `pstack/automations/benny/skills/setup-benny/SKILL.md` with the `skill` tool and follow it.
 
-do not install or update an automation until i explicitly ask. both automations need `experimental.automations` in my global `caudra.toml`.
+both automations ship with caudra. with pstack and `experimental.automations` on in my global `caudra.toml`, `/automations` already lists `benny-triage` and `benny-reproduce` as bundled scripts, so there is nothing to write, validate, or trust. a project or user script of the same name replaces the bundled one, so never write one unless i explicitly ask.
 
-to install them, run `await automation.list()` in `code` and take the project automation directory from its `project_dir`. write the page `pstack/caudra/automations/benny-triage.rhai` to `benny-triage.rhai` there and the page `pstack/caudra/automations/benny-reproduce.rhai` to `benny-reproduce.rhai`, each with everything after the page's first header line. validate them with `await automation.validate("benny-triage")` and `await automation.validate("benny-reproduce")`. then tell me to trust both in `/automations`, to set `BENNY_SLACK_BOT_TOKEN` in my environment or the global `.env` with `channels:history` on the source channel, and to arm them, filled from the configuration:
+when setup is done, tell me to set `BENNY_SLACK_BOT_TOKEN` in my environment or the global `.env` (`~/.config/caudra/.env`) with `channels:history` on the source channel, to forward it to shell commands with `pass = ["BENNY_SLACK_BOT_TOKEN"]` under `[agent.shell_env]` in my global `caudra.toml` or with `/env` when slack goes through `curl`, and to arm them, filled from the configuration:
 
 ```text
 /automations arm benny-triage {"channel_id": "C…", "triage_user_id": "U…"}
@@ -72,4 +72,4 @@ to install them, run `await automation.list()` in `code` and take the project au
 
 each automation's message tells its session to load its operational file: `benny-triage` loads `pstack/automations/benny/skills/triage-issue-reports/SKILL.md` and `benny-reproduce` loads `pstack/automations/benny/skills/reproduce-and-fix-issues/SKILL.md`, with the configuration at the `config_path` arg, `.caudra/benny/configuration.yaml` unless i arm it with another path.
 
-for existing automations, validate the configuration, then compare each installed script with its page. if one differs, show me the diff and replace it only when i agree, then i trust it again. i change args by arming again or in the `/automations` inspector. do not create duplicates.
+for an existing setup, validate the configuration. i change args by arming again or in the `/automations` inspector. do not create duplicates.

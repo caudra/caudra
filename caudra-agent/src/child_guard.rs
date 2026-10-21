@@ -54,6 +54,18 @@ impl ChildGuard {
         }
     }
 
+    /// Kills what is left of the group a child started as leader of once the child itself
+    /// exited, such as a grandchild still holding its output pipes. Elsewhere there is no group.
+    #[cfg(unix)]
+    pub fn kill_leftovers(&self) {
+        unsafe {
+            libc::killpg(self.pid as i32, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn kill_leftovers(&self) {}
+
     #[cfg(unix)]
     fn signal_kill(&self) {
         if self.child.is_some() {

@@ -51,7 +51,6 @@ pub struct AcpParams {
     pub model: Model,
     pub timeouts: Timeouts,
     pub thinking: ThinkingConfig,
-    pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub system_prompt_profile_override: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub model_policy: Arc<ModelPolicy>,
@@ -75,6 +74,9 @@ pub struct AcpRuntime {
     pub seed_permission_mode: Option<PermissionMode>,
     pub snapshots: SnapshotsConfig,
     pub prompt_slots: Arc<ResolvedSlots>,
+    /// Built from this session's own config, so one project's `builtin_skills.pstack` never
+    /// reaches another session's profiles.
+    pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub registry: Arc<ToolRegistry>,
     pub guard: Option<Box<dyn AcpRuntimeGuard>>,

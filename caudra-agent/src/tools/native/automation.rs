@@ -30,7 +30,7 @@ use crate::types::{TextOutput, ToolOutput, counted};
 pub const DESCRIPTION: &str = "Read this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
 
 Actions:
-- `list`: every automation this session can arm, with its scope, availability, status, triggers, args and warnings, files that cannot load with the reason, and the two directories scripts go in, as resolved for this machine and build.
+- `list`: every automation this session can arm, with its scope (`project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack, overridden by a script of the same name), availability, status, triggers, args and warnings, files that cannot load with the reason, and the two directories scripts go in, as resolved for this machine and build.
 - `validate`: parse the header of `name`, compile the script, check the args its body reads, and run the body once per trigger against a canned event, performing nothing.
 - `history`: this session's newest firings with their status, only one automation's when you pass `name`, at most `limit` (20 by default, at most 50). Pass `fire_id` to see one firing's event and its actions, log lines included, with its error and state patch.
 

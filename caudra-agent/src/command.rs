@@ -106,32 +106,38 @@ impl CustomCommand {
         self.accepts_args
     }
 
+    /// Empty `args` leave no trailing space or blank line behind the placeholder.
     pub fn render(&self, args: &str) -> String {
-        self.content.replace(ARGUMENTS_PLACEHOLDER, args)
+        self.content
+            .replace(ARGUMENTS_PLACEHOLDER, args)
+            .trim_end()
+            .to_owned()
     }
 }
 
 /// Builtin commands follow the discovered ones: their own prefix keeps them
-/// apart, so a user command of the same name never shadows one.
-pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
+/// apart, so a user command of the same name never shadows one. `pstack` is
+/// `builtin_skills.pstack` from the caller's config.
+pub fn discover_commands(cwd: &Path, pstack: bool) -> Vec<CustomCommand> {
     let mut commands = discover_commands_inner(
         cwd,
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
     );
-    commands.extend(crate::pstack::commands());
+    commands.extend(crate::pstack::commands(pstack));
     commands
 }
 
 pub fn discover_remote_commands(
     context: &crate::remote_project_context::RemoteProjectContext,
+    pstack: bool,
 ) -> Vec<CustomCommand> {
     let mut commands = discover_remote_commands_in(
         context.commands(),
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
     );
-    commands.extend(crate::pstack::commands());
+    commands.extend(crate::pstack::commands(pstack));
     commands
 }
 

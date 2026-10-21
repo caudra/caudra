@@ -67,6 +67,7 @@ impl AutomationSpawn<'_> {
             session_id,
             cwd,
             user_config_dir: None,
+            bundled: None,
             remote: self.workspace_session.is_some() || self.sandbox,
             features: self.features,
             frontend: Frontend::Tui,

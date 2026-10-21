@@ -559,6 +559,7 @@ impl AutomationFixture {
             session_id,
             cwd: self.project(),
             user_config_dir: Some(self.config_dir()),
+            bundled: Some(Vec::new()),
             remote: false,
             features: FeatureFlags::all(),
             frontend: Frontend::Tui,

@@ -270,6 +270,7 @@ set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
 - Values for `pass` come from the environment Caudra started with and the global `.env`. A project `.env` never supplies one, so a repository cannot choose the value of a variable you forward. Tools in the repository can still read its `.env` file themselves.
 - Only the global file may hold this table. A project `.caudra/caudra.toml` that holds it fails to load.
 - A change applies from the next shell command, with no restart.
+- The commands [pstack's scripts](/docs/code/#pstack-scripts) run, such as `git` and `gh`, get the same environment.
 - The setting applies to local sessions. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's own variables instead, and a [remote Workcell](/docs/remote-workspaces/) uses the environment its operator gives the server.
 
 The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded.

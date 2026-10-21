@@ -1,6 +1,6 @@
 ---
 name: setup-benny
-description: Configure Benny and prepare its triage and repro automations. Use when installing Benny or changing its Slack, tracker, repository, routing, control, model, or budget settings.
+description: Configure Benny and prepare its triage and repro automations. Use when setting up Benny or changing its Slack, tracker, repository, routing, control, model, or budget settings.
 disable-model-invocation: true
 ---
 
@@ -10,15 +10,15 @@ Benny ships as a dormant automation pack inside pstack. Its files are pages of t
 
 The human enters setup by pointing Caudra at the pack's `FOR_AGENTS.md`, the page `pstack/automations/benny/FOR_AGENTS.md`, which leads here. The pack is never copied into the target repository: its skills, references, and templates stay pages at `pstack/automations/benny/...`, loaded with the `skill` tool.
 
-Benny needs external configuration and two Caudra automations, `benny-triage` and `benny-reproduce`. Both need `experimental.automations` in the global `caudra.toml`.
+Benny needs external configuration and two Caudra automations, `benny-triage` and `benny-reproduce`. Both ship with Caudra and are listed in `/automations` while pstack and `experimental.automations` are on in the global `caudra.toml`.
 
-Do not install or update an automation until the user explicitly asks. Never put a secret value in an automation script, a prompt, or configuration.
+Do not write a script that replaces either automation until the user explicitly asks. Never put a secret value in an automation script, a prompt, or configuration.
 
 ## 1. Check the prerequisites
 
-Do this before asking for Benny configuration and before installing either automation.
+Do this before asking for Benny configuration and before the user arms either automation.
 
-Ask which repository will run the automations. Setup, and every session that arms an automation, works in that repository: a project automation lives in its `.caudra/automations/` and messages the session it is armed in.
+Ask which repository will run the automations. Setup, and every session that arms an automation, works in that repository: each automation messages the session it is armed in, and that session reads the configuration under the repository's `.caudra/benny/`.
 
 Check that automations are on: `code` reaches the `automation` module only when `experimental.automations` is set. If it is off, tell the user to set `automations = true` under `[experimental]` in the global `caudra.toml` and restart Caudra, then stop.
 
@@ -72,7 +72,9 @@ Ask for or confirm:
 - Polling and effort budgets
 - Model and thinking level for triage, repro, code work, and media review, as `<model> <thinking>`
 
-Use only models the `task` tool accepts: the session's model favorites and the models `caudra models` lists for providers the user is logged in to. Triage and repro run on the model of the session each automation is armed in. Do not guess a model and do not carry over a private default.
+Use only models the session can run: its model favorites, in the `# Model favorites` system reminder, or a model the user picks in `/model`. `caudra models` lists every model Caudra knows, not only usable ones, so do not pick from it. Triage and repro run on the model of the session each automation is armed in. Do not guess a model and do not carry over a private default.
+
+Polling has fixed limits. `benny-triage` reads one page of channel history per poll; when more than a page arrives between polls, it skips the older posts and logs that it did. `benny-reproduce` looks at the first 100 thread roots in its lookback. Tell the user when the source channel is busy enough to hit either.
 
 The source channel, triage identity, repository, tracker adapter, control skill, and feature map must be explicit. Fail setup if any required value stays ambiguous.
 
@@ -94,9 +96,9 @@ The repro automation needs:
 - A pull request action that can open a draft pull request, such as `gh pr create --draft`
 - The configured control-adapter skill
 
-Both automations poll Slack with `BENNY_SLACK_BOT_TOKEN`, so its bot needs `channels:history` on the source channel and must be a member of it. The user sets the variable in the environment Caudra starts from or in the global `.env`; a project `.env` cannot set it. Never store the value in YAML.
+Both automations poll Slack with `BENNY_SLACK_BOT_TOKEN`, so its bot needs `channels:history` on the source channel and must be a member of it. The user sets the variable in the environment Caudra starts from or in the global `.env`, `~/.config/caudra/.env`, where the automations' `http()` reads it; a project `.env` cannot set it. Never store the value in YAML.
 
-Slack reads, posts, reactions, and file downloads use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and the same token. With `curl`, the bot also needs the scopes for what the session does, such as `chat:write`, `reactions:write`, and `files:read`.
+Slack reads, posts, reactions, and file downloads use a Slack MCP server's tools when one is enabled, else the Slack Web API with `curl` and the same token. Shell commands start from a cleared environment, so for `curl` the user also forwards the token to commands with `pass = ["BENNY_SLACK_BOT_TOKEN"]` under `[agent.shell_env]` in the global `caudra.toml`, or with `/env`. That forwarding applies to local sessions only: in a remote workspace, `curl` sees the token only if the remote server's operator provides it, so prefer a Slack MCP server there. With `curl`, the bot also needs the scopes for what the session does, such as `chat:write`, `reactions:write`, and `files:read`.
 
 Do not use undocumented integration endpoints.
 
@@ -127,29 +129,20 @@ Confirm that the named skill can:
 
 If any capability is missing, leave the repro automation disarmed. It must fail closed rather than claim a reproduction it did not perform.
 
-## 7. Install the automations
+## 7. Arm the automations
 
-Run `await automation.list()` in `code`. Its `project_dir` is the project automation directory, and its `automations` show whether `benny-triage` or `benny-reproduce` is already installed.
+`benny-triage` and `benny-reproduce` ship with Caudra. With pstack and `experimental.automations` on, `/automations` already lists both as bundled scripts, trusted as shipped, so there is nothing to write, validate, or trust. A project or user script of the same name replaces the bundled one. Never write one unless the user asks.
 
-Read `../../FOR_AGENTS.md` as the primary user-intent source for either path. Use it to understand the two triggers, tools, instructions, outcomes, and shared rules. The templates `../../templates/triage-automation-prompt.md` and `../../templates/reproduce-automation-prompt.md` say what each automation's message asks of its session.
-
-### First-time installation
-
-For each automation:
-
-1. Load its page with the `skill` tool: `pstack/caudra/automations/benny-triage.rhai`, then `pstack/caudra/automations/benny-reproduce.rhai`.
-2. Write everything after the page's first header line to `<project_dir>/benny-triage.rhai` or `<project_dir>/benny-reproduce.rhai` with `file_write`, unchanged.
-3. Validate it with `await automation.validate("benny-triage")` or `await automation.validate("benny-reproduce")`. A failure names the line: report it and stop.
+Read `../../FOR_AGENTS.md` as the primary user-intent source. Use it to understand the two triggers, tools, instructions, outcomes, and shared rules. The templates `../../templates/triage-automation-prompt.md` and `../../templates/reproduce-automation-prompt.md` say what each automation's message asks of its session.
 
 `benny-triage` polls the source channel every minute and messages its session with each new top-level report that is neither a bot's nor the triage identity's. Its message tells the session to load `pstack/automations/benny/skills/triage-issue-reports/SKILL.md` and follow it for each report, with the configuration in `config_path`. It starts watching when armed, so earlier messages are never triaged.
 
 `benny-reproduce` polls the channel's recent threads every two minutes and messages its session with each thread where the triage identity's reply carries `[benny:bug]` or `[benny:performance]`. Its message tells the session to load `pstack/automations/benny/skills/reproduce-and-fix-issues/SKILL.md` and follow it for each thread.
 
-Then hand over. Trusting and arming belong to the user. Tell them to:
+Then hand over. Arming belongs to the user. Tell them to:
 
-1. Trust both scripts in `/automations`: select each and press `t`.
-2. Set `BENNY_SLACK_BOT_TOKEN`, as in step 4.
-3. Arm each in the session that should do its work, filled from the configuration. Separate sessions keep a long repro from delaying triage. Each polls only while its session is open.
+1. Set `BENNY_SLACK_BOT_TOKEN`, as in step 4.
+2. Arm each in the session that should do its work, filled from the configuration. Separate sessions keep a long repro from delaying triage. Each polls only while its session is open.
 
 ```text
 /automations arm benny-triage {"channel_id": "C…", "triage_user_id": "U…"}
@@ -158,18 +151,15 @@ Then hand over. Trusting and arming belong to the user. Tell them to:
 
 Add `"config_path": "<path>"` when the configuration is not at `.caudra/benny/configuration.yaml`.
 
-### Existing automations
+### Existing setup
 
-Finish configuration, routing, control-adapter, and feature-map validation. Then compare each installed script with its page.
+Finish configuration, routing, control-adapter, and feature-map validation. Changed args, such as a new channel or triage identity, need no new script: the user arms the automation again with the new args, or edits them under Args in `/automations`.
 
-- If a script differs from its page, show the user the diff. Replace it only when they agree, validate it again, and tell them to trust the new version in `/automations`.
-- Changed args, such as a new channel or triage identity, need no new script: the user arms the automation again with the new args, or edits them under Args in `/automations`.
+Do not install a copy under any name.
 
-Do not install a second copy under another name.
+### Arming boundary
 
-### Installation boundary
-
-Never trust or arm an automation yourself, and never edit a script beyond the page's text without the user's consent.
+Never arm an automation yourself, and never write a script that replaces a bundled one without the user's consent.
 
 Do not arm either automation on the source channel until the thread-safety test passes.
 
@@ -177,11 +167,11 @@ Do not arm either automation on the source channel until the thread-safety test 
 
 Use a test channel or a harmless test report.
 
-Before testing, confirm that the configuration and every file it names exist under the target repository's `.caudra/benny/`, that `/automations` shows both automations trusted and validated, and that `BENNY_SLACK_BOT_TOKEN` is set. If any check fails, stop. Tell the user that the automations cannot be armed yet.
+Before testing, confirm that the configuration and every file it names exist under the target repository's `.caudra/benny/`, that `/automations` lists both automations as valid, that `BENNY_SLACK_BOT_TOKEN` is set, and, when Slack goes through `curl`, that `/env` shows it reaching shell commands. If any check fails, stop. Tell the user that the automations cannot be armed yet.
 
 Verify:
 
-1. Triage stores the root `thread_ts` and posts exactly one verdict as a reply.
+1. Triage stores the report's root `ts` and posts exactly one verdict as a reply.
 2. The verdict contains one configured marker.
 3. Repro accepts the marker only from the configured triage identity.
 4. Repro keeps the same immutable source coordinates.

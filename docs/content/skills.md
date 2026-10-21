@@ -110,12 +110,13 @@ It needs `experimental.lua_plugins`. With Lua on, it is still off by default. It
 
 ### pstack
 
-It is off by default. [pstack](https://github.com/cursor/plugins/tree/main/pstack) is Lauren Tan's set of engineering skills for Cursor, bundled under its MIT license with the `deslop`, `control-cli` and `control-ui` skills from Cursor's team kit. It is opinionated about how work is planned, reviewed and shipped, so turn it on only if you want to work that way. `pstack = true` adds four things:
+It is off by default. [pstack](https://github.com/cursor/plugins/tree/main/pstack) is Lauren Tan's set of engineering skills for Cursor, bundled under its MIT license with the `deslop`, `control-cli` and `control-ui` skills from Cursor's team kit. It is opinionated about how work is planned, reviewed and shipped, so turn it on only if you want to work that way. `pstack = true` adds five things:
 
 - The `pstack` skill, one line in the `skill` tool's list however many skills it holds.
 - A `/pstack:<name>` command for each skill you run directly. `/pstack:poteto-mode fix the flaky test` tells the agent to load `pstack/poteto-mode` and follow it for that request. The `principle-*` skills are read from within other skills and have no command.
 - The task profiles `pstack-poteto-agent` and `pstack-comment-sicko`, described in [Built-in task profiles](/docs/system-prompts/#built-in-task-profiles).
 - pstack's scripts as [`pstack` calls in `code`](/docs/code/#pstack-scripts).
+- The [automations](/docs/automations/#where-scripts-live) `pstack-watch-pr`, `benny-triage` and `benny-reproduce`, listed in `/automations` as `bundled` while `experimental.automations` is on.
 
 The skill uses addresses the way `caudra-docs` does:
 
@@ -124,9 +125,9 @@ The skill uses addresses the way `caudra-docs` does:
 | `pstack` | the index: every skill with its summary, and the model roles in force |
 | `pstack/poteto-mode` | one skill |
 | `pstack/poteto-mode/playbooks/bug-fix.md` | a file inside a skill |
-| `pstack?flaky test` | the pages that contain every word |
+| `pstack?flaky test` | the 8 best pages that contain every word, ranked like a `caudra-docs` search, each with its address and a snippet |
 
-Upstream wrote the skills for Cursor. Caudra ships them translated: the pages name Caudra's tools, paths, models and commands, so the agent follows them as written. Pages that need an [automation](/docs/automations/) say how to install it, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change.
+Upstream wrote the skills for Cursor. Caudra ships them translated: the pages name Caudra's tools, paths, models and commands, so the agent follows them as written. Pages that need an automation say how to arm it and with which args, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change. There is nothing to write or trust: you arm the bundled script in `/automations`. A user or project script of the same name replaces it.
 
 `setup-pstack` picks a model for each role pstack's skills name and writes them to `~/.config/caudra/pstack/models.md`. The index reads that file each time it loads, so a change applies at once.
 

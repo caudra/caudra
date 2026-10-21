@@ -1,7 +1,8 @@
 //! Discovers the automation scripts a session may arm: `<project>/.caudra/automations`, then the
-//! user's `<config>/automations`. The catalog keeps one entry per name: a project script hides a
-//! user script of the same name and records its scope in `shadowed`. A file that breaks a rule
-//! stays listed as invalid, with the reason.
+//! user's `<config>/automations`, then the [`bundled`](super::bundled) ones the binary ships. The
+//! catalog keeps one entry per name: an earlier scope's script hides a later one of the same name
+//! and records its scope in `shadowed`. A script that breaks a rule stays listed as invalid, with
+//! the reason.
 
 use std::fs;
 use std::io;
@@ -24,9 +25,11 @@ use caudra_storage::{StateDir, StorageError};
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use super::bundled::{BundledAutomation, bundled_automations};
+
 const PROJECT_DIR: &str = ".caudra";
 pub(crate) const AUTOMATIONS_SUBDIR: &str = "automations";
-const SCRIPT_EXTENSION: &str = "rhai";
+pub(crate) const SCRIPT_EXTENSION: &str = "rhai";
 const TRUST_DOMAIN: TrustDomain = TrustDomain::Automation;
 const NOT_UTF8: &str = "source is not valid UTF-8";
 const NOT_A_DIRECTORY: &str = "is not a real directory";
@@ -119,18 +122,21 @@ impl Catalog {
             state_dir,
             cwd,
             config_dir().ok().as_deref(),
+            &bundled_automations(),
             features,
             frontend,
         )
     }
 
     /// `user_config` is the user's config directory; production passes [`config_dir`], tests
-    /// pass a tempdir. `features` gates the scripts that use messaging or workflows, and
-    /// `frontend` the ones that need what only the TUI serves.
+    /// pass a tempdir. `bundled` is what production has installed, and what a test lists.
+    /// `features` gates the scripts that use messaging or workflows, and `frontend` the ones
+    /// that need what only the TUI serves.
     pub fn scan_with(
         state_dir: &StateDir,
         cwd: &Path,
         user_config: Option<&Path>,
+        bundled: &[BundledAutomation],
         features: FeatureFlags,
         frontend: Frontend,
     ) -> Self {
@@ -153,18 +159,21 @@ impl Catalog {
             );
         }
         catalog.scan_user_scope(user_config, features, frontend);
+        catalog.scan_bundled(bundled, features, frontend);
         catalog
     }
 
     /// For remote sessions, whose project lives on another machine: only the user's own
-    /// scripts apply.
+    /// scripts and the bundled ones apply.
     pub fn scan_user_only(
         user_config: Option<&Path>,
+        bundled: &[BundledAutomation],
         features: FeatureFlags,
         frontend: Frontend,
     ) -> Self {
         let mut catalog = Self::default();
         catalog.scan_user_scope(user_config, features, frontend);
+        catalog.scan_bundled(bundled, features, frontend);
         catalog
     }
 
@@ -291,16 +300,49 @@ impl Catalog {
             }
         };
         for path in paths {
-            match load_script(&path, scope, features, &approved) {
-                Ok(resolved) => match check_frontend(&resolved.entry.meta, frontend) {
-                    Ok(()) => self.admit(resolved),
-                    Err(reason) => {
-                        self.unavailable.push(resolved.entry.meta.name);
-                        self.invalid.push(invalid_entry(&path, scope, reason));
-                    }
-                },
-                Err(reason) => self.invalid.push(invalid_entry(&path, scope, reason)),
-            }
+            let loaded = load_script(&path, scope, features, &approved);
+            self.place(loaded, &path, scope, frontend);
+        }
+    }
+
+    /// Trusted as shipped, so no approval is looked up.
+    fn scan_bundled(
+        &mut self,
+        bundled: &[BundledAutomation],
+        features: FeatureFlags,
+        frontend: Frontend,
+    ) {
+        for script in bundled {
+            let path = script.path();
+            let resolved = resolve_source(
+                &script.name,
+                &path,
+                script.source.to_string(),
+                Scope::Bundled,
+                features,
+                |_, _| false,
+            );
+            self.place(resolved, &path, Scope::Bundled, frontend);
+        }
+    }
+
+    /// Lists a loaded script, or the reason it cannot run here.
+    fn place(
+        &mut self,
+        loaded: Result<ResolvedAutomation, String>,
+        path: &Path,
+        scope: Scope,
+        frontend: Frontend,
+    ) {
+        match loaded {
+            Ok(resolved) => match check_frontend(&resolved.entry.meta, frontend) {
+                Ok(()) => self.admit(resolved),
+                Err(reason) => {
+                    self.unavailable.push(resolved.entry.meta.name);
+                    self.invalid.push(invalid_entry(path, scope, reason));
+                }
+            },
+            Err(reason) => self.invalid.push(invalid_entry(path, scope, reason)),
         }
     }
 
@@ -373,8 +415,21 @@ fn load_script(
     let bytes =
         read_bounded_regular_file(path, MAX_SOURCE_BYTES).map_err(|error| error.to_string())?;
     let source = String::from_utf8(bytes).map_err(|_| NOT_UTF8.to_owned())?;
+    resolve_source(&stem(path), path, source, scope, features, approved)
+}
+
+/// Checks a script's header against the name it is listed under, and keeps `source` as the text
+/// its digest covers.
+fn resolve_source(
+    name: &str,
+    path: &Path,
+    source: String,
+    scope: Scope,
+    features: FeatureFlags,
+    approved: impl Fn(&Path, &str) -> bool,
+) -> Result<ResolvedAutomation, String> {
     let meta = parse_meta(&source).map_err(|error| error.to_string())?;
-    let warnings = check_entry(&stem(path), scope, &meta)?;
+    let warnings = check_entry(name, scope, &meta)?;
     check_topics(&meta)?;
     check_features(&meta, features)?;
     let digest = digest_of(source.as_bytes());
@@ -507,6 +562,9 @@ fn project_trust(state_dir: &StateDir, root: &Path, path: &Path, digest: &str) -
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::slice;
+
     use caudra_automation::catalog::{
         ALWAYS_OUTSIDE_USER_SCOPE, ALWAYS_WITH_SCHEDULE, STEM_MISMATCH,
     };
@@ -516,7 +574,15 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::automation::bundled::{install_bundled_automations, remove_bundled_automations};
 
+    const PROVIDER: &str = "catalog-test";
+    /// Installed in the process-wide registry, so no other test lists it.
+    const REGISTRY_PROVIDER: &str = "catalog-registry-test";
+    const BUNDLED_NAME: &str = "shipped";
+    const BUNDLED_SOURCE: &str = "let meta = #{ name: \"shipped\", description: \"Poll CI\", triggers: [#{ kind: \"armed\" }] };\n";
+    const BUNDLED_HAS_NO_FILE: &str = "a bundled script's path names its provider, not a file";
+    const BUNDLED_IS_TRUSTED: &str = "a bundled script is trusted as shipped";
     const NAME: &str = "ci-watch";
     const OTHER_NAME: &str = "standup";
     const MISMATCHED_STEM: &str = "other";
@@ -570,11 +636,15 @@ mod tests {
             self.config.join(AUTOMATIONS_SUBDIR)
         }
 
-        fn dir(&self, scope: Scope) -> PathBuf {
-            match scope {
+        /// Writes `source` as `name`'s script in `scope`, or returns it bundled.
+        fn place(&self, scope: Scope, name: &str, source: &str) -> Option<BundledAutomation> {
+            let dir = match scope {
                 Scope::Project => self.project_dir(),
                 Scope::User => self.user_dir(),
-            }
+                Scope::Bundled => return Some(bundled(name, source)),
+            };
+            self.write(&dir, &file_name(name), source.as_bytes());
+            None
         }
 
         fn write(&self, dir: &Path, file: &str, content: &[u8]) -> PathBuf {
@@ -593,8 +663,20 @@ mod tests {
                 &self.state_dir,
                 &self.project,
                 Some(&self.config),
+                &[],
                 features,
                 frontend,
+            )
+        }
+
+        fn scan_bundled(&self, bundled: &[BundledAutomation]) -> Catalog {
+            Catalog::scan_with(
+                &self.state_dir,
+                &self.project,
+                Some(&self.config),
+                bundled,
+                FeatureFlags::NONE,
+                Frontend::Tui,
             )
         }
 
@@ -613,6 +695,14 @@ mod tests {
 
     fn file_name(name: &str) -> String {
         format!("{name}.{SCRIPT_EXTENSION}")
+    }
+
+    fn bundled(name: &str, source: &str) -> BundledAutomation {
+        BundledAutomation {
+            provider: PROVIDER,
+            name: name.to_owned(),
+            source: Cow::Owned(source.to_owned()),
+        }
     }
 
     fn names(catalog: &AutomationCatalog) -> Vec<&str> {
@@ -911,15 +1001,15 @@ mod tests {
 
     #[test_case(Scope::User, Ok(vec![ALWAYS_WITH_SCHEDULE.to_owned()]); "user_scope_warns")]
     #[test_case(Scope::Project, Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "project_scope_is_invalid")]
+    #[test_case(Scope::Bundled, Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "bundled_scope_is_invalid")]
     fn arming_always_follows_the_scope(scope: Scope, expected: Result<Vec<String>, String>) {
         let fixture = Fixture::new();
-        fixture.write(
-            &fixture.dir(scope),
-            &file_name(NAME),
-            script(NAME, ALWAYS_ON_SCHEDULE).as_bytes(),
-        );
+        let bundled: Vec<BundledAutomation> = fixture
+            .place(scope, NAME, &script(NAME, ALWAYS_ON_SCHEDULE))
+            .into_iter()
+            .collect();
 
-        let listed = fixture.scan(FeatureFlags::NONE).to_catalog();
+        let listed = fixture.scan_bundled(&bundled).to_catalog();
 
         let outcome = match (listed.entries.as_slice(), listed.invalid.as_slice()) {
             ([entry], []) => Ok(entry.warnings.clone()),
@@ -964,8 +1054,99 @@ mod tests {
         );
     }
 
+    #[test_case(&[Scope::Bundled] => (Scope::Bundled, Vec::new()); "bundled_alone")]
+    #[test_case(&[Scope::User, Scope::Bundled] => (Scope::User, vec![Scope::Bundled]); "user_over_bundled")]
+    #[test_case(&[Scope::Project, Scope::Bundled] => (Scope::Project, vec![Scope::Bundled]); "project_over_bundled")]
+    #[test_case(&[Scope::Project, Scope::User, Scope::Bundled] => (Scope::Project, vec![Scope::User, Scope::Bundled]); "project_over_both")]
+    fn the_nearest_scope_wins_and_records_the_hidden_ones(scopes: &[Scope]) -> (Scope, Vec<Scope>) {
+        let fixture = Fixture::new();
+        let source = |scope: Scope| format!("{}// {scope:?}\n", script(NAME, ARMED));
+        let bundled: Vec<BundledAutomation> = scopes
+            .iter()
+            .filter_map(|&scope| fixture.place(scope, NAME, &source(scope)))
+            .collect();
+
+        let catalog = fixture.scan_bundled(&bundled);
+
+        let listed = catalog.to_catalog();
+        let [entry] = listed.entries.as_slice() else {
+            panic!("{ONE_ENTRY_PER_NAME}: {listed:?}");
+        };
+        assert_eq!(catalog.resolve(NAME).unwrap().source, source(entry.scope));
+        (entry.scope, entry.shadowed.clone())
+    }
+
     #[test]
-    fn the_user_only_scan_ignores_the_project_scope() {
+    fn a_bundled_script_is_listed_trusted_and_armable_without_a_file() {
+        let fixture = Fixture::new();
+        let source = script(NAME, ARMED);
+        let shipped = bundled(NAME, &source);
+
+        let catalog = fixture.scan_bundled(slice::from_ref(&shipped));
+        let resolved = catalog.resolve(NAME).unwrap();
+
+        assert_eq!(resolved.source, source);
+        assert_eq!(resolved.entry.scope, Scope::Bundled);
+        assert_eq!(resolved.entry.path, shipped.path());
+        assert!(!resolved.entry.path.exists(), "{BUNDLED_HAS_NO_FILE}");
+        assert_eq!(resolved.entry.digest, digest_of(source.as_bytes()));
+        assert_eq!(
+            resolved.entry.trust,
+            Trust::Location,
+            "{BUNDLED_IS_TRUSTED}"
+        );
+        assert!(matches!(
+            catalog.trust(&fixture.state_dir, NAME, &resolved.entry.digest),
+            Ok(())
+        ));
+    }
+
+    #[test]
+    fn a_bundled_script_named_unlike_its_header_is_listed_invalid() {
+        let fixture = Fixture::new();
+        let shipped = bundled(MISMATCHED_STEM, &script(NAME, ARMED));
+
+        let listed = fixture.scan_bundled(slice::from_ref(&shipped)).to_catalog();
+
+        assert!(listed.entries.is_empty());
+        let [invalid] = listed.invalid.as_slice() else {
+            panic!("{:?}", listed.invalid);
+        };
+        assert_eq!(
+            (invalid.name.as_str(), invalid.scope, &invalid.path),
+            (MISMATCHED_STEM, Scope::Bundled, &shipped.path())
+        );
+        assert!(
+            invalid.reason.starts_with(STEM_MISMATCH),
+            "{}",
+            invalid.reason
+        );
+    }
+
+    #[test]
+    fn removing_a_provider_drops_its_scripts_from_the_next_scan() {
+        let fixture = Fixture::new();
+        let scan = || {
+            let installed: Vec<BundledAutomation> = bundled_automations()
+                .iter()
+                .filter(|script| script.provider == REGISTRY_PROVIDER)
+                .cloned()
+                .collect();
+            fixture
+                .scan_bundled(&installed)
+                .find(BUNDLED_NAME)
+                .is_some()
+        };
+        install_bundled_automations(REGISTRY_PROVIDER, [(BUNDLED_NAME, BUNDLED_SOURCE)]);
+        assert!(scan());
+
+        remove_bundled_automations(REGISTRY_PROVIDER);
+
+        assert!(!scan());
+    }
+
+    #[test]
+    fn the_user_only_scan_reads_the_user_and_bundled_scopes() {
         let fixture = Fixture::new();
         fixture.write(
             &fixture.project_dir(),
@@ -979,11 +1160,19 @@ mod tests {
             script(OTHER_NAME, ARMED).as_bytes(),
         );
 
-        let catalog =
-            Catalog::scan_user_only(Some(&fixture.config), FeatureFlags::NONE, Frontend::Tui);
+        let catalog = Catalog::scan_user_only(
+            Some(&fixture.config),
+            &[bundled(BUNDLED_NAME, BUNDLED_SOURCE)],
+            FeatureFlags::NONE,
+            Frontend::Tui,
+        );
 
         let listed = catalog.to_catalog();
-        assert_eq!(names(&listed), [OTHER_NAME], "{PROJECT_IS_IGNORED}");
+        assert_eq!(
+            names(&listed),
+            [OTHER_NAME, BUNDLED_NAME],
+            "{PROJECT_IS_IGNORED}"
+        );
         assert!(listed.invalid.is_empty(), "{PROJECT_IS_IGNORED}");
         assert!(matches!(
             catalog.resolve(NAME),
@@ -1002,10 +1191,11 @@ mod tests {
                 &fixture.state_dir,
                 &missing_cwd,
                 None,
+                &[],
                 FeatureFlags::NONE,
                 Frontend::Tui,
             ),
-            Catalog::scan_user_only(None, FeatureFlags::NONE, Frontend::Tui),
+            Catalog::scan_user_only(None, &[], FeatureFlags::NONE, Frontend::Tui),
         ] {
             let listed = catalog.to_catalog();
             assert!(listed.entries.is_empty());

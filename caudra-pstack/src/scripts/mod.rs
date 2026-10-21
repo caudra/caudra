@@ -54,9 +54,15 @@ impl Script {
         }
     }
 
-    /// Whether a run can change files, which plan mode refuses and permissions ask about.
-    pub fn writes(self) -> bool {
-        matches!(self, Self::Log | Self::Orch)
+    /// Whether a run of `argv` can change files, which plan mode refuses and permissions ask about.
+    /// `orch` reads its command line, so its help and its read-only commands write nothing; `env`
+    /// answers the variables its options fall back to.
+    pub fn writes(self, argv: &[String], env: &dyn Fn(&str) -> Option<String>) -> bool {
+        match self {
+            Self::Log => true,
+            Self::Orch => orch::store_use(argv, env).is_some_and(|used| used.writes),
+            Self::CheckPlan | Self::WorktreeAudit | Self::WatchPr => false,
+        }
     }
 
     pub fn run(self, host: &dyn Host, argv: &[String]) -> Output {

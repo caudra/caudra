@@ -55,10 +55,13 @@ Args are saved with the session. Resuming it arms each automation again with its
 |-------|----------|-------|
 | Project | `<project root>/.caudra/automations/<name>.rhai` | per exact SHA-256 digest |
 | User | `~/.config/caudra/automations/<name>.rhai` | trusted as written |
+| Bundled | shipped inside Caudra by a feature you turned on, such as [pstack](/docs/skills/#pstack) | trusted as shipped |
 
-Debug builds use `~/.config/caudra-debug/automations/` instead, following the platform directory rule in [Configuration](/docs/configuration/#directory-layout). A session on a remote workspace or a sandbox loads user scripts only, because its project lives on another machine.
+Debug builds use `~/.config/caudra-debug/automations/` instead, following the platform directory rule in [Configuration](/docs/configuration/#directory-layout). A session on a remote workspace or a sandbox loads user and bundled scripts only, because its project lives on another machine.
 
-The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-8 file of at most 64 KiB, and a symlink is refused. A file that breaks a rule stays in the list as invalid, with the reason. Caudra reads both directories again whenever it lists the catalog, arms a script, or starts a session, so a fixed file shows up without a restart. When both scopes hold the same name, the project script hides the user script.
+The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-8 file of at most 64 KiB, and a symlink is refused. A file that breaks a rule stays in the list as invalid, with the reason. Caudra reads both directories again whenever it lists the catalog, arms a script, or starts a session, so a fixed file shows up without a restart. When two scopes hold the same name, the nearer one wins: a project script hides a user script, and either hides a bundled one. The winner lists the scopes it hides, so a file of a bundled script's name replaces it.
+
+A bundled script has no file. Its path in the inspector reads `builtin:<provider>/<name>.rhai`, and `o` has nothing to open. It appears while its feature is on and goes when the feature is turned off. A bundled script that is armed when its feature goes off keeps running until the session restarts, and the resumed session disarms it and keeps its args, as it does for a deleted file. Bundled scripts cannot use `arm: "always"`.
 
 A project script arms only after you trust it. Select it in `/automations` and press `t`, which shows the digest you approve. The digest is SHA-256 over the exact bytes together with the automation language and host ABI versions, so changing one byte makes the script untrusted again until you review it. Neither the model nor a script can grant trust.
 
@@ -246,7 +249,7 @@ With workflows on, an automation can start runs and act on their results. `meta.
 
 Automations keep their data in `caudra.db` in the [state directory](/docs/configuration/#directory-layout), and each session holds its own:
 
-- the binding of each automation the session armed, with how it was armed, its args, its state, and the marks of its limits and schedules
+- the binding of each automation the session armed, with its scope, how it was armed, its args, its state, and the marks of its limits and schedules
 - the text of each script version a firing ran, so a trace shows the right lines after an edit
 - each firing, with its event, its actions, and the state change it committed
 
@@ -254,7 +257,7 @@ Each automation keeps its newest 100 finished firings per session, and waiting o
 
 Resuming a session restores its bindings, state, waiting events, and outbox, so the inspector shows the same history. Firings that were running when Caudra stopped end as `interrupted`. Waiting `armed`, `idle`, `needs_input`, and `schedule` events are dropped, because resume fires `armed` again and schedules catch up. Schedules, limit windows, and the `work_finished` cursor keep their marks, so a restart repeats no schedule occurrence or work outcome.
 
-A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or state. [Trimming](/docs/sessions/#retention) a session deletes its firings, actions, and script versions, and keeps its bindings and state. [Moving a session](/docs/sessions/#moving-sessions-to-another-directory) to another directory is refused while a firing runs. The move interrupts waiting firings and disarms project scripts, because they belong to the old project. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its own `caudra.db`, which goes away at exit with everything in it.
+A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or state. [Trimming](/docs/sessions/#retention) a session deletes its firings, actions, and script versions, and keeps its bindings and state. [Moving a session](/docs/sessions/#moving-sessions-to-another-directory) to another directory is refused while a firing runs. The move interrupts waiting firings and disarms project scripts, because they belong to the old project. User and bundled scripts stay armed. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its own `caudra.db`, which goes away at exit with everything in it.
 
 ## Autopilot
 

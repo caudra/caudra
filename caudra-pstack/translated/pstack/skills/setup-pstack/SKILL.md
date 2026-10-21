@@ -11,7 +11,7 @@ Write `~/.config/caudra/pstack/models.md`, the role file that sets pstack's mode
 
 ### 1. Detect available models
 
-The models you can pass to `task` are the session's model favorites and the models `caudra models` lists for providers the user is logged in to. Run `caudra models` with `shell` to list them. If you cannot detect any, ask the user to paste the models they have access to. Never write a model you have not confirmed is available. `inherit` is always valid even though it is not a detected model.
+The models you can pass to `task` are the session's model favorites, which the `# Model favorites` system reminder lists, and the models the user can pick in `/model`. `caudra models` lists every model Caudra knows, not only the ones this user can run, so do not detect with it. If you cannot detect any, ask the user to check `/model` and paste the models they have access to. Never write a model you have not confirmed is available. `inherit` is always valid even though it is not a detected model.
 
 ### 2. Load current state
 
@@ -28,7 +28,7 @@ The default role-to-model mapping is the file shape shown in step 5 below. If `~
 
 **(b) Apply it.** Build the working table from the skill defaults, and on a re-run keep any role you changed by model, list, or `inherit`. `unlimited`, `large`, `medium`, and `small` set the thinking level of every `<model> <thinking>` value, panel entries included, to `max`, `xhigh`, `high`, or `medium`, on the ladder `max` > `xhigh` > `high` > `medium` > `low`. If the model has no such level, use its highest level at or below the target. `inherit` does not change. So `unlimited` turns `claude-opus-5-5 xhigh` into `claude-opus-5-5 max`. Grok tops out at `xhigh`, so under `unlimited` Grok stays `grok-4.7 xhigh`. `large` keeps both defaults. `small` turns them into `claude-opus-5-5 medium` and `grok-4.7 medium`.
 
-**(c) Show the roles and confirm.** Show every role with its value, marking any model not in the detected set as needing a choice. Also list each line step 2 dropped. Ask whether to accept as-is or change specific roles, offering the detected models plus `inherit` (this role runs on the session's Subagent model, so it follows whatever the user set there) as the options. Prefer the `question` tool over free text. For panel roles (arena runners, architect runners, interrogate reviewers) the value is a list, and one subagent runs per entry, `inherit` entries included, so the list length sets the count. `arena cross-judge pool` is also a list, but Arena selects one value from it whose model family differs from the parent's when possible. `swarm workers` is the default model for every worker unless a race or comparison assigns another model per arm.
+**(c) Show the roles and confirm.** Show every role with its value, marking any model not in the detected set as needing a choice. Also list each line step 2 dropped. Ask whether to accept as-is or change specific roles, offering the detected models plus `inherit` (this role omits `model` and `thinking`, so it runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else the user's Subagent model) as the options. Prefer the `question` tool over free text. For panel roles (arena runners, architect runners, interrogate reviewers) the value is a list, and one subagent runs per entry, `inherit` entries included, so the list length sets the count. `arena cross-judge pool` is also a list, but Arena selects one value from it whose model family differs from the parent's when possible. `swarm workers` is the default model for every worker unless a race or comparison assigns another model per arm.
 
 ### 4. Validate
 
@@ -36,11 +36,11 @@ Every model written must be in the detected set. `inherit` always passes. If a c
 
 ### 5. Write the role file
 
-Write `~/.config/caudra/pstack/models.md` with no frontmatter: comment lines starting `#`, a `# budget: <label> (<thinking>)` line with the chosen label and its target thinking level, and one `<role>: <value>` line per role, using the same labels poteto-mode uses. A value is `<model> <thinking>`, or a comma-separated list of those for a panel. Overwrite the whole file so re-runs stay idempotent. Shape:
+Write `~/.config/caudra/pstack/models.md` with no frontmatter: comment lines starting `#`, a `# budget: <label> (<thinking>)` line with the chosen label and its target thinking level, and one `<role>: <value>` line per role, using the same labels poteto-mode uses. A value is `<model> <thinking>`, or a comma-separated list of those for a panel. When `task` has no `model` or `thinking` argument, skills omit both and say so, so every role runs as `inherit`. Overwrite the whole file so re-runs stay idempotent. Shape:
 
 ```
 # pstack model configuration. One line per role. Delete a line to fall back to the skill default.
-# A value is `<model> <thinking>`: the `task` call's `model` and `thinking`. `inherit` as a value: the role runs on the session's Subagent model (omit `model` and `thinking`). `inherit` entries in a panel list still count toward its fan-out.
+# A value is `<model> <thinking>`: the `task` call's `model` and `thinking`. `inherit` as a value: omit `model` and `thinking`, so the role runs on the profile's `subagent_model`, else the user's Subagent model. `inherit` entries in a panel list still count toward its fan-out.
 # budget: large (xhigh)
 feature, refactoring: grok-4.7 xhigh
 bug-fix: grok-4.7 xhigh

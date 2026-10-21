@@ -31,6 +31,7 @@ Write a workflow instead when the job is one multi-agent plan that runs to a res
 |-------|----------|-------|
 | Project | `<project root>/.caudra/automations/<name>.rhai` | The user must trust the file's exact digest in `/automations`. Changing any byte revokes it. |
 | User | `<config dir>/automations/<name>.rhai` | Trusted as written |
+| Bundled | Shipped inside Caudra, such as pstack's scripts while pstack is on. No file. | Trusted as shipped |
 
 Run `await automation.list()` in a `code` snippet before writing. Its `project_dir` and `user_dir` name both directories as resolved for this machine and build, beside the `automations` themselves. Use those paths rather than guessing. The user directory is `~/.config/caudra/automations/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured) and `%APPDATA%\caudra\automations\` on Windows, with `caudra-debug` in place of `caudra` for a debug build.
 
@@ -38,7 +39,8 @@ Choosing a scope:
 
 - The automation is about this repository, its paths, commands, or conventions: project scope. The user must trust it in `/automations` before it can be armed, and again after every edit. You cannot trust it. Neither can the script.
 - The automation is a personal routine for any session: user scope. It can be armed as soon as the file is saved. Only user scripts may use `arm: "always"`.
-- When both scopes hold a script with the same name, the project script wins and hides the user script.
+- You never write a bundled script. It is already listed in `/automations` and the user arms it there. To change one, write a script with the same name in the user or project directory, and it replaces the bundled one.
+- When scopes hold scripts with the same name, the project script wins over the user script, and either wins over a bundled one. The hidden scripts are listed as shadowed.
 
 File rules:
 

@@ -95,7 +95,7 @@ when invoked it:
 
 the full rules and playbooks live in [`skills/poteto-mode/SKILL.md`](./skills/poteto-mode/SKILL.md).
 
-to keep [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, keep working in the same chat. the skill the agent loaded stays in context every turn, so a follow-up such as "continue" runs under the same mode.
+to keep [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, use a [system prompt profile](https://caudra.ai/docs/system-prompts/): a file in `~/.config/caudra/system-prompts/` that tells the agent to load `pstack/poteto-mode` and follow it for every new task. pick it with `/system-prompt` and it stays in the prompt every turn until you switch profile. `/pstack:poteto-mode` on one message loads the skill for that request, and it fades as the chat moves on.
 
 [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) works extremely well with caudra's `/goal` command. you can make caudra work for many hours without sacrificing rigor.
 
@@ -117,9 +117,9 @@ to keep [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, 
 | skill | use it when |
 |---|---|
 | [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) | default entry point for any non-trivial task. |
-| [`/pstack:poteto-help`](./skills/poteto-help/SKILL.md) | you're new to pstack, or unsure which skill, playbook, or principle fits. finds out what you're trying to do, answers that part, and hands you a prompt to type. runs only when you type `/pstack:poteto-help`. |
-| [`/pstack:in-your-own-words`](./skills/in-your-own-words/SKILL.md) | you want the agent to play back your goal and the problem before it starts. runs only when you type `/pstack:in-your-own-words`. |
-| [`/pstack:sharpen`](./skills/sharpen/SKILL.md) | you want a prompt made deeper, not bigger, before you send it: what a top professional would do that you didn't ask for, the raw material they'd start from, their methods and tools, and an outside check that the result is right. hands back the rewritten prompt and leaves your choices open. doesn't do the task. runs only when you type `/pstack:sharpen`. |
+| [`/pstack:poteto-help`](./skills/poteto-help/SKILL.md) | you're new to pstack, or unsure which skill, playbook, or principle fits. finds out what you're trying to do, answers that part, and hands you a prompt to type. loads when you type `/pstack:poteto-help` or ask for it by name. |
+| [`/pstack:in-your-own-words`](./skills/in-your-own-words/SKILL.md) | you want the agent to play back your goal and the problem before it starts. loads when you type `/pstack:in-your-own-words` or ask for it by name. |
+| [`/pstack:sharpen`](./skills/sharpen/SKILL.md) | you want a prompt made deeper, not bigger, before you send it: what a top professional would do that you didn't ask for, the raw material they'd start from, their methods and tools, and an outside check that the result is right. hands back the rewritten prompt and leaves your choices open. doesn't do the task. loads when you type `/pstack:sharpen` or ask for it by name. |
 | [`/pstack:how`](./skills/how/SKILL.md) | you want a walkthrough of how a subsystem works. |
 | [`/pstack:why`](./skills/why/SKILL.md) | you want to know why something was built this way. discovers available MCPs at run time and queries each evidence category in parallel (source control, issue tracker, long-form docs, real-time chat, infra observability, error tracking, analytics warehouse). |
 | [`/pstack:recall`](./skills/recall/SKILL.md) | you're starting or resuming work and want your recent context on a topic rebuilt from your own chat history and the shared record, handed back as a tight current-state brief. |
@@ -208,7 +208,7 @@ pstack also ships [`profile: "pstack-poteto-agent"`](./agents/poteto-agent.md) a
 
 [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) and [`profile: "pstack-poteto-agent"`](./agents/poteto-agent.md) route through the same wrapper.
 
-pstack also ships [Comment Sicko](./agents/comment-sicko.md), a read-only comment reviewer available as `profile: "pstack-comment-sicko"`. usually invoke it through [`/pstack:no-comments`](./skills/no-comments/SKILL.md), not directly.
+pstack also ships [Comment Sicko](./agents/comment-sicko.md), a comment reviewer that deletes comments and never writes application code, available as `profile: "pstack-comment-sicko"` with `mode: "build"`. usually invoke it through [`/pstack:no-comments`](./skills/no-comments/SKILL.md), not directly.
 
 ## principles
 

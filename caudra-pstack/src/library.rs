@@ -1,9 +1,10 @@
 //! The vendored pstack as pages: every file by its path in the plugin, the shorthands the skills'
 //! own routing uses, an index the `pstack` skill opens with, and a word search.
 
-use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{LazyLock, OnceLock};
 
+use caudra_docs::{SearchIndex, SearchReport};
 use include_dir::{Dir, File, include_dir};
 use serde::Deserialize;
 
@@ -33,14 +34,17 @@ const PATH_SEPARATOR: char = '/';
 const PARENT: &str = "..";
 const CURRENT: &str = ".";
 const SEARCH_LIMIT: usize = 8;
+const SEARCH_UNIT: &str = "page";
+/// The heading the search index puts above each page: its path.
+const PATH_HEADING: usize = 0;
 const SUGGESTION_LIMIT: usize = 5;
-const SNIPPET_CHARS: usize = 160;
 /// Entry points the index lists first, in this order.
 const START_HERE: &[&str] = &["poteto-mode", "poteto-help", "setup-pstack"];
 const GUIDE: &str = "docs/guide/README.md";
 const BENNY: &str = "automations/benny/README.md";
 /// Where Caudra's ports of pstack's automations sit among the pages.
 const CAUDRA_AUTOMATIONS_DIR: &str = "caudra/automations";
+const AUTOMATION_EXTENSION: &str = "rhai";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Upstream {
@@ -86,10 +90,24 @@ pub struct Library {
     upstream: Upstream,
     skills: Vec<Skill>,
     agents: Vec<Agent>,
+    search: OnceLock<SearchIndex>,
 }
 
 pub fn library() -> &'static Library {
     &LIBRARY
+}
+
+/// The Caudra automations pstack ships, as `(stem, source)`: listed in `/automations` while pstack
+/// is on, and served as pages under `pstack/caudra/automations`.
+pub fn automations() -> impl Iterator<Item = (&'static str, &'static str)> {
+    AUTOMATIONS
+        .files()
+        .filter(|file| {
+            file.path()
+                .extension()
+                .is_some_and(|extension| extension == AUTOMATION_EXTENSION)
+        })
+        .filter_map(|file| Some((file.path().file_stem()?.to_str()?, file.contents_utf8()?)))
 }
 
 impl Library {
@@ -156,6 +174,7 @@ impl Library {
             upstream,
             skills,
             agents,
+            search: OnceLock::new(),
         }
     }
 
@@ -222,8 +241,10 @@ impl Library {
         }
         index.push_str(&format!(
             "- `{NAME}/{BENNY}`: benny, triage and reproduction of Slack issue reports.\n\
-             - `{NAME}/{CAUDRA_AUTOMATIONS_DIR}`: benny's Slack polling and watch-pr's drive mode \
-             as Caudra automations, installed by benny's setup and the babysit playbook.\n\n\
+             - `{NAME}/{CAUDRA_AUTOMATIONS_DIR}`: the source of benny's Slack polling and \
+             watch-pr's drive mode as Caudra automations. They are bundled: with \
+             `experimental.automations` on they are listed in `/automations`, where the user arms \
+             them; a project or user script of the same name overrides one.\n\n\
              ## Model roles\n\n{}\n",
             roles.describe()
         ));
@@ -284,31 +305,41 @@ impl Library {
         })
     }
 
+    /// The pages that contain every word, ranked as `caudra-docs?<words>` ranks sections, each by
+    /// its best section.
     fn search(&self, words: &str) -> String {
-        let terms: Vec<String> = words.split_whitespace().map(str::to_lowercase).collect();
-        if terms.is_empty() {
+        let query = words.trim();
+        if query.is_empty() {
             return format!("Search with `{NAME}?<words>`, such as `{NAME}?flaky test`.");
         }
-        let hits: Vec<String> = self
-            .pages
-            .iter()
-            .filter(|(_, text)| {
-                let lower = text.to_lowercase();
-                terms.iter().all(|term| lower.contains(term.as_str()))
-            })
-            .take(SEARCH_LIMIT)
-            .map(|(path, text)| match snippet(text, &terms[0]) {
-                Some(line) => format!("- `{NAME}/{path}`: {line}"),
-                None => format!("- `{NAME}/{path}`"),
-            })
-            .collect();
-        match hits.is_empty() {
-            true => format!("No pstack page contains every word of `{words}`."),
-            false => format!(
-                "Pages containing every word of `{words}`:\n\n{}",
-                hits.join("\n")
-            ),
+        let mut search = self.search_index().search(query, usize::MAX);
+        let mut pages = HashSet::new();
+        search.hits.retain(|hit| pages.insert(hit.page));
+        search.matched = search.hits.len();
+        search.hits.truncate(SEARCH_LIMIT);
+        let no_match = format!("No pstack page contains every word of `{query}`.");
+        let mut report = SearchReport::new(&search, query, NAME, SEARCH_UNIT, &no_match);
+        for hit in &search.hits {
+            let Some((path, text)) = self.pages.iter().nth(hit.page) else {
+                continue;
+            };
+            let place = (hit.heading != PATH_HEADING).then_some(hit.title.as_str());
+            report.entry(&format!("{NAME}/{path}"), place, text.len(), &hit.snippet);
         }
+        report.finish()
+    }
+
+    /// Every page in path order under a heading naming its path, so a page without headings of
+    /// its own, such as a script, is searched too.
+    fn search_index(&self) -> &SearchIndex {
+        self.search.get_or_init(|| {
+            let bodies: Vec<String> = self
+                .pages
+                .iter()
+                .map(|(path, text)| format!("# {path}\n\n{}", body(text)))
+                .collect();
+            SearchIndex::from_markdown(bodies.iter().map(String::as_str))
+        })
     }
 
     fn not_found(&self, path: &str) -> String {
@@ -435,7 +466,9 @@ fn normalize(path: &str) -> Option<String> {
 
 fn headed(path: &str, text: &str) -> String {
     let dir = path.rsplit_once(PATH_SEPARATOR).map_or("", |(dir, _)| dir);
-    format!("Page `{NAME}/{path}`. A relative path in it resolves against `{NAME}/{dir}/`.\n\n{text}")
+    format!(
+        "Page `{NAME}/{path}`. A relative path in it resolves against `{NAME}/{dir}/`.\n\n{text}"
+    )
 }
 
 fn entry(skill: &Skill) -> String {
@@ -444,14 +477,6 @@ fn entry(skill: &Skill) -> String {
 
 fn first_sentence(text: &str) -> &str {
     text.find(". ").map_or(text, |end| &text[..=end])
-}
-
-fn snippet(text: &str, term: &str) -> Option<String> {
-    let line = text
-        .lines()
-        .find(|line| line.to_lowercase().contains(term))?
-        .trim();
-    Some(line.chars().take(SNIPPET_CHARS).collect())
 }
 
 fn key_stem(key: &str) -> &str {
@@ -490,6 +515,9 @@ mod tests {
     use super::*;
 
     const POTETO_MODE: &str = "poteto-mode";
+    const SEARCH_ENTRY: &str = "- pstack/";
+    const BUGBOT_CORRECTION: &str =
+        "No word in pstack starts with \"bugbto\", so it also matched \"bugbot\".";
     const MISSING_SKILL_MSG: &str = "the index must list every skill that is not a principle";
     const DANGLING_MSG: &str = "a relative link must resolve to a page";
     const NAME_MISMATCH_MSG: &str = "a skill's frontmatter name must be its directory";
@@ -532,21 +560,24 @@ mod tests {
     }
 
     #[test]
-    fn some_page_says_how_to_install_each_caudra_automation() {
-        const UNNAMED_MSG: &str = "a translated page must say how to install every Caudra automation";
-        let automations: Vec<&String> = library()
-            .pages
-            .keys()
-            .filter(|path| path.starts_with(CAUDRA_AUTOMATIONS_DIR))
-            .collect();
-        assert!(!automations.is_empty());
-        for path in automations {
-            let address = format!("{NAME}/{path}");
-            let named = library()
+    fn some_page_says_how_to_arm_each_caudra_automation() {
+        const UNNAMED_MSG: &str = "a translated page must say how to arm every Caudra automation";
+        const ARM_COMMAND: &str = "/automations arm";
+        let stems: Vec<&str> = automations().map(|(stem, _)| stem).collect();
+        assert_eq!(
+            stems.len(),
+            library()
                 .pages
-                .iter()
-                .any(|(page, text)| !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && text.contains(&address));
-            assert!(named, "{UNNAMED_MSG}: {address}");
+                .keys()
+                .filter(|path| path.starts_with(CAUDRA_AUTOMATIONS_DIR))
+                .count()
+        );
+        for stem in stems {
+            let arm = format!("{ARM_COMMAND} {stem}");
+            let named = library().pages.iter().any(|(page, text)| {
+                !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && text.contains(&arm)
+            });
+            assert!(named, "{UNNAMED_MSG}: {arm}");
         }
     }
 
@@ -558,7 +589,10 @@ mod tests {
     #[test]
     fn an_unknown_address_names_the_nearest_pages() {
         let error = library().load("/poteto-mod").unwrap_err();
-        assert!(error.contains("`pstack/skills/poteto-mode/SKILL.md`"), "{error}");
+        assert!(
+            error.contains("`pstack/skills/poteto-mode/SKILL.md`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -567,10 +601,40 @@ mod tests {
         assert!(listing.contains("`pstack/skills/poteto-mode/playbooks/feature.md`"));
     }
 
+    #[test_case("bugbot triage", "skills/poteto-mode/references/bugbot-triage.md" ; "terms_in_the_path_heading")]
+    #[test_case("lookback_hours", "caudra/automations/benny-reproduce.rhai" ; "script_without_headings")]
+    fn a_search_lists_the_best_page_first(query: &str, path: &str) {
+        let found = library().load(&format!("?{query}")).unwrap();
+        let first = found.lines().find(|line| line.starts_with(SEARCH_ENTRY));
+        assert_eq!(
+            first
+                .and_then(|line| line.split_once(" ("))
+                .map(|(address, _)| address),
+            Some(format!("{SEARCH_ENTRY}{path}").as_str()),
+            "{found}"
+        );
+    }
+
     #[test]
-    fn a_search_finds_pages_with_every_word() {
-        let found = library().load("?bugbot triage").unwrap();
-        assert!(found.contains("poteto-mode/references/bugbot-triage.md"), "{found}");
+    fn a_search_lists_each_page_once() {
+        let found = library().load("?skill").unwrap();
+        let addresses: Vec<&str> = found
+            .lines()
+            .filter(|line| line.starts_with(SEARCH_ENTRY))
+            .collect();
+        let distinct: BTreeSet<&str> = addresses.iter().copied().collect();
+        assert_eq!(addresses.len(), SEARCH_LIMIT, "{found}");
+        assert_eq!(distinct.len(), addresses.len(), "{found}");
+    }
+
+    #[test]
+    fn a_misspelt_search_word_names_its_correction() {
+        let found = library().load("?bugbto triage").unwrap();
+        assert!(found.starts_with(BUGBOT_CORRECTION), "{found}");
+        assert!(
+            found.contains("poteto-mode/references/bugbot-triage.md"),
+            "{found}"
+        );
     }
 
     #[test]
@@ -613,7 +677,8 @@ mod tests {
                     continue;
                 }
                 let target = normalize(&format!("{dir}/{href}")).unwrap();
-                let found = library().page(&target).is_some() || library().listing(&target).is_some();
+                let found =
+                    library().page(&target).is_some() || library().listing(&target).is_some();
                 assert!(found, "{DANGLING_MSG}: {path} -> {href}");
             }
         }
@@ -622,7 +687,11 @@ mod tests {
     #[test]
     fn the_manifest_hashes_every_vendored_file() {
         let manifest: serde_json::Value = serde_json::from_str(
-            UPSTREAM.get_file(MANIFEST).unwrap().contents_utf8().unwrap(),
+            UPSTREAM
+                .get_file(MANIFEST)
+                .unwrap()
+                .contents_utf8()
+                .unwrap(),
         )
         .unwrap();
         let listed: BTreeSet<String> = manifest["files"]
@@ -657,7 +726,10 @@ mod tests {
         let upstream = read(&UPSTREAM, MANIFEST);
         let recorded = read(&TRANSLATED, TRANSLATIONS);
         let recorded = recorded["files"].as_object().unwrap();
-        let translated: BTreeSet<&str> = vendored(&TRANSLATED).into_iter().map(|(path, _)| path).collect();
+        let translated: BTreeSet<&str> = vendored(&TRANSLATED)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
         for path in &translated {
             let base = &upstream["files"][*path];
             assert!(!base.is_null(), "{ORPHAN_MSG}: {path}");
@@ -702,7 +774,9 @@ mod tests {
         library()
             .pages
             .iter()
-            .filter(|(page, _)| !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && !page.ends_with(LICENSE_FILE))
+            .filter(|(page, _)| {
+                !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && !page.ends_with(LICENSE_FILE)
+            })
             .filter(|(page, _)| {
                 !CURSOR_TERMS_ALLOWED
                     .iter()
@@ -723,7 +797,11 @@ mod tests {
             .iter()
             .flat_map(|pattern| untranslated(&Regex::new(pattern).unwrap()))
             .collect();
-        assert!(found.is_empty(), "{UNTRANSLATED_MSG}:\n{}", found.join("\n"));
+        assert!(
+            found.is_empty(),
+            "{UNTRANSLATED_MSG}:\n{}",
+            found.join("\n")
+        );
     }
 
     #[test]
@@ -733,8 +811,16 @@ mod tests {
             .iter()
             .map(|skill| regex::escape(&skill.name))
             .collect();
-        let bare = Regex::new(&format!(r"(?m)(^|[\s`(\[*'])/({})($|[^\w-])", names.join("|"))).unwrap();
+        let bare = Regex::new(&format!(
+            r"(?m)(^|[\s`(\[*'])/({})($|[^\w-])",
+            names.join("|")
+        ))
+        .unwrap();
         let found = untranslated(&bare);
-        assert!(found.is_empty(), "{BARE_COMMAND_MSG}:\n{}", found.join("\n"));
+        assert!(
+            found.is_empty(),
+            "{BARE_COMMAND_MSG}:\n{}",
+            found.join("\n")
+        );
     }
 }

@@ -8,9 +8,9 @@ disable-model-invocation: true
 
 Investigate the motivation and intent behind code. The companion `how` skill answers what the code does and how it works. `why` answers what forces led to its shape.
 
-Each spawn below names a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
+Each spawn below names a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
-Every spawn is a plain `task` (no `profile`) with `mode: "build"`. **Do not use `mode: "plan"`.** It strips most MCP tools, which disables the MCP-backed investigators and the synthesizer's citation spot-checks. Investigators still shouldn't write anything.
+Every spawn is a `task` with `profile: "builtin"` and `mode: "build"`. A task's mode is capped by the caller's, so the session must be in Build mode. **Do not use `mode: "plan"`.** It strips most MCP tools, which disables the MCP-backed investigators and the synthesizer's citation spot-checks. Investigators still shouldn't write anything.
 
 ## Operating Posture
 

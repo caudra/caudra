@@ -223,16 +223,17 @@ impl TaskProfileBindings {
 }
 
 impl PromptProfileCatalog {
-    pub fn discover_user() -> Self {
-        Self::discover_with(caudra_storage::paths::config_dir().ok().as_deref())
+    /// `pstack` is `builtin_skills.pstack` from the caller's config.
+    pub fn discover_user(pstack: bool) -> Self {
+        Self::discover_with(caudra_storage::paths::config_dir().ok().as_deref(), pstack)
     }
 
-    pub fn discover_with(config_dir: Option<&Path>) -> Self {
+    pub fn discover_with(config_dir: Option<&Path>, pstack: bool) -> Self {
         let mut catalog = Self::default();
         if let Some(dir) = caudra_storage::paths::user_config_dir(config_dir, PROFILE_DIR) {
             catalog.load_dir(&dir);
         }
-        catalog.add_builtins(crate::pstack::profiles());
+        catalog.add_builtins(crate::pstack::profiles(pstack));
         catalog
     }
 
@@ -530,7 +531,7 @@ pub enum PromptProfileSelectionError {
 
 fn available_suffix(available: &str) -> String {
     if available.is_empty() {
-        "; no user profiles were found".to_owned()
+        "; no profiles are available".to_owned()
     } else {
         format!("; available profiles: {available}")
     }
@@ -840,6 +841,8 @@ mod tests {
     const EDITED_BODY: &str = "Review every line.";
     const BROKEN_PROFILE: &str = "---\nlayout: nope\n---\nReview carefully.";
     const BUILTIN_BODY: &str = "Review as shipped.";
+    const PSTACK_POTETO_PROFILE: &str = "pstack-poteto-agent";
+    const PSTACK_SICKO_PROFILE: &str = "pstack-comment-sicko";
 
     fn inspection_catalog(model: Option<&str>, thinking: Option<&str>) -> PromptProfileCatalog {
         let name: Arc<str> = Arc::from(INSPECTION_PROFILE);
@@ -862,7 +865,7 @@ mod tests {
     }
 
     fn discover(dir: &Path) -> PromptProfileCatalog {
-        PromptProfileCatalog::discover_with(Some(dir))
+        PromptProfileCatalog::discover_with(Some(dir), false)
     }
 
     fn profile_dir(dir: &TempDir) -> std::path::PathBuf {
@@ -913,6 +916,16 @@ mod tests {
             catalog.get(REVIEW).map(|profile| profile.body().to_owned()),
             expected.map(str::to_owned)
         );
+    }
+
+    #[test_case(false ; "off")]
+    #[test_case(true ; "on")]
+    fn pstack_profiles_follow_the_switch(pstack: bool) {
+        let dir = TempDir::new().unwrap();
+        let catalog = PromptProfileCatalog::discover_with(Some(dir.path()), pstack);
+        for name in [PSTACK_POTETO_PROFILE, PSTACK_SICKO_PROFILE] {
+            assert_eq!(catalog.get(name).is_some(), pstack, "{name}");
+        }
     }
 
     #[test]

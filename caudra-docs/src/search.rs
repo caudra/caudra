@@ -7,7 +7,6 @@ use std::ops::Range;
 
 use memchr::memmem;
 
-use crate::Page;
 use crate::markdown::{self, Fences};
 
 const ONE_TYPO_MIN_LEN: usize = 5;
@@ -37,6 +36,8 @@ pub struct Search {
 pub struct Hit {
     pub page: usize,
     pub heading: usize,
+    /// The heading's text, as a reader sees it.
+    pub title: String,
     pub snippet: String,
     /// Byte ranges of `snippet` that matched a term.
     pub highlights: Vec<Range<usize>>,
@@ -48,7 +49,9 @@ pub struct Correction {
     pub used: String,
 }
 
-pub(crate) struct SearchIndex {
+/// The search over a list of Markdown pages. A hit's `page` is its position in that list and its `heading` the
+/// position among that page's headings. Text before a page's first heading is not indexed.
+pub struct SearchIndex {
     sections: Vec<Section>,
     text: String,
     folded: String,
@@ -63,6 +66,7 @@ struct Section {
     heading: usize,
     body: Range<usize>,
     title: String,
+    folded_title: String,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -105,19 +109,18 @@ impl TermMatches {
 }
 
 impl SearchIndex {
-    pub(crate) fn build(pages: &[Page]) -> Self {
+    pub fn from_markdown<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Self {
         let mut text = String::new();
         let mut sections = Vec::new();
-        for (page_index, page) in pages.iter().enumerate() {
+        for (page_index, body) in bodies.into_iter().enumerate() {
+            let headings = markdown::headings(body);
             let mut fences = Fences::default();
-            let plain: Vec<String> = page
-                .body
+            let plain: Vec<String> = body
                 .lines()
                 .map(|line| plain_line(line, &mut fences))
                 .collect();
-            for (heading_index, heading) in page.headings.iter().enumerate() {
-                let end = page
-                    .headings
+            for (heading_index, heading) in headings.iter().enumerate() {
+                let end = headings
                     .get(heading_index + 1)
                     .map_or(plain.len(), |next| next.line);
                 let start = text.len();
@@ -129,7 +132,8 @@ impl SearchIndex {
                     page: page_index,
                     heading: heading_index,
                     body: start..text.len(),
-                    title: heading.title.to_ascii_lowercase(),
+                    folded_title: heading.title.to_ascii_lowercase(),
+                    title: heading.title.clone(),
                 });
             }
         }
@@ -137,7 +141,7 @@ impl SearchIndex {
         let vocabulary = vocabulary(&folded, &sections);
         let total_len: usize = sections
             .iter()
-            .map(|section| section.body.len() + section.title.len())
+            .map(|section| section.body.len() + section.folded_title.len())
             .sum();
         let average_len = (total_len as f64 / sections.len().max(1) as f64).max(1.0);
         Self {
@@ -149,7 +153,8 @@ impl SearchIndex {
         }
     }
 
-    pub(crate) fn search(&self, query: &str, limit: usize) -> Search {
+    /// Sections that contain every term of `query`, best first.
+    pub fn search(&self, query: &str, limit: usize) -> Search {
         let terms = terms(query);
         let mut corrections = Vec::new();
         let matches: Vec<TermMatches> = terms
@@ -201,8 +206,8 @@ impl SearchIndex {
             }
         }
         for (index, section) in self.sections.iter().enumerate() {
-            for at in finder.find_iter(section.title.as_bytes()) {
-                let quality = quality(&section.title, at, needle.len());
+            for at in finder.find_iter(section.folded_title.as_bytes()) {
+                let quality = quality(&section.folded_title, at, needle.len());
                 if quality >= min_quality {
                     sections.entry(index).or_default().record(quality, true);
                 }
@@ -280,7 +285,7 @@ impl SearchIndex {
 
     fn score(&self, section: usize, matches: &[TermMatches], idf: &[f64]) -> Ranked {
         let entry = &self.sections[section];
-        let len = (entry.body.len() + entry.title.len()) as f64;
+        let len = (entry.body.len() + entry.folded_title.len()) as f64;
         let saturation = BM25_K1 * (1.0 - BM25_B + BM25_B * len / self.average_len);
         let mut ranked = Ranked {
             section,
@@ -308,6 +313,7 @@ impl SearchIndex {
         Hit {
             page: entry.page,
             heading: entry.heading,
+            title: entry.title.clone(),
             snippet,
             highlights,
         }
@@ -364,7 +370,7 @@ fn plain_line(line: &str, fences: &mut Fences) -> String {
 fn vocabulary(folded: &str, sections: &[Section]) -> Vec<(String, u32)> {
     let mut counts: HashMap<&str, (u32, usize)> = HashMap::new();
     for (index, section) in sections.iter().enumerate() {
-        let words = words(&folded[section.body.clone()]).chain(words(&section.title));
+        let words = words(&folded[section.body.clone()]).chain(words(&section.folded_title));
         for word in words.filter(|word| word.len() >= ONE_TYPO_MIN_LEN) {
             let (count, last_section) = counts.entry(word).or_insert((0, usize::MAX));
             if *last_section != index {

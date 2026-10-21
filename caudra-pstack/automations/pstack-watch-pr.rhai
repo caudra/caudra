@@ -23,9 +23,16 @@ const CONCLUSIONS = ["success", "failure", "neutral", "cancelled", "skipped", "t
 const MERGEABLE_STATES = ["clean", "dirty", "blocked", "behind", "unstable", "has_hooks", "unknown", "draft"];
 const REVIEW_STATES = ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"];
 
+let name = args.owner + "/" + args.repo + "#" + args.pr;
+// State outlives re-arming, so arming for another pull request starts it over.
+if state.watching != name {
+    state.watching = name;
+    state.done = ();
+    state.signature = ();
+    state.head = ();
+}
 if state.done != () { skip("the pull request was " + state.done); }
 
-let name = args.owner + "/" + args.repo + "#" + args.pr;
 let repo_url = REPOS_URL + args.owner + "/" + args.repo;
 let response = http(#{ method: "GET", url: repo_url + "/pulls/" + args.pr, headers: HEADERS, bearer_env: "GITHUB_TOKEN" });
 if response.status != 200 || response.json == () {

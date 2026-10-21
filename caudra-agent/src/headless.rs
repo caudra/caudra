@@ -2592,6 +2592,7 @@ impl PendingAutomations {
             session_id,
             cwd: params.initial_wd.clone(),
             user_config_dir: automation.user_config_dir,
+            bundled: None,
             remote: params.workspace_session.is_some()
                 || params
                     .workspace_binding

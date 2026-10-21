@@ -22,9 +22,7 @@ use tokio::process::{Child, Command};
 
 #[cfg(unix)]
 use workcell_tool_contract::shell_env::BASH_EXECUTABLE_ENV;
-use workcell_tool_contract::shell_env::{
-    BASE_ALLOWLIST, FORCED_VARIABLES, is_shell_startup_variable,
-};
+use workcell_tool_contract::shell_env::command_environment;
 
 use crate::bash::BashContextAssumptions;
 
@@ -239,28 +237,9 @@ fn clean_environment_with(
     environment: &[(String, OsString)],
     read: impl Fn(&str) -> Option<OsString>,
 ) {
-    command.env_clear();
-    for &name in BASE_ALLOWLIST {
-        if let Some(value) = read(name) {
-            command.env(name, value);
-        }
-    }
-    for (name, value) in environment {
-        if !is_shell_startup_variable(name) {
-            command.env(name, value);
-        }
-    }
-    // Set, not forwarded, and after every forwarded name so a listed one cannot
-    // replace it. `env_clear` already dropped any inherited `NO_COLOR`,
-    // `FORCE_COLOR`, and `CLICOLOR_FORCE`, so this establishes a default for an
-    // environment that has none rather than overriding an operator's choice.
-    // Not conditioned on the output filter: this describes the environment a
-    // command runs in, not how its output is rendered, and a caller who disables
-    // filtering still sees exactly what the command wrote. An explicit
-    // `--color=always` still wins, which is the intended behaviour.
-    for (name, value) in FORCED_VARIABLES {
-        command.env(name, value);
-    }
+    command
+        .env_clear()
+        .envs(command_environment(environment, read));
 }
 
 pub(crate) async fn terminate_and_reap(
