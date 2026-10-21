@@ -785,7 +785,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `permission_advice` | `off` | `off`, `shadow`, `advise` | Add warnings to an existing permission prompt without delaying the answer. |
 | `auto_screening` | `off` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. Only `enforce` lets Auto run scripts and other lines that cannot be checked command by command. No answer channel means denial. |
 | `shell_effect` | `off` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
-| `content_screening` | `off` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
+| `content_screening` | `off` | `off`, `shadow`, `advise`, `enforce` | Screen web, MCP and `code` output for text that tries to instruct the agent. `advise` adds caution to a flagged result and tightens upload/credential Auto screening for the session; the content stays available. `enforce` does the same, and also withholds from the model a flagged result, or one it could not screen in full, with a notice saying why. You still see the result on its card. |
 | `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, models chosen on the `task` call, profile pins, and continuations keep their routing. |
@@ -800,7 +800,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 
 #### `decisions.thresholds`
 
-Flag thresholds trigger at or above the configured value. Goal prescreening uses an at-or-below comparison. Content screening requires both signals in a sampled chunk. After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.
+Flag thresholds trigger at or above the configured value. Goal prescreening uses an at-or-below comparison. Content screening requires both signals in the same chunk. After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

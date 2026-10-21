@@ -859,7 +859,12 @@ Each warning is a `⚠` line above the answers, with the predicted likelihood, s
 
 `shell_effect = "advise"` can warn about possible project writes during Plan review when `thresholds.shell_writes` is explicitly configured. This is caution only. Deterministic checks still decide read-only access. Shadow labels use the deterministic classifier, not observed filesystem changes.
 
-`content_screening = "advise"` samples web and MCP results. When both injection and agent-addressed signals cross their thresholds, Caudra adds caution and marks the session for tighter upload and credential screening in Auto. This also works in YOLO, with tighter permission screening taking effect if you later switch to Auto. It keeps the content available. Sampling and predictions can miss an attack, so this is not an injection barrier.
+`content_screening` reads web, MCP, and `code` results in full, including the part a long result's preview leaves out, in overlapping chunks of about 1.4 KB. A chunk is flagged when both its injection and its agent-addressed signals reach their thresholds.
+
+- `"advise"` adds caution to a flagged result and marks the session for tighter upload and credential screening in Auto. This also works in YOLO, with tighter permission screening taking effect if you later switch to Auto. The model still reads the content.
+- `"enforce"` withholds a flagged result from the model. The model reads a notice instead, naming the flagged chunks, both signals as percentages, and the thresholds, and asking it to tell you rather than fetch the page again. Caudra deletes the saved copy, so `tool_output` cannot read it back, and marks the session as `"advise"` does. The card keeps the result for you, with `Decision engine: withheld from the model` on its header.
+
+`"enforce"` fails closed. A result is also withheld when the engine fails or times out, when screening is interrupted, or when part of it goes unscreened: results over 64 KiB, or with more than 64 chunks, are withheld unread. Each screened result costs one engine request per chunk, four at a time, so a long page can take several seconds. Predictions can still miss an attack, so treat this as a filter, not an injection barrier.
 
 The optional [question-tool nudge](/docs/configuration/#question-tool-nudge) can remind the main-session assistant to use `question` when its attempted final reply asks you for a choice, clarification, or approval. It is separate from permission checks and defaults to `off`.
 

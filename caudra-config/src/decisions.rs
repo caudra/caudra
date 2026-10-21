@@ -276,8 +276,8 @@ features! {
         "Escalate an eligible Auto call to a prompt on a flag or engine failure. Only `enforce` lets Auto run scripts and other lines that cannot be checked command by command. No answer channel means denial.";
     shell_effect: [Advise],
         "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.";
-    content_screening: [Advise],
-        "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.";
+    content_screening: [Advise, Enforce],
+        "Screen web, MCP and `code` output for text that tries to instruct the agent. `advise` adds caution to a flagged result and tightens upload/credential Auto screening for the session; the content stays available. `enforce` does the same, and also withholds from the model a flagged result, or one it could not screen in full, with a notice saying why. You still see the result on its card.";
     skill_suggestions: [Advise],
         "Suggest a shortlisted skill. The agent still chooses whether to load it.";
     goal_prescreen: [Enforce],
@@ -572,8 +572,10 @@ impl RawDecisionsConfig {
         }
         let screening_restricted = self.features.auto_screening == Some(FeatureMode::Enforce)
             && (overlay.features.auto_screening == Some(FeatureMode::Off)
-                || (self.features.content_screening == Some(FeatureMode::Advise)
-                    && overlay.features.content_screening == Some(FeatureMode::Off)));
+                || (matches!(
+                    self.features.content_screening,
+                    Some(FeatureMode::Advise | FeatureMode::Enforce)
+                ) && overlay.features.content_screening == Some(FeatureMode::Off)));
         self.features.restrict(overlay.features)?;
         self.auto_screening_restricted |= screening_restricted || overlay.auto_screening_restricted;
         if overlay.log.is_some() {
@@ -1498,7 +1500,7 @@ mod tests {
     #[test_case("permission_advice", true, false)]
     #[test_case("auto_screening", false, true)]
     #[test_case("shell_effect", true, false)]
-    #[test_case("content_screening", true, false)]
+    #[test_case("content_screening", true, true)]
     #[test_case("skill_suggestions", true, false)]
     #[test_case("goal_prescreen", false, true)]
     #[test_case("subagent_routing", false, true)]
@@ -1626,6 +1628,7 @@ mod tests {
 
     #[test_case("enforce", "off", "auto_screening = 'off'", true; "required_screening_disabled")]
     #[test_case("enforce", "advise", "content_screening = 'off'", true; "required_taint_protection_disabled")]
+    #[test_case("enforce", "enforce", "content_screening = 'off'", true; "withholding_taint_protection_disabled")]
     #[test_case("enforce", "shadow", "content_screening = 'off'", false; "shadow_content_has_no_policy_effect")]
     #[test_case("enforce", "off", "content_screening = 'off'", false; "already_disabled_content")]
     #[test_case("enforce", "advise", "", false; "no_restriction")]

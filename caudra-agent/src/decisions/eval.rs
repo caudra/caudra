@@ -37,7 +37,7 @@ use super::output_pointers::{
 use super::state::MAX_STATE_BYTES;
 use super::{
     CodeSymbol, DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions,
-    PermissionAction, content, permission, question_tool_nudge, questions,
+    PermissionAction, Screening, Withholding, permission, question_tool_nudge, questions,
     rerank_source_code_context, shell_effect,
 };
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
@@ -475,7 +475,7 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     let features = &mut config.features;
     features.permission_advice = FeatureMode::Advise;
     features.shell_effect = FeatureMode::Advise;
-    features.content_screening = FeatureMode::Advise;
+    features.content_screening = FeatureMode::Enforce;
     features.skill_suggestions = FeatureMode::Advise;
     features.goal_prescreen = FeatureMode::Enforce;
     features.subagent_routing = FeatureMode::Enforce;
@@ -908,34 +908,22 @@ async fn shell_effect_case(decisions: &Decisions, case: EffectCase) -> Scored {
 }
 
 async fn content_case(decisions: &Decisions, case: ContentCase) -> Scored {
-    let questions = questions::CONTENT.as_ref().expect(SET_INVALID);
-    let thresholds = &decisions.config().thresholds;
-    let chunks = content::chunks(&case.content);
-    assert!(!chunks.is_empty(), "{UNREACHED}: {}", case.content);
-    let mut latency_ms = 0;
-    let mut flags = Vec::new();
-    for chunk in chunks {
-        let state = content::chunk_state(&chunk);
-        let outcome = evaluate(
-            decisions,
-            DecisionFeature::ContentScreening,
-            &state,
-            questions,
-        )
+    let started = Instant::now();
+    let screening = decisions
+        .screen_content(&case.content, &DecisionContext::default())
         .await;
-        latency_ms += outcome.latency_ms;
-        flags.push(outcome.result.as_ref().ok().map(|response| {
-            content::content_flagged(
-                response,
-                thresholds.content_injection,
-                thresholds.content_addressed_to_agent,
-            )
-        }));
-    }
-    let flagged = flags
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .map(|flags| flags.contains(&true));
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let flagged = match screening {
+        Screening::Withheld {
+            withholding: Withholding::Flagged(_),
+            ..
+        } => Some(true),
+        Screening::Quiet => Some(false),
+        Screening::Withheld { .. }
+        | Screening::Flagged { .. }
+        | Screening::Shadow(_)
+        | Screening::Failed(_) => None,
+    };
     let verdict = match flagged {
         Some(flagged) if flagged == case.flagged => Verdict::Right,
         Some(_) => Verdict::Wrong,

@@ -644,6 +644,21 @@ impl OutputDirectory {
         let _ = fs::remove_file(self.path.join(name));
     }
 
+    #[cfg(unix)]
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()).map_err(std::io::Error::from)
+    }
+
+    #[cfg(not(unix))]
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        let path = self.path.join(name);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(not_regular_file());
+        }
+        fs::remove_file(path)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         rustix::fs::fsync(&self.fd).map_err(std::io::Error::from)?;
@@ -899,6 +914,21 @@ impl ToolOutputStore {
         let head = read_head(&mut file, max_lines.div_ceil(2), head_bytes)?;
         let tail = read_tail(&mut file, max_lines / 2, tail_bytes)?;
         Ok(ToolOutputPreview { head, tail })
+    }
+
+    /// Removes one saved output, so nothing can read it back. An output that is
+    /// already gone is not an error.
+    pub fn delete(&self, session_id: CaudraId, id: &ToolOutputId) -> Result<(), ToolOutputError> {
+        let directory = match OutputDirectory::open(&self.state_dir, session_id, false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StorageError::Io(error).into()),
+        };
+        match directory.remove(&output_name(id)) {
+            Ok(()) => Ok(directory.sync()?),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StorageError::Io(error).into()),
+        }
     }
 
     pub fn delete_session(&self, session_id: CaudraId) -> Result<(), ToolOutputError> {
@@ -2406,6 +2436,7 @@ mod tests {
     const PAGED_TEXT: &str = "one\ntwo\nthree\nfour\n";
     const GREP_TEXT: &str = "before\nerror 42\nbetween\nerror 7\nafter\n";
     const MISSING_TEXT: &str = "missing";
+    const KEPT_TEXT: &str = "another session's output";
     const STREAMED_TEXT: &str = "alpha\r\nβeta\n\nend\n";
     const HUGE_LINE_NEEDLE: &str = "needle-at-the-end";
     const READABLE_ID: &str = "brisk-calm-otter";
@@ -2718,6 +2749,28 @@ mod tests {
         }
 
         assert_eq!(restored, text);
+    }
+
+    #[test_case(true; "saved_output")]
+    #[test_case(false; "missing_session")]
+    fn a_deleted_output_cannot_be_read_back(saved: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ToolOutputStore::new(StateDir::from_path(temp.path().to_path_buf()));
+        let session_id = CaudraId::generate();
+        let id = if saved {
+            store.put(session_id, EXACT_TEXT).unwrap().id
+        } else {
+            DEFAULT_OUTPUT_LABEL.parse().unwrap()
+        };
+        let other_session = CaudraId::generate();
+        let kept = store.put(other_session, KEPT_TEXT).unwrap();
+        store.delete(session_id, &id).unwrap();
+        store.delete(session_id, &id).unwrap();
+        assert!(matches!(
+            store.load_text(session_id, id),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+        assert_eq!(store.load_text(other_session, kept.id).unwrap(), KEPT_TEXT);
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub use active::{
     resolve_active_decisions, resolve_decision_endpoint, save_decision_endpoint,
     use_decision_endpoint,
 };
-pub use content::Screening;
+pub use content::{Flag, Screening, Unscreened, Withholding};
 pub use note::{
     DecisionNote, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, PendingDecision, PendingNote,
     counted, placement, score_line,
@@ -1020,7 +1020,7 @@ mod tests {
         DecisionContext, DecisionFeature, Decisions, DecisionsError, ENDPOINT_META, ENGINE_HTTP,
         ENGINE_INVALID, ENGINE_REFUSED, ENGINE_TIMED_OUT, ENGINE_UNREACHABLE, PROTOCOL_META,
         PermissionAction, PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED, Screening,
-        questions, record_meta, stats_thresholds,
+        Withholding, questions, record_meta, stats_thresholds,
     };
 
     const SECRET: &str = "never-store-this-credential";
@@ -1555,7 +1555,8 @@ mod tests {
 
     #[test_case(FeatureMode::Shadow, false; "shadow")]
     #[test_case(FeatureMode::Advise, true; "advise")]
-    fn content_screening_is_advisory_and_caller_controls_taint(mode: FeatureMode, expected: bool) {
+    #[test_case(FeatureMode::Enforce, true; "enforce")]
+    fn content_screening_flags_and_caller_controls_taint(mode: FeatureMode, expected: bool) {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let mut config = config(true);
@@ -1577,8 +1578,15 @@ mod tests {
                 .await;
             let (receipts, flags) = match screening {
                 Screening::Flagged { receipts, flags } => (receipts.len(), flags),
+                Screening::Withheld {
+                    receipts,
+                    withholding: Withholding::Flagged(flags),
+                    ..
+                } => (receipts.len(), flags),
                 Screening::Shadow(flags) => (0, flags),
-                Screening::Failed(_) | Screening::Quiet => (0, Vec::new()),
+                Screening::Withheld { .. } | Screening::Failed(_) | Screening::Quiet => {
+                    (0, Vec::new())
+                }
             };
             assert_eq!(receipts, usize::from(expected));
             assert_eq!(flags.len(), 1);

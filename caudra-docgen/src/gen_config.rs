@@ -828,7 +828,7 @@ fn write_decisions_section(out: &mut String) {
     out.push_str(
         "\n#### `decisions.thresholds`\n\n\
          Flag thresholds trigger at or above the configured value. Goal prescreening uses an \
-         at-or-below comparison. Content screening requires both signals in a sampled chunk. \
+         at-or-below comparison. Content screening requires both signals in the same chunk. \
          After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.\n\n",
     );
     write_table(out, DecisionThresholds::FIELDS);

@@ -1044,9 +1044,12 @@ version = 3
 # Type: string.
 # shell_effect = "off"
 
-# Add caution to flagged web/MCP output and tighten upload/credential Auto
-# screening for the session. Content remains available. Modes: off, shadow,
-# advise.
+# Screen web, MCP and `code` output for text that tries to instruct the agent.
+# `advise` adds caution to a flagged result and tightens upload/credential Auto
+# screening for the session; the content stays available. `enforce` does the
+# same, and also withholds from the model a flagged result, or one it could not
+# screen in full, with a notice saying why. You still see the result on its
+# card. Modes: off, shadow, advise, enforce.
 # Type: string.
 # content_screening = "off"
 
