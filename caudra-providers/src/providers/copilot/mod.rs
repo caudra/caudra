@@ -1192,20 +1192,6 @@ fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth,
     })
 }
 
-fn anthropic_messages(messages: &[Message]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    )
-}
-
 /// The body `endpoint` expects for one turn.
 fn endpoint_body(
     endpoint: Endpoint,
@@ -1236,16 +1222,7 @@ fn endpoint_body(
             body
         }
         Endpoint::Messages => {
-            let mut body = json!({
-                "model": model.id,
-                "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
-                "system": [{"type": "text", "text": system}],
-                "messages": anthropic_messages(messages),
-                "tools": tools,
-                "stream": true,
-            });
-            thinking.apply_to_body(&mut body, model);
-            body
+            shared::messages_body(model, &model.id, messages, None, system, tools, thinking)
         }
     }
 }
@@ -1467,6 +1444,32 @@ mod tests {
 
         assert_eq!(wire.url, format!("{DEFAULT_API_ENDPOINT}{path}"));
         assert!(!wire.url.contains(TEST_TOKEN), "{CREDENTIAL_IN_URL}");
+    }
+
+    /// Copilot's Messages endpoint caches only at explicit breakpoints, so a
+    /// body without them pays full price for every turn.
+    #[test]
+    fn messages_body_places_cache_breakpoints() {
+        const MISSING_BREAKPOINT: &str = "Messages body lacks a cache breakpoint";
+        let model = Model::from_spec("copilot/claude-haiku-5.5").unwrap();
+        let tools = json!([{"name": "read", "input_schema": {"type": "object"}}]);
+        let ephemeral = json!({"type": "ephemeral"});
+
+        let body = endpoint_body(
+            Endpoint::Messages,
+            &model,
+            &[Message::user("hi".into())],
+            "system",
+            &tools,
+            &ThinkingConfig::Off,
+        );
+
+        assert_eq!(body["system"][0]["cache_control"], ephemeral, "{MISSING_BREAKPOINT}");
+        assert_eq!(body["tools"][0]["cache_control"], ephemeral, "{MISSING_BREAKPOINT}");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
     }
 
     /// A send refetches `/models` for a model the cache lacks. The dry run
