@@ -70,10 +70,10 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 Each live lane runs in its own git worktree at the PR head. Drive through `control-ui` or `control-cli` from `cursor-team-kit`.
 
-- [ ] `git fetch origin <head-branch> && git worktree add <scratch dir>/<pr-id>-lane-<n> <head SHA>`.
+- [ ] `git fetch origin <head-branch> && git worktree add "$TMPDIR/<pr-id>-lane-<n>" <head SHA>`.
 - [ ] <Start the backend and the surface. Wait for ready.>
 - [ ] <Deliver input only through the control skill's commands. Name the read-only diagnostics.>
-- [ ] Save every screenshot to `/tmp/swarm-<pr-id>/worker-<n>/<slug>.png` and return the paths with the report.
+- [ ] Save every screenshot to `$TMPDIR/swarm-<pr-id>/worker-<n>/<slug>.png` (the scratch directory) and return the paths with the report.
 
 ## <Task as a verb phrase> (<PR id>)
 

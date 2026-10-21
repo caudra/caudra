@@ -1,5 +1,7 @@
 {
   "files": {
+    "cursor-team-kit/skills/control-cli/SKILL.md": "13ac93e595bbda2000849bdb815d5f2ca03f7c2ca63788c8335f9212b9b422a2",
+    "cursor-team-kit/skills/control-ui/SKILL.md": "410cae25bdb1e5d2323b126abc5047b0213be7fdb0195710213fa8de8a751871",
     "pstack/README.md": "89dd87ec01491f5f9764b3f57a571418d2a04e6259afc43ed386cf8556c19fd2",
     "pstack/agents/comment-sicko.md": "3e239e40b7b4b9beb2cf7f3ccc57f2388eb8b69bd1ba8ae888ef87ef6e0e2116",
     "pstack/agents/poteto-agent.md": "979f18abd000d185a0b4c41a2a4111c0910596a7f5c81cbb571885bc721b2bf7",
@@ -32,6 +34,7 @@
     "pstack/skills/correct/SKILL.md": "e347045d00c967a0b831ef883cc6ac79d21329aa10b5968637df95de7febf0ba",
     "pstack/skills/create-formal-verification-skill/SKILL.md": "6c934cd15a9583533ff9b7a9cad62775d7e80402d26d3ba7f74f79ea21a1d8eb",
     "pstack/skills/create-verification-skill/SKILL.md": "d353973547bf8ad8977eca645f4cd4feaed0d32f4b43d1448f906b0a76c4d694",
+    "pstack/skills/create-verification-skill/references/feature-map-example/README.md": "cb7bd782cf89968a4ba3d58a5151db837430db92d19a6f52a906973b77b516ba",
     "pstack/skills/figure-it-out/SKILL.md": "bdb23cdbd82a1e6af094b495691c832a6f7f3ab9706ba9edbeb664ef51a726e1",
     "pstack/skills/how/SKILL.md": "08a00079bb15b4258874ac3ff62d4ca7e94350ffedb521d0fd296dc9dd21904e",
     "pstack/skills/how/references/explainer-prompt.md": "ddb89cebefc24e2b54517a331aedfe045b6971e101f45c71b8cef4cccff45bff",
@@ -58,6 +61,7 @@
     "pstack/skills/poteto-mode/playbooks/multi-phase-plan.md": "5f239457bfdec3345c92caa06c59bf0257c662b89353f25a1c02ea942dcd00b1",
     "pstack/skills/poteto-mode/playbooks/opening-a-pr.md": "a5aef646de8b651306c2d10974623650e4a013a245aec1c00525bbe0e31bfa76",
     "pstack/skills/poteto-mode/playbooks/orchestrate.md": "08dce6c9e7be1d13bc6944ab9b51665f935c531437f5e088bc53d2a62099ef05",
+    "pstack/skills/poteto-mode/playbooks/pause-safely.md": "77968cfe5f4a71a8cd33e0ae8ffcdbd88dd693a212c240457773e6c40c96c21d",
     "pstack/skills/poteto-mode/playbooks/perf-issue.md": "c12aa2f82de7651a11676a3d5fea168f539b7f0faaa3a501d279255dd2a469c8",
     "pstack/skills/poteto-mode/playbooks/refactoring.md": "0f5dd38113379ea8cf61e2182eca0a7478eea9a869eb40c2dddab3335aeca197",
     "pstack/skills/poteto-mode/playbooks/runtime-forensics.md": "3463372b578c28f27c236f2627f09b5c5b1e85e86db7399fb984f3892fb450f5",

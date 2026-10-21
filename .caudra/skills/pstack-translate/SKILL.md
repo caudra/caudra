@@ -104,6 +104,7 @@ pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Eac
 | "the current agent's store" (orchestrate) | `.caudra/pstack/orchestrate/<project-slug>/` in the main checkout, with that folder in `.git/info/exclude` |
 | `.cursor/automations/benny/...` paths | the pages `pstack/automations/benny/...` for the pack's skills and prompts; `.caudra/benny/` for the user's configuration, routing map, and feature map |
 | links to `cursor.com/docs/...` | the matching `https://caudra.ai/docs/...` page, or drop the link |
+| a hard-coded `/tmp/...` | the scratch directory, which Caudra gives each project and writes to without asking: `$TMPDIR/...` in shell commands and env assignments, `${process.env.TMPDIR}` in JavaScript run through `shell`, and in prose "the scratch directory (the `Scratch directory` path in the Environment block, `$TMPDIR` in shell commands)" on first mention. A config value nothing expands takes the placeholder `<scratch directory>/...` |
 
 A page's own links stay relative: a page is served at `pstack/<path>`, and a relative link resolves against its directory.
 

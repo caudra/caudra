@@ -740,7 +740,8 @@ mod tests {
     }
 
     /// Every served page reads as Caudra's: a page that still names one of these was not
-    /// translated. `.caudra/skills/pstack-translate` says what each becomes.
+    /// translated. `.caudra/skills/pstack-translate` says what each becomes. A hard-coded `/tmp`
+    /// counts: Caudra gives each project a scratch directory, and writes outside it prompt.
     const CURSOR_TERMS: &[&str] = &[
         r"`Task`|\bTask (tool|subagent|call)s?\b",
         r"AskQuestion",
@@ -765,6 +766,7 @@ mod tests {
         r"/loop\b",
         r"cursor\.com/docs",
         r"\bCursor\b",
+        r#"(^|[\s`"'(=:])/tmp\b"#,
     ];
     /// Pages that name a Cursor term on purpose, and the term.
     const CURSOR_TERMS_ALLOWED: &[(&str, &str)] = &[("README.md", r"\bCursor\b")];
