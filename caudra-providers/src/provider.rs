@@ -626,9 +626,14 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
         Ok(provider) => provider,
         Err(e) => {
             warn!(error = %e, "provider creation failed, using unconfigured provider");
-            Box::new(UnconfiguredProvider)
+            unconfigured()
         }
     }
+}
+
+/// A provider whose every request asks for a login.
+pub fn unconfigured() -> Box<dyn Provider> {
+    Box::new(UnconfiguredProvider)
 }
 
 struct UnconfiguredProvider;

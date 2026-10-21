@@ -195,6 +195,7 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
 | Small | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 100K out |
+| Small | mai-code-1.1-flash | $0.20 / $1.20 | 200K ctx / 100K out |
 | Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
 |  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
@@ -214,6 +215,8 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 |  | claude-opus-5.5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Best | **claude-opus-5, claude-opus-4.8** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
 |  | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | claude-fable-5.1 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | gpt-6-astra | $10.00 / $50.00 | 200K ctx / 100K out |
 |  | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
 |  | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
 |  | grok-4.7 | $2.00 / $6.00 | 200K ctx / 100K out |
@@ -232,7 +235,7 @@ Copilot lists a prompt limit for each model beside its total window, and refuses
 - **API**: `https://copilot-api.<enterprise-host>`
 - **Features**: Native Copilot Chat HTTP API for one GitHub Enterprise host
 
-Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
+Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a personal account can stay signed in together. Run `caudra auth login copilot-enterprise --hostname company.ghe.com`, or leave out `--hostname` and Caudra asks for it. A name without a dot, such as `company`, means `company.ghe.com`. The login runs against that host and saves the token together with the host. `--method import` reads gh CLI and Copilot plugin tokens for that host only.
 
 Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
 

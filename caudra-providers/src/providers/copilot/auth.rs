@@ -31,6 +31,10 @@ const ENTERPRISE_TOKEN_ENV_VARS: &[&str] = &[ENTERPRISE_TOKEN_ENV];
 pub const ENTERPRISE_HOST_ENV: &str = "GH_COPILOT_ENTERPRISE_HOST";
 const PUBLIC_HOST: &str = "github.com";
 const PUBLIC_SUBDOMAIN_SUFFIX: &str = ".github.com";
+/// Copilot serves enterprises from GHE.com tenants alone, so a bare tenant
+/// name such as `company` means `company.ghe.com`.
+const GHE_COM_SUFFIX: &str = ".ghe.com";
+const LABEL_SEPARATOR: char = '.';
 pub(crate) const PUBLIC_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const PUBLIC_USER_URL: &str = "https://api.github.com/user";
 const ENTERPRISE_REST_PREFIX: &str = "https://api.";
@@ -122,7 +126,7 @@ impl CopilotIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum EnterpriseHostError {
-    #[error("enter a GitHub Enterprise hostname such as company.ghe.com")]
+    #[error("enter a GitHub Enterprise hostname such as company or company.ghe.com")]
     Empty,
     #[error("not a valid hostname or https:// URL")]
     Malformed,
@@ -169,6 +173,9 @@ impl EnterpriseHost {
             return Err(EnterpriseHostError::Path);
         }
         let host = match url.host() {
+            Some(Host::Domain(domain)) if !domain.contains(LABEL_SEPARATOR) => {
+                format!("{domain}{GHE_COM_SUFFIX}")
+            }
             Some(Host::Domain(domain)) => domain.to_owned(),
             Some(Host::Ipv4(_) | Host::Ipv6(_)) => return Err(EnterpriseHostError::IpAddress),
             None => return Err(EnterpriseHostError::Malformed),
@@ -882,6 +889,9 @@ mod tests {
     #[test_case("https://myco.ghe.com/" ; "trailing_slash")]
     #[test_case("  MyCo.GHE.com  " ; "mixed_case_and_spaces")]
     #[test_case("https://myco.ghe.com:443" ; "default_port")]
+    #[test_case("myco" ; "tenant_name")]
+    #[test_case(" MyCo " ; "mixed_case_tenant_name")]
+    #[test_case("https://myco" ; "tenant_name_url")]
     fn enterprise_host_normalizes(input: &str) {
         assert_eq!(EnterpriseHost::parse(input).unwrap().as_str(), HOST);
     }

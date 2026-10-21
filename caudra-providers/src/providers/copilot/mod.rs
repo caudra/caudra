@@ -69,9 +69,9 @@ const CONVERSATION_AGENT: &str = "conversation-agent";
 const ENDPOINT_NOT_RESOLVED: &str =
     "Copilot resolves its API endpoint on the first send; send a message first";
 
-/// OpenAI families Copilot serves over the Responses API. Matched as substrings
-/// so `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
-const RESPONSES_FAMILIES: &[&str] = &["gpt-5", "gpt-6", "codex"];
+/// Families Copilot serves over the Responses API. Matched as substrings so
+/// `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
+const RESPONSES_FAMILIES: &[&str] = &["gpt-5", "gpt-6", "codex", "mai-code"];
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
@@ -212,6 +212,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["mai-code-1.1-flash"],
+            small: true,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.20,
+                output: 1.20,
+                cache_write: 0.25,
+                cache_read: 0.02,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gemini-3.7-flash"],
@@ -531,6 +549,42 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 10.00,
+                output: 50.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["claude-fable-5.1"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 10.00,
+                output: 50.00,
+                cache_write: 12.50,
+                cache_read: 0.25,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["gpt-6-astra"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
@@ -1192,20 +1246,6 @@ fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth,
     })
 }
 
-fn anthropic_messages(messages: &[Message]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    )
-}
-
 /// The body `endpoint` expects for one turn.
 fn endpoint_body(
     endpoint: Endpoint,
@@ -1236,16 +1276,7 @@ fn endpoint_body(
             body
         }
         Endpoint::Messages => {
-            let mut body = json!({
-                "model": model.id,
-                "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
-                "system": [{"type": "text", "text": system}],
-                "messages": anthropic_messages(messages),
-                "tools": tools,
-                "stream": true,
-            });
-            thinking.apply_to_body(&mut body, model);
-            body
+            shared::messages_body(model, &model.id, messages, None, system, tools, thinking)
         }
     }
 }
@@ -1407,8 +1438,9 @@ mod tests {
     #[test_case("gpt-6.1-sol", Endpoint::Responses ; "gpt_6_point_release_takes_responses")]
     #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
     #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
+    #[test_case("mai-code-1.1-flash", Endpoint::Responses ; "mai_code_takes_responses")]
     #[test_case("gemini-4-argon", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
-    fn guess_endpoint_covers_every_openai_family(model_id: &str, expected: Endpoint) {
+    fn guess_endpoint_covers_every_responses_family(model_id: &str, expected: Endpoint) {
         assert_eq!(guess_endpoint(model_id), expected);
     }
 
@@ -1467,6 +1499,38 @@ mod tests {
 
         assert_eq!(wire.url, format!("{DEFAULT_API_ENDPOINT}{path}"));
         assert!(!wire.url.contains(TEST_TOKEN), "{CREDENTIAL_IN_URL}");
+    }
+
+    /// Copilot's Messages endpoint caches only at explicit breakpoints, so a
+    /// body without them pays full price for every turn.
+    #[test]
+    fn messages_body_places_cache_breakpoints() {
+        const MISSING_BREAKPOINT: &str = "Messages body lacks a cache breakpoint";
+        let model = Model::from_spec("copilot/claude-haiku-5.5").unwrap();
+        let tools = json!([{"name": "read", "input_schema": {"type": "object"}}]);
+        let ephemeral = json!({"type": "ephemeral"});
+
+        let body = endpoint_body(
+            Endpoint::Messages,
+            &model,
+            &[Message::user("hi".into())],
+            "system",
+            &tools,
+            &ThinkingConfig::Off,
+        );
+
+        assert_eq!(
+            body["system"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
+        assert_eq!(
+            body["tools"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"], ephemeral,
+            "{MISSING_BREAKPOINT}"
+        );
     }
 
     /// A send refetches `/models` for a model the cache lacks. The dry run
