@@ -1,6 +1,10 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Mutex, OnceLock};
 
 use crate::exclusive_state_lock;
@@ -14,6 +18,7 @@ const ACTIVE_LEASE_PREFIX: &str = "caudra.db.active-";
 const ACTIVE_LEASE_SUFFIX: &str = ".lock";
 const ACTIVE_LEASE_CATALOG: &str = "caudra.db.active.lock";
 const OWNER_FILE_MODE: u32 = 0o600;
+const MAX_PID_BYTES: u64 = 16;
 
 type LeaseKey = (PathBuf, CaudraId);
 
@@ -62,6 +67,13 @@ impl SessionLease {
                 return Err(error.into());
             }
         };
+        if let Err(error) = record_owner(&active_lock) {
+            tracing::warn!(
+                path = %lock_path.display(),
+                %error,
+                "could not record the process ID in the session lease"
+            );
+        }
 
         Ok(Self {
             id,
@@ -177,7 +189,42 @@ pub fn hold_instance(state_dir: &StateDir) -> Result<InstanceHold, StorageError>
 /// without one, so this can be empty even when [`try_instance_lock`] returns
 /// `None`.
 pub fn open_instances(state_dir: &StateDir) -> Vec<CaudraId> {
-    held_session_ids(&state_dir.for_class(StateClass::Persistent))
+    held_sessions(&state_dir.for_class(StateClass::Persistent))
+        .into_iter()
+        .map(|held| held.id)
+        .collect()
+}
+
+/// A session whose lease is held, and the process that holds it when its
+/// lease file says so.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HeldSession {
+    pub id: CaudraId,
+    pub pid: Option<u32>,
+}
+
+/// Writes this process's ID into a lease file it holds the lock on, so a
+/// blocked migration can say which process to close.
+fn record_owner(mut file: &File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.write_all(format!("{}\n", process::id()).as_bytes())
+}
+
+/// The process ID a lease file names. Windows locks the whole file against
+/// other handles, so there a held lease reads as unknown.
+fn read_owner_pid(path: &Path) -> Option<u32> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let mut contents = String::new();
+    options
+        .open(path)
+        .ok()?
+        .take(MAX_PID_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    contents.trim().parse().ok()
 }
 
 fn process_leases() -> std::sync::MutexGuard<'static, HashSet<LeaseKey>> {
@@ -187,28 +234,32 @@ fn process_leases() -> std::sync::MutexGuard<'static, HashSet<LeaseKey>> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
-/// Session ids whose lease is held right now, by this process or any other.
+/// Sessions whose lease is held right now, by this process or any other.
 ///
 /// A lease file that still accepts an exclusive lock was left by a process that
 /// has since gone, so it names nothing that is open. Best effort throughout:
 /// this only ever explains a failure that already happened, and must not
 /// replace it with one of its own.
-pub(crate) fn held_session_ids(state_dir: &StateDir) -> Vec<CaudraId> {
+pub(crate) fn held_sessions(state_dir: &StateDir) -> Vec<HeldSession> {
     let Ok(entries) = fs::read_dir(state_dir.path()) else {
         return Vec::new();
     };
-    let mut ids = Vec::new();
+    let mut held = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(id) = name.to_str().and_then(lease_session_id) else {
             continue;
         };
-        if let Ok(None) = try_exclusive_state_lock(&entry.path(), OWNER_FILE_MODE) {
-            ids.push(id);
+        let path = entry.path();
+        if let Ok(None) = try_exclusive_state_lock(&path, OWNER_FILE_MODE) {
+            held.push(HeldSession {
+                id,
+                pid: read_owner_pid(&path),
+            });
         }
     }
-    ids.sort_by_key(CaudraId::to_string);
-    ids
+    held.sort_by_key(|session| session.id.to_string());
+    held
 }
 
 fn lease_session_id(name: &str) -> Option<CaudraId> {
@@ -258,9 +309,11 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
+    const OVERSIZED_PID: &str = "12345678901234567890";
     const CHILD_ENV: &str = "CAUDRA_SESSION_LEASE_TEST_CHILD";
     const CHILD_PATH_ENV: &str = "CAUDRA_SESSION_LEASE_TEST_PATH";
     const CHILD_ID_ENV: &str = "CAUDRA_SESSION_LEASE_TEST_ID";
@@ -388,6 +441,41 @@ mod tests {
         assert!(open_instances(&state_dir).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lease_records_its_process_id() {
+        let (_temp, state_dir) = state_dir();
+        let id = CaudraId::generate();
+        let _lease = SessionLease::acquire(&state_dir, id).unwrap();
+        let lock_path = state_dir
+            .path()
+            .join(format!("{ACTIVE_LEASE_PREFIX}{id}{ACTIVE_LEASE_SUFFIX}"));
+
+        assert_eq!(
+            fs::read_to_string(lock_path).unwrap(),
+            format!("{}\n", process::id())
+        );
+        assert_eq!(
+            held_sessions(&state_dir),
+            [HeldSession {
+                id,
+                pid: Some(process::id())
+            }]
+        );
+    }
+
+    #[test_case("123\n", Some(123) ; "recorded")]
+    #[test_case("", None ; "empty")]
+    #[test_case("abc", None ; "not_a_number")]
+    #[test_case(OVERSIZED_PID, None ; "oversized")]
+    fn owner_pid_is_read_from_the_lease_file(contents: &str, expected: Option<u32>) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(ACTIVE_LEASE_CATALOG);
+        fs::write(&path, contents).unwrap();
+
+        assert_eq!(read_owner_pid(&path), expected);
+    }
+
     #[test]
     fn lease_holder_process() {
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -443,6 +531,14 @@ mod tests {
             SessionLease::acquire(&state_dir, id),
             Err(SessionError::SessionInUse { id: actual }) if actual == id
         ));
+        #[cfg(unix)]
+        assert_eq!(
+            held_sessions(&state_dir),
+            [HeldSession {
+                id,
+                pid: Some(child.id())
+            }]
+        );
 
         child.kill().unwrap();
         child.wait().unwrap();

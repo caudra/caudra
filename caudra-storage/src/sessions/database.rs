@@ -57,7 +57,7 @@ mod source_code_rename;
 pub use source_code_rename::SOURCE_CODE_TOOL_RENAMES;
 
 use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
-use super::lease::{SessionLease, held_session_ids};
+use super::lease::{SessionLease, held_sessions};
 use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionListing,
@@ -184,6 +184,12 @@ const NO_NAMED_HOLDERS: &str =
     "another Caudra process, a storage command, or a reader has it open; close it and start again";
 const NAMED_HOLDERS: &str = "close these open sessions and start again:";
 const UNKNOWN_SESSION_TITLE: &str = "<untitled>";
+const PID_HEADER: &str = "PID";
+const SESSION_HEADER: &str = "SESSION";
+const TITLE_HEADER: &str = "TITLE";
+const UNKNOWN_PID: &str = "-";
+const COLUMN_GAP: &str = "  ";
+const TABLE_INDENT: &str = "  ";
 const MAX_HOLDER_TITLE_BYTES: usize = 60;
 const TITLE_ELLIPSIS: &str = "...";
 const MAX_BASE58_UUID_BYTES: usize = 22;
@@ -5221,19 +5227,51 @@ fn reject_unmigratable(version: i64) -> Result<(), SessionError> {
 /// inspector, or an older binary holds the same lock without ever taking one, so
 /// an empty list is reported as exactly that rather than as nothing being open.
 fn describe_migration_holders(state_dir: &StateDir, path: &Path) -> String {
-    let ids = held_session_ids(state_dir);
-    if ids.is_empty() {
+    let held = held_sessions(state_dir);
+    if held.is_empty() {
         return NO_NAMED_HOLDERS.to_owned();
     }
     let titles = session_titles(path);
-    let mut described = String::from(NAMED_HOLDERS);
-    for id in ids {
-        let title = titles
-            .get(&id)
-            .map_or(UNKNOWN_SESSION_TITLE, String::as_str);
-        described.push_str(&format!("\n  {id}  {title}"));
+    let rows: Vec<[String; 3]> = held
+        .into_iter()
+        .map(|session| {
+            [
+                session
+                    .pid
+                    .map_or_else(|| UNKNOWN_PID.to_owned(), |pid| pid.to_string()),
+                session.id.to_string(),
+                titles
+                    .get(&session.id)
+                    .map_or(UNKNOWN_SESSION_TITLE, String::as_str)
+                    .to_owned(),
+            ]
+        })
+        .collect();
+    holder_table(&rows)
+}
+
+/// [`NAMED_HOLDERS`] over a table of PID, session and title, one row per
+/// held session. The title comes last and unpadded, so no line ends in
+/// spaces.
+fn holder_table(rows: &[[String; 3]]) -> String {
+    let width = |column: usize, header: &str| {
+        rows.iter()
+            .map(|row| row[column].len())
+            .fold(header.len(), usize::max)
+    };
+    let (pid_width, session_width) = (width(0, PID_HEADER), width(1, SESSION_HEADER));
+    let line = |pid: &str, session: &str, title: &str| {
+        let line = format!(
+            "\n{TABLE_INDENT}{pid:<pid_width$}{COLUMN_GAP}{session:<session_width$}{COLUMN_GAP}{title}"
+        );
+        line.trim_end().to_owned()
+    };
+    let mut table = String::from(NAMED_HOLDERS);
+    table.push_str(&line(PID_HEADER, SESSION_HEADER, TITLE_HEADER));
+    for [pid, session, title] in rows {
+        table.push_str(&line(pid, session, title));
     }
-    described
+    table
 }
 
 /// [`describe_migration_holders`] for whatever holds the instance lock on the
@@ -14115,6 +14153,54 @@ CREATE TABLE subagents (
             )),
             "{BLOCKED_NAMES_SESSIONS}: {holders}"
         );
+        let mut lines = holders.lines().skip(1);
+        let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(
+            header,
+            [PID_HEADER, SESSION_HEADER, TITLE_HEADER],
+            "{holders}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>(),
+            [process::id().to_string(), id.to_string()],
+            "{BLOCKED_NAMES_SESSIONS}: {holders}"
+        );
+    }
+
+    const HOLDER_TABLE_MIXED: &str = "close these open sessions and start again:\n  \
+        PID    SESSION                 TITLE\n  \
+        48213  CgBUSiTqJofeMJp54oyev   Tango reply request\n  \
+        -      3vQp9uWmXkT7cZbN1aLdFe  <untitled>";
+    const HOLDER_TABLE_EMPTY_TITLE: &str = "close these open sessions and start again:\n  \
+        PID  SESSION                TITLE\n  \
+        7    CgBUSiTqJofeMJp54oyev";
+
+    #[test_case(
+        &[
+            ["48213", "CgBUSiTqJofeMJp54oyev", "Tango reply request"],
+            [UNKNOWN_PID, "3vQp9uWmXkT7cZbN1aLdFe", UNKNOWN_SESSION_TITLE],
+        ],
+        HOLDER_TABLE_MIXED ;
+        "known_and_unknown_pids"
+    )]
+    #[test_case(
+        &[["7", "CgBUSiTqJofeMJp54oyev", ""]],
+        HOLDER_TABLE_EMPTY_TITLE ;
+        "empty_title_leaves_no_trailing_space"
+    )]
+    fn holder_table_aligns_pid_and_session_columns(rows: &[[&str; 3]], expected: &str) {
+        let rows: Vec<[String; 3]> = rows.iter().map(|row| row.map(str::to_owned)).collect();
+
+        let table = holder_table(&rows);
+
+        assert_eq!(table, expected);
+        assert!(table.lines().all(|line| line == line.trim_end()), "{table}");
     }
 
     fn schema_objects(database: &SessionDatabase) -> Vec<(String, String, Option<String>)> {
