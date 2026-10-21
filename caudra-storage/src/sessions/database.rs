@@ -6871,7 +6871,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::process;
     use std::ptr::null_mut;
     use std::sync::Barrier;
