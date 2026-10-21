@@ -1303,7 +1303,7 @@ pub fn index(cli: &Cli, path: &str) -> Result<()> {
     let mut host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
 
     host.load_production_builtins(&config.plugins)
@@ -1698,7 +1698,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     let reg = ToolRegistry::global_arc();
     let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -1810,7 +1810,7 @@ pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool
     let reg = ToolRegistry::global_arc();
     let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
@@ -1936,7 +1936,7 @@ pub fn prompt(
     let reg = ToolRegistry::global_arc();
     let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;

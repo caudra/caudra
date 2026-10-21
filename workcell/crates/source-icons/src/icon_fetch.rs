@@ -104,7 +104,9 @@ impl SourceIconResolver {
         match result {
             Ok(response) => Ok(FetchOutcome::Response(Box::new(response))),
             Err(NetError::Cancelled) => Err(SourceIconError::Cancelled),
-            Err(NetError::Policy(_)) => Ok(FetchOutcome::DefinitiveFailure),
+            Err(NetError::Policy(_) | NetError::RedirectRefused { .. }) => {
+                Ok(FetchOutcome::DefinitiveFailure)
+            }
             Err(_) => Ok(FetchOutcome::TransientFailure),
         }
     }

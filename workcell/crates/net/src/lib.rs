@@ -15,6 +15,7 @@ mod dns;
 mod http_client;
 mod http_error;
 mod policy;
+mod private;
 mod proxy;
 mod redirect;
 mod retry;
@@ -36,6 +37,7 @@ pub use http_client::{
 };
 pub use http_error::NetError;
 pub use policy::{OperatorConfiguredPolicy, UrlPolicy, UrlPolicyError};
+pub use private::{PrivateAllowlist, PrivateHost, PrivateNetwork, SharedAllowlist};
 pub use proxy::{ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint, ProxyRoute};
 pub use retry::{RetryPolicy, retry_after_delay};
 pub use transport::{

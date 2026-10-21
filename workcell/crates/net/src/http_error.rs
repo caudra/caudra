@@ -1,4 +1,5 @@
 use thiserror::Error;
+use url::Url;
 
 use crate::{DnsError, MAX_REQUEST_BODY_BYTES, TransportError, UrlPolicyError};
 
@@ -6,9 +7,17 @@ use crate::{DnsError, MAX_REQUEST_BODY_BYTES, TransportError, UrlPolicyError};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// URL policy rejected an initial or redirect target.
+    /// URL policy rejected the requested target.
     #[error(transparent)]
     Policy(#[from] UrlPolicyError),
+    /// URL policy rejected the target a redirect led to.
+    #[error("{source}")]
+    RedirectRefused {
+        /// The refused redirect target.
+        location: Url,
+        /// Why it was refused.
+        source: UrlPolicyError,
+    },
     /// The request body exceeds [`MAX_REQUEST_BODY_BYTES`]. Nothing was sent.
     #[error(
         "request body of {length} bytes exceeds the {limit}-byte limit",

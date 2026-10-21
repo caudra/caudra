@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::num::{NonZeroU32, ParseIntError};
 use std::ops::Range;
 use std::path::Path;
@@ -16,6 +16,7 @@ use workcell_tool_contract::shell_env::{EnvPatternError, ShellEnvironmentSelecti
 
 use crate::config_version::ConfigVersion;
 use crate::migration::{self, ConfigFormat, MigrationError};
+use crate::network::parse_cidr;
 use crate::{ConfigField, ConfigValue};
 
 pub mod persistence;
@@ -277,27 +278,12 @@ text_type!(CidrRule);
 
 impl CidrRule {
     pub fn parse(value: &str) -> Result<Self, SandboxError> {
-        let invalid = || {
+        let (network, prefix) = parse_cidr(value).ok_or_else(|| {
             field(
                 "cidrs",
                 "expected an IPv4 or IPv6 network with a valid prefix length",
             )
-        };
-        let (address, prefix) = value.split_once('/').ok_or_else(invalid)?;
-        if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid());
-        }
-        let prefix = prefix.parse::<u32>().map_err(|_| invalid())?;
-        let ip = address.parse::<IpAddr>().map_err(|_| invalid())?;
-        let network = match ip {
-            IpAddr::V4(ip) if prefix <= u32::BITS => IpAddr::V4(Ipv4Addr::from(
-                u32::from(ip) & u32::MAX.checked_shl(u32::BITS - prefix).unwrap_or(0),
-            )),
-            IpAddr::V6(ip) if prefix <= u128::BITS => IpAddr::V6(Ipv6Addr::from(
-                u128::from(ip) & u128::MAX.checked_shl(u128::BITS - prefix).unwrap_or(0),
-            )),
-            _ => return Err(invalid()),
-        };
+        })?;
         Ok(Self(format!("{network}/{prefix}")))
     }
 }

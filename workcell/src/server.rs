@@ -1701,7 +1701,10 @@ impl WorkcellServer {
                     .ok_or_else(unavailable)?
                     .prepare_webfetch_operation(input)
                     .map_err(|error| {
-                        let code = if matches!(error, WebfetchError::Denied(_)) {
+                        let code = if matches!(
+                            error,
+                            WebfetchError::Denied(_) | WebfetchError::PrivateTarget { .. }
+                        ) {
                             error.code()
                         } else {
                             WEB_PREPARATION_FAILED_CODE

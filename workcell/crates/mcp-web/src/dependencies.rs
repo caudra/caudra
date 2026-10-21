@@ -4,7 +4,9 @@ mod icons;
 
 use std::sync::Arc;
 
-use workcell_net::{HttpClient, OperatorConfiguredPolicy, ProxyConfiguration, UrlPolicy};
+use workcell_net::{
+    HttpClient, OperatorConfiguredPolicy, ProxyConfiguration, SharedAllowlist, UrlPolicy,
+};
 use workcell_source_icons::SourceIconResolver;
 
 use crate::pdf::{NativePdfExtractor, PdfExtractor};
@@ -24,6 +26,7 @@ pub struct WebToolDependencies {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) pdf: Arc<dyn PdfExtractor>,
     pub(crate) webfetch_policy: UrlPolicy,
+    pub(crate) private_allowlist: SharedAllowlist,
     pub(crate) source_icons_enabled: bool,
 }
 
@@ -59,6 +62,7 @@ impl WebToolDependencies {
             clock: Arc::new(SystemClock),
             pdf: Arc::new(NativePdfExtractor),
             webfetch_policy: UrlPolicy::PublicInternet,
+            private_allowlist: SharedAllowlist::default(),
             source_icons_enabled,
         }
     }
@@ -76,6 +80,7 @@ impl WebToolDependencies {
             clock,
             pdf,
             webfetch_policy: UrlPolicy::PublicInternet,
+            private_allowlist: SharedAllowlist::default(),
             // Supplying an icon provider is an explicit opt-in for alternate hosts and tests.
             source_icons_enabled: true,
         }
@@ -90,6 +95,14 @@ impl WebToolDependencies {
             allow_special_use_names: true,
             allow_url_credentials: false,
         });
+        self
+    }
+
+    /// Let `webfetch` reach the private targets `allowlist` holds when each
+    /// fetch starts. The host replaces the list as its configuration changes.
+    #[must_use]
+    pub fn with_private_allowlist(mut self, allowlist: SharedAllowlist) -> Self {
+        self.private_allowlist = allowlist;
         self
     }
 

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -130,6 +131,7 @@ async fn search(
             max_redirects: 5,
             max_body_bytes: MAX_RESPONSE_BYTES,
             cancellation: cancellation.clone(),
+            private: Arc::default(),
         })
         .await
         .map_err(|error| match transport_error(error, timeout) {

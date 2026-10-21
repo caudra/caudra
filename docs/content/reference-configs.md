@@ -18,7 +18,7 @@ description: "Every TOML config file in full, with each key commented out and de
 # brackets, such as <string>, marks a setting that has no default. The global
 # file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
 # Windows. A project .caudra/caudra.toml takes the same settings, except
-# [experimental], [automations], [agent.shell_env], and the ones marked
+# [experimental], [automations], [agent.shell_env], [web], and the ones marked
 # global-only.
 #
 # caudra.toml holds the settings only you write. Other files hold what Caudra
@@ -1220,6 +1220,22 @@ version = 3
 # Retries for transient provider errors during an autopilot engagement.
 # Type: u32, 0 to 20.
 # error_retries = 5
+
+[web]
+# Private targets `webfetch` may reach in local sessions, besides the public
+# internet. A redirect may lead to a listed target only from another one. Only
+# the global caudra.toml may hold this table, and a change applies at once.
+
+# Exact `HOST:PORT` targets on loopback or private networks that `webfetch` may
+# reach, such as `"localhost:3000"` or `"[fd7a::1]:80"`. The port is required.
+# Type: string[].
+# allow_private_hosts = []
+
+# Networks `webfetch` may reach on any port: `loopback`, `private`, `cgnat`,
+# `tailscale`, or a CIDR such as `"10.20.0.0/16"`. Every private address a name
+# resolves to must be inside one.
+# Type: string[].
+# allow_private_networks = []
 
 [plugins]
 # Bundled tools are on by default. Turn one off with `enabled = false` in its

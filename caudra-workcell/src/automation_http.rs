@@ -214,7 +214,10 @@ fn answer(response: BoundedResponse) -> HttpAnswer {
 /// `Location`, whose path or query may carry a secret, gives way to a fixed message.
 fn http_error(error: &NetError, timeout: Duration) -> HttpError {
     match error {
-        NetError::Policy(refused) => HttpError::new(HttpErrorKind::Refused, refusal(refused)),
+        NetError::Policy(refused)
+        | NetError::RedirectRefused {
+            source: refused, ..
+        } => HttpError::new(HttpErrorKind::Refused, refusal(refused)),
         NetError::Proxy(_) => HttpError::new(HttpErrorKind::Refused, PROXY_REFUSED),
         NetError::ReservedHeader { .. } | NetError::RequestBodyTooLarge { .. } => {
             HttpError::new(HttpErrorKind::InvalidArgument, error.to_string())

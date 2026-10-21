@@ -728,7 +728,7 @@ fn build_stack(
     } else {
         warnings.extend(notices);
     }
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
     skill::refresh(ToolRegistry::global());
 

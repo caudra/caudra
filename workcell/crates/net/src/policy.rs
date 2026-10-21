@@ -59,6 +59,15 @@ pub enum UrlPolicyError {
     },
 }
 
+impl UrlPolicyError {
+    /// Whether the target was refused only for being private or special-use,
+    /// which an operator allowlist can change.
+    #[must_use]
+    pub const fn is_non_public_target(&self) -> bool {
+        matches!(self, Self::SpecialUseHostname(_) | Self::NonPublicIp { .. })
+    }
+}
+
 impl UrlPolicy {
     /// Parse an absolute URL, or resolve a relative value against `base`, then
     /// enforce scheme, credential, and syntactic host policy.
@@ -67,17 +76,22 @@ impl UrlPolicy {
     /// checks is essential: a harmless-looking domain can resolve to loopback,
     /// and a public first hop can redirect to a private target.
     pub fn parse_url(&self, value: &str, base: Option<&Url>) -> Result<Url, UrlPolicyError> {
+        let url = self.parse_syntax(value, base)?;
+        self.validate_url(&url)?;
+        Ok(url)
+    }
+
+    /// Parse or resolve `value` and refuse credentials in its raw form, leaving
+    /// the host for a caller that validates it with a private allowlist.
+    pub(crate) fn parse_syntax(&self, value: &str, base: Option<&Url>) -> Result<Url, UrlPolicyError> {
         if raw_value_has_userinfo(value) && !self.operator_options().allow_url_credentials {
             return Err(UrlPolicyError::CredentialsNotAllowed);
         }
-        let url = match base {
-            Some(base) => base
-                .join(value)
-                .map_err(|_| UrlPolicyError::InvalidUrl(value.to_owned()))?,
-            None => Url::parse(value).map_err(|_| UrlPolicyError::InvalidUrl(value.to_owned()))?,
-        };
-        self.validate_url(&url)?;
-        Ok(url)
+        match base {
+            Some(base) => base.join(value),
+            None => Url::parse(value),
+        }
+        .map_err(|_| UrlPolicyError::InvalidUrl(value.to_owned()))
     }
 
     /// Validate an already parsed URL without performing DNS I/O.
@@ -135,7 +149,7 @@ impl UrlPolicy {
         }
     }
 
-    const fn operator_options(self) -> OperatorConfiguredPolicy {
+    pub(crate) const fn operator_options(self) -> OperatorConfiguredPolicy {
         match self {
             Self::PublicInternet => OperatorConfiguredPolicy {
                 allow_non_public_ips: false,

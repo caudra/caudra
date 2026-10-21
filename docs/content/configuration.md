@@ -117,7 +117,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -810,6 +810,36 @@ Only the permission question set currently supports a user-global file override:
 | `error_retries` | u32 | `5` | 0 | 20 | Retries for transient provider errors during an autopilot engagement |
 
 [Autopilot](/docs/autopilot/) is experimental and needs `autopilot = true` under [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one.
+
+### `[web]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow_private_hosts` | string[] | `[]` | Exact `HOST:PORT` targets on loopback or private networks that `webfetch` may reach, such as `"localhost:3000"` or `"[fd7a::1]:80"`. The port is required |
+| `allow_private_networks` | string[] | `[]` | Networks `webfetch` may reach on any port: `loopback`, `private`, `cgnat`, `tailscale`, or a CIDR such as `"10.20.0.0/16"`. Every private address a name resolves to must be inside one |
+
+`webfetch` reaches only the public internet unless this table names private targets as well. It applies to local sessions. A [remote workspace](/docs/remote-workspaces/) or a [sandbox](/docs/sandboxes/) keeps the public-internet rule. Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot point the model at your network.
+
+```toml
+[web]
+allow_private_hosts = ["100.64.0.2:8787", "localhost:3000", "[fd7a::1]:80"]
+allow_private_networks = ["tailscale", "10.20.0.0/16"]
+```
+
+An `allow_private_hosts` entry admits one host name or address on one port, whatever the name resolves to. An `allow_private_networks` entry admits any port, and a name only when every address it resolves to is public or inside a listed network. It takes a CIDR or one of these names:
+
+| Name | Addresses |
+|------|-----------|
+| `loopback` | `127.0.0.0/8` and `::1` |
+| `private` | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `fc00::/7` |
+| `cgnat` | `100.64.0.0/10` |
+| `tailscale` | `100.64.0.0/10` and `fd7a:115c:a1e0::/48` |
+
+No name covers link-local addresses, which hold the cloud metadata service at `169.254.169.254`. A CIDR can still name them. No entry admits an unspecified or a multicast address.
+
+An `http` URL to a listed target stays `http`, because a local server often has no certificate. Other `http` URLs are still upgraded to `https`. A redirect may lead to a listed target only from a URL the list admitted too, so a public page cannot send `webfetch` into your network. When a local `webfetch` refuses a private target, its error names the `HOST:PORT` to add to `allow_private_hosts` and links to this section, so the model can tell you what to change. The hint is the same whether or not this table exists.
+
+With a proxy set in `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`, a request to a listed target goes through the proxy unless `NO_PROXY` names its host. The proxy then resolves the name, so a special-use name such as `localhost` passes only through an `allow_private_hosts` entry. Each fetch reads the list once, when it starts, and an edit applies to the next fetch in every open session. See [Hot reload](#hot-reload).
 
 ## Plugins
 

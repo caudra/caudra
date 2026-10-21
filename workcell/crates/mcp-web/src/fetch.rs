@@ -4,11 +4,13 @@ mod input;
 mod output;
 mod pdf_response;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use workcell_source_icons::SourceIconError;
 
 use crate::WebToolDependencies;
@@ -34,6 +36,15 @@ pub enum WebfetchError {
     /// Network safety rules or the outbound proxy refused the target.
     #[error("{0}")]
     Denied(String),
+    /// Network safety rules refused a private or special-use target, which a
+    /// private allowlist could admit. `url` is the refused target, and
+    /// `redirected` says a redirect led to it.
+    #[error("{message}")]
+    PrivateTarget {
+        message: String,
+        url: Url,
+        redirected: bool,
+    },
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -49,7 +60,7 @@ impl WebfetchError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Aborted => "cancelled",
             Self::TimedOut(_) => "timed_out",
-            Self::Denied(_) => "web_request_denied",
+            Self::Denied(_) | Self::PrivateTarget { .. } => "web_request_denied",
             Self::NotFound(_) => "not_found",
             Self::Operation(_) => "operation_failed",
         }
@@ -74,10 +85,12 @@ pub(crate) async fn execute(
     // Webfetch timeout is one total deadline for network transfer and primary
     // HTML/PDF parsing. Optional icon decoration is skipped at that deadline.
     let deadline = Instant::now() + timeout;
-    input
-        .policy
-        .validate_url(&input.url)
-        .map_err(input::policy_error)?;
+    // One read of the list covers the whole fetch, so an entry removed after
+    // the call was prepared or approved is already refused here.
+    let private = dependencies.private_allowlist.current();
+    private
+        .validate_url(input.policy, &input.url)
+        .map_err(|error| input::policy_error(error, &input.requested, false))?;
     let response = dependencies
         .http
         .execute(WebHttpRequest {
@@ -92,13 +105,19 @@ pub(crate) async fn execute(
             // signature can be inspected.
             max_body_bytes: input.max_body_bytes,
             cancellation: cancellation.clone(),
+            private: Arc::clone(&private),
         })
         .await
-        .map_err(|error| map_http_error(error, input.timeout_seconds))?;
-    input
-        .policy
-        .validate_url(&response.final_url)
-        .map_err(input::policy_error)?;
+        .map_err(|error| map_http_error(error, &input))?;
+    private
+        .validate_url(input.policy, &response.final_url)
+        .map_err(|error| {
+            input::policy_error(
+                error,
+                &response.final_url,
+                response.final_url != input.url,
+            )
+        })?;
     if !response.status.is_success() {
         let message = format!(
             "webfetch returned {} {}",
@@ -209,13 +228,16 @@ pub(crate) async fn execute(
     })
 }
 
-fn map_http_error(error: WebHttpError, timeout: u64) -> WebfetchError {
+fn map_http_error(error: WebHttpError, request: &input::NormalizedWebfetchInput) -> WebfetchError {
     match error {
         WebHttpError::Cancelled => WebfetchError::Aborted,
-        WebHttpError::Timeout => WebfetchError::timed_out(timeout),
-        WebHttpError::Rejected(message) => {
-            WebfetchError::Denied(format!("URL is blocked by network safety rules: {message}"))
-        }
+        WebHttpError::Timeout => WebfetchError::timed_out(request.timeout_seconds),
+        WebHttpError::Rejected(message) => WebfetchError::Denied(input::blocked(message)),
+        WebHttpError::NonPublicTarget { message, redirect } => WebfetchError::PrivateTarget {
+            message: input::blocked(message),
+            redirected: redirect.is_some(),
+            url: redirect.unwrap_or_else(|| request.requested.clone()),
+        },
         WebHttpError::ProxyRejected => WebfetchError::Denied(
             "The outbound proxy refused this request; the target is not permitted.".to_owned(),
         ),

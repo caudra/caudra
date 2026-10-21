@@ -50,8 +50,8 @@ const DECISION_ENGINE: &str = "decision engine";
 const DECISION_ENGINE_KEPT: &str = "keeping the running decision engine";
 const DECISIONS_TURNED_OFF: &str =
     "the active decision endpoint is gone from providers.toml, so decisions are off";
-/// The tables every session screens with as soon as the file is saved.
-const NOW_TABLES: [&str; 1] = ["decisions"];
+/// The tables every session screens or fetches with as soon as the file is saved.
+const NOW_TABLES: [&str; 2] = ["decisions", "web"];
 /// Keys that apply as soon as the file is saved, in a table whose other keys wait. A key
 /// may be a dotted path into the table.
 const NOW_KEYS: [(&str, &str); 2] = [("ui", "show_decisions"), ("plugins", "skill.pstack")];
@@ -241,7 +241,7 @@ impl SettingsTables {
     }
 }
 
-/// When each changed key applies, by name only: `[decisions]` and `ui.show_decisions` at
+/// When each changed key applies, by name only: `[decisions]`, `[web]` and `ui.show_decisions` at
 /// once, `[agent]` and `[autopilot]` from the next turn, `[experimental]` after a restart,
 /// everything else after `/reload`. `None` when no key changed, as for an edit to a comment.
 fn settings_note(changed: &BTreeMap<String, bool>) -> Option<String> {
@@ -1024,6 +1024,16 @@ mod tests {
             format!(
                 "[decisions]{LIST_SEPARATOR}ui.show_decisions {NOW_SUFFIX}{LIST_SEPARATOR}[agent] {LIVE_SUFFIX}{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}"
             )
+        );
+    }
+
+    #[test]
+    fn web_settings_apply_at_once() {
+        let changed = BTreeMap::from([("ui".to_owned(), true), ("web".to_owned(), true)]);
+
+        assert_eq!(
+            settings_note(&changed).unwrap(),
+            format!("[web] {NOW_SUFFIX}{LIST_SEPARATOR}[ui] {RELOAD_SUFFIX}")
         );
     }
 

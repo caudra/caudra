@@ -49,8 +49,8 @@ pub use types::{
 };
 // Re-exported so a host configuring outbound egress needs only this crate.
 pub use workcell_net::{
-    OperatorConfiguredPolicy, ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint,
-    ProxyRoute, UrlPolicy,
+    OperatorConfiguredPolicy, PrivateAllowlist, PrivateHost, PrivateNetwork, ProxyConfiguration,
+    ProxyConfigurationError, ProxyEndpoint, ProxyRoute, SharedAllowlist, UrlPolicy,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 
