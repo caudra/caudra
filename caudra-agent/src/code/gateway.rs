@@ -21,6 +21,7 @@ use serde_json::Value;
 use super::args::{bind, text};
 use super::decide::DecisionsModule;
 use super::history::HistoryModule;
+use super::pstack::PstackModule;
 use super::hosted::HostedCall;
 use super::module::{
     AbsentModule, CallFailure, HostCallPlan, HostModule, ModuleDoc, Prepared, ToolCallPlan,
@@ -169,7 +170,7 @@ async fn modules(ctx: &ToolContext) -> Option<Vec<Arc<dyn HostModule>>> {
         }
         None => Arc::new(AbsentModule::new(&MCP_DOC, NO_MCP)),
     };
-    Some(vec![
+    let mut modules: Vec<Arc<dyn HostModule>> = vec![
         Arc::new(HistoryModule::for_session(ctx)),
         mcp,
         Arc::new(DecisionsModule::new(ctx.permissions.decisions())),
@@ -177,7 +178,11 @@ async fn modules(ctx: &ToolContext) -> Option<Vec<Arc<dyn HostModule>>> {
         Arc::new(ToolModule::host(ctx)),
         Arc::new(ToolModule::workflow(ctx)),
         Arc::new(ToolModule::automation(ctx)),
-    ])
+    ];
+    if crate::pstack::enabled() {
+        modules.push(Arc::new(PstackModule::for_session(ctx)));
+    }
+    Some(modules)
 }
 
 fn note_text(note: ReplNote) -> String {

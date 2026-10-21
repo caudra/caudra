@@ -6311,7 +6311,10 @@ impl App {
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
             "/workbench" => self.run_builtin(BuiltinAction::Workbench),
-            name if name.starts_with("/project:") || name.starts_with("/user:") => {
+            name if name.starts_with("/project:")
+                || name.starts_with("/user:")
+                || self.command_palette.find_custom_command(name).is_some() =>
+            {
                 self.execute_custom_command(name, &cmd.args)
             }
             name if self.command_palette.find_mcp_prompt(name).is_some() => {

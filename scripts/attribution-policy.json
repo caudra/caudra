@@ -31,6 +31,24 @@
         "supplements/THIRD_PARTY_LICENSES/SublimeRhai.txt"
       ]
     },
+    "caudra-pstack@0.2.0-preview.11": {
+      "expression": "Apache-2.0 AND MIT",
+      "reason": "The Caudra glue, library, and adapter remain Apache-2.0. The embedded pstack (Lauren Tan) and cursor-team-kit skills (Cursor) copied from cursor/plugins, and the Rust ports of pstack's scripts, remain MIT. Preserve both upstream licenses. This aggregate expression does not relicense individual files.",
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/Pstack.txt",
+          "sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e"
+        },
+        {
+          "path": "THIRD_PARTY_LICENSES/CursorTeamKit.txt",
+          "sha256": "702f5f331b56aff0e33d8c7826df5202559f894145eb70355c6477b55b5bb8a0"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/Pstack.txt",
+        "supplements/THIRD_PARTY_LICENSES/CursorTeamKit.txt"
+      ]
+    },
     "rmcp@3.5.1": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The published crate omits LICENSE. Its .cargo_vcs_info.json pins upstream revision 79437f291b2c44053d00dcd5db969fd0cca7c887, whose complete LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",

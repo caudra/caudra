@@ -33,6 +33,7 @@ A module is a namespace of calls that reach beyond the interpreter. Each call is
 | `host` | `environment`: what the machine commands run on offers |
 | `workflow` | `list`, `validate`, `start`, `status`, `inspect`, `history`, `pause`, `resume`, `stop` |
 | `automation` | `list`, `validate`, `history` |
+| `pstack` | `log`, `check_plan`, `worktree_audit`, `watch_pr`, `orch`: [pstack's scripts](#pstack-scripts), only while the pstack skill is on |
 
 `help` is the one other name a snippet starts with. The `code` description carries one line per module, and `help` loads the rest when the model needs it:
 
@@ -246,6 +247,27 @@ A direct call of one of these tools, on its own or inside `batch`, fails with th
 
 `image.generate()` needs a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan. It saves one PNG per call and never overwrites a local file, so read the returned `path`. `help("image.generate")` lists the size rules and how to pass reference images.
 
+## pstack scripts
+
+With the [pstack skill](/docs/skills/#pstack) on, the scripts its skills run are calls in the `pstack` module. Upstream wrote them for Bun and Bash, and Caudra carries Rust ports, so they need neither. Each call takes the arguments the upstream command line takes, as strings, and returns `{"code", "stdout", "stderr"}`. A nonzero `code` is the script's own verdict, such as a plan that fails its checks, and the snippet decides what to do with it.
+
+```python
+r = await pstack.check_plan("plans/feature.md")
+r["code"] == 0
+```
+
+| Call | Upstream script | Does |
+|---|---|---|
+| `pstack.log(logfile, phase, decision, why, evidence, result)` | `log.sh` | Appends one tab-separated row to a work log, writing the header first |
+| `pstack.check_plan(plan_md)` | `check-plan.mjs` | Checks a plan's structure and its verification boxes |
+| `pstack.worktree_audit("-b", "origin/main", repo)` | `worktree-audit.sh` | Lists every worktree with its branch state. `LAST_CHAT` names the newest Caudra session that worked there |
+| `pstack.watch_pr("--pr", "123", "--status-only")` | `watch-pr` | Reports a pull request's checks and reviews through the GitHub CLI, `gh`. Without `--status-only` it polls until a verdict, so give the run a `timeoutSec` that covers the wait |
+| `pstack.orch("--store", dir, ...)` | `orch.ts` | Reads and writes the orchestrate store in the same file format. Every call names its store |
+
+`pstack.watch_pr("--help")` and `pstack.orch("--help")` list every option. A long-running call shows its latest line on the card. To watch a pull request without holding the turn, arm the `pstack-watch-pr` [automation](/docs/automations/) that `pstack/adapter` describes.
+
+The scripts run on this machine. In a [remote workspace](/docs/remote-workspaces/) the calls raise `RuntimeError`, and the agent follows the skill's steps with `shell` instead.
+
 ## Permissions
 
 Starting a run never asks: the `code` tool is allowed by default, because a snippet on its own reaches nothing. What the snippet calls is reviewed call by call:
@@ -258,6 +280,8 @@ Starting a run never asks: the `code` tool is allowed by default, because a snip
 | `history` in another project, or `scope="all"` | Asks, as [Privacy and permissions](#privacy-and-permissions) describes |
 | `decisions.decide()`, `decisions.rerank()` | Allowed |
 | `image`, `host`, `workflow`, `automation` | Under the rules of the tool the call runs, such as `image_generate`. The prompt shows the call as the snippet made it |
+| `pstack.log()`, `pstack.orch()` | Asks, scoped to `pstack:<script>`. Plan mode refuses them, because they write files |
+| `pstack.check_plan()`, `pstack.worktree_audit()`, `pstack.watch_pr()` | Asks, scoped to `pstack:<script>` |
 | `help()`, `mcp.search()`, `mcp.servers()` | Allowed |
 
 A deny rule for `code` itself blocks every run. `code` cannot be disabled with `disabled_tools` or a profile, because the modules live in it. Turn off a module's [tool group](/docs/system-prompts/#tool-groups) instead.

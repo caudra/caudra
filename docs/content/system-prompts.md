@@ -215,6 +215,17 @@ The effective profile and mode, and any `model` or `thinking` the call set, are 
 
 The task API no longer accepts `subagent_type` or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Put a standing model choice in profile frontmatter and remove `plugins.task.allow_model` from your `caudra.toml` or `init.lua`.
 
+### Built-in task profiles
+
+With the [pstack skill](/docs/skills/#pstack) on, two more profiles appear in the task profile list:
+
+| Profile | Does |
+|---|---|
+| `pstack-poteto-agent` | Writes code or runs a helper step that a poteto-mode run delegates. It loads `pstack/adapter` and `pstack/poteto-mode` before any work |
+| `pstack-comment-sicko` | Deletes comments in a diff or a set of files, apart from a short list of exceptions such as license headers and API docs, and marks code that needs a rename or refactor instead. It never writes application code. It loads `pstack/adapter` before any work |
+
+Their text is pstack's own agent files, with a first line that sends the agent to the adapter. A file of the same name in `system-prompts/` replaces one, even a file that fails to load. With `pstack = false` they are gone, and a task that names one fails as a missing profile does.
+
 ## Select a profile
 
 Set the default in `caudra.toml`:

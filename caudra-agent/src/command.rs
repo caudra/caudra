@@ -14,7 +14,8 @@ pub(crate) const PROJECT_COMMAND_DIRS: &[&str] =
 pub(crate) const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] =
     &[".claude/commands", ".config/opencode/commands"];
 pub(crate) const COMMANDS_SUBDIR: &str = "commands";
-const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+pub(crate) const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+const BUILTIN_SOURCE: &str = "builtin";
 
 #[derive(Debug, Default, Deserialize)]
 struct Frontmatter {
@@ -58,6 +59,8 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
 pub enum CommandScope {
     Project,
     User,
+    /// Shipped with Caudra under its own `/<scope>:` prefix, such as `/pstack:`.
+    Builtin(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +79,7 @@ pub struct CustomCommand {
 pub enum CommandSource {
     Local(PathBuf),
     Remote(Box<RemoteAssetIdentity>),
+    Builtin,
 }
 
 impl std::fmt::Display for CommandSource {
@@ -83,6 +87,7 @@ impl std::fmt::Display for CommandSource {
         match self {
             Self::Local(path) => path.display().fmt(formatter),
             Self::Remote(source) => formatter.write_str(&source.source_label()),
+            Self::Builtin => formatter.write_str(BUILTIN_SOURCE),
         }
     }
 }
@@ -90,10 +95,11 @@ impl std::fmt::Display for CommandSource {
 impl CustomCommand {
     pub fn display_name(&self) -> String {
         let prefix = match self.scope {
-            CommandScope::Project => "/project",
-            CommandScope::User => "/user",
+            CommandScope::Project => "project",
+            CommandScope::User => "user",
+            CommandScope::Builtin(scope) => scope,
         };
-        format!("{prefix}:{}", self.name)
+        format!("/{prefix}:{}", self.name)
     }
 
     pub fn has_args(&self) -> bool {
@@ -105,22 +111,28 @@ impl CustomCommand {
     }
 }
 
+/// Builtin commands follow the discovered ones: their own prefix keeps them
+/// apart, so a user command of the same name never shadows one.
 pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
-    discover_commands_inner(
+    let mut commands = discover_commands_inner(
         cwd,
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
-    )
+    );
+    commands.extend(crate::pstack::commands());
+    commands
 }
 
 pub fn discover_remote_commands(
     context: &crate::remote_project_context::RemoteProjectContext,
 ) -> Vec<CustomCommand> {
-    discover_remote_commands_in(
+    let mut commands = discover_remote_commands_in(
         context.commands(),
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
-    )
+    );
+    commands.extend(crate::pstack::commands());
+    commands
 }
 
 fn discover_remote_commands_in(

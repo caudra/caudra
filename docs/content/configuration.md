@@ -117,7 +117,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions) and `ui.show_decisions` at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -849,6 +849,7 @@ enabled = false
 | `workflow_dev` | boolean | `true` | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
 | `automation_dev` | boolean | `true` | Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`. |
 | `docs` | boolean | `true` | Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time. |
+| `pstack` | boolean | `false` | Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`. |
 
 ### `plugins.task`
 

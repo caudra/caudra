@@ -432,6 +432,12 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
+        "With the [pstack skill](/docs/skills/#pstack) on, the palette also lists a `/pstack:<name>` command for each pstack skill you run directly. `/pstack:poteto-mode fix the flaky test` tells the agent to load `pstack/poteto-mode` and follow it for that request. Their own prefix keeps them apart, so a command of yours with the same name never replaces one."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
         "Skip all of the above with `--no-commands` (see [CLI](/docs/cli/))."
     )
     .unwrap();

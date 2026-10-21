@@ -97,6 +97,17 @@ pub fn install_builtin_skill(skill: BuiltinSkill) {
     });
 }
 
+/// How a settings reload turns a builtin back off.
+pub fn remove_builtin_skill(name: &str) {
+    BUILTINS.rcu(|installed| {
+        installed
+            .iter()
+            .filter(|existing| existing.name != name)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+}
+
 fn installed_builtins() -> Arc<Vec<Arc<BuiltinSkill>>> {
     BUILTINS.load_full()
 }

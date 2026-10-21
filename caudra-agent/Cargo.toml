@@ -17,6 +17,7 @@ caudra-config = { workspace = true }
 caudra-decision = { workspace = true }
 caudra-diff = { workspace = true }
 caudra-otel = { workspace = true }
+caudra-pstack = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -56,6 +56,7 @@ pub mod editable_queue;
 pub mod patch;
 pub mod permissions;
 pub mod prompt;
+pub mod pstack;
 pub mod remote_project_context;
 pub mod scratch;
 pub mod session_fork;

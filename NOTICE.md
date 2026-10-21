@@ -20,6 +20,8 @@ Third-party material remains under its own MIT, Apache-2.0, or other applicable 
 
 The built-in `deep-research` workflow (`caudra-workflow/builtins/deep-research.rhai`) is adapted from Grok Build, copyright (c) 2023-2026 SpaceXAI, licensed under the Apache License, Version 2.0. The license text is in `THIRD_PARTY_LICENSES/GrokBuild.txt`. The workflow engine, journal, and runtime in `caudra-workflow` and `caudra-agent` are independent Caudra work that follows the Grok Build design.
 
+The bundled pstack (`caudra-pstack/upstream/pstack/`) is copied from [cursor/plugins](https://github.com/cursor/plugins) at the revision recorded in `caudra-pstack/upstream/upstream.json`, copyright (c) 2026 Lauren Tan, licensed under the MIT License. See `THIRD_PARTY_LICENSES/Pstack.txt`. The `deslop`, `control-cli`, and `control-ui` skills (`caudra-pstack/upstream/cursor-team-kit/`) are copied from the same revision's cursor-team-kit, copyright (c) 2026 Cursor, licensed under the MIT License. See `THIRD_PARTY_LICENSES/CursorTeamKit.txt`. Both keep their license beside the copy. The only change to the copied files rewrites relative links to files left out of the copy as links to the upstream repository. The Rust ports of pstack's scripts in `caudra-pstack/src/scripts/` follow the upstream scripts' behaviour and remain under the same MIT terms.
+
 The bundled Monty interpreter is copyright (c) Pydantic Services Inc., licensed under the MIT License. See `THIRD_PARTY_LICENSES/Monty.txt`.
 
 The file, shell, web, code, and Python tools are built on [Workcell](https://github.com/caudra/caudra/tree/main/workcell), copyright The Workcell MCP authors, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/Workcell.txt`.

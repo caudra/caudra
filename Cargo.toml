@@ -83,6 +83,7 @@ members = [
   "caudra-otel",
   "caudra-providers",
   "caudra-proxy",
+  "caudra-pstack",
   "caudra-script",
   "caudra-storage",
   "caudra-config-macro",
@@ -139,6 +140,7 @@ caudra-docs = { path = "caudra-docs" }
 caudra-interpreter = { path = "caudra-interpreter" }
 caudra-providers = { path = "caudra-providers" }
 caudra-proxy = { path = "caudra-proxy" }
+caudra-pstack = { path = "caudra-pstack" }
 caudra-script = { path = "caudra-script", default-features = false }
 caudra-automation = { path = "caudra-automation" }
 caudra-storage = { path = "caudra-storage" }

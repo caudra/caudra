@@ -1,0 +1,24 @@
+[package]
+name = "caudra-pstack"
+description = "The bundled pstack: its skills as addressable pages, the Cursor-to-Caudra adapter, and Rust ports of its scripts."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+include_dir = { workspace = true }
+jiff = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+caudra-automation = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+test-case = { workspace = true }

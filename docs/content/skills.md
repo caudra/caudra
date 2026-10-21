@@ -108,6 +108,29 @@ The agent validates the script with [`automation.validate()`](/docs/code/#tools-
 
 It needs `experimental.lua_plugins`. With Lua on, it is still off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
 
+### pstack
+
+It is off by default. [pstack](https://github.com/cursor/plugins/tree/main/pstack) is Lauren Tan's set of engineering skills for Cursor, bundled under its MIT license with the `deslop`, `control-cli` and `control-ui` skills from Cursor's team kit. It is opinionated about how work is planned, reviewed and shipped, so turn it on only if you want to work that way. `pstack = true` adds four things:
+
+- The `pstack` skill, one line in the `skill` tool's list however many skills it holds.
+- A `/pstack:<name>` command for each skill you run directly. `/pstack:poteto-mode fix the flaky test` tells the agent to load `pstack/poteto-mode` and follow it for that request. The `principle-*` skills are read from within other skills and have no command.
+- The task profiles `pstack-poteto-agent` and `pstack-comment-sicko`, described in [Built-in task profiles](/docs/system-prompts/#built-in-task-profiles).
+- pstack's scripts as [`pstack` calls in `code`](/docs/code/#pstack-scripts).
+
+The skill uses addresses the way `caudra-docs` does:
+
+| Load | You get |
+|---|---|
+| `pstack` | the index: every skill with its summary, and the model roles in force |
+| `pstack/poteto-mode` | one skill |
+| `pstack/poteto-mode/playbooks/bug-fix.md` | a file inside a skill |
+| `pstack/adapter` | how Cursor's tools, paths and subagent fields map to Caudra's |
+| `pstack?flaky test` | the pages that contain every word |
+
+Upstream wrote the skills for Cursor, so the index tells the agent to load `pstack/adapter` once per session before it follows one. The adapter also lists the [automations](/docs/automations/) pstack ships for Caudra, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change.
+
+`setup-pstack` picks a model for each role pstack's skills name and writes them to `~/.config/caudra/pstack/models.md`. The index reads that file each time it loads, so a change applies at once.
+
 Each builtin has a switch under `plugins.skill`:
 
 ```toml
@@ -116,7 +139,8 @@ Each builtin has a switch under `plugins.skill`:
 automation_dev = true
 docs = false
 plugin_dev = true
+pstack = true
 workflow_dev = false
 ```
 
-`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working.
+`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working. `pstack = false` removes the skill, its commands, its profiles and its `code` calls. While the terminal UI runs, switching `pstack` applies as soon as you save the file.

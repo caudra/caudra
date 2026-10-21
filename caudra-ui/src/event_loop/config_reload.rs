@@ -52,8 +52,10 @@ const DECISIONS_TURNED_OFF: &str =
     "the active decision endpoint is gone from providers.toml, so decisions are off";
 /// The tables every session screens with as soon as the file is saved.
 const NOW_TABLES: [&str; 1] = ["decisions"];
-/// Keys that apply as soon as the file is saved, in a table whose other keys wait.
-const NOW_KEYS: [(&str, &str); 1] = [("ui", "show_decisions")];
+/// Keys that apply as soon as the file is saved, in a table whose other keys wait. A key
+/// may be a dotted path into the table.
+const NOW_KEYS: [(&str, &str); 2] = [("ui", "show_decisions"), ("plugins", "skill.pstack")];
+const KEY_PATH_SEPARATOR: char = '.';
 /// The tables whose settings a session adopts at its next turn.
 const LIVE_TABLES: [&str; 2] = ["agent", "autopilot"];
 /// The table read once, at startup.
@@ -209,10 +211,17 @@ impl SettingsTables {
                 let (mut old, mut new) = (before.get(key).cloned(), after.get(key).cloned());
                 for (table, now_key) in NOW_KEYS.iter().filter(|(table, _)| table == key) {
                     let take = |value: &mut Option<toml::Value>| {
-                        value
-                            .as_mut()
-                            .and_then(toml::Value::as_table_mut)
-                            .and_then(|table| table.remove(*now_key))
+                        let (parents, leaf) = now_key
+                            .rsplit_once(KEY_PATH_SEPARATOR)
+                            .map_or((None, *now_key), |(parents, leaf)| (Some(parents), leaf));
+                        let mut table = value.as_mut().and_then(toml::Value::as_table_mut)?;
+                        for parent in parents
+                            .into_iter()
+                            .flat_map(|path| path.split(KEY_PATH_SEPARATOR))
+                        {
+                            table = table.get_mut(parent).and_then(toml::Value::as_table_mut)?;
+                        }
+                        table.remove(leaf)
                     };
                     if take(&mut old) != take(&mut new) {
                         changed.insert(format!("{table}.{now_key}"), false);
@@ -623,7 +632,15 @@ impl EventLoop<'_> {
         match (self.config_reload.reloader)(cwd) {
             Ok(config) => {
                 self.ctx.config_problems.clear(SETTINGS_FILE);
+                let pstack_switched =
+                    self.ctx.config.builtin_skills.pstack != config.agent.builtin_skills.pstack;
                 self.ctx.config = config.agent;
+                if pstack_switched {
+                    self.reload_prompt_profiles(report);
+                    if local {
+                        self.reload_commands(cwd);
+                    }
+                }
                 for runtime in &self.sessions {
                     runtime
                         .app
@@ -798,6 +815,11 @@ mod tests {
         "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\nshow_decisions = false\n";
     const UI_AND_SHOW_DECISIONS_EDITED: &str =
         "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"light\"\nshow_decisions = false\n";
+    const PSTACK_OFF: &str = "[plugins.skill]\npstack = false\n";
+    const PSTACK_ON: &str = "[plugins.skill]\npstack = true\n";
+    const PSTACK_ON_DOCS_OFF: &str = "[plugins.skill]\npstack = true\ndocs = false\n";
+    const PSTACK_KEY: &str = "plugins.skill.pstack";
+    const PLUGINS_TABLE: &str = "plugins";
     const DECISIONS_ADDED: &str = "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\n\n[decisions.features]\nmemory_search = \"enforce\"\n";
     const LOADING_PROFILE: (&str, &str) = ("review", "Review carefully.");
     const EMPTY_PROFILE: (&str, &str) = ("blank", "");
@@ -923,6 +945,34 @@ mod tests {
             .map(|(key, table)| ((*key).to_owned(), *table))
             .collect();
         assert_eq!(changed, expected);
+    }
+
+    #[test_case(PSTACK_OFF, PSTACK_ON, &[(PSTACK_KEY, false)] ; "the_pstack_switch_alone")]
+    #[test_case(PSTACK_OFF, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true), (PSTACK_KEY, false)] ; "the_switch_beside_another_skill_flag")]
+    #[test_case(PSTACK_ON, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true)] ; "another_skill_flag_alone")]
+    fn a_nested_key_that_applies_at_once_is_named_by_its_path(
+        before: &str,
+        after: &str,
+        expected: &[(&str, bool)],
+    ) {
+        let dir = TempDir::new().unwrap();
+        fs::write(settings_file(&dir), before).unwrap();
+        let roots = roots(dir.path());
+        let tables = SettingsTables::read(&roots);
+        fs::write(settings_file(&dir), after).unwrap();
+
+        let changed = tables.changed_keys(&SettingsTables::read(&roots), true);
+
+        let expected: BTreeMap<String, bool> = expected
+            .iter()
+            .map(|(key, table)| ((*key).to_owned(), *table))
+            .collect();
+        assert_eq!(changed, expected);
+        assert_eq!(
+            settings_note(&changed)
+                .is_some_and(|note| note.contains(&format!("{PSTACK_KEY} {NOW_SUFFIX}"))),
+            expected.contains_key(PSTACK_KEY)
+        );
     }
 
     #[test]

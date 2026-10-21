@@ -105,6 +105,21 @@ pub struct SystemPromptProfile {
 }
 
 impl SystemPromptProfile {
+    /// An overlay Caudra ships. It has no file, so `address` stands in for its path.
+    pub fn builtin(name: &str, description: &str, body: String, address: &str) -> Self {
+        Self {
+            name: Arc::from(name),
+            description: Some(Arc::from(description)),
+            layout: PromptProfileLayout::Overlay,
+            subagent_model: None,
+            subagent_thinking: None,
+            tools: ProfileToolPolicy::default(),
+            automations: Vec::new(),
+            body: Arc::from(body),
+            path: Arc::from(Path::new(address)),
+        }
+    }
+
     pub fn tools(&self) -> &ProfileToolPolicy {
         &self.tools
     }
@@ -217,7 +232,20 @@ impl PromptProfileCatalog {
         if let Some(dir) = caudra_storage::paths::user_config_dir(config_dir, PROFILE_DIR) {
             catalog.load_dir(&dir);
         }
+        catalog.add_builtins(crate::pstack::profiles());
         catalog
+    }
+
+    /// A user file of the same name wins, even a broken one, so its error is reported
+    /// rather than silently replaced.
+    fn add_builtins(&mut self, builtins: impl IntoIterator<Item = SystemPromptProfile>) {
+        for profile in builtins {
+            if !self.invalid.contains_key(profile.name()) {
+                self.profiles
+                    .entry(Arc::clone(&profile.name))
+                    .or_insert_with(|| Arc::new(profile));
+            }
+        }
     }
 
     pub fn profiles(&self) -> impl Iterator<Item = &SystemPromptProfile> {
@@ -811,6 +839,7 @@ mod tests {
     const LOADED_BODY: &str = "Review carefully.";
     const EDITED_BODY: &str = "Review every line.";
     const BROKEN_PROFILE: &str = "---\nlayout: nope\n---\nReview carefully.";
+    const BUILTIN_BODY: &str = "Review as shipped.";
 
     fn inspection_catalog(model: Option<&str>, thinking: Option<&str>) -> PromptProfileCatalog {
         let name: Arc<str> = Arc::from(INSPECTION_PROFILE);
@@ -862,6 +891,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(discover(dir.path()).resolve(Some("policy")).is_ok(), valid);
+    }
+
+    #[test_case(None, Some(BUILTIN_BODY) ; "builtin_alone")]
+    #[test_case(Some(LOADED_BODY), Some(LOADED_BODY) ; "user_file_wins")]
+    #[test_case(Some(BROKEN_PROFILE), None ; "broken_user_file_still_shadows")]
+    fn builtin_profiles_sit_below_user_files(user_file: Option<&str>, expected: Option<&str>) {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        if let Some(text) = user_file {
+            fs::write(profiles.join(REVIEW_FILE), text).unwrap();
+        }
+        let mut catalog = discover(dir.path());
+        catalog.add_builtins([SystemPromptProfile::builtin(
+            REVIEW,
+            REVIEW,
+            BUILTIN_BODY.to_owned(),
+            REVIEW_FILE,
+        )]);
+        assert_eq!(
+            catalog.get(REVIEW).map(|profile| profile.body().to_owned()),
+            expected.map(str::to_owned)
+        );
     }
 
     #[test]

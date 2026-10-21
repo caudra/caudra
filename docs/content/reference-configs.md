@@ -1257,6 +1257,12 @@ version = 3
 # Type: boolean.
 # docs = true
 
+# Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:`
+# commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles,
+# and its scripts as `pstack` calls in `code`.
+# Type: boolean.
+# pstack = false
+
 [plugins.task]
 
 # Max concurrently running subagents.

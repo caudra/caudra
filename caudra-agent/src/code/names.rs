@@ -221,6 +221,7 @@ pub fn renamed(name: &str) -> Option<String> {
 pub fn is_reserved(name: &str) -> bool {
     name == HELP
         || MODULE_DOCS.iter().any(|doc| doc.namespace == name)
+        || name == caudra_pstack::NAME
         || RENAMED_GLOBALS.iter().any(|(old, _)| *old == name)
         || [BUILTINS, TYPING_NAMES, STDLIB_MODULES]
             .iter()
