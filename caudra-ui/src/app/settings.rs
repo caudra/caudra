@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use caudra_config::config_file::load_global_config;
-use caudra_config::settings_file::GlobalSettingsFile;
+use caudra_config::config_file::{load_global_config, project_config_path};
+use caudra_config::settings_file::{GlobalSettingsFile, ProjectSettings};
 use caudra_config::websearch::{BACKENDS_KEY, GlobalWebsearchFile, MODE_KEY, WebsearchConfig};
 use caudra_workcell::WebsearchControl;
 use flume::{Receiver, TryRecvError};
@@ -60,10 +60,16 @@ impl App {
 
     fn start_settings_request(&mut self, request: SettingsRequest) {
         let path = self.settings.config_path.clone();
+        let project = self
+            .workspace_session
+            .is_none()
+            .then(|| project_config_path(Path::new(&self.state.session.cwd)));
         let control = self.settings.websearch.clone();
         let (sender, receiver) = flume::bounded(1);
         smol::spawn(async move {
-            let reply = smol::unblock(move || run(request, path, control.as_ref())).await;
+            let reply =
+                smol::unblock(move || run(request, path, project.as_deref(), control.as_ref()))
+                    .await;
             let _ = sender.send(reply);
         })
         .detach();
@@ -97,6 +103,7 @@ fn stopped() -> SettingsReply {
 fn run(
     request: SettingsRequest,
     path: Option<PathBuf>,
+    project: Option<&Path>,
     control: Option<&WebsearchControl>,
 ) -> SettingsReply {
     let Some(path) = path else {
@@ -113,7 +120,7 @@ fn run(
             (apply(&files, *edit).err(), websearch)
         }
     };
-    let data = load(&path, control);
+    let data = load(&path, project, control);
     let note = match (&data, control) {
         (Ok(_), Some(control)) if websearch && error.is_none() => {
             expanded_websearch(&path).ok().map(|config| {
@@ -146,9 +153,20 @@ fn apply(files: &SettingsFiles, edit: SettingsEdit) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-fn load(path: &Path, control: Option<&WebsearchControl>) -> Result<SettingsData, String> {
+/// A project file that does not load marks nothing, so the global settings stay editable.
+fn load(
+    path: &Path,
+    project: Option<&Path>,
+    control: Option<&WebsearchControl>,
+) -> Result<SettingsData, String> {
     let settings = GlobalSettingsFile::load(path).map_err(|error| error.to_string())?;
     let websearch = GlobalWebsearchFile::load(path).map_err(|error| error.to_string())?;
+    let project = project
+        .map(ProjectSettings::load)
+        .transpose()
+        .inspect_err(|error| tracing::warn!(%error, "project config unreadable for /settings"))
+        .unwrap_or_default()
+        .unwrap_or_default();
     let statuses = match control {
         Some(control) => control.status(&expanded_websearch(path)?),
         None => Vec::new(),
@@ -158,6 +176,7 @@ fn load(path: &Path, control: Option<&WebsearchControl>) -> Result<SettingsData,
             settings,
             websearch,
         },
+        project,
         statuses,
         default_backends: environment_backends(environment(BACKENDS_KEY).as_deref()),
         default_mode: environment_mode(environment(MODE_KEY).as_deref()),
@@ -212,12 +231,12 @@ mod tests {
     }
 
     fn edited(path: &Path, edit: SettingsEdit) -> SettingsReply {
-        let files = load(path, None).expect("load").files;
+        let files = load(path, None, None).expect("load").files;
         let request = SettingsRequest::Edit {
             files: Box::new(files),
             edit: Box::new(edit),
         };
-        run(request, Some(path.to_path_buf()), None)
+        run(request, Some(path.to_path_buf()), None, None)
     }
 
     #[test]

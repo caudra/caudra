@@ -6,7 +6,9 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
+use crate::config_file::{CONFIG_FORMAT, ConfigFileError};
 use crate::global_file::{GlobalDocument, GlobalFileError};
+use crate::migration;
 use crate::toml_document::set_value;
 
 const UNEXPECTED_LAYOUT: &str = "a table on the way to the key is not a table";
@@ -72,6 +74,35 @@ impl GlobalSettingsFile {
     }
 }
 
+/// The keys a project `caudra.toml` sets, read only to tell which global ones it overrides.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSettings {
+    table: toml::Table,
+}
+
+impl ProjectSettings {
+    /// A missing file sets nothing.
+    pub fn load(path: &Path) -> Result<Self, ConfigFileError> {
+        let Some(loaded) = migration::read(path, &CONFIG_FORMAT)? else {
+            return Ok(Self::default());
+        };
+        toml::from_str(&loaded.text)
+            .map(|table| Self { table })
+            .map_err(|source| ConfigFileError::Invalid {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Whether the file sets `key` of the table at `table`. An empty `table` is the root.
+    pub fn sets(&self, table: &[&str], key: &str) -> bool {
+        table
+            .iter()
+            .try_fold(&self.table, |current, name| current.get(*name)?.as_table())
+            .is_some_and(|current| current.contains_key(key))
+    }
+}
+
 /// The table at `path`, creating the missing ones: the last with a header, the rest implicit.
 fn created_table<'a>(
     document: &'a mut DocumentMut,
@@ -125,6 +156,7 @@ mod tests {
     use std::path::PathBuf;
 
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::config_file::CONFIG_FILE;
@@ -180,5 +212,21 @@ mod tests {
         let error = file.set(&[UI], THEME, Value::from(1)).unwrap_err();
         assert!(matches!(error, GlobalFileError::Invalid { .. }), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
+    }
+
+    #[test_case(&[UI], THEME, true; "a_key_it_sets")]
+    #[test_case(&[UI], SCROLLBAR, false; "a_key_it_leaves")]
+    #[test_case(&[], THEME, false; "the_same_name_in_another_table")]
+    fn a_project_file_tells_which_keys_it_sets(table: &[&str], key: &str, expected: bool) {
+        let (_dir, path) = written(ORIGINAL);
+        let project = ProjectSettings::load(&path).unwrap();
+        assert_eq!(project.sets(table, key), expected);
+    }
+
+    #[test]
+    fn a_missing_project_file_sets_nothing() {
+        let dir = TempDir::new().unwrap();
+        let project = ProjectSettings::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(!project.sets(&[UI], THEME));
     }
 }

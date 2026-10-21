@@ -9,7 +9,7 @@ mod websearch;
 use std::mem;
 
 use caudra_config::interpolation::holds_reference;
-use caudra_config::settings_file::GlobalSettingsFile;
+use caudra_config::settings_file::{GlobalSettingsFile, ProjectSettings};
 use caudra_config::websearch::{
     GlobalWebsearchFile, WebsearchBackendName, WebsearchConfig, WebsearchEdit, WebsearchMode,
     is_secret_key,
@@ -138,6 +138,8 @@ pub(crate) struct SettingsFiles {
 
 pub(crate) struct SettingsData {
     pub(crate) files: SettingsFiles,
+    /// The keys this project's `caudra.toml` sets, which win over the global ones.
+    pub(crate) project: ProjectSettings,
     /// Every backend as the config and the environment set it up; empty for a remote Workcell.
     pub(crate) statuses: Vec<BackendStatus>,
     /// What the environment lists while `backends` is unset.
@@ -814,14 +816,14 @@ impl SettingsModal {
             }
             &FormTarget::Key { table, field } => {
                 let text = changes[0].1.clone().unwrap_or_default();
-                match ScalarKind::of(field).map(|kind| kind.parse(&text)) {
+                match ScalarKind::of(field).map(|kind| kind.parse(field, &text)) {
                     Some(Ok(value)) => Ok(SettingsEdit::Key {
                         table,
                         key: field.name,
                         value,
                     }),
                     Some(Err(error)) => {
-                        form.fail(error.to_owned());
+                        form.fail(error);
                         Err(())
                     }
                     None => Err(()),
@@ -905,6 +907,7 @@ impl SettingsModal {
                         field_row(
                             field,
                             data.files.settings.get(table, field.name),
+                            data.project.sets(table, field.name),
                             width,
                             theme,
                         )
@@ -984,6 +987,7 @@ impl SettingsModal {
                         field,
                         table,
                         data.files.settings.get(table, field.name),
+                        data.project.sets(table, field.name),
                         theme,
                     )
                 })
@@ -1108,6 +1112,7 @@ mod tests {
     use super::*;
 
     const CONFIG_NAME: &str = "caudra.toml";
+    const PROJECT_CONFIG_NAME: &str = "project.toml";
     const SCREEN_WIDTH: u16 = 120;
     const SCREEN_HEIGHT: u16 = 40;
     const CANARY: &str = "canary-9f3e1c7a";
@@ -1124,9 +1129,19 @@ mod tests {
     }
 
     fn opened(contents: &str, local: bool) -> Fixture {
+        opened_in(contents, None, local)
+    }
+
+    fn opened_in(contents: &str, project: Option<&str>, local: bool) -> Fixture {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join(CONFIG_NAME);
         fs::write(&path, format!("version = {CONFIG_VERSION}\n{contents}")).expect("write config");
+        let project = project.map_or_else(ProjectSettings::default, |project| {
+            let path = dir.path().join(PROJECT_CONFIG_NAME);
+            fs::write(&path, format!("version = {CONFIG_VERSION}\n{project}"))
+                .expect("write project config");
+            ProjectSettings::load(&path).expect("project config")
+        });
         let mut modal = SettingsModal::new();
         modal.open(local);
         let files = SettingsFiles {
@@ -1136,6 +1151,7 @@ mod tests {
         modal.receive(SettingsReply {
             data: Ok(Box::new(SettingsData {
                 files,
+                project,
                 statuses: Vec::new(),
                 default_backends: vec![WebsearchBackendName::ExaMcp],
                 default_mode: WebsearchMode::Fallback,
@@ -1341,6 +1357,19 @@ mod tests {
         assert_eq!(
             value.and_then(|value| value.as_bool()),
             Some(!current_bool(field, None))
+        );
+    }
+
+    #[test_case(true; "a_key_the_project_sets")]
+    #[test_case(false; "no_project_file")]
+    fn a_project_override_is_marked(overridden: bool) {
+        let key = scalar_fields(TOP_LEVEL_FIELDS)[0].name;
+        let project = format!("{key} = 1\n");
+        let mut fixture = opened_in("", overridden.then_some(project.as_str()), true);
+        press(&mut fixture.modal, KeyCode::Tab);
+        assert_eq!(
+            screen(&mut fixture.modal).contains(fields::OVERRIDDEN),
+            overridden
         );
     }
 

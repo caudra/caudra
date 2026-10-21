@@ -17,9 +17,16 @@ const TABLE_SEPARATOR: &str = ".";
 const DEFAULT_PREFIX: &str = "Default: ";
 const ENV_PREFIX: &str = "Environment variable: ";
 const MIN_PREFIX: &str = "Minimum: ";
+const MAX_PREFIX: &str = "Maximum: ";
 const WRITTEN: &str = "Set in the global caudra.toml. d resets it to the default.";
 const NOT_WRITTEN: &str = "Not set, so the default applies.";
-pub(super) const NOT_A_NUMBER: &str = "Enter a whole number, or nothing to reset it.";
+const PROJECT_MARK: &str = "  project";
+pub(super) const OVERRIDDEN: &str =
+    "This project's .caudra/caudra.toml sets this key too, and its value wins here.";
+const NOT_A_NUMBER: &str = "Enter a whole number, or nothing to reset it.";
+const BELOW_MIN: &str = "Enter a whole number no lower than ";
+const ABOVE_MAX: &str = "Enter a whole number no higher than ";
+const SENTENCE_END: &str = ".";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarKind {
@@ -41,16 +48,27 @@ impl ScalarKind {
         }
     }
 
-    /// The value `text` spells, `None` for empty text, which resets the key.
-    pub(super) fn parse(self, text: &str) -> Result<Option<Value>, &'static str> {
+    /// The value `text` spells for `field`, `None` for empty text, which resets the key.
+    pub(super) fn parse(self, field: &ConfigField, text: &str) -> Result<Option<Value>, String> {
         if text.is_empty() {
             return Ok(None);
         }
         match self {
-            Self::Integer => text
-                .parse::<i64>()
-                .map(|number| Some(Value::from(number)))
-                .map_err(|_| NOT_A_NUMBER),
+            Self::Integer => {
+                let number = text.parse::<i64>().map_err(|_| NOT_A_NUMBER.to_owned())?;
+                let below = field
+                    .min
+                    .filter(|min| i128::from(number) < i128::from(*min))
+                    .map(|min| (BELOW_MIN, min));
+                let above = field
+                    .max
+                    .filter(|max| i128::from(number) > i128::from(*max))
+                    .map(|max| (ABOVE_MAX, max));
+                match below.or(above) {
+                    Some((prefix, bound)) => Err(format!("{prefix}{bound}{SENTENCE_END}")),
+                    None => Ok(Some(Value::from(number))),
+                }
+            }
             Self::Bool | Self::Text => Ok(Some(Value::from(text))),
         }
     }
@@ -83,6 +101,7 @@ pub(super) fn current_bool(field: &ConfigField, written: Option<&Item>) -> bool 
 pub(super) fn field_row(
     field: &ConfigField,
     written: Option<&Item>,
+    overridden: bool,
     name_cols: usize,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
@@ -98,6 +117,9 @@ pub(super) fn field_row(
             spans.push(Span::styled(DEFAULT_SUFFIX, theme.tool_dim));
         }
     }
+    if overridden {
+        spans.push(Span::styled(PROJECT_MARK, theme.tool_warning));
+    }
     spans
 }
 
@@ -105,6 +127,7 @@ pub(super) fn field_info(
     field: &ConfigField,
     table: &[&str],
     written: Option<&Item>,
+    overridden: bool,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let path = table
@@ -124,6 +147,9 @@ pub(super) fn field_info(
     if let Some(min) = field.min {
         lines.push(Line::styled(format!("{MIN_PREFIX}{min}"), theme.tool_dim));
     }
+    if let Some(max) = field.max {
+        lines.push(Line::styled(format!("{MAX_PREFIX}{max}"), theme.tool_dim));
+    }
     if let Some(env) = field.env {
         lines.push(Line::styled(format!("{ENV_PREFIX}{env}"), theme.tool_dim));
     }
@@ -134,6 +160,9 @@ pub(super) fn field_info(
         },
         theme.tool_dim,
     ));
+    if overridden {
+        lines.push(Line::styled(OVERRIDDEN, theme.tool_warning));
+    }
     lines
 }
 
@@ -164,19 +193,39 @@ mod tests {
         assert!(listed.iter().all(|field| field.name != skipped));
     }
 
+    const LOWEST: u64 = 2;
+    const HIGHEST: u64 = 20;
+    const BOUNDED: ConfigField = ConfigField {
+        name: "bounded",
+        ty: "integer",
+        default: ConfigValue::Unset,
+        min: Some(LOWEST),
+        max: Some(HIGHEST),
+        env: None,
+        description: "",
+    };
+
     #[test_case(ScalarKind::Integer, "12", Some("12"); "integer")]
+    #[test_case(ScalarKind::Integer, "2", Some("2"); "the_lowest_allowed")]
+    #[test_case(ScalarKind::Integer, "20", Some("20"); "the_highest_allowed")]
     #[test_case(ScalarKind::Text, "dark", Some("\"dark\""); "text")]
     #[test_case(ScalarKind::Text, "", None; "empty_resets")]
     fn text_parses_by_kind(kind: ScalarKind, text: &str, expected: Option<&str>) {
-        let parsed = kind.parse(text).unwrap();
+        let parsed = kind.parse(&BOUNDED, text).unwrap();
         assert_eq!(
             parsed.map(|value| value.to_string().trim().to_owned()),
             expected.map(str::to_owned)
         );
     }
 
-    #[test]
-    fn a_word_is_not_a_number() {
-        assert_eq!(ScalarKind::Integer.parse("ten").unwrap_err(), NOT_A_NUMBER);
+    #[test_case("ten", NOT_A_NUMBER.to_owned(); "a_word")]
+    #[test_case("1", format!("{BELOW_MIN}{LOWEST}{SENTENCE_END}"); "below_the_minimum")]
+    #[test_case("-1", format!("{BELOW_MIN}{LOWEST}{SENTENCE_END}"); "negative")]
+    #[test_case("21", format!("{ABOVE_MAX}{HIGHEST}{SENTENCE_END}"); "above_the_maximum")]
+    fn a_number_out_of_bounds_is_refused(text: &str, expected: String) {
+        assert_eq!(
+            ScalarKind::Integer.parse(&BOUNDED, text).unwrap_err(),
+            expected
+        );
     }
 }
