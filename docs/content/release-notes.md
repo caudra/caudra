@@ -24,7 +24,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 > **Important**
 >
-> **Close every other Caudra session before you start Preview 12.** On its first start, Preview 12 upgrades the session database in your [state directory](/docs/configuration/#directory-layout) to keep what it learns about each model's tokenizer and what continual learning changed, to import your past shell commands' run times for shell ETAs, and to arm automations that ship with Caudra. The upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 12 does not start. It lists the open sessions to close instead, and nothing is changed.
+> **Close every other Caudra session before you start Preview 12.** On its first start, Preview 12 upgrades the session database in your [state directory](/docs/configuration/#directory-layout) to keep what it learns about each model's tokenizer and what continual learning changed, to import your past shell commands' run times for shell ETAs, and to arm automations that ship with Caudra. The upgrade needs exclusive access. This includes other terminals, editor sessions over ACP, and `caudra storage` commands. While any of them still has the database open, Preview 12 does not start. It lists the open sessions to close instead, with each one's process ID and title, and nothing is changed.
 >
 > The upgrade keeps your sessions and saves a copy of the database from before it as `backups/caudra.db.v32.bak` in the state directory. Preview 11 and earlier cannot open the upgraded database, and `caudra rollback` restores only the previous binary.
 
