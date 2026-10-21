@@ -70,6 +70,12 @@ const BODY_FIELD: &str = "body";
 const LEFT_FIELD: &str = "left";
 const RIGHT_FIELD: &str = "right";
 const TYPE_FIELD: &str = "type";
+const COMMENT: &str = "comment";
+const LINE_CONTINUATION: &str = "line_continuation";
+const BLOCK_OPENER: &str = ":";
+const OPENING_BRACKETS: [&str; 3] = ["(", "[", "{"];
+const CLOSING_BRACKETS: [&str; 3] = [")", "]", "}"];
+const INDENT: u8 = b' ';
 
 /// One change made to a snippet before it ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +84,8 @@ pub enum Repair {
     Unfenced,
     /// JavaScript's `const`, `let` or `var` was dropped before an assignment.
     Undeclared(&'static str),
+    /// A line indented deeper than its block, and the lines under it, were lined up with the block.
+    Dedented,
     /// JavaScript's single object argument to a host call was passed as keyword arguments.
     Unpacked(String),
     /// A module the snippet used without importing it was imported before it ran.
@@ -101,6 +109,10 @@ impl Repair {
             Self::Undeclared(keyword) => Some(format!(
                 "snippets are Python, so assign with `name = value`, without `{keyword}`"
             )),
+            Self::Dedented => Some(
+                "start each line at its block's indentation: only a line after one ending in `:` goes deeper"
+                    .to_owned(),
+            ),
             Self::Unpacked(function) => Some(format!(
                 "calls take Python arguments, so write `{function}(name=value)` rather than one JavaScript object"
             )),
@@ -129,6 +141,7 @@ impl fmt::Display for Repair {
                     "dropped JavaScript's `{keyword}` before an assignment"
                 )
             }
+            Self::Dedented => formatter.write_str("lined up an over-indented line with its block"),
             Self::Unpacked(function) => {
                 write!(
                     formatter,
@@ -163,6 +176,7 @@ impl Repaired {
                 Repair::Imported(module) => Some(*module),
                 Repair::Unfenced
                 | Repair::Undeclared(_)
+                | Repair::Dedented
                 | Repair::Unpacked(_)
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn
@@ -251,21 +265,26 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
     }
 }
 
-/// A snippet the parser cannot read, with its Markdown fence blanked and JavaScript's declarations
-/// dropped: kept only when together they leave one it reads whole, else returned as it came.
+/// A snippet Python cannot read, with its Markdown fence blanked, JavaScript's declarations dropped,
+/// and over-indented lines lined up with their blocks: kept only when together they leave one the
+/// parser reads whole, else returned as it came. The parser reads an over-indented line as Python
+/// does not, so indentation is checked even in a snippet it reads.
 fn syntax_repaired(code: String) -> (String, Vec<Repair>) {
-    if reads_as_python(&code) {
-        return (code, Vec::new());
-    }
     let mut repairs = Vec::new();
     let mut candidate = None;
-    if let Some(unfenced) = unfenced(&code) {
-        repairs.push(Repair::Unfenced);
-        candidate = Some(unfenced);
+    if !reads_as_python(&code) {
+        if let Some(unfenced) = unfenced(&code) {
+            repairs.push(Repair::Unfenced);
+            candidate = Some(unfenced);
+        }
+        if let Some((undeclared, keywords)) = undeclared(candidate.as_deref().unwrap_or(&code)) {
+            repairs.extend(keywords.into_iter().map(Repair::Undeclared));
+            candidate = Some(undeclared);
+        }
     }
-    if let Some((undeclared, keywords)) = undeclared(candidate.as_deref().unwrap_or(&code)) {
-        repairs.extend(keywords.into_iter().map(Repair::Undeclared));
-        candidate = Some(undeclared);
+    if let Some(dedented) = dedented(candidate.as_deref().unwrap_or(&code)) {
+        repairs.push(Repair::Dedented);
+        candidate = Some(dedented);
     }
     match candidate.filter(|candidate| reads_as_python(candidate)) {
         Some(candidate) => (candidate, repairs),
@@ -546,6 +565,135 @@ fn undeclared(code: &str) -> Option<(String, Vec<&'static str>)> {
         }
     }
     (!keywords.is_empty()).then(|| (applied(code, edits), keywords))
+}
+
+/// The snippet with each line indented deeper than its block lined up with it, and the lines
+/// under it moved by as much: Python goes deeper only after a line ending in `:`, so the block is
+/// the only place such a line can belong. Indentation is followed as Python follows it, and any
+/// other mismatch, or a tab, leaves the snippet as it came. Strings, comments, and lines continued
+/// inside brackets or after `\` keep their indentation.
+fn dedented(code: &str) -> Option<String> {
+    let tree = parse(code)?;
+    let mut levels = vec![0];
+    let mut strays: Vec<Stray> = Vec::new();
+    let mut opens_block = false;
+    let mut edits = Vec::new();
+    for line in logical_lines(code, &tree)? {
+        while strays
+            .last()
+            .is_some_and(|stray| line.width < stray.written)
+        {
+            strays.pop();
+        }
+        let mut width = line
+            .width
+            .checked_sub(strays.iter().map(|stray| stray.removed).sum())?;
+        let level = *levels.last()?;
+        if width > level && opens_block {
+            levels.push(width);
+        } else if width > level {
+            strays.push(Stray {
+                written: line.width,
+                removed: width - level,
+            });
+            width = level;
+        } else if opens_block {
+            return None;
+        } else {
+            while levels.last().is_some_and(|open| *open > width) {
+                levels.pop();
+            }
+            if levels.last() != Some(&width) {
+                return None;
+            }
+        }
+        if width < line.width {
+            edits.push(Edit::remove(line.start, line.start + line.width - width));
+        }
+        opens_block = line.opens_block;
+    }
+    (!edits.is_empty()).then(|| applied(code, edits))
+}
+
+/// An over-indented line: how deep it was written, and how much was taken off it and the lines
+/// under it.
+struct Stray {
+    written: usize,
+    removed: usize,
+}
+
+/// Where a statement starts a line, as Python's indentation sees it.
+struct LogicalLine {
+    /// The byte its line starts at.
+    start: usize,
+    /// Its indentation, in spaces.
+    width: usize,
+    /// Whether it ends in `:`, so the next one may go deeper.
+    opens_block: bool,
+}
+
+/// The lines that start a statement: not inside brackets, a string, or after `\`, and not only a
+/// comment. `None` when one is indented with anything but spaces.
+fn logical_lines(code: &str, tree: &Tree) -> Option<Vec<LogicalLine>> {
+    let mut lines: Vec<LogicalLine> = Vec::new();
+    let mut depth = 0_usize;
+    let mut previous: Option<Node<'_>> = None;
+    for lexeme in lexemes(tree) {
+        let kind = lexeme.kind();
+        let starts_row = previous.is_none_or(|previous| {
+            previous.end_position().row < lexeme.start_position().row
+                && previous.kind() != LINE_CONTINUATION
+        });
+        if starts_row && depth == 0 && kind != COMMENT {
+            let start = lexeme.start_byte() - lexeme.start_position().column;
+            let indent = &code.as_bytes()[start..lexeme.start_byte()];
+            if indent.iter().any(|byte| *byte != INDENT) {
+                return None;
+            }
+            lines.push(LogicalLine {
+                start,
+                width: indent.len(),
+                opens_block: false,
+            });
+        }
+        if OPENING_BRACKETS.contains(&kind) {
+            depth += 1;
+        } else if CLOSING_BRACKETS.contains(&kind) {
+            depth = depth.saturating_sub(1);
+        }
+        if kind != COMMENT
+            && kind != LINE_CONTINUATION
+            && let Some(line) = lines.last_mut()
+        {
+            line.opens_block = kind == BLOCK_OPENER;
+        }
+        previous = Some(lexeme);
+    }
+    Some(lines)
+}
+
+/// The tree's tokens in source order, with each string whole, so nothing inside one is a token.
+fn lexemes(tree: &Tree) -> Vec<Node<'_>> {
+    let mut lexemes = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        let whole = node.kind() == STRING || node.child_count() == 0;
+        if whole && !node.is_missing() {
+            lexemes.push(node);
+        }
+        if !whole && cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                return lexemes;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
 }
 
 /// `gh.list({state: "open"})`, JavaScript's single object argument to a host call, as
@@ -958,6 +1106,7 @@ mod tests {
     /// interpreter's own stubs, so using it was not one.
     #[test_case(Repair::Imported("json"), true ; "imported")]
     #[test_case(Repair::FinalReturn, true ; "final_return")]
+    #[test_case(Repair::Dedented, true ; "dedented")]
     #[test_case(Repair::Settled, false ; "settled")]
     fn only_slips_carry_a_lesson(repair: Repair, teaches: bool) {
         assert_eq!(repair.lesson().is_some(), teaches);
@@ -1063,6 +1212,51 @@ mod tests {
     #[test_case("await gh.list({state:\n    1})" ; "a_value_on_the_next_line")]
     #[test_case("await gh.list({**rest})" ; "a_spread")]
     fn other_dict_arguments_are_left_alone(code: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+    }
+
+    #[test_case("import datetime\n datetime.datetime.now()", "import datetime\ndatetime.datetime.now()" ; "a_stray_space")]
+    #[test_case("  x = 1\n  x", "x = 1\nx" ; "the_whole_snippet_indented")]
+    #[test_case("x = 1\n    if x:\n        y = 2\n    z = 3\nx", "x = 1\nif x:\n    y = 2\nz = 3\nx" ; "a_block_under_the_stray_line")]
+    #[test_case("for i in range(2):\n    a = i\n      b = i\n    c = i", "for i in range(2):\n    a = i\n    b = i\n    c = i" ; "deeper_inside_a_block")]
+    #[test_case("x = 1\n    # note\n  y = 2", "x = 1\n    # note\ny = 2" ; "a_comment_line_keeps_its_place")]
+    #[test_case("x = 1\n  y = [\n      1,\n  ]", "x = 1\ny = [\n      1,\n  ]" ; "lines_inside_brackets_keep_theirs")]
+    #[test_case("x = 1\n  y = '''\n    z = 1\n'''", "x = 1\ny = '''\n    z = 1\n'''" ; "a_string_is_never_touched")]
+    #[test_case("x = 1\n  y = 1 + \\\n    2", "x = 1\ny = 1 + \\\n    2" ; "a_continued_line_keeps_its_indentation")]
+    #[test_case("```python\nx = 1\n  x\n```", "\nx = 1\nx\n" ; "inside_a_fence")]
+    fn an_over_indented_line_is_lined_up_with_its_block(code: &str, expected: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, expected);
+        assert!(
+            repaired.repairs.contains(&Repair::Dedented),
+            "{:?}",
+            repaired.repairs
+        );
+        assert_eq!(repaired.taught.as_deref(), Some(expected));
+    }
+
+    #[test_case("if x:\n    y = 1\nelif z:\n    y = 2\nelse:\n    y = 3" ; "branches")]
+    #[test_case("def f():\n    '''doc\n  more'''\n    return 1" ; "a_docstring_less_indented")]
+    #[test_case("x = (1,\n        2)\nd = {\n 'a': 1,\n}" ; "brackets")]
+    #[test_case("class A:\n    @staticmethod\n    def f():\n        pass\n\n        # note\n    def g(self): pass" ; "a_class")]
+    #[test_case("match x:\n    case 1:\n        pass" ; "a_match")]
+    #[test_case("if x: y = 1\nz = 2" ; "a_one_line_block")]
+    #[test_case("try:\n    a()\nexcept Exception as error:\n    b(error)\nfinally:\n    c()" ; "a_try")]
+    #[test_case("x = 1 + \\\n        2\ny = f'''{x}\n   {x}'''" ; "continued_lines")]
+    fn valid_python_keeps_its_indentation(code: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+    }
+
+    #[test_case("if x:\n    a = 1\n  b = 2" ; "an_unindent_that_matches_no_block")]
+    #[test_case("if x:\ny = 1" ; "a_block_left_empty")]
+    #[test_case("x = 1\n\ty = 2" ; "a_tab")]
+    #[test_case("x = 1\n  y = (" ; "still_broken_after")]
+    #[test_case("x = '''\n  a\n'''" ; "a_string_alone")]
+    fn other_indentation_is_left_alone(code: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, code);
         assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);

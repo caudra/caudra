@@ -286,6 +286,7 @@ impl CodeToolGroup {
                 Repair::Imported(module) => imported.contains(module),
                 Repair::Unfenced
                 | Repair::Undeclared(_)
+                | Repair::Dedented
                 | Repair::Unpacked(_)
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn

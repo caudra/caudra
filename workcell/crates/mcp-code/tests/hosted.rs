@@ -501,6 +501,28 @@ async fn a_repaired_snippet_keeps_its_line_numbers() {
     group.shutdown().await;
 }
 
+/// A stray space before a statement, which Python rejects as an unexpected indent, is taken off.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_indented_line_runs_lined_up_with_its_block() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(
+        &group,
+        &host,
+        "import datetime\n datetime.datetime(2026, 1, 2).isoformat()",
+        None,
+    )
+    .await;
+    assert_eq!(
+        result(&executed),
+        &json!("2026-01-02T00:00:00"),
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(executed.repairs, [Repair::Dedented]);
+    group.shutdown().await;
+}
+
 /// A tool takes its arguments as keywords or as one dict, and both forms are checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tool_takes_one_dict_of_arguments() {
