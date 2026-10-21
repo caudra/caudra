@@ -701,6 +701,8 @@ fn build_stack(
     let loaded = load_recorded_settings(&plugin_host, &cli.startup, cwd, remote).and_then(
         |(settings, lua_layers)| {
             let config = resolve_config(settings, &ConfigFlags::of(cli), cwd, remote)?;
+            // The catalog holds pstack's task profiles only while pstack is on.
+            caudra_agent::pstack::configure(config.agent.builtin_skills.pstack);
             let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
             let selected_name = cli
                 .system_prompt_profile
