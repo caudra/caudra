@@ -30,7 +30,7 @@ use fork_tab::ForkLaunch;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::peers::PeerHost;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::{Context, Report, eyre};
 use peers::PeerRegistration;
 
 use crate::sandbox::{
@@ -76,8 +76,8 @@ use caudra_providers::Timeouts;
 use caudra_providers::accounts::{Reroute, save_login};
 use caudra_providers::manifest::ManifestRegistry;
 use caudra_providers::openai_auth;
-use caudra_providers::provider::{Provider, fetch_all_models, from_model};
-use caudra_providers::{HistoryItem, Message, Model};
+use caudra_providers::provider::{Provider, fetch_all_models, from_model, unconfigured};
+use caudra_providers::{AgentError, HistoryItem, Message, Model, UserFailure};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::accounts::AccountName;
@@ -199,6 +199,7 @@ const AUTH_NAME_ARG: &str = "--name";
 const AUTH_EXECUTABLE_ERR: &str = "could not locate the Caudra executable for login";
 const AUTH_PROCESS_ERR: &str = "could not run the OAuth login process";
 const AUTH_EXIT_ERR: &str = "OAuth login process failed";
+const CREATE_PROVIDER_ERR: &str = "create provider";
 const AUTH_STDERR_CHUNK: usize = 1024;
 const AUTH_STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// Bounds the wait for the child's last stderr bytes, in case something it
@@ -1827,6 +1828,34 @@ fn changelog_open_now(
     enabled && !has_initial_prompt && !exit_on_done && !dialog_open
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StartupLogin {
+    Ready,
+    /// No model resolved, so a placeholder stands in until the user signs in.
+    NoModel,
+    /// The chosen model's provider lost its credentials.
+    SignedOut,
+}
+
+/// A missing or signed-out credential opens the login instead of stopping
+/// startup, which a deleted auth file would otherwise do on every launch.
+fn startup_provider(
+    created: Result<Box<dyn Provider>, AgentError>,
+    needs_login: bool,
+    warnings: &mut Vec<String>,
+) -> Result<(Box<dyn Provider>, StartupLogin)> {
+    match created {
+        Ok(provider) if needs_login => Ok((provider, StartupLogin::NoModel)),
+        Ok(provider) => Ok((provider, StartupLogin::Ready)),
+        Err(_) if needs_login => Ok((unconfigured(), StartupLogin::NoModel)),
+        Err(error) if UserFailure::of(&error.user_message()) == Some(UserFailure::Auth) => {
+            warnings.push(error.user_message());
+            Ok((unconfigured(), StartupLogin::SignedOut))
+        }
+        Err(error) => Err(Report::new(error).wrap_err(CREATE_PROVIDER_ERR)),
+    }
+}
+
 fn should_open_startup_login(needs_login: bool, providers: &ProvidersConfig) -> bool {
     needs_login
         && !providers.providers.iter().any(|(slug, definition)| {
@@ -1916,13 +1945,12 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         let mcp_ms = lap();
 
-        let provider: Arc<dyn Provider> = if needs_login {
-            Arc::from(caudra_providers::provider::from_model_fallback(
-                &mut model, timeouts,
-            ))
-        } else {
-            Arc::from(from_model(&mut model, timeouts).context("create provider")?)
-        };
+        let (provider, login) = startup_provider(
+            from_model(&mut model, timeouts),
+            needs_login,
+            &mut startup_warnings,
+        )?;
+        let provider: Arc<dyn Provider> = Arc::from(provider);
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: model.clone(),
             provider,
@@ -2026,8 +2054,11 @@ impl<'t> EventLoop<'t> {
         }
         app.install_initial_seed(initial_seed);
         app.exit_on_done = exit_on_done;
-        let show_login =
-            needs_login && should_open_startup_login(needs_login, &ProvidersConfig::load());
+        let show_login = match login {
+            StartupLogin::Ready => false,
+            StartupLogin::NoModel => should_open_startup_login(true, &ProvidersConfig::load()),
+            StartupLogin::SignedOut => true,
+        };
         if show_login {
             app.login_picker.open(app.storage.clone());
         }
@@ -5458,9 +5489,7 @@ mod tests {
     use caudra_config::{FeatureFlags, PermissionsConfig, ToolKey};
     use caudra_providers::copilot_auth::CopilotIdentity;
     use caudra_providers::provider::BoxFuture;
-    use caudra_providers::{
-        AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
-    };
+    use caudra_providers::{CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
@@ -5478,6 +5507,8 @@ mod tests {
     const AUTH_CHILD_TEST: &str = "event_loop::tests::oauth_login_child";
     const AUTH_CHILD_EXIT: &str = "CAUDRA_TEST_AUTH_CHILD_EXIT";
     const AUTH_CHILD_FAILURE: i32 = 17;
+    const MISSING_CREDENTIAL: &str = "GH_COPILOT_ENTERPRISE_TOKEN not set and no saved credentials for 'copilot-enterprise' — run `caudra auth login copilot-enterprise`";
+    const BROKEN_PROVIDER: &str = "unknown provider 'nowhere'";
     const AUTH_CHILD_REPORT: &str =
         "\n✖ http: failed to resolve host name\n└─ [6] Could not resolve hostname\n\n";
     const AUTH_CHILD_REASON: &str =
@@ -5562,6 +5593,55 @@ mod tests {
             eprint!("{AUTH_CHILD_REPORT}");
             process::exit(exit_code.parse().unwrap());
         }
+    }
+
+    fn config_error(message: &str) -> AgentError {
+        AgentError::Config {
+            message: message.into(),
+        }
+    }
+
+    #[test_case(false, StartupLogin::SignedOut, &[MISSING_CREDENTIAL] ; "chosen_model_signed_out")]
+    #[test_case(true, StartupLogin::NoModel, &[] ; "placeholder_model")]
+    fn a_missing_credential_opens_the_login_instead_of_stopping_startup(
+        needs_login: bool,
+        expected: StartupLogin,
+        expected_warnings: &[&str],
+    ) {
+        let mut warnings = Vec::new();
+
+        let (_, login) = startup_provider(
+            Err(config_error(MISSING_CREDENTIAL)),
+            needs_login,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(login, expected);
+        assert_eq!(warnings, expected_warnings);
+    }
+
+    #[test]
+    fn another_provider_failure_still_stops_startup() {
+        let error = startup_provider(Err(config_error(BROKEN_PROVIDER)), false, &mut Vec::new())
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{CREATE_PROVIDER_ERR}: {BROKEN_PROVIDER}")
+        );
+    }
+
+    #[test_case(false, StartupLogin::Ready ; "configured")]
+    #[test_case(true, StartupLogin::NoModel ; "awaiting_login")]
+    fn a_created_provider_keeps_the_login_decision(needs_login: bool, expected: StartupLogin) {
+        let mut warnings = Vec::new();
+
+        let (_, login) = startup_provider(Ok(unconfigured()), needs_login, &mut warnings).unwrap();
+
+        assert_eq!(login, expected);
+        assert!(warnings.is_empty());
     }
 
     #[test_case(AUTH_CHILD_REPORT, Some(AUTH_CHILD_REASON) ; "headline_and_cause")]
