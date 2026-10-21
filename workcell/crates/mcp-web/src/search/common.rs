@@ -50,6 +50,7 @@ pub(super) fn safe_transport_error(error: WebHttpError, timeout: u64) -> String 
         }
         WebHttpError::Cancelled
         | WebHttpError::Rejected(_)
+        | WebHttpError::NonPublicTarget { .. }
         | WebHttpError::RedirectRejected
         | WebHttpError::RequestFailed => "Search backend request failed.".to_owned(),
     }

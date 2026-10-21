@@ -7,6 +7,7 @@ use url::{Host, Url};
 
 use crate::body::read_bounded_body;
 use crate::deadline::{remaining, try_run_until};
+use crate::private::Admission;
 use crate::{
     BoundedResponse, HttpClient, NetError, ProxyRoute, RedirectScope, RequestSpec,
     TransportRequest, TransportResponse, TransportRoute, UrlPolicyError,
@@ -24,8 +25,19 @@ impl HttpClient {
         let mut url = request.url.clone();
         let mut headers = options.headers.clone();
         let redirect_limit = options.max_redirects.min(MAX_REDIRECTS);
+        let mut allowlist_open = true;
         for redirect_count in 0..=redirect_limit {
-            let response = self.execute_hop(request, &url, &headers, deadline).await?;
+            let (response, needed_allowlist) = self
+                .execute_hop(request, &url, &headers, allowlist_open, deadline)
+                .await
+                .map_err(|error| match error {
+                    NetError::Policy(source) if redirect_count > 0 => NetError::RedirectRefused {
+                        location: url.clone(),
+                        source,
+                    },
+                    other => other,
+                })?;
+            allowlist_open = needed_allowlist;
             let Some(location) = followed_location(request, &response, &url)? else {
                 let body = read_bounded_body(
                     response,
@@ -45,7 +57,9 @@ impl HttpClient {
             if redirect_count >= redirect_limit {
                 return Err(NetError::Redirect("redirect limit exceeded".to_owned()));
             }
-            let next = self.policy.parse_url(location, Some(&url))?;
+            // The next hop validates the host, under the allowlist only when
+            // this hop needed it.
+            let next = self.policy.parse_syntax(location, Some(&url))?;
             if !same_origin(&url, &next) {
                 // A blacklist cannot enumerate custom credential headers such
                 // as X-API-Key. Rebuild from the small set a redirected GET
@@ -59,25 +73,41 @@ impl HttpClient {
         Err(NetError::Redirect("redirect limit exceeded".to_owned()))
     }
 
+    /// Send one hop. With `allowlist_open` the hop may use the private
+    /// allowlist. The answer says whether it needed to, which decides whether
+    /// the hop it redirects to may.
     async fn execute_hop(
         &self,
         request: &RequestSpec,
         url: &Url,
         headers: &HeaderMap,
+        allowlist_open: bool,
         deadline: Instant,
-    ) -> Result<TransportResponse, NetError> {
+    ) -> Result<(TransportResponse, bool), NetError> {
         let cancellation = &request.options.cancellation;
-        // Every hop gets a fresh policy and DNS check. Validating only the first
-        // URL would allow an otherwise public endpoint to redirect into a LAN.
-        self.policy.validate_url(url)?;
         // The route is decided per hop, not per operation: a redirect onto a
         // bypassed host is dialled directly and pinned, and a redirect off one
         // goes to the proxy.
-        let route = match self.proxy.route(url) {
-            ProxyRoute::Proxy(endpoint) => TransportRoute::Proxy { endpoint },
-            ProxyRoute::Direct => TransportRoute::Direct {
-                resolved_addresses: self.resolve_target(url, deadline, cancellation).await?,
-            },
+        let route = self.proxy.route(url);
+        // Every hop gets a fresh policy and DNS check. Validating only the first
+        // URL would allow an otherwise public endpoint to redirect into a LAN.
+        let admission = if allowlist_open {
+            self.allowlist
+                .admit_url(self.policy, url, matches!(route, ProxyRoute::Direct))?
+        } else {
+            self.policy.validate_url(url).map(|()| Admission::Base)?
+        };
+        let (route, needed_allowlist) = match route {
+            ProxyRoute::Proxy(endpoint) => (TransportRoute::Proxy { endpoint }, admission.needed()),
+            ProxyRoute::Direct => {
+                let (resolved_addresses, needed) = self
+                    .resolve_target(url, admission, deadline, cancellation)
+                    .await?;
+                (
+                    TransportRoute::Direct { resolved_addresses },
+                    admission.needed() || needed,
+                )
+            }
         };
         let hop = TransportRequest {
             method: request.method.clone(),
@@ -87,40 +117,40 @@ impl HttpClient {
             route,
             timeout: remaining(deadline)?,
         };
-        try_run_until(deadline, cancellation, self.transport.execute(hop)).await
+        try_run_until(deadline, cancellation, self.transport.execute(hop))
+            .await
+            .map(|response| (response, needed_allowlist))
     }
 
+    /// The addresses to pin, and whether any of them needed the allowlist.
     async fn resolve_target(
         &self,
         url: &Url,
+        admission: Admission,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<IpAddr>, NetError> {
-        match url.host().ok_or(UrlPolicyError::MissingHost)? {
-            Host::Ipv4(address) => {
-                let address = IpAddr::V4(address);
-                self.policy.validate_ip(address)?;
-                Ok(vec![address])
-            }
-            Host::Ipv6(address) => {
-                let address = IpAddr::V6(address);
-                self.policy.validate_ip(address)?;
-                Ok(vec![address])
-            }
+    ) -> Result<(Vec<IpAddr>, bool), NetError> {
+        let addresses = match url.host().ok_or(UrlPolicyError::MissingHost)? {
+            Host::Ipv4(address) => vec![IpAddr::V4(address)],
+            Host::Ipv6(address) => vec![IpAddr::V6(address)],
             Host::Domain(hostname) => {
                 let addresses =
                     try_run_until(deadline, cancellation, self.resolver.resolve(hostname)).await?;
                 if addresses.is_empty() {
                     return Err(NetError::EmptyDnsAnswer(hostname.to_owned()));
                 }
-                // Reject mixed public/private answers rather than allowing the
-                // connector to choose a policy-violating address.
-                for address in &addresses {
-                    self.policy.validate_ip(*address)?;
-                }
-                Ok(addresses)
+                addresses
             }
+        };
+        // Reject mixed public/private answers rather than allowing the
+        // connector to choose a policy-violating address.
+        let mut needed = false;
+        for address in &addresses {
+            needed |= self
+                .allowlist
+                .admit_answer(self.policy, admission, *address)?;
         }
+        Ok((addresses, needed))
     }
 }
 

@@ -8,7 +8,7 @@ use crate::{
     AgentConfig, AutomationsConfig, AutopilotConfig, ConfigValue, DEFAULT_BUILTINS,
     MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig,
     SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
-    WorktreesConfig,
+    WebConfig, WorktreesConfig,
 };
 
 use super::{Document, Entry, Header, Table, code_list, global_location, preamble};
@@ -20,7 +20,7 @@ const USAGE: &str = "To change a setting, copy its line into your caudra.toml un
      [table] header, remove the \"#\", and set your value. A value in angle brackets, such as \
      <string>, marks a setting that has no default.";
 const PROJECT_SCOPE: &str = "A project .caudra/caudra.toml takes the same settings, except \
-     [experimental], [automations], [agent.shell_env], and the ones marked global-only.";
+     [experimental], [automations], [agent.shell_env], [web], and the ones marked global-only.";
 const SHELL_ENV_ABOUT: &str = "Variables local shell commands receive beyond the fixed \
      allowlist. Only the global caudra.toml may hold this table.";
 const EXPERIMENTAL_ABOUT: &str = "Experimental features stay off until you turn them on, and each \
@@ -48,6 +48,9 @@ const AUTOMATIONS_ABOUT: &str = "Limits for automations, which need `automations
      [experimental]. Only the global caudra.toml may hold this table.";
 const AUTOPILOT_ABOUT: &str = "Limits for autopilot, which needs `autopilot = true` under \
      [experimental]. Only the global caudra.toml may hold this table.";
+const WEB_ABOUT: &str = "Private targets `webfetch` may reach in local sessions, besides the \
+     public internet. A redirect may lead to a listed target only from another one. Only the \
+     global caudra.toml may hold this table, and a change applies at once.";
 
 /// Every `caudra.toml` setting with its default, type, bounds, and
 /// environment variable.
@@ -148,6 +151,7 @@ fn tables() -> Vec<Table> {
         .about(AUTOMATIONS_ABOUT),
         Table::of(Header::Fixed("autopilot".into()), AutopilotConfig::FIELDS)
             .about(AUTOPILOT_ABOUT),
+        Table::of(Header::Fixed("web".into()), WebConfig::FIELDS).about(WEB_ABOUT),
         Table::new(Header::Fixed("plugins".into()), Vec::new()).about(plugins_about()),
     ]);
     tables.extend(
@@ -245,6 +249,7 @@ mod tests {
                 &config.telemetry,
                 &config.worktrees,
                 &config.automations,
+                &config.web,
                 &config.decisions,
                 &config.plugins,
             )
@@ -279,6 +284,7 @@ mod tests {
             &config.provider,
             &config.storage,
             &config.automations,
+            &config.web,
             &config.decisions,
         );
         let built_in = (
@@ -287,6 +293,7 @@ mod tests {
             &defaults.provider,
             &defaults.storage,
             &defaults.automations,
+            &defaults.web,
             &defaults.decisions,
         );
         assert_eq!(format!("{stated:?}"), format!("{built_in:?}"));

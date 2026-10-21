@@ -27,7 +27,7 @@ use caudra_config::config_file::{
     self, ConfigFileError, global_init_lua_path, project_init_lua_path,
 };
 use caudra_config::providers::slugify;
-use caudra_config::{AgentConfig, Config, Feature, FeatureDisabled, FeatureFlags, RawConfig};
+use caudra_config::{Config, Feature, FeatureDisabled, FeatureFlags, RawConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::accounts::{parse_account_overrides, set_process_selection};
 use caudra_storage::accounts::{AccountSelection, ensure_legacy_auth_migrated};
@@ -270,7 +270,7 @@ fn settings_reloader(
         let config = reload_settings(&startup, cwd, remote, &layers)
             .and_then(|settings| resolve_config(settings, &flags, cwd, remote))
             .map_err(|error| format!("{error:#}"))?;
-        configure_native_tools(&config.agent);
+        configure_native_tools(&config);
         Ok(config)
     })
 }
@@ -380,8 +380,10 @@ fn reconcile_worktrees(storage: &StateDir, cwd: &Path) -> Vec<String> {
 /// docs, so only `caudra-lua` can build it, and `caudra-docs` reads the user
 /// docs this binary embeds. A terminal host's skill, such as `herdr` or
 /// `orca`, exists only inside that host, the one place its CLI reaches a
-/// session.
-fn configure_native_tools(agent: &AgentConfig) {
+/// session. `[web]` reaches every local Workcell host's `webfetch` here too,
+/// so a reload applies it at once.
+fn configure_native_tools(config: &Config) {
+    let agent = &config.agent;
     if agent.builtin_skills.plugin_dev && agent.features.enabled(Feature::LuaPlugins) {
         install_builtin_skill(caudra_lua::docs_render::plugin_dev_skill());
     }
@@ -399,6 +401,7 @@ fn configure_native_tools(agent: &AgentConfig) {
         install_builtin_skill(host_skill(skill));
     }
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
+    caudra_workcell::configure_web(&config.web);
 }
 
 /// Points the temp-directory variables at Caudra's own scratch directory, so a

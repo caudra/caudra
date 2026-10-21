@@ -11,8 +11,8 @@ use url::Url;
 
 use crate::deadline::sleep_until_or_cancel;
 use crate::{
-    DnsResolver, HttpTransport, NetError, ProxyConfiguration, ReqwestTransport, RetryPolicy,
-    TokioDnsResolver, UrlPolicy,
+    DnsResolver, HttpTransport, NetError, PrivateAllowlist, ProxyConfiguration, ReqwestTransport,
+    RetryPolicy, TokioDnsResolver, UrlPolicy,
 };
 
 /// Largest request body [`HttpClient::request`] will send.
@@ -143,6 +143,7 @@ pub struct BoundedResponse {
 #[derive(Clone)]
 pub struct HttpClient {
     pub(crate) policy: UrlPolicy,
+    pub(crate) allowlist: Arc<PrivateAllowlist>,
     pub(crate) resolver: Arc<dyn DnsResolver>,
     pub(crate) transport: Arc<dyn HttpTransport>,
     pub(crate) proxy: ProxyConfiguration,
@@ -174,10 +175,20 @@ impl HttpClient {
     ) -> Self {
         Self {
             policy,
+            allowlist: Arc::default(),
             resolver,
             transport,
             proxy: ProxyConfiguration::direct(),
         }
+    }
+
+    /// Let hops reach the private targets `allowlist` names, on top of the
+    /// policy. A redirect may enter the list only from a hop the list itself
+    /// admitted, so a public page cannot bounce a request into it.
+    #[must_use]
+    pub fn with_private_allowlist(mut self, allowlist: Arc<PrivateAllowlist>) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// Route matching hops through an operator-configured outbound proxy.
@@ -203,7 +214,7 @@ impl HttpClient {
         value: &str,
         options: FetchOptions,
     ) -> Result<BoundedResponse, NetError> {
-        let url = self.policy.parse_url(value, None)?;
+        let url = self.policy.parse_syntax(value, None)?;
         self.get_url(url, options).await
     }
 
@@ -238,7 +249,7 @@ impl HttpClient {
     /// followed past `max_redirects` is an error. Only idempotent methods are
     /// retried.
     pub async fn request(&self, request: RequestSpec) -> Result<BoundedResponse, NetError> {
-        self.policy.validate_url(&request.url)?;
+        self.allowlist.validate_url(self.policy, &request.url)?;
         if let Some(length) = request
             .body
             .as_ref()

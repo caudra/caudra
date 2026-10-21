@@ -23,7 +23,8 @@ use caudra_config::{
     DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig,
     Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS,
     PERMISSIONS_FORMAT, ProviderConfig, RetentionConfig, SnapshotsConfig, SteeringConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WebConfig,
+    WorktreesConfig,
 };
 use caudra_lua::MANIFEST_FORMAT;
 use jiff::civil::{Date, date};
@@ -537,6 +538,48 @@ fn write_automations_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_web_section(out: &mut String) {
+    write_section(out, "[web]", WebConfig::FIELDS);
+    out.push_str(
+        "`webfetch` reaches only the public internet unless this table names private targets \
+         as well. It applies to local sessions. A [remote workspace](/docs/remote-workspaces/) \
+         or a [sandbox](/docs/sandboxes/) keeps the public-internet rule. Only the global \
+         `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that \
+         contains it, even an empty one, so a repository cannot point the model at your \
+         network.\n\n\
+         ```toml\n\
+         [web]\n\
+         allow_private_hosts = [\"100.64.0.2:8787\", \"localhost:3000\", \"[fd7a::1]:80\"]\n\
+         allow_private_networks = [\"tailscale\", \"10.20.0.0/16\"]\n\
+         ```\n\n\
+         An `allow_private_hosts` entry admits one host name or address on one port, whatever \
+         the name resolves to. An `allow_private_networks` entry admits any port, and a name \
+         only when every address it resolves to is public or inside a listed network. It takes \
+         a CIDR or one of these names:\n\n\
+         | Name | Addresses |\n\
+         |------|-----------|\n\
+         | `loopback` | `127.0.0.0/8` and `::1` |\n\
+         | `private` | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `fc00::/7` |\n\
+         | `cgnat` | `100.64.0.0/10` |\n\
+         | `tailscale` | `100.64.0.0/10` and `fd7a:115c:a1e0::/48` |\n\n\
+         No name covers link-local addresses, which hold the cloud metadata service at \
+         `169.254.169.254`. A CIDR can still name them. No entry admits an unspecified or a \
+         multicast address.\n\n\
+         An `http` URL to a listed target stays `http`, because a local server often has no \
+         certificate. Other `http` URLs are still upgraded to `https`. A redirect may lead to a \
+         listed target only from a URL the list admitted too, so a public page cannot send \
+         `webfetch` into your network. When a local `webfetch` refuses a private target, its \
+         error names the `HOST:PORT` to add to `allow_private_hosts` and links to this section, \
+         so the model can tell you what to change. The hint is the same whether or not this \
+         table exists.\n\n\
+         With a proxy set in `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`, a request to a listed \
+         target goes through the proxy unless `NO_PROXY` names its host. The proxy then \
+         resolves the name, so a special-use name such as `localhost` passes only through an \
+         `allow_private_hosts` entry. Each fetch reads the list once, when it starts, and an \
+         edit applies to the next fetch in every open session. See [Hot reload](#hot-reload).\n\n",
+    );
+}
+
 fn write_shell_env_section(out: &mut String) {
     write_section(out, "agent.shell_env", ShellEnvConfig::FIELDS);
     writeln!(
@@ -928,7 +971,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -1316,6 +1359,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_decisions_section(&mut out);
     write_automations_section(&mut out);
     write_autopilot_section(&mut out);
+    write_web_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

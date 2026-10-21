@@ -49,7 +49,7 @@ use std::fmt::Write;
 use std::future::Future;
 use std::mem;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use caudra_agent::decisions::{
@@ -79,7 +79,7 @@ use caudra_agent::{
     SharedBuf, ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput,
     SnapshotLine, SourceCodeGraphRow, TextOutput, TokenScale, ToolInput, ToolOutput,
 };
-use caudra_config::ShellNativeRedirect;
+use caudra_config::{ShellNativeRedirect, WebConfig, WebNetwork};
 use caudra_storage::StateDir;
 use caudra_storage::permission_state::{
     BROWSE_DIRECT, BROWSE_RECURSION_ATTRIBUTE, BROWSE_RECURSIVE,
@@ -95,6 +95,7 @@ use serde_json::{Value, json};
 use smol::Timer;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeInput, CodePools, WorkerSource};
@@ -123,7 +124,8 @@ use workcell::source_code_graph::{
     SourceCodeRefsOutput, crawl_filesystem_limits, fit, site_label,
 };
 use workcell::web::{
-    PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, ProxyConfigurationError, WebExecution,
+    PreparedWebfetch, PreparedWebsearch, PrivateAllowlist, PrivateHost, PrivateNetwork,
+    ProxyConfiguration, ProxyConfigurationError, SharedAllowlist, WebExecution, WebToolDependencies,
     WebToolGroup, WebfetchError, WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration,
     WebsearchInput, WebsearchOutput,
 };
@@ -243,6 +245,12 @@ const GIT_REPOSITORY_NO: &str = "no";
 const NOT_APPLIED: &str = "[not applied: nothing was written]";
 const DECISION_TOOL_META: &str = "tool";
 const SOURCE_CODE_CONTEXT_TOOL: &str = "source_code_context";
+const WEB_DOCS_URL: &str = "https://caudra.ai/docs/configuration/#web";
+const WEB_ENTRY_FALLBACK: &str = "its HOST:PORT";
+
+/// The `[web]` private targets every local host's `webfetch` reads. One list
+/// for the process, so a config reload reaches every session at once.
+static PRIVATE_WEB_TARGETS: LazyLock<SharedAllowlist> = LazyLock::new(SharedAllowlist::default);
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -481,10 +489,10 @@ impl WorkcellHost {
             inner: Arc::new(HostInner {
                 runtime,
                 projects: tokio::sync::Mutex::new(projects),
-                web: WebToolGroup::production_with_proxy(
+                web: WebToolGroup::with_dependencies(
                     WebsearchExecutionConfiguration::default(),
-                    SOURCE_ICONS_ENABLED,
-                    &proxy,
+                    WebToolDependencies::production_with_proxy(SOURCE_ICONS_ENABLED, &proxy)
+                        .with_private_allowlist(PRIVATE_WEB_TARGETS.clone()),
                 ),
                 code,
             }),
@@ -918,6 +926,33 @@ fn ambient_proxy() -> Result<ProxyConfiguration, ProxyConfigurationError> {
         first(PROXY_HTTPS_VARS).as_deref(),
         first(PROXY_ALL_VARS).as_deref(),
         first(PROXY_BYPASS_VARS).as_deref(),
+    )
+}
+
+/// Applies `[web]` to every local host's `webfetch`. A fetch already running
+/// keeps the list it started with.
+pub fn configure_web(config: &WebConfig) {
+    PRIVATE_WEB_TARGETS.replace(private_allowlist(config));
+}
+
+fn private_allowlist(config: &WebConfig) -> PrivateAllowlist {
+    PrivateAllowlist::new(
+        config
+            .allow_private_hosts
+            .iter()
+            .map(|entry| PrivateHost::new(entry.host.clone(), entry.port))
+            .collect(),
+        config
+            .allow_private_networks
+            .iter()
+            .map(|network| match *network {
+                WebNetwork::Loopback => PrivateNetwork::Loopback,
+                WebNetwork::Private => PrivateNetwork::Private,
+                WebNetwork::Cgnat => PrivateNetwork::Cgnat,
+                WebNetwork::Tailscale => PrivateNetwork::Tailscale,
+                WebNetwork::Range { network, prefix } => PrivateNetwork::Range { network, prefix },
+            })
+            .collect(),
     )
 }
 
@@ -3268,7 +3303,32 @@ fn filesystem_error(error: FilesystemError) -> ToolError {
 }
 
 fn webfetch_error(error: WebfetchError) -> ToolError {
-    ToolError::new(ToolFailure::from_code(error.code()), error.to_string())
+    let message = match &error {
+        WebfetchError::PrivateTarget {
+            url, redirected, ..
+        } => format!("{error}\n{}", private_target_hint(url, *redirected)),
+        _ => error.to_string(),
+    };
+    ToolError::new(ToolFailure::from_code(error.code()), message)
+}
+
+/// How the user can let a local `webfetch` reach a private target the
+/// public-internet rule refused. It names only the refused URL, so it reads the
+/// same whatever `[web]` holds.
+fn private_target_hint(url: &Url, redirected: bool) -> String {
+    let entry = url
+        .host_str()
+        .zip(url.port_or_known_default())
+        .map_or_else(|| WEB_ENTRY_FALLBACK.to_owned(), |(host, port)| format!("\"{host}:{port}\""));
+    if redirected {
+        format!(
+            "A redirect led to {url}. webfetch follows a redirect to a private target only when `[web]` admits both the target and the URL that redirected to it. Once the user adds {entry} to `allow_private_hosts` in the `[web]` table of their global caudra.toml, fetch {url} directly. See {WEB_DOCS_URL}"
+        )
+    } else {
+        format!(
+            "To let webfetch reach it, the user can add {entry} to `allow_private_hosts` in the `[web]` table of their global caudra.toml. A project .caudra/caudra.toml cannot hold it. See {WEB_DOCS_URL}"
+        )
+    }
 }
 
 fn shell_preparation_error(error: ShellPreparationError) -> ToolError {
@@ -9939,6 +9999,34 @@ mod tests {
         failure: ToolFailure,
     ) {
         assert_eq!(error.failure, failure);
+    }
+
+    const PRIVATE_REFUSAL: &str = "URL is blocked by network safety rules: non-public IP address is not allowed by policy: 100.64.0.3 (Shared)";
+    const PRIVATE_URL: &str = "http://100.64.0.3:8787/page";
+    const PRIVATE_ENTRY: &str = "\"100.64.0.3:8787\"";
+
+    #[test_case(false ; "requested")]
+    #[test_case(true ; "redirected")]
+    fn a_refused_private_target_says_how_to_list_it(redirected: bool) {
+        let error = webfetch_error(WebfetchError::PrivateTarget {
+            message: PRIVATE_REFUSAL.to_owned(),
+            url: Url::parse(PRIVATE_URL).unwrap(),
+            redirected,
+        });
+
+        assert_eq!(error.failure, ToolFailure::Denied);
+        let (refusal, hint) = error.message.split_once('\n').unwrap();
+        assert_eq!(refusal, PRIVATE_REFUSAL);
+        assert!(hint.contains(PRIVATE_ENTRY), "{hint}");
+        assert!(hint.ends_with(WEB_DOCS_URL), "{hint}");
+        assert_eq!(hint.contains(PRIVATE_URL), redirected, "{hint}");
+    }
+
+    #[test]
+    fn other_refusals_carry_no_web_hint() {
+        let error = webfetch_error(WebfetchError::Denied(PRIVATE_REFUSAL.to_owned()));
+
+        assert_eq!(error.message, PRIVATE_REFUSAL);
     }
 
     /// A host reports only that an operation was cancelled, so it is a timeout

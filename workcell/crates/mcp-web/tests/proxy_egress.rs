@@ -3,6 +3,7 @@
 //! fake proxy is a local listener, so nothing here needs DNS or real egress.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderValue, Method};
@@ -55,6 +56,7 @@ fn provider_request(url: &str) -> WebHttpRequest {
         max_redirects: 0,
         max_body_bytes: 1024,
         cancellation: CancellationToken::new(),
+        private: Arc::default(),
     }
 }
 

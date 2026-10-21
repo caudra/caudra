@@ -112,6 +112,7 @@ pub mod global_file;
 pub mod interpolation;
 pub mod mcp;
 pub mod migration;
+mod network;
 pub mod own_writes;
 pub mod profile_tools;
 pub mod providers;
@@ -119,6 +120,7 @@ pub mod sandbox;
 pub mod shell_env;
 pub mod steering;
 pub mod toml_document;
+pub mod web;
 pub mod workcell;
 
 pub use caudra_proxy::{ProxyEnv, ProxyRoute};
@@ -129,6 +131,7 @@ pub use profile_tools::{
     TOOL_POLICY_GROUPS, ToolPolicyGroup,
 };
 pub use steering::SteeringConfig;
+pub use web::{WebConfig, WebFileConfig, WebHost, WebNetwork};
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -647,6 +650,8 @@ pub enum ConfigError {
         "invalid project config: [autopilot] is global-only; move it to the global caudra.toml"
     )]
     ProjectAutopilot,
+    #[error("invalid project config: [web] is global-only; move it to the global caudra.toml")]
+    ProjectWeb,
     #[error(
         "invalid project config: [agent.shell_env] is global-only; move it to the global caudra.toml"
     )]
@@ -663,6 +668,8 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     Decisions(#[from] decisions::DecisionsConfigError),
+    #[error(transparent)]
+    Web(#[from] web::WebConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
     InvalidSteering { field: String, message: String },
     #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
@@ -798,6 +805,9 @@ pub struct RawConfig {
     pub project_autopilot_override: bool,
     #[serde(skip)]
     #[doc(hidden)]
+    pub project_web_override: bool,
+    #[serde(skip)]
+    #[doc(hidden)]
     pub project_shell_env_override: bool,
     #[serde(skip)]
     #[doc(hidden)]
@@ -817,6 +827,9 @@ pub struct RawConfig {
     /// `Some` for any `[autopilot]` table, even an empty one, so a project
     /// layer that holds one is refused.
     pub autopilot: Option<AutopilotFileConfig>,
+    /// `Some` for any `[web]` table, even an empty one, so a project layer
+    /// that holds one is refused.
+    pub web: Option<WebFileConfig>,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
@@ -833,6 +846,7 @@ impl RawConfig {
             overlay.project_automations_override || overlay.automations.is_some();
         self.project_autopilot_override |=
             overlay.project_autopilot_override || overlay.autopilot.is_some();
+        self.project_web_override |= overlay.project_web_override || overlay.web.is_some();
         let holds_shell_env = overlay.agent.shell_env.take().is_some();
         self.project_shell_env_override |= overlay.project_shell_env_override || holds_shell_env;
         let holds_cache_warming = overlay.agent.cache_warming.take().is_some();
@@ -890,6 +904,7 @@ impl RawConfig {
             .or(overlay.project_message_history_override);
         self.project_automations_override |= overlay.project_automations_override;
         self.project_autopilot_override |= overlay.project_autopilot_override;
+        self.project_web_override |= overlay.project_web_override;
         self.project_shell_env_override |= overlay.project_shell_env_override;
         self.project_cache_warming_override |= overlay.project_cache_warming_override;
         merge_option!(self, overlay, always_yolo, always_auto);
@@ -898,6 +913,9 @@ impl RawConfig {
         }
         if let Some(autopilot) = overlay.autopilot.take() {
             self.autopilot.get_or_insert_default().merge(autopilot);
+        }
+        if let Some(web) = overlay.web.take() {
+            self.web.get_or_insert_default().merge(web);
         }
         self.decisions.overlay(mem::take(&mut overlay.decisions));
         self.merge_shared(overlay);
@@ -932,6 +950,9 @@ impl RawConfig {
         }
         if self.project_autopilot_override {
             return Err(ConfigError::ProjectAutopilot);
+        }
+        if self.project_web_override {
+            return Err(ConfigError::ProjectWeb);
         }
         if self.project_shell_env_override {
             return Err(ConfigError::ProjectShellEnv);
@@ -970,6 +991,7 @@ impl RawConfig {
             worktrees: self.worktrees,
             automations: AutomationsConfig::from_file(self.automations.unwrap_or_default()),
             autopilot: AutopilotConfig::from_file(self.autopilot.unwrap_or_default()),
+            web: WebConfig::from_file(self.web.unwrap_or_default())?,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         };
@@ -2297,6 +2319,7 @@ pub struct Config {
     pub worktrees: WorktreesConfig,
     pub automations: AutomationsConfig,
     pub autopilot: AutopilotConfig,
+    pub web: WebConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -4697,6 +4720,11 @@ mod tests {
     const CUSTOM_TURNS_PER_HOUR: u32 = 30;
     const CUSTOM_UNATTENDED_TURNS: u32 = 50;
     const AUTOPILOT_TABLE: &str = "[autopilot]";
+    const WEB_TABLE: &str = "[web]";
+    const PRIVATE_HOSTS_ENTRY: &str = "allow_private_hosts = ['localhost:3000']";
+    const PRIVATE_NETWORKS_ENTRY: &str = "allow_private_networks = ['loopback']";
+    const PROJECT_WEB_ERROR: &str =
+        "invalid project config: [web] is global-only; move it to the global caudra.toml";
     const CUSTOM_AUTOPILOT_CONTINUATIONS: u32 = 40;
     const CUSTOM_AUTOPILOT_COST: f64 = 2.5;
     const DECISION_ENDPOINT_NAME: &str = "typesafe";
@@ -5056,6 +5084,45 @@ mod tests {
                 allow_private_network: true,
             }
         );
+    }
+
+    fn web_layer(options: &str) -> RawConfig {
+        toml::from_str(&format!("{WEB_TABLE}\n{options}")).unwrap()
+    }
+
+    #[test_case(""; "empty_table")]
+    #[test_case(PRIVATE_HOSTS_ENTRY; "hosts")]
+    #[test_case(PRIVATE_NETWORKS_ENTRY; "networks")]
+    fn project_layers_cannot_hold_web(options: &str) {
+        let mut raw = RawConfig::default();
+        raw.merge(web_layer(options));
+        let error = raw.into_config(false).err().expect("project [web] refused");
+        assert_eq!(error.to_string(), PROJECT_WEB_ERROR);
+    }
+
+    #[test]
+    fn global_layers_merge_web_key_by_key() {
+        let mut raw = web_layer(PRIVATE_HOSTS_ENTRY);
+        raw.merge_global(web_layer(PRIVATE_NETWORKS_ENTRY));
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().web,
+            WebConfig {
+                allow_private_hosts: vec![WebHost {
+                    host: url::Host::Domain("localhost".into()),
+                    port: 3000,
+                }],
+                allow_private_networks: vec![WebNetwork::Loopback],
+            }
+        );
+    }
+
+    #[test_case("allow_private_host = []", UNKNOWN_FIELD_ERROR; "unknown_field")]
+    #[test_case("allow_private_hosts = 'localhost:3000'", "expected a sequence"; "not_a_list")]
+    fn invalid_web_config_is_rejected(source: &str, expected: &str) {
+        let error = toml::from_str::<RawConfig>(&format!("{WEB_TABLE}\n{source}"))
+            .expect_err("invalid web option");
+        assert!(error.to_string().contains(expected), "{error}");
     }
 
     fn autopilot_layer(options: &str) -> RawConfig {
@@ -6295,6 +6362,7 @@ mod tests {
             worktrees: WorktreesConfig::default(),
             automations: AutomationsConfig::default(),
             autopilot: AutopilotConfig::default(),
+            web: WebConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };

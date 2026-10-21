@@ -130,7 +130,7 @@ fn runtime_resolver(
                 super::apply_startup_policy(&mut config, startup.features);
                 config.permissions.yolo |= config.always_yolo;
                 config.validate()?;
-                super::configure_native_tools(&config.agent);
+                super::configure_native_tools(&config);
                 super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
                 plugin_host.load_production_builtins(&config.plugins)?;
                 let seed_permission_mode = Some(super::permission_mode_seed(&config));
@@ -207,7 +207,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     config.validate()?;
     let (storage, _ephemeral_root) =
         super::run_storage(storage, cli.ephemeral || config.storage.ephemeral)?;
-    super::configure_native_tools(&config.agent);
+    super::configure_native_tools(&config);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 
     plugin_host

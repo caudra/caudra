@@ -442,7 +442,11 @@ impl WebToolGroup {
         input: WebfetchInput,
     ) -> Result<PreparedWebfetch, WebfetchError> {
         let input = validate_webfetch(input).map_err(WebfetchError::InvalidInput)?;
-        let input = fetch::normalize_input(input, self.dependencies.webfetch_policy)?;
+        let input = fetch::normalize_input(
+            input,
+            self.dependencies.webfetch_policy,
+            &self.dependencies.private_allowlist.current(),
+        )?;
         Ok(PreparedWebfetch {
             permission_url: input.url.to_string(),
             format: input.format,

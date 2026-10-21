@@ -9,8 +9,8 @@ use http::{HeaderMap, Method, StatusCode};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use workcell_net::{
-    FetchOptions, HttpClient, NetError, OperatorConfiguredPolicy, ProxyConfiguration, ProxyRoute,
-    ReqwestTransport, RetryPolicy, TokioDnsResolver, UrlPolicy,
+    FetchOptions, HttpClient, NetError, OperatorConfiguredPolicy, PrivateAllowlist,
+    ProxyConfiguration, ProxyRoute, ReqwestTransport, RetryPolicy, TokioDnsResolver, UrlPolicy,
 };
 
 /// Trust/policy mode for an injected HTTP request.
@@ -36,6 +36,8 @@ pub struct WebHttpRequest {
     pub max_redirects: usize,
     pub max_body_bytes: usize,
     pub cancellation: CancellationToken,
+    /// Private targets a `PublicGet` may reach. The other kinds ignore it.
+    pub private: Arc<PrivateAllowlist>,
 }
 
 impl fmt::Debug for WebHttpRequest {
@@ -95,6 +97,14 @@ pub enum WebHttpError {
     Timeout,
     #[error("network target was rejected: {0}")]
     Rejected(String),
+    /// The policy refused a private or special-use target, which a private
+    /// allowlist could admit. `redirect` is the target a redirect led to, and
+    /// `None` means the requested URL itself.
+    #[error("network target was rejected: {message}")]
+    NonPublicTarget {
+        message: String,
+        redirect: Option<Url>,
+    },
     #[error("provider redirect was rejected")]
     RedirectRejected,
     #[error("the outbound proxy refused the request")]
@@ -263,7 +273,13 @@ impl ProductionWebHttpTransport {
 impl WebHttpTransport for ProductionWebHttpTransport {
     async fn execute(&self, request: WebHttpRequest) -> Result<WebHttpResponse, WebHttpError> {
         match request.kind {
-            WebHttpRequestKind::PublicGet => Self::get(&self.public, request).await,
+            WebHttpRequestKind::PublicGet => {
+                let client = self
+                    .public
+                    .clone()
+                    .with_private_allowlist(Arc::clone(&request.private));
+                Self::get(&client, request).await
+            }
             WebHttpRequestKind::OperatorGet => Self::get(&self.operator, request).await,
             WebHttpRequestKind::PinnedProvider => self.pinned_provider(request).await,
         }
@@ -274,7 +290,19 @@ fn map_net_error(error: NetError) -> WebHttpError {
     match error {
         NetError::Cancelled => WebHttpError::Cancelled,
         NetError::Timeout => WebHttpError::Timeout,
-        NetError::Policy(error) => WebHttpError::Rejected(error.to_string()),
+        NetError::Policy(error) if error.is_non_public_target() => WebHttpError::NonPublicTarget {
+            message: error.to_string(),
+            redirect: None,
+        },
+        NetError::RedirectRefused { location, source } if source.is_non_public_target() => {
+            WebHttpError::NonPublicTarget {
+                message: source.to_string(),
+                redirect: Some(location),
+            }
+        }
+        NetError::Policy(error) | NetError::RedirectRefused { source: error, .. } => {
+            WebHttpError::Rejected(error.to_string())
+        }
         NetError::Proxy(_) => WebHttpError::ProxyRejected,
         _ => WebHttpError::RequestFailed,
     }

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, time::Duration};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -132,6 +132,7 @@ impl WebsearchProvider for KagiProvider {
                 max_redirects: 0,
                 max_body_bytes: MAX_RESPONSE_BYTES,
                 cancellation,
+                private: Arc::default(),
             })
             .await
             .map_err(|e| match transport_error(e, seconds) {

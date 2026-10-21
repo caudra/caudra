@@ -10,13 +10,13 @@ use http::header::HeaderName;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use test_case::test_case;
 use tokio_util::sync::CancellationToken;
-use url::Url;
+use url::{Host, Url};
 
 use crate::{
     BodyStream, DnsError, DnsResolver, FetchOptions, HttpClient, HttpTransport,
-    MAX_REQUEST_BODY_BYTES, NetError, OperatorConfiguredPolicy, ProxyConfiguration, RedirectScope,
-    RequestSpec, RetryPolicy, TransportError, TransportRequest, TransportResponse, TransportRoute,
-    UrlPolicy, UrlPolicyError,
+    MAX_REQUEST_BODY_BYTES, NetError, OperatorConfiguredPolicy, PrivateAllowlist, PrivateHost,
+    PrivateNetwork, ProxyConfiguration, RedirectScope, RequestSpec, RetryPolicy, TransportError,
+    TransportRequest, TransportResponse, TransportRoute, UrlPolicy, UrlPolicyError,
 };
 
 const API_HOST: &str = "api.example.com";
@@ -222,7 +222,7 @@ async fn rejects_redirect_to_private_literal_before_second_request() {
         client
             .get("https://example.com/start", FetchOptions::default())
             .await,
-        Err(NetError::Policy(UrlPolicyError::NonPublicIp { .. }))
+        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -312,7 +312,7 @@ async fn rejects_redirect_to_hostname_resolving_private_before_second_request() 
         client
             .get("https://public.example.com/start", FetchOptions::default())
             .await,
-        Err(NetError::Policy(UrlPolicyError::NonPublicIp { .. }))
+        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -978,7 +978,7 @@ async fn a_followed_307_hop_is_resolved_and_checked_again() {
 
     assert!(matches!(
         result,
-        Err(NetError::Policy(UrlPolicyError::NonPublicIp { .. }))
+        Err(NetError::RedirectRefused { source: UrlPolicyError::NonPublicIp { .. }, .. })
     ));
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
@@ -1344,4 +1344,133 @@ fn a_transport_request_debug_shows_no_path_query_header_value_body_or_address() 
     );
     assert!(!rendered.contains("secret"), "{rendered}");
     assert!(!rendered.contains(&address.to_string()), "{rendered}");
+}
+
+const LISTED_ADDRESS: &str = "100.64.0.2";
+const LISTED_PORT: u16 = 8787;
+const OTHER_LISTED_PORT: u16 = 8790;
+const LISTED_URL: &str = "http://100.64.0.2:8787/flag";
+const OTHER_LISTED_URL: &str = "http://100.64.0.2:8790/other";
+const UNLISTED_URL: &str = "http://100.64.0.3:8787/flag";
+const PUBLIC_HOST: &str = "example.com";
+const PUBLIC_URL: &str = "https://example.com/start";
+const LAN_NAME: &str = "nas.local";
+const LAN_URL: &str = "http://nas.local/";
+const LAN_ADDRESS: &str = "192.168.1.5";
+const UNLISTED_LAN_ADDRESS: &str = "10.9.9.9";
+
+/// A client that lists two tailnet ports and `networks`, with `nas.local`
+/// resolving to `lan` and `example.com` to a public address.
+fn allowlisted(
+    networks: Vec<PrivateNetwork>,
+    lan: &[&str],
+    responses: Vec<TransportResponse>,
+) -> (HttpClient, Arc<FakeTransport>) {
+    let mut dns = public_dns(&[PUBLIC_HOST]);
+    dns.answers.insert(
+        LAN_NAME.to_owned(),
+        lan.iter().map(|address| address.parse().unwrap()).collect(),
+    );
+    let (client, transport) = fixture(dns, responses);
+    let hosts = [LISTED_PORT, OTHER_LISTED_PORT]
+        .map(|port| PrivateHost::new(Host::parse(LISTED_ADDRESS).unwrap(), port))
+        .to_vec();
+    let allowlist = Arc::new(PrivateAllowlist::new(hosts, networks));
+    (client.with_private_allowlist(allowlist), transport)
+}
+
+/// What the public-internet rule says about `url`, the error a target the
+/// list does not admit must keep.
+fn public_refusal(url: &str) -> String {
+    NetError::from(
+        UrlPolicy::PublicInternet
+            .validate_url(&Url::parse(url).unwrap())
+            .unwrap_err(),
+    )
+    .to_string()
+}
+
+#[test_case(LISTED_URL, vec![empty(StatusCode::OK)], 1 ; "a listed host")]
+#[test_case(LISTED_URL, vec![redirect(StatusCode::FOUND, OTHER_LISTED_URL), empty(StatusCode::OK)], 2 ; "a listed host redirecting to another")]
+#[test_case(LISTED_URL, vec![redirect(StatusCode::FOUND, PUBLIC_URL), empty(StatusCode::OK)], 2 ; "a listed host redirecting to a public one")]
+#[test_case(LAN_URL, vec![empty(StatusCode::OK)], 1 ; "a name resolving into a listed network")]
+#[tokio::test]
+async fn the_allowlist_admits_listed_targets(
+    url: &str,
+    responses: Vec<TransportResponse>,
+    hops: usize,
+) {
+    let (client, transport) = allowlisted(vec![PrivateNetwork::Private], &[LAN_ADDRESS], responses);
+    let response = client.get(url, FetchOptions::default()).await.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(transport.requests.lock().unwrap().len(), hops);
+}
+
+#[test_case(UNLISTED_URL, vec![], UNLISTED_URL, 0 ; "an unlisted private host")]
+#[test_case(LISTED_URL, vec![redirect(StatusCode::FOUND, UNLISTED_URL)], UNLISTED_URL, 1 ; "a listed host redirecting to an unlisted one")]
+#[test_case(PUBLIC_URL, vec![redirect(StatusCode::FOUND, LISTED_URL)], LISTED_URL, 1 ; "a public host redirecting into the list")]
+#[test_case(LISTED_URL, vec![redirect(StatusCode::FOUND, PUBLIC_URL), redirect(StatusCode::FOUND, OTHER_LISTED_URL)], OTHER_LISTED_URL, 2 ; "back into the list after a public hop")]
+#[tokio::test]
+async fn the_allowlist_refuses_with_the_public_rules_error(
+    url: &str,
+    responses: Vec<TransportResponse>,
+    refused: &str,
+    hops: usize,
+) {
+    let (client, transport) = allowlisted(vec![PrivateNetwork::Private], &[LAN_ADDRESS], responses);
+    let error = client
+        .get(url, FetchOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), public_refusal(refused));
+    let location = match &error {
+        NetError::RedirectRefused { location, .. } => Some(location.clone()),
+        _ => None,
+    };
+    assert_eq!(location, (hops > 0).then(|| Url::parse(refused).unwrap()));
+    assert_eq!(transport.requests.lock().unwrap().len(), hops);
+}
+
+#[tokio::test]
+async fn a_name_with_an_unlisted_private_answer_is_refused() {
+    let (client, transport) = allowlisted(
+        vec![PrivateNetwork::Range {
+            network: "192.168.0.0".parse().unwrap(),
+            prefix: 16,
+        }],
+        &[LAN_ADDRESS, UNLISTED_LAN_ADDRESS],
+        vec![empty(StatusCode::OK)],
+    );
+    let error = client
+        .get(LAN_URL, FetchOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NetError::Policy(UrlPolicyError::NonPublicIp { address, .. })
+                if address == UNLISTED_LAN_ADDRESS.parse::<IpAddr>().unwrap()
+        ),
+        "{error}"
+    );
+    assert!(transport.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_proxied_special_use_name_stays_refused_under_networks_alone() {
+    let (client, transport) = allowlisted(
+        vec![PrivateNetwork::Private],
+        &[LAN_ADDRESS],
+        vec![empty(StatusCode::OK)],
+    );
+    let proxy =
+        ProxyConfiguration::from_values(None, None, Some("http://proxy.internal:8080"), None)
+            .unwrap();
+    let error = client
+        .with_proxy(proxy)
+        .get(LAN_URL, FetchOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), public_refusal(LAN_URL));
+    assert!(transport.requests.lock().unwrap().is_empty());
 }

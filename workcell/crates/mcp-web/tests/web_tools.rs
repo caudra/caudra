@@ -16,7 +16,8 @@ use test_case::test_case;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
     NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
-    PreparedWebOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, UrlPolicy,
+    PreparedWebOperation, PrivateAllowlist, PrivateHost, PrivateNetwork,
+    STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, SharedAllowlist, UrlPolicy,
     WebExecution, WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution,
     WebToolGroup, WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
     WebsearchBackend, WebsearchConfigurationIssue, WebsearchConfigurationSource,
@@ -1385,6 +1386,135 @@ async fn webfetch_failures_carry_the_code_of_their_cause() {
         assert_eq!(webfetch_error(&group, url).await.code(), code, "{url}");
     }
     assert_eq!(http.requests().len(), 6);
+}
+
+const LISTED_URL: &str = "http://100.64.0.2:8787/flag";
+const UNLISTED_URL: &str = "http://100.64.0.3:8787/flag";
+const CGNAT_URL: &str = "http://100.64.0.9:8080/page";
+const FIXTURE_HTTP_URL: &str = "http://example.test/page";
+const FIXTURE_HTTPS_URL: &str = "https://example.test/page";
+const LISTED_BODY: &[u8] = b"tailnet page";
+
+fn tailnet_allowlist(networks: Vec<PrivateNetwork>) -> SharedAllowlist {
+    let shared = SharedAllowlist::default();
+    shared.replace(PrivateAllowlist::new(
+        vec![PrivateHost::new(
+            url::Host::parse("100.64.0.2").unwrap(),
+            8787,
+        )],
+        networks,
+    ));
+    shared
+}
+
+fn allowlisted_group(http: Arc<FakeHttp>, allowlist: SharedAllowlist) -> WebToolGroup {
+    WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http, Arc::new(FakeIcons::default()), default_pdf())
+            .with_private_allowlist(allowlist),
+    )
+}
+
+fn text_input(url: &str) -> WebfetchInput {
+    WebfetchInput {
+        url: url.into(),
+        format: WebfetchFormat::Text,
+        pdf_mode: WebfetchPdfMode::Extract,
+        timeout: None,
+    }
+}
+
+#[test_case(LISTED_URL, LISTED_URL ; "a listed host keeps http")]
+#[test_case(CGNAT_URL, CGNAT_URL ; "an address in a listed network keeps http")]
+#[test_case(FIXTURE_HTTP_URL, FIXTURE_HTTPS_URL ; "any other target is upgraded")]
+#[tokio::test]
+async fn webfetch_reaches_listed_private_targets_over_plain_http(url: &str, requested: &str) {
+    let http = Arc::new(FakeHttp::with_responses(vec![Ok(response(
+        requested,
+        StatusCode::OK,
+        Some("text/plain"),
+        Bytes::from_static(LISTED_BODY),
+    ))]));
+    let group = allowlisted_group(http.clone(), tailnet_allowlist(vec![PrivateNetwork::Cgnat]));
+    let result = group
+        .webfetch(text_input(url), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.output.output.as_bytes(), LISTED_BODY);
+    let request = &http.requests()[0];
+    assert_eq!(request.url.as_str(), requested);
+    assert_eq!(request.kind, WebHttpRequestKind::PublicGet);
+    assert!(!request.private.is_empty());
+}
+
+#[tokio::test]
+async fn webfetch_refuses_an_unlisted_private_host_as_it_does_without_a_list() {
+    let listed = allowlisted_group(Arc::default(), tailnet_allowlist(Vec::new()));
+    let unlisted = allowlisted_group(Arc::default(), SharedAllowlist::default());
+    assert_eq!(
+        webfetch_error(&listed, UNLISTED_URL).await.to_string(),
+        webfetch_error(&unlisted, UNLISTED_URL).await.to_string()
+    );
+    assert_eq!(
+        webfetch_error(&listed, UNLISTED_URL).await.code(),
+        WEB_REQUEST_DENIED_CODE
+    );
+}
+
+#[tokio::test]
+async fn webfetch_names_a_refused_private_target_as_requested() {
+    let group = allowlisted_group(Arc::default(), SharedAllowlist::default());
+    let error = webfetch_error(&group, UNLISTED_URL).await;
+    assert!(
+        matches!(
+            &error,
+            WebfetchError::PrivateTarget { url, redirected: false, .. } if url.as_str() == UNLISTED_URL
+        ),
+        "{error:?}"
+    );
+}
+
+#[test_case(LISTED_URL, Some(UNLISTED_URL), UNLISTED_URL, true ; "a_redirect_target")]
+#[test_case(FIXTURE_HTTP_URL, None, FIXTURE_HTTP_URL, false ; "a_name_resolving_private_keeps_its_requested_port")]
+#[tokio::test]
+async fn webfetch_names_the_private_target_the_transport_refused(
+    requested: &str,
+    redirect: Option<&str>,
+    refused: &str,
+    redirected_to: bool,
+) {
+    let http = Arc::new(FakeHttp::with_responses(vec![Err(
+        WebHttpError::NonPublicTarget {
+            message: UNLISTED_URL.to_owned(),
+            redirect: redirect.map(|url| url::Url::parse(url).unwrap()),
+        },
+    )]));
+    let group = allowlisted_group(http, tailnet_allowlist(Vec::new()));
+    let error = webfetch_error(&group, requested).await;
+    assert_eq!(error.code(), WEB_REQUEST_DENIED_CODE);
+    assert!(
+        matches!(
+            &error,
+            WebfetchError::PrivateTarget { url, redirected, .. }
+                if url.as_str() == refused && *redirected == redirected_to
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn webfetch_refuses_a_target_removed_from_the_list_after_it_was_prepared() {
+    let http = Arc::new(FakeHttp::default());
+    let allowlist = tailnet_allowlist(Vec::new());
+    let group = allowlisted_group(http.clone(), allowlist.clone());
+    let prepared = group.prepare_webfetch(text_input(LISTED_URL)).unwrap();
+    allowlist.replace(PrivateAllowlist::default());
+    let error = group
+        .execute_webfetch(prepared, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), WEB_REQUEST_DENIED_CODE);
+    assert!(http.requests().is_empty());
 }
 
 #[tokio::test]
