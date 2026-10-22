@@ -64,6 +64,8 @@ const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host ro
 /// The checker's builtins lack `PermissionError`, which a refused host call raises, so a snippet that
 /// catches it would be rejected before it ran.
 const JAVASCRIPT_GUIDANCE: &str = "This looks like JavaScript, and `code` runs Python. Rewrite it in Python: `await` each call, and use `asyncio.gather` for several at once.";
+const UNTRANSLATED_OPENING: &str = "It was not translated:";
+const UNTRANSLATED_CLOSING: &str = "has no Python form that keeps its meaning.";
 const HOSTED_STUBS_PRELUDE: &str = "class PermissionError(Exception): ...\n";
 /// The checker reads the body as reachable and the interpreter skips it, so a snippet under it is
 /// checked without running.
@@ -211,6 +213,9 @@ pub struct HostedExecution {
     /// The snippet with only the changes that undid the caller's own slips, line for line with
     /// what it sent, so the caller can see what it should have written.
     pub taught_code: Option<String>,
+    /// The Python that ran, when the snippet was JavaScript translated to it. Line numbers in the
+    /// run's output refer to it.
+    pub ran_as: Option<String>,
 }
 
 impl CodeToolGroup {
@@ -244,11 +249,13 @@ impl CodeToolGroup {
         let stubs = host.stubs();
         let looked_like_javascript = looks_like_javascript(&prepared.code);
         let repaired = repair(prepared.code, &stubs);
-        let javascript = looked_like_javascript && !reads_as_python(&repaired.code);
+        let javascript = (looked_like_javascript || repaired.untranslated.is_some())
+            && !reads_as_python(&repaired.code);
         let prelude = Prelude {
             imports: repaired.imports(),
             settles: repaired.settles(),
         };
+        let ran_as = repaired.translated().then(|| repaired.code.clone());
         let prepared = PreparedCode {
             code: repaired.code,
             ..prepared
@@ -262,6 +269,7 @@ impl CodeToolGroup {
                 state_note: None,
                 repairs: Vec::new(),
                 taught_code: None,
+                ran_as: None,
             },
             executed = self.run_hosted(
                 prepared,
@@ -277,7 +285,21 @@ impl CodeToolGroup {
             && execution.output.outcome == Outcome::Rejected
         {
             let diagnostic = execution.output.diagnostic.take().unwrap_or_default();
-            execution.output.diagnostic = Some(format!("{JAVASCRIPT_GUIDANCE}\n{diagnostic}"));
+            let reason = repaired
+                .untranslated
+                .as_ref()
+                .map(|refusal| {
+                    format!(
+                        " {UNTRANSLATED_OPENING} {} on line {} {UNTRANSLATED_CLOSING}",
+                        refusal.construct, refusal.line
+                    )
+                })
+                .unwrap_or_default();
+            execution.output.diagnostic =
+                Some(format!("{JAVASCRIPT_GUIDANCE}{reason}\n{diagnostic}"));
+        }
+        if executed.execution.is_some() {
+            executed.ran_as = ran_as;
         }
         executed.repairs = repaired
             .repairs
@@ -290,7 +312,8 @@ impl CodeToolGroup {
                 | Repair::Unpacked(_)
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn
-                | Repair::Settled => true,
+                | Repair::Settled
+                | Repair::Translated => true,
             })
             .collect();
         executed.taught_code = repaired.taught;
@@ -328,6 +351,7 @@ impl CodeToolGroup {
                 state_note: note,
                 repairs: Vec::new(),
                 taught_code: None,
+                ran_as: None,
             };
 
         if type_check
@@ -411,6 +435,7 @@ impl CodeToolGroup {
                     state_note: note,
                     repairs: Vec::new(),
                     taught_code: None,
+                    ran_as: None,
                 };
             }
         };
@@ -436,6 +461,7 @@ impl CodeToolGroup {
             state_note: note,
             repairs: Vec::new(),
             taught_code: None,
+            ran_as: None,
         }
     }
 

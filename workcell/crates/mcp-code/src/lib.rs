@@ -18,6 +18,7 @@ mod catalog;
 mod diagnose;
 mod group;
 mod hosted;
+mod javascript;
 mod render;
 mod repair;
 mod subset;

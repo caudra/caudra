@@ -14,6 +14,7 @@ use ruff_python_parser::{parse_module, parse_unchecked_source};
 use ruff_text_size::{Ranged, TextRange};
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::javascript::{self, Untranslated};
 use crate::subset::SUBSET_MODULES;
 
 const FENCE: &str = "```";
@@ -97,6 +98,8 @@ pub enum Repair {
     /// `asyncio.gather(..., return_exceptions=...)` was rewritten to run without the keyword.
     // MONTY-GATHER-SHIM: remove with the rest of the shim; see `SETTLED_HELPER`.
     Settled,
+    /// The snippet was JavaScript, and ran as the Python it translates to.
+    Translated,
 }
 
 impl Repair {
@@ -124,6 +127,10 @@ impl Repair {
             )),
             Self::FinalReturn => Some(
                 "a snippet is module code, so end on the expression rather than `return` it"
+                    .to_owned(),
+            ),
+            Self::Translated => Some(
+                "snippets are Python: it ran as the Python shown, so write Python next time"
                     .to_owned(),
             ),
             Self::Settled => None,
@@ -156,6 +163,7 @@ impl fmt::Display for Repair {
             Self::Settled => {
                 formatter.write_str("ran `asyncio.gather` without `return_exceptions`")
             }
+            Self::Translated => formatter.write_str("ran the JavaScript as Python"),
         }
     }
 }
@@ -164,8 +172,11 @@ pub(crate) struct Repaired {
     pub(crate) code: String,
     pub(crate) repairs: Vec<Repair>,
     /// The snippet with only the changes that undid the model's own slips, line for line with what
-    /// it wrote, so it can see what it should have written. `None` when no such change touched it.
+    /// it wrote, so it can see what it should have written. `None` when no such change touched it,
+    /// and always for a translated snippet, which is shown whole instead.
     pub(crate) taught: Option<String>,
+    /// Why a snippet that is JavaScript was not translated.
+    pub(crate) untranslated: Option<Untranslated>,
 }
 
 impl Repaired {
@@ -180,7 +191,8 @@ impl Repaired {
                 | Repair::Unpacked(_)
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn
-                | Repair::Settled => None,
+                | Repair::Settled
+                | Repair::Translated => None,
             })
             .collect()
     }
@@ -190,19 +202,43 @@ impl Repaired {
     pub(crate) fn settles(&self) -> bool {
         self.repairs.contains(&Repair::Settled)
     }
+
+    /// Whether the snippet was JavaScript, so its code is the Python it translates to.
+    pub(crate) fn translated(&self) -> bool {
+        self.repairs.contains(&Repair::Translated)
+    }
 }
 
 /// Repairs `code`, whose host declares its functions in `stubs`. Every repair finds its slip in
 /// the parser's tree, and the parser reads the result again: a stage whose result it cannot read
-/// whole is dropped, so a repair never leaves a snippet worse than it came.
+/// whole is dropped, so a repair never leaves a snippet worse than it came. JavaScript the syntax
+/// stage leaves unreadable is translated whole, and the later stages run on its Python.
 pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
     let stubs = StubIndex::of(stubs);
     let (code, mut repairs) = syntax_repaired(code, &stubs);
-    let syntax_taught = (!repairs.is_empty()).then(|| code.clone());
+    let mut untranslated = None;
+    let code = if reads_as_python(&code) {
+        code
+    } else {
+        match javascript::translated(&code, &stubs) {
+            Ok(python) if reads_as_python(&python) => {
+                repairs = vec![Repair::Translated];
+                python
+            }
+            Ok(_) => code,
+            Err(refusal) => {
+                untranslated = refusal.is_javascript().then_some(refusal);
+                code
+            }
+        }
+    };
+    let translated = repairs.contains(&Repair::Translated);
+    let syntax_taught = (!translated && !repairs.is_empty()).then(|| code.clone());
     let unedited = |code: String, repairs: Vec<Repair>| Repaired {
         code,
         repairs,
         taught: syntax_taught.clone(),
+        untranslated: untranslated.clone(),
     };
     let Some(tree) = parse(&code).filter(|tree| !tree.root_node().has_error()) else {
         return unedited(code, repairs);
@@ -261,7 +297,8 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
     Repaired {
         code: repaired,
         repairs,
-        taught: taught.or(syntax_taught),
+        taught: taught.filter(|_| !translated).or(syntax_taught),
+        untranslated,
     }
 }
 
@@ -809,7 +846,7 @@ fn parse(code: &str) -> Option<Tree> {
 /// What the host's stubs declare, as the parser reads them: the names a snippet starts with, and
 /// the calls among them that answer at once, as `help` or `mcp.search`.
 #[derive(Default)]
-struct StubIndex {
+pub(crate) struct StubIndex {
     /// Top-level functions and namespaces.
     names: HashSet<String>,
     /// Namespaces, as `gh` in `gh: _Gh`.
@@ -819,11 +856,20 @@ struct StubIndex {
 }
 
 impl StubIndex {
-    fn is_host(&self, name: &str) -> bool {
+    pub(crate) fn is_host(&self, name: &str) -> bool {
         self.names.contains(name)
     }
 
-    fn of(stubs: &str) -> Self {
+    pub(crate) fn is_namespace(&self, name: &str) -> bool {
+        self.namespaces.contains(name)
+    }
+
+    /// Whether `qualified`, as `help` or `gh.nope`, answers at once rather than when awaited.
+    pub(crate) fn is_immediate(&self, qualified: &str) -> bool {
+        self.immediate.contains(qualified)
+    }
+
+    pub(crate) fn of(stubs: &str) -> Self {
         let mut index = Self::default();
         let Some(tree) = parse(stubs) else {
             return index;
@@ -999,6 +1045,7 @@ mod tests {
     const MAX_STRAYS_PER_FILE: usize = 40;
     const STRAY_WIDTHS: [usize; 2] = [1, 4];
     const STUBS: &str = "class _Gh:\n    async def list(self) -> list[str]: ...\n    def nope(self) -> int: ...\ngh: _Gh\ndef search(query: str) -> list[str]: ...\ndef servers() -> list[str]: ...\nasync def resources(server: str) -> list[str]: ...\n";
+    const SWITCH: &str = "`switch`";
 
     fn repaired(code: &str) -> Repaired {
         repair(code.to_owned(), STUBS)
@@ -1129,6 +1176,7 @@ mod tests {
     #[test_case(Repair::FinalReturn, true ; "final_return")]
     #[test_case(Repair::Dedented, true ; "dedented")]
     #[test_case(Repair::Settled, false ; "settled")]
+    #[test_case(Repair::Translated, true ; "translated")]
     fn only_slips_carry_a_lesson(repair: Repair, teaches: bool) {
         assert_eq!(repair.lesson().is_some(), teaches);
     }
@@ -1214,6 +1262,42 @@ mod tests {
             ]
         );
         assert_eq!(repaired.taught.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn javascript_the_syntax_stage_makes_python_is_not_translated() {
+        assert_eq!(
+            repaired("const r = await gh.list(); r").repairs,
+            [Repair::Undeclared("const")]
+        );
+    }
+
+    #[test]
+    fn javascript_is_translated_whole_then_repaired_further() {
+        let repaired = repaired("const r = await gh.nope();\nconst a = r.length > 0 ? 1 : 2;");
+        assert_eq!(repaired.code, "r = gh.nope()\na = 1 if len(r) > 0 else 2");
+        assert_eq!(
+            repaired.repairs,
+            [Repair::Translated, Repair::Unawaited("gh.nope".to_owned())]
+        );
+        assert!(repaired.translated());
+        assert_eq!(repaired.taught, None);
+    }
+
+    #[test_case("results = await gh.list(", None ; "broken_python")]
+    #[test_case("x = 1;;", None ; "python_with_a_stray_semicolon")]
+    #[test_case("const xs = [1];\nswitch (xs) {}", Some(SWITCH) ; "javascript_outside_the_subset")]
+    fn code_that_is_not_translated_is_left_alone(code: &str, construct: Option<&str>) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+        assert_eq!(
+            repaired
+                .untranslated
+                .map(|refusal| refusal.construct.to_string())
+                .as_deref(),
+            construct
+        );
     }
 
     /// The model is shown what it should have written, never the interpreter's own workaround.

@@ -1,0 +1,1 @@
+const results = await Promise.all([executor.search({query:'', limit:5}), executor.search({query:'', namespace:'executor', limit:5})]); return results.map(r => ({items:r.items, namespaces:r.namespaces, unavailableApps:r.unavailableApps}));

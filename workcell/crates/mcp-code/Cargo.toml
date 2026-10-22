@@ -26,6 +26,7 @@ tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 tree-sitter.workspace = true
 tree-sitter-python.workspace = true
+tree-sitter-typescript.workspace = true
 workcell-tool-contract.workspace = true
 workcell-monty-worker = { workspace = true, optional = true }
 

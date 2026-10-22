@@ -24,10 +24,11 @@ const DENIED: &str = "denied by the user";
 const SLOW_REPLY: &str = "answered late";
 const HOME_ASSISTANT: &str = "homeassistant";
 const EXECUTOR: &str = "executor";
+const SEARCH: &str = "search";
 const MISSING_LIST: &str = "Shopping list";
 const NO_SUCH_LIST: &str = "no such list";
 /// Declared as Caudra's gateway declares them: a tool takes keywords, or one dict of them.
-const STUBS: &str = "from typing import Any, overload\nclass _Gh:\n    @overload\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    @overload\n    async def list(self, arguments: dict[str, Any], /) -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\nclass _Homeassistant:\n    async def homeassistant__GetLiveContext(self) -> Any: ...\n    async def llm__GetDateTime(self) -> Any: ...\n    async def todo__get_items(self, *, todo_list: str, status: str | None = None) -> Any: ...\nhomeassistant: _Homeassistant\nclass _Executor:\n    @overload\n    async def skills(self) -> Any: ...\n    @overload\n    async def skills(self, arguments: dict[str, Any], /) -> Any: ...\nexecutor: _Executor\ndef search(query: str) -> list[str]: ...\n";
+const STUBS: &str = "from typing import Any, overload\nclass _Gh:\n    @overload\n    async def list(self, *, owner: str = '') -> dict[str, Any]: ...\n    @overload\n    async def list(self, arguments: dict[str, Any], /) -> dict[str, Any]: ...\n    async def echo(self, value: Any, *, nested: Any) -> Any: ...\n    async def boom(self) -> Any: ...\n    async def hang(self) -> Any: ...\n    async def slow(self) -> str: ...\ngh: _Gh\nclass _Homeassistant:\n    async def homeassistant__GetLiveContext(self) -> Any: ...\n    async def llm__GetDateTime(self) -> Any: ...\n    async def todo__get_items(self, *, todo_list: str, status: str | None = None) -> Any: ...\nhomeassistant: _Homeassistant\nclass _Executor:\n    @overload\n    async def skills(self) -> Any: ...\n    @overload\n    async def skills(self, arguments: dict[str, Any], /) -> Any: ...\n    async def search(self, *, query: str = '', namespace: str = '', limit: int = 0) -> Any: ...\nexecutor: _Executor\ndef search(query: str) -> list[str]: ...\n";
 const HOSTED_SUSPENSION_LIMIT_MESSAGE: &str = "The snippet made too many host round trips and was stopped. Batch work into fewer calls, and check for an undefined name read inside a loop.";
 const SHORT_TIMEOUT_SECS: u64 = 1;
 const TIME_LIMIT_TEST_DEADLINE: Duration = Duration::from_secs(10);
@@ -127,6 +128,7 @@ impl CodeHost for FakeHost {
                     Err(HostError::new(HostErrorKind::Runtime, NO_SUCH_LIST))
                 }
                 "hang" => std::future::pending().await,
+                SEARCH => Ok(search_answer()),
                 "slow" => {
                     tokio::time::sleep(HOST_DELAY).await;
                     Ok(json!(SLOW_REPLY))
@@ -173,6 +175,11 @@ impl CodeHost for BareHost {
     fn stubs(&self) -> String {
         String::new()
     }
+}
+
+/// What `executor.search` answers, whatever it is asked.
+fn search_answer() -> Value {
+    json!({"items": [{"name": "skill"}], "namespaces": [EXECUTOR], "unavailableApps": []})
 }
 
 async fn run(
@@ -576,9 +583,20 @@ for r in results:
     else:
         print(r)"#;
 const FIELD_EMPTY_DICT: &str = "await executor.skills({})";
-const FIELD_JAVASCRIPT: &str = "const results = await Promise.all([executor.search({query:'', limit:5}), executor.search({query:'', namespace:'executor', limit:5})]); return results.map(r => ({items:r.items, namespaces:r.namespaces, unavailableApps:r.unavailableApps}));";
-const JAVASCRIPT: &str = "looks like JavaScript";
+const FIELD_JAVASCRIPT: &str = include_str!("fixtures/field_javascript.js");
+const FIELD_JAVASCRIPT_PYTHON: &str = include_str!("fixtures/field_javascript.py");
+const JAVASCRIPT_SWITCH: &str =
+    "const r = await gh.list({owner: 'a'});\nswitch (r.owner) { case 'a': console.log(1); }";
+const SWITCH_UNTRANSLATED: &str =
+    "It was not translated: `switch` on line 2 has no Python form that keeps its meaning.";
+/// A wrong argument on the snippet's fifth line, which is the fourth of the Python that ran.
+const JAVASCRIPT_WRONG_ARGUMENT: &str = "const r = await gh.list({owner: 'a'});\nif (r.owner === 'a') {\n  console.log(r.owner);\n}\nawait gh.list({owner: 1});";
+const WRONG_ARGUMENT_LINE: usize = 4;
+const WRONG_ARGUMENT_PYTHON: &str = "await gh.list(owner=1)";
 const TOP_LEVEL_RETURN: &str = "module code, not a function body";
+const JAVASCRIPT_STRINGIFY: &str = "const r = await gh.list({owner: 'é'});\nif (r.owner === 'é') {\n  console.log(JSON.stringify(r));\n}\nreturn JSON.stringify(r, null, 2);";
+const STRINGIFIED_COMPACT: &str = "{\"owner\":\"é\"}\n";
+const STRINGIFIED_INDENTED: &str = "{\n  \"owner\": \"é\"\n}";
 
 /// Snippets models wrote against real servers that failed before Caudra repaired or explained
 /// them, verbatim. A failure seen in the field goes here first, with what it should do now.
@@ -603,7 +621,7 @@ async fn field_snippets_now_run(code: &str, repairs: &[Repair], shows: &str) {
     group.shutdown().await;
 }
 
-#[test_case(FIELD_JAVASCRIPT, JAVASCRIPT ; "javascript")]
+#[test_case(JAVASCRIPT_SWITCH, SWITCH_UNTRANSLATED ; "javascript_outside_the_subset")]
 #[test_case("if True:\n    return 1\n2", TOP_LEVEL_RETURN ; "a_return_before_the_end")]
 #[tokio::test(flavor = "multi_thread")]
 async fn field_snippets_that_cannot_run_say_why(code: &str, explained_by: &str) {
@@ -613,6 +631,66 @@ async fn field_snippets_that_cannot_run_say_why(code: &str, explained_by: &str) 
     assert_eq!(outcome(&executed), Outcome::Rejected);
     let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
     assert!(diagnostic.contains(explained_by), "{diagnostic}");
+    assert!(host.calls().is_empty());
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn field_javascript_runs_as_the_python_it_translates_to() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, FIELD_JAVASCRIPT, None).await;
+    assert_eq!(
+        outcome(&executed),
+        Outcome::Completed,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(host.calls(), [SEARCH, SEARCH]);
+    assert_eq!(executed.repairs, [Repair::Translated]);
+    assert_eq!(executed.taught_code, None);
+    assert_eq!(
+        executed.ran_as.as_deref(),
+        Some(FIELD_JAVASCRIPT_PYTHON.trim_end())
+    );
+    assert_eq!(
+        result(&executed),
+        &json!([search_answer(), search_answer()])
+    );
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn translated_json_stringify_writes_the_text_javascript_does() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, JAVASCRIPT_STRINGIFY, None).await;
+    assert_eq!(
+        output(&executed).stdout,
+        STRINGIFIED_COMPACT,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(result(&executed), &json!(STRINGIFIED_INDENTED));
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_translated_snippet_reports_lines_of_the_python_that_ran() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, JAVASCRIPT_WRONG_ARGUMENT, None).await;
+    assert_eq!(outcome(&executed), Outcome::Rejected);
+    let ran_as = executed.ran_as.as_deref().expect("translated");
+    assert_eq!(
+        ran_as.lines().nth(WRONG_ARGUMENT_LINE - 1),
+        Some(WRONG_ARGUMENT_PYTHON)
+    );
+    let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
+    assert!(
+        diagnostic.contains(&format!("snippet.py:{WRONG_ARGUMENT_LINE}:")),
+        "{diagnostic}"
+    );
     assert!(host.calls().is_empty());
     group.shutdown().await;
 }
