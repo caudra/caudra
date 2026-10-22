@@ -159,7 +159,7 @@ Every turn re-sends the conversation, so a noisy result costs tokens again on ev
 - **Fewer, smaller turns.** Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.
 - **MCP servers through Python.** The model reaches your MCP servers by writing Python in its one `code` tool. A snippet calls several tools at once and filters their results before the model reads anything, and a server that connects or changes its tools never changes the tool definitions, so the prompt cache holds.
 
-Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model. Opt-in [cache warming](https://caudra.ai/docs/token-economy/#cache-warming) keeps the Anthropic prompt cache alive while a long tool runs, and `/usage` shows what it would save before you turn it on. In the creator's daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](https://github.com/redhat-et/ripwire).
+A tool card that loads text into the context says about how many tokens it adds, [counted with what Caudra learned](https://caudra.ai/docs/token-economy/#watching-it-work) about that model's tokenizer. Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model. Opt-in [cache warming](https://caudra.ai/docs/token-economy/#cache-warming) keeps the Anthropic prompt cache alive while a long tool runs, and `/usage` shows what it would save before you turn it on. In the creator's daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](https://github.com/redhat-et/ripwire).
 
 [How Caudra saves tokens](https://caudra.ai/docs/token-economy/) · Watch: [Filter shell output](https://caudra.ai/gallery/#filter)
 
@@ -177,6 +177,21 @@ Every session keeps its full history, subagent transcripts included, in compact 
 File revert cannot undo external side effects such as running processes, databases, network calls, or Git branch state.
 
 [Sessions and revert](https://caudra.ai/docs/sessions/) · Watch: [Revert files from a message](https://caudra.ai/gallery/#revert)
+
+## Say it once. Caudra writes it down.
+
+*When you repeat yourself*
+
+When you correct the agent, cut an answer off, refuse a call, or repeat a preference, a background learner notices. It checks each finding against the project's history and writes what will still hold into your instruction files and project memory, so later sessions start out knowing it.
+
+- **Evidence before it writes.** The learner is a read-only subagent that checks each finding against this project's past sessions. A line in the committed `AGENTS.md` needs evidence from at least two of them, and text that looks like a secret is refused.
+- **One block it owns.** Caudra writes only between its own markers in `AGENTS.md`, `AGENTS.local.md`, or your global `AGENTS.md`, and longer detail goes to project memory. `AGENTS.local.md` is added to `.gitignore` first, and a file you changed while the learner worked is left alone.
+- **Review and revert in `/learn`.** `/learn` lists each run with what it changed, what it dropped, and why. Open a run's transcript, revert one change, start a run now, or pause learning for the project.
+- **Out of the way of your turn.** A run waits until you have typed 10 new messages and 2 hours have passed since the last run, then starts after a minute of idle time. It never takes a turn of your conversation. It runs on its own Learn model job, and its spend shows under `learning` in `/usage`.
+
+Learning is on by default. Turn it off with `[agent] continual_learning = false`, or narrow where it writes with `learning_targets`. Changes to the committed `AGENTS.md` also show in git and the workbench, so you can review them before you commit. Shell cards also show an ETA, such as `ETA ~40s`, from a [small model on your machine](https://caudra.ai/docs/configuration/#agent) that learns from the commands you run and sends nothing anywhere.
+
+[How continual learning works](https://caudra.ai/docs/learning/)
 
 ## Open the code without leaving.
 
@@ -251,7 +266,7 @@ In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B repl
 When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, source code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), which also runs on its own as an MCP server.
 
 - **Searches that report what they withheld.** A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.
-- **Guarded web fetching.** `webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
+- **Search and fetch where you allow.** `websearch` uses Exa by default, or [the backends you list](https://caudra.ai/docs/web-search/), such as your own SearXNG, with fallback between them. `webfetch` refuses private and loopback addresses unless you list a local or tailnet server under [`[web]`](https://caudra.ai/docs/configuration/#web), and checks every redirect. A page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
 - **PDFs as text or as the file.** A fetched PDF arrives as its text. In attachment mode, a model that reads PDFs receives the file itself inside the tool result, within a quarter of its context window. Saved sessions keep only the URL, name, and page count.
 - **Python in an isolated worker.** `code` runs snippets in a separate worker with no file system, network, environment variables, or subprocesses. A snippet that calls nothing outside the worker runs without a prompt, and each call it makes, such as a search of your past conversations, is checked on its own. `timeoutSec` bounds the whole run, waits included.
 
@@ -299,13 +314,13 @@ Claude subscription sign-in is experimental. Anthropic's terms limit Pro and Max
 Caudra reads the instruction files and skills you already have and connects to your MCP servers, so trying it does not mean starting over.
 
 - **[Instruction files](https://caudra.ai/docs/context/#instruction-files).** At session start, Caudra loads `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`, or one of six other instruction file names.
-- **[Skills](https://caudra.ai/docs/skills/#where-skills-live).** Caudra reads skills from `.claude/skills` and `.agents/skills` folders.
+- **[Skills](https://caudra.ai/docs/skills/#where-skills-live).** Caudra reads skills from `.claude/skills` and `.agents/skills` folders. Lauren Tan's [pstack](https://github.com/cursor/plugins/tree/main/pstack) engineering skills ship built in, off until you turn them on.
 - **[MCP servers](https://caudra.ai/docs/mcp/#configuration).** Add stdio or HTTP MCP servers in `mcp.toml`, with OAuth sign-in. The model calls them by writing Python in its `code` tool, and Caudra speaks the current MCP protocol and the older one.
 - **[Scripts](https://caudra.ai/docs/headless/#claude-code-compatibility).** `--print` writes the same JSON fields as Claude Code, so scripts that parse its output keep working.
 
 ### A model for each job
 
-Eleven jobs decide which model serves each kind of work. Pin a job to a model in `/model`, or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`. For a single task, name the model in your prompt, as in “ask opus and sol to review this change”, and each gets a task of its own.
+Model jobs decide which model serves each kind of work. Pin a job to a model in `/model`, or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`. For a single task, name the model in your prompt, as in “ask opus and sol to review this change”, and each gets a task of its own.
 
 | Job | What it serves |
 | --- | --- |
@@ -317,23 +332,24 @@ Eleven jobs decide which model serves each kind of work. Pin a job to a model in
 | Goal | The `/goal` evaluator, on Fast until you bind it. |
 | Extract | Requirements for `/extract` and compaction, on Fast until you bind it. |
 | Memory | One-line summaries of older memory notes, on the compaction model until you bind it. |
+| Learn | The continual learner, on the Chat model until you bind it. |
 | Autopilot | Answers for experimental autopilot while you are away, on Best until you bind it. |
 | Fast | The preferred small model, for routine calls. |
 | Best | The provider's flagship. Point Plan or a prompt profile's subagents at it. |
 
 See [Model jobs](https://caudra.ai/docs/providers/#model-jobs).
 
-The [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints) sends typed questions to one decision endpoint you pick: TypeSafe Jev, OpenAI Luna, or a server of your own. It powers permission advice, Auto mode screening, shell effect and duration predictions, sampled web and MCP content screening, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, `source_code_context` rows, history matches, and omitted tool output first, and the transcript shows what each feature changed. In a `code` snippet, [`decisions.decide()` and `decisions.rerank()`](https://caudra.ai/docs/code/#decisions-and-reranking) judge what the snippet gathered before any of it reaches the model. Add an endpoint in `/login` and switch it in `/model`. Each feature is off until you turn it on, and predictions add to deterministic permission rules and can miss risks.
+The [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints) sends typed questions to one decision endpoint you pick: TypeSafe Jev, OpenAI Luna, or a server of your own. It powers permission advice, Auto mode screening, shell effect predictions, content screening of web, MCP, and `code` results that can withhold a flagged one, skill suggestions, goal prescreening, and subagent routing to the Fast or Best model. As a reranker, it can put the most relevant memory notes, `source_code_context` rows, history matches, and omitted tool output first, and the transcript shows what each feature changed. Switch each feature from `/decisions`, and a decision about a tool call shows on that call's card. In a `code` snippet, [`decisions.decide()` and `decisions.rerank()`](https://caudra.ai/docs/code/#decisions-and-reranking) judge what the snippet gathered before any of it reaches the model. Add an endpoint in `/login` and switch it in `/model`. Each feature is off until you turn it on, and predictions add to deterministic permission rules and can miss risks.
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 87 capabilities, designed together.
+## 96 capabilities, designed together.
 
 *Everything in the box*
 
 Each one links to its documentation. Experimental items are marked and stay off until you switch them on.
 
 <details>
-<summary><b>Agents</b> (19)</summary>
+<summary><b>Agents</b> (20)</summary>
 
 - [Steerable subagents](https://caudra.ai/docs/commands/#tasks)
 - [Background tasks and shell jobs](https://caudra.ai/docs/sessions/#background-tasks)
@@ -351,39 +367,45 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Tasks on the model you name](https://caudra.ai/docs/commands/#models-and-reasoning)
 - [Favorite models in `/model`](https://caudra.ai/docs/providers/#model-jobs)
 - [Automatic steering, tuned per model](https://caudra.ai/docs/configuration/#agent-steering)
+- [Continual learning into `AGENTS.md` and memory](https://caudra.ai/docs/learning/)
 - [Requirements tracking with `/extract`](https://caudra.ai/docs/commands/#requirements)
 - [Resume a stopped turn with `/continue`](https://caudra.ai/docs/commands/#resuming-after-an-interruption)
 - [Durable workflows](https://caudra.ai/docs/workflows/) (experimental)
 
 </details>
 <details>
-<summary><b>Tools</b> (12)</summary>
+<summary><b>Tools</b> (15)</summary>
 
 - [File read and search, with one editor per model](https://caudra.ai/docs/tools/#file-operations)
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
 - [Source code graph for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
 - [Shell with output filtering](https://caudra.ai/docs/tools/#shell)
+- [Shell ETAs learned on your machine](https://caudra.ai/docs/configuration/#agent)
 - [Python for computation, history search, MCP, and modules loaded on demand](https://caudra.ai/docs/code/)
 - [`decisions.decide()` and `decisions.rerank()` inside snippets](https://caudra.ai/docs/code/#decisions-and-reranking)
 - [Parallel calls with `batch`](https://caudra.ai/docs/tools/#batch)
 - [Retained output search](https://caudra.ai/docs/tools/#tool_output)
 - [Web search and fetch, with PDFs as text or as the file](https://caudra.ai/docs/tools/#web)
+- [Web search through Exa, SearXNG, Brave, Kagi, or SerpApi](https://caudra.ai/docs/web-search/)
+- [Fetches from local and tailnet servers you list](https://caudra.ai/docs/configuration/#web)
 - [Image generation with a ChatGPT login](https://caudra.ai/docs/code/#image-generation)
 - [Tool-call JSON repair](https://caudra.ai/docs/token-economy/#fewer-round-trips)
 - [Polling and waiting inside snippets](https://caudra.ai/docs/code/#the-python-subset)
 
 </details>
 <details>
-<summary><b>Context</b> (10)</summary>
+<summary><b>Context</b> (12)</summary>
 
 - [Instruction files with `AGENTS.md`](https://caudra.ai/docs/context/#instruction-files)
 - [Project memory with summaries](https://caudra.ai/docs/memory/)
 - [Skills from `.claude` and `.agents` folders](https://caudra.ai/docs/skills/#where-skills-live)
+- [pstack engineering skills, off by default](https://caudra.ai/docs/skills/#pstack)
 - [`@file` and `#commit` mentions](https://caudra.ai/docs/context/#mention-a-file-with)
 - [Inspect with `/context` and `/projection`](https://caudra.ai/docs/context/#inspect-the-active-window)
 - [Compaction that keeps recent turns](https://caudra.ai/docs/context/#when-the-window-fills)
 - [System prompt profiles](https://caudra.ai/docs/system-prompts/)
 - [Config edits apply while Caudra runs](https://caudra.ai/docs/configuration/#hot-reload)
+- [Config files that upgrade themselves, with backups](https://caudra.ai/docs/configuration/#config-file-versions)
 - [`{env:NAME}` secrets in global config](https://caudra.ai/docs/configuration/#environment-variables)
 - [The full manual offline in `/docs`](https://caudra.ai/docs/commands/#docs)
 
@@ -407,21 +429,23 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Interface</b> (9)</summary>
+<summary><b>Interface</b> (11)</summary>
 
 - [Workbench with Git and search](https://caudra.ai/docs/workbench/)
 - [Passage review](https://caudra.ai/docs/review/)
 - [Markdown with maths and Mermaid](https://caudra.ai/docs/markdown/)
 - [Pictures in the transcript](https://caudra.ai/docs/markdown/#images)
 - [Tool calls drawn as they stream](https://caudra.ai/docs/token-economy/#fewer-round-trips)
+- [Token cost on tool cards](https://caudra.ai/docs/token-economy/#watching-it-work)
 - [Draft stash and command palette](https://caudra.ai/docs/commands/#stash)
+- [Edit `caudra.toml` in `/settings`](https://caudra.ai/docs/configuration/)
 - [Paired light and dark themes](https://caudra.ai/docs/configuration/#ui-theme)
 - [Hover tooltips that explain controls](https://caudra.ai/docs/quick-start/#first-session)
 - [Notifications in tmux, Herdr, and Orca](https://caudra.ai/docs/notifications/)
 
 </details>
 <details>
-<summary><b>Safety</b> (9)</summary>
+<summary><b>Safety</b> (10)</summary>
 
 - [Parsed shell permissions](https://caudra.ai/docs/permissions/#shell-parsing)
 - [Scoped approvals, down to a folder](https://caudra.ai/docs/permissions/#per-command-scopes)
@@ -430,6 +454,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [No tracking, opt-in telemetry](https://caudra.ai/docs/telemetry/)
 - [Managed VM sandboxes](https://caudra.ai/docs/sandboxes/) (experimental)
 - [Auto mode with decision screening](https://caudra.ai/docs/permissions/#auto-mode)
+- [Content screening that can withhold a result](https://caudra.ai/docs/permissions/#decision-engine-advice)
 - [Every request through your proxy](https://caudra.ai/docs/cli/#network-proxies)
 - [JEV decision engine](https://caudra.ai/docs/providers/#decision-endpoints)
 
@@ -481,9 +506,10 @@ workflows = true
 Sessions, retained output, and file change records are stored locally. Cloud models and network tools still receive what you send them.
 
 - **No tracking.** Telemetry is off unless you send it to a collector you run.
-- **Offline with a local model.** Use Ollama or llama.cpp without internet access, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), a custom inference engine by Caudra's creator for Qwen3.8-27B on one RTX 4090. It serves a standard OpenAI-compatible endpoint that follows the official Responses API specification, so the entry sets `protocol = "openai-responses"` as it would for any such endpoint. Otherwise a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
+- **Offline with a local model.** Use Ollama or llama.cpp without internet access, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), a custom inference engine by Caudra's creator for Qwen3.8-27B on one RTX 4090. It serves a standard OpenAI-compatible endpoint that follows the official Responses API specification, so the entry sets `protocol = "openai-responses"` as it would for any such endpoint. Otherwise a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa, or the search backends you set, when the agent searches the web.
 - **Commands start from a cleared environment.** Shell commands receive only [a short list of variables](https://caudra.ai/docs/cli/#shell-host-configuration), such as `PATH`, `HOME`, and proxy settings, so API keys set for Caudra stay out of them. `/env` [forwards the variables you choose](https://caudra.ai/docs/cli/#forwarding-more-variables), and a project `.env` or project config never supplies them.
-- **Private addresses refused.** `webfetch` checks every URL and redirect before it connects, and refuses private, loopback, and link-local addresses.
+- **Learning you can read and revert.** Continual learning builds a redacted digest of this project's sessions on your machine and sends it to the model on your Learn job, which can read more of that history to check a finding. It writes to instruction files and memory notes you can open, and `/learn` can revert each change. Turn it off with `continual_learning = false`.
+- **Private addresses refused.** `webfetch` checks every URL and redirect before it connects, and refuses private, loopback, and link-local addresses unless you list a host or network under `[web]` in your global config. A repository cannot add one.
 - **Update checks you can turn off.** At startup, the interactive UI asks GitHub for a newer release at most once a day and shows a banner. GitHub receives your IP address and normal request metadata, but no session data or installed version. Caudra never installs an update by itself. Set [`ui.update_check = false`](https://caudra.ai/docs/configuration/#ui) or `CAUDRA_ENABLE_UPDATE_CHECK=0` to stop the checks. See [updating and release channels](https://caudra.ai/docs/cli/#caudra-update-caudra-rollback).
 
 ## Try it on the repository you have open.
