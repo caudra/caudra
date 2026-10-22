@@ -589,6 +589,8 @@ const JAVASCRIPT_SWITCH: &str =
     "const r = await gh.list({owner: 'a'});\nswitch (r.owner) { case 'a': console.log(1); }";
 const SWITCH_UNTRANSLATED: &str =
     "It was not translated: `switch` on line 2 has no Python form that keeps its meaning.";
+const JAVASCRIPT_SWITCH_RETURNED: &str = "const r = await gh.list({owner: 'a'});\nswitch (r.owner) { case 'a': console.log(1); }\nreturn r;";
+const CHECKER_LOCATION: &str = "snippet.py:";
 /// A wrong argument on the snippet's fifth line, which is the fourth of the Python that ran.
 const JAVASCRIPT_WRONG_ARGUMENT: &str = "const r = await gh.list({owner: 'a'});\nif (r.owner === 'a') {\n  console.log(r.owner);\n}\nawait gh.list({owner: 1});";
 const WRONG_ARGUMENT_LINE: usize = 4;
@@ -632,6 +634,21 @@ async fn field_snippets_that_cannot_run_say_why(code: &str, explained_by: &str) 
     let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
     assert!(diagnostic.contains(explained_by), "{diagnostic}");
     assert!(host.calls().is_empty());
+    group.shutdown().await;
+}
+
+/// The checker's errors read the JavaScript as Python, so they only bury the reason it was not
+/// translated.
+#[tokio::test(flavor = "multi_thread")]
+async fn javascript_refused_by_name_says_only_why() {
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, JAVASCRIPT_SWITCH_RETURNED, None).await;
+    assert_eq!(outcome(&executed), Outcome::Rejected);
+    let diagnostic = output(&executed).diagnostic.as_deref().unwrap_or_default();
+    assert!(diagnostic.ends_with(SWITCH_UNTRANSLATED), "{diagnostic}");
+    assert!(!diagnostic.contains(CHECKER_LOCATION), "{diagnostic}");
+    assert!(!diagnostic.contains(TOP_LEVEL_RETURN), "{diagnostic}");
     group.shutdown().await;
 }
 

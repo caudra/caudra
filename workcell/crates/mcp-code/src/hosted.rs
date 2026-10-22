@@ -285,18 +285,13 @@ impl CodeToolGroup {
             && execution.output.outcome == Outcome::Rejected
         {
             let diagnostic = execution.output.diagnostic.take().unwrap_or_default();
-            let reason = repaired
-                .untranslated
-                .as_ref()
-                .map(|refusal| {
-                    format!(
-                        " {UNTRANSLATED_OPENING} {} on line {} {UNTRANSLATED_CLOSING}",
-                        refusal.construct, refusal.line
-                    )
-                })
-                .unwrap_or_default();
-            execution.output.diagnostic =
-                Some(format!("{JAVASCRIPT_GUIDANCE}{reason}\n{diagnostic}"));
+            execution.output.diagnostic = Some(match &repaired.untranslated {
+                Some(refusal) => format!(
+                    "{JAVASCRIPT_GUIDANCE} {UNTRANSLATED_OPENING} {} on line {} {UNTRANSLATED_CLOSING}",
+                    refusal.construct, refusal.line
+                ),
+                None => format!("{JAVASCRIPT_GUIDANCE}\n{diagnostic}"),
+            });
         }
         if executed.execution.is_some() {
             executed.ran_as = ran_as;
