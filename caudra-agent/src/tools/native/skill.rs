@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::remote_project_context::RemoteSkill;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_config::ModelPolicy;
 use caudra_terminal_host::skill::SkillSource;
 use serde_json::Value;
 
@@ -61,7 +62,33 @@ static SCHEMA: ParamSchema = ParamSchema::Object {
 
 /// Resolves an address under a builtin skill, given everything from its `/` or
 /// `?` on, so `caudra-docs/tools#shell` arrives as `/tools#shell`.
-pub type PageLoader = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+pub type PageLoader = Box<dyn Fn(&str, &SkillServe) -> Result<String, String> + Send + Sync>;
+
+/// A builtin's body, and the file it spilled a reference to, if any.
+pub type SkillResolver = Box<dyn Fn(&SkillServe) -> (String, Option<PathBuf>) + Send + Sync>;
+
+/// What a builtin may tailor its text to: the session that loads it.
+pub struct SkillServe {
+    pub model_policy: Arc<ModelPolicy>,
+    pub task_model_choice: bool,
+}
+
+impl SkillServe {
+    fn of(ctx: &ToolContext) -> Self {
+        Self {
+            model_policy: Arc::clone(&ctx.model_policy),
+            task_model_choice: ctx.config.task_model_choice,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unrestricted() -> Self {
+        Self {
+            model_policy: Arc::new(ModelPolicy::default()),
+            task_model_choice: true,
+        }
+    }
+}
 
 /// A skill Caudra ships rather than discovers. `caudra-lua` installs the
 /// plugin-authoring skill here at startup: it is generated from the live Lua
@@ -72,7 +99,7 @@ pub struct BuiltinSkill {
     pub description: String,
     /// Deferred because resolving may write the reference to disk, which is
     /// wasted work for every session that never loads the skill.
-    pub resolve: Box<dyn Fn() -> (String, Option<PathBuf>) + Send + Sync>,
+    pub resolve: SkillResolver,
     /// Addresses such as `<name>/<page>` or `<name>?<terms>`. They stay out of
     /// the catalog, so they cost nothing until the skill body names them.
     pub pages: Option<PageLoader>,
@@ -313,7 +340,7 @@ pub fn directories(registry: &ToolRegistry) -> Vec<SkillDirCandidate> {
 }
 
 /// The body exactly as the model receives it, for `caudra skills <name>`.
-pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
+pub fn load(registry: &ToolRegistry, name: &str, serve: &SkillServe) -> Result<String, String> {
     let registered = registry.get(SKILL_TOOL_NAME);
     let loaded = match registered
         .as_ref()
@@ -324,8 +351,8 @@ pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
             dirs: tool.dirs(),
             remote_skills: tool.remote_skills.clone(),
         }
-        .load(),
-        None => load_from(name, &[], &installed_builtins()),
+        .load(serve),
+        None => load_from(name, &[], &installed_builtins(), serve),
     };
     loaded
         .map(|skill| skill.model_text())
@@ -384,7 +411,8 @@ impl ToolInvocation for SkillCall {
                         .map_or_else(|| Arc::from([]), |context| Arc::from(context.skills())),
                 );
             }
-            match smol::unblock(move || self.load()).await {
+            let serve = SkillServe::of(ctx);
+            match smol::unblock(move || self.load(&serve)).await {
                 Ok(skill) => ToolExecResult::from(Ok(ToolOutput::Skill(skill))),
                 Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
@@ -393,13 +421,17 @@ impl ToolInvocation for SkillCall {
 }
 
 impl SkillCall {
-    fn load(&self) -> Result<SkillOutput, ToolError> {
-        self.load_with(&installed_builtins())
+    fn load(&self, serve: &SkillServe) -> Result<SkillOutput, ToolError> {
+        self.load_with(&installed_builtins(), serve)
     }
 
     /// A remote skill shadows the builtin of its name, pages included, just as
     /// a skill file does.
-    fn load_with(&self, builtins: &[Arc<BuiltinSkill>]) -> Result<SkillOutput, ToolError> {
+    fn load_with(
+        &self,
+        builtins: &[Arc<BuiltinSkill>],
+        serve: &SkillServe,
+    ) -> Result<SkillOutput, ToolError> {
         let remote = self.remote_skills.as_deref().unwrap_or_default();
         if let Some(skill) = remote.iter().find(|skill| skill.name == self.name) {
             return Ok(SkillOutput {
@@ -412,7 +444,7 @@ impl SkillCall {
             .filter(|builtin| remote.iter().all(|skill| skill.name != builtin.name))
             .cloned()
             .collect();
-        load_from(&self.name, &self.dirs, &unshadowed)
+        load_from(&self.name, &self.dirs, &unshadowed, serve)
     }
 }
 
@@ -428,10 +460,11 @@ fn load_from(
     name: &str,
     dirs: &[SkillDirCandidate],
     builtins: &[Arc<BuiltinSkill>],
+    serve: &SkillServe,
 ) -> Result<SkillOutput, ToolError> {
     let discovered = discover(dirs, builtins);
     if let Some(skill) = discovered.get(name) {
-        let (body, location) = read_skill(skill, builtins)?;
+        let (body, location) = read_skill(skill, builtins, serve)?;
         return Ok(SkillOutput { location, body });
     }
     if let Some((parent, address)) = split_address(name)
@@ -440,7 +473,7 @@ fn load_from(
             .and_then(|skill| builtin_for(skill, builtins))
             .and_then(|builtin| builtin.pages.as_ref())
     {
-        return pages(address)
+        return pages(address, serve)
             .map(|body| SkillOutput {
                 location: builtin_location(name),
                 body,
@@ -534,9 +567,13 @@ fn builtin_for<'a>(skill: &Skill, builtins: &'a [Arc<BuiltinSkill>]) -> Option<&
         .map(Arc::as_ref)
 }
 
-fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, String), String> {
+fn read_skill(
+    skill: &Skill,
+    builtins: &[Arc<BuiltinSkill>],
+    serve: &SkillServe,
+) -> Result<(String, String), String> {
     if let Some(builtin) = builtin_for(skill, builtins) {
-        let (content, reference) = (builtin.resolve)();
+        let (content, reference) = (builtin.resolve)(serve);
         let location = reference.map_or_else(
             || skill.location.clone(),
             |path| path.to_string_lossy().into_owned(),
@@ -555,7 +592,7 @@ pub fn host_skill(source: SkillSource) -> BuiltinSkill {
     BuiltinSkill {
         name: source.name.to_owned(),
         description: source.description.to_owned(),
-        resolve: Box::new(move || {
+        resolve: Box::new(move |_| {
             let body = source.fetch().map_or_else(
                 |unavailable| unavailable,
                 |printed| parse_frontmatter(&printed).1,
@@ -706,7 +743,7 @@ mod tests {
         };
 
         let skill = host_skill(source);
-        let (body, reference) = (skill.resolve)();
+        let (body, reference) = (skill.resolve)(&SkillServe::unrestricted());
 
         assert_eq!(skill.name, "host");
         assert_eq!(body, HOST_SKILL_BODY);
@@ -772,7 +809,7 @@ mod tests {
                 dirs: tool.dirs(),
                 remote_skills: tool.remote_skills.clone(),
             }
-            .load()
+            .load(&SkillServe::unrestricted())
             .map(|skill| skill.model_text())
         };
         assert!(call(&embedded, SHARED_SKILL).unwrap().contains(LOCAL_BODY));
@@ -824,14 +861,14 @@ mod tests {
         BuiltinSkill {
             name: BUILTIN_NAME.into(),
             description: BUILTIN_DESC.into(),
-            resolve: Box::new(move || (BUILTIN_BODY.into(), reference.clone())),
+            resolve: Box::new(move |_| (BUILTIN_BODY.into(), reference.clone())),
             pages: None,
         }
     }
 
     fn paged_skill() -> BuiltinSkill {
         BuiltinSkill {
-            pages: Some(Box::new(|address| match address {
+            pages: Some(Box::new(|address, _| match address {
                 MISSING_PAGE => Err(PAGE_ERROR.to_owned()),
                 _ => Ok(format!("{PAGE_BODY}{address}")),
             })),
@@ -843,7 +880,13 @@ mod tests {
     #[test_case("?shell timeout" ; "search")]
     fn pages_and_searches_load_through_the_parent_name(address: &str) {
         let name = format!("{BUILTIN_NAME}{address}");
-        let out = load_from(&name, &[], &[Arc::new(paged_skill())]).unwrap();
+        let out = load_from(
+            &name,
+            &[],
+            &[Arc::new(paged_skill())],
+            &SkillServe::unrestricted(),
+        )
+        .unwrap();
         assert_eq!(out.body, format!("{PAGE_BODY}{address}"));
         assert_eq!(out.location, builtin_location(&name));
     }
@@ -851,7 +894,13 @@ mod tests {
     #[test]
     fn a_resolver_error_is_not_found_with_its_message() {
         let name = format!("{BUILTIN_NAME}{MISSING_PAGE}");
-        let error = load_from(&name, &[], &[Arc::new(paged_skill())]).unwrap_err();
+        let error = load_from(
+            &name,
+            &[],
+            &[Arc::new(paged_skill())],
+            &SkillServe::unrestricted(),
+        )
+        .unwrap_err();
         assert_eq!(error.failure, ToolFailure::NotFound);
         assert_eq!(error.message, PAGE_ERROR);
     }
@@ -860,7 +909,9 @@ mod tests {
     fn a_builtin_without_pages_has_no_addresses() {
         let name = format!("{BUILTIN_NAME}{PAGE_ADDRESS}");
         let builtins = [Arc::new(plugin_dev_skill(None))];
-        let error = load_from(&name, &[], &builtins).unwrap_err().message;
+        let error = load_from(&name, &[], &builtins, &SkillServe::unrestricted())
+            .unwrap_err()
+            .message;
         assert!(error.starts_with(NOT_FOUND), "{error}");
     }
 
@@ -883,7 +934,9 @@ mod tests {
                 }])
             }),
         };
-        let error = call.load_with(&[Arc::new(paged_skill())]).unwrap_err();
+        let error = call
+            .load_with(&[Arc::new(paged_skill())], &SkillServe::unrestricted())
+            .unwrap_err();
         assert_eq!(error.failure, ToolFailure::NotFound);
         assert!(error.message.starts_with(NOT_FOUND), "{}", error.message);
     }
@@ -896,7 +949,9 @@ mod tests {
             "deploy",
             "---\nname: deploy\ndescription: ship it\n---\nfirst\nsecond\n",
         );
-        let out = load_from("deploy", &[root], &[]).unwrap().model_text();
+        let out = load_from("deploy", &[root], &[], &SkillServe::unrestricted())
+            .unwrap()
+            .model_text();
         assert!(out.contains("   1 | first"), "{out}");
         assert!(out.contains("   2 | second"), "{out}");
         assert!(!out.contains("description: ship it"), "frontmatter leaked");
@@ -942,7 +997,7 @@ mod tests {
     fn an_unknown_skill_lists_what_is_available() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
-        let error = load_from("nope", &[root], &[]).unwrap_err();
+        let error = load_from("nope", &[root], &[], &SkillServe::unrestricted()).unwrap_err();
         assert_eq!(error.failure, ToolFailure::NotFound);
         let error = error.message;
         assert!(error.starts_with(NOT_FOUND), "{error}");
@@ -1033,7 +1088,9 @@ mod tests {
     #[test]
     fn an_uninstalled_builtin_is_simply_absent() {
         assert!(discover(&[], &[]).is_empty());
-        let error = load_from(BUILTIN_NAME, &[], &[]).unwrap_err().message;
+        let error = load_from(BUILTIN_NAME, &[], &[], &SkillServe::unrestricted())
+            .unwrap_err()
+            .message;
         assert!(error.starts_with(NOT_FOUND), "{error}");
     }
 
@@ -1044,7 +1101,7 @@ mod tests {
             discover(&[], &builtins)[BUILTIN_NAME].description,
             BUILTIN_DESC
         );
-        let out = load_from(BUILTIN_NAME, &[], &builtins).unwrap();
+        let out = load_from(BUILTIN_NAME, &[], &builtins, &SkillServe::unrestricted()).unwrap();
         assert_eq!(out.body, BUILTIN_BODY);
         assert_eq!(out.location, builtin_location(BUILTIN_NAME));
     }
@@ -1060,13 +1117,13 @@ mod tests {
             Arc::new(BuiltinSkill {
                 name: OTHER_NAME.into(),
                 description: BUILTIN_DESC.into(),
-                resolve: Box::new(|| (OTHER_BODY.into(), None)),
+                resolve: Box::new(|_| (OTHER_BODY.into(), None)),
                 pages: None,
             }),
         ];
         let found = discover(&[], &builtins);
         assert!(found.contains_key(BUILTIN_NAME) && found.contains_key(OTHER_NAME));
-        let out = load_from(OTHER_NAME, &[], &builtins).unwrap();
+        let out = load_from(OTHER_NAME, &[], &builtins, &SkillServe::unrestricted()).unwrap();
         assert_eq!(out.body, OTHER_BODY);
     }
 
@@ -1076,7 +1133,13 @@ mod tests {
     fn a_builtin_that_spills_a_reference_reports_its_path() {
         let reference = PathBuf::from("/state/docs/lua-api.md");
         let builtin = plugin_dev_skill(Some(reference.clone()));
-        let out = load_from(BUILTIN_NAME, &[], &[Arc::new(builtin)]).unwrap();
+        let out = load_from(
+            BUILTIN_NAME,
+            &[],
+            &[Arc::new(builtin)],
+            &SkillServe::unrestricted(),
+        )
+        .unwrap();
         assert_eq!(out.location, reference.to_string_lossy());
     }
 
@@ -1090,7 +1153,13 @@ mod tests {
             &format!("---\nname: {BUILTIN_NAME}\n---\n{DISK_BODY}\n"),
         );
         let builtin = plugin_dev_skill(None);
-        let out = load_from(BUILTIN_NAME, &[root], &[Arc::new(builtin)]).unwrap();
+        let out = load_from(
+            BUILTIN_NAME,
+            &[root],
+            &[Arc::new(builtin)],
+            &SkillServe::unrestricted(),
+        )
+        .unwrap();
         assert_eq!(out.body, DISK_BODY);
     }
 

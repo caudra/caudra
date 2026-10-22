@@ -579,6 +579,7 @@ impl Starter<'_> {
                     pending,
                     remote,
                     runtime,
+                    model_policy: Arc::clone(&self.ctx.params.model_policy),
                 };
                 state.fit_reasoning();
                 Ok(state)

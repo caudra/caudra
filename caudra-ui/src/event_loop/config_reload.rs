@@ -718,6 +718,9 @@ impl EventLoop<'_> {
                 let pstack_switched =
                     self.ctx.config.builtin_skills.pstack != config.agent.builtin_skills.pstack;
                 self.ctx.config = config.agent;
+                for runtime in &mut self.sessions {
+                    runtime.app.settings.task_model_choice = self.ctx.config.task_model_choice;
+                }
                 if pstack_switched {
                     self.apply_pstack(cwd, local, report);
                 }

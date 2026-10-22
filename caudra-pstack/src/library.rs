@@ -8,7 +8,7 @@ use caudra_docs::{SearchIndex, SearchReport};
 use include_dir::{Dir, File, include_dir};
 use serde::Deserialize;
 
-use crate::models::Roles;
+use crate::roles::{MODEL_ROLES_REF, RoleTable};
 
 static UPSTREAM: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/upstream");
 static TRANSLATED: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/translated");
@@ -39,7 +39,10 @@ const SEARCH_UNIT: &str = "page";
 const PATH_HEADING: usize = 0;
 const SUGGESTION_LIMIT: usize = 5;
 /// Entry points the index lists first, in this order.
-const START_HERE: &[&str] = &["poteto-mode", "poteto-help", "setup-pstack"];
+const START_HERE: &[&str] = &["poteto-mode", "poteto-help"];
+/// Upstream files Caudra replaces with a feature of its own, by their path in the vendored tree:
+/// never served, indexed, or searched, and a retired skill has no command.
+const RETIRED: &[&str] = &["pstack/skills/setup-pstack/SKILL.md"];
 const GUIDE: &str = "docs/guide/README.md";
 const BENNY: &str = "automations/benny/README.md";
 /// Where Caudra's ports of pstack's automations sit among the pages.
@@ -192,7 +195,7 @@ impl Library {
 
     /// What loading `pstack` itself returns: how to read the rest, the entry points, every
     /// skill, and the user's model roles.
-    pub fn index(&self, roles: &Roles) -> String {
+    pub fn index(&self, roles: &RoleTable) -> String {
         let Upstream {
             version, commit, ..
         } = &self.upstream;
@@ -244,15 +247,15 @@ impl Library {
              - `{NAME}/{CAUDRA_AUTOMATIONS_DIR}`: the source of benny's Slack polling and \
              watch-pr's drive mode as Caudra automations. They are bundled: with \
              `experimental.automations` on they are listed in `/automations`, where the user arms \
-             them; a project or user script of the same name overrides one.\n\n\
-             ## Model roles\n\n{}\n",
-            roles.describe()
+             them; a project or user script of the same name overrides one.\n\n{}",
+            roles.render()
         ));
         index
     }
 
-    /// One page by the address that follows `pstack`: `/path`, or `?words` to search.
-    pub fn load(&self, address: &str) -> Result<String, String> {
+    /// One page by the address that follows `pstack`: `/path`, or `?words` to search. A page that
+    /// points at the model roles ends with `roles`.
+    pub fn load(&self, address: &str, roles: &RoleTable) -> Result<String, String> {
         if let Some(words) = address.strip_prefix(SEARCH_SEPARATOR) {
             return Ok(self.search(words));
         }
@@ -261,7 +264,12 @@ impl Library {
             format!("`{NAME}/{requested}` leaves pstack; addresses stay inside the plugin")
         })?;
         if let Some((found, text)) = self.page(&path) {
-            return Ok(headed(&found, text));
+            let mut page = headed(&found, text);
+            if text.contains(MODEL_ROLES_REF) {
+                page.push_str("\n\n");
+                page.push_str(&roles.render());
+            }
+            return Ok(page);
         }
         if let Some(listing) = self.listing(&path) {
             return Ok(listing);
@@ -388,13 +396,14 @@ fn text_file(file: &'static File<'static>) -> Option<(&'static str, &'static str
 }
 
 /// Every text file under the pstack and team-kit roots of a vendored tree, by its path in that
-/// tree. The manifests beside the roots are left out.
+/// tree. The manifests beside the roots and the retired files are left out.
 fn vendored(tree: &'static Dir<'static>) -> Vec<(&'static str, &'static str)> {
     [PSTACK_ROOT, TEAM_KIT_ROOT]
         .into_iter()
         .filter_map(|root| tree.get_dir(root))
         .flat_map(files)
         .filter_map(text_file)
+        .filter(|(path, _)| !RETIRED.contains(path))
         .collect()
 }
 
@@ -513,6 +522,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::roles::{ModelFacts, StoredRoles};
 
     const POTETO_MODE: &str = "poteto-mode";
     const SEARCH_ENTRY: &str = "- pstack/";
@@ -533,10 +543,87 @@ mod tests {
     /// Links upstream writes as templates for the model to fill in.
     const PLACEHOLDER_LINKS: &[&str] = &["url"];
 
-    fn roles() -> Roles {
-        Roles::Missing {
-            path: "/config/pstack/models.md".to_owned(),
+    const ROLES_HEADING: &str = "## Model roles";
+    const POINTING_PAGE: &str = "skills/point/SKILL.md";
+    const POINTING_TEXT: &str = "---\nname: point\ndescription: Points.\n---\n\nUse the Panel \
+         rows of the **Model roles** table below for zebra reviews.\n";
+    const UNSERVED_MSG: &str = "a retired file must not be served, listed, or searched";
+    const VANISHED_MSG: &str = "a retired file is gone upstream; drop it from RETIRED";
+    const UNPOINTED_MSG: &str =
+        "a page that names a kind's rows must point at the Model roles table";
+    const KIND_ROWS: &str = r"\b(Code|Hardest|Judgment|Verify|Panel|Cross-judge pool) rows?\b";
+
+    fn roles() -> RoleTable {
+        RoleTable::resolve(
+            &StoredRoles::default(),
+            &ModelFacts {
+                favorites: Vec::new(),
+                task_model_choice: true,
+                known: &|_| None,
+            },
+        )
+    }
+
+    fn pointing_library() -> Library {
+        let upstream = library().upstream().clone();
+        Library::new(
+            BTreeMap::from([(POINTING_PAGE.to_owned(), POINTING_TEXT)]),
+            upstream,
+        )
+    }
+
+    #[test]
+    fn a_page_that_points_at_the_roles_ends_with_the_table() {
+        let roles = roles();
+        let page = pointing_library().load("/point", &roles).unwrap();
+        assert!(page.ends_with(&roles.render()), "{page}");
+        let found = pointing_library().load("?zebra", &roles).unwrap();
+        assert!(found.contains(POINTING_PAGE), "{found}");
+        assert!(!found.contains(ROLES_HEADING), "{found}");
+    }
+
+    #[test]
+    fn a_page_that_does_not_point_at_the_roles_has_no_table() {
+        let page = library().load("/skills/how/SKILL.md", &roles()).unwrap();
+        assert_eq!(
+            page.contains(ROLES_HEADING),
+            library().pages["skills/how/SKILL.md"].contains(MODEL_ROLES_REF)
+        );
+    }
+
+    #[test]
+    fn the_index_carries_the_roles_table() {
+        let roles = roles();
+        assert!(library().index(&roles).contains(&roles.render()));
+    }
+
+    #[test]
+    fn a_retired_file_is_neither_served_nor_a_skill() {
+        for retired in RETIRED {
+            assert!(
+                UPSTREAM.get_file(retired).is_some(),
+                "{VANISHED_MSG}: {retired}"
+            );
+            let key = page_key(retired);
+            assert!(!library().pages.contains_key(&key), "{UNSERVED_MSG}: {key}");
+            if let Some(name) = skill_of(&key) {
+                assert!(library().skill(name).is_none(), "{UNSERVED_MSG}: {name}");
+                let found = library().load(&format!("?{name}"), &roles()).unwrap();
+                assert!(!found.contains(&key), "{UNSERVED_MSG}: {found}");
+            }
         }
+    }
+
+    #[test]
+    fn a_page_naming_a_kinds_rows_points_at_the_roles_table() {
+        let kind_rows = Regex::new(KIND_ROWS).unwrap();
+        let unpointed: Vec<&String> = library()
+            .pages
+            .iter()
+            .filter(|(_, text)| kind_rows.is_match(text) && !text.contains(MODEL_ROLES_REF))
+            .map(|(page, _)| page)
+            .collect();
+        assert!(unpointed.is_empty(), "{UNPOINTED_MSG}: {unpointed:?}");
     }
 
     #[test_case("/poteto-mode", "skills/poteto-mode/SKILL.md" ; "skill_shorthand")]
@@ -548,7 +635,7 @@ mod tests {
     #[test_case("/agents/poteto-agent.md", "agents/poteto-agent.md" ; "agent")]
     #[test_case("/caudra/automations/pstack-watch-pr.rhai", "caudra/automations/pstack-watch-pr.rhai" ; "caudra_automation")]
     fn an_address_loads_its_page(address: &str, path: &str) {
-        let page = library().load(address).unwrap();
+        let page = library().load(address, &roles()).unwrap();
         assert!(page.starts_with(&format!("Page `{NAME}/{path}`")), "{page}");
     }
 
@@ -583,12 +670,12 @@ mod tests {
 
     #[test]
     fn an_address_cannot_climb_out_of_the_plugin() {
-        assert!(library().load("/../../etc/passwd").is_err());
+        assert!(library().load("/../../etc/passwd", &roles()).is_err());
     }
 
     #[test]
     fn an_unknown_address_names_the_nearest_pages() {
-        let error = library().load("/poteto-mod").unwrap_err();
+        let error = library().load("/poteto-mod", &roles()).unwrap_err();
         assert!(
             error.contains("`pstack/skills/poteto-mode/SKILL.md`"),
             "{error}"
@@ -597,14 +684,14 @@ mod tests {
 
     #[test]
     fn a_directory_without_an_index_lists_its_pages() {
-        let listing = library().load("/poteto-mode/playbooks").unwrap();
+        let listing = library().load("/poteto-mode/playbooks", &roles()).unwrap();
         assert!(listing.contains("`pstack/skills/poteto-mode/playbooks/feature.md`"));
     }
 
     #[test_case("bugbot triage", "skills/poteto-mode/references/bugbot-triage.md" ; "terms_in_the_path_heading")]
     #[test_case("lookback_hours", "caudra/automations/benny-reproduce.rhai" ; "script_without_headings")]
     fn a_search_lists_the_best_page_first(query: &str, path: &str) {
-        let found = library().load(&format!("?{query}")).unwrap();
+        let found = library().load(&format!("?{query}"), &roles()).unwrap();
         let first = found.lines().find(|line| line.starts_with(SEARCH_ENTRY));
         assert_eq!(
             first
@@ -617,7 +704,7 @@ mod tests {
 
     #[test]
     fn a_search_lists_each_page_once() {
-        let found = library().load("?skill").unwrap();
+        let found = library().load("?skill", &roles()).unwrap();
         let addresses: Vec<&str> = found
             .lines()
             .filter(|line| line.starts_with(SEARCH_ENTRY))
@@ -629,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_misspelt_search_word_names_its_correction() {
-        let found = library().load("?bugbto triage").unwrap();
+        let found = library().load("?bugbto triage", &roles()).unwrap();
         assert!(found.starts_with(BUGBOT_CORRECTION), "{found}");
         assert!(
             found.contains("poteto-mode/references/bugbot-triage.md"),
@@ -767,9 +854,17 @@ mod tests {
         r"cursor\.com/docs",
         r"\bCursor\b",
         r#"(^|[\s`"'(=:])/tmp\b"#,
+        r"\b(claude-(opus|sonnet|haiku)|grok|gemini)-[0-9]",
+        r"\bgpt-[0-9]",
+        r"setup-pstack",
+        r"pstack/models\.md",
     ];
-    /// Pages that name a Cursor term on purpose, and the term.
-    const CURSOR_TERMS_ALLOWED: &[(&str, &str)] = &[("README.md", r"\bCursor\b")];
+    /// Pages that name a Cursor term on purpose, and the term. The synthesizer's `gpt-4` is its
+    /// example of a fact that goes stale, not a model to run.
+    const CURSOR_TERMS_ALLOWED: &[(&str, &str)] = &[
+        ("README.md", r"\bCursor\b"),
+        ("skills/reflect/references/synthesizer.md", r"\bgpt-[0-9]"),
+    ];
     const LICENSE_FILE: &str = "LICENSE";
 
     fn untranslated(term: &Regex) -> Vec<String> {

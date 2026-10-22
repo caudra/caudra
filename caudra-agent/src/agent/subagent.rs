@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::decisions::FeatureMode;
-use caudra_config::{CODE_TOOL_NAME, ProfileToolPolicy};
+use caudra_config::{CODE_TOOL_NAME, ModelPolicy, ProfileToolPolicy};
 use caudra_decision::{Answer, DecisionResponse, ScoreAnswer};
 use serde_json::{Value as JsonValue, json};
 use tracing::info;
@@ -1665,22 +1665,13 @@ async fn resolve_task_model(ctx: &ToolContext, name: &str) -> Result<String, Str
         }))
         .filter(|spec| policy.allows(spec))
         .collect();
-    let preferred: Vec<&str> = in_use
-        .iter()
-        .filter_map(|spec| Some(spec.split_once(MODEL_SPEC_SEPARATOR)?.0))
-        .collect();
+    let preferred = preferred_providers(&in_use);
     let name = name.trim().to_owned();
-    if let Ok(favorite) = find_model(&name, &favorites::allowed(&policy), &preferred) {
-        return Ok(favorite);
-    }
-    let mut candidates = {
-        let policy = Arc::clone(&policy);
-        smol::unblock(move || provider::delegable_model_specs(&policy)).await
+    let (result, mut candidates) = {
+        let (policy, in_use, name) = (Arc::clone(&policy), in_use.clone(), name.clone());
+        smol::unblock(move || offline_task_model(&policy, &in_use, &name)).await
     };
-    candidates.extend(in_use.iter().cloned());
-    candidates.sort_unstable();
-    candidates.dedup();
-    match find_model(&name, &candidates, &preferred) {
+    match result {
         Err(ModelLookupError::NotFound { .. }) => {}
         result => return result.map_err(|error| error.to_string()),
     }
@@ -1697,6 +1688,43 @@ async fn resolve_task_model(ctx: &ToolContext, name: &str) -> Result<String, Str
         }
     }
     result.map_err(|error| error.to_string())
+}
+
+/// What a task's model name resolves to among the models known without asking a provider:
+/// the allowed favorites first, then every delegable and in-use spec. Blocking.
+pub(crate) fn resolve_task_model_offline(
+    policy: &ModelPolicy,
+    in_use: &[String],
+    name: &str,
+) -> Result<String, String> {
+    offline_task_model(policy, in_use, name.trim())
+        .0
+        .map_err(|error| error.to_string())
+}
+
+/// The offline lookup and, after a miss among the favorites, the candidates it searched, which
+/// a live listing extends.
+fn offline_task_model(
+    policy: &ModelPolicy,
+    in_use: &[String],
+    name: &str,
+) -> (Result<String, ModelLookupError>, Vec<String>) {
+    let preferred = preferred_providers(in_use);
+    if let Ok(favorite) = find_model(name, &favorites::allowed(policy), &preferred) {
+        return (Ok(favorite), Vec::new());
+    }
+    let mut candidates = provider::delegable_model_specs(policy);
+    candidates.extend(in_use.iter().cloned());
+    candidates.sort_unstable();
+    candidates.dedup();
+    (find_model(name, &candidates, &preferred), candidates)
+}
+
+fn preferred_providers(in_use: &[String]) -> Vec<&str> {
+    in_use
+        .iter()
+        .filter_map(|spec| Some(spec.split_once(MODEL_SPEC_SEPARATOR)?.0))
+        .collect()
 }
 
 async fn resolve_provider(

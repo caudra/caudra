@@ -287,8 +287,10 @@ Some pickers add extra bindings on top of the defaults:
 | Settings | `Space` | Use or drop the selected backend, flip a switch, or step to the next choice |
 | Settings | `[` / `]` | Move the selected backend up or down the list |
 | Settings | `m` | Switch web search to its next mode |
-| Settings | `Enter` | Edit the selected backend or setting; a list opens its own form |
-| Settings | `d` | Leave the backends to the environment, or reset the selected setting |
+| Settings | `Enter` | Edit the selected backend or setting, or pick a pstack seat's model; a list opens its own form |
+| Settings | `d` | Leave the backends to the environment, reset the selected setting, or remove the selected pstack seat |
+| Settings | `t` | Step the selected pstack seat's thinking through its model's levels, then effort |
+| Settings | `R` | Return the selected pstack kind to auto, or Effort to its default |
 | Settings | `Ctrl+R` | Show or mask credentials in a backend's form |
 | Settings | `/` | Filter every tab by key or table name; Esc clears it |
 | Settings | `?` | Open the selected setting's docs, as its [?] does |

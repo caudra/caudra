@@ -12,6 +12,8 @@ use crate::theme;
 const TAB_GAP: &str = "  ";
 /// The digits a strip counts with: `1` to `9`, then `0` for a tenth section.
 const DIGITS: usize = 10;
+/// What a cramped strip shows for a tab past the tenth, which no digit names.
+const UNNUMBERED: &str = "·";
 
 /// A modal's sections in strip order, which is also the order the digit keys
 /// and Tab walk them in.
@@ -29,19 +31,27 @@ pub(crate) trait SectionTab: Copy + Eq + 'static {
 
     /// The section a digit key names, counting from one, with `0` for the tenth.
     fn from_digit(digit: char) -> Option<Self> {
-        let number = digit.to_digit(10)? as usize;
-        Self::ALL.get((number + DIGITS - 1) % DIGITS).copied()
-    }
-
-    /// The digit key that names this section.
-    fn digit(self) -> usize {
-        (self.index() + 1) % DIGITS
+        digit_index(digit).and_then(|index| Self::ALL.get(index).copied())
     }
 
     fn step(self, delta: isize) -> Self {
-        let len = Self::ALL.len() as isize;
-        Self::ALL[(self.index() as isize + delta).rem_euclid(len) as usize]
+        step_in(Self::ALL, self, delta)
     }
+}
+
+/// The place in the strip a digit key names, counting from one, with `0` for the tenth.
+pub(crate) fn digit_index(digit: char) -> Option<usize> {
+    let number = digit.to_digit(10)? as usize;
+    Some((number + DIGITS - 1) % DIGITS)
+}
+
+/// The tab `delta` places from `current` among `tabs`, wrapping; `current` when it is not listed.
+pub(crate) fn step_in<T: SectionTab>(tabs: &[T], current: T, delta: isize) -> T {
+    let Some(at) = tabs.iter().position(|tab| *tab == current) else {
+        return current;
+    };
+    let len = tabs.len() as isize;
+    tabs[(at as isize + delta).rem_euclid(len) as usize]
 }
 
 /// The strip with `current` marked and the tab under `pointer` hovered, and
@@ -52,17 +62,29 @@ pub(crate) fn tab_strip<T: SectionTab>(
     pointer: Option<Position>,
     area: Rect,
 ) -> (Line<'static>, Vec<(Rect, T)>) {
+    tab_strip_of(T::ALL, current, pointer, area)
+}
+
+/// [`tab_strip`] over the tabs shown now, which a modal may narrow. A tab past the tenth has
+/// no digit key, so it shows its name alone.
+pub(crate) fn tab_strip_of<T: SectionTab>(
+    tabs: &[T],
+    current: T,
+    pointer: Option<Position>,
+    area: Rect,
+) -> (Line<'static>, Vec<(Rect, T)>) {
     let t = theme::current();
-    let named = strip_cols::<T>() <= area.width;
+    let named = strip_cols(tabs) <= area.width;
     let gap = u16::try_from(TAB_GAP.width()).unwrap_or(u16::MAX);
-    let mut spans = Vec::with_capacity(T::ALL.len() * 2);
-    let mut hits = Vec::with_capacity(T::ALL.len());
+    let mut spans = Vec::with_capacity(tabs.len() * 2);
+    let mut hits = Vec::with_capacity(tabs.len());
     let mut x = area.x;
-    for &tab in T::ALL {
-        let digit = tab.digit();
-        let text = match named {
-            true => format!("{digit} {}", tab.label()),
-            false => digit.to_string(),
+    for (index, &tab) in tabs.iter().enumerate() {
+        let text = match (named, digit_of(index)) {
+            (true, Some(digit)) => format!("{digit} {}", tab.label()),
+            (true, None) => tab.label().to_owned(),
+            (false, Some(digit)) => digit.to_string(),
+            (false, None) => UNNUMBERED.to_owned(),
         };
         let width = u16::try_from(text.width()).unwrap_or(u16::MAX);
         let style = match tab == current {
@@ -85,12 +107,21 @@ pub(crate) fn tab_strip<T: SectionTab>(
 
 /// What the strip needs to name every section, the gap after the last one
 /// included.
-fn strip_cols<T: SectionTab>() -> u16 {
-    let named: usize = T::ALL
+fn strip_cols<T: SectionTab>(tabs: &[T]) -> u16 {
+    let named: usize = tabs
         .iter()
-        .map(|tab| tab.digit().to_string().len() + 1 + tab.label().width() + TAB_GAP.width())
+        .enumerate()
+        .map(|(index, tab)| {
+            let digit = digit_of(index).map_or(0, |digit| digit.to_string().len() + 1);
+            digit + tab.label().width() + TAB_GAP.width()
+        })
         .sum();
     u16::try_from(named).unwrap_or(u16::MAX)
+}
+
+/// The digit key for the tab at `index`, none past the tenth.
+fn digit_of(index: usize) -> Option<usize> {
+    (index < DIGITS).then_some((index + 1) % DIGITS)
 }
 
 #[cfg(test)]

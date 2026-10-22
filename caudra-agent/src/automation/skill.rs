@@ -23,7 +23,7 @@ pub fn automation_dev_skill() -> BuiltinSkill {
             .get(DESCRIPTION_FIELD)
             .cloned()
             .unwrap_or_default(),
-        resolve: Box::new(move || (body.clone(), None)),
+        resolve: Box::new(move |_| (body.clone(), None)),
         pages: None,
     }
 }
@@ -31,6 +31,7 @@ pub fn automation_dev_skill() -> BuiltinSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::native::skill::SkillServe;
 
     const HEADING: &str = "# Writing Caudra automations";
     const NAME_LINE: &str = "name: caudra-automation-dev";
@@ -43,7 +44,7 @@ mod tests {
         assert_eq!(skill.name, FALLBACK_NAME);
         assert!(!skill.description.is_empty(), "{DESCRIBED_MSG}");
 
-        let (body, reference) = (skill.resolve)();
+        let (body, reference) = (skill.resolve)(&SkillServe::unrestricted());
         assert!(reference.is_none());
         assert!(body.starts_with(HEADING), "{HEADER_LEAKED_MSG}");
         assert!(!body.contains(NAME_LINE), "{HEADER_LEAKED_MSG}");

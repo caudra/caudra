@@ -124,7 +124,7 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal, SearchTab};
 use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::session_relocation::SessionRelocationPicker;
-use crate::components::settings_modal::SettingsModal;
+use crate::components::settings_modal::{RoleEdit, SettingsModal};
 use crate::components::shell_modal::ShellModal;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
@@ -3064,8 +3064,22 @@ impl App {
     }
 
     fn handle_model_picker_action(&mut self, action: ModelPickerAction) -> Vec<Action> {
+        let actions = self.model_picker_actions(action);
+        self.unpark_settings();
+        actions
+    }
+
+    fn model_picker_actions(&mut self, action: ModelPickerAction) -> Vec<Action> {
         match action {
             ModelPickerAction::Consumed | ModelPickerAction::Close => vec![],
+            ModelPickerAction::AssignPstack { kind, seat, value } => {
+                self.save_pstack_pick(RoleEdit::Seat { kind, seat, value });
+                vec![]
+            }
+            ModelPickerAction::ClearPstack(kind) => {
+                self.save_pstack_pick(RoleEdit::Reset(kind));
+                vec![]
+            }
             ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
             ModelPickerAction::Bind(purpose, binding) => vec![Action::Bind(purpose, binding)],
             ModelPickerAction::Unbind(purpose) => vec![Action::Unbind(purpose)],
@@ -6564,6 +6578,9 @@ impl App {
     /// project, so it rediscovers them here; a local one takes them from [`Self::reload_commands`].
     pub(crate) fn set_pstack(&mut self, on: bool) {
         self.pstack = on;
+        if self.settings_modal.is_open() {
+            self.settings_modal.set_pstack(self.pstack_roles());
+        }
         if !self.no_commands
             && let Some(context) = &self.remote_project_context
         {
@@ -7021,6 +7038,7 @@ impl App {
         self.suspend_permission_editor();
         self.close_stream_modal();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
+        self.settings.parked = None;
     }
 
     /// Hides the update banner in every session until Caudra restarts. Nothing

@@ -2,7 +2,7 @@ pub mod cache_warming;
 pub mod change_recording;
 pub mod commit_preamble;
 mod compaction;
-mod favorites;
+pub(crate) mod favorites;
 mod goal;
 mod goal_progress;
 mod history;

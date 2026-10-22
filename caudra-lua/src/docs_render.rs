@@ -316,7 +316,7 @@ pub fn plugin_dev_skill() -> BuiltinSkill {
     BuiltinSkill {
         name: NAME.to_owned(),
         description: DESCRIPTION.to_owned(),
-        resolve: Box::new(|| {
+        resolve: Box::new(|_| {
             let reference = reference();
             let content = skill_content(&reference);
             match spill_reference(&reference) {

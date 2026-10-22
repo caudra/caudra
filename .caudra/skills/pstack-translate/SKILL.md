@@ -73,12 +73,24 @@ A completion notification is the background task's final report, which arrives i
 
 ## Models
 
-- A model slug with an effort, `claude-opus-5-5-xhigh`, `grok-4.7-xhigh-fast`, `gpt-6.1-sol-high`: write `model: "<model>"` and `thinking: "<effort>"` on the `task` call, as `claude-opus-5-5` with `xhigh`. Drop `-fast`.
-- In tables of defaults, and in the role file, a role's value is `<model> <thinking>`, such as `claude-opus-5-5 xhigh` or `grok-4.7 xhigh`, or a comma-separated list of those for a panel.
-- `auto` and `inherit-parent` become `inherit`: omit `model` and `thinking`, so the task runs on the session's Subagent model.
-- A model `task` rejects: omit `model`, keep `thinking`, and say so in the reply.
-- `~/.cursor/rules/pstack-models.mdc`, "the `pstack-models.mdc` rule": the role file `~/.config/caudra/pstack/models.md`. It has no frontmatter: comment lines starting `#`, a `# budget: <label> (<thinking>)` line, and one `<role>: <value>` line per role. The `pstack` index shows the lines in force, so a skill reads them there. A missing file or role line means the skill's default.
-- Detecting models: the models `task` accepts are the session's model favorites and the models `caudra models` lists for providers the user is logged in to.
+Never name a model on a page. Caudra appends a **Model roles** table to every page that contains the exact phrase `the **Model roles** table` (bold included), computed when the page is served from the user's `/settings` → pstack choices, else from their favorite models and model jobs, so it only lists models they can run. Each row gives ready `task` arguments: `model` and `thinking`, or `inherit`. A page that tells the agent which model to use must contain that phrase, as in "the Code row of the **Model roles** table below", and names rows by their kind exactly.
+
+| Upstream role, default, or model slug | Kind |
+| --- | --- |
+| feature, refactoring, bug-fix, perf-issue, hillclimb; how explorer; why investigators; reflect tooling; any code-writing delegate | the Code row |
+| hardest tasks | the Hardest row |
+| judgment and prose; how explainer; why synthesizer; reflect judgment, divergent, synthesizer | the Judgment row |
+| swarm workers | the Verify row |
+| arena runners, architect runners, interrogate reviewers | the Panel rows, one task per seat; the seat count sets the panel size |
+| arena cross-judge pool | the Cross-judge pool row, picking a model on a provider other than the parent's when possible |
+
+- A model slug or a default (`<model> <effort>`, a panel list of them) becomes its role's row. Drop the slug and the default.
+- `auto` and `inherit-parent` become `inherit`: omit `model` and `thinking`, so the task runs on the profile's `subagent_model`, else the user's Subagent model.
+- When `task` has no `model` or `thinking` argument, omit both and say so: every row acts as `inherit`.
+- A value `task` rejects: run that seat as `inherit` and say so in the reply. Drop upstream's fallbacks to per-skill defaults and its family-prefix matching.
+- "A model family different from the parent's", for the cross-judge: a provider other than the parent's.
+- Reasoning levels start from the row's `thinking`. A page changes only `thinking` and keeps the row's model, so a diverse panel stays diverse.
+- `~/.cursor/rules/pstack-models.mdc`, "the `pstack-models.mdc` rule", reasoning budgets, and `setup-pstack` (retired): `/settings` → pstack, as in "Change these in `/settings` → pstack." setup-pstack's offers of a verification skill and a formal verification skill are suggestions in `docs/guide/01-setup.md`.
 
 ## Scripts
 

@@ -1494,6 +1494,7 @@ impl SpawnCtx {
         app.local_documents = self.local_documents.clone();
         app.summarize_memory = self.config.summarize_memory;
         app.pstack = self.config.builtin_skills.pstack;
+        app.settings.task_model_choice = self.config.task_model_choice;
         app.sandbox_live.connector = self.sandbox_connector.clone();
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();

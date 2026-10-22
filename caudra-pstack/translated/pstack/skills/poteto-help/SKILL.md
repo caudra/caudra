@@ -24,24 +24,20 @@ Infer the need from the message and the conversation. A named situation, such as
 
 Check the state that changes the answer, and mention it only when it does:
 
-- No role file, `~/.config/caudra/pstack/models.md`, means `/pstack:setup-pstack` hasn't run for this user, so every role uses its default model. The `pstack` index says which under Model roles.
 - No `verify-*` skill or other app harness in the project means agents have no scripted way to drive the app. Mention `/pstack:create-verification-skill` when the question is about proving a change works.
 - No formal verification skill in the project means no property is checked past what tests reach. Mention `/pstack:create-formal-verification-skill` when the question is about a race, an invariant, or another case tests rarely hit. When one exists and the code it covers changed after the commit it records as last in sync, mention `/pstack:maintain-formal-verification-skill` if the question touches that code.
 
-When the role file is missing and it matters, ask whether the user wants to pick a model for each role and a reasoning budget now. It matters when the user is new, the question is about setup or cost, or the answer depends on which models run. Ask at most once per chat. If the need is also unclear, ask both questions together. Offer two choices:
-
-- Now: give them `/pstack:setup-pstack` to type, and answer their question too.
-- Later: answer their question, and add one line saying every role keeps its default model until they run `/pstack:setup-pstack`.
+When the question is about setup or cost, or the answer depends on which models run, say which model each kind uses from the **Model roles** table below, and that `/settings` → pstack changes them.
 
 ## Get set up
 
 1. Turn pstack on with `pstack = true` under `[plugins.skill]` in `~/.config/caudra/caudra.toml`.
-2. Run [`/pstack:setup-pstack`](../setup-pstack/SKILL.md). It asks for a reasoning budget, maps a model to each role, and writes the role file. Its lines apply the next time the `pstack` skill is loaded. Then it offers once each to generate a verification skill and a formal verification skill for the project, unless the project already has one.
+2. Optionally pick a model and thinking level for each kind of subagent in `/settings` → pstack. Unset kinds are filled from the user's favorite models and model jobs. Suggest `/pstack:create-verification-skill` and `/pstack:create-formal-verification-skill` for the project, unless it already has them.
 3. Start a real task with `/pstack:poteto-mode`, a goal, and a check that can pass or fail.
 
 Turning it on changes nothing until the user invokes a skill. A pstack skill loads when the user types `/pstack:<name>` or asks for it by name. The [README](../../README.md) and [guide page 1](../../docs/guide/01-setup.md) have the details. Offer to word their first prompt with them, per [`references/prompting.md`](references/prompting.md).
 
-If cost is the worry, say where the tokens go and how to spend fewer. pstack spends extra tokens on subagents and review panels. Rerun `/pstack:setup-pstack` and pick a smaller budget or cheaper models. A role set to `inherit` omits `model` and `thinking`, so it runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else the user's Subagent model. That saves tokens when it is a cheaper model. A shorter panel list runs fewer subagents, one for each entry. Save `/pstack:poteto-mode` for work that needs rigor.
+If cost is the worry, say where the tokens go and how to spend fewer. pstack spends extra tokens on subagents and review panels. In `/settings` → pstack, pick cheaper models or lower thinking levels. A kind set to `inherit` omits `model` and `thinking`, so it runs on the model Caudra gives a task with no `model`: the profile's `subagent_model`, else the user's Subagent model. That saves tokens when it is a cheaper model. A shorter Panel runs fewer subagents, one for each seat. Save `/pstack:poteto-mode` for work that needs rigor.
 
 ## Start a task with `/pstack:poteto-mode`
 
@@ -87,7 +83,6 @@ The default answer is `/pstack:poteto-mode`, which runs most of the others when 
 | Vet a performance number before reporting or acting on it | [`/pstack:benchmark-checklist`](../benchmark-checklist/SKILL.md) |
 | Run a large or cross-cutting change, or one to review after stepping away | [`/pstack:figure-it-out`](../figure-it-out/SKILL.md) |
 | Keep a decision log during a run, and review it afterward | [`/pstack:show-me-your-work`](../show-me-your-work/SKILL.md) |
-| Pick a model for each role and a reasoning budget | [`/pstack:setup-pstack`](../setup-pstack/SKILL.md) |
 | Turn their own working habits into a personal mode skill | [`/pstack:automate-me`](../automate-me/SKILL.md) |
 | Turn what a finished task taught into skill edits | [`/pstack:reflect`](../reflect/SKILL.md) |
 | Stop agents from repeating the same mistakes in this repo | [`/pstack:correct`](../correct/SKILL.md) |
@@ -134,7 +129,7 @@ Principles are one-rule skills that `/pstack:poteto-mode` reads and cites in its
 |---|---|
 | The mode stopped applying after a few turns | It was started with `/pstack:poteto-mode` on one message. Keep it on with a system prompt profile, or start each task with `/pstack:poteto-mode`. |
 | A question got treated as the next step of the last task | Say "new task", or say the turn doesn't need the mode. |
-| A new model choice had no effect | The role file from `/pstack:setup-pstack` applies the next time the `pstack` skill is loaded. Load it again. |
+| A new model choice had no effect | `/settings` → pstack applies to the next pstack page an agent loads. Load the skill again. |
 | Runs cost more than expected | See the cost paragraph under Get set up. |
 | A skill didn't load on its own | A pstack skill loads only when the user types `/pstack:<name>` or asks for it by name, or when `/pstack:poteto-mode` runs it, and it doesn't run every skill. |
 | Parallel agents overwrote each other | Give each agent its own git worktree. |
@@ -147,6 +142,7 @@ For a run that drifts, [`references/prompting.md`](references/prompting.md) has 
 
 - [`/pstack:automate-me`](../automate-me/SKILL.md) drafts a personal mode skill from the user's own history, to use alongside `/pstack:poteto-mode`.
 - [`/pstack:reflect`](../reflect/SKILL.md) after a session turns its lessons into skill edits the user approves.
+- `/settings` → pstack picks the model and thinking level for each kind of subagent.
 - `/pstack:poteto-mode write a skill for <workflow>` runs the authoring playbook. The eval playbook tests a skill change blind.
 - Fix a misbehaving skill in its own PR, not inside the feature work where it went wrong.
 

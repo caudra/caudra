@@ -15,12 +15,13 @@ use caudra_agent::headless::{InteractiveHandle, InteractiveRun, billed_cost};
 use caudra_agent::mcp::McpHandle;
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::native::plan::PlanTarget;
-use caudra_agent::tools::native::skill;
+use caudra_agent::tools::native::skill::{self, SkillServe};
 use caudra_agent::types::AgentEvent;
 use caudra_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, McpPromptRef, Message,
     QueueItemId, SteeringQueue, mentions,
 };
+use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
 use caudra_providers::{ThinkingConfig, add_cost};
 use caudra_storage::id::CaudraId;
@@ -83,6 +84,8 @@ pub(crate) struct SessionState {
     pub(crate) cwd: PathBuf,
     pub(crate) remote: bool,
     pub(crate) runtime: AcpRuntime,
+    /// What the builtin skills this session loads tailor their text to.
+    pub(crate) model_policy: Arc<ModelPolicy>,
 }
 
 impl SessionState {
@@ -237,7 +240,11 @@ impl SessionState {
             None => (Vec::new(), None),
             Some(Invocation::Compact) => return Ok(Submission::Compact),
             Some(Invocation::Skill(name)) => {
-                let body = skill::load(&self.runtime.registry, name)
+                let serve = SkillServe {
+                    model_policy: Arc::clone(&self.model_policy),
+                    task_model_choice: self.runtime.config.task_model_choice,
+                };
+                let body = skill::load(&self.runtime.registry, name, &serve)
                     .map_err(|error| invalid_params(&error))?;
                 (vec![Message::observation(body)], None)
             }

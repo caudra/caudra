@@ -324,6 +324,7 @@ impl TestServer {
             cwd: PathBuf::new(),
             remote: false,
             runtime: AcpRuntime::default(),
+            model_policy: Arc::new(ModelPolicy::default()),
         };
         let sid = state.id();
         self.server

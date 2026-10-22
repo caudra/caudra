@@ -27,12 +27,12 @@ every file here is then a page of the `pstack` skill, and each skill you run dir
 
 two steps:
 
-1. run [`/pstack:setup-pstack`](./skills/setup-pstack/SKILL.md), pick a reasoning budget, and choose which models you want.
+1. open `/settings` → pstack and choose which models you want, or keep the ones caudra picks from your favorite models.
 2. use [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) whenever you're doing anything that requires rigor.
 
 new here? the [pstack guide](./docs/guide/README.md) walks you through a first real task, from setup and prompting through verification and overnight runs. stuck, or unsure which skill fits? ask [`/pstack:poteto-help`](./skills/poteto-help/SKILL.md).
 
-that's it. the other skills are situational, and the mode skill uses them for you as needed. out of the box the mode splits work by model strength: code delegates (feature, refactoring, bug fix, perf, hillclimb) go to grok, while the hardest changes, prose, and judgment go to opus 5.5. the default panel is opus 5.5 / grok. [`/pstack:setup-pstack`](./skills/setup-pstack/SKILL.md) changes any of it.
+that's it. the other skills are situational, and the mode skill uses them for you as needed. the mode splits work by model strength: code delegates (feature, refactoring, bug fix, perf, hillclimb) go to your code model, the hardest changes to your strongest model, and prose and judgment to your judgment model. review panels mix models so their blind spots differ. `/settings` → pstack changes any of it.
 
 ## usage
 
@@ -131,7 +131,6 @@ to keep [`/pstack:poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, 
 | [`/pstack:interrogate`](./skills/interrogate/SKILL.md) | you have a diff and want different models to try to break it, including a strict code-quality lens. |
 | [`/pstack:automate-me`](./skills/automate-me/SKILL.md) | you want your own `-mode` skill, drafted from how you've actually worked. |
 | [`/pstack:make-bot-ui`](./skills/make-bot-ui/SKILL.md) | you want a page or dashboard whose buttons wake this Caudra session through an automation, including Tailscale. |
-| [`/pstack:setup-pstack`](./skills/setup-pstack/SKILL.md) | you want to pick which models pstack uses per role. detects your models and writes a role file. |
 | [`/pstack:reflect`](./skills/reflect/SKILL.md) | a long task landed and you want the recipe captured as a skill edit. |
 | [`/pstack:correct`](./skills/correct/SKILL.md) | you keep correcting agents for the same mistakes. mines history for mistake classes, fixes each at the highest level that works (architecture, then types, lint, and ci, then tests, with docs last), and keeps a table pairing each rule with what enforces it. |
 | [`/pstack:teach`](./skills/teach/SKILL.md) | you want to actually understand a change or subsystem, not just have it summarized. runs how + why and weaves one plain explanation, built up diagram by diagram. |
@@ -264,9 +263,7 @@ caudra already has a great plan mode which works great with pstack. but personal
 
 type [`/pstack:automate-me`](./skills/automate-me/SKILL.md). it mines your recent transcripts, drafts a `<your-name>-mode` skill from how you've actually worked, and routes through pstack underneath. you keep pstack as the base and end up with your own routing skill alongside `poteto-mode`.
 
-models are configurable too. type [`/pstack:setup-pstack`](./skills/setup-pstack/SKILL.md). it detects the models you have access to and writes a small role file, `~/.config/caudra/pstack/models.md`, mapping each role (code, judgment, the review panels) to a model. every skill reads it and falls back to sensible defaults when the file or a role line is absent, so you override only what you want.
-
-when a default changes, a role file written before the change still pins the old default. delete those role lines, or delete the file, then run `/pstack:setup-pstack` again. a rerun keeps any role whose model differs from the default.
+models are configurable too. open `/settings` → pstack and pick a model and thinking level for each kind of subagent (code, hardest, judgment, verify, the review panel, the cross-judge pool). a kind you leave alone is filled from your favorite models and model jobs, so you override only what you want.
 
 ## automations
 

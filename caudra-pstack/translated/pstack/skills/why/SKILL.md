@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Investigate the motivation and intent behind code. The companion `how` skill answers what the code does and how it works. `why` answers what forces led to its shape.
 
-Each spawn below names a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
+Each spawn names a row of the **Model roles** table below. Set `model` and `thinking` to that row's values, and leave both unset when the row is `inherit`. Change the rows in `/settings` → pstack. If `task` rejects a value, run that spawn as `inherit` and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
 Every spawn is a `task` with `profile: "builtin"` and `mode: "build"`. A task's mode is capped by the caller's, so the session must be in Build mode. **Do not use `mode: "plan"`.** It strips most MCP tools, which disables the MCP-backed investigators and the synthesizer's citation spot-checks. Investigators still shouldn't write anything.
 
@@ -46,7 +46,7 @@ Map each available MCP to one evidence category:
 
 Source control is always available through git and `gh`. For the other six, classify using the MCP name, server instructions, tool names, and resource descriptors. If an MCP could fit more than one category, choose the one matching its primary evidence. Record ambiguous cases in the coverage map.
 
-Spawn one investigator per category that has a matching MCP, all in a single message so they run concurrently, each owning exactly one tool or MCP. Don't ask one agent to cover multiple MCPs. `model` and `thinking`: the `why investigators` line, default `grok-4.7 xhigh`.
+Spawn one investigator per category that has a matching MCP, all in a single message so they run concurrently, each owning exactly one tool or MCP. Don't ask one agent to cover multiple MCPs. `model` and `thinking`: the Code row.
 
 Each investigator's prompt is `references/investigator-prompt.md` filled in, plus:
 - the category playbook `references/sources/<source>.md` for the selected MCP, adapted from the examples in `references/source-playbook.md`
@@ -76,7 +76,7 @@ If your scope assessment suggests a single-commit trivial target where the PR de
 
 ## Step 4. Synthesize
 
-Spawn one synthesizer. `model` and `thinking`: the `why synthesizer` line, default `claude-opus-5-5 xhigh`. It gets:
+Spawn one synthesizer. `model` and `thinking`: the Judgment row. It gets:
 1. The investigator findings, including any null results and any categories skipped with justification
 2. The code anchor
 3. The user's original question

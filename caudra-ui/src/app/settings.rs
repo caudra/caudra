@@ -1,8 +1,10 @@
 //! `/settings` from the app's side: the global `caudra.toml` it edits, the local Workcell whose
 //! web search it reports on, and the reads and writes it hands to a background thread.
 
+use std::mem;
 use std::path::{Path, PathBuf};
 
+use caudra_agent::pstack::roles::{self, Kind};
 use caudra_config::config_file::{load_global_config, project_config_path};
 use caudra_config::settings_file::{GlobalSettingsFile, ProjectSettings};
 use caudra_config::websearch::{BACKENDS_KEY, GlobalWebsearchFile, MODE_KEY, WebsearchConfig};
@@ -11,8 +13,9 @@ use flume::{Receiver, TryRecvError};
 
 use super::App;
 use crate::components::settings_modal::{
-    SettingsAction, SettingsData, SettingsEdit, SettingsFiles, SettingsReply, SettingsRequest,
-    environment_backends, environment_mode,
+    PstackAction, PstackRoles, RoleEdit, SettingsAction, SettingsData, SettingsEdit, SettingsFiles,
+    SettingsModal, SettingsReply, SettingsRequest, apply_role_edit, environment_backends,
+    environment_mode,
 };
 use crate::components::{Action, Overlay};
 use crate::repaint::Dirty;
@@ -21,12 +24,17 @@ const NO_CONFIG_DIRECTORY: &str =
     "Caudra cannot resolve its configuration directory, so there is no global caudra.toml to edit.";
 const WORKER_STOPPED: &str = "The background read stopped before it answered; reopen /settings.";
 const LIST_SEPARATOR: &str = "; ";
+const ROLES_NOT_SAVED: &str = "pstack's roles were not saved: ";
 
 /// What `/settings` edits for this session, and the work it has in flight.
 pub(crate) struct SettingsLink {
     /// The local Workcell's web search, `None` when web tools run on a remote one.
     pub(crate) websearch: Option<WebsearchControl>,
     pub(crate) config_path: Option<PathBuf>,
+    /// Set by the event loop: `agent.task_model_choice`, which pstack's roles resolve against.
+    pub(crate) task_model_choice: bool,
+    /// The modal set aside while the model picker chooses a pstack seat, back when it closes.
+    pub(crate) parked: Option<Box<SettingsModal>>,
     reply: Option<Receiver<SettingsReply>>,
 }
 
@@ -35,6 +43,8 @@ impl Default for SettingsLink {
         Self {
             websearch: None,
             config_path: caudra_config::global_config_path(),
+            task_model_choice: true,
+            parked: None,
             reply: None,
         }
     }
@@ -43,6 +53,7 @@ impl Default for SettingsLink {
 impl App {
     pub(super) fn open_settings(&mut self) -> Vec<Action> {
         let action = self.settings_modal.open(self.settings.websearch.is_some());
+        self.settings_modal.set_pstack(self.pstack_roles());
         self.handle_settings_action(action)
     }
 
@@ -55,8 +66,72 @@ impl App {
             }
             SettingsAction::Request(request) => self.start_settings_request(request),
             SettingsAction::OpenDocs(topic) => self.open_docs(topic),
+            SettingsAction::Pstack(PstackAction::Edit(edit)) => self.edit_pstack_roles(edit),
+            SettingsAction::Pstack(PstackAction::Pick { kind, seat, model }) => {
+                return self.pick_pstack_model(kind, seat, model);
+            }
         }
         Vec::new()
+    }
+
+    /// pstack's roles as stored now, `None` while pstack is off.
+    pub(super) fn pstack_roles(&self) -> Option<PstackRoles> {
+        self.pstack.then(|| {
+            PstackRoles::new(
+                roles::table(&self.model_policy, self.settings.task_model_choice),
+                roles::load(),
+                roles::effort_levels,
+            )
+        })
+    }
+
+    /// Reads the stored roles fresh, applies `edit` against the table they resolve to, writes
+    /// them back, and shows what pstack serves now.
+    fn edit_pstack_roles(&mut self, edit: RoleEdit) {
+        let mut stored = roles::load();
+        let table = roles::table(&self.model_policy, self.settings.task_model_choice);
+        apply_role_edit(&mut stored, &table, edit, roles::effort_levels);
+        let error = roles::store(&stored)
+            .err()
+            .map(|error| format!("{ROLES_NOT_SAVED}{error}"));
+        let roles = self.pstack_roles();
+        self.settings_modal.pstack_saved(roles, error);
+    }
+
+    /// Sets the modal aside and opens the model picker on the seat; [`Self::unpark_settings`]
+    /// brings the modal back as it was.
+    fn pick_pstack_model(
+        &mut self,
+        kind: Kind,
+        seat: Option<usize>,
+        model: Option<String>,
+    ) -> Vec<Action> {
+        self.settings.parked = Some(Box::new(mem::take(&mut self.settings_modal)));
+        self.model_picker.open_pstack(
+            &self.state.model,
+            &self.model_policy,
+            self.active_decision_endpoint(),
+            kind,
+            seat,
+            model,
+        );
+        vec![Action::RefreshModels]
+    }
+
+    /// The modal set aside for the model picker, back once the picker has closed.
+    pub(super) fn unpark_settings(&mut self) {
+        if self.model_picker.is_open() {
+            return;
+        }
+        if let Some(modal) = self.settings.parked.take() {
+            self.settings_modal = *modal;
+        }
+    }
+
+    /// What the model picker chose for a pstack seat, saved once the modal is back.
+    pub(super) fn save_pstack_pick(&mut self, edit: RoleEdit) {
+        self.unpark_settings();
+        self.edit_pstack_roles(edit);
     }
 
     fn start_settings_request(&mut self, request: SettingsRequest) {
@@ -87,7 +162,10 @@ impl App {
             Err(TryRecvError::Disconnected) => stopped(),
         };
         self.settings.reply = None;
-        self.settings_modal.receive(reply);
+        match self.settings.parked.as_mut() {
+            Some(parked) => parked.receive(reply),
+            None => self.settings_modal.receive(reply),
+        }
         Dirty::YES
     }
 }

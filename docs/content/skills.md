@@ -122,14 +122,29 @@ The skill uses addresses the way `caudra-docs` does:
 
 | Load | You get |
 |---|---|
-| `pstack` | the index: every skill with its summary, and the model roles in force |
+| `pstack` | the index: every skill with its summary, and the Model roles table |
 | `pstack/poteto-mode` | one skill |
 | `pstack/poteto-mode/playbooks/bug-fix.md` | a file inside a skill |
 | `pstack?flaky test` | the 8 best pages that contain every word, ranked like a `caudra-docs` search, each with its address and a snippet |
 
 Upstream wrote the skills for Cursor. Caudra ships them translated: the pages name Caudra's tools, paths, models and commands, so the agent follows them as written. Pages that need an automation say how to arm it and with which args, such as `pstack-watch-pr`, which watches a pull request and messages the session when its checks or reviews change. There is nothing to write or trust: you arm the bundled script in `/automations`. A user or project script of the same name replaces it.
 
-`setup-pstack` picks a model for each role pstack's skills name and writes them to `~/.config/caudra/pstack/models.md`. The index reads that file each time it loads, so a change applies at once.
+#### Model roles
+
+The pages never name a model. They name six kinds of work, and every page that starts tasks ends with a **Model roles** table that gives each kind's `model` and `thinking` for the `task` call:
+
+| Kind | Used for | Unless you set it |
+|---|---|---|
+| Code | code-writing delegates, explorers, investigators | `inherit`: the profile's `subagent_model`, else the Subagent [model job](/docs/providers/#model-jobs) |
+| Hardest | the hardest changes | your newest Best-lane favorite |
+| Judgment | prose, judgment, explainers, synthesizers | your newest Best-lane favorite |
+| Verify | verification lanes | `inherit` |
+| Panel | a diverse panel, one task per seat, such as arena runners and interrogate reviewers | two Best-lane favorites on different providers |
+| Cross-judge pool | the model that judges an arena, on a provider other than the session's when it can | the Panel's models |
+
+The lane is the one `caudra models` and the `# Model favorites` reminder show. Short of Best-lane favorites on two providers, the Panel takes your newest favorites on different providers from any lane. With every favorite on one provider, the table repeats one model and says the panel is not diverse. With no favorites, every kind is `inherit`. Each value gets the default effort, `xhigh` unless you change it, lowered to the highest level the model supports.
+
+Open `/settings` and its **pstack** tab, the last one, shown while pstack is on, to choose a kind's model. `Enter` opens the model list with `inherit` and your favorites first, `t` changes a row's thinking level, and `R` returns the kind to automatic. On the Effort row, `Enter` steps the default effort and `R` restores `xhigh`. A Panel or Cross-judge pool has a line per seat, `+ add seat` adds one, and `d` removes one. The choices are saved globally with your model jobs and apply the next time a page loads, in every session, including `--print` and ACP. A saved model you can no longer use, because it is unstarred and Caudra cannot resolve it or `allowed_models` rules it out, is replaced by the automatic choice, and the table says so. With `agent.task_model_choice = false`, `task` has no `model` or `thinking`, so every kind runs as `inherit`.
 
 Each builtin has a switch under `plugins.skill`:
 

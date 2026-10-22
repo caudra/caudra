@@ -1,11 +1,13 @@
-//! `/settings`: the `[websearch]` backends with whether each is ready, and a tab per group of
-//! plain tables of the global `caudra.toml`. Edits go to a background thread that writes the
-//! file and keeps its comments; the config watcher puts them in force.
+//! `/settings`: the `[websearch]` backends with whether each is ready, a tab per group of
+//! plain tables of the global `caudra.toml`, and pstack's model roles while pstack is on. Edits
+//! go to a background thread that writes the file and keeps its comments; the config watcher
+//! puts them in force. pstack's roles live in Caudra's state, which the app writes.
 
 mod fields;
 mod form;
 mod list_form;
 mod plain;
+mod pstack;
 mod websearch;
 
 use std::mem;
@@ -37,7 +39,7 @@ use crate::components::command_text::ellipsize_spans;
 use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
-use crate::components::section_tabs::{SectionTab, tab_strip};
+use crate::components::section_tabs::{SectionTab, digit_index, step_in, tab_strip_of};
 use crate::components::{Overlay, ascii_key, plain_char, selectable_row};
 use crate::event_loop::config_reload::ApplyTiming;
 use crate::theme::{self, Theme};
@@ -48,6 +50,8 @@ use fields::{
 use form::{FormField, FormKey, SettingsForm};
 use list_form::{ListForm, ListKey};
 use plain::{Group, PlainRow, filtered_rows, heading, tab_rows, timing_of};
+pub(crate) use pstack::{PstackAction, PstackRoles, RoleEdit, apply as apply_role_edit};
+use pstack::{PstackRow, next_effort, next_thinking, row_info, row_lines};
 use websearch::{
     BackendRow, RowColumns, backend_info, backend_line, backend_rows, literal_warning, mode_line,
 };
@@ -59,7 +63,11 @@ pub(crate) const MODE_LABEL: &str = "m";
 pub(crate) const RESET_LABEL: &str = "d";
 pub(crate) const FILTER_LABEL: &str = "/";
 pub(crate) const DOCS_LABEL: &str = "?";
+pub(crate) const THINKING_LABEL: &str = "t";
+pub(crate) const AUTO_LABEL: &str = "R";
 const TOGGLE_KEY: char = ' ';
+const THINKING_KEY: char = ascii_key(THINKING_LABEL);
+const AUTO_KEY: char = ascii_key(AUTO_LABEL);
 const MOVE_UP_KEY: char = ascii_key(MOVE_UP_LABEL);
 const MOVE_DOWN_KEY: char = ascii_key(MOVE_DOWN_LABEL);
 const MODE_KEY: char = ascii_key(MODE_LABEL);
@@ -111,6 +119,12 @@ const FIELD_HINT: &str =
 const FORM_TITLE_PREFIX: &str = " ";
 const FORM_TITLE_SUFFIX: &str = " ";
 const FOOTER_GAPS: [(bool, &str); 3] = [(true, SEPARATOR), (false, "  "), (false, " ")];
+const PSTACK_SAVED: &str = "Saved; pstack uses it from its next page load.";
+const EFFORT_ALREADY_DEFAULT: &str = "Effort is already the default.";
+const ALREADY_AUTO: &str = "This kind is already on auto.";
+const NOT_A_SEAT: &str = "Only a Panel or Cross-judge pool seat can be removed.";
+const INHERIT_THINKING: &str = "An inherit seat takes no thinking level; pick a model first.";
+const NO_LEVELS: &str = "This model takes no thinking level.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsTab {
@@ -124,6 +138,8 @@ pub(crate) enum SettingsTab {
     Worktrees,
     Autopilot,
     Automations,
+    /// Listed only while pstack is on, last so it moves no other tab's digit.
+    Pstack,
 }
 
 impl SectionTab for SettingsTab {
@@ -138,6 +154,7 @@ impl SectionTab for SettingsTab {
         Self::Worktrees,
         Self::Autopilot,
         Self::Automations,
+        Self::Pstack,
     ];
 
     fn label(self) -> &'static str {
@@ -152,6 +169,7 @@ impl SectionTab for SettingsTab {
             Self::Worktrees => "Worktrees",
             Self::Autopilot => "Autopilot",
             Self::Automations => "Automations",
+            Self::Pstack => "pstack",
         }
     }
 }
@@ -222,10 +240,10 @@ const AUTOMATIONS_GROUPS: &[Group] = &[Group {
 }];
 
 impl SettingsTab {
-    /// The tables a plain tab edits, none for Web search.
+    /// The tables a plain tab edits, none for Web search or pstack.
     fn groups(self) -> &'static [Group] {
         match self {
-            Self::Websearch => &[],
+            Self::Websearch | Self::Pstack => &[],
             Self::General => GENERAL_GROUPS,
             Self::Ui => UI_GROUPS,
             Self::Agent => AGENT_GROUPS,
@@ -289,6 +307,7 @@ pub(crate) enum SettingsAction {
     Request(SettingsRequest),
     /// Opens the docs over the modal, which stays open beneath.
     OpenDocs(DocsTopic),
+    Pstack(PstackAction),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -305,6 +324,9 @@ enum FooterCommand {
     MoveDown,
     Mode,
     Reset,
+    Thinking,
+    Auto,
+    Remove,
     Filter,
     Docs,
     Section,
@@ -320,6 +342,9 @@ impl FooterCommand {
             Self::MoveDown => (MOVE_DOWN_LABEL, "Down"),
             Self::Mode => (MODE_LABEL, "Mode"),
             Self::Reset => (RESET_LABEL, "Reset"),
+            Self::Thinking => (THINKING_LABEL, "Thinking"),
+            Self::Auto => (AUTO_LABEL, "Auto"),
+            Self::Remove => (RESET_LABEL, "Remove"),
             Self::Filter => (FILTER_LABEL, "Filter"),
             Self::Docs => (DOCS_LABEL, "Docs"),
             Self::Section => (key::TAB.label, "Section"),
@@ -357,6 +382,10 @@ pub(crate) struct SettingsModal {
     backend: WebsearchBackendName,
     /// The plain row selected, by its place among the rows shown; always a key, never a heading.
     field: usize,
+    /// pstack's roles while pstack is on, which lists its tab.
+    pstack: Option<PstackRoles>,
+    /// The pstack row selected, by its place among the rows shown.
+    pstack_row: usize,
     filter: Option<Filter>,
     form: Option<(SettingsForm, FormTarget)>,
     list_form: Option<(ListForm, KeyTarget)>,
@@ -392,6 +421,8 @@ impl SettingsModal {
             data: None,
             backend: WebsearchBackendName::ALL[0],
             field: 0,
+            pstack: None,
+            pstack_row: 0,
             filter: None,
             form: None,
             list_form: None,
@@ -551,8 +582,8 @@ impl SettingsModal {
         }
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Tab => self.set_tab(self.tab.step(1)),
-            KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
+            KeyCode::Tab => self.step_tab(1),
+            KeyCode::BackTab => self.step_tab(-1),
             KeyCode::Up if shifted => self.scroll_info(-1),
             KeyCode::Down if shifted => self.scroll_info(1),
             KeyCode::Up => self.step(-1),
@@ -562,17 +593,25 @@ impl SettingsModal {
             KeyCode::Home => self.step(isize::MIN),
             KeyCode::End => self.step(isize::MAX),
             KeyCode::Enter => return self.command(FooterCommand::Edit),
+            KeyCode::Right if self.selected_pstack_row() == Some(PstackRow::Effort) => {
+                return self.command(FooterCommand::Edit);
+            }
             _ => {
                 return match plain_char(&key) {
                     Some(TOGGLE_KEY) => self.command(FooterCommand::Toggle),
                     Some(MOVE_UP_KEY) => self.command(FooterCommand::MoveUp),
                     Some(MOVE_DOWN_KEY) => self.command(FooterCommand::MoveDown),
                     Some(MODE_KEY) => self.command(FooterCommand::Mode),
+                    Some(RESET_KEY) if self.pstack_shown() => self.command(FooterCommand::Remove),
                     Some(RESET_KEY) => self.command(FooterCommand::Reset),
+                    Some(THINKING_KEY) => self.command(FooterCommand::Thinking),
+                    Some(AUTO_KEY) => self.command(FooterCommand::Auto),
                     Some(FILTER_KEY) => self.command(FooterCommand::Filter),
                     Some(DOCS_KEY) => self.command(FooterCommand::Docs),
                     Some(digit) => {
-                        if let Some(tab) = SettingsTab::from_digit(digit) {
+                        if let Some(tab) =
+                            digit_index(digit).and_then(|index| self.tabs().get(index).copied())
+                        {
                             self.set_tab(tab);
                         }
                         SettingsAction::Consumed
@@ -598,8 +637,8 @@ impl SettingsModal {
                 }
                 self.select_first_key();
             }
-            KeyCode::Tab => self.set_tab(self.tab.step(1)),
-            KeyCode::BackTab => self.set_tab(self.tab.step(-1)),
+            KeyCode::Tab => self.step_tab(1),
+            KeyCode::BackTab => self.step_tab(-1),
             KeyCode::Char(typed)
                 if !key
                     .modifiers
@@ -679,7 +718,7 @@ impl SettingsModal {
             Constraint::Length(1),
         ])
         .areas(padded);
-        let (strip, hits) = tab_strip(self.tab, self.pointer, tabs);
+        let (strip, hits) = tab_strip_of(&self.tabs(), self.tab, self.pointer, tabs);
         self.tab_hits = hits;
         frame.render_widget(Paragraph::new(strip), tabs);
         self.render_lead(frame, lead, &theme);
@@ -708,6 +747,57 @@ impl SettingsModal {
         self.tab == SettingsTab::Websearch && self.filter.is_none()
     }
 
+    /// Whether the pstack tab shows, which a filter hides.
+    fn pstack_shown(&self) -> bool {
+        self.tab == SettingsTab::Pstack && self.filter.is_none()
+    }
+
+    /// pstack's roles as the app read them, `None` while pstack is off, which hides its tab.
+    pub(crate) fn set_pstack(&mut self, roles: Option<PstackRoles>) {
+        if roles.is_none() && self.tab == SettingsTab::Pstack {
+            self.set_tab(SettingsTab::Websearch);
+        }
+        self.pstack = roles;
+        self.pstack_row = self
+            .pstack_row
+            .min(self.pstack_rows().len().saturating_sub(1));
+        self.reveal_cursor = true;
+    }
+
+    /// The roles read back after an edit, and why it was not saved.
+    pub(crate) fn pstack_saved(&mut self, roles: Option<PstackRoles>, error: Option<String>) {
+        self.set_pstack(roles);
+        self.message = error.is_none().then(|| PSTACK_SAVED.to_owned());
+        self.error = error;
+    }
+
+    /// The tabs listed: every one, pstack's only while pstack is on.
+    fn tabs(&self) -> Vec<SettingsTab> {
+        SettingsTab::ALL
+            .iter()
+            .copied()
+            .filter(|tab| *tab != SettingsTab::Pstack || self.pstack.is_some())
+            .collect()
+    }
+
+    fn step_tab(&mut self, delta: isize) {
+        self.set_tab(step_in(&self.tabs(), self.tab, delta));
+    }
+
+    fn pstack_rows(&self) -> Vec<PstackRow> {
+        self.pstack
+            .as_ref()
+            .map(|roles| pstack::rows(&roles.table))
+            .unwrap_or_default()
+    }
+
+    fn selected_pstack_row(&self) -> Option<PstackRow> {
+        if !self.pstack_shown() {
+            return None;
+        }
+        self.pstack_rows().get(self.pstack_row).copied()
+    }
+
     fn set_tab(&mut self, tab: SettingsTab) {
         if tab == self.tab && self.filter.is_none() {
             return;
@@ -715,6 +805,7 @@ impl SettingsModal {
         self.tab = tab;
         self.filter = None;
         self.field = 0;
+        self.pstack_row = 0;
         self.offset = 0;
         self.info_scroll = 0;
         self.mode_hits.clear();
@@ -760,6 +851,9 @@ impl SettingsModal {
     }
 
     fn cursor(&self) -> usize {
+        if self.pstack_shown() {
+            return self.pstack_row;
+        }
         match self.websearch_shown() {
             true => self
                 .backend_order()
@@ -771,8 +865,13 @@ impl SettingsModal {
     }
 
     fn step(&mut self, delta: isize) {
-        if self.websearch_shown() {
-            let last = WebsearchBackendName::ALL.len() - 1;
+        let fixed = match (self.websearch_shown(), self.pstack_shown()) {
+            (true, _) => Some(WebsearchBackendName::ALL.len()),
+            (_, true) => Some(self.pstack_rows().len()),
+            _ => None,
+        };
+        if let Some(rows) = fixed {
+            let last = rows.saturating_sub(1);
             self.select(self.cursor().saturating_add_signed(delta).min(last));
             return;
         }
@@ -796,6 +895,12 @@ impl SettingsModal {
     fn select(&mut self, index: usize) {
         self.reveal_cursor = true;
         self.info_scroll = 0;
+        if self.pstack_shown() {
+            if index < self.pstack_rows().len() {
+                self.pstack_row = index;
+            }
+            return;
+        }
         match self.websearch_shown() {
             true => {
                 if let Some(backend) = self.backend_order().get(index) {
@@ -812,9 +917,10 @@ impl SettingsModal {
 
     fn click_row(&mut self, position: Position) -> SettingsAction {
         let index = self.offset + usize::from(position.y - self.list_area.y);
-        let rows = match self.websearch_shown() {
-            true => WebsearchBackendName::ALL.len(),
-            false => self.plain_rows().len(),
+        let rows = match (self.websearch_shown(), self.pstack_shown()) {
+            (true, _) => WebsearchBackendName::ALL.len(),
+            (_, true) => self.pstack_rows().len(),
+            _ => self.plain_rows().len(),
         };
         if index >= rows {
             return SettingsAction::Consumed;
@@ -855,7 +961,7 @@ impl SettingsModal {
         let websearch = self.websearch_shown();
         match (command, websearch) {
             (FooterCommand::Section, _) => {
-                self.set_tab(self.tab.step(1));
+                self.step_tab(1);
                 SettingsAction::Consumed
             }
             (FooterCommand::Close, _) => SettingsAction::Close,
@@ -877,6 +983,10 @@ impl SettingsModal {
                 SettingsAction::Consumed
             }
             _ if self.refused() => SettingsAction::Consumed,
+            _ if self.pstack_shown() => self.pstack_command(command),
+            (FooterCommand::Thinking | FooterCommand::Auto | FooterCommand::Remove, _) => {
+                SettingsAction::Consumed
+            }
             (FooterCommand::Toggle, true) => self.toggle_backend(),
             (FooterCommand::Edit, true) => self.open_backend_form(),
             (FooterCommand::MoveUp, true) => self.move_backend(false),
@@ -931,6 +1041,82 @@ impl SettingsModal {
             files,
             edit: Box::new(edit),
         })
+    }
+
+    fn pstack_command(&mut self, command: FooterCommand) -> SettingsAction {
+        let (Some(row), Some(roles)) = (self.selected_pstack_row(), self.pstack.as_ref()) else {
+            return SettingsAction::Consumed;
+        };
+        let refusal = |message: &str| (None, Some(message.to_owned()));
+        let (action, message) = match (command, row) {
+            (FooterCommand::Edit | FooterCommand::Toggle, PstackRow::Effort) => {
+                let effort = next_effort(roles.stored.effort.as_deref());
+                (
+                    Some(PstackAction::Edit(RoleEdit::Effort(Some(effort)))),
+                    None,
+                )
+            }
+            (FooterCommand::Edit | FooterCommand::Toggle, PstackRow::Seat { kind, seat }) => (
+                Some(PstackAction::Pick {
+                    kind,
+                    seat: Some(seat),
+                    model: roles.seat_model(kind, seat).map(str::to_owned),
+                }),
+                None,
+            ),
+            (FooterCommand::Edit | FooterCommand::Toggle, PstackRow::Add(kind)) => (
+                Some(PstackAction::Pick {
+                    kind,
+                    seat: None,
+                    model: None,
+                }),
+                None,
+            ),
+            (FooterCommand::Auto, PstackRow::Effort) if roles.stored.effort.is_none() => {
+                refusal(EFFORT_ALREADY_DEFAULT)
+            }
+            (FooterCommand::Auto, PstackRow::Effort) => {
+                (Some(PstackAction::Edit(RoleEdit::Effort(None))), None)
+            }
+            (FooterCommand::Auto, PstackRow::Seat { kind, .. } | PstackRow::Add(kind)) => {
+                match roles.stores(kind) {
+                    true => (Some(PstackAction::Edit(RoleEdit::Reset(kind))), None),
+                    false => refusal(ALREADY_AUTO),
+                }
+            }
+            (FooterCommand::Remove, PstackRow::Seat { kind, seat }) if kind.is_list() => (
+                Some(PstackAction::Edit(RoleEdit::Remove { kind, seat })),
+                None,
+            ),
+            (FooterCommand::Remove, _) => refusal(NOT_A_SEAT),
+            (FooterCommand::Thinking, PstackRow::Seat { kind, seat }) => {
+                match roles.seat_model(kind, seat) {
+                    None => refusal(INHERIT_THINKING),
+                    Some(model) if roles.levels(model).is_empty() => refusal(NO_LEVELS),
+                    Some(model) => {
+                        let thinking =
+                            next_thinking(roles.stored_thinking(kind, seat), roles.levels(model));
+                        (
+                            Some(PstackAction::Edit(RoleEdit::Thinking {
+                                kind,
+                                seat,
+                                thinking,
+                            })),
+                            None,
+                        )
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+        self.message = message;
+        match action {
+            Some(action) => {
+                self.error = None;
+                SettingsAction::Pstack(action)
+            }
+            None => SettingsAction::Consumed,
+        }
     }
 
     fn written(&self) -> Option<&WebsearchConfig> {
@@ -1053,7 +1239,7 @@ impl SettingsModal {
 
     /// The selected plain key and the section of the reference that documents it.
     fn selected_key(&self) -> Option<(KeyTarget, DocsTopic)> {
-        if self.websearch_shown() {
+        if self.websearch_shown() || self.pstack_shown() {
             return None;
         }
         match self.plain_rows().get(self.field)? {
@@ -1242,6 +1428,12 @@ impl SettingsModal {
                     .collect();
             }
             line
+        } else if let Some(roles) = self.pstack.as_ref().filter(|_| self.pstack_shown()) {
+            let style = match roles.table.task_model_choice {
+                true => theme.tool_dim,
+                false => theme.tool_warning,
+            };
+            Line::styled(pstack::lead(roles), style)
         } else {
             let tables: Vec<String> = self
                 .tab
@@ -1265,6 +1457,9 @@ impl SettingsModal {
         let Some(data) = &self.data else {
             return Vec::new();
         };
+        if let Some(roles) = self.pstack.as_ref().filter(|_| self.pstack_shown()) {
+            return row_lines(&pstack::rows(&roles.table), roles, theme);
+        }
         if self.websearch_shown() {
             let listed = websearch_listed(data);
             let rows = backend_rows(&listed, &data.statuses);
@@ -1411,6 +1606,9 @@ impl SettingsModal {
         let Some(data) = &self.data else {
             return Vec::new();
         };
+        if let (Some(row), Some(roles)) = (self.selected_pstack_row(), &self.pstack) {
+            return row_info(row, roles, theme);
+        }
         if self.websearch_shown() {
             let listed = websearch_listed(data);
             let rows = backend_rows(&listed, &data.statuses);
@@ -1455,9 +1653,9 @@ impl SettingsModal {
     }
 
     fn footer_commands(&self) -> Vec<FooterCommand> {
-        let mut commands = match self.websearch_shown() {
-            true if !self.local => Vec::new(),
-            true => vec![
+        let mut commands = match (self.websearch_shown(), self.pstack_shown()) {
+            (true, _) if !self.local => Vec::new(),
+            (true, _) => vec![
                 FooterCommand::Toggle,
                 FooterCommand::MoveUp,
                 FooterCommand::MoveDown,
@@ -1465,7 +1663,13 @@ impl SettingsModal {
                 FooterCommand::Edit,
                 FooterCommand::Reset,
             ],
-            false => vec![FooterCommand::Edit, FooterCommand::Reset],
+            (_, true) => vec![
+                FooterCommand::Edit,
+                FooterCommand::Thinking,
+                FooterCommand::Auto,
+                FooterCommand::Remove,
+            ],
+            _ => vec![FooterCommand::Edit, FooterCommand::Reset],
         };
         commands.extend([
             FooterCommand::Filter,
@@ -1506,6 +1710,9 @@ impl Overlay for SettingsModal {
     fn docs_topic(&self) -> Option<DocsTopic> {
         if self.websearch_shown() {
             return Some(DocsTopic::WebSearch);
+        }
+        if self.pstack_shown() {
+            return Some(DocsTopic::ConfigSkills);
         }
         self.selected_key()
             .map(|(_, docs)| docs)
@@ -1552,9 +1759,14 @@ fn footer_line(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use caudra_agent::pstack::roles::{
+        AutoReason, DEFAULT_EFFORT, Kind, ResolvedSeat, RoleRow, RoleTable, Seat, Source,
+        StoredRoles,
+    };
     use caudra_config::config_file::CONFIG_VERSION;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
@@ -1588,6 +1800,18 @@ mod tests {
     const FILTER_QUERY: &str = "CACHE_WARM";
     const PSTACK: &str = "pstack";
     const TENTH_TAB_KEY: char = '0';
+    const PSTACK_TAB: &str = "pstack";
+    const OPUS_SPEC: &str = "anthropic/claude-opus-5-5";
+    const GROK_SPEC: &str = "xai/grok-4.7";
+    const OPUS_LEVELS: &[&str] = &["low", "high", "max"];
+    const LOWEST_LEVEL: &str = "low";
+    const MAX_EFFORT: &str = "max";
+    const EFFORT_ROW: usize = 0;
+    const CODE_ROW: usize = 1;
+    const HARDEST_ROW: usize = 2;
+    const SECOND_PANEL_SEAT_ROW: usize = 4;
+    const ADD_PANEL_SEAT_ROW: usize = 5;
+    const NOT_WRITABLE: &str = "pstack's roles were not saved: disk full";
 
     struct Fixture {
         _dir: TempDir,
@@ -2244,5 +2468,200 @@ mod tests {
             .modal
             .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert!(screen_of(&mut fixture.modal, SMALL_WIDTH).contains(MORE_ABOVE));
+    }
+
+    /// Every kind on auto: Code inherits, Hardest runs on Opus, the Panel on Opus and Grok.
+    fn pstack_roles(stored: StoredRoles) -> PstackRoles {
+        let seat = |model: &str| ResolvedSeat {
+            model: Some(model.to_owned()),
+            thinking: None,
+        };
+        let row = |kind, seats, source| RoleRow {
+            kind,
+            seats,
+            source,
+        };
+        let table = RoleTable {
+            rows: vec![
+                row(
+                    Kind::Code,
+                    vec![ResolvedSeat::default()],
+                    Source::Auto(AutoReason::SubagentJob),
+                ),
+                row(
+                    Kind::Hardest,
+                    vec![seat(OPUS_SPEC)],
+                    Source::Auto(AutoReason::BestFavorite),
+                ),
+                row(
+                    Kind::Panel,
+                    vec![seat(OPUS_SPEC), seat(GROK_SPEC)],
+                    Source::Auto(AutoReason::PanelFavorites),
+                ),
+            ],
+            task_model_choice: true,
+            effort: DEFAULT_EFFORT.to_owned(),
+        };
+        PstackRoles::new(table, stored, |model| match model {
+            OPUS_SPEC => OPUS_LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    fn on_pstack(stored: StoredRoles, row: usize) -> Fixture {
+        let mut fixture = opened("", true);
+        fixture.modal.set_pstack(Some(pstack_roles(stored)));
+        fixture.modal.set_tab(SettingsTab::Pstack);
+        fixture.modal.select(row);
+        fixture
+    }
+
+    fn pstack_action(action: SettingsAction) -> PstackAction {
+        match action {
+            SettingsAction::Pstack(action) => action,
+            _ => panic!("expected a pstack action"),
+        }
+    }
+
+    fn refused_with(fixture: &mut Fixture, key: char, message: &str) {
+        let action = press(&mut fixture.modal, KeyCode::Char(key));
+        assert!(matches!(action, SettingsAction::Consumed));
+        assert_eq!(fixture.modal.message.as_deref(), Some(message));
+    }
+
+    #[test_case(true, SettingsTab::Pstack ; "listed_last_while_pstack_is_on")]
+    #[test_case(false, SettingsTab::Automations ; "hidden_while_pstack_is_off")]
+    fn the_pstack_tab_follows_the_switch(on: bool, last: SettingsTab) {
+        let mut fixture = opened("", true);
+        fixture
+            .modal
+            .set_pstack(on.then(|| pstack_roles(StoredRoles::default())));
+        assert_eq!(
+            screen_of(&mut fixture.modal, WIDE_WIDTH).contains(PSTACK_TAB),
+            on
+        );
+        press(&mut fixture.modal, KeyCode::BackTab);
+        assert_eq!(fixture.modal.tab(), last);
+    }
+
+    #[test]
+    fn turning_pstack_off_leaves_its_tab() {
+        let mut fixture = on_pstack(StoredRoles::default(), EFFORT_ROW);
+        fixture.modal.set_pstack(None);
+        assert_eq!(fixture.modal.tab(), SettingsTab::Websearch);
+    }
+
+    #[test_case(HARDEST_ROW, Kind::Hardest, Some(0), Some(OPUS_SPEC) ; "a_kind_row_picks_its_seat")]
+    #[test_case(SECOND_PANEL_SEAT_ROW, Kind::Panel, Some(1), Some(GROK_SPEC) ; "a_list_seat_picks_itself")]
+    #[test_case(ADD_PANEL_SEAT_ROW, Kind::Panel, None, None ; "the_add_row_picks_a_new_seat")]
+    fn enter_asks_for_the_model_picker(
+        row: usize,
+        kind: Kind,
+        seat: Option<usize>,
+        model: Option<&str>,
+    ) {
+        let mut fixture = on_pstack(StoredRoles::default(), row);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, KeyCode::Enter)),
+            PstackAction::Pick {
+                kind,
+                seat,
+                model: model.map(str::to_owned),
+            }
+        );
+    }
+
+    #[test_case(KeyCode::Enter ; "enter")]
+    #[test_case(KeyCode::Right ; "right")]
+    fn effort_steps_up_from_the_default(code: KeyCode) {
+        let mut fixture = on_pstack(StoredRoles::default(), EFFORT_ROW);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, code)),
+            PstackAction::Edit(RoleEdit::Effort(Some(MAX_EFFORT.to_owned())))
+        );
+    }
+
+    #[test]
+    fn auto_returns_a_stored_effort_to_the_default() {
+        let stored = StoredRoles {
+            effort: Some(MAX_EFFORT.to_owned()),
+            ..StoredRoles::default()
+        };
+        let mut fixture = on_pstack(stored, EFFORT_ROW);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, KeyCode::Char(AUTO_KEY))),
+            PstackAction::Edit(RoleEdit::Effort(None))
+        );
+        let mut fixture = on_pstack(StoredRoles::default(), EFFORT_ROW);
+        refused_with(&mut fixture, AUTO_KEY, EFFORT_ALREADY_DEFAULT);
+    }
+
+    #[test]
+    fn thinking_steps_to_the_models_lowest_level() {
+        let mut fixture = on_pstack(StoredRoles::default(), HARDEST_ROW);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, KeyCode::Char(THINKING_KEY))),
+            PstackAction::Edit(RoleEdit::Thinking {
+                kind: Kind::Hardest,
+                seat: 0,
+                thinking: Some(LOWEST_LEVEL.to_owned()),
+            })
+        );
+    }
+
+    #[test_case(CODE_ROW, INHERIT_THINKING ; "an_inherit_seat")]
+    #[test_case(SECOND_PANEL_SEAT_ROW, NO_LEVELS ; "a_model_without_levels")]
+    fn thinking_needs_a_model_with_levels(row: usize, message: &str) {
+        let mut fixture = on_pstack(StoredRoles::default(), row);
+        refused_with(&mut fixture, THINKING_KEY, message);
+    }
+
+    #[test]
+    fn auto_returns_a_stored_kind_to_auto() {
+        let stored = StoredRoles {
+            kinds: BTreeMap::from([(Kind::Hardest, vec![Seat::Inherit])]),
+            ..StoredRoles::default()
+        };
+        let mut fixture = on_pstack(stored, HARDEST_ROW);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, KeyCode::Char(AUTO_KEY))),
+            PstackAction::Edit(RoleEdit::Reset(Kind::Hardest))
+        );
+        let mut fixture = on_pstack(StoredRoles::default(), HARDEST_ROW);
+        refused_with(&mut fixture, AUTO_KEY, ALREADY_AUTO);
+    }
+
+    #[test]
+    fn remove_takes_only_a_list_seat() {
+        let mut fixture = on_pstack(StoredRoles::default(), SECOND_PANEL_SEAT_ROW);
+        assert_eq!(
+            pstack_action(press(&mut fixture.modal, KeyCode::Char(RESET_KEY))),
+            PstackAction::Edit(RoleEdit::Remove {
+                kind: Kind::Panel,
+                seat: 1,
+            })
+        );
+        let mut fixture = on_pstack(StoredRoles::default(), HARDEST_ROW);
+        refused_with(&mut fixture, RESET_KEY, NOT_A_SEAT);
+    }
+
+    #[test_case(None, Some(PSTACK_SAVED), None ; "saved")]
+    #[test_case(Some(NOT_WRITABLE), None, Some(NOT_WRITABLE) ; "refused")]
+    fn a_pstack_edit_reports_how_it_went(
+        error: Option<&str>,
+        message: Option<&str>,
+        shown_error: Option<&str>,
+    ) {
+        let mut fixture = on_pstack(StoredRoles::default(), HARDEST_ROW);
+        fixture.modal.pstack_saved(
+            Some(pstack_roles(StoredRoles::default())),
+            error.map(str::to_owned),
+        );
+        assert_eq!(fixture.modal.message.as_deref(), message);
+        assert_eq!(fixture.modal.error.as_deref(), shown_error);
+        assert_eq!(fixture.modal.cursor(), HARDEST_ROW);
     }
 }

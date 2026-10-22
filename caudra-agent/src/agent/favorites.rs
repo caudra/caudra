@@ -2,6 +2,8 @@
 //! model name resolves against them. One list serves both, so the favorites
 //! the agent is told about are exactly the ones a name prefers.
 
+use std::borrow::Borrow;
+
 use caudra_config::ModelPolicy;
 use caudra_providers::Message;
 use caudra_providers::model::{Model, ModelPurpose};
@@ -81,8 +83,7 @@ fn thinking(model: &Model) -> String {
     if !model.supports_thinking() {
         return NO_THINKING.to_owned();
     }
-    let options = model.reasoning_options();
-    let ladder = options.effort_ladder();
+    let ladder = effort_levels(model);
     let requires = model.requires_thinking();
     let parts = (!requires)
         .then_some(OFF_LEVEL.to_owned())
@@ -93,12 +94,30 @@ fn thinking(model: &Model) -> String {
     format!("{THINKING_LABEL}{}", parts.join(LIST_SEPARATOR))
 }
 
+/// The effort levels `model` takes, low to high; empty when it has no thinking control.
+pub(crate) fn effort_levels(model: &Model) -> Vec<String> {
+    match model.supports_thinking() {
+        true => model
+            .reasoning_options()
+            .effort_ladder()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        false => Vec::new(),
+    }
+}
+
 /// A ladder that walks the effort levels without a gap reads as its two ends.
-fn levels(ladder: &[&str]) -> String {
-    let ranks: Option<Vec<usize>> = ladder.iter().map(|level| effort_rank(level)).collect();
+fn levels<Level: Borrow<str>>(ladder: &[Level]) -> String {
+    let ranks: Option<Vec<usize>> = ladder
+        .iter()
+        .map(|level| effort_rank(level.borrow()))
+        .collect();
     let unbroken = ranks.is_some_and(|ranks| ranks.windows(2).all(|pair| pair[1] == pair[0] + 1));
     match ladder {
-        [first, .., last] if unbroken => format!("{first}{LEVEL_RANGE}{last}"),
+        [first, .., last] if unbroken => {
+            format!("{}{LEVEL_RANGE}{}", first.borrow(), last.borrow())
+        }
         _ => ladder.join(LIST_SEPARATOR),
     }
 }

@@ -1684,12 +1684,22 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Edit the selected backend or setting; a list opens its own form",
+        description: "Edit the selected backend or setting, or pick a pstack seat's model; a list opens its own form",
         context: KeybindContext::Settings,
     },
     Keybind {
         label: KeyLabel::Single(settings_modal::RESET_LABEL),
-        description: "Leave the backends to the environment, or reset the selected setting",
+        description: "Leave the backends to the environment, reset the selected setting, or remove the selected pstack seat",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::THINKING_LABEL),
+        description: "Step the selected pstack seat's thinking through its model's levels, then effort",
+        context: KeybindContext::Settings,
+    },
+    Keybind {
+        label: KeyLabel::Single(settings_modal::AUTO_LABEL),
+        description: "Return the selected pstack kind to auto, or Effort to its default",
         context: KeybindContext::Settings,
     },
     Keybind {

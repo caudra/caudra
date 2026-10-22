@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use caudra_agent::pstack::roles::{Kind, Seat};
 use caudra_config::ModelPolicy;
 use caudra_config::decisions::{DecisionEndpoint, DecisionKeySource};
 use caudra_grab::grab_scope;
@@ -53,6 +54,14 @@ const DECISION_ADD_DETAIL: &str = "opens /login";
 const DECISION_INVALID: &str = "invalid";
 const DECISION_KEY_PREFIX: &str = "key: ";
 const DECISION_SPEC_PREFIX: &str = "@decision:";
+const PSTACK_TITLE_PREFIX: &str = " pstack › ";
+const PSTACK_SEAT: &str = " seat ";
+const PSTACK_NEW_SEAT: &str = " new seat";
+const PSTACK_SECTION: &str = "Seat";
+const INHERIT_ROW: &str = "inherit";
+const INHERIT_DETAIL: &str =
+    "omit model and thinking: the profile's subagent_model, else the Subagent model";
+const INHERIT_SPEC: &str = "@inherit";
 
 fn home_footer_line() -> Vec<Hint> {
     vec![
@@ -67,6 +76,15 @@ fn assignment_footer_line() -> Vec<Hint> {
         Hint::bind(key::ENTER, "assign"),
         Hint::bind(key::TOGGLE_FAVORITE, "favorite"),
         Hint::char(UNBIND_LABEL, "unbind"),
+        Hint::bind(key::ESC, "back"),
+    ]
+}
+
+fn pstack_footer_line() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "assign"),
+        Hint::bind(key::TOGGLE_FAVORITE, "favorite"),
+        Hint::char(UNBIND_LABEL, "auto"),
         Hint::bind(key::ESC, "back"),
     ]
 }
@@ -92,6 +110,14 @@ pub enum ModelPickerAction {
     /// The endpoint to screen with, `None` for off.
     SelectDecision(Option<String>),
     AddDecisionEndpoint,
+    /// A pstack kind's seat, `seat: None` for a new one.
+    AssignPstack {
+        kind: Kind,
+        seat: Option<usize>,
+        value: Seat,
+    },
+    /// Returns a pstack kind to auto.
+    ClearPstack(Kind),
     Close,
     Copy(String),
 }
@@ -204,10 +230,24 @@ fn title_for(purpose: ModelPurpose) -> String {
     format!(" Models · {} ", purpose.label())
 }
 
+fn pstack_title(kind: Kind, seat: Option<usize>) -> String {
+    let seat = match (kind.is_list(), seat) {
+        (false, _) => String::new(),
+        (true, Some(seat)) => format!("{PSTACK_SEAT}{}", seat + 1),
+        (true, None) => PSTACK_NEW_SEAT.to_owned(),
+    };
+    format!("{PSTACK_TITLE_PREFIX}{}{seat} ", kind.label())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerPage {
     Home,
     Job(ModelPurpose),
+    /// A pstack kind's seat from `/settings`, `seat: None` for a new one.
+    Pstack {
+        kind: Kind,
+        seat: Option<usize>,
+    },
     Decisions,
 }
 
@@ -250,6 +290,8 @@ pub struct ModelPicker {
     model_policy: Option<ModelPolicy>,
     page: PickerPage,
     binding: Option<Binding>,
+    /// The model the pstack seat runs on now, `None` for inherit or a new seat.
+    pstack_model: Option<String>,
     needs_rebuild: bool,
     anchor: Option<SelectionAnchor>,
     active_decision: Option<DecisionEndpoint>,
@@ -273,6 +315,7 @@ impl ModelPicker {
             model_policy: None,
             page: PickerPage::Home,
             binding: None,
+            pstack_model: None,
             needs_rebuild: false,
             anchor: None,
             active_decision: None,
@@ -337,6 +380,28 @@ impl ModelPicker {
         if purpose != ModelPurpose::Chat {
             self.open_job_page(purpose);
         }
+    }
+
+    /// The page that picks a pstack kind's seat: `seat: None` adds one, and `model` is the one
+    /// the seat runs on now, which the cursor starts on.
+    pub fn open_pstack(
+        &mut self,
+        current_model: &Model,
+        model_policy: &ModelPolicy,
+        active_decision: Option<DecisionEndpoint>,
+        kind: Kind,
+        seat: Option<usize>,
+        model: Option<String>,
+    ) {
+        self.open(current_model, model_policy, active_decision);
+        self.page = PickerPage::Pstack { kind, seat };
+        self.binding = None;
+        self.pstack_model = model;
+        self.picker.set_footer_builder(pstack_footer_line);
+        let entries = self.load_entries();
+        self.picker.open(entries, pstack_title(kind, seat));
+        self.preselect_page();
+        self.capture_anchor();
     }
 
     pub fn open_decisions(
@@ -451,6 +516,7 @@ impl ModelPicker {
         let mut entries = match self.page {
             PickerPage::Home => self.job_entries(),
             PickerPage::Job(purpose) => binding_entries(purpose),
+            PickerPage::Pstack { .. } => vec![inherit_entry()],
             PickerPage::Decisions => return self.decision_entries(),
         };
         for entry in &mut entries {
@@ -586,6 +652,10 @@ impl ModelPicker {
         entry.selected = match self.page {
             PickerPage::Home => entry.job.is_none() && entry.spec == current_spec,
             PickerPage::Job(_) => entry.job.is_none() && entry.binds == self.binding,
+            PickerPage::Pstack { seat, .. } => match &self.pstack_model {
+                Some(model) => entry.spec == *model,
+                None => seat.is_some() && entry.spec == INHERIT_SPEC,
+            },
             PickerPage::Decisions => false,
         };
     }
@@ -621,6 +691,12 @@ impl ModelPicker {
                     self.picker.select_item_by(|entry| entry.selected);
                 }
             }
+            PickerPage::Pstack { .. } => match self.pstack_model.clone() {
+                Some(model) => self.preselect_spec(&model),
+                None => {
+                    self.picker.select_item_by(|entry| entry.selected);
+                }
+            },
         }
     }
 
@@ -699,7 +775,8 @@ impl ModelPicker {
     }
 
     pub(crate) fn text_key(&self, key: Option<KeyEvent>) -> bool {
-        !(key.is_some_and(is_reset_key) && matches!(self.page, PickerPage::Job(_)))
+        !(key.is_some_and(is_reset_key)
+            && matches!(self.page, PickerPage::Job(_) | PickerPage::Pstack { .. }))
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ModelPickerAction {
@@ -710,6 +787,16 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if let PickerPage::Pstack { kind, .. } = self.page {
+            if key.code == KeyCode::Esc {
+                self.close();
+                return ModelPickerAction::Close;
+            }
+            if is_reset_key(key) {
+                self.close();
+                return ModelPickerAction::ClearPstack(kind);
+            }
+        }
         if key.code == KeyCode::Esc && self.page != PickerPage::Home {
             match self.page {
                 PickerPage::Job(purpose) => self.return_home(|entry| entry.job == Some(purpose)),
@@ -778,6 +865,17 @@ impl ModelPicker {
                         Some(binding) => ModelPickerAction::Bind(purpose, binding),
                         None => ModelPickerAction::Unbind(purpose),
                     }
+                }
+                PickerPage::Pstack { kind, seat } => {
+                    let value = match entry.binds {
+                        Some(Binding::Exact(model)) => Seat::Model {
+                            model,
+                            thinking: None,
+                        },
+                        _ => Seat::Inherit,
+                    };
+                    self.close();
+                    ModelPickerAction::AssignPstack { kind, seat, value }
                 }
             },
             PickerAction::Close => ModelPickerAction::Close,
@@ -878,6 +976,26 @@ fn binding_row(id: &str, detail: &str, binds: Option<Binding>) -> ModelEntry {
         search_text: String::new(),
         claimed_by: Vec::new(),
         binds,
+        job: None,
+        decision: None,
+        selected: false,
+        free: false,
+        mark: None,
+    }
+    .with_search_text()
+}
+
+/// The pstack page's first row: the seat runs as `inherit`, naming no model.
+fn inherit_entry() -> ModelEntry {
+    ModelEntry {
+        spec: INHERIT_SPEC.into(),
+        id: INHERIT_ROW.into(),
+        provider_display: PSTACK_SECTION.into(),
+        suffix: None,
+        detail: INHERIT_DETAIL.into(),
+        search_text: String::new(),
+        claimed_by: Vec::new(),
+        binds: None,
         job: None,
         decision: None,
         selected: false,
@@ -1109,6 +1227,7 @@ mod tests {
     const ANTHROPIC_SHARED_SPEC: &str = "anthropic/shared-model";
     const ZAI_SHARED_SPEC: &str = "zai/shared-model";
     const ASYNC_SPEC: &str = "anthropic/search-only-model";
+    const PSTACK_SEAT_TITLE: &str = "pstack › Panel seat 2";
 
     fn current_model(spec: &str) -> Model {
         Model::from_spec(spec).unwrap()
@@ -1574,6 +1693,75 @@ mod tests {
         ));
         assert_eq!(p.page, PickerPage::Job(ModelPurpose::Plan));
         assert!(p.is_open());
+    }
+
+    fn open_pstack_picker(picker: &mut ModelPicker, seat: Option<usize>, model: Option<&str>) {
+        picker.open_pstack(
+            &current_model(SONNET_SPEC),
+            &ModelPolicy::default(),
+            None,
+            Kind::Panel,
+            seat,
+            model.map(str::to_owned),
+        );
+    }
+
+    #[test]
+    fn the_pstack_page_names_the_seat_and_starts_on_its_model() {
+        let mut p = ModelPicker::new(test_models());
+        open_pstack_picker(&mut p, Some(1), Some(OPUS_SPEC));
+        assert!(render(&mut p).contains(PSTACK_SEAT_TITLE));
+        assert_eq!(
+            p.picker.selected_item().map(|entry| entry.spec.as_str()),
+            Some(OPUS_SPEC)
+        );
+        assert_eq!(p.load_entries()[0].spec, INHERIT_SPEC);
+    }
+
+    #[test]
+    fn enter_on_a_model_assigns_the_pstack_seat_and_closes() {
+        let mut p = ModelPicker::new(test_models());
+        open_pstack_picker(&mut p, None, None);
+        navigate_to_model(&mut p, SWAPPED_SPEC, "Z.AI");
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            ModelPickerAction::AssignPstack {
+                kind: Kind::Panel,
+                seat: None,
+                value: Seat::Model { model, thinking: None },
+            } if model == SWAPPED_SPEC
+        ));
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn enter_on_inherit_assigns_inherit() {
+        let mut p = ModelPicker::new(test_models());
+        open_pstack_picker(&mut p, Some(0), None);
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            ModelPickerAction::AssignPstack {
+                kind: Kind::Panel,
+                seat: Some(0),
+                value: Seat::Inherit,
+            }
+        ));
+    }
+
+    #[test_case(key(KeyCode::Char('R')), true ; "uppercase_r_returns_the_kind_to_auto")]
+    #[test_case(key(KeyCode::Esc), false ; "esc_closes_without_a_change")]
+    fn the_pstack_page_closes_on_its_keys(pressed: KeyEvent, cleared: bool) {
+        let mut p = ModelPicker::new(test_models());
+        open_pstack_picker(&mut p, Some(0), Some(OPUS_SPEC));
+        assert!(!p.text_key(Some(key(KeyCode::Char('R')))));
+        let action = p.handle_key(pressed);
+        assert_eq!(
+            matches!(action, ModelPickerAction::ClearPstack(Kind::Panel)),
+            cleared
+        );
+        assert!(!p.is_open());
     }
 
     #[test]

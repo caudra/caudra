@@ -24,7 +24,7 @@ pub fn workflow_dev_skill() -> BuiltinSkill {
             .get(DESCRIPTION_FIELD)
             .cloned()
             .unwrap_or_default(),
-        resolve: Box::new(move || (body.clone(), None)),
+        resolve: Box::new(move |_| (body.clone(), None)),
         pages: None,
     }
 }
@@ -32,6 +32,7 @@ pub fn workflow_dev_skill() -> BuiltinSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::native::skill::SkillServe;
 
     const DESCRIBED_MSG: &str = "the skill needs a description for the model to pick it by";
     const HEADER_LEAKED_MSG: &str = "the frontmatter must not be part of the body";
@@ -42,7 +43,7 @@ mod tests {
         assert_eq!(skill.name, FALLBACK_NAME);
         assert!(!skill.description.is_empty(), "{DESCRIBED_MSG}");
 
-        let (body, reference) = (skill.resolve)();
+        let (body, reference) = (skill.resolve)(&SkillServe::unrestricted());
         assert!(reference.is_none());
         assert!(
             body.starts_with("# Writing Caudra workflows"),

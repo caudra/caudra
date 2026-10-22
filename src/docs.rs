@@ -24,8 +24,8 @@ pub fn skill() -> BuiltinSkill {
     BuiltinSkill {
         name: NAME.to_owned(),
         description: SKILL_DESCRIPTION.to_owned(),
-        resolve: Box::new(|| (library().index(), None)),
-        pages: Some(Box::new(|address| {
+        resolve: Box::new(|_| (library().index(), None)),
+        pages: Some(Box::new(|address, _| {
             library().load(address).map_err(|error| error.to_string())
         })),
     }

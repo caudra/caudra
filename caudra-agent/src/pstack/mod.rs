@@ -1,12 +1,16 @@
 //! The bundled pstack, off unless `[plugins.skill] pstack = true`: its `pstack` skill, its
 //! bundled automations, the `/pstack:<skill>` commands, and the `pstack-<agent>` task profiles.
 
-use caudra_pstack::{Agent, Library, NAME, Roles, SKILL_DESCRIPTION, automations, library};
+use caudra_pstack::{Agent, Library, NAME, RoleTable, SKILL_DESCRIPTION, automations, library};
 
 use crate::automation::bundled::{install_bundled_automations, remove_bundled_automations};
 use crate::command::{ARGUMENTS_PLACEHOLDER, CommandScope, CommandSource, CustomCommand};
 use crate::prompt::profile::SystemPromptProfile;
-use crate::tools::native::skill::{BuiltinSkill, install_builtin_skill, remove_builtin_skill};
+use crate::tools::native::skill::{
+    BuiltinSkill, SkillServe, install_builtin_skill, remove_builtin_skill,
+};
+
+pub mod roles;
 
 /// Applied at startup and on every settings reload. The skill and automation registries are
 /// process-wide; the commands and profiles follow the config each caller holds.
@@ -43,18 +47,15 @@ fn skill() -> BuiltinSkill {
     BuiltinSkill {
         name: NAME.to_owned(),
         description: SKILL_DESCRIPTION.to_owned(),
-        resolve: Box::new(|| (library().index(&roles()), None)),
-        pages: Some(Box::new(|address| library().load(address))),
+        resolve: Box::new(|serve| (library().index(&table(serve)), None)),
+        pages: Some(Box::new(|address, serve| {
+            library().load(address, &table(serve))
+        })),
     }
 }
 
-fn roles() -> Roles {
-    match caudra_storage::paths::config_dir() {
-        Ok(dir) => Roles::read(&dir),
-        Err(_) => Roles::Missing {
-            path: caudra_pstack::ROLES_FILE.to_owned(),
-        },
-    }
+fn table(serve: &SkillServe) -> RoleTable {
+    roles::table(&serve.model_policy, serve.task_model_choice)
 }
 
 /// One per skill a user runs; the `principle-*` leaves are read from within other skills.

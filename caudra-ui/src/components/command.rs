@@ -436,7 +436,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/settings",
-        description: "Choose web search backends and change plain settings in the global caudra.toml",
+        description: "Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml",
         max_args: 0,
         scope: ChatScope::Any,
         features: &[],

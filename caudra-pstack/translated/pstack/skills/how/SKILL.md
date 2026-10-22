@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Every spawn is a `task` with `profile: "builtin"` and `mode: "plan"`. Explorers use the `how explorer` line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows (default `grok-4.7 xhigh`), and every explainer uses the `how explainer` line (default `claude-opus-5-5 xhigh`). Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
+Every spawn is a `task` with `profile: "builtin"` and `mode: "plan"`. Explorers use the Code row of the **Model roles** table below, and every explainer uses the Judgment row. Set `model` and `thinking` to that row's values, and leave both unset when the row is `inherit`. Change the rows in `/settings` → pstack. If `task` rejects a value, run that spawn as `inherit` and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
 ## 1. Assess complexity
 

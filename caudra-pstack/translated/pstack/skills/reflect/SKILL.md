@@ -18,19 +18,19 @@ Before fanning out, write a tight digest of this conversation: its opening user 
 
 One message, three `task` calls with `profile: "builtin"` and `mode: "build"`. A task's mode is capped by the caller's, so the session must be in Build mode. Reviewers need MCP access to look up the tickets, chat threads, and observability traces the transcript references, and plan mode strips most MCP tools.
 
-Each reviewer and the synthesizer name a role line in the role file, `~/.config/caudra/pstack/models.md`, which the `pstack` index shows, and a default. Set `model` and `thinking` to that line's value, or to the default if the file or the line is missing. Leave both unset when the value is `inherit`. If `task` rejects a model, use the default and say so. If it rejects the default, omit `model`, keep `thinking`, and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
+Each reviewer and the synthesizer name a row of the **Model roles** table below. Set `model` and `thinking` to that row's values, and leave both unset when the row is `inherit`. Change the rows in `/settings` → pstack. If `task` rejects a value, run that spawn as `inherit` and say so. If `task` has no `model` or `thinking` argument, omit both and say so. Pick each subagent's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
-| Lens | Role line | Default | Prompt template |
-|---|---|---|---|
-| Judgment | `reflect judgment, divergent, synthesizer` | `claude-opus-5-5 xhigh` | `references/judgment-reviewer.md` |
-| Tooling | `reflect tooling` | `grok-4.7 xhigh` | `references/tooling-reviewer.md` |
-| Divergent | `reflect judgment, divergent, synthesizer` | `claude-opus-5-5 xhigh` | `references/divergent-reviewer.md` |
+| Lens | Model row | Prompt template |
+|---|---|---|
+| Judgment | Judgment | `references/judgment-reviewer.md` |
+| Tooling | Code | `references/tooling-reviewer.md` |
+| Divergent | Judgment | `references/divergent-reviewer.md` |
 
 Pass each template verbatim, substituting the digest where marked. Reviewers return findings in their task's final report.
 
 ## 3. Synthesize
 
-One `task` call with `profile: "builtin"`, `model` and `thinking` from the `reflect judgment, divergent, synthesizer` line (default `claude-opus-5-5 xhigh`), and `mode: "build"`, which again needs the session in Build mode. It spot-verifies citations through MCP, and plan mode strips most MCP tools. Pass `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. It returns an Accepted / Rejected / Backlog list.
+One `task` call with `profile: "builtin"`, `model` and `thinking` from the Judgment row, and `mode: "build"`, which again needs the session in Build mode. It spot-verifies citations through MCP, and plan mode strips most MCP tools. Pass `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. It returns an Accepted / Rejected / Backlog list.
 
 ## 4. Structural enforcement check
 

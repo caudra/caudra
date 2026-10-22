@@ -12,7 +12,9 @@ use caudra_agent::decisions::{remove_decision_endpoint, save_decision_endpoint};
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::template::{self, Vars};
-use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
+use caudra_agent::tools::native::skill::{
+    self, SkillDirCandidate, SkillInventoryEntry, SkillServe,
+};
 use caudra_agent::tools::profile_policy::{CEILING_DISABLED, LEGACY_LOADING, registered_decision};
 use caudra_agent::tools::registry::ToolDefinitions;
 use caudra_agent::tools::{
@@ -1820,7 +1822,11 @@ pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool
         .context("load builtin plugins")?;
 
     if let Some(name) = name {
-        match skill::load(reg, name) {
+        let serve = SkillServe {
+            model_policy: Arc::new(config.provider.model_policy.clone()),
+            task_model_choice: config.agent.task_model_choice,
+        };
+        match skill::load(reg, name, &serve) {
             Ok(body) => println!("{body}"),
             Err(message) => {
                 bail!(message);
