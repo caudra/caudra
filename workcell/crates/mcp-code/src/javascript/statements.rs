@@ -17,12 +17,12 @@ use super::syntax::{
     FOR_STATEMENT, FUNCTION_DECLARATION, HANDLER_FIELD, IDENTIFIER, IF_STATEMENT, IN,
     INCREMENT_FIELD, INITIALIZER_FIELD, INTERFACE_DECLARATION, KEY_FIELD, KIND_FIELD, LEFT_FIELD,
     LET, LEXICAL_DECLARATION, MEMBER_EXPRESSION, NAME_FIELD, NEW, NEW_EXPRESSION, NUMBER,
-    OBJECT_FIELD, OBJECT_PATTERN, OF, OPERATOR_FIELD, PAIR_PATTERN, PROPERTY_FIELD,
-    PROPERTY_IDENTIFIER, Parts, RETURN_STATEMENT, RETURN_TYPE_FIELD, RIGHT_FIELD, SEMICOLON,
-    SHORTHAND_PROPERTY_IDENTIFIER_PATTERN, STATEMENT_BLOCK, STRING, SUBSCRIPT_EXPRESSION,
-    TEMPLATE_STRING, THROW_STATEMENT, TRY_STATEMENT, TYPE_ALIAS_DECLARATION, TYPE_ARGUMENTS_FIELD,
-    TYPE_FIELD, TYPE_PARAMETERS_FIELD, UPDATE_EXPRESSION, VALUE_FIELD, VAR, VARIABLE_DECLARATION,
-    WHILE_STATEMENT, decoded, line, refused,
+    OBJECT_FIELD, OBJECT_PATTERN, OF, OPERATOR_FIELD, OPTIONAL_CHAIN_FIELD, PAIR_PATTERN,
+    PROPERTY_FIELD, PROPERTY_IDENTIFIER, Parts, RETURN_STATEMENT, RETURN_TYPE_FIELD, RIGHT_FIELD,
+    SEMICOLON, SHORTHAND_PROPERTY_IDENTIFIER_PATTERN, STATEMENT_BLOCK, STRING,
+    SUBSCRIPT_EXPRESSION, TEMPLATE_STRING, THROW_STATEMENT, TRY_STATEMENT, TYPE_ALIAS_DECLARATION,
+    TYPE_ARGUMENTS_FIELD, TYPE_FIELD, TYPE_PARAMETERS_FIELD, UPDATE_EXPRESSION, VALUE_FIELD, VAR,
+    VARIABLE_DECLARATION, WHILE_STATEMENT, decoded, line, refused,
 };
 use super::{Translation, Translator};
 
@@ -780,7 +780,8 @@ fn is_kept(fact: Fact) -> bool {
 
 /// What a `let` named `written`, declared by `declarator` with a value known as `fact`, stays
 /// known as through every assignment after it in its block: a whole number only set or stepped by
-/// whole number literals, or a string only set or extended by string literals and templates.
+/// whole number literals or `.length`, or a string only set or extended by string literals and
+/// templates.
 fn kept(declarator: Node<'_>, written: &str, fact: Fact, source: &str) -> Fact {
     let Some(block) = declarator
         .parent()
@@ -819,7 +820,7 @@ fn stepped(assignment: Node<'_>, fact: Fact, source: &str) -> Fact {
     let operator = assignment
         .child_by_field_name(OPERATOR_FIELD)
         .map_or(ASSIGN, |operator| operator.kind());
-    let literal = assignment
+    let by = assignment
         .child_by_field_name(RIGHT_FIELD)
         .map(|right| match right.kind() {
             NUMBER
@@ -829,10 +830,11 @@ fn stepped(assignment: Node<'_>, fact: Fact, source: &str) -> Fact {
             {
                 Fact::Count
             }
+            MEMBER_EXPRESSION if is_length(right, source) => Fact::Count,
             STRING | TEMPLATE_STRING => Fact::Str,
             _ => Fact::Unknown,
         });
-    match (fact, operator, literal) {
+    match (fact, operator, by) {
         (Fact::Count | Fact::Integer, INCREMENT, None) => fact,
         (Fact::Count | Fact::Integer, DECREMENT, None) => Fact::Integer,
         (Fact::Count | Fact::Integer, ASSIGN | ADD_ASSIGN | MULTIPLY_ASSIGN, Some(Fact::Count)) => {
@@ -842,6 +844,15 @@ fn stepped(assignment: Node<'_>, fact: Fact, source: &str) -> Fact {
         (Fact::Str, ASSIGN | ADD_ASSIGN, Some(Fact::Str)) => Fact::Str,
         _ => Fact::Unknown,
     }
+}
+
+/// Whether `member` reads `.length` without `?.`: translated as `len()`, it is a count wherever it
+/// translates at all.
+fn is_length(member: Node<'_>, source: &str) -> bool {
+    member.child_by_field_name(OPTIONAL_CHAIN_FIELD).is_none()
+        && member
+            .child_by_field_name(PROPERTY_FIELD)
+            .is_some_and(|property| &source[property.byte_range()] == LENGTH)
 }
 
 /// A comment's text, without its `//` or `/* */` and each block line's leading `*`.
@@ -959,6 +970,8 @@ mod tests {
     #[test_case("const xs = [1];\nxs.forEach((x, i) => { if (i > 0) console.log(x); });", "xs = [1]\nfor i, x in enumerate(xs):\n    if i > 0:\n        print(x)" ; "for_each")]
     #[test_case("const xs = [\"a\"];\nconst ys = xs.map(x => { const y = x.length + 1; return y; });", "xs = [\"a\"]\ndef _caudra_callback_0(x):\n    y = len(x) + 1\n    return y\nys = [_caudra_callback_0(x) for x in xs]" ; "lifted_callback")]
     #[test_case("const xs = [\"a\"];\nfor (const x of xs) { const ys = xs.filter(y => { return y.length > x.length; }); }", "xs = [\"a\"]\nfor x in xs:\n    def _caudra_callback_0(y):\n        return len(y) > len(x)\n    ys = [y for y in xs if _caudra_callback_0(y)]" ; "lifted_callback_stays_in_its_loop")]
+    #[test_case("const words = [\"ab\"];\nlet total = 0;\nfor (const w of words) { total += w.length; }\ntotal", "words = [\"ab\"]\ntotal = 0\nfor w in words:\n    total += len(w)\ntotal" ; "let_number_stepped_by_a_length")]
+    #[test_case("const rs = [{a: 1}];\nlet total: number = 0;\nfor (const r of rs) { total += Object.keys(r).length; }\nconst big = total > 1;", "rs = [{\"a\": 1}]\ntotal = 0\nfor r in rs:\n    total += len(list(r))\nbig = total > 1" ; "let_number_stepped_by_a_key_count")]
     fn statement_translates(js: &str, expected: &str) {
         assert_eq!(python(js), expected);
     }
@@ -981,6 +994,7 @@ mod tests {
     #[test_case("const o = {};\no[String(1)] = 1;", TARGET_CALL, 2 ; "target_with_a_call")]
     #[test_case("let n = 0;\nn = n * 3;", "`*` of a value not known to be a number", 2 ; "let_number_set_by_a_value")]
     #[test_case("let n = 0;\nn = parseFloat(\"1\");\nn += 1;", "`+=` of values not known to be two numbers or two strings", 3 ; "let_number_set_to_a_parsed_number")]
+    #[test_case("const xs = [\"a\"];\nlet n = 0;\nn += xs[0]?.length;", "`xs[0]?.length`, which may be `undefined`, compared or computed", 3 ; "let_number_stepped_by_an_optional_length")]
     #[test_case("const a = 1;\na = 2;", "an assignment to `a`", 2 ; "const_reassigned")]
     #[test_case("let a = 1;\nfunction f() { a = 2; }", "an assignment to `a`", 2 ; "outer_assignment")]
     #[test_case("const a = [1];\nif (a) { console.log(1); }", "the condition `a`", 2 ; "bare_condition")]

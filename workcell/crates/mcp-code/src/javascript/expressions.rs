@@ -98,7 +98,9 @@ const NULLISH_CHAINED: &str = "`??` after another `??`";
 const UNDEFINED_OPERAND: &str = "which may be `undefined`, compared or computed";
 const NOT_NUMBERS: &str = "of a value not known to be a number";
 const NOT_NUMBERS_OR_STRINGS: &str = "of values not known to be two numbers or two strings";
-const DIVISOR: &str = "`/` by something other than a number literal that is not zero";
+const NO_NUMBER: &str = "of two values, neither known to be a number";
+const NUMBER_AGAINST_OTHER: &str = "of a number and a string, an object or `null`";
+const DIVISOR: &str = "`/` by zero";
 const CHAINED: &str = "a comparison of a comparison";
 const UNDEFINED_VALUE: &str = "`undefined` as a value";
 const LOOSE_EQUALITY: &str = "`==` or `!=` against something other than `null`";
@@ -604,9 +606,12 @@ impl Translator<'_> {
         Ok(lowered)
     }
 
-    /// Both operands of arithmetic or an ordering, which must be known numbers: where JavaScript
-    /// converts a string, `null` or a list, Python raises or compares otherwise.
-    fn numbers(
+    /// Both operands of an ordering, one of them a known number. Against a number or a boolean
+    /// Python orders as JavaScript does; against a string, `null`, a list or an object, where
+    /// JavaScript converts, Python raises and stops the run instead of taking another branch. Two
+    /// lists, which Python orders by their items, never meet, and a known string or object, or
+    /// `null` written out, is refused, since Python would always raise.
+    fn ordered(
         &mut self,
         left: Node<'_>,
         right: Node<'_>,
@@ -614,13 +619,18 @@ impl Translator<'_> {
     ) -> Translation<(Lowered, Lowered)> {
         let left = self.operand(left)?;
         let right = self.operand(right)?;
-        if !left.fact.is_numeric() || !right.fact.is_numeric() {
-            return Err(syntax(
-                format!("`{}` {NOT_NUMBERS}", operator.kind()),
-                operator,
-            ));
-        }
-        Ok((left, right))
+        let comparable = |operand: &Lowered| match operand.fact {
+            Fact::Unknown => !matches!(operand.expression, Expression::Constant(Constant::None)),
+            fact => fact.is_numeric() || fact == Fact::Bool,
+        };
+        let refusal = if !left.fact.is_numeric() && !right.fact.is_numeric() {
+            NO_NUMBER
+        } else if !comparable(&left) || !comparable(&right) {
+            NUMBER_AGAINST_OTHER
+        } else {
+            return Ok((left, right));
+        };
+        Err(syntax(format!("`{}` {refusal}", operator.kind()), operator))
     }
 
     /// A value in an object literal or an argument, which `undefined` may not be: JavaScript
@@ -666,7 +676,7 @@ impl Translator<'_> {
                 );
             }
             if let Some((_, comparison)) = ordering {
-                let (left, right) = self.numbers(left, right, operator)?;
+                let (left, right) = self.ordered(left, right, operator)?;
                 return Ok(Lowered::new(
                     Expression::Compare {
                         left: Box::new(left.expression),
@@ -1962,8 +1972,10 @@ fn is_scalar_literal(node: Node<'_>) -> bool {
 
 /// What `left operator right`, written at `at`, is known to be when both languages compute it
 /// alike: two known numbers, or two strings added. Where JavaScript converts a string, `null` or
-/// a list, Python raises or computes otherwise. `/` takes only a literal divisor other than zero,
-/// and `%` only counts, as the sign of a negative remainder differs.
+/// a list, Python raises or computes otherwise. `/` refuses a zero written out, which JavaScript
+/// divides by into `Infinity` or `NaN`; a divisor that turns out to be zero stops the run in Python
+/// rather than computing otherwise. `%` takes only counts, as the sign of a negative remainder
+/// differs.
 pub(super) fn arithmetic(
     left: Fact,
     operator: Operator,
@@ -1983,22 +1995,22 @@ pub(super) fn arithmetic(
         }
         Operator::Mod if counts => Ok(Fact::Count),
         Operator::Mod => Err(syntax(MODULO, at)),
-        Operator::Div if is_nonzero_number(&right.expression) => Ok(Fact::Number),
-        Operator::Div => Err(syntax(DIVISOR, at)),
+        Operator::Div if is_zero(&right.expression) => Err(syntax(DIVISOR, at)),
+        Operator::Div => Ok(Fact::Number),
         Operator::Add | Operator::Mult if counts => Ok(Fact::Count),
         _ if wholes => Ok(Fact::Integer),
         _ => Ok(Fact::Number),
     }
 }
 
-/// A number literal other than zero, maybe negated: a divisor Python never raises on.
-fn is_nonzero_number(expression: &Expression) -> bool {
+/// A zero number literal, maybe negated: a divisor Python always raises on.
+fn is_zero(expression: &Expression) -> bool {
     match expression {
         Expression::Constant(Constant::Number(number)) => number
             .replace(DIGIT_SEPARATOR, "")
             .parse::<f64>()
-            .is_ok_and(|value| value != 0.0),
-        Expression::Negative(inner) => is_nonzero_number(inner),
+            .is_ok_and(|value| value == 0.0),
+        Expression::Negative(inner) => is_zero(inner),
         _ => false,
     }
 }
@@ -2457,6 +2469,7 @@ mod tests {
     const UNAWAITED_LOCAL: &str = "`f()` without `await`";
     const OPTIONAL_COMPARED: &str = "`r?.x`, which may be `undefined`, compared or computed";
     const GATHERED_GET: &str = "`gh.get()` gathered with an argument other than a literal, a name, or a read of the loop's own item";
+    const GREATER_THAN_OTHER: &str = "`>` of a number and a string, an object or `null`";
 
     #[test_case("const a = [true, false, null, undefined];", "a = [True, False, None, None]" ; "literals")]
     #[test_case("const a = 1.5;\nconst b = 0x1f;\nconst c = 'it\\'s \"q\"\\n';", "a = 1.5\nb = 31\nc = \"it's \\\"q\\\"\\n\"" ; "numbers_and_strings_requoted")]
@@ -2466,6 +2479,8 @@ mod tests {
     #[test_case("const s = \"x\";\nconst a = \"s=\" + s + \"!\";", "s = \"x\"\na = f\"s={s}!\"" ; "plus_of_strings")]
     #[test_case("const xs = [1];\nconst a = [xs.length + 1, xs.length - 2 * 3, -xs.length, xs.length / 2, xs.length / -0.5];", "xs = [1]\na = [len(xs) + 1, len(xs) - 2 * 3, -len(xs), len(xs) / 2, len(xs) / -0.5]" ; "arithmetic_of_numbers")]
     #[test_case("const xs = [1];\nconst a = xs.length > 0 && xs.length <= 3;", "xs = [1]\na = len(xs) > 0 and len(xs) <= 3" ; "and_of_tests_as_a_value")]
+    #[test_case("const r = await gh.get();\nconst a = r.n > 0;\nconst b = 2.5 <= r.m;\nconst c = r.items.filter(i => i.count >= r.items.length);", "r = await gh.get()\na = r[\"n\"] > 0\nb = 2.5 <= r[\"m\"]\nc = [i for i in r[\"items\"] if i[\"count\"] >= len(r[\"items\"])]" ; "ordering_of_an_unknown_against_a_number")]
+    #[test_case("const xs = [1];\nconst a = xs.length / xs.length;", "xs = [1]\na = len(xs) / len(xs)" ; "division_by_a_known_number")]
     #[test_case("const r = await gh.get();\nconsole.log(`${r[\"a\"]} and ${r.b.c}`);", "r = await gh.get()\nprint(f\"{r['a']} and {r['b']['c']}\")" ; "quotes_inside_a_template")]
     #[test_case("const xs = [1];\nconst a = [...xs, 2];", "xs = [1]\na = [*xs, 2]" ; "array_spread")]
     #[test_case("const o = {};\nconst k = \"k\";\nconst a = {o, ...o, [k]: 1, \"b-c\": 2, d: 3};", "o = {}\nk = \"k\"\na = {\"o\": o, **o, k: 1, \"b-c\": 2, \"d\": 3}" ; "object")]
@@ -2514,13 +2529,16 @@ mod tests {
     #[test_case("const a = true === 1;", STRICT_UNKNOWN, 1 ; "boolean_against_a_number")]
     #[test_case("const r = await gh.get();\nconst a = r.done === 1;", BOOLEAN_NUMBER, 2 ; "one_against_an_unknown")]
     #[test_case("const r = await gh.get();\nconst a = 0 !== r.done;", BOOLEAN_NUMBER, 2 ; "zero_against_an_unknown")]
-    #[test_case("const r = await gh.get();\nconst a = r.n > 0;", "`>` of a value not known to be a number", 2 ; "ordering_of_an_unknown")]
+    #[test_case("const r = await gh.get();\nconst a = r.n > r.m;", "`>` of two values, neither known to be a number", 2 ; "ordering_of_two_unknowns")]
+    #[test_case("const s = \"10\";\nconst a = s > 5;", GREATER_THAN_OTHER, 2 ; "ordering_of_a_string_and_a_number")]
+    #[test_case("const o = {n: 1};\nconst a = 0 <= o;", "`<=` of a number and a string, an object or `null`", 2 ; "ordering_of_a_number_and_an_object")]
+    #[test_case("const a = 5 > null;", GREATER_THAN_OTHER, 1 ; "ordering_of_a_number_and_null")]
     #[test_case("const r = await gh.get();\nconst a = r.n * 2;", "`*` of a value not known to be a number", 2 ; "product_of_an_unknown")]
     #[test_case("const r = await gh.get();\nconst a = -r.n;", "`-` of a value not known to be a number", 2 ; "negation_of_an_unknown")]
     #[test_case("const r = await gh.get();\nconst a = r.n + 1;", "`+` of values not known to be two numbers or two strings", 2 ; "sum_of_an_unknown")]
     #[test_case("const a = \"n=\" + 1;", "`+` of values not known to be two numbers or two strings", 1 ; "string_plus_number")]
-    #[test_case("const xs = [1];\nconst a = xs.length / xs.length;", DIVISOR, 2 ; "division_by_a_value")]
     #[test_case("const xs = [1];\nconst a = xs.length / 0;", DIVISOR, 2 ; "division_by_zero")]
+    #[test_case("const xs = [1];\nconst a = xs.length / -0.0;", DIVISOR, 2 ; "division_by_negative_zero")]
     #[test_case("const a = 9007199254740993;", "the number `9007199254740993`", 1 ; "integer_past_exact")]
     #[test_case("const a = 0x20000000000001;", "the number `0x20000000000001`", 1 ; "hex_past_exact")]
     #[test_case("const a = await gh.list({owner: undefined});", UNDEFINED_VALUE, 1 ; "undefined_keyword")]
