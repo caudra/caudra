@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 
 use ruff_python_ast::PySourceType;
 use ruff_python_ast::token::{Token, TokenKind};
@@ -195,7 +196,8 @@ impl Repaired {
 /// the parser's tree, and the parser reads the result again: a stage whose result it cannot read
 /// whole is dropped, so a repair never leaves a snippet worse than it came.
 pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
-    let (code, mut repairs) = syntax_repaired(code);
+    let stubs = StubIndex::of(stubs);
+    let (code, mut repairs) = syntax_repaired(code, &stubs);
     let syntax_taught = (!repairs.is_empty()).then(|| code.clone());
     let unedited = |code: String, repairs: Vec<Repair>| Repaired {
         code,
@@ -206,7 +208,6 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
         return unedited(code, repairs);
     };
     let root = tree.root_node();
-    let stubs = StubIndex::of(stubs);
     let uses = Uses::of(root, &code, &stubs);
     repairs.extend(
         SUBSET_MODULES
@@ -267,7 +268,7 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
 /// A snippet Python cannot read, with its Markdown fence blanked, JavaScript's declarations dropped,
 /// and over-indented blocks lined up: kept only when together they leave one Python reads whole,
 /// else returned as it came.
-fn syntax_repaired(code: String) -> (String, Vec<Repair>) {
+fn syntax_repaired(code: String, stubs: &StubIndex) -> (String, Vec<Repair>) {
     if reads_as_python(&code) {
         return (code, Vec::new());
     }
@@ -281,7 +282,7 @@ fn syntax_repaired(code: String) -> (String, Vec<Repair>) {
         repairs.extend(keywords.into_iter().map(Repair::Undeclared));
         candidate = Some(undeclared);
     }
-    if let Some(dedented) = dedented(candidate.as_deref().unwrap_or(&code)) {
+    if let Some(dedented) = dedented(candidate.as_deref().unwrap_or(&code), stubs) {
         repairs.push(Repair::Dedented);
         candidate = Some(dedented);
     }
@@ -571,8 +572,10 @@ fn undeclared(code: &str) -> Option<(String, Vec<&'static str>)> {
 /// stray indent is the only place it can belong. Each pass lines up the block whose stray indent
 /// the first error sits on, and the snippet is read again; any other first error, a tab, or a pass
 /// that leaves nothing to change returns `None`. The lexer never starts a statement inside
-/// brackets, a string, a comment, or after `\`, so those lines keep their indentation.
-fn dedented(code: &str) -> Option<String> {
+/// brackets, a string, a comment, or after `\`, so those lines keep their indentation. A stray
+/// block that names a host function or namespace returns `None` too: its indent may be all that
+/// is left of a dropped `if` or loop header, and lining it up would make its calls unconditional.
+fn dedented(code: &str, stubs: &StubIndex) -> Option<String> {
     let mut current = code.to_owned();
     for _ in 0..=code.lines().count() {
         let parsed = parse_unchecked_source(&current, PySourceType::Python);
@@ -586,7 +589,12 @@ fn dedented(code: &str) -> Option<String> {
         if !is_stray_indent(parsed.tokens(), first.location) {
             return None;
         }
-        let edits = lined_up(&current, parsed.tokens(), first.location.start().to_usize())?;
+        let edits = lined_up(
+            &current,
+            parsed.tokens(),
+            first.location.start().to_usize(),
+            stubs,
+        )?;
         current = applied(&current, edits);
     }
     None
@@ -612,8 +620,9 @@ fn is_stray_indent(tokens: &[Token], location: TextRange) -> bool {
 
 /// The edits taking the stray statement whose indentation starts at `at`, and the statements
 /// after it as deep or deeper, back to the indentation of the statement before it: the deepest
-/// block open there, since everything before the first error is valid.
-fn lined_up(code: &str, tokens: &[Token], at: usize) -> Option<Vec<Edit>> {
+/// block open there, since everything before the first error is valid. `None` when the block
+/// names a host function or namespace.
+fn lined_up(code: &str, tokens: &[Token], at: usize, stubs: &StubIndex) -> Option<Vec<Edit>> {
     let starts = statement_starts(code, tokens)?;
     let first = starts.iter().position(|start| start.token >= at)?;
     let enclosing = first
@@ -621,13 +630,36 @@ fn lined_up(code: &str, tokens: &[Token], at: usize) -> Option<Vec<Edit>> {
         .map_or(0, |previous| starts[previous].width);
     let written = starts[first].width;
     let shift = written.checked_sub(enclosing).filter(|shift| *shift > 0)?;
+    let block = starts[first..]
+        .iter()
+        .take_while(|start| start.width >= written)
+        .count();
+    let end = starts
+        .get(first + block)
+        .map_or(code.len(), |next| next.line);
+    if names_host(code, tokens, starts[first].line..end, stubs) {
+        return None;
+    }
     Some(
-        starts[first..]
+        starts[first..first + block]
             .iter()
-            .take_while(|start| start.width >= written)
             .map(|start| Edit::remove(start.line, start.line + shift))
             .collect(),
     )
+}
+
+/// Whether a name token within `span` is one the host declares, read as a name rather than as an
+/// attribute after `.`.
+fn names_host(code: &str, tokens: &[Token], span: Range<usize>, stubs: &StubIndex) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        let after_dot = index
+            .checked_sub(1)
+            .is_some_and(|previous| tokens[previous].kind() == TokenKind::Dot);
+        token.kind() == TokenKind::Name
+            && !after_dot
+            && span.contains(&token.start().to_usize())
+            && stubs.is_host(&code[token.range()])
+    })
 }
 
 /// A token that starts a statement on its own line.
@@ -787,6 +819,10 @@ struct StubIndex {
 }
 
 impl StubIndex {
+    fn is_host(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
     fn of(stubs: &str) -> Self {
         let mut index = Self::default();
         let Some(tree) = parse(stubs) else {
@@ -1217,6 +1253,8 @@ mod tests {
     #[test_case("import datetime\r\n datetime.datetime.now()", "import datetime\r\ndatetime.datetime.now()" ; "crlf")]
     #[test_case("@a\n @b\nclass C: pass", "@a\n@b\nclass C: pass" ; "between_decorators")]
     #[test_case("try: a()\n except OSError: pass", "try: a()\nexcept OSError: pass" ; "a_clause_after_a_one_line_block")]
+    #[test_case("x = 1\n  y = x.search", "x = 1\ny = x.search" ; "a_host_name_read_as_an_attribute")]
+    #[test_case("r = await gh.list()\n  n = len(r)", "r = await gh.list()\nn = len(r)" ; "a_host_call_before_the_stray")]
     fn an_over_indented_line_is_lined_up_with_its_block(code: &str, expected: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, expected);
@@ -1250,6 +1288,11 @@ mod tests {
     #[test_case("if x:\n    if y:\n        a = 1\n      b = 2" ; "a_dedent_between_levels")]
     #[test_case("x = 1\n  y = (" ; "still_broken_after")]
     #[test_case("x = '''\n  a\n'''" ; "a_string_alone")]
+    #[test_case("x = 1\n    await gh.list()" ; "a_stray_host_call")]
+    #[test_case("x = 1\n  y = 2\n  hits = search('a')" ; "a_host_call_later_in_the_stray_block")]
+    #[test_case("x = 1\n  for q in qs:\n      print(f'{servers()}')" ; "a_host_call_inside_an_f_string")]
+    #[test_case("x = 1\n  y = gh" ; "a_host_namespace_named")]
+    #[test_case("```python\nx = 1\n  await gh.list()\n```" ; "inside_a_fence")]
     fn other_indentation_is_left_alone(code: &str) {
         let repaired = repaired(code);
         assert_eq!(repaired.code, code);
@@ -1284,7 +1327,7 @@ mod tests {
                 continue;
             }
             files += 1;
-            if syntax_repaired(code.clone()) != (code.clone(), Vec::new()) {
+            if syntax_repaired(code.clone(), &StubIndex::default()) != (code.clone(), Vec::new()) {
                 failures.push(format!("{}: valid file changed", path.display()));
             }
             let parsed = parse_unchecked_source(&code, PySourceType::Python);
@@ -1309,7 +1352,7 @@ mod tests {
                     cases += 1;
                     let mut stray = code.clone();
                     stray.insert_str(start.line, &" ".repeat(spaces));
-                    let (repaired, repairs) = syntax_repaired(stray);
+                    let (repaired, repairs) = syntax_repaired(stray, &StubIndex::default());
                     if repaired != code || repairs != [Repair::Dedented] {
                         let line = code[..start.line].lines().count() + 1;
                         failures.push(format!("{}:{line} +{spaces}: {repairs:?}", path.display()));

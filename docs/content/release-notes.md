@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 13 {#v0-2-0-preview-13}
+
+[v0.2.0-preview.13 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.13)
+
+- A stray indent no longer makes a server call in a `code` snippet run every time.
+
+### Fixes
+
+- **A stray indent no longer makes a server call unconditional**: Since Preview 12, a `code` snippet with a line indented deeper than its block, such as ` datetime.datetime.now()` after `import datetime`, has that line lined up with its block and runs. When the deeper block names a server or a host function, its indent may be all that is left of a missing `if` or loop, and lining it up would run its calls every time. Such a snippet is now rejected with `Unexpected indentation`, as before Preview 12. See [Results and errors](/docs/mcp/#results-and-errors).
+
 ## Caudra 0.2 Preview 12 {#v0-2-0-preview-12}
 
 [v0.2.0-preview.12 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.12)
