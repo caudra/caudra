@@ -3,7 +3,7 @@ title: "Quick Start"
 description: "Install, connect a provider, first session."
 ---
 
-Install Caudra, connect a provider, and run a first session. Caudra is an independent fork. Its first public release is 0.2 Preview (`0.2.0-preview.1`).
+Install Caudra, connect a provider, and run a first session. Caudra is in preview. The [Release notes](/docs/release-notes/) name the latest version.
 
 ## Install
 
@@ -14,7 +14,7 @@ To select a channel explicitly after downloading the shell installer, run `sh in
 ### Linux / macOS
 
 ```sh
-# Download and read the script first (don't blindly trust shell scripts).
+# Download the script and read it before you run it.
 curl -fsSL https://caudra.ai/install.sh -o install.sh
 cat install.sh
 
@@ -33,7 +33,7 @@ Installs to `~/.local/bin`. Override with `CAUDRA_INSTALL_DIR`.
 ### Windows (PowerShell)
 
 ```powershell
-# Download and read the script first (don't blindly trust remote scripts).
+# Download the script and read it before you run it.
 irm https://caudra.ai/install.ps1 -OutFile install.ps1
 Get-Content install.ps1
 
@@ -55,7 +55,7 @@ curl -fsSL https://caudra.ai/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\caudra` and add it to your user PATH. Override with `CAUDRA_INSTALL_DIR` / `$env:CAUDRA_INSTALL_DIR`.
 
-### Living on the edge (main branch)
+### Build from main
 
 ```sh
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
@@ -79,10 +79,12 @@ After an update, the first interactive start shows what changed since the releas
 
 ```bash
 caudra auth login                           # choose a provider and auth method
-caudra auth login anthropic                 # Claude subscription OAuth
+caudra auth login anthropic                 # Claude subscription OAuth (experimental)
 caudra auth login openai                    # ChatGPT/Codex subscription OAuth
 caudra auth login anthropic --method api-key
 ```
+
+Claude subscription sign-in is experimental. Anthropic's terms limit Pro and Max subscriptions to official clients. See [Anthropic](/docs/providers/#anthropic).
 
 Open `/login` inside the TUI for the same OAuth and API-key choices. You can also set provider environment variables such as `ANTHROPIC_API_KEY`. Every env var and model catalog is in [Providers](/docs/providers/). To use more than one subscription or key of a provider, see [Accounts](/docs/accounts/).
 
