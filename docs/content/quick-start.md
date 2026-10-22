@@ -55,6 +55,14 @@ curl -fsSL https://caudra.ai/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\caudra` and add it to your user PATH. Override with `CAUDRA_INSTALL_DIR` / `$env:CAUDRA_INSTALL_DIR`.
 
+### With Homebrew
+
+```sh
+brew install caudra/tap/caudra
+```
+
+The [tap](https://github.com/caudra/homebrew-tap) installs the newest release on macOS and Linux, previews included, from the same archives and checksums as the installers. Update with `brew upgrade caudra`. `caudra update` leaves Homebrew installations to Homebrew.
+
 ### Build from main
 
 ```sh
