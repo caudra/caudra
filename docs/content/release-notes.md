@@ -11,7 +11,12 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.13 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.13)
 
+- JavaScript and TypeScript `code` snippets run as Python when every part of them translates without changing what it does.
 - A stray indent no longer makes a server call in a `code` snippet run every time.
+
+### Changes
+
+- **JavaScript snippets run as Python**: A `code` snippet written in JavaScript or TypeScript, such as `const r = await Promise.all([...]); return r.map(x => x.name)`, was rejected with `This looks like JavaScript`, which cost the model a turn to rewrite it. Caudra now translates it to Python and runs that, when every part has a Python form that keeps its meaning. The card and the model see the Python that ran. A snippet with a part that has no such form, such as `switch`, `if (items)` on a bare value, or a server call that is never awaited, is still rejected, and the error names that part and its line. See [Results and errors](/docs/mcp/#results-and-errors).
 
 ### Fixes
 
