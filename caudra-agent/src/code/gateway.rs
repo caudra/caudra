@@ -154,6 +154,7 @@ pub async fn run(ctx: &ToolContext, code: String, reset: bool, timeout: Duration
     if let Some(taught) = outcome.taught_code {
         output.repaired_lines = repaired_lines(&output.code, &taught);
     }
+    output.ran_as = outcome.ran_as;
     output
 }
 

@@ -231,6 +231,8 @@ pub struct ScriptOutcome {
     /// The snippet with only the changes that undid the model's own slips, line for line with
     /// what it wrote.
     pub taught_code: Option<String>,
+    /// The Python that ran, when the snippet was JavaScript translated to it.
+    pub ran_as: Option<String>,
 }
 
 /// One change made to a snippet before it ran.

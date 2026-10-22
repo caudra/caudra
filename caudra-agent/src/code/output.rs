@@ -22,6 +22,8 @@ const NOTE_LABEL: &str = "Note:";
 const REPAIRED_LABEL: &str = "Repaired:";
 const LESSON_SEPARATOR: &str = "; ";
 const AS_REPAIRED_LABEL: &str = "The lines as repaired:";
+const RAN_AS_LABEL: &str =
+    "The snippet was JavaScript, so it ran as this Python; line numbers in the output refer to it:";
 const LINE_NUMBER_WIDTH: usize = 4;
 const LINE_BREAK: char = '\n';
 /// Repaired lines the model reads before the rest are only counted.
@@ -45,6 +47,18 @@ const LINE_NOUN: &str = "line";
 /// How much of a longer snippet's first statement its row shows, so the line count after it
 /// survives the one-row clamp.
 const MAX_SNIPPET_PREVIEW_CHARS: usize = 60;
+
+/// Every line of the translated `python`, numbered: snippets are byte-bounded, so none is cut.
+fn ran_as(python: &str) -> String {
+    let mut lines = vec![RAN_AS_LABEL.to_owned()];
+    lines.extend(
+        python
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>LINE_NUMBER_WIDTH$} | {line}", index + 1)),
+    );
+    lines.join("\n")
+}
 
 /// `history.read(ref="abc", limit=5000)`: a call as the snippet made it, with the values it ran
 /// with, which a permission prompt and a subagent's row both spell this way.
@@ -115,6 +129,9 @@ pub struct CodeOutput {
     /// written beside the lessons.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repaired_lines: Vec<RepairedLine>,
+    /// The Python that ran, when `code` was JavaScript translated to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_as: Option<String>,
     /// The calls whose answers `stdout` only repeats, in the order printed, so the card can show
     /// their cards in its place. Empty when it printed anything else.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -380,6 +397,9 @@ impl CodeOutput {
         if !self.repaired_lines.is_empty() {
             parts.push(self.lines_as_repaired());
         }
+        if let Some(python) = &self.ran_as {
+            parts.push(ran_as(python));
+        }
         if let Some(note) = &self.state_note {
             parts.push(format!("{NOTE_LABEL} {note}"));
         }
@@ -543,6 +563,36 @@ mod tests {
             "{text}"
         );
         assert_eq!(output.repaired_lines.len(), 1, "{text}");
+    }
+
+    const TRANSLATED_LESSON: &str = "snippets are Python";
+    const RAN_AS: &str = "x = 1\nx";
+
+    #[test]
+    fn the_model_reads_every_line_of_the_python_that_ran() {
+        let output = CodeOutput {
+            code: "const x = 1;\nx".to_owned(),
+            result: Some(RESULT.to_owned()),
+            outcome: CodeOutcome::Completed,
+            lessons: vec![TRANSLATED_LESSON.to_owned()],
+            ran_as: Some(RAN_AS.to_owned()),
+            ..CodeOutput::default()
+        };
+        let text = output.model_text();
+        assert!(
+            text.ends_with(&format!(
+                "{REPAIRED_LABEL} {TRANSLATED_LESSON}.\n\n{RAN_AS_LABEL}\n{:>LINE_NUMBER_WIDTH$} | x = 1\n{:>LINE_NUMBER_WIDTH$} | x",
+                1, 2
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_output_saved_before_translation_loads() {
+        let saved = json!({"code": "x", "outcome": {"status": "completed"}});
+        let output: CodeOutput = serde_json::from_value(saved).expect("loads");
+        assert_eq!(output.ran_as, None);
     }
 
     #[test]

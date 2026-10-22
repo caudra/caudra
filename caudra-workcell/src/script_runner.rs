@@ -220,6 +220,7 @@ async fn run_hosted(
             })
             .collect(),
         taught_code: executed.taught_code,
+        ran_as: executed.ran_as,
     };
     (outcome, executed.state)
 }

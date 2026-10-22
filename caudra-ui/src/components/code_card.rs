@@ -17,7 +17,8 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use super::code_view::{
-    BodySource, TreeFolds, body_window, json_body, plain_body, tree_body, truncation_line,
+    BodySource, TreeFolds, body_window, highlighted_body, json_body, plain_body, tree_body,
+    truncation_line,
 };
 use super::literal;
 use super::mcp_card::decisions;
@@ -32,6 +33,8 @@ const TIMED_OUT: &str = "Timed out after ";
 const KIND_SEPARATOR: &str = ": ";
 const REPAIRED: &str = "Repaired: ";
 const REPAIR_SEPARATOR: &str = ", ";
+const RAN_AS_LABEL: &str = "Ran as Python:";
+const PYTHON_LANGUAGE: &str = "python";
 const LINE_BREAK: char = '\n';
 
 /// A run of the card's lines, the text a selection over them copies (`None` is chrome), and for
@@ -286,7 +289,20 @@ pub(crate) fn tail(
         let repairs = format!("{REPAIRED}{}", output.repairs.join(REPAIR_SEPARATOR));
         blocks.push(Block::chrome(label_line(&repairs, theme.tool_dim)));
     }
+    if let Some(python) = &output.ran_as {
+        blocks.push(Block::chrome(label_line(RAN_AS_LABEL, theme.accent)));
+        blocks.push(python_block(python, width));
+    }
     (blocks, truncated)
+}
+
+/// `python` coloured as Python, copied as its plain text in a Python fence.
+fn python_block(python: &str, width: u16) -> Block {
+    let (_, mut source) = plain_body(python, width);
+    for code in &mut source.code {
+        code.language = Some(PYTHON_LANGUAGE.to_owned());
+    }
+    Block::text((highlighted_body(python, PYTHON_LANGUAGE, width), source))
 }
 
 /// A part of what the snippet printed or ended on, as it draws.
@@ -725,5 +741,24 @@ pub(crate) mod tests {
                 "{REPAIRED}imported `asyncio`{REPAIR_SEPARATOR}imported `json`"
             )]
         );
+    }
+
+    const TRANSLATED_REPAIR: &str = "ran the JavaScript as Python";
+    const RAN_AS: &str = "x = 1\nx";
+    const RAN_AS_LINES: [&str; 2] = ["x = 1", "x"];
+
+    #[test]
+    fn the_tail_shows_the_python_a_javascript_snippet_ran_as() {
+        let output = CodeOutput {
+            repairs: vec![TRANSLATED_REPAIR.to_owned()],
+            ran_as: Some(RAN_AS.to_owned()),
+            ..CodeOutput::default()
+        };
+        let (blocks, _) = tail(Tail::new(&output), usize::MAX, WIDTH, &TreeFolds::default());
+        let texts = texts(&blocks);
+        assert_eq!(texts[1], RAN_AS_LABEL, "{texts:?}");
+        assert_eq!(texts[2..], RAN_AS_LINES, "{texts:?}");
+        let copied = blocks.last().and_then(|block| block.source.as_ref());
+        assert_eq!(copied.map(|source| source.text.as_str()), Some(RAN_AS));
     }
 }
