@@ -97,7 +97,7 @@ const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("variable.parameter", "variable.parameter"),
     (
         "variable.other.member",
-        "variable.other.member, variable.other.property",
+        "variable.other.member, variable.other.property, meta.mapping.key string, meta.mapping.key string punctuation.definition.string, entity.name.tag.yaml, entity.name.tag.toml",
     ),
     (
         "constant",
@@ -1471,6 +1471,40 @@ mod tests {
                 "scope {scope} should resolve correctly"
             );
         }
+    }
+
+    const LIGHT_KEY_COLOR: SynColor = SynColor {
+        r: 0xd1,
+        g: 0x38,
+        b: 0x3d,
+        a: 0xFF,
+    };
+    const LIGHT_STRING_COLOR: SynColor = SynColor {
+        r: 0x3d,
+        g: 0x9a,
+        b: 0x57,
+        a: 0xFF,
+    };
+    const JSON_KEY: &str =
+        "source.json meta.mapping.json meta.mapping.key.json string.quoted.double.json";
+    const JSON_KEY_QUOTE: &str = "source.json meta.mapping.json meta.mapping.key.json string.quoted.double.json punctuation.definition.string.begin.json";
+    const JSON_VALUE: &str =
+        "source.json meta.mapping.json meta.mapping.value.json string.quoted.double.json";
+    const JSON_VALUE_QUOTE: &str = "source.json meta.mapping.json meta.mapping.value.json string.quoted.double.json punctuation.definition.string.begin.json";
+    const YAML_KEY: &str = "source.yaml string.unquoted.plain.out.yaml entity.name.tag.yaml";
+    const TOML_KEY: &str = "source.toml meta.tag.key.toml entity.name.tag.toml";
+
+    #[test_case(JSON_KEY, LIGHT_KEY_COLOR; "json_key")]
+    #[test_case(JSON_KEY_QUOTE, LIGHT_KEY_COLOR; "json_key_quote")]
+    #[test_case(JSON_VALUE, LIGHT_STRING_COLOR; "json_string_value")]
+    #[test_case(JSON_VALUE_QUOTE, LIGHT_STRING_COLOR; "json_string_value_quote")]
+    #[test_case(YAML_KEY, LIGHT_KEY_COLOR; "yaml_key")]
+    #[test_case(TOML_KEY, LIGHT_KEY_COLOR; "toml_key")]
+    fn data_keys_take_the_member_colour_and_values_stay_strings(scope: &str, expected: SynColor) {
+        assert_eq!(
+            resolve_color_for_scope(&bundled("caudra-light").syntax, scope),
+            Some(expected)
+        );
     }
 
     #[test]
