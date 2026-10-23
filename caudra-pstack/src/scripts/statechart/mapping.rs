@@ -14,8 +14,8 @@ use caudra_script::{SandboxLimits, restricted_engine};
 use regex::Regex;
 use rhai::serde::to_dynamic;
 use rhai::{
-    AST, Array, CallFnOptions, Dynamic, Engine, EvalAltResult, EvalContext, ImmutableString,
-    Map as RhaiMap, Position, Scope, Target,
+    AST, Array, CallFnOptions, Dynamic, Engine, EvalAltResult, EvalContext, INT, Identifier,
+    ImmutableString, Map as RhaiMap, Position, Scope, Target,
 };
 use serde_json::Value as Json;
 use thiserror::Error;
@@ -72,9 +72,14 @@ const PRIMES_OR_UNCHANGED: &str = r"[\w)\]>}]'|\bUNCHANGED\b";
 const BLOCK_COMMENT: &str = r"\(\*[\s\S]*?\*\)";
 const LINE_COMMENT: &str = r"\\\*.*";
 const TOP_LEVEL: &str = r"\n(\S)";
-/// The key under which a map of a second model's state lists the fields it lacks. The mapping
-/// can see it among the map's keys, but no TLA+ name starts with a NUL.
+/// The key under which a map of a second model's state lists the fields it lacks. No TLA+ name
+/// starts with a NUL, and the map functions below leave it out.
 const LACKS: &str = "\u{0}lacks";
+/// The map functions that would otherwise show `LACKS`.
+const MAP_KEYS: &str = "keys";
+const MAP_VALUES: &str = "values";
+const MAP_LEN: &str = "len";
+const MAP_IS_EMPTY: &str = "is_empty";
 /// The name upstream's messages give the mapping's state argument.
 const STATE_ARGUMENT: &str = "v";
 const FIELD_SEPARATOR: &str = ".";
@@ -242,10 +247,23 @@ impl Mapping {
 
     /// The same mapping for the states of a second model, which `lacking_value` builds: reading
     /// a field that such a state lacks fails, as upstream's guard does, where any other missing
-    /// field reads as `()`.
+    /// field reads as `()`. A map's own functions do not show the marker that says what it lacks.
     pub fn for_lacking_states(&self) -> Self {
         let mut engine = restricted_engine(&LIMITS, HINT);
-        engine.on_map_missing_property(missing_property);
+        engine
+            .on_map_missing_property(missing_property)
+            .register_fn(MAP_KEYS, |map: &mut RhaiMap| -> Array {
+                unmarked(map).map(|(key, _)| key.clone().into()).collect()
+            })
+            .register_fn(MAP_VALUES, |map: &mut RhaiMap| -> Array {
+                unmarked(map).map(|(_, value)| value.clone()).collect()
+            })
+            .register_fn(MAP_LEN, |map: &mut RhaiMap| -> INT {
+                INT::try_from(unmarked(map).count()).unwrap_or(INT::MAX)
+            })
+            .register_fn(MAP_IS_EMPTY, |map: &mut RhaiMap| {
+                unmarked(map).next().is_none()
+            });
         Self {
             name: self.name.clone(),
             engine,
@@ -567,6 +585,10 @@ fn marked(vars: &Vars, lacks: &LackTree, model: &Arc<str>, at: &mut Vec<String>)
         map.insert(LACKS.into(), Dynamic::from(lacking));
     }
     map.into()
+}
+
+fn unmarked(map: &RhaiMap) -> impl Iterator<Item = (&Identifier, &Dynamic)> {
+    map.iter().filter(|(key, _)| key.as_str() != LACKS)
 }
 
 /// A field the second model lacks fails. Any other missing field reads as `()` and joins the map,
@@ -974,6 +996,27 @@ mod tests {
         };
         assert_eq!(function, STATE);
         got
+    }
+
+    #[test_case("let keys = v.keys(); keys.sort(); keys.reduce(|all, key| all + key + \" \", \"\")" => "note retries "; "keys")]
+    #[test_case("v.note.values().len().to_string()" => "1"; "values")]
+    #[test_case("`${v.len()} ${v.note.len()}`" => "2 1"; "len")]
+    #[test_case("`${#{}.is_empty()} ${v.note.is_empty()}`" => "true false"; "is_empty")]
+    fn a_second_models_state_hides_what_it_lacks(body: &str) -> String {
+        let Json::Object(state) = json!({"note": {"text": "hi"}, "retries": 0}) else {
+            panic!("vars are an object");
+        };
+        let lacks = [
+            vec!["note".to_owned(), "rev".to_owned()],
+            vec!["count".to_owned()],
+        ];
+        let mapping = mapping(&format!("fn state(v) {{ {body} }}")).for_lacking_states();
+        mapping
+            .state(
+                &lacking_value(&state, &lacks, &Arc::from("the fix")),
+                &facts([], false),
+            )
+            .expect(MUST_CALL)
     }
 
     #[test]
