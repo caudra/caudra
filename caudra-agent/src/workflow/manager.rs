@@ -3280,7 +3280,7 @@ complete(result);
                     .await
                     .is_none()
             );
-            background.suppress_wakes();
+            background.close_for_test();
             background.rearm();
             drop(guard);
             assert!(pending.await.is_err());

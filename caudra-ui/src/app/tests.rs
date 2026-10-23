@@ -1258,7 +1258,10 @@ mod background_runtime {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{App, ImageMediaType, ImageSource, Msg, Status, subagent_info, test_app};
+    use super::{
+        App, ImageMediaType, ImageSource, Msg, SHELL_TOOL_NAME, Status, subagent_info, test_app,
+        tool_start,
+    };
     use crate::AppSession;
     use crate::agent::shared_queue::QueueItem;
     use crate::agent::{AgentHandles, ModelSlot, QueuedMessage, reserve_background_transition};
@@ -2144,6 +2147,61 @@ mod background_runtime {
         }));
     }
 
+    #[test_case(false; "succeeded")]
+    #[test_case(true; "cancelled")]
+    fn a_finished_task_settles_a_call_whose_end_never_arrived(cancelled: bool) {
+        const LOST_CALL: &str = "lost-shell";
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let task = background.list()[0].clone();
+            fixture.app.focus_task(&task.task_id).unwrap();
+            fixture.app.update(Msg::Agent(Box::new(Envelope {
+                task: None,
+                event: tool_start(LOST_CALL, SHELL_TOOL_NAME),
+                subagent: Some(SubagentInfo {
+                    parent_tool_use_id: task.call_id.clone(),
+                    task_id: task.task_id.clone(),
+                    name: task.label.clone(),
+                    prompt: None,
+                    model: None,
+                    thinking: None,
+                    fast: false,
+                    answer_tx: None,
+                    steer_tx: None,
+                }),
+                run_id: fixture.app.run_id,
+                workflow: None,
+            })));
+            let task_chat = |app: &App| {
+                app.chats
+                    .iter()
+                    .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task.task_id))
+                    .unwrap()
+            };
+            let index = task_chat(&fixture.app);
+            assert_eq!(fixture.app.chats[index].in_progress_count(), 1);
+            if cancelled {
+                background.cancel(&task.task_id).await.unwrap();
+            } else {
+                fixture.child.reply.send(final_response()).unwrap();
+            }
+            loop {
+                let changed = background.listen();
+                if !background.resident_status(&task.task_id).unwrap().active() {
+                    break;
+                }
+                changed.await;
+            }
+            let _ = fixture.app.reconcile_tasks();
+            assert_eq!(
+                fixture.app.chats[task_chat(&fixture.app)].in_progress_count(),
+                0
+            );
+            fixture.close().await;
+        }));
+    }
+
     #[test_case(false, false; "hidden_task")]
     #[test_case(true, false; "visible_task")]
     #[test_case(false, true; "hidden_task_and_workflow")]
@@ -2828,7 +2886,7 @@ mod background_runtime {
             fixture.app.update(Msg::Key(key(KeyCode::Char('x'))));
             assert!(!fixture.app.input_box.is_empty());
             if generation_changed {
-                background.suppress_wakes();
+                background.close_for_test();
                 background.rearm();
             }
             drop(admission);
@@ -13114,7 +13172,7 @@ fn blank_session_is_saved_only_when_peers_can_reach_it(controls: StoredPeerContr
 #[test_case(true; "fork")]
 fn peer_controls_are_not_inherited_by_new_session_ids(fork: bool) {
     let mut app = test_app();
-    app.suppress_background_wakes();
+    app.suppress_background_wakes(tasks::WAKES_SUPPRESSED_RUN_CANCELLED);
     app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
     crate::push_history_message(
         app.state.session_mut(),

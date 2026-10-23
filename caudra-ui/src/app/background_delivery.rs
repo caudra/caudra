@@ -13,6 +13,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use super::App;
+use super::tasks::{WAKES_SUPPRESSED_STOP_FAILED, WAKES_SUPPRESSED_STOP_REQUESTED};
 use super::workflow::{WorkflowDelivery, WorkflowDeliveryResult};
 use crate::components::{DisplayMessage, DisplayRole};
 
@@ -369,7 +370,7 @@ impl BackgroundDelivery {
 impl App {
     pub(crate) fn stop_background_work(&mut self) {
         self.drop_questions();
-        self.suppress_background_wakes();
+        self.suppress_background_wakes(WAKES_SUPPRESSED_STOP_REQUESTED);
         let key = DeliveryKey {
             session: self.state.session.id,
             run: self.run_id,
@@ -478,7 +479,7 @@ impl App {
     ) {
         let error = match failure {
             DeliveryFailure::Stop(error) => {
-                self.suppress_background_wakes();
+                self.suppress_background_wakes(WAKES_SUPPRESSED_STOP_FAILED);
                 self.flash(error);
                 return;
             }

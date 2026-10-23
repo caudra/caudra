@@ -19,6 +19,7 @@ use caudra_storage::id::CaudraId;
 use caudra_terminal_host::status::PaneSubagent;
 use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
+use tracing::warn;
 
 use crate::app::App;
 use crate::app::background_delivery::{DeliveryFailure, DeliveryJob, DeliveryKey};
@@ -31,6 +32,13 @@ use crate::input_document::InputDraft;
 use crate::repaint::Dirty;
 
 pub(crate) const MAIN_TASK_ID: &str = "main";
+/// Where [`App::suppress_background_wakes`] was called from, for its log line.
+pub(crate) const WAKES_SUPPRESSED_RUN_CANCELLED: &str = "run_cancelled";
+pub(crate) const WAKES_SUPPRESSED_RUN_MAX_TURNS: &str = "run_max_turns";
+pub(crate) const WAKES_SUPPRESSED_RUN_MAX_TOKENS: &str = "run_max_tokens";
+pub(crate) const WAKES_SUPPRESSED_RUN_ERROR: &str = "run_error";
+pub(crate) const WAKES_SUPPRESSED_STOP_REQUESTED: &str = "stop_requested";
+pub(crate) const WAKES_SUPPRESSED_STOP_FAILED: &str = "stop_failed";
 const MILLIS_PER_SECOND: u64 = 1_000;
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const TASK_NOUN: &str = "task";
@@ -552,7 +560,13 @@ impl App {
         }
     }
 
-    pub(crate) fn suppress_background_wakes(&mut self) {
+    pub(crate) fn suppress_background_wakes(&mut self, site: &'static str) {
+        warn!(
+            session = %self.state.session.id,
+            site,
+            active_tasks = self.background.as_ref().map_or(0, BackgroundTasks::active_count),
+            "background wakes suppressed"
+        );
         self.background_delivery.invalidate();
         self.automatic_wakes_suppressed = true;
         if let Some(background) = &self.background {
@@ -1075,6 +1089,9 @@ impl App {
                 let chat = &mut self.chats[index];
                 if chat.task_outcome() != Some(outcome) {
                     chat.resume();
+                    // A call whose end never reached this chat must not keep
+                    // its clock running past the task's own end.
+                    chat.cancel_in_progress();
                     chat.mark_finished(outcome, &task.state);
                     changed = true;
                 }

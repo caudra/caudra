@@ -5383,18 +5383,26 @@ impl App {
             }
         }
 
-        if envelope.subagent.is_none()
-            && matches!(
-                &envelope.event,
+        if envelope.subagent.is_none() {
+            let site = match &envelope.event {
                 AgentEvent::Done {
-                    reason: caudra_agent::DoneReason::MaxTurns
-                        | caudra_agent::DoneReason::MaxTokens
-                        | caudra_agent::DoneReason::Cancelled,
+                    reason: caudra_agent::DoneReason::MaxTurns,
                     ..
-                } | AgentEvent::Error { .. }
-            )
-        {
-            self.suppress_background_wakes();
+                } => Some(tasks::WAKES_SUPPRESSED_RUN_MAX_TURNS),
+                AgentEvent::Done {
+                    reason: caudra_agent::DoneReason::MaxTokens,
+                    ..
+                } => Some(tasks::WAKES_SUPPRESSED_RUN_MAX_TOKENS),
+                AgentEvent::Done {
+                    reason: caudra_agent::DoneReason::Cancelled,
+                    ..
+                } => Some(tasks::WAKES_SUPPRESSED_RUN_CANCELLED),
+                AgentEvent::Error { .. } => Some(tasks::WAKES_SUPPRESSED_RUN_ERROR),
+                _ => None,
+            };
+            if let Some(site) = site {
+                self.suppress_background_wakes(site);
+            }
         }
 
         match &envelope.event {

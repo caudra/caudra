@@ -204,6 +204,9 @@ struct State {
     answers: HashMap<String, flume::Sender<String>>,
     generation: u64,
     open: bool,
+    /// Automatic wakes are held until the user acts again. Running tasks keep
+    /// reporting and stay visible; only claiming their messages waits.
+    wakes_paused: bool,
     pending_stops: usize,
     transition: Option<CaudraId>,
     shutdown: bool,
@@ -490,6 +493,7 @@ impl BackgroundTasks {
                 answers: HashMap::new(),
                 generation,
                 open: true,
+                wakes_paused: false,
                 pending_stops: 0,
                 transition: None,
                 shutdown: false,
@@ -882,6 +886,7 @@ impl BackgroundTasks {
     fn has_pending_for(&self, owner: &JobOwner, generation: u64) -> bool {
         let state = self.lock();
         state.open
+            && !wakes_held(&state, owner)
             && !state.closed_owners.contains(owner)
             && state.transition.is_none()
             && state.failure.is_none()
@@ -919,6 +924,7 @@ impl BackgroundTasks {
             return;
         }
         state.steering = None;
+        state.wakes_paused = false;
         if !state.open {
             state.generation += 1;
             state.closed_owners.clear();
@@ -953,6 +959,13 @@ impl BackgroundTasks {
         self.lock().admission_committed = Some((committed, resume));
     }
 
+    /// Closes admission the way a stop does, without draining, so a test can
+    /// rearm into a new generation while it holds the admission gate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn close_for_test(&self) {
+        self.lock().open = false;
+    }
+
     pub async fn workflow_admission(&self) -> Result<MutexGuardArc<()>, String> {
         let generation = self.lock().generation;
         let guard = self.0.gate.lock_arc().await;
@@ -975,8 +988,11 @@ impl BackgroundTasks {
         self.lock().steering.get_or_insert(initial).clone()
     }
 
+    /// Holds automatic wakes until [`Self::rearm`]. Unlike a stop, running
+    /// tasks carry on in the same generation, so what they finish with is
+    /// delivered once wakes resume.
     pub fn suppress_wakes(&self) {
-        self.lock().open = false;
+        self.lock().wakes_paused = true;
         self.0.changed.notify(usize::MAX);
     }
 
@@ -1192,7 +1208,11 @@ impl BackgroundTasks {
             RuntimeHealth::Closed
         } else if state.failure.is_some() {
             RuntimeHealth::Unavailable
-        } else if !state.open || state.pending_stops > 0 || state.transition.is_some() {
+        } else if !state.open
+            || wakes_held(&state, owner)
+            || state.pending_stops > 0
+            || state.transition.is_some()
+        {
             RuntimeHealth::Stopping
         } else {
             RuntimeHealth::Current
@@ -1394,6 +1414,7 @@ impl BackgroundTasks {
             return Err(error.clone());
         }
         if !state.open
+            || wakes_held(&state, owner)
             || state.transition.is_some()
             || state.generation != generation
             || state.closed_owners.contains(owner)
@@ -2325,6 +2346,12 @@ fn store_outcome(
 
 fn eligible(record: &TaskRecord, generation: u64) -> bool {
     record.background && record.receipt_accepted && record.generation == generation
+}
+
+/// A pause holds only the main session's wakes: a running task still claims
+/// what its own jobs report, or it would wait on them forever.
+fn wakes_held(state: &State, owner: &JobOwner) -> bool {
+    state.wakes_paused && *owner == JobOwner::Main
 }
 
 fn current_event(state: &State, record: &TaskRecord) -> bool {
@@ -3974,6 +4001,65 @@ mod tests {
             );
             fixture.tasks.rearm();
             assert!(!fixture.tasks.has_pending());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_running_tasks_events_stay_owned_across_a_wake_pause() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            let envelope = fixture.events.recv_async().await.unwrap();
+            let generation = fixture.tasks.generation();
+            fixture.tasks.suppress_wakes();
+            assert!(fixture.tasks.event_is_current(&envelope));
+            fixture.tasks.rearm();
+            assert_eq!(fixture.tasks.generation(), generation);
+            assert!(fixture.tasks.owns_event(&envelope));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_task_finishing_while_wakes_are_paused_is_delivered_after_rearm() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            let generation = fixture.tasks.generation();
+            fixture.tasks.suppress_wakes();
+            fixture
+                .responses
+                .send(report_response(false, None))
+                .unwrap();
+            fixture.started.recv_async().await.unwrap();
+            fixture.responses.send(final_response()).unwrap();
+            fixture.settled().await;
+            let status = fixture.tasks.status(&fixture.task_id()).unwrap();
+            assert_eq!(status.state, SUCCEEDED);
+            assert_eq!(status.reports, vec![REPORT]);
+            fixture.open_receipt().await;
+            assert!(!fixture.tasks.has_pending());
+            assert!(fixture.tasks.claim_messages().unwrap().is_empty());
+            fixture.tasks.rearm();
+            assert_eq!(fixture.tasks.generation(), generation);
+            assert!(fixture.tasks.has_pending());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "paused")]
+    #[test_case(true; "stopped")]
+    fn a_child_scope_admits_until_a_stop(stopped: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.child_scope(INVOCATION);
+            fixture.tasks.suppress_wakes();
+            if stopped {
+                fixture.tasks.stop().await.unwrap();
+            }
+            let expected = if stopped { Err(CLOSED.into()) } else { Ok(()) };
+            assert_eq!(scope.current(), expected);
             fixture.tasks.shutdown().await.unwrap();
         });
     }

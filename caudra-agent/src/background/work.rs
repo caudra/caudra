@@ -1,6 +1,6 @@
 use crate::{TaskCard, workflow::WorkflowHandle};
 
-use super::{BackgroundTasks, deliverable, eligible};
+use super::{BackgroundTasks, deliverable, eligible, wakes_held};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SessionWork {
@@ -68,6 +68,7 @@ impl BackgroundTasks {
                 || (state.open
                     && state.records.values().any(|record| {
                         eligible(record, state.generation)
+                            && !wakes_held(&state, &record.owner)
                             && record.events.iter().any(|event| deliverable(record, event))
                     })),
             unavailable: state.failure.is_some(),
