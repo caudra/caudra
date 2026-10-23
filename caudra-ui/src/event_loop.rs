@@ -107,7 +107,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
-use crate::app::background_delivery::DeliveryReply;
+use crate::app::background_delivery::{DeliveryFailure, DeliveryReply};
 use crate::app::decisions::feature_saved;
 use crate::app::file_revert::{self, RecorderSlot};
 use crate::app::permission_editor::{ConversationPermissions, attach_session_permissions};
@@ -152,6 +152,16 @@ use caudra_terminal_host::workspaces::{PaneSite, Workspaces};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
+const DELIVERY_SITE_REPLY: &str = "delivery_reply";
+const DELIVERY_SITE_CHECKPOINT: &str = "checkpoint";
+const DELIVERY_SITE_QUEUE_DRAINED: &str = "queue_drained";
+const DELIVERY_SITE_TERMINAL: &str = "terminal_event";
+const DELIVERY_SITE_MAILBOX: &str = "mailbox_persist";
+const DELIVERY_SITE_WORKFLOW_CLAIM: &str = "workflow_claim";
+const DELIVERY_SITE_BACKGROUND_CLAIM: &str = "background_claim";
+const DELIVERY_SITE_MAILBOX_RUN: &str = "mailbox_run";
+const DELIVERY_SITE_PEER_RUN: &str = "peer_run";
+const WAKE_RUN_NOT_STARTED: &str = "the woken run could not start";
 const NO_GLOBAL_CONFIG: &str = "No global config directory to save the decision feature in";
 /// Messages from other sessions wait for the user to let them in.
 const PEER_MESSAGES_BLOCKER: &str = "Peer messages await approval";
@@ -2338,9 +2348,12 @@ impl<'t> EventLoop<'t> {
             }
             Wake::Background => {}
             Wake::Delivery(index, reply) => {
-                if let Err(error) = self.sessions[index].app.apply_delivery_reply(*reply) {
-                    self.sessions[index].app.suppress_background_wakes();
-                    self.sessions[index].app.flash(error);
+                if let Err(failure) = self.sessions[index].app.apply_delivery_reply(*reply) {
+                    self.sessions[index].app.delivery_failed(
+                        DELIVERY_SITE_REPLY,
+                        failure,
+                        Instant::now(),
+                    );
                 }
             }
             Wake::Shell(i, event) => self.handle_shell_event(i, event),
@@ -2431,11 +2444,11 @@ impl<'t> EventLoop<'t> {
                 }
             }
             let final_save = rt.delivery_idle();
-            if let Err(error) = rt.app.persist_background_delivery(final_save) {
-                rt.app.suppress_background_wakes();
-                rt.app
-                    .flash(format!("Failed to persist background delivery: {error}"));
-            }
+            rt.app.persist_or_retry_background_delivery(
+                final_save,
+                DELIVERY_SITE_CHECKPOINT,
+                Instant::now(),
+            );
         }
     }
 
@@ -2864,10 +2877,11 @@ impl<'t> EventLoop<'t> {
                 if current {
                     rt.notifications.on_drain();
                     let final_save = rt.delivery_idle();
-                    if let Err(error) = rt.app.persist_background_delivery(final_save) {
-                        rt.app.suppress_background_wakes();
-                        rt.app.flash(error);
-                    }
+                    rt.app.persist_or_retry_background_delivery(
+                        final_save,
+                        DELIVERY_SITE_QUEUE_DRAINED,
+                        Instant::now(),
+                    );
                 }
                 return;
             }
@@ -2889,10 +2903,11 @@ impl<'t> EventLoop<'t> {
         if terminal {
             let rt = &mut self.sessions[idx];
             let final_save = rt.delivery_idle();
-            if let Err(error) = rt.app.persist_background_delivery(final_save) {
-                rt.app.suppress_background_wakes();
-                rt.app.flash(error);
-            }
+            rt.app.persist_or_retry_background_delivery(
+                final_save,
+                DELIVERY_SITE_TERMINAL,
+                Instant::now(),
+            );
         }
         self.dispatch(idx, actions);
     }
@@ -3244,6 +3259,7 @@ impl<'t> EventLoop<'t> {
         if crate::sandbox::transfer::active() {
             return Dirty::NO;
         }
+        let now = Instant::now();
         let ready: Vec<_> = self
             .sessions
             .iter_mut()
@@ -3257,9 +3273,11 @@ impl<'t> EventLoop<'t> {
                 {
                     return None;
                 }
-                if let Err(error) = runtime.app.persist_background_delivery(true) {
-                    runtime.app.suppress_background_wakes();
-                    runtime.app.flash(error);
+                if !runtime.app.persist_or_retry_background_delivery(
+                    true,
+                    DELIVERY_SITE_MAILBOX,
+                    now,
+                ) {
                     return None;
                 }
                 if runtime.app.background_delivery.pending() {
@@ -3270,9 +3288,12 @@ impl<'t> EventLoop<'t> {
                 match runtime.app.claim_workflow_completions() {
                     Ok(messages) => preamble.extend(messages),
                     Err(error) => {
-                        runtime.app.suppress_background_wakes();
                         runtime.app.release_background_claims();
-                        runtime.app.flash(error);
+                        runtime.app.delivery_failed(
+                            DELIVERY_SITE_WORKFLOW_CLAIM,
+                            DeliveryFailure::Save(error),
+                            now,
+                        );
                         return None;
                     }
                 }
@@ -3284,9 +3305,12 @@ impl<'t> EventLoop<'t> {
                             preamble.extend(messages);
                         }
                         Err(error) => {
-                            runtime.app.suppress_background_wakes();
                             runtime.app.release_background_claims();
-                            runtime.app.flash(error);
+                            runtime.app.delivery_failed(
+                                DELIVERY_SITE_BACKGROUND_CLAIM,
+                                DeliveryFailure::Save(error),
+                                now,
+                            );
                             return None;
                         }
                     }
@@ -3306,8 +3330,12 @@ impl<'t> EventLoop<'t> {
                 .app
                 .start_mailbox_run(preamble, started_by);
             if actions.is_empty() {
-                self.sessions[index].app.suppress_background_wakes();
                 self.sessions[index].app.release_background_claims();
+                self.sessions[index].app.delivery_failed(
+                    DELIVERY_SITE_MAILBOX_RUN,
+                    DeliveryFailure::Save(WAKE_RUN_NOT_STARTED.into()),
+                    now,
+                );
             }
             self.dispatch(index, actions);
         }
@@ -3332,6 +3360,7 @@ impl<'t> EventLoop<'t> {
         if crate::sandbox::transfer::active() {
             return Dirty::NO;
         }
+        let now = Instant::now();
         let ready: Vec<_> = self
             .sessions
             .iter()
@@ -3340,6 +3369,7 @@ impl<'t> EventLoop<'t> {
                 (runtime.quiescent()
                     && runtime.handles.queue.is_empty()
                     && !runtime.app.automatic_wakes_suppressed
+                    && !runtime.app.background_delivery.retry_pending(now)
                     && runtime.app.sandbox_network_dispatch_blocker().is_none()
                     && runtime.app.goal_checkin_due()
                     && runtime.handles.active_background_tasks() == 0)

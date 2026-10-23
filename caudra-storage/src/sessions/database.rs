@@ -49,7 +49,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tempfile::NamedTempFile;
-use tracing::warn;
+use tracing::{field, warn};
 
 #[path = "source_code_rename.rs"]
 mod source_code_rename;
@@ -102,6 +102,12 @@ const BACKUP_PAGES_PER_STEP: c_int = 1024;
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// A write that waited for, or held, the lock this long is logged with its
+/// pid, so a shared log names who kept other processes' saves waiting.
+const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
+const SAVE_FULL_OPERATION: &str = "session full save";
+const SAVE_DELTA_OPERATION: &str = "session delta save";
+const RECREATE_OPERATION: &str = "session recreate";
 const RUNTIME_CONTENTION_BUDGET: Duration = Duration::from_secs(30);
 const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RUNTIME_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -1494,6 +1500,51 @@ struct RootRow {
     workspace_cursor_label: Option<String>,
 }
 
+/// How long a write waited for `BEGIN IMMEDIATE` and then held the lock,
+/// logged on drop when either reaches [`SLOW_WRITE_THRESHOLD`].
+pub(crate) struct WriteTiming {
+    operation: &'static str,
+    session_id: Option<CaudraId>,
+    started: Instant,
+    acquired: Option<Instant>,
+}
+
+impl WriteTiming {
+    pub(crate) fn start(operation: &'static str, session_id: Option<CaudraId>) -> Self {
+        Self {
+            operation,
+            session_id,
+            started: Instant::now(),
+            acquired: None,
+        }
+    }
+
+    pub(crate) fn acquired(&mut self) {
+        self.acquired = Some(Instant::now());
+    }
+}
+
+impl Drop for WriteTiming {
+    fn drop(&mut self) {
+        let finished = Instant::now();
+        let acquired = self.acquired.unwrap_or(finished);
+        let wait = acquired.duration_since(self.started);
+        let hold = finished.duration_since(acquired);
+        if wait.max(hold) < SLOW_WRITE_THRESHOLD {
+            return;
+        }
+        warn!(
+            operation = self.operation,
+            session_id = self.session_id.as_ref().map(field::display),
+            wait_ms = wait.as_millis(),
+            hold_ms = hold.as_millis(),
+            acquired = self.acquired.is_some(),
+            pid = std::process::id(),
+            "slow session database write"
+        );
+    }
+}
+
 pub struct RuntimeRetry<'a> {
     started: Instant,
     deadline: Instant,
@@ -1648,9 +1699,11 @@ impl SessionDatabase {
         mut write: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
     ) -> Result<T, SessionError> {
         self.connection.busy_timeout(Duration::ZERO)?;
+        let mut timing = WriteTiming::start(operation, None);
         retry.run(operation, || {
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            timing.acquired();
             let result = (|| {
                 let value = write(&transaction)?;
                 retry.check(operation)?;
@@ -2941,9 +2994,11 @@ impl SessionDatabase {
         // closes the gap between its tombstone check and deletion so a new
         // canonical generation cannot commit until old cleanup has finished.
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
+        let mut timing = WriteTiming::start(RECREATE_OPERATION, Some(session.id));
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        timing.acquired();
         match root_on(&transaction, session.id) {
             Ok(_) => return Err(SessionError::AlreadyExists { id: session.id }),
             Err(SessionError::Storage(StorageError::NotFound(_))) => {}
@@ -3738,9 +3793,11 @@ impl SessionDatabase {
             .map(|expected| self.prepare_archive(session.id, session.messages.len(), expected))
             .transpose()?
             .flatten();
+        let mut timing = WriteTiming::start(SAVE_FULL_OPERATION, Some(session.id));
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        timing.acquired();
         let previous_root_bytes = serialized.root.bytes();
         serialized
             .root
@@ -3788,6 +3845,7 @@ impl SessionDatabase {
             )?;
         }
         transaction.commit()?;
+        drop(timing);
         if let Some(mut archive) = archive {
             archive.cleanup_on_drop = false;
             if let Err(error) =
@@ -3857,9 +3915,11 @@ impl SessionDatabase {
                 .flat_map(|(_, _, values)| values)
                 .map(String::len)
                 .sum::<usize>();
+        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        timing.acquired();
         root.fence_permissions(&transaction, session.id)?;
         let logical_bytes = cursor
             .logical_bytes
@@ -3902,6 +3962,7 @@ impl SessionDatabase {
         }
         replace_auxiliary(&transaction, session)?;
         transaction.commit()?;
+        drop(timing);
         let write_version = cursor.write_version + 1;
         session
             .base_write_version

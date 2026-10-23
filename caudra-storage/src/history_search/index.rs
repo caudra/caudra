@@ -16,8 +16,8 @@ use super::extract::{call_id, classify, index_body, item_id};
 use super::{CatchUp, HistoryKind, HistoryScope, INDEX_VERSION, source};
 use crate::id::CaudraId;
 use crate::sessions::{
-    RuntimeRetry, SessionDatabase, SessionError, decompress_payload, from_i64_usize, id_from_row,
-    to_i64,
+    RuntimeRetry, SessionDatabase, SessionError, WriteTiming, decompress_payload, from_i64_usize,
+    id_from_row, to_i64,
 };
 
 const BATCH_ITEMS: usize = 256;
@@ -116,8 +116,10 @@ fn immediate<T>(
     retry: &RuntimeRetry<'_>,
     mut write: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
 ) -> Result<T, SessionError> {
+    let mut timing = WriteTiming::start(CATCH_UP_OPERATION, None);
     retry.run(CATCH_UP_OPERATION, || {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+        timing.acquired();
         let value = write(&transaction)?;
         transaction.commit()?;
         Ok(value)

@@ -198,6 +198,8 @@ pub struct StorageWriter {
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
     permission_mutations: flume::Sender<PermissionWrite>,
+    #[cfg(test)]
+    failing_save_sync: Mutex<Option<SessionError>>,
 }
 
 impl StorageWriter {
@@ -298,7 +300,19 @@ impl StorageWriter {
             thread,
             generation,
             permission_mutations,
+            #[cfg(test)]
+            failing_save_sync: Mutex::default(),
         }
+    }
+
+    /// Makes the next `save_sync` fail with `error` without touching storage,
+    /// as a locked database would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_save_sync(&self, error: SessionError) {
+        *self
+            .failing_save_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(error);
     }
 
     /// Counts stored-session changes this process has made. A view built from
@@ -461,6 +475,15 @@ impl StorageWriter {
     }
 
     pub fn save_sync(&self, session: Arc<AppSession>) -> Result<(), SessionError> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .failing_save_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Err(error);
+        }
         let id = session.id;
         let (done_tx, done_rx) = flume::bounded(1);
         self.enqueue(id, Entry::SaveSync(session, done_tx));

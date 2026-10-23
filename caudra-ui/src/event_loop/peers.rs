@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
 use crate::AppSession;
 use crate::app::App;
+use crate::app::background_delivery::DeliveryFailure;
 use crate::components::automation_inspector::REREAD_EVERY;
 use crate::components::peer_manager::{
     HISTORY_POLL, PageRequest, PeerManager, PeerView, SubscriptionChange,
@@ -371,6 +372,7 @@ fn peer_eligible(app: &App) -> bool {
 
 fn peer_blocked(app: &App) -> bool {
     app.automatic_wakes_suppressed
+        || app.background_delivery.retry_pending(Instant::now())
         || app.cancelling_run.is_some()
         || app.awaiting_input()
         || app.lifecycle_blocker().is_some()
@@ -672,7 +674,11 @@ impl EventLoop<'_> {
                 .app
                 .start_mailbox_run(Vec::new(), StartedBy::Mailbox);
             if actions.is_empty() {
-                self.sessions[index].app.suppress_background_wakes();
+                self.sessions[index].app.delivery_failed(
+                    super::DELIVERY_SITE_PEER_RUN,
+                    DeliveryFailure::Save(super::WAKE_RUN_NOT_STARTED.into()),
+                    Instant::now(),
+                );
             }
             self.dispatch(index, actions);
             dirty = Dirty::YES;

@@ -27,6 +27,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 ### Fixes
 
 - **A stray indent no longer makes a server call unconditional**: Since Preview 12, a `code` snippet with a line indented deeper than its block, such as ` datetime.datetime.now()` after `import datetime`, has that line lined up with its block and runs. When the deeper block names a server or a host function, its indent may be all that is left of a missing `if` or loop, and lining it up would run its calls every time. Such a snippet is now rejected with `Unexpected indentation`, as before Preview 12. See [Results and errors](/docs/mcp/#results-and-errors).
+- **Background work survives a brief database lock**: A brief database lock no longer stops goal or autopilot sessions from continuing after background tasks finish, and no longer cancels running subagents' shells; Caudra retries and says so in the chat if saving keeps failing.
 
 ## Caudra 0.2 Preview 12 {#v0-2-0-preview-12}
 

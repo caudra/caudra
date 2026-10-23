@@ -21,7 +21,7 @@ use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
 
 use crate::app::App;
-use crate::app::background_delivery::{DeliveryJob, DeliveryKey};
+use crate::app::background_delivery::{DeliveryFailure, DeliveryJob, DeliveryKey};
 
 use crate::components::input::{InputState, Submission};
 use crate::components::shell_modal;
@@ -570,7 +570,10 @@ impl App {
         self.workflow.release_completions();
     }
 
-    pub(crate) fn persist_background_delivery(&mut self, final_save: bool) -> Result<(), String> {
+    pub(crate) fn persist_background_delivery(
+        &mut self,
+        final_save: bool,
+    ) -> Result<(), DeliveryFailure> {
         self.poll_background_delivery()?;
         let workflow = self.workflow.delivery_snapshot();
         if self
@@ -581,6 +584,7 @@ impl App {
             && workflow.pending.is_empty()
             && self.background_claims.is_empty()
         {
+            self.delivery_recovered();
             return Ok(());
         }
         self.checkpoint_now();
@@ -603,8 +607,9 @@ impl App {
             return Ok(());
         }
         let history = crate::active_session_history(&self.state.session)
-            .map_err(|error| error.to_string())?;
-        let messages = project_messages(&history).map_err(|error| error.to_string())?;
+            .map_err(|error| DeliveryFailure::Save(error.to_string()))?;
+        let messages =
+            project_messages(&history).map_err(|error| DeliveryFailure::Save(error.to_string()))?;
         if self.background_saved_revision != Some(revision) {
             if let Err(error) = self
                 .storage_writer
@@ -613,7 +618,7 @@ impl App {
                 if final_save {
                     self.release_background_claims();
                 }
-                return Err(error.to_string());
+                return Err(DeliveryFailure::Save(error.to_string()));
             }
             self.background_saved_revision = Some(revision);
         }

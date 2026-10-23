@@ -1223,9 +1223,10 @@ fn terminal_limits_suppress_background_continuation(reason: DoneReason) {
 }
 
 mod background_runtime {
+    use std::io;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use arc_swap::ArcSwap;
     use caudra_agent::background::ShellJobMetadata;
@@ -1246,8 +1247,9 @@ mod background_runtime {
         RequestOptions, Role, StandingReminderKind, StopReason, StreamResponse, Timeouts,
         project_messages,
     };
+    use caudra_storage::StorageError;
     use caudra_storage::id::{CaudraId, SessionRef};
-    use caudra_storage::sessions::PermissionMode;
+    use caudra_storage::sessions::{PermissionMode, SessionError};
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
     };
@@ -1271,6 +1273,8 @@ mod background_runtime {
     const PARENT: &str = "Implement the change and launch the independent audit.";
     const CHILD: &str = "Audit the implementation independently.";
     const TASK: &str = "background-audit";
+    const LOCKED_SAVE: &str = "database is locked";
+    const RETRY_SITE: &str = "test";
     const SUCCEEDED: &str = "succeeded";
     const REPORT_CALL: &str = "audit-report";
     const REPORT: &str = "The audit found a missing input validation check.";
@@ -2651,6 +2655,62 @@ mod background_runtime {
             );
             fixture.app.persist_background_delivery(true).unwrap();
             assert!(!fixture.app.background_delivery.pending());
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "checkpoint")]
+    #[test_case(true; "queue_drained")]
+    fn failed_background_save_retries_without_closing_admission(final_save: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            let generation = background.generation();
+            let started = fixture.app.background_delivery.jobs_started();
+            fixture.app.background_delivery.invalidate();
+            fixture.app.background_saved_revision = None;
+            fixture
+                .app
+                .storage_writer
+                .fail_next_save_sync(SessionError::Storage(StorageError::Io(io::Error::other(
+                    LOCKED_SAVE,
+                ))));
+            let now = Instant::now();
+            assert!(
+                !fixture
+                    .app
+                    .persist_or_retry_background_delivery(final_save, RETRY_SITE, now)
+            );
+            assert!(!fixture.app.automatic_wakes_suppressed);
+            assert_eq!(background.generation(), generation);
+            assert!(background.workflow_admission().await.is_ok());
+            assert!(fixture.app.background_delivery.retry_pending(now));
+            assert!(
+                !fixture
+                    .app
+                    .persist_or_retry_background_delivery(final_save, RETRY_SITE, now)
+            );
+            assert_eq!(fixture.app.background_delivery.jobs_started(), started);
+            let retry_at = fixture.app.background_delivery.retry_at().unwrap();
+            assert!(
+                fixture
+                    .app
+                    .persist_or_retry_background_delivery(final_save, RETRY_SITE, retry_at)
+            );
+            while fixture.app.background_delivery.pending() {
+                let reply = fixture
+                    .app
+                    .background_delivery
+                    .replies
+                    .recv_async()
+                    .await
+                    .unwrap();
+                fixture.app.apply_delivery_reply(reply).unwrap();
+            }
+            assert_eq!(fixture.app.background_delivery.retry_at(), None);
+            assert_eq!(background.generation(), generation);
             fixture.close().await;
         }));
     }

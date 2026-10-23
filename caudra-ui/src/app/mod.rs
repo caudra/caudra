@@ -4773,7 +4773,7 @@ impl App {
 
     pub(crate) fn handle_cancel(&mut self) -> Vec<Action> {
         if let Err(error) = self.poll_background_delivery() {
-            self.flash(error);
+            self.flash(error.to_string());
         }
         if self.background_delivery.fence.admission_error().is_some() {
             self.stop_background_work();
