@@ -600,7 +600,8 @@ impl SteeringQueue {
     }
 
     pub fn finish_edit(&self, id: QueueItemId, text: String) -> bool {
-        self.queue.finish_edit(id, |(_, input)| input.message = text)
+        self.queue
+            .finish_edit(id, |(_, input)| input.message = text)
     }
 
     pub fn cancel_edit(&self, id: QueueItemId) -> bool {
@@ -612,7 +613,8 @@ impl SteeringQueue {
     }
 
     pub fn move_down(&self, id: QueueItemId) -> bool {
-        self.queue.move_down_by(id, |(admission, _)| Some(*admission))
+        self.queue
+            .move_down_by(id, |(admission, _)| Some(*admission))
     }
 
     pub fn drain(&self) -> Vec<(QueueItemId, AgentInput)> {
@@ -980,9 +982,10 @@ mod tests {
         match receiver.poll() {
             None => Vec::new(),
             Some(ExtractedCommand::Interrupt(input, _, _)) => vec![input.message],
-            Some(ExtractedCommand::InterruptBatch(inputs)) => {
-                inputs.into_iter().map(|queued| queued.input.message).collect()
-            }
+            Some(ExtractedCommand::InterruptBatch(inputs)) => inputs
+                .into_iter()
+                .map(|queued| queued.input.message)
+                .collect(),
             Some(ExtractedCommand::Compact(_)) => panic!("steering never compacts"),
         }
     }
@@ -999,7 +1002,10 @@ mod tests {
 
         assert_eq!(second.superseded, Some(first.id));
         let (id, replacement) = receiver.take_replacement().expect("replacement missing");
-        assert_eq!((id, replacement.message.as_str()), (second.id, SECOND_REPLACEMENT));
+        assert_eq!(
+            (id, replacement.message.as_str()),
+            (second.id, SECOND_REPLACEMENT)
+        );
         assert!(receiver.take_replacement().is_none());
     }
 

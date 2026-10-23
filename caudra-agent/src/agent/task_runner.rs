@@ -956,7 +956,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{AgentEvent, AgentInput, SubagentEnd, ThinkingConfig};
     use crate::agent::history::is_run_failure_marker;
     use crate::cancel::CancelTrigger;
     use crate::permissions::PermissionMode;
@@ -967,6 +966,7 @@ mod tests {
     };
     use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
     use crate::workflow::{RuntimeDeps, WorkflowRuntime, WorkspaceRebind};
+    use crate::{AgentEvent, AgentInput, SubagentEnd, ThinkingConfig};
     use caudra_storage::{StateDir, id::CaudraId};
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,

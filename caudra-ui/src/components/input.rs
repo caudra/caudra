@@ -80,7 +80,11 @@ const REPLACE_OPTION: AdmissionOption = (
 /// The main chat while a run is busy.
 pub(crate) const MAIN_ADMISSIONS: [AdmissionOption; 3] = [
     ("Enter", "next", PromptAdmission::Queue),
-    (leader::STEER_PROMPT.label, GUIDE_WORD, PromptAdmission::Steer),
+    (
+        leader::STEER_PROMPT.label,
+        GUIDE_WORD,
+        PromptAdmission::Steer,
+    ),
     REPLACE_OPTION,
 ];
 /// A running task's chat, which has no next run to wait for.
