@@ -5948,6 +5948,49 @@ fn a_click_on_a_cards_chips_toggles_its_details() {
     );
 }
 
+/// A call inside a batch keeps its decision to the chip on its own row,
+/// whether or not the call is open, and a click on that chip opens it under
+/// the row and puts it away again.
+#[test]
+fn a_click_on_a_batched_calls_chips_toggles_its_details() {
+    let mut panel = panel_with_batch();
+    assert!(panel.attach_decision(CardDecision::settled(
+        DecisionSubject::Call(format!("{DECISION_WAIT_CALL}:1")),
+        DecisionFeature::MemorySearch,
+        NoteOutcome::Acted,
+        DECISION_SUMMARY,
+        &[DECISION_DETAIL.into()],
+    )));
+    panel.toggle_batch_child(DECISION_WAIT_CALL, 1);
+    let render_text = |panel: &mut MessagesPanel| {
+        buffer_text(&render(panel, DECISIONS_AREA.width, DECISIONS_AREA.height))
+    };
+
+    let seen = render_text(&mut panel);
+    assert!(!seen.contains(DECISION_DETAIL), "{DECISION_FOLDED}: {seen}");
+    let (column, row) = cell_of(&seen, DECISION_PREFIX);
+
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    let opened = render_text(&mut panel);
+    assert_eq!(
+        screen_row_of(&opened, DECISION_SUMMARY),
+        Some(usize::from(row) + 1),
+        "{DECISION_OPENED}: {opened}"
+    );
+    assert!(
+        opened.contains(DECISION_DETAIL),
+        "{DECISION_OPENED}: {opened}"
+    );
+
+    let (column, row) = cell_of(&opened, DECISION_PREFIX);
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    let folded = render_text(&mut panel);
+    assert!(
+        !folded.contains(DECISION_DETAIL),
+        "{DECISION_FOLDED}: {folded}"
+    );
+}
+
 #[test]
 fn a_timed_decision_row_draws_how_long_it_took_but_does_not_search_it() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

@@ -1079,6 +1079,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
     let mut rows = Vec::new();
     let mut links = LinkMap::default();
     let mut spans_out = Vec::new();
+    let mut chips = Vec::new();
     let mut trace = SourceTrace::default();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
@@ -1107,15 +1108,17 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 limits.views.tree_folds(index),
             )
         });
-        let decided: Vec<Line<'static>> = match (&body, limits.decisions.get(&index)) {
-            (Some(_), Some(decisions)) => card_decisions::section(decisions)
-                .into_iter()
-                .flat_map(|(lines, _)| lines)
-                .collect(),
+        let decided: Vec<Line<'static>> = match limits.decisions.get(&index) {
+            Some(decisions) if limits.views.decisions_open(index) => {
+                card_decisions::section(decisions)
+                    .into_iter()
+                    .flat_map(|(lines, _)| lines)
+                    .collect()
+            }
             _ => Vec::new(),
         };
-        let has_body =
-            !decided.is_empty() || body.as_ref().is_some_and(|body| !body.lines.is_empty());
+        let has_output = body.as_ref().is_some_and(|body| !body.lines.is_empty());
+        let has_body = has_output || !decided.is_empty();
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
@@ -1151,7 +1154,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
-        let summary = match has_body
+        let summary = match has_output
             && (body_repeats_summary(entry) || matches!(entry.output, Some(ToolOutput::Tasks(_))))
         {
             true => "",
@@ -1204,9 +1207,16 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             .as_deref(),
             workdir,
         ));
-        if let Some(decisions) = limits.decisions.get(&index) {
-            spans.extend(card_decisions::chip_spans(decisions).spans);
-        }
+        let chip_spans = limits.decisions.get(&index).map(|decisions| {
+            let drawn = card_decisions::chip_spans(decisions).spans;
+            let gap = drawn
+                .iter()
+                .take_while(|span| span.content.trim().is_empty())
+                .count();
+            let start = spans.len() + gap;
+            spans.extend(drawn);
+            start..spans.len()
+        });
         if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
             let clock = match entry.status {
                 BatchToolStatus::Running => format_live_duration(elapsed),
@@ -1217,13 +1227,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 t.tool_dim,
             ));
         }
-        if body.is_none()
-            && (holds_a_body(entry)
-                || limits
-                    .decisions
-                    .get(&index)
-                    .is_some_and(|decisions| card_decisions::any_settled(decisions)))
-        {
+        if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         // A child is a section of the card, not another run of its output, so
@@ -1232,12 +1236,19 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // A title too long for the card hangs under its own label, so the
         // connector and the sigil are said once and the tree stays legible.
         let broken = wrap_styled(spans, 2, &body_indent, limits.width);
+        if let Some((row, columns)) = chip_spans.and_then(|spans| origin_columns(&broken, &spans)) {
+            chips.push(ChildChips {
+                line: lines.len() + row,
+                columns,
+                child: index,
+            });
+        }
         let heading = child_heading(index, entry);
         trace.record(lines.len(), heading_rows(&broken, heading));
         rows.resize(rows.len() + broken.len(), target);
         lines.extend(wrapped_lines(broken));
-        // What the engine decided about the child leads its opened body, as
-        // it leads a card's.
+        // What the engine decided about the child sits under its row once its
+        // chips are opened, as it sits under a card's header.
         rows.resize(rows.len() + decided.len(), target);
         lines.extend(indent_all(decided, &body_indent));
         // A child's own output is content and clears the trunk; what the child
@@ -1316,7 +1327,28 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         lines,
         rows,
         spans: spans_out,
+        chips,
     }
+}
+
+/// The last broken row the spans at `origins` reach, where a narrow row
+/// leaves their words, and the columns they take on it.
+fn origin_columns(
+    broken: &[Vec<SpanPiece>],
+    origins: &Range<usize>,
+) -> Option<(usize, Range<u16>)> {
+    let held = |piece: &SpanPiece| piece.origin.is_some_and(|origin| origins.contains(&origin));
+    let (row, pieces) = broken
+        .iter()
+        .enumerate()
+        .rfind(|(_, pieces)| pieces.iter().any(held))?;
+    let width = |count: usize| -> u16 {
+        let columns: usize = pieces[..count].iter().map(|piece| piece.span.width()).sum();
+        u16::try_from(columns).unwrap_or(u16::MAX)
+    };
+    let first = pieces.iter().position(held)?;
+    let end = pieces.iter().rposition(held)? + 1;
+    Some((row, width(first)..width(end)))
 }
 
 /// A `code` run under its snippet: its calls as batch rows, each opening to the call's own card,
@@ -1484,6 +1516,17 @@ struct BatchCard {
     rows: Vec<Option<RowTarget>>,
     spans: Vec<ScrollSpan>,
     source: Option<BodySource>,
+    chips: Vec<ChildChips>,
+}
+
+/// Where a batch child's decision chips landed: the line holding them, the
+/// columns they take on it, and the child whose decisions a click on them
+/// opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildChips {
+    pub line: usize,
+    pub columns: Range<u16>,
+    pub child: usize,
 }
 
 /// Whether opening this child would show anything, which is what the folded
@@ -3160,6 +3203,8 @@ pub struct BatchViews {
     raw: Arc<[usize]>,
     /// The tree nodes a click moved from where they rest, as (child, tree, node).
     nodes: Arc<[(usize, usize, usize)]>,
+    /// The children whose decisions a click on their chips opened.
+    decided: Arc<[usize]>,
 }
 
 /// The nodes a click moved from where they rest in each of one child's trees, as (tree, node).
@@ -3234,6 +3279,17 @@ impl BatchViews {
     pub fn raw_toggled(&self, index: usize) -> Self {
         Self {
             raw: toggled_index(&self.raw, index),
+            ..self.clone()
+        }
+    }
+
+    fn decisions_open(&self, index: usize) -> bool {
+        self.decided.contains(&index)
+    }
+
+    pub fn decisions_toggled(&self, index: usize) -> Self {
+        Self {
+            decided: toggled_index(&self.decided, index),
             ..self.clone()
         }
     }
@@ -3884,6 +3940,7 @@ pub struct ToolContent {
     /// by the same pass that built `lines`, because the highlighted render
     /// changes the span count of every code row.
     pub source: Option<BodySource>,
+    pub chips: Vec<ChildChips>,
 }
 
 /// Where one window sits in a body, and how far into that body it sits, so a
@@ -3977,6 +4034,7 @@ pub fn render_tool_content(
     let mut trace = SourceTrace::default();
     let mut output_source: Option<BodySource> = None;
     let mut output_links = LinkMap::default();
+    let mut output_chips = Vec::new();
     let drawn_script = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
             (language, code)
@@ -4135,6 +4193,7 @@ pub fn render_tool_content(
             output_spans = card.spans;
             output_source = card.source;
             output_links = card.links;
+            output_chips = card.chips;
             (card.lines, false)
         }
         Some(ToolOutput::Code(output)) => {
@@ -4144,6 +4203,7 @@ pub fn render_tool_content(
             output_spans = card.spans;
             output_source = card.source;
             output_links = card.links;
+            output_chips = card.chips;
             (card.lines, truncated)
         }
         Some(ToolOutput::Mcp(output)) => {
@@ -4214,6 +4274,13 @@ pub fn render_tool_content(
         .into_iter()
         .map(|span| span.shifted(body_start, span.child))
         .collect();
+    let chips = output_chips
+        .into_iter()
+        .map(|chips| ChildChips {
+            line: chips.line + body_start,
+            ..chips
+        })
+        .collect();
     wrapped_content(
         ToolContent {
             highlights,
@@ -4223,6 +4290,7 @@ pub fn render_tool_content(
             truncation,
             scroll_spans,
             source,
+            chips,
         },
         limits.width,
     )
@@ -4282,6 +4350,7 @@ pub(crate) fn render_mcp_content(
             truncation: card.truncated,
             scroll_spans: Vec::new(),
             source,
+            chips: Vec::new(),
         },
         limits.width,
     );
@@ -4340,6 +4409,14 @@ fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
             .map(|span| wrapped.scroll_span(span))
             .collect(),
         source: content.source.map(|source| wrapped.body(source)),
+        chips: content
+            .chips
+            .into_iter()
+            .map(|chips| ChildChips {
+                line: wrapped.row_of(chips.line),
+                ..chips
+            })
+            .collect(),
     }
 }
 
@@ -4781,6 +4858,7 @@ mod tests {
                 history_start,
             }]),
             source: None,
+            chips: Vec::new(),
         };
 
         let wrapped = wrapped_content(content, CODE_CARD_WIDTH);

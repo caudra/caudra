@@ -4,7 +4,7 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::{BodySource, CodeBlock, RowTarget, ScrollSpan};
+use super::super::code_view::{BodySource, ChildChips, CodeBlock, RowTarget, ScrollSpan};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use crate::provenance::LineProvenance;
@@ -37,6 +37,13 @@ pub fn instruction_parent(id: &str) -> Option<&str> {
 pub(super) struct ChipsHit {
     pub line: usize,
     pub columns: Range<u16>,
+}
+
+/// Whose decisions the chips under a click belong to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChipsOwner {
+    Row,
+    Child(usize),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -153,6 +160,7 @@ pub(super) struct Segment {
     pub scroll_footer_line: Option<usize>,
     /// A text row's decision chips, the control that opens their details.
     pub decision_chips: Option<ChipsHit>,
+    child_chips: Vec<ChildChips>,
     pub scroll_spans: Vec<ScrollSpan>,
     /// What each line belongs to, parallel to `lines`. Spliced alongside them
     /// so a highlighted card keeps the rows a click names.
@@ -328,16 +336,23 @@ impl Segment {
         self.links.target_at(&self.lines, content_width, row, col)
     }
 
-    /// Whether the cell at (`rel_row`, `rel_col`) is on the row's decision
-    /// chips.
-    pub fn on_decision_chips(&self, rel_row: u16, rel_col: u16, width: u16) -> bool {
-        let Some(chips) = &self.decision_chips else {
-            return false;
-        };
-        rel_col
-            .checked_sub(self.chrome(width).left)
-            .is_some_and(|column| chips.columns.contains(&column))
-            && self.source_line_at(rel_row, width) == Some(chips.line)
+    /// Whose decision chips the cell at (`rel_row`, `rel_col`) is on: the
+    /// row's own, or a batch child's.
+    pub fn decision_chips_at(&self, rel_row: u16, rel_col: u16, width: u16) -> Option<ChipsOwner> {
+        let column = rel_col.checked_sub(self.chrome(width).left)?;
+        let line = self.source_line_at(rel_row, width)?;
+        let on = |at: usize, columns: &Range<u16>| at == line && columns.contains(&column);
+        if self
+            .decision_chips
+            .as_ref()
+            .is_some_and(|chips| on(chips.line, &chips.columns))
+        {
+            return Some(ChipsOwner::Row);
+        }
+        self.child_chips
+            .iter()
+            .find(|chips| on(chips.line, &chips.columns))
+            .map(|chips| ChipsOwner::Child(chips.child))
     }
 
     /// The markdown behind the cell at (`rel_row`, `rel_col`), with the byte it
@@ -533,6 +548,7 @@ impl Segment {
         self.decision_chips = tl
             .decision_chips
             .map(|(line, columns)| ChipsHit { line, columns });
+        self.child_chips = tl.child_chips;
         self.set_lines(tl.lines);
         self.set_links(tl.links);
         self.set_images(tl.images);
@@ -1206,6 +1222,7 @@ mod tests {
             source: None,
             images: Vec::new(),
             decision_chips: None,
+            child_chips: Vec::new(),
         }
     }
 

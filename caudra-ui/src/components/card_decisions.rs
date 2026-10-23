@@ -441,11 +441,6 @@ pub fn children(decisions: &[CardDecision], root: &str) -> ChildDecisions {
     Arc::new(children)
 }
 
-/// Whether opening the card would show a decision.
-pub fn any_settled(decisions: &[CardDecision]) -> bool {
-    decisions.iter().any(|decision| !decision.is_pending())
-}
-
 /// Every answered decision on the card as an open row draws it, with the text
 /// each one copies and searches as.
 pub fn section<'a>(
@@ -714,8 +709,8 @@ mod tests {
 
     use super::{
         ALL_QUIET, CardDecision, DecisionState, DecisionSubject, MANY_DECISIONS, ONE_DECISION,
-        Tone, about, any_settled, children, chip_spans, details, keeps_quiet, quiet, record,
-        row_chips, section, settle, settle_all, skipped,
+        Tone, about, children, chip_spans, details, keeps_quiet, quiet, record, row_chips, section,
+        settle, settle_all, skipped,
     };
     use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
     use crate::components::DECISION_SEPARATOR;
@@ -1001,7 +996,6 @@ mod tests {
     #[test]
     fn only_an_answered_decision_has_a_section() {
         let waiting = [pending(call(CALL), DecisionFeature::SourceCodeContext)];
-        assert!(!any_settled(&waiting));
         assert!(section(&waiting).is_empty());
 
         let decided = [settled(
@@ -1010,7 +1004,6 @@ mod tests {
             NoteOutcome::Acted,
         )];
         let [(lines, text)] = section(&decided).try_into().unwrap();
-        assert!(any_settled(&decided));
         assert_eq!(lines.len(), 2);
         assert!(text.ends_with(&format!("{SUMMARY}\n{DETAIL}")));
     }

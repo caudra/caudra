@@ -7,7 +7,7 @@ mod selection;
 mod tests;
 mod thinking;
 use self::render::{EXPAND_AFFORDANCE, HoverFeedback, Placement, RenderCursor, RenderFeedback};
-use self::segment::{ChipsHit, Segment, SegmentCache, wrapped_line_count};
+use self::segment::{ChipsHit, ChipsOwner, Segment, SegmentCache, wrapped_line_count};
 use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
@@ -1963,14 +1963,21 @@ impl MessagesPanel {
         let Ok(rel_row) = u16::try_from(doc_row - start) else {
             return false;
         };
-        if !segment.on_decision_chips(rel_row, column - area.x, width) {
+        let Some(owner) = segment.decision_chips_at(rel_row, column - area.x, width) else {
             return false;
-        }
+        };
         if let Some(tool_id) = segment.tool_id.clone() {
-            if !self.card_decisions_open.remove(&tool_id) {
-                self.card_decisions_open.insert(tool_id.clone());
+            match owner {
+                ChipsOwner::Child(index) => {
+                    self.change_batch_views(&tool_id, |views| views.decisions_toggled(index));
+                }
+                ChipsOwner::Row => {
+                    if !self.card_decisions_open.remove(&tool_id) {
+                        self.card_decisions_open.insert(tool_id.clone());
+                    }
+                    self.mark_card_dirty(&tool_id);
+                }
             }
-            self.mark_card_dirty(&tool_id);
             return true;
         }
         let Some(msg_index) = segment.msg_index else {

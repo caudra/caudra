@@ -12,9 +12,9 @@ use caudra_config::{ClockFormat, ToolOutputLines};
 use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
-    CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, STANDALONE_CHILD,
-    ScrollSpan, ScrollWindow, SourceTrace, SubagentModels, ToolContent, UNCONSTRAINED_WIDTH,
-    WrappedRows,
+    CardPolicy, ChildChips, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget,
+    STANDALONE_CHILD, ScrollSpan, ScrollWindow, SourceTrace, SubagentModels, ToolContent,
+    UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -1557,6 +1557,9 @@ pub struct ToolLines {
     /// The row the header's decision chips landed on and the columns they
     /// span, for a click to open their details.
     pub decision_chips: Option<(usize, Range<u16>)>,
+    /// Where each batch child's chips landed, for a click to open that
+    /// child's decisions under its row.
+    pub child_chips: Vec<ChildChips>,
 }
 
 #[derive(Clone)]
@@ -2050,6 +2053,7 @@ struct ToolLineBuilder {
     images: Vec<ImageSpan>,
     /// The spans of row 0 the decision chips took, empty without any.
     chip_spans: Range<usize>,
+    child_chips: Vec<ChildChips>,
 }
 
 impl ToolLineBuilder {
@@ -2079,6 +2083,7 @@ impl ToolLineBuilder {
             indicator,
             head: 0,
             chip_spans: 0..0,
+            child_chips: Vec::new(),
         }
     }
 
@@ -2349,6 +2354,8 @@ impl ToolLineBuilder {
         };
         self.link_rows.retain_mut(|(line, _)| keep_row(line));
         self.spinner_lines.retain_mut(|(line, _)| keep_row(line));
+        self.child_chips
+            .retain_mut(|chips| keep_row(&mut chips.line));
         self.raw_toggle_line = self
             .raw_toggle_line
             .filter(|line| (start..end).contains(line));
@@ -2454,6 +2461,13 @@ impl ToolLineBuilder {
         self.content_range = (start, self.lines.len());
         self.rows.resize(start, None);
         self.rows.extend(content.rows);
+        let indent = u16::try_from(self.body_indent.width()).unwrap_or(u16::MAX);
+        self.child_chips
+            .extend(content.chips.into_iter().map(|chips| ChildChips {
+                line: chips.line + start,
+                columns: chips.columns.start + indent..chips.columns.end + indent,
+                child: chips.child,
+            }));
         self.scroll_spans.extend(
             content
                 .scroll_spans
@@ -2837,6 +2851,14 @@ impl ToolLineBuilder {
                 })
                 .collect(),
             decision_chips: chip_columns(&wrapped, &lines, self.chip_spans),
+            child_chips: self
+                .child_chips
+                .into_iter()
+                .map(|chips| ChildChips {
+                    line: wrapped.row_of(chips.line),
+                    ..chips
+                })
+                .collect(),
             lines,
         }
     }
@@ -3725,6 +3747,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock], scale: TokenScale) -> 
         source: None,
         images: Vec::new(),
         decision_chips: None,
+        child_chips: Vec::new(),
     }
 }
 
@@ -9777,8 +9800,9 @@ mod tests {
 
     const BATCH_DECISION_SUMMARY: &str = "screened the whole batch";
     const SEARCHED_NOTES: &str = "batching notes";
+    const RANKED_CHIP: &str = "ranked";
 
-    fn decided_batch(views: BatchViews) -> String {
+    fn decided_batch(views: BatchViews, width: u16) -> ToolLines {
         let mut msg = bash_msg("batch", ToolStatus::Success, None, None);
         if let DisplayRole::Tool(tool) = &mut msg.role {
             tool.name = BATCH_TOOL_NAME.into();
@@ -9813,22 +9837,23 @@ mod tests {
         let rctx = RenderCtx {
             batch_views: &views,
             decisions_open: true,
-            ..test_rctx(UNBROKEN)
+            ..test_rctx(width)
         };
-        lines_text(&build_tool_lines(
+        build_tool_lines(
             &msg,
             ToolStatus::Success,
             &rctx,
             Some(Disclosure::default()),
-        ))
+        )
     }
 
-    /// A batch rests open on its tree, so a child's decision is drawn only
-    /// once that child is opened, and then under the child's own row.
+    /// A child keeps its decision to its chip, opened or not, until a click
+    /// on that chip draws it under the child's own row.
     #[test_case(BatchViews::default(), false ; "a_folded_child_keeps_its_decision_to_its_chip")]
-    #[test_case(BatchViews::new([1]), true ; "an_opened_child_shows_its_decision_under_its_row")]
-    fn a_childs_decision_opens_with_the_child(views: BatchViews, opened: bool) {
-        let text = decided_batch(views);
+    #[test_case(BatchViews::new([1]), false ; "an_opened_child_keeps_its_decision_to_its_chip")]
+    #[test_case(BatchViews::default().decisions_toggled(1), true ; "a_child_with_its_chips_opened_shows_its_decision_under_its_row")]
+    fn a_childs_decision_opens_with_its_chips(views: BatchViews, opened: bool) {
+        let text = lines_text(&decided_batch(views, UNBROKEN));
         let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{text}"));
         assert!(
             position(BATCH_DECISION_SUMMARY) < position(SOURCE_PATH),
@@ -9841,6 +9866,24 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test_case(UNBROKEN ; "a_wide_batch")]
+    #[test_case(NARROW_CARD ; "a_batch_too_narrow_for_its_rows")]
+    fn a_childs_chips_are_its_own_click_target(width: u16) {
+        let tl = decided_batch(BatchViews::default(), width);
+        let [chips] = tl.child_chips.as_slice() else {
+            panic!("one child has a decision: {:?}", tl.child_chips);
+        };
+        assert_eq!(chips.child, 1);
+        let under: String = tl.lines[chips.line]
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(usize::from(chips.columns.start))
+            .take(chips.columns.len())
+            .collect();
+        assert!(under.contains(RANKED_CHIP), "{under}");
     }
 
     #[test_case(None ; "folded")]
