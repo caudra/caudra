@@ -60,6 +60,7 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+pub(crate) const INTERRUPTED_TEXT: &str = "Interrupted";
 /// The seam a summary replaced turns at. Progress belongs to the status bar's
 /// spinner, so the transcript card marks the border instead of announcing work.
 const COMPACTION_BORDER_TEXT: &str =

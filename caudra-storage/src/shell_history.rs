@@ -253,13 +253,14 @@ impl SessionDatabase {
             .transpose()
     }
 
-    /// Settles every record a previous runtime left unfinished. Their outcome is
-    /// unknown, so they become interrupted and nothing is retried.
+    /// Settles every record a previous runtime left unfinished and answers with
+    /// them as they now stand. Their outcome is unknown, so they become
+    /// interrupted and nothing is retried.
     pub fn interrupt_shell_executions(
         &self,
         session: CaudraId,
         reason: &str,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<Vec<ShellExecutionRecord>, SessionError> {
         self.interrupt_shell_executions_inner(session, reason, None)
     }
 
@@ -268,7 +269,7 @@ impl SessionDatabase {
         session: CaudraId,
         reason: &str,
         retry: &RuntimeRetry<'_>,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<Vec<ShellExecutionRecord>, SessionError> {
         self.interrupt_shell_executions_inner(session, reason, Some(retry))
     }
 
@@ -277,7 +278,7 @@ impl SessionDatabase {
         session: CaudraId,
         reason: &str,
         retry: Option<&RuntimeRetry<'_>>,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<Vec<ShellExecutionRecord>, SessionError> {
         let write = |transaction: &Transaction<'_>| {
             let unfinished = {
                 let mut statement = transaction.prepare(
@@ -289,7 +290,7 @@ impl SessionDatabase {
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
-            let mut interrupted = 0;
+            let mut interrupted = Vec::new();
             for (summary, output_bytes) in unfinished {
                 let mut record: ShellExecutionRecord = match serde_json::from_str(&summary) {
                     Ok(record) => record,
@@ -302,7 +303,7 @@ impl SessionDatabase {
                 record.reason.get_or_insert_with(|| reason.to_owned());
                 let summary = serde_json::to_string(&record).map_err(StorageError::from)?;
                 Self::validate_len(SUMMARY_KIND, summary.len(), MAX_SHELL_SUMMARY_BYTES)?;
-                interrupted += transaction.execute(
+                let updated = transaction.execute(
                     "UPDATE shell_executions SET active = 0, summary = ?3, bytes = ?4 \
                  WHERE session_id = ?1 AND execution_id = ?2",
                     params![
@@ -312,6 +313,9 @@ impl SessionDatabase {
                         to_i64(summary.len(), BYTES_FIELD)? + output_bytes
                     ],
                 )?;
+                if updated > 0 {
+                    interrupted.push(record);
+                }
             }
             Ok(interrupted)
         };
@@ -549,14 +553,15 @@ mod tests {
         assert_eq!(
             database
                 .interrupt_shell_executions(session, REASON)
-                .unwrap(),
+                .unwrap()
+                .len(),
             1
         );
-        assert_eq!(
+        assert!(
             database
                 .interrupt_shell_executions(session, REASON)
-                .unwrap(),
-            0
+                .unwrap()
+                .is_empty()
         );
         let records = database.shell_executions(session, None, 10).unwrap();
         assert_eq!(records[0].state, ShellExecutionState::Succeeded);
@@ -656,7 +661,11 @@ mod tests {
                     &RuntimeRetry::new(None, &cancelled)
                 )
                 .unwrap(),
-            usize::from(unfinished)
+            if unfinished {
+                vec![expected.clone()]
+            } else {
+                Vec::new()
+            }
         );
         assert!(writer.borrow().is_none());
         assert_eq!(

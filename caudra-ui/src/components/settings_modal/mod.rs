@@ -1793,6 +1793,9 @@ mod tests {
     /// Room for every tab's name in the strip.
     const WIDE_WIDTH: u16 = 160;
     const CACHE_WARMING: &str = "cache_warming";
+    const RESUME_INTERRUPTED: &str = "resume_interrupted";
+    const RESUME_CHOICES: &[&str] = &["auto", "ask", "off"];
+    const ASK: &str = "ask";
     const DISABLED_TOOLS: &str = "disabled_tools";
     const SHOW_DECISIONS: &str = "show_decisions";
     const UPDATE_CHECK: &str = "update_check";
@@ -2271,6 +2274,26 @@ mod tests {
             value.as_ref().and_then(Value::as_str),
             Some(next_choice(agent_field(CACHE_WARMING), None))
         );
+    }
+
+    #[test]
+    fn resume_interrupted_is_a_choice_on_the_agent_tab() {
+        let mut fixture = opened("", true);
+        let index = select_key(
+            &mut fixture.modal,
+            SettingsTab::Agent,
+            AGENT_TABLE,
+            RESUME_INTERRUPTED,
+        );
+        screen(&mut fixture.modal);
+        let chips: Vec<&str> = fixture.modal.row_chips[index]
+            .iter()
+            .map(|(_, choice)| *choice)
+            .collect();
+        assert_eq!(chips, RESUME_CHOICES);
+        let (table, key, value) = key_edit(press(&mut fixture.modal, KeyCode::Char(TOGGLE_KEY)));
+        assert_eq!((table, key), (AGENT_TABLE, RESUME_INTERRUPTED));
+        assert_eq!(value.as_ref().and_then(Value::as_str), Some(ASK));
     }
 
     #[test]

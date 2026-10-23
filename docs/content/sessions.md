@@ -130,7 +130,38 @@ Subagents and workflow agents can own asynchronous shell jobs, even when their p
 
 Stopping all session tasks and workflows cancels owned work and suppresses automatic continuation, including late reports and completion notices. A new user turn re-enables continuation. See [Stop and replace](/docs/queue/#stop-and-replace) for TUI controls.
 
-Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children and shell commands before saving and releasing it. Background work is session-owned, not a daemon or a promise to keep executing after exit. Crash recovery marks unfinished work interrupted without replaying commands or other effects.
+Switching TUI tabs leaves the owning session open. Quitting Caudra stops a session's turn, children, and shell commands, marks them interrupted, and then saves and releases the session. Background work is session-owned, not a daemon or a promise to keep executing after exit. See [Resuming after a restart](#resuming-after-a-restart) for what happens when the session opens again.
+
+## Resuming after a restart
+
+When Caudra stops while a session is working, the next open picks the work back up. A crash, a kill, and quitting mid-turn all count. Reopen the session with `caudra -c`, `caudra --session <id>`, or the session picker.
+
+What resumes:
+
+- The main turn, when one was running. It continues from its saved transcript.
+- Every agent task the main chat started, foreground or background. Each task keeps its task ID and continues from the transcript it saved while it ran, at most one second old. A task that ran in the foreground resumes in the background, and its result arrives as a report.
+
+Shell commands, questions, and workflow runs are not run again. A command that was running when Caudra stopped gets a result that names the command and its directory and says its outcome is unknown. Processes it detached may still be running.
+
+Each resumed agent first reads a reminder titled "Resumed after interruption". It lists what was cut off and asks the agent to check what the interrupted work changed, such as files, git status, and detached processes, before it carries on. A task's reminder lists its own interrupted jobs, which the task continues itself. When the main chat had already ended its turn and was waiting on tasks, it reads the reminder with the first report a resumed task sends.
+
+The transcript shows a "Resumed after interruption" row naming what resumed, for example `main turn, 2 tasks`. Press `Esc` to stop it like any other turn.
+
+`[agent] resume_interrupted` in `caudra.toml` sets the behavior:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` (default) | Resume at once. |
+| `ask` | Show what was interrupted. `/continue` resumes it, and a new prompt leaves it. |
+| `off` | Show what was interrupted. The main chat reads the reminder with its next turn. |
+
+`auto` asks instead in three cases:
+
+- A resume of the same work already crashed once. This stops a crash loop.
+- The work stopped more than `resume_max_age_hours` ago (default `24`).
+- Automatic wakes are suppressed in the session.
+
+ACP clients get the same task resume when they load a session. The main turn waits for the next prompt, which carries the reminder. The `session/load` response lists what was cut off in `_meta.caudra.interrupted`: `main` (a turn was running), `tasks` (their task IDs), and `resumed`. Headless `caudra -p -c` shows the reminder to the model with the prompt and resumes nothing.
 
 ## Moving sessions to another directory
 

@@ -699,8 +699,12 @@ impl JobScope {
         };
         let mut outcome = json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "is_error": done.is_error, TASK_DURATION_FIELD: done.accounting.duration_ms, "outcome": done.accounting.outcome});
         outcome[output_field] = json!(done.output);
+        let interrupting = self.tasks.interrupting() && cancel.is_cancelled();
+        if interrupting {
+            super::mark_shutdown_interrupted(&mut record, &mut outcome);
+        }
         record.outcome = Some(outcome);
-        let suppressed = self.current().is_err();
+        let suppressed = interrupting || self.current().is_err();
         record.events.push(TaskEvent {
             sequence: self.tasks.next_sequence(),
             event_id: CaudraId::generate().to_string(),

@@ -55,7 +55,7 @@ use crate::tools::{
 };
 use crate::types::WorkflowProvenance;
 use crate::workflow::WorkspaceRebind;
-use crate::{AgentConfig, AgentMode, EventSender};
+use crate::{AgentConfig, AgentMode, EventSender, SharedHistory};
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Report your final result. Call it exactly once when your task is complete.";
@@ -311,6 +311,10 @@ impl PreparedTask {
 
     pub(crate) fn checkpoint(&self) -> Result<(Value, Value), String> {
         self.session.0.checkpoint()
+    }
+
+    pub(crate) fn mirror_history(&mut self) -> SharedHistory {
+        self.session.0.mirror_history()
     }
 
     pub(crate) fn discard(mut self) {

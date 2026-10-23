@@ -430,6 +430,19 @@ version = 4
 # Type: string.
 # cache_warming = "off"
 
+# What reopening a session does with work Caudra stopping cut off (a crash, a
+# kill, or quitting mid-turn): `auto` resumes the main turn and its tasks at
+# once, `ask` offers to, `off` only says what was interrupted. `auto` asks
+# instead when a resume already crashed once, when the work is older than
+# `resume_max_age_hours`, or when automatic wakes are suppressed.
+# Type: string.
+# resume_interrupted = "auto"
+
+# Hours after which `resume_interrupted = "auto"` asks before resuming
+# interrupted work instead of resuming it.
+# Type: u64, at least 1.
+# resume_max_age_hours = 24
+
 # Learn from your conversations in the background: after enough new prompts,
 # the Learn model reads them and keeps durable conventions, setup facts and
 # preferences in the instruction files and memory notes. A project config can

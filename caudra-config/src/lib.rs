@@ -154,6 +154,8 @@ pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percen
 pub const DEFAULT_BACKGROUND_REMINDER_TURNS: u32 = 0;
 pub const DEFAULT_WORK_NUDGE_COMPACTIONS: u32 = 2;
 pub const DEFAULT_SHELL_ASYNC_THRESHOLD_SECS: u64 = 120;
+pub const DEFAULT_RESUME_MAX_AGE_HOURS: u64 = 24;
+const MIN_RESUME_MAX_AGE_HOURS: u64 = 1;
 pub const MIN_SHELL_ASYNC_THRESHOLD_SECS: u64 = 1;
 const TASK_ASYNC_UNSUPPORTED: &str = "task_execution = async requires a frontend with task delivery support; use a supported session or change agent.task_execution";
 const SHELL_ASYNC_UNSUPPORTED: &str = "shell_execution = async requires a frontend with shell delivery support; use a supported session or change agent.shell_execution";
@@ -1400,6 +1402,19 @@ impl CacheWarmingMode {
     }
 }
 
+/// What reopening a session does with the work Caudra stopping cut off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeInterrupted {
+    /// Resume it at once, unless a guard asks first.
+    #[default]
+    Auto,
+    /// Offer to resume it.
+    Ask,
+    /// Leave it, saying only what was cut off.
+    Off,
+}
+
 /// Where continual learning may write what it learned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -1632,6 +1647,8 @@ pub struct AgentFileConfig {
     pub shell_native_redirect: Option<ShellNativeRedirect>,
     pub image_model: Option<ImageModel>,
     pub cache_warming: Option<CacheWarmingMode>,
+    pub resume_interrupted: Option<ResumeInterrupted>,
+    pub resume_max_age_hours: Option<u64>,
     pub continual_learning: Option<bool>,
     pub learning_targets: Option<Vec<LearningTarget>>,
     pub disabled_tools: Option<Vec<String>>,
@@ -1678,7 +1695,9 @@ impl AgentFileConfig {
             shell_workdir_redirect,
             shell_native_redirect,
             image_model,
-            cache_warming
+            cache_warming,
+            resume_interrupted,
+            resume_max_age_hours
         );
         // Restrictions only: an overlay can stop learning or narrow where it
         // writes, never start it or widen it, because it spends and it edits
@@ -3021,6 +3040,22 @@ pub struct AgentConfig {
     pub cache_warming: CacheWarmingMode,
 
     #[config(
+        default = ResumeInterrupted::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "What reopening a session does with work Caudra stopping cut off (a crash, a kill, or quitting mid-turn): `auto` resumes the main turn and its tasks at once, `ask` offers to, `off` only says what was interrupted. `auto` asks instead when a resume already crashed once, when the work is older than `resume_max_age_hours`, or when automatic wakes are suppressed",
+        choices = ["auto", "ask", "off"],
+    )]
+    pub resume_interrupted: ResumeInterrupted,
+
+    #[config(
+        default = DEFAULT_RESUME_MAX_AGE_HOURS,
+        min = MIN_RESUME_MAX_AGE_HOURS,
+        desc = "Hours after which `resume_interrupted = \"auto\"` asks before resuming interrupted work instead of resuming it"
+    )]
+    pub resume_max_age_hours: u64,
+
+    #[config(
         default = true,
         desc = "Learn from your conversations in the background: after enough new prompts, the Learn model reads them and keeps durable conventions, setup facts and preferences in the instruction files and memory notes. A project config can turn it off, never on"
     )]
@@ -3130,6 +3165,10 @@ impl AgentConfig {
             shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
             cache_warming: file.cache_warming.unwrap_or_default(),
+            resume_interrupted: file.resume_interrupted.unwrap_or_default(),
+            resume_max_age_hours: file
+                .resume_max_age_hours
+                .unwrap_or(DEFAULT_RESUME_MAX_AGE_HOURS),
             continual_learning: file.continual_learning.unwrap_or(true),
             learning_targets: file
                 .learning_targets

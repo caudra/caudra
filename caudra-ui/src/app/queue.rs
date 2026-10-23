@@ -1532,6 +1532,9 @@ impl App {
     /// reaches the transcript. What the request tail still needs is the
     /// agent's call, since it is the only side that owns history.
     pub(super) fn continue_run(&mut self) -> Vec<Action> {
+        if self.interrupted.is_some() && self.status == Status::Idle {
+            return self.resume_interrupted();
+        }
         if self.cancelling_run.is_some()
             || (self.status == Status::Streaming
                 && !(self.state.mode == super::Mode::Plan
@@ -1623,11 +1626,15 @@ impl App {
 
     pub(super) fn start_admitted_run(
         &mut self,
-        input: AgentInput,
+        mut input: AgentInput,
         display: String,
         started_by: StartedBy,
     ) -> Vec<Action> {
         self.run_id += 1;
+        if let Some(nudge) = self.resume_preamble.take() {
+            input.preamble.insert(0, nudge);
+        }
+        self.open_run(started_by == StartedBy::Resume);
         self.background_delivery.invalidate();
         if !input.message.is_empty() || !input.images.is_empty() || input.resume {
             self.rearm_background();

@@ -562,6 +562,50 @@ pub struct SessionMeta {
     /// `None` while nothing records the session's calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_coverage: Option<RecordCoverage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_run: Option<StoredOpenRun>,
+}
+
+/// A main run that started and has not settled. Written as the run starts and cleared when it
+/// ends on its own, so a session that reopens with one was cut off mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredOpenRun {
+    /// Unix milliseconds.
+    pub started_at: i64,
+    /// Automatic resumes of this run that never lived to settle it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resume_attempts: u32,
+    /// Unix milliseconds. Set when Caudra shut down on purpose while the run went on; a crash
+    /// leaves it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shut_down_at: Option<i64>,
+}
+
+impl StoredOpenRun {
+    /// The record a run starting at `now` leaves. A resume counts one more
+    /// attempt on the run it picks up.
+    pub fn start(previous: Option<&Self>, resumed: bool, now: i64) -> Self {
+        let resume_attempts = match (resumed, previous) {
+            (true, Some(run)) => run.resume_attempts.saturating_add(1),
+            (true, None) => 1,
+            (false, _) => 0,
+        };
+        Self {
+            started_at: now,
+            resume_attempts,
+            shut_down_at: None,
+        }
+    }
+
+    /// What a run ending leaves of its record: only a shutdown keeps it, for
+    /// the next start to resume.
+    pub fn settle(run: Option<Self>) -> Option<Self> {
+        run.filter(|run| run.shut_down_at.is_some())
+    }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SessionMeta {
@@ -1769,11 +1813,12 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, DEFAULT_TITLE, LOG_FORMAT_VERSION,
         MAX_TITLE_LEN, SESSION_VERSION, SESSIONS_DIR, StoredAutomationControls,
-        StoredDeliveryBackoff, StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange,
-        StoredPauseLatch, StoredPauseSource, StoredPeerControls, StoredPromptAdmission,
-        StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
-        StoredSubagentTaskSpec, StoredTokenUsage, StoredTurnWindow, StoredUnattendedTurns,
-        generate_title, meta_record, next_epoch, persisted_session_ids, write_full_session,
+        StoredDeliveryBackoff, StoredImage, StoredInboundPolicy, StoredMode, StoredOpenRun,
+        StoredPasteRange, StoredPauseLatch, StoredPauseSource, StoredPeerControls,
+        StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+        StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredTurnWindow,
+        StoredUnattendedTurns, generate_title, meta_record, next_epoch, persisted_session_ids,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
@@ -1791,6 +1836,35 @@ mod tests {
     use test_case::test_case;
 
     type TestSession = Session<Value, Value, Value>;
+
+    const RUN_STARTED_AT: i64 = 1_000;
+
+    #[test_case(None, false => 0; "a_fresh_run")]
+    #[test_case(Some(2), false => 0; "a_new_turn_forgets_attempts")]
+    #[test_case(None, true => 1; "a_resume_without_a_record")]
+    #[test_case(Some(1), true => 2; "a_resume_counts_one_more")]
+    fn an_open_run_counts_resume_attempts(previous: Option<u32>, resumed: bool) -> u32 {
+        let previous = previous.map(|resume_attempts| StoredOpenRun {
+            started_at: 0,
+            resume_attempts,
+            shut_down_at: None,
+        });
+        let run = StoredOpenRun::start(previous.as_ref(), resumed, RUN_STARTED_AT);
+        assert_eq!(run.started_at, RUN_STARTED_AT);
+        assert_eq!(run.shut_down_at, None);
+        run.resume_attempts
+    }
+
+    #[test_case(None => false; "a_finished_run")]
+    #[test_case(Some(RUN_STARTED_AT) => true; "a_shut_down_run")]
+    fn only_a_shutdown_keeps_an_open_run(shut_down_at: Option<i64>) -> bool {
+        StoredOpenRun::settle(Some(StoredOpenRun {
+            started_at: 0,
+            resume_attempts: 0,
+            shut_down_at,
+        }))
+        .is_some()
+    }
 
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;

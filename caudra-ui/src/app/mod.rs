@@ -25,6 +25,7 @@ mod mouse;
 pub(crate) mod permission_editor;
 pub(crate) mod questions;
 mod queue;
+pub(crate) mod restart;
 mod sandbox;
 mod search;
 mod session;
@@ -668,6 +669,13 @@ pub struct App {
     pub(crate) background: Option<BackgroundTasks>,
     pub(crate) task_host: Option<Arc<WorkflowHostContext>>,
     task_continuation: Option<tasks::TaskContinuation>,
+    /// Work Caudra stopping cut off, until it is resumed or a new turn
+    /// supersedes it.
+    interrupted: Option<caudra_agent::restart::Interruption>,
+    /// Resume [`Self::interrupted`] once the session settles.
+    resume_due: bool,
+    /// The reminder a reopened main chat reads with its next run.
+    resume_preamble: Option<caudra_providers::Message>,
     /// The foreground shell tracker's last snapshot, polled every tick for the
     /// footer chip and the `/shells` modal.
     shell_snapshot: Watch<ShellSnapshot>,
@@ -1001,6 +1009,9 @@ impl App {
             background: None,
             task_host: None,
             task_continuation: None,
+            interrupted: None,
+            resume_due: false,
+            resume_preamble: None,
             shell_snapshot: Watch::default(),
             task_interactions: tasks::TaskInteractions::default(),
             task_controls: tasks::TaskControls::default(),
@@ -5403,7 +5414,9 @@ impl App {
                 AgentEvent::Error { .. } => Some(tasks::WAKES_SUPPRESSED_RUN_ERROR),
                 _ => None,
             };
-            if let Some(site) = site {
+            if let Some(site) = site
+                && !self.shutting_down()
+            {
                 self.suppress_background_wakes(site);
             }
         }
@@ -5949,6 +5962,7 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
+                    self.settle_open_run();
                     self.bind_main_chat_sources();
                     if !self.goal_deferred {
                         self.state.turns += 1;
@@ -5963,6 +5977,7 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
+                    self.settle_open_run();
                     self.bind_main_chat_sources();
                     self.cancel_queue_edit();
                     // The transcript keeps what the turn managed to write, so say so here: the
@@ -7074,6 +7089,7 @@ impl App {
         }
         self.queue.clear();
         self.shell.cancel_all();
+        self.mark_open_run_shut_down();
     }
 
     pub(crate) fn disconnect_agent_queue(&mut self) {

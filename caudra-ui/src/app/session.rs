@@ -562,6 +562,7 @@ impl App {
                 .or_else(|| state.session.meta.automations.clone()),
             unrecorded: state.session.meta.unrecorded.clone(),
             record_coverage: state.session.meta.record_coverage.clone(),
+            open_run: state.session.meta.open_run.clone(),
         };
         if let Some(snapshot) = self.conversation_permissions.published() {
             let snapshot = snapshot.load();
@@ -573,6 +574,38 @@ impl App {
                 self.permissions.structured_conversation_rules_snapshot();
         }
         meta
+    }
+
+    pub(super) fn push_restored_subagent(
+        &mut self,
+        sa: StoredSubagent,
+        display: Vec<DisplayMessage>,
+        items: Vec<caudra_lua::RestoreItem>,
+        (outcome, text): (TaskOutcome, &'static str),
+    ) {
+        self.chat_index
+            .insert(sa.tool_use_id.clone(), self.chats.len());
+        let mut chat = Chat::subagent(
+            &sa.tool_use_id,
+            sa.name,
+            Path::new(&self.state.session.cwd),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        if let Some(parent_tool_use_id) = sa.parent_tool_use_id {
+            if let Some(model) = &sa.model {
+                self.main_chat().set_tool_model(&parent_tool_use_id, model);
+            }
+            chat.set_parent_tool_use_id(parent_tool_use_id);
+        }
+        chat.set_restore_channel(self.restore_event_tx.clone());
+        chat.model_id = sa.model;
+        chat.thinking = sa.thinking;
+        chat.fast = sa.fast;
+        chat.load_messages(display);
+        chat.mark_finished(outcome, text);
+        self.fire_restore_items(items);
+        self.chats.push(chat);
     }
 
     pub(super) fn sync_subagents(&mut self) {
@@ -891,30 +924,8 @@ impl App {
             self.ui_config.show_reminders,
         );
         for ((sa, _), (display, items)) in restorable.into_iter().zip(rendered) {
-            self.chat_index
-                .insert(sa.tool_use_id.clone(), self.chats.len());
-            let mut chat = Chat::subagent(
-                &sa.tool_use_id,
-                sa.name,
-                Path::new(&self.state.session.cwd),
-                self.ui_config.clone(),
-                self.lua_event_handle.clone(),
-            );
-            if let Some(parent_tool_use_id) = sa.parent_tool_use_id {
-                if let Some(model) = &sa.model {
-                    self.main_chat().set_tool_model(&parent_tool_use_id, model);
-                }
-                chat.set_parent_tool_use_id(parent_tool_use_id);
-            }
-            chat.set_restore_channel(self.restore_event_tx.clone());
-            chat.model_id = sa.model;
-            chat.thinking = sa.thinking;
-            chat.fast = sa.fast;
-            chat.load_messages(display);
-            let (outcome, text) = restored_subagent_outcome(sa.outcome);
-            chat.mark_finished(outcome, text);
-            self.fire_restore_items(items);
-            self.chats.push(chat);
+            let finished = restored_subagent_outcome(sa.outcome);
+            self.push_restored_subagent(sa, display, items, finished);
         }
 
         self.sync_subagents();
@@ -1728,7 +1739,7 @@ pub(super) fn source_target_id(source: DisplaySource) -> CaudraId {
 /// per-chat, independent, and reads nothing but shared state, and a long-lived
 /// session carries enough subagents that doing it serially is the largest
 /// remaining cost of a resume. Each gets the decision rows made for it.
-fn render_subagent_displays(
+pub(super) fn render_subagent_displays(
     restorable: &[(StoredSubagent, Arc<Vec<HistoryItem>>)],
     decisions: &[StoredEngineDecision],
     tool_outputs: &HashMap<String, Arc<caudra_agent::ToolOutput>>,

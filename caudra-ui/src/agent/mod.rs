@@ -21,6 +21,7 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::remote_project_context::{RemoteProjectContext, load_remote_project_context};
+use caudra_agent::restart::{self, DanglingCall, RestoredWork};
 use caudra_agent::tools::{PathLocks, ToolContext};
 use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind, prepare_workspace_transition};
@@ -262,6 +263,9 @@ pub(crate) struct AgentHandles {
     /// [`Self::start_automations`]: its launch facts come from the app.
     automation: Option<AutomationSession>,
     pub(crate) background: Option<BackgroundTasks>,
+    /// What the previous process left cut off when this loop opened a
+    /// session, for the app to take once it has drawn the transcript.
+    pub(crate) interrupted: Option<(RestoredWork, Vec<DanglingCall>)>,
     pub(crate) task_host: Option<Arc<WorkflowHostContext>>,
     /// The session's continual learner, while one runs.
     pub(crate) learner: Arc<arc_swap::ArcSwapOption<caudra_agent::learning::LearnerHandle>>,
@@ -329,7 +333,9 @@ impl AgentHandles {
                     .map_err(|error| warn!(%error, "background tasks unavailable"))
                     .ok()
             });
-        spawn_agent_internal(
+        let mut initial_history = initial_history;
+        let interrupted = take_interrupted(background.as_ref(), &mut initial_history);
+        let mut handles = spawn_agent_internal(
             flume::unbounded(),
             model_slot,
             Arc::new(ArcSwap::new(model_slot.load_full())),
@@ -362,7 +368,9 @@ impl AgentHandles {
             remote_project_context,
             host_cwd,
             local_documents,
-        )
+        );
+        handles.interrupted = Some(interrupted);
+        handles
     }
 
     pub(crate) fn workflow_handle(&self) -> Option<WorkflowHandle> {
@@ -654,9 +662,12 @@ impl AgentHandles {
                 WorkflowSlot::Fresh(Some(app.storage.clone()))
             }
         };
+        let mut history = history;
+        let interrupted =
+            (!same_session).then(|| take_interrupted(background.as_ref(), &mut history));
         let archived = crate::archived_session_history(&app.state.session);
         let todos = crate::session_todos(&app.state.session, &archived, &history);
-        let new = spawn_agent_internal(
+        let mut new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             if same_session {
@@ -702,6 +713,7 @@ impl AgentHandles {
             self.host_cwd.clone(),
             self.local_documents.clone(),
         );
+        new.interrupted = interrupted;
         let old = mem::replace(self, new);
         self.automation = match automation {
             Some(started_without) if !workflow_kept && self.workflow.is_some() => {
@@ -989,6 +1001,7 @@ fn spawn_agent_internal(
         workflow,
         automation: None,
         background,
+        interrupted: None,
         background_enabled,
         task_host,
         learner,
@@ -1005,6 +1018,19 @@ fn spawn_agent_internal(
         settings,
         task,
     }
+}
+
+/// What the previous process left cut off for a session this loop opens,
+/// with the open calls ending `history` answered for what became of them.
+fn take_interrupted(
+    background: Option<&BackgroundTasks>,
+    history: &mut Vec<HistoryItem>,
+) -> (RestoredWork, Vec<DanglingCall>) {
+    let work = background
+        .map(BackgroundTasks::take_restored)
+        .unwrap_or_default();
+    let dangling = restart::close_interrupted_items(history, &work);
+    (work, dangling)
 }
 
 pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHistoryStore {

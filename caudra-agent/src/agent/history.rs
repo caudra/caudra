@@ -14,6 +14,9 @@ use tracing::warn;
 use crate::types::{TodoItem, ToolDoneEvent, ToolOutput};
 
 pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
+/// Ends a run Caudra's own shutdown cut off, which the next open resumes
+/// rather than treating as the user's cancel.
+pub const SHUTDOWN_MARKER: &str = "[Interrupted: Caudra shut down]";
 /// Opens the marker a run that died mid-turn leaves behind. A prefix rather than a fixed
 /// string because the marker names the failure, which is the whole reason it exists.
 pub(crate) const RUN_FAILED_PREFIX: &str = "[Run failed: ";
@@ -751,7 +754,7 @@ fn is_run_marker(m: &Message) -> bool {
     matches!(m.role, Role::User)
         && m.display_text.as_deref() == Some("")
         && matches!(m.content.as_slice(), [ContentBlock::Text { text }]
-            if text == CANCEL_MARKER || is_run_failure_marker(text))
+            if text == CANCEL_MARKER || text == SHUTDOWN_MARKER || is_run_failure_marker(text))
 }
 
 /// Recognises what [`sanitize_failed_history`] wrote, so a frontend can tell a turn that died
@@ -803,6 +806,10 @@ fn close_run_with_marker(history: &mut History, rollback_len: usize, marker: &st
 
 pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) -> bool {
     close_run_with_marker(history, rollback_len, CANCEL_MARKER)
+}
+
+pub(crate) fn sanitize_shutdown_history(history: &mut History, rollback_len: usize) -> bool {
+    close_run_with_marker(history, rollback_len, SHUTDOWN_MARKER)
 }
 
 /// Records a run killed by an error its retry budget could not absorb. Without it the transcript

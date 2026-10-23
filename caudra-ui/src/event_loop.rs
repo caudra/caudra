@@ -2984,6 +2984,7 @@ impl<'t> EventLoop<'t> {
             dirty |= runtime.sync_adopted_selection();
             runtime.request_settled_adoption();
         }
+        dirty |= self.start_interrupted_resumes();
         dirty |= self.start_goal_checkins();
         dirty |= self.sync_automations();
         self.emit_status_changes();
@@ -3375,6 +3376,43 @@ impl<'t> EventLoop<'t> {
                 self.dispatch(index, actions);
                 dirty = Dirty::YES;
             }
+        }
+        dirty
+    }
+
+    /// Takes what a session's reopening found cut off, and resumes it once
+    /// the session is quiet enough for a run of its own.
+    fn start_interrupted_resumes(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        let configured = self.ctx.config.resume_interrupted;
+        let max_age_hours = self.ctx.config.resume_max_age_hours;
+        for runtime in &mut self.sessions {
+            if let Some((work, dangling)) = runtime.handles.interrupted.take() {
+                runtime
+                    .app
+                    .restore_interruption(work, dangling, configured, max_age_hours);
+                dirty = Dirty::YES;
+            }
+        }
+        if crate::sandbox::transfer::active() {
+            return dirty;
+        }
+        let ready: Vec<_> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, runtime)| {
+                (runtime.quiescent()
+                    && runtime.handles.queue.is_empty()
+                    && runtime.app.sandbox_network_dispatch_blocker().is_none()
+                    && runtime.app.interrupted_resume_due())
+                .then_some(index)
+            })
+            .collect();
+        for index in ready {
+            let actions = self.sessions[index].app.resume_interrupted();
+            self.dispatch(index, actions);
+            dirty = Dirty::YES;
         }
         dirty
     }

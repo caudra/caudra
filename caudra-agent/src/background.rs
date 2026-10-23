@@ -7,13 +7,13 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use async_lock::Semaphore;
 use async_lock::{Mutex as AsyncMutex, MutexGuardArc};
 use caudra_config::ExecutionMode;
-use caudra_providers::{ContentBlock, Message, TaskEventOrigin};
+use caudra_providers::{ContentBlock, HistoryItem, Message, TaskEventOrigin, project_messages};
 use caudra_storage::{
     StateDir,
     background::{
@@ -27,17 +27,22 @@ use caudra_storage::{
     tool_outputs::{ToolOutputRef, ToolOutputStore},
 };
 use event_listener::{Event, EventListener};
+use flume::Receiver;
+use futures_lite::FutureExt;
 use serde_json::{Value, json};
+use smol::Timer;
+use tracing::{info, warn};
 
 use crate::{
-    AgentEvent, CancelToken, CancelTrigger, Envelope, EventSender, SubagentTaskSpec, TaskCard,
-    TaskProvenance,
+    AgentEvent, CancelToken, CancelTrigger, Envelope, EventSender, SharedHistory, SubagentTaskSpec,
+    TaskCard, TaskProvenance,
     agent::{
         steering::SharedSteering,
         subagent::TaskIdentity,
         task_runner::{PreparedTask, TaskOutcome, TaskRequest},
     },
     background_reminder::{RuntimeHealth, RuntimeSnapshot},
+    restart::{self, DanglingCall, InterruptedJob, RestoredWork, StopCause},
     tools::{Deadline, ToolContext, native::question},
     types::{BACKGROUND_EVENT_RUN_ID, TASK_DURATION_FIELD, task_output_access},
 };
@@ -65,6 +70,22 @@ const TASK_SETTLING: &str = "task failure is still settling; try again after set
 const EMPTY_CONTINUATION: &str = "a task continuation requires a non-empty follow-up";
 const RETRY_MISMATCH: &str = "task retry differs from the admitted request";
 const INTERRUPTED: &str = "Execution interrupted by session shutdown or crash; effects may require reconciliation before explicit resume.";
+const SHUTDOWN_INTERRUPTED: &str = "Caudra shut down while this task ran. Its transcript was kept, and it continues under the same task_id once the session reopens.";
+const SHUTDOWN_JOB_INTERRUPTED: &str =
+    "Caudra shut down while this job ran; its outcome is unknown and it was not run again.";
+/// Marks an outcome the shutdown cut off and the next restore has yet to report.
+const RESTART_PENDING_FIELD: &str = "restart_pending";
+const RESTART_CONTINUATION_FIELD: &str = "restart_continuation";
+/// How many restarts a task's run has been resumed across, so a task that
+/// dies with every resume is not restarted forever.
+const RESTARTS_FIELD: &str = "restarts";
+const INTERRUPTED_STATE: &str = "interrupted";
+const INTERRUPTED_TASK_REQUIRED: &str =
+    "only an interrupted managed agent task owned by this session can be resumed";
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+/// Past this a live checkpoint keeps the last one that fit, so one long
+/// transcript cannot crowd every other record out of the session's budget.
+const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
 const QUESTION_INTERRUPTED: &str =
     "The session closed before the user answered; ask again if you still need the answer.";
 const TASK_SYNC: &str = "task_execution = sync requires completed task results";
@@ -183,6 +204,8 @@ struct Inner {
     drain_gate: AsyncMutex<()>,
     changed: Event,
     shells: ShellExecutions,
+    /// What the previous process left unfinished, until a frontend takes it.
+    restored: Mutex<RestoredWork>,
 }
 
 struct State {
@@ -210,6 +233,9 @@ struct State {
     pending_stops: usize,
     transition: Option<CaudraId>,
     shutdown: bool,
+    /// Set as a shutdown begins: work it cuts off ends interrupted, to resume
+    /// once the session reopens, rather than cancelled.
+    interrupting: bool,
     failure: Option<String>,
     steering: Option<SharedSteering>,
     #[cfg(test)]
@@ -298,6 +324,15 @@ impl Drop for BackgroundTransition {
             self.tasks.0.changed.notify(usize::MAX);
         }
     }
+}
+
+/// A task picked back up under its own id rather than started.
+#[derive(Clone, Copy)]
+enum Continuation<'a> {
+    /// The user continues a task that failed in this process.
+    Human(&'a TaskCard),
+    /// Caudra resumes a task the previous process left interrupted.
+    Restart(&'a InterruptedJob),
 }
 
 pub(crate) enum TaskDelivery {
@@ -410,7 +445,7 @@ impl TaskReporter {
 impl BackgroundTasks {
     pub async fn spawn(dir: StateDir, session: CaudraId) -> Result<Self, String> {
         let load_dir = dir.clone();
-        let (records, shells, recent, generation, sequence) =
+        let (records, shells, recent, generation, sequence, restored) =
             smol::unblock(move || -> Result<_, String> {
                 let retry = RuntimeRetry::new(None, &|| false);
                 let db = SessionDatabase::open_runtime(&load_dir, &retry)
@@ -418,16 +453,51 @@ impl BackgroundTasks {
                 let (mut records, (generation, sequence)) = db
                     .background_restore_runtime(session, &retry)
                     .map_err(|error| error.to_string())?;
+                let mut restored = RestoredWork {
+                    jobs: records
+                        .iter()
+                        .filter_map(|record| {
+                            interruption(record).map(|cause| interrupted_job(record, cause))
+                        })
+                        .collect(),
+                    shells: db
+                        .interrupt_shell_executions_runtime(
+                            session,
+                            shells::SHELL_INTERRUPTED,
+                            &retry,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    transcripts: HashMap::new(),
+                    dangling: HashMap::new(),
+                };
                 for record in &mut records {
                     let retry = RuntimeRetry::new(None, &|| false);
+                    if record.kind() == JobKind::Agent
+                        && let Some(job) = restored
+                            .jobs
+                            .iter()
+                            .find(|job| job.invocation_id == record.invocation_id)
+                    {
+                        let task_id = job.task_id.clone();
+                        let (transcript, dangling) = close_checkpoint_calls(record, &restored)?;
+                        if !dangling.is_empty() {
+                            restored.dangling.insert(task_id.clone(), dangling);
+                        }
+                        if !transcript.is_empty() {
+                            restored.transcripts.insert(task_id, Arc::new(transcript));
+                        }
+                    }
                     if record.active() {
                         let error = match record.kind() {
                             JobKind::Question => QUESTION_INTERRUPTED,
                             JobKind::Agent | JobKind::Shell => INTERRUPTED,
                         };
-                        record.state = "interrupted".into();
+                        record.state = INTERRUPTED_STATE.into();
                         record.outcome = Some(json!({"error": error}));
                         record.output_ref = None;
+                    }
+                    if let Some(outcome) = record.outcome.as_mut().and_then(Value::as_object_mut) {
+                        outcome.remove(RESTART_PENDING_FIELD);
                     }
                     if record.output_ref.is_none()
                         && let Some(outcome) = &record.outcome
@@ -457,15 +527,22 @@ impl BackgroundTasks {
                     .background_history_runtime(session, None, MAX_HISTORY_PAGE, None, &retry)
                     .map_err(|error| error.to_string())?
                     .records;
-                db.interrupt_shell_executions_runtime(session, shells::SHELL_INTERRUPTED, &retry)
-                    .map_err(|error| error.to_string())?;
                 let shells = db
                     .shell_executions(session, None, MAX_SHELL_EXECUTIONS)
                     .map_err(|error| error.to_string())?;
-                Ok((resident, shells, recent, generation + 1, sequence))
+                Ok((resident, shells, recent, generation + 1, sequence, restored))
             })
             .await?;
+        if !restored.is_empty() {
+            info!(
+                %session,
+                jobs = restored.jobs.len(),
+                shells = restored.shells.len(),
+                "restored work the previous process left unfinished"
+            );
+        }
         Ok(Self(Arc::new(Inner {
+            restored: Mutex::new(restored),
             shells: ShellExecutions::restore(dir.clone(), session, shells),
             dir,
             session,
@@ -497,6 +574,7 @@ impl BackgroundTasks {
                 pending_stops: 0,
                 transition: None,
                 shutdown: false,
+                interrupting: false,
                 failure: None,
                 steering: None,
                 #[cfg(test)]
@@ -641,6 +719,7 @@ impl BackgroundTasks {
             }
             state.records.values().filter(|record| {
                 record.settled()
+                    && interruption(record).is_none()
                     && !state.drivers.contains_key(&record.invocation_id)
                     && !state.admitting.contains(&record.invocation_id)
                     && !state.cancels.contains_key(&record.invocation_id)
@@ -801,6 +880,73 @@ impl BackgroundTasks {
 
     async fn persist(&self, record: TaskRecord) -> Result<(), String> {
         self.persist_record(record, None).await
+    }
+
+    /// Saves the running task's transcript into its record at most once per
+    /// [`CHECKPOINT_INTERVAL`], so a restart continues it from where it was
+    /// rather than from its admission. When `stop` closes, it saves once more
+    /// only if a shutdown cut the run off: a run that ended on its own keeps
+    /// its transcript elsewhere, and saving it would hold up its outcome.
+    async fn keep_checkpoint(&self, invocation: &str, mirror: SharedHistory, stop: Receiver<()>) {
+        let mut saved = Arc::clone(&mirror.load().messages);
+        loop {
+            let running = async {
+                Timer::after(CHECKPOINT_INTERVAL).await;
+                true
+            }
+            .or(async {
+                let _ = stop.recv_async().await;
+                false
+            })
+            .await;
+            if !running && !self.interrupting() {
+                return;
+            }
+            let items = Arc::clone(&mirror.load().messages);
+            if !Arc::ptr_eq(&saved, &items) {
+                self.checkpoint_transcript(invocation, &items).await;
+                saved = items;
+            }
+            if !running {
+                return;
+            }
+        }
+    }
+
+    async fn checkpoint_transcript(&self, invocation: &str, items: &[HistoryItem]) {
+        let history = match project_messages(items)
+            .map_err(|error| error.to_string())
+            .and_then(|messages| serde_json::to_value(messages).map_err(|error| error.to_string()))
+        {
+            Ok(history) => history,
+            Err(error) => {
+                warn!(invocation, %error, "task checkpoint skipped: transcript unreadable");
+                return;
+            }
+        };
+        let bytes = history.to_string().len();
+        if bytes > MAX_CHECKPOINT_BYTES {
+            warn!(
+                invocation,
+                bytes, "task checkpoint skipped: transcript too large"
+            );
+            return;
+        }
+        let _gate = self.0.gate.lock().await;
+        let record = {
+            let state = self.lock();
+            match state.records.get(invocation) {
+                Some(record) if record.active() => {
+                    let mut record = record.clone();
+                    record.history = history;
+                    record
+                }
+                _ => return,
+            }
+        };
+        if let Err(error) = self.persist(record).await {
+            warn!(invocation, %error, "task checkpoint save failed");
+        }
     }
 
     async fn persist_record(
@@ -1177,7 +1323,33 @@ impl BackgroundTasks {
         Some(record)
     }
 
+    /// Whether a shutdown is cutting work off, which then ends interrupted.
+    pub fn interrupting(&self) -> bool {
+        self.lock().interrupting
+    }
+
+    /// What the previous process left unfinished. Taken once: whoever takes it
+    /// owns telling the agents about it.
+    pub fn take_restored(&self) -> RestoredWork {
+        std::mem::take(
+            &mut *self
+                .0
+                .restored
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    /// Stops every job as interrupted rather than cancelled. Running work is cut
+    /// off before admission closes, so nothing it does next meets a closed
+    /// runtime and records that as its outcome.
     pub async fn shutdown(&self) -> Result<(), String> {
+        let cancels = {
+            let mut state = self.lock();
+            state.interrupting = true;
+            std::mem::take(&mut state.cancels)
+        };
+        drop(cancels);
         {
             let mut state = self.lock();
             state.shutdown = true;
@@ -1763,6 +1935,48 @@ impl BackgroundTasks {
         request_id: String,
         prompt: String,
     ) -> Result<TaskCard, String> {
+        self.continue_task(
+            ctx,
+            Continuation::Human(expected),
+            &expected.task_id,
+            &expected.label,
+            request_id,
+            prompt,
+        )
+        .await
+    }
+
+    /// Picks a task the previous process left interrupted back up in the
+    /// background, from the transcript it saved, with `prompt` as its next
+    /// turn. A foreground task resumes in the background too: whoever waited
+    /// on it is gone.
+    pub async fn resume_interrupted(
+        &self,
+        ctx: &ToolContext,
+        job: &InterruptedJob,
+        request_id: String,
+        prompt: String,
+    ) -> Result<TaskCard, String> {
+        self.continue_task(
+            ctx,
+            Continuation::Restart(job),
+            &job.task_id,
+            &job.label,
+            request_id,
+            prompt,
+        )
+        .await
+    }
+
+    async fn continue_task(
+        &self,
+        ctx: &ToolContext,
+        continuation: Continuation<'_>,
+        task_id: &str,
+        label: &str,
+        request_id: String,
+        prompt: String,
+    ) -> Result<TaskCard, String> {
         if ctx.session_id.as_ref().map(|session| session.as_str())
             != Some(self.0.session.to_string().as_str())
             || ctx.jobs.as_ref().is_some_and(|jobs| {
@@ -1776,8 +1990,8 @@ impl BackgroundTasks {
         }
         let request = TaskRequest {
             prompt: Some(prompt),
-            label: expected.label.clone(),
-            task: TaskIdentity::Continue(expected.task_id.clone()),
+            label: label.to_owned(),
+            task: TaskIdentity::Continue(task_id.to_owned()),
             mode: None,
             profile: None,
             model: Default::default(),
@@ -1791,7 +2005,7 @@ impl BackgroundTasks {
             ..ctx.clone()
         };
         match self
-            .execute_admitted(&ctx, request, true, Some(expected))
+            .execute_admitted(&ctx, request, true, Some(continuation))
             .await?
         {
             TaskDelivery::Background(card) => Ok(*card),
@@ -1804,7 +2018,7 @@ impl BackgroundTasks {
         ctx: &ToolContext,
         mut request: TaskRequest,
         background: bool,
-        expected: Option<&TaskCard>,
+        continuation: Option<Continuation<'_>>,
     ) -> Result<TaskDelivery, String> {
         if ctx
             .session_id
@@ -1831,26 +2045,39 @@ impl BackgroundTasks {
         if let Some(thinking) = &request.model.thinking {
             contract["task_thinking"] = json!(thinking.to_string());
         }
-        if let Some(expected) = expected {
-            if expected.kind != JobKind::Agent
-                || expected.owner != JobOwner::Main
-                || expected.state != "failed"
-            {
-                return Err(FAILED_TASK_REQUIRED.into());
+        match continuation {
+            Some(Continuation::Human(expected)) => {
+                if expected.kind != JobKind::Agent
+                    || expected.owner != JobOwner::Main
+                    || expected.state != "failed"
+                {
+                    return Err(FAILED_TASK_REQUIRED.into());
+                }
+                if expected.generation != admission.scope.generation()
+                    || ctx
+                        .jobs
+                        .as_ref()
+                        .is_some_and(|jobs| jobs.generation() != expected.generation)
+                {
+                    return Err(STALE_INVOCATION.into());
+                }
+                task_delivery_policy(&self.lock().task_execution, background)?;
+                contract["human_continuation"] = json!({
+                    "invocation_id": expected.invocation_id,
+                    "generation": expected.generation,
+                });
             }
-            if expected.generation != admission.scope.generation()
-                || ctx
-                    .jobs
-                    .as_ref()
-                    .is_some_and(|jobs| jobs.generation() != expected.generation)
-            {
-                return Err(STALE_INVOCATION.into());
+            Some(Continuation::Restart(job)) => {
+                if job.kind != JobKind::Agent || job.owner != JobOwner::Main {
+                    return Err(INTERRUPTED_TASK_REQUIRED.into());
+                }
+                task_delivery_policy(&self.lock().task_execution, background)?;
+                contract[RESTART_CONTINUATION_FIELD] = json!({
+                    "invocation_id": job.invocation_id,
+                    RESTARTS_FIELD: job.restarts + 1,
+                });
             }
-            task_delivery_policy(&self.lock().task_execution, background)?;
-            contract["human_continuation"] = json!({
-                "invocation_id": expected.invocation_id,
-                "generation": expected.generation,
-            });
+            None => {}
         }
         let retry = self
             .retry_record(&JobOwner::Main, &request.call_id, &admission)
@@ -1859,7 +2086,7 @@ impl BackgroundTasks {
             if record.request != contract {
                 return Err(RETRY_MISMATCH.into());
             }
-            if expected.is_some() {
+            if continuation.is_some() {
                 let latest = self.prior_record(&record.task_id, None, &admission).await?;
                 if record.generation != admission.scope.generation()
                     || latest.is_none_or(|latest| latest.invocation_id != record.invocation_id)
@@ -1873,28 +2100,42 @@ impl BackgroundTasks {
                 .wait_delivery(ctx, &record.invocation_id, &record.task_id)
                 .await;
         }
-        let failed_checkpoint = if let Some(expected) = expected {
-            let prior = self
-                .prior_record(&expected.task_id, None, &admission)
-                .await?
-                .ok_or_else(|| FAILED_TASK_REQUIRED.to_owned())?;
-            if prior.invocation_id != expected.invocation_id
-                || prior.generation != expected.generation
-            {
-                return Err(STALE_INVOCATION.into());
+        let failed_checkpoint = match continuation {
+            Some(continuation) => {
+                let (task_id, invocation_id, state, refused) = match continuation {
+                    Continuation::Human(expected) => (
+                        &expected.task_id,
+                        &expected.invocation_id,
+                        "failed",
+                        FAILED_TASK_REQUIRED,
+                    ),
+                    Continuation::Restart(job) => (
+                        &job.task_id,
+                        &job.invocation_id,
+                        INTERRUPTED_STATE,
+                        INTERRUPTED_TASK_REQUIRED,
+                    ),
+                };
+                let prior = self
+                    .prior_record(task_id, None, &admission)
+                    .await?
+                    .ok_or_else(|| refused.to_owned())?;
+                let generation_changed = matches!(continuation, Continuation::Human(expected) if prior.generation != expected.generation);
+                if &prior.invocation_id != invocation_id || generation_changed {
+                    return Err(STALE_INVOCATION.into());
+                }
+                if prior.active() {
+                    return Err(TASK_SETTLING.into());
+                }
+                if prior.kind() != JobKind::Agent
+                    || prior.owner != JobOwner::Main
+                    || prior.state != state
+                {
+                    return Err(refused.into());
+                }
+                Some(prior)
             }
-            if prior.active() {
-                return Err(TASK_SETTLING.into());
-            }
-            if prior.kind() != JobKind::Agent
-                || prior.owner != JobOwner::Main
-                || prior.state != "failed"
-            {
-                return Err(FAILED_TASK_REQUIRED.into());
-            }
-            Some(prior)
-        } else {
-            None
+            None => None,
         };
         let gate = self.archive_settled(gate, Some(admission.clone())).await?;
         admission.check()?;
@@ -2070,7 +2311,7 @@ impl BackgroundTasks {
         owned.steering_observations = None;
         owned.steering_order.clear();
         owned.live_sink = None;
-        let prepared = PreparedTask::prepare(&owned, request, Some(reporter.clone())).await?;
+        let mut prepared = PreparedTask::prepare(&owned, request, Some(reporter.clone())).await?;
         let (history, spec) = match prepared.checkpoint() {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -2087,6 +2328,7 @@ impl BackgroundTasks {
             return Err(CLOSED.into());
         }
         let generation = admission.scope.generation();
+        let mirror = prepared.mirror_history();
         let record = TaskRecord {
             payload: JobPayload::Agent,
             owner: JobOwner::Main,
@@ -2099,7 +2341,7 @@ impl BackgroundTasks {
             generation,
             state: "queued".into(),
             background,
-            receipt_accepted: expected.is_some(),
+            receipt_accepted: continuation.is_some(),
             mode: prepared.mode().to_string(),
             request: contract,
             outcome: None,
@@ -2149,6 +2391,12 @@ impl BackgroundTasks {
                 }
                 drop(gate);
                 let _ = admitted_tx.send(current);
+                let (stop_checkpoints, stopped) = flume::bounded::<()>(1);
+                let checkpoints = smol::spawn({
+                    let tasks = tasks.clone();
+                    let invocation = driver_id.clone();
+                    async move { tasks.keep_checkpoint(&invocation, mirror, stopped).await }
+                });
                 #[cfg(not(test))]
                 let outcome = prepared.run(&cancel).await;
                 #[cfg(test)]
@@ -2156,6 +2404,8 @@ impl BackgroundTasks {
                     Some(permits) => prepared.run_with_permits(&cancel, permits).await,
                     None => prepared.run(&cancel).await,
                 };
+                drop(stop_checkpoints);
+                checkpoints.await;
                 let _gate = tasks.0.gate.lock().await;
                 let result = tasks
                     .finish(
@@ -2260,7 +2510,11 @@ impl BackgroundTasks {
             record.spec =
                 serde_json::to_value(history.spec()).map_err(|error| error.to_string())?;
         }
-        let value = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+        let interrupting = self.lock().interrupting && !outcome.success;
+        let mut value = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+        if interrupting {
+            mark_shutdown_interrupted(&mut record, &mut value);
+        }
         let terminal = outcome_text(&value);
         let dir = self.0.dir.clone();
         let session = self.0.session;
@@ -2272,7 +2526,10 @@ impl BackgroundTasks {
         record.outcome = Some(value);
         let suppressed = {
             let state = self.lock();
-            !state.open || state.generation != record.generation || !record.background
+            interrupting
+                || !state.open
+                || state.generation != record.generation
+                || !record.background
         };
         for event in &mut record.events {
             event.suppressed |= suppressed;
@@ -2344,6 +2601,79 @@ fn store_outcome(
         .map_err(|error| format!("could not persist complete task outcome: {error}"))
 }
 
+/// Why `record` was left unfinished by the previous process, if it was: still
+/// active means the process died under it, and a pending restart means a
+/// shutdown cut it off.
+fn interruption(record: &TaskRecord) -> Option<StopCause> {
+    if record.active() {
+        return Some(StopCause::Crash);
+    }
+    record
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get(RESTART_PENDING_FIELD))
+        .and_then(Value::as_bool)
+        .filter(|pending| *pending && record.state == INTERRUPTED_STATE)
+        .map(|_| StopCause::Shutdown)
+}
+
+fn interrupted_job(record: &TaskRecord, cause: StopCause) -> InterruptedJob {
+    let card = TaskCard::summary(record);
+    let restarts = record
+        .request
+        .get(RESTART_CONTINUATION_FIELD)
+        .and_then(|continuation| continuation.get(RESTARTS_FIELD))
+        .and_then(Value::as_u64)
+        .map_or(0, |restarts| u32::try_from(restarts).unwrap_or(u32::MAX));
+    InterruptedJob {
+        restarts,
+        stopped_at: record.updated_at,
+        task_id: card.task_id,
+        invocation_id: card.invocation_id,
+        call_id: card.call_id,
+        kind: card.kind,
+        owner: card.owner,
+        background: card.background,
+        label: card.label,
+        cause,
+    }
+}
+
+/// Answers the calls an interrupted task's saved transcript left open, so the
+/// transcript a continuation picks up says what became of them. Returns that
+/// transcript and the calls it answered.
+fn close_checkpoint_calls(
+    record: &mut TaskRecord,
+    restored: &RestoredWork,
+) -> Result<(Vec<Message>, Vec<DanglingCall>), String> {
+    if record.history.is_null() {
+        return Ok(Default::default());
+    }
+    let mut messages: Vec<Message> =
+        serde_json::from_value(record.history.clone()).map_err(|error| error.to_string())?;
+    let dangling = restart::close_interrupted_calls(&mut messages, restored);
+    if !dangling.is_empty() {
+        record.history = serde_json::to_value(&messages).map_err(|error| error.to_string())?;
+    }
+    Ok((messages, dangling))
+}
+
+/// Ends `record` as cut off by a shutdown, for the next restore to report.
+fn mark_shutdown_interrupted(record: &mut TaskRecord, outcome: &mut Value) {
+    record.state = INTERRUPTED_STATE.into();
+    let error = match record.kind() {
+        JobKind::Agent => SHUTDOWN_INTERRUPTED,
+        JobKind::Shell => SHUTDOWN_JOB_INTERRUPTED,
+        JobKind::Question => QUESTION_INTERRUPTED,
+    };
+    outcome["error"] = json!(error);
+    outcome[RESTART_PENDING_FIELD] = json!(true);
+    if record.kind() == JobKind::Agent {
+        outcome["success"] = json!(false);
+        outcome["cancelled"] = json!(false);
+    }
+}
+
 fn eligible(record: &TaskRecord, generation: u64) -> bool {
     record.background && record.receipt_accepted && record.generation == generation
 }
@@ -2412,8 +2742,8 @@ mod tests {
         ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, EMPTY_CONTINUATION,
         FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_HISTORY_PAGE, MAX_INVOCATIONS, MAX_REPORT_BYTES,
         MAX_REPORTS, MAX_RESULT_BYTES, RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION,
-        TASK_ASYNC, TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SETTLING,
-        TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter, TaskStatus, ran_on,
+        StopCause, TASK_ASYNC, TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_PROMOTION,
+        TASK_SETTLING, TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter, TaskStatus, ran_on,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -4749,6 +5079,25 @@ mod tests {
             drop(restored.archive_settled(gate, None).await.unwrap());
             assert!(restored.lock().records.is_empty());
             assert_archive_count(&restored, count + 1).await;
+        });
+    }
+
+    #[test]
+    fn a_task_a_shutdown_cut_off_stays_resident_for_the_restore() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            fixture.tasks.shutdown().await.unwrap();
+            let gate = fixture.tasks.0.gate.lock_arc().await;
+            drop(fixture.tasks.archive_settled(gate, None).await.unwrap());
+            let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            let work = restored.take_restored();
+            assert_eq!(work.jobs.len(), 1);
+            assert_eq!(work.jobs[0].task_id, TASK);
+            assert_eq!(work.jobs[0].cause, StopCause::Shutdown);
+            restored.shutdown().await.unwrap();
         });
     }
 

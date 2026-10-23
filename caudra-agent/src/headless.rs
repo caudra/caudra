@@ -19,7 +19,8 @@ use caudra_config::ToolKey;
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
-    AutomationsConfig, AutopilotConfig, Feature, FeatureFlags, ModelPolicy, SnapshotsConfig,
+    AutomationsConfig, AutopilotConfig, Feature, FeatureFlags, ModelPolicy, ResumeInterrupted,
+    SnapshotsConfig,
 };
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Billing, Model, ModelPurpose};
@@ -44,12 +45,12 @@ use caudra_storage::permission_state::mutation::{
 };
 use caudra_storage::sessions::{
     PermissionMode, SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode,
-    StoredPlanTarget, StoredSubagent, StoredSubagentOutcome, add_cost,
+    StoredOpenRun, StoredPlanTarget, StoredSubagent, StoredSubagentOutcome, add_cost,
 };
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
-use caudra_storage::{StateDir, StorageError};
+use caudra_storage::{StateDir, StorageError, now_epoch};
 use caudra_workflow::{
     RunSnapshot, RunStatus, WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
@@ -98,6 +99,7 @@ use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
+use crate::restart::{self, InterruptedJob, InterruptedNotice, Interruption, MainState};
 use crate::session_fork::ReachableTasks;
 use crate::template;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
@@ -663,6 +665,30 @@ impl SessionStore {
                 id: self.session.id,
             }),
         }
+    }
+
+    /// Records the main run as open, so a session reopened with it still set
+    /// knows the run was cut off.
+    fn open_run(&mut self, resumed: bool) {
+        let meta = &mut self.session.meta;
+        meta.open_run = Some(StoredOpenRun::start(
+            meta.open_run.as_ref(),
+            resumed,
+            SystemClock::new().now_ms(),
+        ));
+        if let Err(error) = self.save() {
+            warn!(session_id = %self.session.id, %error, "open run not recorded");
+        }
+    }
+
+    /// A run that ended on its own leaves nothing to resume; one a shutdown
+    /// cut off stays open for the next start.
+    fn settle_open_run(&mut self, shutting_down: bool) {
+        let meta = &mut self.session.meta;
+        if shutting_down && let Some(run) = &mut meta.open_run {
+            run.shut_down_at = Some(SystemClock::new().now_ms());
+        }
+        meta.open_run = StoredOpenRun::settle(meta.open_run.take());
     }
 
     fn record_turn(
@@ -1843,6 +1869,8 @@ pub struct InteractiveHandle {
     pub event_rx: Receiver<Envelope>,
     pub run_rx: Receiver<InteractiveRun>,
     pub background: Option<BackgroundTasks>,
+    /// What the previous process left cut off when this session opened.
+    pub interrupted: Option<InterruptedNotice>,
     pub tool_names: Vec<String>,
     pub input_tx: flume::Sender<AgentInput>,
     /// The prompts no run has taken yet, which a host withdraws to cancel them
@@ -2251,6 +2279,92 @@ fn record_subagent_goal_usage(goal: &GoalHandle, envelope: &Envelope) {
         } => goal.record_external_usage(*usage, *cost, *billing),
         _ => {}
     }
+}
+
+/// The main chat's reminder after a restart, held for its next run.
+struct HeldResume {
+    nudge: Message,
+    /// Whether that run picks the cut-off turn back up.
+    resume: bool,
+}
+
+/// What restarts the tasks the main chat started.
+struct TaskRestarter {
+    background: BackgroundTasks,
+    host: WorkflowHostContext,
+    events: EventSender,
+}
+
+impl TaskRestarter {
+    /// Admits the restart as a task of its own: awaited inside the session's
+    /// start, the admission future overflows the executor thread's stack.
+    fn restart(&self, job: &InterruptedJob, prompt: String) {
+        let (background, host, events, job) = (
+            self.background.clone(),
+            self.host.clone(),
+            self.events.clone(),
+            job.clone(),
+        );
+        smol::spawn(async move {
+            let call_id = CaudraId::generate().to_string();
+            let resumed = async {
+                let mut ctx = host
+                    .tool_context(CancelToken::none(), events, &call_id)
+                    .await?;
+                ctx.jobs = Some(background.main_scope());
+                background
+                    .resume_interrupted(&ctx, &job, call_id.clone(), prompt)
+                    .await
+            };
+            match resumed.await {
+                Ok(card) => {
+                    info!(task_id = %card.task_id, invocation_id = %card.invocation_id, "interrupted task resumed");
+                }
+                Err(error) => {
+                    warn!(task_id = %job.task_id, %error, "interrupted task did not resume");
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+/// What a session reopened with interrupted work does as it starts. Under
+/// `auto` the tasks the main chat started restart at once, and its next run
+/// resumes the cut-off turn; otherwise that run only reads what was cut off.
+fn start_interrupted(
+    interruption: &Interruption,
+    config: &AgentConfig,
+    restarter: Option<TaskRestarter>,
+) -> (Option<HeldResume>, InterruptedNotice) {
+    let choice = interruption.choice(
+        config.resume_interrupted,
+        config.resume_max_age_hours,
+        now_epoch(),
+        false,
+    );
+    let restarter = restarter.filter(|_| choice == ResumeInterrupted::Auto);
+    info!(
+        main = ?interruption.main,
+        cause = ?interruption.cause,
+        tasks = interruption.work.resumable().count(),
+        shells = interruption.work.shells.len(),
+        attempts = interruption.attempts,
+        ?choice,
+        resuming = restarter.is_some(),
+        "session reopened with interrupted work"
+    );
+    if let Some(restarter) = &restarter {
+        for job in interruption.work.resumable() {
+            restarter.restart(job, interruption.task_nudge(job));
+        }
+    }
+    let resuming = restarter.is_some();
+    let held = interruption.main_nudge(resuming).map(|nudge| HeldResume {
+        nudge: Message::synthetic(nudge),
+        resume: resuming && interruption.main == MainState::Working,
+    });
+    (held, InterruptedNotice::new(interruption, resuming))
 }
 
 /// `mode`, unless a control has set the session's mode since.
@@ -2754,6 +2868,7 @@ impl InteractiveHandle {
             event_rx: flume::unbounded().1,
             run_rx: flume::unbounded().1,
             background: None,
+            interrupted: None,
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             pending_inputs: PendingInputs::default(),
@@ -3010,7 +3125,9 @@ fn initialize_decisions(
 
 pub struct PreparedInteractive {
     params: InteractiveParams,
-    history: History,
+    /// The stored transcript, restored once the background runtime has said
+    /// which of its open calls Caudra stopping cut off.
+    items: Vec<HistoryItem>,
     model: Model,
     provider: Arc<dyn Provider>,
     store: SessionStore,
@@ -3087,8 +3204,7 @@ pub async fn prepare_interactive(
             "remote workspace and environment must be supplied together".into(),
         ));
     }
-    let history = History::restored(std::mem::take(&mut params.initial_history))
-        .map_err(|error| InteractiveStartError(format!("Failed to restore history: {error}")))?;
+    let items = std::mem::take(&mut params.initial_history);
     let mut model = params.model.clone();
     let provider: Arc<dyn Provider> = provider::from_model_async(&mut model, params.timeouts)
         .await
@@ -3169,7 +3285,7 @@ pub async fn prepare_interactive(
         .map_err(|error| InteractiveStartError(format!("{PERSIST_FAILED}: {error}")))?;
     Ok(PreparedInteractive {
         params,
-        history: history.with_todos(store.todos()),
+        items,
         model,
         provider,
         store,
@@ -3202,12 +3318,38 @@ async fn spawn_prepared_session(
 ) -> Result<InteractiveHandle, InteractiveStartError> {
     let PreparedInteractive {
         mut params,
-        mut history,
+        mut items,
         mut model,
         mut provider,
         mut store,
         changes,
     } = prepared;
+    let session_ref = params.session_id.clone();
+    let session_id = session_ref.id();
+    let state_dir = store.dir.clone();
+    let background = if background_enabled {
+        Some(
+            BackgroundTasks::spawn(state_dir.clone(), session_id)
+                .await
+                .map_err(InteractiveStartError)?,
+        )
+    } else {
+        None
+    };
+    let restored = background
+        .as_ref()
+        .map(BackgroundTasks::take_restored)
+        .unwrap_or_default();
+    let dangling = restart::close_interrupted_items(&mut items, &restored);
+    let mut history = History::restored(items)
+        .map_err(|error| InteractiveStartError(format!("Failed to restore history: {error}")))?
+        .with_todos(store.todos());
+    let interruption = Interruption::new(
+        restored,
+        dangling,
+        store.session.meta.open_run.as_ref(),
+        store.session.updated_at,
+    );
     let mut home_model: Option<Model> = None;
     let decisions = initialize_decisions(&params.decisions_config, &store.dir)?;
     if !params.config.features.enabled(Feature::Workflows) {
@@ -3270,8 +3412,6 @@ async fn spawn_prepared_session(
     });
     let tool_names = extract_tool_names(&tools);
 
-    let session_ref = params.session_id.clone();
-    let session_id = session_ref.id();
     let memory_origin = session_ref.as_str().to_owned();
     let cache_warmer = CacheWarmer::new(
         params.config.cache_warming,
@@ -3286,16 +3426,6 @@ async fn spawn_prepared_session(
     let subagent_history = store.subagent_history.clone();
     let goal = store.goal.clone();
     let goal_deferral = Arc::new(GoalDeferral::default());
-    let state_dir = store.dir.clone();
-    let background = if background_enabled {
-        Some(
-            BackgroundTasks::spawn(state_dir.clone(), session_id)
-                .await
-                .map_err(InteractiveStartError)?,
-        )
-    } else {
-        None
-    };
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (run_tx, run_rx) = flume::unbounded();
@@ -3577,6 +3707,28 @@ async fn spawn_prepared_session(
         workflow: workflow.clone(),
         ..base
     };
+    let (mut held_resume, interrupted) = match interruption {
+        Some(interruption) => {
+            let restarter = background.as_ref().map(|background| TaskRestarter {
+                background: background.clone(),
+                host: WorkflowHostContext::from_agent_params(
+                    &base,
+                    HostExtras {
+                        mcp: mcp.clone(),
+                        loaded_instructions: baseline.loaded().clone(),
+                        user_response_rx: Some(Arc::clone(&answer_rx)),
+                    },
+                    live_resolver(),
+                    routed_mode(&mode_route, Arc::new(|| AgentMode::Build)),
+                    Arc::clone(&base.subagent_cancels),
+                ),
+                events: EventSender::new(agent_tx.clone(), BACKGROUND_EVENT_RUN_ID),
+            });
+            let (held, notice) = start_interrupted(&interruption, &params.config, restarter);
+            (held, Some(notice))
+        }
+        None => (None, None),
+    };
     let subagent_cancels = Arc::clone(&base.subagent_cancels);
     let learner = (params.config.continual_learning
         && params.workspace_session.is_none()
@@ -3857,10 +4009,13 @@ async fn spawn_prepared_session(
                                     },
                                     futures_lite::future::or(
                                         async {
-                                            if let Some(background) = &background {
-                                                background.notified().await;
-                                            } else {
-                                                futures_lite::future::pending::<()>().await;
+                                            // A wake runs as the last run's continuation,
+                                            // so without one a report waits for a prompt.
+                                            match &background {
+                                                Some(background) if continuation.is_some() => {
+                                                    background.notified().await;
+                                                }
+                                                _ => futures_lite::future::pending::<()>().await,
                                             }
                                             NextInput::Background
                                         },
@@ -4279,6 +4434,14 @@ async fn spawn_prepared_session(
                         .splice(0..0, delivery.messages.iter().cloned());
                 }
                 input.preamble.extend(workflow_delivery.iter().cloned());
+                let resumed = held_resume.take().is_some_and(|held| {
+                    input.preamble.insert(0, held.nudge);
+                    input.resume |= held.resume;
+                    held.resume
+                });
+                if let Some(store) = &mut *store.lock().await {
+                    store.open_run(resumed);
+                }
                 if background_enabled {
                     let _ = run_tx.send(InteractiveRun {
                         run_id,
@@ -4704,6 +4867,11 @@ async fn spawn_prepared_session(
                     if matches!(result, Ok(DoneReason::Cancelled)) {
                         store.kill_unfinished_subagents();
                     }
+                    store.settle_open_run(
+                        background
+                            .as_ref()
+                            .is_some_and(BackgroundTasks::interrupting),
+                    );
                     if let Err(error) = store.record_turn(&history, model.spec(), &permissions) {
                         let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
                             message: format!("{PERSIST_FAILED}: {error}"),
@@ -4790,6 +4958,7 @@ async fn spawn_prepared_session(
         event_rx,
         run_rx,
         background,
+        interrupted,
         tool_names,
         input_tx,
         pending_inputs,
@@ -6642,7 +6811,7 @@ complete(#{ report: first.output });
             spawn_prepared_session(
                 PreparedInteractive {
                     params,
-                    history: History::default(),
+                    items: Vec::new(),
                     model: Model::from_spec(MODEL_SPEC).unwrap(),
                     provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
                     store,

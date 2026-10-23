@@ -7,6 +7,7 @@
 //! both paths use the Subagent model purpose unless explicitly overridden.
 
 use std::env;
+use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -62,10 +63,10 @@ use crate::types::counted;
 use crate::{
     ActivityChild, Agent, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams,
     AgentRunParams, BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History,
-    InterruptSource, McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity,
-    SubagentEnd, SubagentHistoryError, SubagentHistoryLease, SubagentHistoryStore, SubagentInfo,
-    SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, ToolInput,
-    ToolOutput, reasoning_summary, steering_queue,
+    InterruptSource, McpSession, SharedHistory, SteeringQueue, SteeringQueueReceiver,
+    SubagentActivity, SubagentEnd, SubagentHistoryError, SubagentHistoryLease,
+    SubagentHistoryStore, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
+    SubagentTaskSpecCandidate, ToolInput, ToolOutput, reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -519,6 +520,14 @@ impl Subagent {
         let spec = serde_json::to_value(self.history_lease.as_ref().and_then(|lease| lease.spec()))
             .map_err(|error| error.to_string())?;
         Ok((history, spec))
+    }
+
+    /// Publishes the transcript as each message commits, for a saver that
+    /// keeps it while the task runs.
+    pub(crate) fn mirror_history(&mut self) -> SharedHistory {
+        let mirror = SharedHistory::default();
+        self.history = mem::take(&mut self.history).with_mirror(Arc::clone(&mirror));
+        mirror
     }
 
     pub(crate) fn report_ready(&self) -> bool {

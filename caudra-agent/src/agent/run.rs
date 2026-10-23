@@ -36,8 +36,8 @@ use super::goal::{
 };
 use super::goal_progress::{GoalPace, GoalTurn, Judgement, MAX_GOAL_WAITS, turn_fingerprint};
 use super::history::{
-    CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history,
-    settle_failed_attempt, user_request,
+    CANCEL_MARKER, History, SHUTDOWN_MARKER, sanitize_cancelled_history, sanitize_failed_history,
+    sanitize_shutdown_history, settle_failed_attempt, user_request,
 };
 use super::instructions::LoadedInstructions;
 use super::measured::{MeasuredContext, SentRequest};
@@ -976,7 +976,8 @@ impl<'h> Agent<'h> {
             }
         }
         if inputs.last().is_some_and(|input| input.resume) {
-            self.prepare_resume();
+            let prompted = inputs.iter().any(|input| !input.preamble.is_empty());
+            self.prepare_resume(prompted);
         }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
@@ -1044,9 +1045,20 @@ impl<'h> Agent<'h> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                if sanitize_cancelled_history(self.history, self.rollback_len) {
+                let shutdown = self
+                    .background
+                    .as_ref()
+                    .is_some_and(BackgroundTasks::interrupting);
+                let (closed, marker) = if shutdown {
+                    let closed = sanitize_shutdown_history(self.history, self.rollback_len);
+                    (closed, SHUTDOWN_MARKER)
+                } else {
+                    let closed = sanitize_cancelled_history(self.history, self.rollback_len);
+                    (closed, CANCEL_MARKER)
+                };
+                if closed {
                     let _ = self.event_tx.send(AgentEvent::Injected {
-                        text: CANCEL_MARKER.into(),
+                        text: marker.into(),
                         task_event: None,
                         peer_event: None,
                         automation_event: None,
@@ -1161,14 +1173,16 @@ impl<'h> Agent<'h> {
     /// somewhere the model can answer from. Dropping the cancel marker puts it
     /// back on the tool result the loop stopped at; when the reply itself was
     /// cut there is no such seam, and an assistant tail would go out as a
-    /// prefill, which providers reject once reasoning is on.
-    fn prepare_resume(&mut self) {
+    /// prefill, which providers reject once reasoning is on. A `prompted`
+    /// resume brings its own message to answer, so it needs no seam.
+    fn prepare_resume(&mut self, prompted: bool) {
         self.history.drop_run_marker();
-        if self
-            .history
-            .as_slice()
-            .last()
-            .is_none_or(|message| matches!(message.role, Role::Assistant))
+        if !prompted
+            && self
+                .history
+                .as_slice()
+                .last()
+                .is_none_or(|message| matches!(message.role, Role::Assistant))
         {
             self.push_injected(Message::synthetic(RESUME_PROMPT.into()));
         }
@@ -1537,7 +1551,7 @@ impl<'h> Agent<'h> {
         if !autopilot.is_engaged() {
             return Err(error);
         }
-        self.prepare_resume();
+        self.prepare_resume(false);
         let wake = autopilot.sleep(delay);
         let nudged = self.retry_now.listen();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);

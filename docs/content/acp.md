@@ -86,6 +86,8 @@ ACP session ids are Caudra session ids, the same ones the TUI's session picker a
 
 A prompt, close, or option change naming a session that is not open fails with `-32002` (resource not found), and so does a load, resume, or fork of a session that does not exist. Extra directories an editor asks for are checked but grant nothing: a session reaches only its working directory.
 
+A session that Caudra stopping cut off mid-work resumes its tasks as it loads or resumes, and its next prompt picks the cut-off turn back up. The `session/load` and `session/resume` responses then carry `_meta.caudra.interrupted` with `main` (a turn was running), `tasks` (the task IDs of the main chat's tasks), and `resumed` (whether Caudra restarted them). See [Resuming after a restart](/docs/sessions/#resuming-after-a-restart).
+
 The model-written session name reaches the editor as a `session_info_update`. Loading, resuming, or forking a named session sends its stored title and last-update time right after the response.
 
 MCP servers the editor passes on `session/new` and `session/load` join the servers from `mcp.toml`. Caudra connects to stdio and HTTP servers and drops other transports with a warning. A remote Workcell session refuses editor servers with `invalid_params`. Project MCP startup trust must already be approved through `/mcp` in the TUI. ACP returns an actionable session error instead of silently omitting a parked server.

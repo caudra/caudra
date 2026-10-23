@@ -157,6 +157,8 @@ pub enum StartedBy {
     Mailbox,
     /// Autopilot's implement turn, or its check-in on a resumed session.
     Autopilot,
+    /// A turn Caudra stopping cut off, picked back up when its session reopened.
+    Resume,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -812,6 +814,7 @@ mod tests {
     #[test_case(StartedBy::Goal => json!({"kind": "goal"}); "goal")]
     #[test_case(StartedBy::Mailbox => json!({"kind": "mailbox"}); "mailbox")]
     #[test_case(StartedBy::Autopilot => json!({"kind": "autopilot"}); "autopilot")]
+    #[test_case(StartedBy::Resume => json!({"kind": "resume"}); "resume")]
     fn started_by_uses_the_plan_names(started_by: StartedBy) -> Value {
         serde_json::to_value(started_by).expect(MUST_SERIALIZE)
     }

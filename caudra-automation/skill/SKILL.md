@@ -287,7 +287,7 @@ The fields of each trigger follow. Untrusted ones are marked U.
 - `error_kind`: `"rate_limit"`, `"overloaded"`, `"auth"`, `"timeout"`, `"network"`, `"other"`, or `()`
 - `error` U: the error message, or `()`
 - `last_response` U: the final response, at most 32 KiB
-- `started_by`: `#{ kind }` for the first run of the period. `kind` is `"user"`, `"automation"` (with `automation` and `fire_id`), `"peer"` (a message, with `message_id`, `sender`, `sender_kind`, `audience`, and `topic`), `"work"` (a work item, with `group`, `work`, `attempt`, `max_attempts`, `message_id`, and `topic`), `"background"`, `"workflow"`, `"goal"`, `"mailbox"`, or `"autopilot"`. For `"peer"` and `"work"`, `message_id` is the id the model saw the message by, and a script's message has `sender: ()`.
+- `started_by`: `#{ kind }` for the first run of the period. `kind` is `"user"`, `"automation"` (with `automation` and `fire_id`), `"peer"` (a message, with `message_id`, `sender`, `sender_kind`, `audience`, and `topic`), `"work"` (a work item, with `group`, `work`, `attempt`, `max_attempts`, `message_id`, and `topic`), `"background"`, `"workflow"`, `"goal"`, `"mailbox"`, `"autopilot"`, or `"resume"` (a turn Caudra stopping cut off, picked back up when the session reopened). For `"peer"` and `"work"`, `message_id` is the id the model saw the message by, and a script's message has `sender: ()`.
 - `automations`: the names of the automations whose messages were delivered during the period
 - `runs`: how many runs it held
 - `busy_s`: its length in seconds

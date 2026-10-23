@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema::v1::{
     AgentResponse, CloseSessionResponse, DeleteSessionResponse, Error as AcpError,
-    ForkSessionRequest, ForkSessionResponse, McpServer, NewSessionRequest, RequestId,
+    ForkSessionRequest, ForkSessionResponse, McpServer, Meta, NewSessionRequest, RequestId,
     ResumeSessionResponse, SessionId, SessionUpdate,
 };
 use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams, PreparedInteractive};
@@ -21,6 +21,7 @@ use caudra_storage::sessions::{PermissionMode, SessionError, SessionLease};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
 use flume::Sender;
+use serde_json::json;
 
 use crate::asks::ClientProfile;
 use crate::child_work::Children;
@@ -35,9 +36,11 @@ use crate::restore::{
 };
 use crate::server::Incoming;
 use crate::session::SessionState;
+use crate::translate::META_NAMESPACE;
 use crate::{AcpParams, AcpRuntime, AcpRuntimeGuard, AcpRuntimeResolver, methods};
 
 const SESSION_IN_USE_ERROR_CODE: i32 = -32001;
+pub(crate) const META_INTERRUPTED: &str = "interrupted";
 pub(crate) const RUNTIME_SHUTDOWN_FAILED: &str = "Session runtime did not shut down; its lease is retained. Restart the ACP server before loading this session again.";
 const WORKSPACE_IDENTITY_CHANGED: &str =
     "session workspace identity changed; runtime detached, no local fallback";
@@ -596,7 +599,8 @@ pub(crate) fn load_response(state: &mut SessionState, model_specs: &[String]) ->
     AgentResponse::LoadSessionResponse(
         methods::load_session_response()
             .modes(methods::mode_state(state.mode_id()))
-            .config_options(state.hand_over_options(model_specs)),
+            .config_options(state.hand_over_options(model_specs))
+            .meta(interrupted_meta(&mut state.handle)),
     )
 }
 
@@ -604,8 +608,20 @@ pub(crate) fn resume_response(state: &mut SessionState, model_specs: &[String]) 
     AgentResponse::ResumeSessionResponse(
         ResumeSessionResponse::new()
             .modes(methods::mode_state(state.mode_id()))
-            .config_options(state.hand_over_options(model_specs)),
+            .config_options(state.hand_over_options(model_specs))
+            .meta(interrupted_meta(&mut state.handle)),
     )
+}
+
+/// `_meta.caudra.interrupted` for a session that opened on work Caudra
+/// stopping cut off, so a client can offer to resume what was not. Said
+/// once: a later load of the open session finds nothing new cut off.
+fn interrupted_meta(handle: &mut InteractiveHandle) -> Option<Meta> {
+    let notice = serde_json::to_value(handle.interrupted.take()?).ok()?;
+    Some(Meta::from_iter([(
+        META_NAMESPACE.to_owned(),
+        json!({ META_INTERRUPTED: notice }),
+    )]))
 }
 
 fn fork_response(state: &mut SessionState, model_specs: &[String]) -> AgentResponse {
