@@ -716,6 +716,7 @@ impl App {
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
             inserts,
+            restored.turns,
         );
         attach_card_decisions(&mut display_msgs, restored.cards);
         let mut reachable_subagents = reachable_subagent_ids(
@@ -1696,6 +1697,7 @@ fn render_subagent_displays(
             tool_output_lines,
             show_reminders,
             restored.rows,
+            restored.turns,
         );
         attach_card_decisions(&mut display, restored.cards);
         (display, restore)

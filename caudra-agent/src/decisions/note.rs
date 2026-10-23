@@ -1,3 +1,5 @@
+use std::mem;
+
 use caudra_config::decisions::FeatureMode;
 use caudra_storage::engine_decisions::{
     StoredDecisionAnchor, StoredDecisionOutcome, StoredEngineDecision,
@@ -230,20 +232,32 @@ impl NoteSink {
         let pending = decisions.enabled(&feature);
         if pending {
             self.event_tx.try_send(AgentEvent::DecisionPending(Box::new(
-                self.pending(&feature),
+                self.pending(&feature, Vec::new()),
             )));
         }
         PendingNote {
             sink: Some(self.clone()),
             feature,
             pending,
+            near_misses: Vec::new(),
         }
     }
 
-    fn pending(&self, feature: &DecisionFeature) -> PendingDecision {
+    /// Says `feature` looked at this anchor and had nothing to ask the engine,
+    /// `reason` saying why: a settle with no wait before it, so no time.
+    pub fn skipped(&self, decisions: &Decisions, feature: DecisionFeature, reason: &str) {
+        if decisions.enabled(&feature) {
+            self.event_tx.try_send(AgentEvent::DecisionSettled(Box::new(
+                self.pending(&feature, vec![reason.to_owned()]),
+            )));
+        }
+    }
+
+    fn pending(&self, feature: &DecisionFeature, details: Vec<String>) -> PendingDecision {
         PendingDecision {
             feature: feature.clone(),
             anchor: self.anchor.clone(),
+            details,
         }
     }
 }
@@ -254,6 +268,11 @@ pub struct PendingDecision {
     #[serde(serialize_with = "feature_name")]
     pub feature: DecisionFeature,
     pub anchor: NoteAnchor,
+    /// Empty while it waits. Settled without a note, what the engine weighed
+    /// and found short of the bar, one candidate per line, or, settled without
+    /// a wait, why the engine was not asked. Never stored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
 }
 
 /// Holds a [`PendingDecision`] open. Emitting the note settles it; dropped
@@ -263,6 +282,7 @@ pub struct PendingNote {
     sink: Option<NoteSink>,
     feature: DecisionFeature,
     pending: bool,
+    near_misses: Vec<String>,
 }
 
 impl PendingNote {
@@ -272,7 +292,13 @@ impl PendingNote {
             sink: None,
             feature,
             pending: false,
+            near_misses: Vec::new(),
         }
+    }
+
+    /// Ends the wait without a note, saying what came closest.
+    pub fn quiet(mut self, near_misses: Vec<String>) {
+        self.near_misses = bounded_details(near_misses, MAX_NOTE_BYTES);
     }
 
     pub fn emit(mut self, draft: NoteDraft) {
@@ -293,7 +319,7 @@ impl Drop for PendingNote {
     fn drop(&mut self) {
         if let Some(sink) = self.sink.as_ref().filter(|_| self.pending) {
             sink.event_tx.try_send(AgentEvent::DecisionSettled(Box::new(
-                sink.pending(&self.feature),
+                sink.pending(&self.feature, mem::take(&mut self.near_misses)),
             )));
         }
     }
@@ -583,9 +609,39 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_answer_says_what_came_closest_as_it_settles() {
+        let (sink, decisions, events, _root) = sink_for(FeatureMode::Enforce);
+        sink.begin(&decisions, DecisionFeature::SourceCodeContext)
+            .quiet(details(1, DETAIL));
+        let settled: Vec<Vec<String>> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::DecisionSettled(settled) => Some(settled.details),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled, [details(1, DETAIL)]);
+    }
+
+    #[test]
+    fn a_skip_settles_without_a_wait_and_says_why() {
+        let (sink, decisions, events, _root) = sink_for(FeatureMode::Enforce);
+        sink.skipped(&decisions, DecisionFeature::SourceCodeContext, DETAIL);
+        let heard: Vec<(bool, Vec<String>)> = events
+            .try_iter()
+            .map(|envelope| match envelope.event {
+                AgentEvent::DecisionSettled(settled) => (true, settled.details),
+                _ => (false, Vec::new()),
+            })
+            .collect();
+        assert_eq!(heard, [(true, details(1, DETAIL))]);
+    }
+
+    #[test]
     fn a_feature_that_is_off_never_waits() {
         let (sink, decisions, events, _root) = sink_for(FeatureMode::Off);
         drop(sink.begin(&decisions, DecisionFeature::SourceCodeContext));
+        sink.skipped(&decisions, DecisionFeature::SourceCodeContext, DETAIL);
         assert!(heard(&events).is_empty());
     }
 

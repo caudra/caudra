@@ -1,7 +1,7 @@
 {
   "k": 5,
   "baseline": {"ndcg_at_k": 0.635, "recall_at_k": 0.658, "p50_ms": 6223, "p95_ms": 6320},
-  "baseline_note": "Six synthetic, hand-labelled cases, and eleven whose candidates are the 64 rows source_code_context returned on this repository for a commit's subject, the relevant rows being the symbols its diff changed. Measured 2026-10-21 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The Workcell order that the feature falls back to scored nDCG@k 0.123 and recall@k 0.183 on the same cases; judging only the first 16 scored nDCG@k 0.560 and recall@k 0.553.",
+  "baseline_note": "Six synthetic, hand-labelled cases, and eleven whose candidates are the 64 rows source_code_context returned on this repository for a commit's subject, the relevant rows being the symbols its diff changed. Measured 2026-10-21 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model decision-1. The Workcell order that the feature falls back to scored nDCG@k 0.123 and recall@k 0.183 on the same cases; judging only the first 16 scored nDCG@k 0.560 and recall@k 0.553.",
   "cases": [
     {
       "query": "where do we invalidate the cache after a write",

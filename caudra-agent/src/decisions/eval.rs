@@ -47,7 +47,8 @@ use crate::agent::{
     suggested_skill,
 };
 use crate::history::{self, PoolJudgement};
-use crate::memory::relevance::{self, Advice, Judge};
+use crate::memory::relevance::tests::note_store;
+use crate::memory::relevance::{self, Advice, Judge, MAX_RECALLED, RecallFocus, RecallQuery};
 use crate::memory::search::{Candidate, Hit};
 use crate::permissions::{PermissionResource, decision_state};
 use crate::tools::native::skill::{SkillInventoryEntry, SkillScope};
@@ -87,6 +88,10 @@ const RANK_CASE_EMPTY: &str = "a case needs a query and candidates";
 const RANK_RELEVANT_OUT_OF_RANGE: &str = "a relevant index is not a candidate";
 const RANK_CANDIDATE_UNBOUNDED: &str = "a candidate exceeds the bounded decision context";
 const NOTE_INVALID: &str = "a memory candidate needs a name, a heading and a body";
+const POOL_OUTSIDE_FIXTURE: &str = "the recall pool named a note the case never wrote";
+const NAME_FIELD: &str = "name";
+/// The confidence levels a recall run reports what it would name at.
+const RECALL_SWEEP: [f64; 5] = [0.7, 0.75, 0.8, 0.85, 0.9];
 const EXCERPT_INVALID: &str =
     "a history candidate needs a known kind, an ISO date, a title and a snippet";
 const NEW_NOTE_INVALID: &str =
@@ -220,6 +225,36 @@ struct RankCase {
     query: String,
     candidates: Vec<Value>,
     relevant: BTreeSet<usize>,
+    #[serde(default)]
+    focus: CaseFocus,
+}
+
+/// What a recall case's session is working on besides its request.
+#[derive(Default, Deserialize)]
+struct CaseFocus {
+    working_on: Option<String>,
+    #[serde(default)]
+    open_todos: Vec<String>,
+    previous_request: Option<String>,
+}
+
+impl CaseFocus {
+    fn todos(&self) -> Vec<TodoItem> {
+        let todo = |content: &String, status| TodoItem {
+            content: content.clone(),
+            status,
+            priority: TodoPriority::default(),
+        };
+        self.working_on
+            .iter()
+            .map(|content| todo(content, TodoStatus::InProgress))
+            .chain(
+                self.open_todos
+                    .iter()
+                    .map(|content| todo(content, TodoStatus::Pending)),
+            )
+            .collect()
+    }
 }
 
 /// A match in a history fixture, as the keyword ranker would offer it.
@@ -422,6 +457,7 @@ fn decision_eval() {
         ]
     });
     smol::block_on(async {
+        report_recall_sweep(judge, include_str!("eval/memory_recall.json")).await;
         report_narrowed(
             "memory_search",
             include_str!("eval/memory_search.json"),
@@ -1064,11 +1100,155 @@ async fn memory_search_case(judge: &Judge, case: RankCase) -> Ranking {
     }
 }
 
+/// A recall end to end: the case's notes are the store, the word pool picks
+/// what the engine judges, and notes the pool missed rank last.
 async fn memory_recall_case(judge: &Judge, case: RankCase) -> Ranking {
+    let recalled = recall(judge, &case).await;
+    let mut order: Vec<usize> = match &recalled.advice {
+        Some(advice) => advice
+            .order()
+            .into_iter()
+            .map(|index| recalled.pooled[index])
+            .collect(),
+        None => recalled.pooled.clone(),
+    };
+    order.extend((0..case.candidates.len()).filter(|index| !recalled.pooled.contains(index)));
+    Ranking {
+        order,
+        advised: recalled.advice.map_or_else(Vec::new, |advice| {
+            advice
+                .advised
+                .iter()
+                .map(|index| recalled.pooled[*index])
+                .collect()
+        }),
+        latency_ms: recalled.latency_ms,
+    }
+}
+
+/// What one recall case pooled, by fixture index, and what the engine said
+/// of the pool.
+struct Recalled {
+    pooled: Vec<usize>,
+    advice: Option<Advice>,
+    latency_ms: u64,
+}
+
+async fn recall(judge: &Judge, case: &RankCase) -> Recalled {
     let notes = memory_notes(&case.candidates).expect(RANK_FIXTURE_INVALID);
+    let state = tempfile::tempdir().unwrap();
+    let written: Vec<(&str, &str)> = notes
+        .iter()
+        .map(|note| (note.hit.name.as_str(), note.excerpt.as_str()))
+        .collect();
+    let store = note_store(state.path(), &written);
+    let todos = case.focus.todos();
+    let query = RecallQuery::new(
+        &case.query,
+        RecallFocus {
+            todos: &todos,
+            previous_request: case.focus.previous_request.as_deref(),
+            goal: None,
+        },
+    );
     let started = Instant::now();
-    let advice = relevance::recall_advice(judge, &case.query, &notes).await;
-    advised(advice.ok(), &notes, started)
+    let pool = relevance::fresh_recall_pool(&store, &query);
+    let pooled = pool
+        .iter()
+        .map(|pooled| {
+            notes
+                .iter()
+                .position(|note| note.hit.name == pooled.hit.name)
+                .expect(POOL_OUTSIDE_FIXTURE)
+        })
+        .collect();
+    let advice = match pool.is_empty() {
+        true => None,
+        false => relevance::recall_advice(judge, &query, &pool).await.ok(),
+    };
+    Recalled {
+        pooled,
+        advice,
+        latency_ms: latency_since(started),
+    }
+}
+
+/// Prints how many relevant notes reach the pool, and what each threshold
+/// in [`RECALL_SWEEP`] would name. Never gates the run.
+async fn report_recall_sweep(judge: &Judge, fixture: &str) {
+    let fixture = rank_fixture(fixture).expect(RANK_FIXTURE_INVALID);
+    let mut relevant_total = 0;
+    let mut pooled_relevant = 0;
+    let mut unrelated_best = 0.0_f64;
+    let mut runs = Vec::new();
+    for case in &fixture.cases {
+        let recalled = recall(judge, case).await;
+        relevant_total += case.relevant.len();
+        pooled_relevant += recalled
+            .pooled
+            .iter()
+            .filter(|index| case.relevant.contains(index))
+            .count();
+        let missed: Vec<&str> = case
+            .relevant
+            .iter()
+            .filter(|index| !recalled.pooled.contains(index))
+            .filter_map(|index| case.candidates[*index][NAME_FIELD].as_str())
+            .collect();
+        if !missed.is_empty() {
+            println!("  memory_recall {:?}: pool missed {missed:?}", case.query);
+        }
+        if let Some(advice) = &recalled.advice {
+            unrelated_best = recalled
+                .pooled
+                .iter()
+                .zip(advice.scores())
+                .filter(|(index, _)| !case.relevant.contains(index))
+                .fold(unrelated_best, |best, (_, score)| best.max(*score));
+        }
+        let scored: Vec<(usize, f64)> = recalled.advice.as_ref().map_or_else(Vec::new, |advice| {
+            recalled
+                .pooled
+                .iter()
+                .copied()
+                .zip(advice.scores().iter().copied())
+                .collect()
+        });
+        runs.push((scored, &case.relevant));
+    }
+    println!(
+        "memory_recall pool_recall {:.3} ({pooled_relevant}/{relevant_total}), best unrelated score {unrelated_best:.3}",
+        ratio(pooled_relevant, relevant_total)
+    );
+    for threshold in RECALL_SWEEP {
+        let (mut named, mut wrong, mut right) = (0, 0, 0);
+        for (scored, relevant) in &runs {
+            let mut confident: Vec<&(usize, f64)> = scored
+                .iter()
+                .filter(|(_, score)| *score >= threshold)
+                .collect();
+            confident.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (index, _) in confident.into_iter().take(MAX_RECALLED) {
+                named += 1;
+                match relevant.contains(index) {
+                    true => right += 1,
+                    false => wrong += 1,
+                }
+            }
+        }
+        println!(
+            "  at {threshold:.2}: named {named}, recall {:.3}, false advice {:.3}",
+            ratio(right, relevant_total),
+            ratio(wrong, named)
+        );
+    }
+}
+
+fn ratio(part: usize, whole: usize) -> f64 {
+    match whole {
+        0 => 0.0,
+        whole => part as f64 / whole as f64,
+    }
 }
 
 async fn memory_duplicates_case(judge: &Judge, case: RankCase) -> Ranking {

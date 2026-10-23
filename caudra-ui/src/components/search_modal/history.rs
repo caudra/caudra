@@ -2,8 +2,9 @@
 //! the left, the selected hit in its context on the right.
 
 use std::ops::Range;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use caudra_agent::format_live_duration;
 use caudra_agent::history::Ranking;
 use caudra_grab::grab_scope;
 use caudra_storage::history_search::{
@@ -21,6 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::animation::live_elapsed;
 use crate::components::keybindings::key;
 use crate::components::list_picker::truncate_label;
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
@@ -104,7 +106,7 @@ pub(crate) struct HistoryPane {
     scroll: usize,
     viewport_hits: usize,
     pub(crate) status: HistoryStatus,
-    reranking: bool,
+    reranking: Option<Instant>,
     sort: HistorySort,
     rerank: bool,
     rerank_available: bool,
@@ -132,7 +134,7 @@ impl HistoryPane {
             scroll: 0,
             viewport_hits: 0,
             status: HistoryStatus::Empty,
-            reranking: false,
+            reranking: None,
             sort: HistorySort::Relevance,
             rerank: true,
             rerank_available: false,
@@ -240,13 +242,14 @@ impl HistoryPane {
         self.status = status;
     }
 
+    /// Each rerank sent replaces the one before it, so its clock starts over.
     pub(crate) fn set_reranking(&mut self, reranking: bool) {
-        self.reranking = reranking;
+        self.reranking = reranking.then(Instant::now);
     }
 
     /// Whether a search or a rerank is on its way, which keeps the spinner turning.
     pub(super) fn busy(&self) -> bool {
-        self.reranking || self.status == HistoryStatus::Searching
+        self.reranking.is_some() || self.status == HistoryStatus::Searching
     }
 
     pub(super) fn rerank_offered(&self) -> bool {
@@ -477,10 +480,14 @@ impl HistoryPane {
             }
         };
         let mut spans = Vec::new();
-        if self.reranking {
+        if let Some(since) = self.reranking {
             spans.push(Span::styled(
                 format!("{} {RERANKING} ", spinner_frame()),
                 t.spinner,
+            ));
+            spans.push(Span::styled(
+                format!("{}{SEPARATOR}", format_live_duration(live_elapsed(since))),
+                t.item_desc,
             ));
         }
         spans.push(Span::styled(text, t.item_desc));
@@ -874,4 +881,39 @@ fn spinner_frame() -> &'static str {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
     SPINNER_FRAMES[(elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{HistoryPane, RERANKING};
+    use crate::animation::test_clock::FrozenClock;
+
+    const RERANKED_FOR: Duration = Duration::from_millis(1_234);
+    const RERANKED_FOR_TEXT: &str = "1.2s";
+
+    fn status(pane: &HistoryPane) -> String {
+        pane.status_line(false, false)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_rerank_on_its_way_says_how_long_it_has_run() {
+        let _clock = FrozenClock::at(RERANKED_FOR);
+        let mut pane = HistoryPane::new();
+
+        pane.set_reranking(true);
+        assert!(
+            status(&pane).contains(&format!("{RERANKING} {RERANKED_FOR_TEXT}")),
+            "{}",
+            status(&pane)
+        );
+
+        pane.set_reranking(false);
+        assert!(!status(&pane).contains(RERANKING));
+    }
 }

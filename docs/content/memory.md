@@ -120,10 +120,12 @@ Three [decision features](/docs/configuration/#reranking) can judge which notes 
 | Feature | Mode | Effect |
 |---------|------|--------|
 | `memory_search` | `enforce` | `search` takes up to 64 word matches and shows the ones the engine scores at or above `relevance_floor`, most relevant first, up to 10. A notice names the matches it left out, and `read` still opens any of them |
-| `memory_recall` | `advise` | At each new user message in the main session, a reminder names up to 3 notes that the engine scores at or above `routing_confidence` for that message. A note is named once per conversation, and the agent reads it before relying on it |
+| `memory_recall` | `advise` | A reminder names up to 3 notes that the engine scores at or above `recall_confidence`. It runs at each new user message, when a todo step starts, when a goal check finds the goal unmet, and after compaction. A note is named once per conversation, and the agent reads it before relying on it |
 | `memory_duplicates` | `advise` | After `write` creates a note under a new name, the receipt names existing notes that may cover the same topic and suggests rewriting one of them instead |
 
-Recall weighs the 16 notes that share the most significant words with the message and uses the shorter `timeout_ms` deadline, because it runs before the turn starts. It runs at the same time as skill suggestions. A write is never blocked or changed by duplicate advice. When the engine fails, times out, or refuses, search shows its word matches as before and the other two add nothing.
+Recall judges the message together with what the session is working on: the todo in progress, up to 3 open todos, the request before a short one such as "commit this", and, after a goal check, the goal and the evaluator's reason. It weighs the 16 notes that share the most significant words with all of these. A rare word counts for more than a common one, a word matches its other forms, so "resizing" finds "resize", and notes the conversation already read are left out. At a new message, recall runs before the turn starts, at the same time as skill suggestions, within `timeout_ms`, and a chip at the right edge of your message counts the wait. Click the chip to see which notes recall named, and the notes that came closest with their scores against `recall_confidence`. A recall when a step starts or a goal check fails comes at least 5 model requests after the previous one.
+
+Subagents recall too, from the notes their `memory` tool reads, although their prompt has no view. The [learner](/docs/learning/) never recalls. A write is never blocked or changed by duplicate advice. When the engine fails, times out, or refuses, search shows its word matches as before and the other two add nothing.
 
 ## Summaries and spend
 

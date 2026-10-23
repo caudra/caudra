@@ -1,7 +1,7 @@
 //! Word search over the current notes: the way in to what the view only
 //! names, or has folded into a line about something else.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::decisions::RERANK_POOL;
 
@@ -16,10 +16,14 @@ pub const MAX_LINE_BYTES: usize = 200;
 
 const NAME_WEIGHT: usize = 4;
 const BODY_WEIGHT: usize = 1;
-/// A note shares at least one word of its name or heading, or two of its
-/// body, before it counts as related.
-const MIN_RELATED_SCORE: usize = 2;
 const MARKDOWN_SUFFIX: &str = ".md";
+const PLURAL_SUFFIXES: &[&str] = &["es", "s"];
+/// What a plural ending never follows, so "process", "status" and
+/// "analysis" keep their `s`.
+const KEPT_BEFORE_S: &[char] = &['s', 'u', 'i'];
+const WORD_ENDINGS: &[&str] = &["ing", "ed", "e"];
+/// The shortest stem an ending is dropped from, so "bus" and "used" stay.
+const MIN_STEM_BYTES: usize = 3;
 const ELLIPSIS: &str = "…";
 /// Words too common to say which candidate a request wants, including the
 /// "use" that skill descriptions open with by convention.
@@ -108,26 +112,48 @@ pub fn pool<'a>(
         .collect()
 }
 
-/// The notes sharing the most of `words`, at most `limit`: whole words, a
-/// word in a note's name or heading counting more than one in its body, and
+/// The notes sharing the most of `words`, at most `limit`: whole words, plural
+/// or inflected or not, a word in a note's name or heading counting more than
+/// one in its body, a word few notes hold counting more than one most do, and
 /// the more recent note winning a tie.
 pub fn related<'a>(
     words: &BTreeSet<String>,
     documents: impl IntoIterator<Item = Document<'a>>,
     limit: usize,
 ) -> Vec<Candidate> {
-    let scored = documents
+    let words = folded(words.iter().map(String::as_str));
+    let documents: Vec<(Document<'a>, BTreeSet<String>, BTreeSet<String>)> = documents
         .into_iter()
-        .filter_map(|document| {
-            let mut titled = name_words(document.name);
-            titled.extend(significant_words(document.heading));
-            let score = NAME_WEIGHT * titled.intersection(words).count()
-                + BODY_WEIGHT * significant_words(document.body).intersection(words).count();
-            (score >= MIN_RELATED_SCORE).then_some((score, document))
+        .map(|document| {
+            let titled = folded(
+                name_words(document.name)
+                    .iter()
+                    .chain(&significant_words(document.heading))
+                    .map(String::as_str),
+            );
+            let body = folded(significant_words(document.body).iter().map(String::as_str));
+            (document, titled, body)
         })
         .collect();
-    best(scored, limit)
-        .map(|document| Candidate {
+    let rarity = Rarity::new(
+        &words,
+        documents.iter().map(|(_, titled, body)| (titled, body)),
+    );
+    let mut scored: Vec<(f64, Document<'a>)> = documents
+        .into_iter()
+        .filter_map(|(document, titled, body)| {
+            let titled: Vec<&String> = titled.intersection(&words).collect();
+            let body: Vec<&String> = body.intersection(&words).collect();
+            let score =
+                NAME_WEIGHT as f64 * rarity.sum(&titled) + BODY_WEIGHT as f64 * rarity.sum(&body);
+            (!titled.is_empty() || !body.is_empty()).then_some((score, document))
+        })
+        .collect();
+    scored.sort_by(|(a_score, a), (b_score, b)| b_score.total_cmp(a_score).then(b.seq.cmp(&a.seq)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, document)| Candidate {
             hit: Hit {
                 seq: document.seq,
                 name: document.name.to_owned(),
@@ -137,6 +163,66 @@ pub fn related<'a>(
             excerpt: excerpt(document.body),
         })
         .collect()
+}
+
+/// `words` cut to their stems, so "ports" meets "port" and "resizing" meets
+/// "resize".
+fn folded<'a>(words: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
+    words.map(|word| stem(word).to_owned()).collect()
+}
+
+/// `word` without a plural ending, then without an `-ing`, `-ed` or `-e`. The
+/// stem need not be a word, only the same for every form of one.
+fn stem(word: &str) -> &str {
+    let singular = strip(word, PLURAL_SUFFIXES, |stem| !stem.ends_with(KEPT_BEFORE_S));
+    strip(singular, WORD_ENDINGS, |_| true)
+}
+
+fn strip<'a>(word: &'a str, suffixes: &[&str], allowed: impl Fn(&str) -> bool) -> &'a str {
+    suffixes
+        .iter()
+        .find_map(|suffix| {
+            word.strip_suffix(suffix)
+                .filter(|stem| stem.len() >= MIN_STEM_BYTES && allowed(stem))
+        })
+        .unwrap_or(word)
+}
+
+/// How much each query word says about a note: more the fewer notes hold it,
+/// smoothed so a word every note holds still counts for something.
+struct Rarity(HashMap<String, f64>);
+
+impl Rarity {
+    fn new<'a>(
+        words: &BTreeSet<String>,
+        documents: impl ExactSizeIterator<Item = (&'a BTreeSet<String>, &'a BTreeSet<String>)>,
+    ) -> Self {
+        let total = documents.len() as f64;
+        let mut holding: HashMap<&str, usize> = HashMap::new();
+        for (titled, body) in documents {
+            for word in words {
+                if titled.contains(word) || body.contains(word) {
+                    *holding.entry(word.as_str()).or_default() += 1;
+                }
+            }
+        }
+        Self(
+            words
+                .iter()
+                .map(|word| {
+                    let held = holding.get(word.as_str()).copied().unwrap_or_default() as f64;
+                    (word.clone(), ((total + 1.0) / (held + 1.0)).ln() + 1.0)
+                })
+                .collect(),
+        )
+    }
+
+    fn sum(&self, words: &[&String]) -> f64 {
+        words
+            .iter()
+            .map(|word| self.0.get(*word).copied().unwrap_or_default())
+            .sum()
+    }
 }
 
 fn matching<'a>(
@@ -321,8 +407,8 @@ mod tests {
     }
 
     #[test_case("release tagging", &["release.md"] ; "a_title_word_is_enough")]
-    #[test_case("tags signed", &["notes.md"] ; "two_body_words_are_enough")]
-    #[test_case("signed", &[] ; "one_body_word_is_not")]
+    #[test_case("signed", &["notes.md"] ; "one_body_word_is_enough")]
+    #[test_case("signed release", &["release.md", "notes.md"] ; "a_title_word_outranks_a_body_word")]
     #[test_case("md", &[] ; "the_markdown_suffix_says_nothing")]
     #[test_case("rel", &[] ; "only_whole_words_count")]
     fn related_notes_share_whole_words(text: &str, expected: &[&str]) {
@@ -338,6 +424,58 @@ mod tests {
             .map(|candidate| candidate.hit.name.as_str())
             .collect();
         assert_eq!(names, expected);
+    }
+
+    #[test_case("port conflicts", &["ports.md"] ; "a_plural_title_meets_its_singular")]
+    #[test_case("signing tags", &["notes.md"] ; "an_inflected_body_word_meets_its_root")]
+    #[test_case("listening resizes", &["ports.md", "notes.md"] ; "more_shared_word_forms_rank_higher")]
+    fn related_notes_fold_word_forms(text: &str, expected: &[&str]) {
+        let documents = [
+            document(0, "ports.md", "Dev server listens on 3000 and resizes."),
+            document(1, "notes.md", "Each tag is signed. The tags resize."),
+        ];
+
+        let related = related(&significant_words(text), documents, MAX_HITS);
+
+        let names: Vec<&str> = related
+            .iter()
+            .map(|candidate| candidate.hit.name.as_str())
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test_case(&["ports", "port"] ; "plural")]
+    #[test_case(&["processes", "processing", "process"] ; "doubled_s")]
+    #[test_case(&["statuses", "status"] ; "us_ending")]
+    #[test_case(&["resizing", "resized", "resizes", "resize"] ; "silent_e")]
+    #[test_case(&["strings", "string"] ; "ing_root")]
+    fn the_forms_of_a_word_share_a_stem(forms: &[&str]) {
+        assert_eq!(folded(forms.iter().copied()).len(), 1);
+    }
+
+    #[test_case("bus" ; "short_word")]
+    #[test_case("process" ; "doubled_s")]
+    #[test_case("status" ; "us_ending")]
+    #[test_case("analysis" ; "is_ending")]
+    fn a_word_without_an_ending_is_its_own_stem(word: &str) {
+        assert_eq!(stem(word), word);
+    }
+
+    #[test]
+    fn a_rare_shared_word_outranks_a_common_one() {
+        let documents = [
+            document(0, "flaky.md", "Bind a free port."),
+            document(1, "tests-a.md", "Body."),
+            document(2, "tests-b.md", "Body."),
+            document(3, "tests-c.md", "Body."),
+        ];
+
+        let related = related(&significant_words("flaky tests"), documents, MAX_HITS);
+
+        assert_eq!(
+            related.first().map(|candidate| candidate.hit.name.as_str()),
+            Some("flaky.md")
+        );
     }
 
     #[test]

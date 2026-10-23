@@ -2124,8 +2124,8 @@ mod auth_tests {
     const TYPESAFE: &str = "typesafe";
     const TUNNEL: &str = "tunnel";
     const TUNNEL_BASE_URL: &str = "http://100.64.0.2:8080/v1";
-    const TUNNEL_MODEL: &str = "systemone-decision-v7";
-    const TUNNEL_LABEL: &str = "openai · systemone-decision-v7";
+    const TUNNEL_MODEL: &str = "decision-1";
+    const TUNNEL_LABEL: &str = "openai · decision-1";
     const MASKED_KEY: &str = "sk-1...cdef";
     const KEY_VARIABLE: &str = "TYPESAFE_API_KEY";
     const MENU: LoginMenu = LoginMenu {

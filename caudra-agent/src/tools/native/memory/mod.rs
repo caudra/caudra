@@ -377,16 +377,8 @@ impl MemoryCall {
         })
     }
 
-    /// The local project's notes, or a remote session's, which the document
-    /// store keeps on this machine.
     fn store(&self, ctx: &ToolContext) -> Result<Arc<MemoryStore>, ToolError> {
-        Ok(match ctx.workspace_session {
-            Some(_) => MemoryStore::for_documents(scoped_store(ctx)?)?,
-            None => {
-                let cwd = self.cwd.as_deref().ok_or(CWD_UNRESOLVED)?;
-                MemoryStore::for_cwd(&StateDir::resolve().map_err(MemoryError::from)?, cwd)?
-            }
-        })
+        open_store(ctx, self.cwd.as_deref())
     }
 
     /// Reconciles first, so the call sees notes edited outside the tool. A
@@ -586,6 +578,21 @@ fn judge(ctx: &ToolContext) -> Option<Judge> {
             .decision_context(json!({DECISION_TOOL_KEY: crate::tools::MEMORY_TOOL_NAME})),
         permissions: Some(Arc::clone(&ctx.permissions)),
         cancel: ctx.cancel.clone(),
+    })
+}
+
+/// The notes the memory tool reads under `ctx`: the local project's at `cwd`,
+/// or a remote session's, which the document store keeps on this machine.
+pub(crate) fn open_store(
+    ctx: &ToolContext,
+    cwd: Option<&Path>,
+) -> Result<Arc<MemoryStore>, ToolError> {
+    Ok(match ctx.workspace_session {
+        Some(_) => MemoryStore::for_documents(scoped_store(ctx)?)?,
+        None => {
+            let cwd = cwd.ok_or(CWD_UNRESOLVED)?;
+            MemoryStore::for_cwd(&StateDir::resolve().map_err(MemoryError::from)?, cwd)?
+        }
     })
 }
 

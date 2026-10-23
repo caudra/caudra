@@ -27,7 +27,7 @@ use super::run::{estimate_message_tokens, push_injected, stranded_reminders};
 use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use crate::cancel::CancelToken;
-use crate::decisions::NoteAnchor;
+use crate::decisions::{DecisionFeature, NoteAnchor, NoteSink};
 use crate::nudge::Nudge;
 use crate::{
     AgentError, AgentEvent, BackgroundReminderContext, DoneReason, EventSender, TurnCompleteEvent,
@@ -162,7 +162,14 @@ pub(super) async fn compact_history(
         .for_each(Message::detach_documents);
     strip_thinking(&mut compaction_history);
     let (plan, note) = match &retention {
-        Some(retention) => rank_tool_results(&compaction_history, retention, cancel).await,
+        Some(retention) => {
+            let _waiting = NoteSink::new(
+                event_tx.clone(),
+                NoteAnchor::History(history.transcript().count()),
+            )
+            .begin(&retention.decisions, DecisionFeature::CompactionRetention);
+            rank_tool_results(&compaction_history, retention, cancel).await
+        }
         None => (None, None),
     };
     strip_old_tool_results(&mut compaction_history, plan.as_ref());

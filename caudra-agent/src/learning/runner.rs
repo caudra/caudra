@@ -41,10 +41,11 @@ const NO_FILE: &str = "(no such file yet)";
 const NO_BLOCK: &str = "(no learned block yet)";
 
 /// A session's task host narrowed to what a learner may do: `code` and
-/// `memory` only, nobody to ask, history held to this project, and a task
-/// history of its own that nothing persists.
+/// `memory` only, no recall, nobody to ask, history held to this project,
+/// and a task history of its own that nothing persists.
 pub fn learner_host(mut host: WorkflowHostContext) -> WorkflowHostContext {
     host.config.history_project_only = true;
+    host.config.no_memory_recall = true;
     host.user_response_rx = None;
     host.subagent_history = SubagentHistoryStore::default();
     host.jobs = None;

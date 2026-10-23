@@ -1,7 +1,7 @@
 {
   "k": 2,
   "baseline": {"ndcg_at_k": 1.0, "recall_at_k": 1.0, "false_advice_rate": 0.0, "p50_ms": 711, "p95_ms": 895},
-  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The line order that the feature falls back to scored nDCG@k 0.222 and recall@k 0.250 on the same cases.",
+  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model decision-1. The line order that the feature falls back to scored nDCG@k 0.222 and recall@k 0.250 on the same cases.",
   "cases": [
     {
       "query": "cargo test --workspace\nThe parser tests fail after my change to tokenizer.rs, find out why and fix it.",

@@ -173,7 +173,9 @@ impl LearnTranscripts {
             MouseEventKind::Up(MouseButton::Left)
                 if pressed && on_body && !chat.armed_card_at(event.column, event.row) =>
             {
-                chat.handle_click(event.row, body);
+                if !chat.toggle_decisions_at(event.column, event.row, body) {
+                    chat.handle_click(event.row, body);
+                }
             }
             MouseEventKind::ScrollUp => chat.scroll(-LINE_STEP),
             MouseEventKind::ScrollDown => chat.scroll(LINE_STEP),

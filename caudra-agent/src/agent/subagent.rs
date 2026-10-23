@@ -6,6 +6,7 @@
 //! through here. The task path resolves its prompt and tools from a profile;
 //! both paths use the Subagent model purpose unless explicitly overridden.
 
+use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use caudra_config::decisions::FeatureMode;
 use caudra_config::{CODE_TOOL_NAME, ModelPolicy, ProfileToolPolicy};
 use caudra_decision::{Answer, DecisionResponse, ScoreAnswer};
 use serde_json::{Value as JsonValue, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::model_lookup::{ModelLookupError, find_model};
@@ -46,14 +47,16 @@ use crate::decisions::{
     DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteDraft, NoteOutcome,
     redacted_excerpt,
 };
+use crate::memory::store::MemoryStore;
 use crate::permissions::PassiveDecisionRevision;
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
+use crate::tools::native::memory;
 use crate::tools::native::plan::PlanTarget;
 use crate::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
-    ToolFilter, ToolLive,
+    Deadline, DescriptionContext, FileReadTracker, LocalTools, MEMORY_TOOL_NAME, ToolAudience,
+    ToolContext, ToolFilter, ToolLive,
 };
 use crate::types::counted;
 use crate::{
@@ -499,6 +502,8 @@ pub struct Subagent {
     steering: SharedSteering,
     report_ready: Option<Arc<AtomicBool>>,
     terminal_report: Option<Arc<AtomicBool>>,
+    /// Recalled from on every prompt, with no memory view in its prompt.
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 impl Subagent {
@@ -731,7 +736,7 @@ impl Subagent {
                 event_tx: self.sub_event_tx.clone(),
                 tools: self.tools.clone(),
                 tools_fixed: false,
-                memory_store: None,
+                memory_store: self.memory_store.clone(),
             },
         )
         .with_user_response_rx(Arc::clone(&self.answer_rx))
@@ -1821,6 +1826,7 @@ fn build(
         .insert(resolved.task_id.clone(), child_trigger);
 
     info!(name = %name, model = %resolved.model.id, "subagent session opened");
+    let memory_store = recall_store(ctx, &tool_filter);
     let context_publisher = ctx
         .context_publisher
         .as_ref()
@@ -1921,7 +1927,26 @@ fn build(
         usage_rx,
         start: Instant::now(),
         closed: false,
+        memory_store,
     })
+}
+
+/// The notes a child recalls from: the ones its memory tool would read,
+/// opened only while recall is on and the child may use that tool. Never a
+/// learner's.
+fn recall_store(ctx: &ToolContext, tool_filter: &ToolFilter) -> Option<Arc<MemoryStore>> {
+    let recalls = !ctx.config.no_memory_recall
+        && tool_filter.matches(MEMORY_TOOL_NAME)
+        && ctx
+            .permissions
+            .decisions()
+            .is_some_and(|decisions| decisions.enabled(&DecisionFeature::MemoryRecall));
+    if !recalls {
+        return None;
+    }
+    memory::open_store(ctx, env::current_dir().ok().as_deref())
+        .inspect_err(|error| warn!(%error, "subagent memory recall unavailable"))
+        .ok()
 }
 
 fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {

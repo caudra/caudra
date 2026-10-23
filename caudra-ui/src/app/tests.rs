@@ -28834,6 +28834,7 @@ mod engine_decisions {
     use caudra_config::decisions::FeatureMode;
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::sessions::{SessionDatabase, StoredSubagent, StoredSubagentOutcome};
+    use std::iter;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -28873,24 +28874,28 @@ mod engine_decisions {
         title.rsplit(DECISION_SEPARATOR).next().unwrap_or_default()
     }
 
-    /// A card by its call followed by the decisions it carries, a decision
-    /// row by its summary, anything else by its text.
+    /// A card by its call and any other row by its text, each followed by the
+    /// decisions it carries, and a decision row by its summary.
     fn placement(chat: &Chat) -> Vec<&str> {
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
-            .flat_map(|message| match &message.role {
-                DisplayRole::Tool(tool) => {
-                    std::iter::once(tool.id.as_str())
-                        .chain(message.decisions.iter().filter_map(
-                            |decision| match &decision.state {
+            .flat_map(|message| {
+                let shown = match &message.role {
+                    DisplayRole::Tool(tool) => tool.id.as_str(),
+                    DisplayRole::Decision(..) => decision_summary(&message.text),
+                    _ => message.text.as_str(),
+                };
+                iter::once(shown)
+                    .chain(
+                        message
+                            .decisions
+                            .iter()
+                            .filter_map(|decision| match &decision.state {
                                 DecisionState::Settled { text, .. } => Some(decision_summary(text)),
-                                DecisionState::Pending => None,
-                            },
-                        ))
-                        .collect::<Vec<_>>()
-                }
-                DisplayRole::Decision(_) => vec![decision_summary(&message.text)],
-                _ => vec![message.text.as_str()],
+                                DecisionState::Pending { .. } | DecisionState::Quiet { .. } => None,
+                            }),
+                    )
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -28937,8 +28942,8 @@ mod engine_decisions {
     }
 
     /// The App keeps each row through the storage writer, and a reopened
-    /// session draws the main agent's under its call and the task's in the
-    /// task's own transcript, unless decisions are hidden.
+    /// session draws the main agent's on its call's card and the task's on
+    /// the task's prompt, unless decisions are hidden.
     #[test_case(true ; "shown")]
     #[test_case(false ; "hidden")]
     fn decision_rows_survive_a_reload(shown: bool) {

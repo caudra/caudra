@@ -68,12 +68,12 @@ use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
-    NoteDraft, NoteOutcome, push_fitting, question_tool_nudge, redact_decision_text,
-    redacted_excerpt,
+    NoteDraft, NoteOutcome, NoteSink, PendingNote, push_fitting, question_tool_nudge,
+    redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
 use crate::mcp::code::catalog;
-use crate::memory::relevance::{Judge, Recall};
+use crate::memory::relevance::{Judge, Recall, RecallFocus, RecallQuery, Recalled};
 use crate::memory::search::significant_words;
 use crate::memory::store::MemoryStore;
 use crate::nudge::Nudge;
@@ -89,7 +89,7 @@ use crate::tools::{
     TASK_TOOL_NAME,
 };
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
-use crate::types::{AutopilotEvent, TodoItem};
+use crate::types::{AutopilotEvent, TodoItem, TodoStatus};
 use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, BackgroundReminderContext,
@@ -97,7 +97,7 @@ use crate::{
     QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_automation::request::AutomationError;
-use caudra_config::decisions::FeatureMode;
+use caudra_config::decisions::{DecisionThresholds, FeatureMode};
 use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_decision::{Answer, ChoiceAnswer, Question, QuestionSet, QuestionType};
 use caudra_storage::autopilot::AutopilotEnd;
@@ -127,12 +127,21 @@ const SKILL_DESCRIPTION_EXCERPT_BYTES: usize = 320;
 const MAX_SKILL_CANDIDATES: usize = 8;
 const SKILL_SUGGESTED: &str = "suggested skill";
 const SKILL_FALLBACK: &str = "suggested no skill";
+/// Most of the likeliest skills a quiet suggestion reports.
+const MAX_SKILL_NEAR_MISSES: usize = 2;
+const SKILL_BELOW_THE_BAR: &str = "below";
+/// The shortlist is empty when no unloaded skill shares a word with the
+/// request, and when the request names a skill itself.
+const NO_SKILL_MATCHED: &str = "not asked: no skill left to offer for this request";
 const QUESTION_NUDGED: &str = "asked the agent to use the question tool";
 const QUESTION_NUDGE_FALLBACK: &str = "left the reply without a question-tool reminder";
 const GOAL_SKIPPED: &str = "skipped the goal check";
 const GOAL_PRESCREEN_FALLBACK: &str = "ran the goal check";
 const THRESHOLD_LABEL: &str = "threshold";
 const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
+/// Provider requests a recall the agent starts on its own waits after the
+/// last one, so a burst of todo updates asks the engine once.
+const RECALL_SPACING_REQUESTS: usize = 5;
 pub(crate) const GOAL_MET_QUESTION: &str = "goal_met";
 const GOAL_PRESCREEN_CONTINUATION: &str =
     "Continue working toward the goal. Verify the remaining requirements before finishing.";
@@ -323,6 +332,28 @@ enum TurnOutcome {
     Done(DoneReason),
 }
 
+/// Why the agent recalls notes: a new request, or a point in its own work
+/// where what it needs may have changed.
+#[derive(Clone, Copy)]
+enum RecallTrigger<'a> {
+    Request(&'a str),
+    /// A different todo is now in progress.
+    StepStarted,
+    /// The goal evaluator found the goal unmet, for `reason`.
+    GoalContinued {
+        condition: &'a str,
+        reason: &'a str,
+    },
+    /// Compaction summarized earlier reminders away.
+    Compacted,
+}
+
+impl RecallTrigger<'_> {
+    fn spaced(self) -> bool {
+        matches!(self, Self::StepStarted | Self::GoalContinued { .. })
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentParams {
     pub background: Option<crate::background::BackgroundTasks>,
@@ -404,8 +435,8 @@ pub struct AgentRunParams<'h> {
     /// configured when it was fixed. They are then sent as given, and a call
     /// to a tool that is no longer available fails at dispatch.
     pub tools_fixed: bool,
-    /// The project's notes, which a main session's turn may recall from.
-    /// `None` for a subagent.
+    /// The project's notes, which the agent's turns may recall from. `None`
+    /// where nothing should be recalled, as for the learner.
     pub memory_store: Option<Arc<MemoryStore>>,
 }
 
@@ -525,6 +556,9 @@ pub struct Agent<'h> {
     /// The group work item this run last reminded autopilot's agent to report.
     work_reminded: Option<String>,
     memory_store: Option<Arc<MemoryStore>>,
+    /// Provider requests since the last recall, which spaces the recalls the
+    /// agent starts on its own.
+    requests_since_recall: usize,
 }
 
 impl<'h> Agent<'h> {
@@ -689,6 +723,7 @@ impl<'h> Agent<'h> {
             autopilot_observed: None,
             work_reminded: None,
             memory_store: run.memory_store,
+            requests_since_recall: 0,
         }
     }
 
@@ -948,23 +983,17 @@ impl<'h> Agent<'h> {
         if !self.tools_fixed {
             self.configure_profile_tools();
         }
-        let recall = self.memory_recall(&message, peer_wake);
+        let recall = (!peer_wake)
+            .then(|| self.memory_recall(RecallTrigger::Request(&message)))
+            .flatten();
         let (skill_suggestion, recalled) = future::zip(self.suggest_skill(&message), async {
             match recall {
-                Some(recall) => recall.run(&message).await,
+                Some(recall) => recall.run().await,
                 None => None,
             }
         })
         .await;
-        if let Some(recalled) = recalled {
-            recalled.record();
-            if let Some(note) = recalled.note {
-                self.emit_decision(note);
-            }
-            if let Some(reminder) = recalled.reminder {
-                self.push_injected(Message::synthetic(reminder));
-            }
-        }
+        self.push_recalled(recalled);
 
         info!(
             model = %self.model.id,
@@ -1783,6 +1812,7 @@ impl<'h> Agent<'h> {
         let Some(questions) = decision_questions::QUESTION_TOOL_NUDGE.as_ref() else {
             return Ok(None);
         };
+        let pending = self.decision_rows().begin(&decisions, feature.clone());
         let outcome = self
             .cancel
             .race(self.permissions.run_passive_decision(decisions.evaluate(
@@ -1815,7 +1845,7 @@ impl<'h> Agent<'h> {
         ) {
             (FeatureMode::Advise, Some(probability)) => probability,
             (FeatureMode::Shadow, Some(probability)) => {
-                self.emit_decision(question_nudge_note(
+                pending.emit(question_nudge_note(
                     &decisions,
                     NoteOutcome::Shadow,
                     probability,
@@ -1825,7 +1855,7 @@ impl<'h> Agent<'h> {
             }
             (FeatureMode::Advise, None) => {
                 if let Some(failure) = outcome.fresh_failure() {
-                    self.emit_decision(NoteDraft::fell_back(
+                    pending.emit(NoteDraft::fell_back(
                         &decisions,
                         DecisionFeature::QuestionToolNudge,
                         &failure,
@@ -1850,7 +1880,7 @@ impl<'h> Agent<'h> {
         }
         self.response_text = None;
         self.count_continuation();
-        self.emit_decision(question_nudge_note(
+        pending.emit(question_nudge_note(
             &decisions,
             NoteOutcome::Acted,
             probability,
@@ -2361,6 +2391,7 @@ impl<'h> Agent<'h> {
         };
         let request_epoch = self.history.epoch();
         let request_started = Instant::now();
+        self.requests_since_recall += 1;
         let message_id = CaudraId::generate();
         self.event_tx
             .send(AgentEvent::MessageStarted { id: message_id })?;
@@ -2587,6 +2618,7 @@ impl<'h> Agent<'h> {
             && !self.session_work().running
             && steering::visible_text(&response.message)
                 .is_some_and(|text| steering::abandons_turn(&text));
+        let step_before = self.step_in_progress();
         let (observed, all_repairable) = if has_tools {
             self.response_text = None;
             self.process_tool_calls(response, repair_state, message_id)
@@ -2806,6 +2838,12 @@ impl<'h> Agent<'h> {
         // one by reopening a normal final answer.
         if matches!(outcome, TurnOutcome::Continue) && !compacted {
             self.inject_advisory();
+            if self
+                .step_in_progress()
+                .is_some_and(|step| step_before.as_ref() != Some(&step))
+            {
+                self.recall_while_working(RecallTrigger::StepStarted).await;
+            }
         }
         self.publish_prepared_context();
         Ok(outcome)
@@ -2946,11 +2984,13 @@ impl<'h> Agent<'h> {
         }
 
         let evaluation = goal.evaluations.saturating_add(1);
-        let prescreen = self.prescreen_goal(&goal.condition).await;
+        let (prescreen, pending) = self.prescreen_goal(&goal.condition).await.unzip();
         if !self.goal_completion_ready() {
             return self.defer_goal(done_reason);
         }
-        if let Some((decisions, outcome)) = &prescreen {
+        if let Some((decisions, outcome)) = &prescreen
+            && let Some(pending) = pending
+        {
             let threshold = decisions.config().thresholds.goal_skip_below;
             let skip = should_skip_goal(
                 &FeatureMode::Enforce,
@@ -2967,7 +3007,7 @@ impl<'h> Agent<'h> {
                     if !self.goal.is_generation_active(goal.generation) {
                         return Ok(TurnOutcome::Done(done_reason));
                     }
-                    self.emit_decision(goal_skip_note(
+                    pending.emit(goal_skip_note(
                         decisions,
                         NoteOutcome::Acted,
                         probability,
@@ -3011,7 +3051,7 @@ impl<'h> Agent<'h> {
                     return Ok(TurnOutcome::Continue);
                 }
                 (FeatureMode::Shadow, Some(probability)) => {
-                    self.emit_decision(goal_skip_note(
+                    pending.emit(goal_skip_note(
                         decisions,
                         NoteOutcome::Shadow,
                         probability,
@@ -3020,7 +3060,7 @@ impl<'h> Agent<'h> {
                 }
                 (FeatureMode::Enforce, None) => {
                     if let Some(failure) = outcome.fresh_failure() {
-                        self.emit_decision(NoteDraft::fell_back(
+                        pending.emit(NoteDraft::fell_back(
                             decisions,
                             DecisionFeature::GoalPrescreen,
                             &failure,
@@ -3301,20 +3341,31 @@ impl<'h> Agent<'h> {
                 if let Some(guidance) = guidance {
                     self.push_injected(guidance);
                 }
+                self.recall_while_working(RecallTrigger::GoalContinued {
+                    condition: &goal.condition,
+                    reason: &reason,
+                })
+                .await;
                 self.mark_goal_turn();
                 Ok(TurnOutcome::Continue)
             }
         }
     }
 
-    /// The recall a main session's turn runs next to the skill suggestion,
-    /// built from what it owns so the two can ask the engine at once.
-    fn memory_recall(&self, request: &str, peer_wake: bool) -> Option<Recall> {
-        if peer_wake
-            || request.trim().is_empty()
-            || !self.is_main_session()
-            || !self.tool_filter.matches(MEMORY_TOOL_NAME)
-        {
+    /// The recall `trigger` asks for, built from what the agent owns so a
+    /// turn's first recall can ask the engine next to the skill suggestion.
+    /// The ones the agent starts on its own while it works wait
+    /// [`RECALL_SPACING_REQUESTS`] provider requests after the last.
+    fn memory_recall(&mut self, trigger: RecallTrigger<'_>) -> Option<Recall> {
+        if trigger.spaced() && self.requests_since_recall < RECALL_SPACING_REQUESTS {
+            return None;
+        }
+        let request = match trigger {
+            RecallTrigger::Request(request) => Some(request),
+            _ => self.history.latest_user_request(),
+        }
+        .filter(|request| !request.trim().is_empty())?;
+        if !self.tool_filter.matches(MEMORY_TOOL_NAME) {
             return None;
         }
         let store = Arc::clone(self.memory_store.as_ref()?);
@@ -3322,13 +3373,57 @@ impl<'h> Agent<'h> {
             .permissions
             .decisions()
             .filter(|decisions| decisions.enabled(&DecisionFeature::MemoryRecall))?;
+        let query = RecallQuery::new(
+            request,
+            RecallFocus {
+                todos: self.history.todos().unwrap_or_default(),
+                previous_request: self.history.user_requests().nth(1),
+                goal: match trigger {
+                    RecallTrigger::GoalContinued { condition, reason } => Some((condition, reason)),
+                    _ => None,
+                },
+            },
+        );
         let judge = Judge {
             decisions,
             context: self.decision_context(),
             permissions: Some(Arc::clone(&self.permissions)),
             cancel: self.cancel.clone(),
         };
-        Some(Recall::new(judge, store, self.history.as_slice()))
+        self.requests_since_recall = 0;
+        Some(Recall::new(
+            judge,
+            store,
+            self.history.as_slice(),
+            query,
+            self.decision_rows(),
+        ))
+    }
+
+    /// The todo the agent is working on.
+    fn step_in_progress(&self) -> Option<String> {
+        self.history
+            .todos()?
+            .iter()
+            .find(|todo| todo.status == TodoStatus::InProgress)
+            .map(|todo| todo.content.clone())
+    }
+
+    /// Pushes what a recall named, once it named something.
+    fn push_recalled(&mut self, recalled: Option<Recalled>) {
+        if let Some(recalled) = recalled {
+            recalled.record();
+            self.push_injected(Message::synthetic(recalled.reminder));
+        }
+    }
+
+    /// Runs the recall `trigger` asks for while the agent works on its own,
+    /// so its reminder reaches the next request.
+    async fn recall_while_working(&mut self, trigger: RecallTrigger<'_>) {
+        if let Some(recall) = self.memory_recall(trigger) {
+            let recalled = recall.run().await;
+            self.push_recalled(recalled);
+        }
     }
 
     async fn suggest_skill(&mut self, task: &str) -> Option<SkillSuggestion> {
@@ -3342,7 +3437,12 @@ impl<'h> Agent<'h> {
         }
         let loaded = loaded_skills(&self.history.transcript_items());
         let candidates = skill_shortlist(task, skill::inventory(&self.registry), &loaded);
-        let questions = skill_questions(&candidates)?;
+        let Some(questions) = skill_questions(&candidates) else {
+            self.decision_rows()
+                .skipped(&decisions, feature, NO_SKILL_MATCHED);
+            return None;
+        };
+        let pending = self.decision_rows().begin(&decisions, feature.clone());
         let outcome = self
             .cancel
             .race(self.permissions.run_passive_decision(decisions.evaluate(
@@ -3355,18 +3455,15 @@ impl<'h> Agent<'h> {
             .ok()
             .flatten()
             .flatten()?;
-        let suggestion = suggested_skill(
-            &outcome,
-            &candidates,
-            decisions.config().thresholds.routing_confidence,
-        )
-        .zip(skill_answer(&outcome));
+        let threshold = decisions.config().thresholds.routing_confidence;
+        let suggestion =
+            suggested_skill(&outcome, &candidates, threshold).zip(skill_answer(&outcome));
         match (
             decisions.mode(&DecisionFeature::SkillSuggestions),
             suggestion,
         ) {
             (FeatureMode::Advise, Some(suggestion @ (name, _))) => {
-                self.emit_decision(skill_note(
+                pending.emit(skill_note(
                     &decisions,
                     NoteOutcome::Acted,
                     suggestion,
@@ -3378,23 +3475,28 @@ impl<'h> Agent<'h> {
                 }
             }
             (FeatureMode::Shadow, Some(suggestion)) => {
-                self.emit_decision(skill_note(
+                pending.emit(skill_note(
                     &decisions,
                     NoteOutcome::Shadow,
                     suggestion,
                     &candidates,
                 ));
             }
-            (FeatureMode::Advise, None) => {
-                if let Some(failure) = outcome.fresh_failure() {
-                    self.emit_decision(NoteDraft::fell_back(
-                        &decisions,
-                        DecisionFeature::SkillSuggestions,
-                        &failure,
-                        SKILL_FALLBACK,
-                    ));
-                }
+            (FeatureMode::Advise, None) if let Some(failure) = outcome.fresh_failure() => {
+                pending.emit(NoteDraft::fell_back(
+                    &decisions,
+                    DecisionFeature::SkillSuggestions,
+                    &failure,
+                    SKILL_FALLBACK,
+                ));
             }
+            (_, None) => pending.quiet(
+                skill_answer(&outcome)
+                    .map(|answer| {
+                        skill_near_misses(answer, &candidates, &decisions.config().thresholds)
+                    })
+                    .unwrap_or_default(),
+            ),
             _ => {}
         }
         Some(SkillSuggestion {
@@ -3411,20 +3513,30 @@ impl<'h> Agent<'h> {
             .decision_context(json!({"turn": self.turn_id}))
     }
 
-    /// Reports what a decision feature did this turn, for a row placed before
-    /// the next transcript item: emit it before pushing what the decision
-    /// added, so the row sits above it.
-    pub(crate) fn emit_decision(&self, draft: NoteDraft) {
-        let anchor = NoteAnchor::History(self.history.transcript().count());
-        self.event_tx.try_send(draft.anchored(anchor));
+    /// Where this turn's decision rows go: before the next transcript item, so
+    /// emit a row before pushing what the decision added. Its `begin` says a
+    /// feature is waiting on the engine there until the row, or nothing, comes.
+    fn decision_rows(&self) -> NoteSink {
+        NoteSink::new(
+            self.event_tx.clone(),
+            NoteAnchor::History(self.history.transcript().count()),
+        )
     }
 
-    async fn prescreen_goal(&self, condition: &str) -> Option<(Decisions, DecisionOutcome)> {
+    /// The prescreen's answer, with the wait it announced, which its row
+    /// settles.
+    async fn prescreen_goal(
+        &self,
+        condition: &str,
+    ) -> Option<((Decisions, DecisionOutcome), PendingNote)> {
         let decisions = self.permissions.decisions()?;
         if !decisions.enabled(&DecisionFeature::GoalPrescreen) {
             return None;
         }
         let questions = decision_questions::GOAL.as_ref()?;
+        let pending = self
+            .decision_rows()
+            .begin(&decisions, DecisionFeature::GoalPrescreen);
         let state = goal_prescreen_state(
             condition,
             self.response_text.as_deref(),
@@ -3443,7 +3555,7 @@ impl<'h> Agent<'h> {
             .ok()
             .flatten()
             .flatten()?;
-        Some((decisions, outcome))
+        Some(((decisions, outcome), pending))
     }
 
     /// A check of `evaluation` with nothing but its outcome, placed after the
@@ -3988,8 +4100,7 @@ impl<'h> Agent<'h> {
                         message,
                     })?;
             }
-            self.event_tx.send(AgentEvent::Compacting)?;
-            self.do_compact().await?;
+            self.auto_compact().await?;
             input = self.request_context_size();
         }
         let input_ceiling = self
@@ -4022,9 +4133,17 @@ impl<'h> Agent<'h> {
             return Ok(false);
         }
         info!(context_size, "auto-compacting");
+        self.auto_compact().await?;
+        Ok(true)
+    }
+
+    /// Compacts in the middle of the agent's work, then recalls what the
+    /// summary may have taken out of view.
+    async fn auto_compact(&mut self) -> Result<(), AgentError> {
         self.event_tx.send(AgentEvent::Compacting)?;
         self.do_compact().await?;
-        Ok(true)
+        self.recall_while_working(RecallTrigger::Compacted).await;
+        Ok(())
     }
 
     async fn do_compact(&mut self) -> Result<(), AgentError> {
@@ -4380,14 +4499,7 @@ fn skill_note(
     (name, answer): (&str, &ChoiceAnswer),
     candidates: &[SkillInventoryEntry],
 ) -> NoteDraft {
-    let mut options: Vec<(&str, f64)> = candidates
-        .iter()
-        .map(|skill| skill.name.as_str())
-        .chain([SKILL_NONE])
-        .filter_map(|option| Some((option, *answer.probabilities.get(option)?)))
-        .collect();
-    options.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-    let details = options
+    let details = skill_options(answer, candidates)
         .into_iter()
         .map(|(option, probability)| format!("{probability:.2}  {option}"))
         .collect();
@@ -4398,6 +4510,41 @@ fn skill_note(
         &format!("{SKILL_SUGGESTED} {name} ({:.2})", answer.confidence),
         details,
     )
+}
+
+/// Each offered option with its probability, most likely first.
+fn skill_options<'a>(
+    answer: &ChoiceAnswer,
+    candidates: &'a [SkillInventoryEntry],
+) -> Vec<(&'a str, f64)> {
+    let mut options: Vec<(&str, f64)> = candidates
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .chain([SKILL_NONE])
+        .filter_map(|option| Some((option, *answer.probabilities.get(option)?)))
+        .collect();
+    options.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    options
+}
+
+/// The likeliest skills when none was likely enough to suggest, none below
+/// `thresholds.relevance_floor`, each against the bar it missed.
+fn skill_near_misses(
+    answer: &ChoiceAnswer,
+    candidates: &[SkillInventoryEntry],
+    thresholds: &DecisionThresholds,
+) -> Vec<String> {
+    let threshold = thresholds.routing_confidence;
+    skill_options(answer, candidates)
+        .into_iter()
+        .filter(|(option, probability)| {
+            *option != SKILL_NONE && *probability >= thresholds.relevance_floor
+        })
+        .take(MAX_SKILL_NEAR_MISSES)
+        .map(|(option, probability)| {
+            format!("{probability:.2}  {option}  {SKILL_BELOW_THE_BAR} {threshold:.2}")
+        })
+        .collect()
 }
 
 fn skill_reminder(name: &str) -> String {
@@ -4944,6 +5091,9 @@ mod tests {
     const RECALL_NOTE: &str = "release.md";
     const RECALL_CONTENT: &str = "# Release tags\nSign them before publishing.";
     const RECALL_ROOT: &str = "call-recall";
+    const UNRELATED_REQUEST: &str = "Tidy the workspace";
+    const PENDING_STATUS: &str = "pending";
+    const IN_PROGRESS_STATUS: &str = "in_progress";
 
     #[test]
     fn peer_wake_without_a_claim_does_not_request_the_model() {
@@ -5598,12 +5748,12 @@ mod tests {
     }
 
     #[test_case(|_| {}, true ; "main_session")]
-    #[test_case(|agent| agent.root_tool_use_id = Some(RECALL_ROOT.into()), false ; "subagent_run")]
-    #[test_case(|agent| agent.audience = ToolAudience::GENERAL_SUB, false ; "not_the_main_audience")]
+    #[test_case(|agent| agent.root_tool_use_id = Some(RECALL_ROOT.into()), true ; "subagent_run")]
+    #[test_case(|agent| agent.audience = ToolAudience::GENERAL_SUB, true ; "not_the_main_audience")]
     #[test_case(|agent| agent.tool_filter = ToolFilter::All.excluding(&[MEMORY_TOOL_NAME]), false ; "memory_tool_filtered_out")]
     #[test_case(|agent| agent.memory_store = None, false ; "no_memory")]
     #[test_case(|agent| agent.permissions.set_decisions(None), false ; "no_engine")]
-    fn memory_recall_reaches_only_a_main_session_that_can_read_memory(
+    fn memory_recall_reaches_any_agent_that_can_read_memory(
         adjust: fn(&mut Agent<'_>),
         recalled: bool,
     ) {
@@ -5651,19 +5801,81 @@ mod tests {
 
             assert_eq!(recall_reminders(&captured.lock().unwrap()[0]), reminders);
             assert_eq!(calls.load(Ordering::Relaxed), asked);
-            let rows: Vec<NoteOutcome> = events
+            let heard: Vec<Option<NoteOutcome>> = events
                 .try_iter()
                 .filter_map(|envelope| match envelope.event {
+                    AgentEvent::DecisionPending(pending)
+                        if pending.feature == DecisionFeature::MemoryRecall =>
+                    {
+                        Some(None)
+                    }
+                    AgentEvent::DecisionSettled(settled)
+                        if settled.feature == DecisionFeature::MemoryRecall =>
+                    {
+                        panic!("the row settles the wait")
+                    }
                     AgentEvent::Decision(note)
                         if note.feature == DecisionFeature::MemoryRecall
                             && matches!(note.anchor, NoteAnchor::History(_)) =>
                     {
-                        Some(note.outcome)
+                        Some(Some(note.outcome))
                     }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(rows, Vec::from_iter(outcome));
+            let expected: Vec<Option<NoteOutcome>> = outcome
+                .map(|outcome| vec![None, Some(outcome)])
+                .unwrap_or_default();
+            assert_eq!(heard, expected);
+        });
+    }
+
+    /// The model plans one step, waits `waiting` requests, then starts it;
+    /// the step's words are the only ones the note shares.
+    #[test_case(RECALL_SPACING_REQUESTS - 1, 1 ; "once_requests_have_passed")]
+    #[test_case(0, 0 ; "never_right_after_the_last")]
+    fn memory_recall_follows_a_started_step(waiting: usize, reminders: usize) {
+        smol::block_on(async {
+            let state = tempdir();
+            let step = |status: &str| {
+                tool_use_response(
+                    TODOWRITE_TOOL_NAME,
+                    json!({"todos": [{"content": RECALL_REQUEST, "status": status}]}),
+                )
+            };
+            let mut responses: Vec<StreamResponse> =
+                (0..waiting).map(|_| step(PENDING_STATUS)).collect();
+            responses.push(step(IN_PROGRESS_STATUS));
+            responses.extend([answer(FIRST_ANSWER), answer(SECOND_ANSWER)]);
+            let provider = MockProvider::new(responses);
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = recalling_agent(
+                &mut history,
+                state.path(),
+                FeatureMode::Advise,
+                NoteEngine::scoring(&[(RECALL_NOTE, RELEVANT)]),
+                provider,
+            );
+            install_todo_tool(&agent);
+
+            agent
+                .run(AgentInput {
+                    message: UNRELATED_REQUEST.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(
+                requests[..=waiting]
+                    .iter()
+                    .map(|request| recall_reminders(request))
+                    .sum::<usize>(),
+                0
+            );
+            assert_eq!(recall_reminders(&requests[waiting + 1]), reminders);
         });
     }
 
@@ -5888,7 +6100,7 @@ mod tests {
         let items = history.transcript().count();
         assert_ne!(items, history.len());
         let (agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
-        agent.emit_decision(NoteDraft {
+        agent.decision_rows().emit(NoteDraft {
             feature: DecisionFeature::MemoryRecall,
             mode: FeatureMode::Advise,
             outcome: NoteOutcome::Acted,

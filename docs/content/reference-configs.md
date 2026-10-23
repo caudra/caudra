@@ -1093,10 +1093,12 @@ version = 3
 # Type: string.
 # history_search = "off"
 
-# In main sessions, remind the agent of at most three saved notes likely
-# relevant to a new user message, without loading them. Sends a redacted
-# message excerpt and each keyword-matched note's name, heading, and redacted
-# excerpt. Modes: off, shadow, advise.
+# Remind the agent of at most three saved notes likely relevant to a new user
+# message, a todo step it starts, an unmet goal, or the work after compaction,
+# without loading them. Sends a redacted excerpt of the request and of the open
+# todos, the previous request when this one is short, and an unmet goal with
+# the evaluator's reason, and each keyword-matched note's name, heading, and
+# redacted excerpt. Modes: off, shadow, advise.
 # Type: string.
 # memory_recall = "off"
 
@@ -1152,9 +1154,8 @@ version = 3
 
 # Confidence required for skill suggestions. Subagent routing picks the Fast
 # model when this much difficulty probability is at or below routine work, and
-# the Best model when this much is on open-ended work. Memory recall, memory
-# duplicates, and output pointers name a candidate only at or above this
-# relevance probability.
+# the Best model when this much is on open-ended work. Memory duplicates and
+# output pointers name a candidate only at or above this relevance probability.
 # Type: float.
 # routing_confidence = 0.9
 
@@ -1181,6 +1182,11 @@ version = 3
 # emptied.
 # Type: float.
 # relevance_floor = 0.1
+
+# Relevance probability a note needs before memory recall names it in a
+# reminder.
+# Type: float.
+# recall_confidence = 0.75
 
 [automations]
 # Limits for automations, which need `automations = true` under [experimental].

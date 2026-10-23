@@ -499,7 +499,7 @@ mod tests {
         "ninfer-4090/qwen3.8-27b-grpo_sudoku",
         "ninfer-4090/qwen3.8-27b-random",
         "ninfer-4090/qwen3.8-27b-zero",
-        "ninfer-4090/systemone-decision-v7",
+        "ninfer-4090/decision-1",
         "anthropic/claude-haiku-5-5",
         "anthropic/claude-haiku-4-5",
         "anthropic/claude-sonnet-4-5",
@@ -573,11 +573,11 @@ mod tests {
     #[test_case("caveman7", &[], "ninfer-4090/qwen3.8-27b-caveman7" ; "a_variants_own_numbered_word")]
     #[test_case("distill 1.5", &[], "ninfer-4090/qwen3.8-27b-distill-1.5-8500" ; "variant_number_picks_its_latest_checkpoint")]
     #[test_case("distill 1.5 6500", &[], "ninfer-4090/qwen3.8-27b-distill-1.5-6500" ; "variant_checkpoint")]
-    #[test_case("systemone v7", &[], "ninfer-4090/systemone-decision-v7" ; "numbered_word_as_version")]
+    #[test_case("decision 1", &[], "ninfer-4090/decision-1" ; "trailing_number_as_version")]
     #[test_case("sudoku", &[], "ninfer-4090/qwen3.8-27b-grpo_sudoku" ; "underscore_separates_words")]
     #[test_case("qwen3.8", &[], "ninfer-4090/qwen3.8-27b" ; "qwen_numbered_word")]
     #[test_case("qwen zero", &[], "ninfer-4090/qwen3.8-27b-zero" ; "qwen_variant")]
-    #[test_case("systemone", &[], "ninfer-4090/systemone-decision-v7" ; "local_model")]
+    #[test_case("decision", &[], "ninfer-4090/decision-1" ; "local_model")]
     #[test_case("sonnet", &[COPILOT], "copilot/claude-sonnet-5.5" ; "copilot_dotted_sonnet")]
     #[test_case("opus", &[COPILOT], "copilot/claude-opus-5.5" ; "copilot_opus")]
     #[test_case("opus fast", &[], "copilot/claude-opus-4.8-fast" ; "copilot_fast_variant")]
