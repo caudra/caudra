@@ -71,7 +71,7 @@ timeout_secs = 180
 max_file_size_mb = 4
 ```
 
-All fields are optional. A file starts with `version = 3`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
+All fields are optional. A file starts with `version = 4`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
@@ -282,7 +282,6 @@ automations = true
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 | `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
-| `autopilot` | `false` | [Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot). |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -856,7 +855,7 @@ Only the permission question set currently supports a user-global file override:
 | `max_minutes` | u32 | unset | 1 | 525600 | Most wall-clock minutes per autopilot engagement while the session is open. Unset means no cap |
 | `error_retries` | u32 | `5` | 0 | 20 | Retries for transient provider errors during an autopilot engagement |
 
-[Autopilot](/docs/autopilot/) is experimental and needs `autopilot = true` under [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one.
+Limits for [autopilot](/docs/autopilot/). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one.
 
 ### `[web]`
 
@@ -971,7 +970,7 @@ Each TOML config file starts with a top-level `version`, the version of its form
 
 | File | Version | Without `version` | Newer than this build reads |
 |------|---------|-------------------|-----------------------------|
-| `caudra.toml` | 3 | Read as version 1 | Caudra stops with an error |
+| `caudra.toml` | 4 | Read as version 1 | Caudra stops with an error |
 | `permissions.toml` | 2 | Read as version 1 | Fails closed. Tool calls are denied until the file is fixed |
 | `mcp.toml` | 2 | Read as version 1 | Servers from that file do not start, and Caudra shows the error |
 | `providers.toml` | 1 | Read as version 1 | Caudra stops with an error |
@@ -1012,7 +1011,7 @@ reads like this after the upgrade:
 # My settings
 
 # Added by Caudra 0.2.0-preview.12 on 2026-10-20: the format version of this file, which Caudra now requires.
-version = 3
+version = 4
 
 [ui.tool_output_lines]
 # Upgraded by Caudra 0.2.0-preview.12 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.

@@ -350,7 +350,7 @@ mod tests {
     use crate::config_file::{CONFIG_FILE, load_global_config};
     use crate::{ENV_FILE, PROJECT_DIR, RawConfig, load_env_files_scoped};
 
-    const ORIGINAL: &str = "# my settings\nversion = 3\n\n[ui]\n# keep this\ntheme = \"{env:CAUDRA_TEST_SHELL_ENV_THEME}\" # trailing\n\n[agent]\ntodo_reminder = false\n";
+    const ORIGINAL: &str = "# my settings\nversion = 4\n\n[ui]\n# keep this\ntheme = \"{env:CAUDRA_TEST_SHELL_ENV_THEME}\" # trailing\n\n[agent]\ntodo_reminder = false\n";
     const THEME_VARIABLE: &str = "CAUDRA_TEST_SHELL_ENV_THEME";
     const DOCKER_HOST: &str = "DOCKER_HOST";
     const AWS_PREFIX: &str = "AWS_*";

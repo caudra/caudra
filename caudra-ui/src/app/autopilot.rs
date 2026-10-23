@@ -10,11 +10,12 @@ use caudra_agent::AgentMode;
 use caudra_agent::automation::clock::SystemClock;
 use caudra_agent::autopilot::{
     ActionName, AutopilotDecision, AutopilotHandle, DecisionKind, EngagementSpend, StoodDown,
+    running_engagement,
 };
 use caudra_agent::permissions::AutopilotNote;
 use caudra_agent::types::AutopilotEvent;
 use caudra_automation::event::StartedBy;
-use caudra_config::{AutopilotConfig, Feature};
+use caudra_config::AutopilotConfig;
 use caudra_providers::model_registry;
 use caudra_providers::{
     AutopilotMessageKind, AutopilotOrigin, Billing, Message, ModelPurpose, TokenUsage,
@@ -172,22 +173,12 @@ fn left_to_you(note: Option<&AutopilotNote>) -> Option<&str> {
 }
 
 impl App {
-    /// The handle the session's agents and root permission manager get,
-    /// `None` while the experiment is off.
-    pub(crate) fn attached_autopilot(&self) -> Option<AutopilotHandle> {
-        self.features
-            .enabled(Feature::Autopilot)
-            .then(|| self.state.autopilot.clone())
-    }
-
     /// Opens the session's own engagement under `limits`, still engaged if it
     /// was stored engaged, and hands it to the root permission manager the
     /// session's agents read it from. An engaged session with a goal owes the
     /// goal one check-in once it settles.
     pub(crate) fn restore_autopilot(&mut self, limits: AutopilotConfig) {
-        let restored = (self.features.enabled(Feature::Autopilot)
-            && self.state.session.meta.autopilot.is_some())
-        .then(|| {
+        let restored = self.state.session.meta.autopilot.is_some().then(|| {
             AutopilotHandle::from_meta(
                 &self.state.session.meta,
                 self.stored_autopilot_decisions(),
@@ -196,18 +187,17 @@ impl App {
         });
         self.state.autopilot = restored.unwrap_or_default();
         self.state.autopilot.set_limits(limits);
-        self.permissions.set_autopilot(self.attached_autopilot());
+        self.permissions
+            .set_autopilot(Some(self.state.autopilot.clone()));
         self.autopilot_checkin_due =
             self.state.autopilot.is_engaged() && self.state.goal.snapshot().is_some();
+        self.autopilot_check_due = self.state.autopilot.is_engaged();
     }
 
     /// The stored log's transcript rows, every decision and each engagement's
     /// start and end, with the history length and time each was made at, so a
-    /// restore places it among the turns. None while the experiment is off.
+    /// restore places it among the turns.
     pub(super) fn autopilot_log_rows(&self) -> Vec<(LogPlace, DisplayMessage)> {
-        if !self.features.enabled(Feature::Autopilot) {
-            return Vec::new();
-        }
         let decisions = self
             .stored_autopilot_decisions()
             .into_iter()
@@ -268,13 +258,9 @@ impl App {
             })
     }
 
-    /// What `SessionMeta.autopilot` keeps. With the experiment off the handle
-    /// was never restored, so the stored engagement stays as it was.
+    /// What `SessionMeta.autopilot` keeps.
     pub(super) fn stored_autopilot(&self) -> Option<Box<StoredAutopilot>> {
         let saved = self.state.session.meta.autopilot.as_deref();
-        if !self.features.enabled(Feature::Autopilot) {
-            return saved.cloned().map(Box::new);
-        }
         let mut stored = self.state.autopilot.stored()?;
         if let Some(saved) = saved
             && stored.elapsed_ms.abs_diff(saved.elapsed_ms) < ELAPSED_SAVE_STEP_MS
@@ -417,12 +403,8 @@ impl App {
         self.autopilot_panel.view(frame, area, &content)
     }
 
-    /// The footer chip, present while autopilot is engaged with the
-    /// experiment on.
+    /// The footer chip, present while autopilot is engaged.
     pub(super) fn autopilot_chip(&self) -> Option<AutopilotChip> {
-        if !self.features.enabled(Feature::Autopilot) {
-            return None;
-        }
         let stored = self
             .state
             .autopilot
@@ -566,7 +548,14 @@ impl App {
             .map(|goal| goal.condition.to_string());
         if let Some(engaged) = self.state.autopilot.engage(owns_goal, goal) {
             self.note_autopilot_event(engaged);
+            self.autopilot_check_due = true;
         }
+    }
+
+    /// Whether an engagement started or resumed since the last call, and is
+    /// owed a check of what it runs without.
+    pub(crate) fn take_autopilot_check(&mut self) -> bool {
+        mem::take(&mut self.autopilot_check_due)
     }
 
     /// Whether there was an engagement to end.
@@ -625,7 +614,7 @@ impl App {
 
     /// Where every engagement change and decision lands, from the agent or
     /// from the App itself.
-    fn note_autopilot_event(&mut self, event: AutopilotEvent) {
+    pub(crate) fn note_autopilot_event(&mut self, event: AutopilotEvent) {
         match event {
             AutopilotEvent::Engaged { engagement, goal } => {
                 self.autopilot_engaged(engagement, goal);
@@ -648,6 +637,11 @@ impl App {
                 self.push_autopilot_row(retrying_row(attempt, limit, delay_ms, &error));
             }
             AutopilotEvent::Deciding { seq, kind, .. } => self.autopilot_decides(seq, kind),
+            AutopilotEvent::Caveat { engagement, caveat } => {
+                if running_engagement(&self.state.autopilot) == Some(engagement) {
+                    self.push_autopilot_row(caveat.to_string());
+                }
+            }
             AutopilotEvent::ImplementPlan { .. } => {}
         }
     }

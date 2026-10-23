@@ -6349,7 +6349,6 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
 #[test_case("/automations", Feature::Automations; "automations")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
-#[test_case("/autopilot", Feature::Autopilot; "autopilot")]
 fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Feature) {
     let mut app = test_app();
     app.features = FeatureFlags::all().without(feature);
@@ -27329,21 +27328,22 @@ pub(crate) mod automation_runtime {
     }
 }
 
-/// The App's side of autopilot, with the experiment on.
+/// The App's side of autopilot.
 mod autopilot {
     use std::path::{Path, PathBuf};
     use std::slice;
     use std::sync::Arc;
 
     use caudra_agent::autopilot::{
-        ActionName, AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
+        ActionName, AutopilotCaveat, AutopilotDecision, DecisionKind, DecisionOutcome,
+        EngagementSpend, StoodDown,
     };
     use caudra_agent::permissions::{AutopilotNote, PermissionRequest};
     use caudra_agent::types::{Answerer, AutopilotEvent};
     use caudra_agent::{AgentEvent, AgentMode, DoneReason, GoalVerdict};
     use caudra_automation::event::{AutopilotView, InputKind, SessionStatus};
     use caudra_automation::snapshot::PauseSource;
-    use caudra_config::{AutopilotConfig, Feature, FeatureFlags, ToolKey};
+    use caudra_config::{AutopilotConfig, ToolKey};
     use caudra_providers::{AutopilotMessageKind, AutopilotOrigin, Billing, Message, TokenUsage};
     use caudra_storage::autopilot::{
         AutopilotBudget, AutopilotEnd, AutopilotStopper, StoredAutopilotDecision,
@@ -27459,17 +27459,14 @@ mod autopilot {
     const EMPTY_SESSION_KEPT: &str =
         "an empty session is kept only while autopilot is engaged in it";
     const ENGAGEMENT_LOGGED: &str = "a kept session's engagement must reach the log";
-
-    fn autopilot_features(enabled: bool) -> FeatureFlags {
-        if enabled {
-            FeatureFlags::NONE.with(Feature::Autopilot)
-        } else {
-            FeatureFlags::NONE
-        }
-    }
+    const CAVEAT_MODEL: &str = "openai/gpt-6-astra";
+    const CAVEAT_REASON: &str = "not signed in";
+    const NO_CHECK_UNENGAGED: &str = "a session never engaged owes no readiness check";
+    const CHECK_ON_ENGAGE: &str = "an engagement must be checked for what it runs without";
+    const CHECKED_ONCE: &str = "an engagement is checked once";
+    const CAVEAT_CHANGES_NOTHING: &str = "a caveat must leave autopilot engaged";
 
     fn enable(app: &mut App) {
-        app.features = autopilot_features(true);
         app.restore_autopilot(AutopilotConfig::default());
     }
 
@@ -27549,15 +27546,13 @@ mod autopilot {
         })
     }
 
-    #[test_case(false ; "experiment_off")]
-    #[test_case(true ; "experiment_on")]
-    fn the_handle_is_attached_only_with_the_experiment(enabled: bool) {
+    #[test]
+    fn the_handle_is_attached_to_the_permissions() {
         let mut app = test_app();
-        app.features = autopilot_features(enabled);
 
         app.restore_autopilot(AutopilotConfig::default());
 
-        assert_eq!(app.permissions.autopilot().is_some(), enabled);
+        assert!(app.permissions.autopilot().is_some());
     }
 
     fn has_autopilot_row(app: &App, text: &str) -> bool {
@@ -27621,6 +27616,51 @@ mod autopilot {
 
         command(&mut app, AUTOPILOT_OFF);
         assert_eq!(app.status_bar.flash_text(), Some(NOT_ENGAGED_MSG));
+    }
+
+    #[test]
+    fn only_a_new_engagement_is_owed_a_readiness_check() {
+        let mut app = autopilot_app();
+        assert!(!app.take_autopilot_check(), "{NO_CHECK_UNENGAGED}");
+
+        command(&mut app, AUTOPILOT_GOAL);
+        assert!(app.take_autopilot_check(), "{CHECK_ON_ENGAGE}");
+        assert!(!app.take_autopilot_check(), "{CHECKED_ONCE}");
+
+        command(&mut app, AUTOPILOT_GOAL);
+        assert!(!app.take_autopilot_check(), "{CHECKED_ONCE}");
+    }
+
+    #[test_case(AutopilotCaveat::NoDecisionEndpoint ; "no_decision_endpoint")]
+    #[test_case(AutopilotCaveat::ContentScreeningOff ; "content_screening_off")]
+    #[test_case(AutopilotCaveat::DelegateUnavailable {
+        model: CAVEAT_MODEL.into(),
+        reason: CAVEAT_REASON.into(),
+    } ; "delegate_unavailable")]
+    fn a_caveat_follows_the_engaged_row(caveat: AutopilotCaveat) {
+        let mut app = engaged_app();
+
+        app.note_autopilot_event(AutopilotEvent::Caveat {
+            engagement: AUTOPILOT_ENGAGEMENT,
+            caveat: caveat.clone(),
+        });
+
+        assert_eq!(last_autopilot_row(&app), Some(caveat.to_string()));
+        assert!(app.state.autopilot.is_engaged(), "{CAVEAT_CHANGES_NOTHING}");
+    }
+
+    #[test]
+    fn a_caveat_for_an_engagement_that_ended_shows_nothing() {
+        let mut app = engaged_app();
+        command(&mut app, AUTOPILOT_OFF);
+        let rows = app.chats[0].message_count();
+
+        app.note_autopilot_event(AutopilotEvent::Caveat {
+            engagement: AUTOPILOT_ENGAGEMENT,
+            caveat: AutopilotCaveat::NoDecisionEndpoint,
+        });
+
+        assert_eq!(app.chats[0].message_count(), rows);
     }
 
     #[test_case(AUTOPILOT_GOAL, None, true ; "autopilot_sets_it")]
@@ -27700,10 +27740,9 @@ mod autopilot {
     }
 
     /// The decision's row lands after the session's, and a reload restores
-    /// both. With the experiment off the stored engagement is kept as it was.
-    #[test_case(false ; "experiment_off")]
-    #[test_case(true ; "experiment_on")]
-    fn an_engagement_and_its_decisions_survive_a_reload(enabled: bool) {
+    /// both.
+    #[test]
+    fn an_engagement_and_its_decisions_survive_a_reload() {
         let (_tmp, dir, writer, mut app) = tempdir_app();
         enable(&mut app);
         app.state.goal.set(GOAL).unwrap();
@@ -27727,21 +27766,15 @@ mod autopilot {
         );
 
         let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir)));
-        restored.features = autopilot_features(enabled);
         restored
             .apply_loaded_session(loaded, &test_model())
             .unwrap();
 
-        assert_eq!(restored.state.autopilot.is_engaged(), enabled);
-        assert_eq!(restored.goal_checkin_due(), enabled);
-        assert_eq!(has_autopilot_row(&restored, ENGAGED_ROW), enabled);
-        let restored_rows = if enabled { vec![row] } else { Vec::new() };
-        assert_eq!(decision_rows(&restored, SEQ), restored_rows);
-        if !enabled {
-            restored.checkpoint_now();
-            assert_eq!(restored.state.session.meta.autopilot, stored);
-            return;
-        }
+        assert!(restored.state.autopilot.is_engaged());
+        assert!(restored.take_autopilot_check(), "{CHECK_ON_ENGAGE}");
+        assert!(restored.goal_checkin_due());
+        assert!(has_autopilot_row(&restored, ENGAGED_ROW));
+        assert_eq!(decision_rows(&restored, SEQ), [row]);
         assert!(restored.state.autopilot.owns_goal());
         assert_eq!(restored.state.autopilot.recent_decisions(), vec![decision]);
         assert!(!restored.start_goal_checkin().is_empty());
@@ -28183,15 +28216,11 @@ mod autopilot {
         );
     }
 
-    #[test_case(false ; "experiment_off")]
-    #[test_case(true ; "disengaged")]
-    fn there_is_no_chip_without_an_engagement(enabled: bool) {
+    #[test]
+    fn there_is_no_chip_without_an_engagement() {
         let mut app = test_app();
-        app.features = autopilot_features(enabled);
         app.engage_autopilot(false);
-        if enabled {
-            command(&mut app, AUTOPILOT_OFF);
-        }
+        command(&mut app, AUTOPILOT_OFF);
 
         assert_eq!(app.autopilot_chip(), None);
     }
@@ -28525,9 +28554,8 @@ mod autopilot {
     /// Engagement 1 runs over the first prompt and ends where engagement 2
     /// starts, which then runs over the second prompt, so rows share a
     /// history length with others from both engagements.
-    #[test_case(true ; "experiment_on")]
-    #[test_case(false ; "experiment_off")]
-    fn the_log_is_restored_in_history_order(enabled: bool) {
+    #[test]
+    fn the_log_is_restored_in_history_order() {
         let (_tmp, dir, writer, mut app) = tempdir_app();
         app.state
             .session_mut()
@@ -28562,7 +28590,6 @@ mod autopilot {
         drop(database);
 
         let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
-        restored.features = autopilot_features(enabled);
         restored
             .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
             .unwrap();
@@ -28574,20 +28601,16 @@ mod autopilot {
                 .unwrap_or_default()
                 .to_owned()
         };
-        let expected = if enabled {
-            vec![
-                ENGAGED_ROW.to_owned(),
-                FIRST_PROMPT.to_owned(),
-                title(&made_in_first),
-                ended_row(&stopped, &first),
-                ENGAGED_ROW.to_owned(),
-                title(&made_in_second),
-                SECOND_PROMPT.to_owned(),
-                title(&stood_down),
-            ]
-        } else {
-            vec![FIRST_PROMPT.to_owned(), SECOND_PROMPT.to_owned()]
-        };
+        let expected = vec![
+            ENGAGED_ROW.to_owned(),
+            FIRST_PROMPT.to_owned(),
+            title(&made_in_first),
+            ended_row(&stopped, &first),
+            ENGAGED_ROW.to_owned(),
+            title(&made_in_second),
+            SECOND_PROMPT.to_owned(),
+            title(&stood_down),
+        ];
         assert_eq!(transcript(&restored), expected, "{LOG_PLACEMENT}");
     }
 
@@ -28619,7 +28642,6 @@ mod autopilot {
         drop(database);
 
         let mut restored = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
-        restored.features = autopilot_features(true);
         restored
             .apply_loaded_session(AppSession::load(id, &dir).unwrap(), &test_model())
             .unwrap();
@@ -28692,7 +28714,6 @@ mod autopilot {
         Some(AutopilotView { owns_goal, waiting })
     }
 
-    #[test_case(|app| { app.features = autopilot_features(false); app.engage_autopilot(false); }, None ; "experiment_off")]
     #[test_case(enable, None ; "disengaged")]
     #[test_case(|app| { enable(app); app.engage_autopilot(false); }, view(false, false) ; "engaged")]
     #[test_case(engaged_owning_its_goal, view(true, false) ; "engaged_on_its_own_goal")]

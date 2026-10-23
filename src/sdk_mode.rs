@@ -18,7 +18,7 @@ use std::time::Instant;
 use caudra_agent::automation::clock::SystemClock;
 use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::autopilot::{
-    AutopilotDecision, AutopilotHandle, DecisionKind, EngagementSpend, StoodDown,
+    AutopilotCaveat, AutopilotDecision, AutopilotHandle, DecisionKind, EngagementSpend, StoodDown,
 };
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::decisions::DecisionNote;
@@ -46,8 +46,8 @@ use caudra_automation::request::{
 use caudra_automation::snapshot::{ArmOrigin, AutomationEvent, FiringSummary, PauseSource};
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{
-    AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy,
-    SnapshotsConfig, effective_shell_execution, effective_task_execution,
+    AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, ModelPolicy, SnapshotsConfig,
+    effective_shell_execution, effective_task_execution,
 };
 use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, Reroute, RoutedAccount};
 use caudra_providers::model::Model;
@@ -140,8 +140,9 @@ const AUTOPILOT_START: &str = "autopilot_start";
 const AUTOPILOT_STOP: &str = "autopilot_stop";
 const AUTOPILOT_STATUS: &str = "autopilot_status";
 const AUTOPILOT_LOG: &str = "autopilot_log";
+const AUTOPILOT_MISSING: &str = "this session has no autopilot";
 /// Every `control_request` subtype autopilot answers, as the init message
-/// advertises them while `experimental.autopilot` is on.
+/// advertises them.
 const AUTOPILOT_CONTROLS: &[&str] = &[
     AUTOPILOT_START,
     AUTOPILOT_STOP,
@@ -860,6 +861,12 @@ pub(crate) enum AutopilotSystemPayload<'a> {
         #[serde(flatten)]
         spend: &'a EngagementSpend,
     },
+    /// What the engagement runs without, and what the user can do about it.
+    Caveat {
+        engagement: u32,
+        caveat: &'a AutopilotCaveat,
+        message: String,
+    },
 }
 
 /// A decision the delegate is still making, under the names its `decided`
@@ -908,6 +915,11 @@ impl<'a> AutopilotSystemPayload<'a> {
                 end: reason,
                 engagement: *engagement,
                 spend,
+            },
+            AutopilotEvent::Caveat { engagement, caveat } => Self::Caveat {
+                engagement: *engagement,
+                caveat,
+                message: caveat.to_string(),
             },
             AutopilotEvent::ImplementPlan { .. } => return None,
         })
@@ -1823,14 +1835,11 @@ pub fn run(params: SdkParams) -> Result<()> {
                 http: automation_http_client(),
                 user_config_dir: None,
             }),
-        autopilot: config
-            .features
-            .enabled(Feature::Autopilot)
-            .then(|| AutopilotParams {
-                limits: autopilot,
-                mode: workflow_mode.clone(),
-                fast,
-            }),
+        autopilot: Some(AutopilotParams {
+            limits: autopilot,
+            mode: workflow_mode.clone(),
+            fast,
+        }),
         workflow_mode: Some(workflow_mode),
         workspace_binding: workspace_binding.clone(),
         remote_environment: remote_environment.clone(),
@@ -2606,12 +2615,12 @@ fn send_goal_kickoff(
     input_tx.send(input).map_err(|_| SESSION_CLOSED.to_owned())
 }
 
-/// The session's autopilot, refused while `experimental.autopilot` is off.
+/// The session's autopilot, refused for a session started without one.
 fn session_autopilot(handle: &InteractiveHandle) -> Result<&AutopilotHandle, String> {
     handle
         .autopilot
         .as_ref()
-        .ok_or_else(|| FeatureDisabled(Feature::Autopilot).to_string())
+        .ok_or_else(|| AUTOPILOT_MISSING.to_owned())
 }
 
 /// `/autopilot [goal]` for a client. A goal is set as `goal_set` sets it and
@@ -2822,8 +2831,8 @@ fn goal_log(state_dir: &StateDir, session_id: CaudraId, request: &GoalLogRequest
 /// shape: `workflows` and `automations` say whether those runtimes are
 /// attached, and `workflow_controls`, `automation_controls` and
 /// `goal_controls` name the `control_request` subtypes the runtimes and the
-/// session goal answer. While `experimental.autopilot` is on,
-/// `autopilot_controls` names autopilot's and `autopilot` is its status.
+/// session goal answer. With an autopilot attached, `autopilot_controls`
+/// names autopilot's and `autopilot` is its status.
 fn init_payload(
     mut payload: Value,
     workflows: bool,
@@ -7300,6 +7309,8 @@ mod tests {
 
     const AUTOPILOT_SEQ: u32 = 7;
     const AUTOPILOT_ENGAGEMENT: u32 = 1;
+    const CAVEAT_MODEL: &str = "openai/gpt-6-astra";
+    const CAVEAT_REASON: &str = "not signed in";
     const AUTOPILOT_SUBJECT: &str = "cargo test";
     const AUTOPILOT_REASON: &str = "the tests only read the tree";
     const AUTOPILOT_LIMIT: u32 = 12;
@@ -7522,6 +7533,29 @@ mod tests {
                     "retries": RETRY_ATTEMPT,
                 }),
             ),
+            "caveat" => {
+                let caveat = AutopilotCaveat::DelegateUnavailable {
+                    model: CAVEAT_MODEL.into(),
+                    reason: CAVEAT_REASON.into(),
+                };
+                let message = caveat.to_string();
+                (
+                    AutopilotEvent::Caveat {
+                        engagement: AUTOPILOT_ENGAGEMENT,
+                        caveat,
+                    },
+                    serde_json::json!({
+                        "kind": "caveat",
+                        "engagement": AUTOPILOT_ENGAGEMENT,
+                        "caveat": {
+                            "kind": "delegate_unavailable",
+                            "model": CAVEAT_MODEL,
+                            "reason": CAVEAT_REASON,
+                        },
+                        "message": message,
+                    }),
+                )
+            }
             other => unreachable!("no autopilot event is named {other}"),
         }
     }
@@ -7613,7 +7647,7 @@ mod tests {
     #[test_case(AUTOPILOT_STOP; "stop")]
     #[test_case(AUTOPILOT_STATUS; "status")]
     #[test_case(AUTOPILOT_LOG; "log")]
-    fn without_the_experiment_an_autopilot_control_is_refused(subtype: &str) {
+    fn a_session_without_autopilot_refuses_its_controls(subtype: &str) {
         let state = TempDir::new().unwrap();
         let session = autopilot_session(&state, None);
         let (writer, out_rx) = sdk_writer();
@@ -7622,10 +7656,7 @@ mod tests {
 
         let reply = next_message(&out_rx);
         assert_eq!(reply["response"]["subtype"], "error");
-        assert_eq!(
-            reply["response"]["error"],
-            FeatureDisabled(Feature::Autopilot).to_string()
-        );
+        assert_eq!(reply["response"]["error"], AUTOPILOT_MISSING);
         assert!(out_rx.is_empty());
     }
 
@@ -8068,9 +8099,9 @@ mod tests {
         assert!(!autopilot.owns_goal());
     }
 
-    #[test_case(true => (serde_json::json!([AUTOPILOT_START, AUTOPILOT_STOP, AUTOPILOT_STATUS, AUTOPILOT_LOG]), serde_json::json!(AUTOPILOT_ENGAGED)); "while_the_experiment_is_on")]
-    #[test_case(false => (Value::Null, Value::Null); "while_it_is_off")]
-    fn init_advertises_autopilot_only_while_the_experiment_is_on(on: bool) -> (Value, Value) {
+    #[test_case(true => (serde_json::json!([AUTOPILOT_START, AUTOPILOT_STOP, AUTOPILOT_STATUS, AUTOPILOT_LOG]), serde_json::json!(AUTOPILOT_ENGAGED)); "with_autopilot")]
+    #[test_case(false => (Value::Null, Value::Null); "without_it")]
+    fn init_advertises_autopilot_only_when_the_session_has_it(on: bool) -> (Value, Value) {
         let autopilot = engaged_autopilot(false);
         let payload = init_payload(
             serde_json::json!({}),
@@ -8096,6 +8127,7 @@ mod tests {
     #[test_case("settled" => Value::Null; "settled")]
     #[test_case("retrying" => Value::Null; "retrying")]
     #[test_case("ended" => Value::Null; "ended")]
+    #[test_case("caveat" => Value::Null; "caveat")]
     fn an_autopilot_event_is_an_autopilot_system_message(case: &str) -> Value {
         let (event, body) = autopilot_event(case);
         let (mut pump, out_rx, _) =

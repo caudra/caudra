@@ -34,7 +34,7 @@ description: "Every TOML config file in full, with each key commented out and de
 #
 # Full reference: https://caudra.ai/docs/configuration/
 
-version = 3
+version = 4
 
 # Start every session with YOLO mode (skip permission prompts, deny rules still
 # apply); global config only.
@@ -85,10 +85,6 @@ version = 3
 # Turn on automations.
 # Type: bool.
 # automations = false
-
-# Turn on Autopilot runs.
-# Type: bool.
-# autopilot = false
 
 [ui]
 
@@ -1208,8 +1204,7 @@ version = 3
 # allow_private_network = false
 
 [autopilot]
-# Limits for autopilot, which needs `autopilot = true` under [experimental].
-# Only the global caudra.toml may hold this table.
+# Limits for autopilot. Only the global caudra.toml may hold this table.
 
 # Most continuations autopilot may send per engagement before it ends. `0`
 # removes the limit.

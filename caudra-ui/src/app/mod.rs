@@ -693,6 +693,8 @@ pub struct App {
     goal_deferred: bool,
     /// A resumed engaged session owes its goal one check-in once it settles.
     autopilot_checkin_due: bool,
+    /// An engagement started or resumed is owed a check of what it runs without.
+    autopilot_check_due: bool,
     /// The implement handoff autopilot chose, with the run that chose it. It
     /// starts once that run is done, and any other run's end drops it.
     autopilot_implement: Option<(u64, u32)>,
@@ -1020,6 +1022,7 @@ impl App {
             replacement_item: None,
             goal_deferred: false,
             autopilot_checkin_due: false,
+            autopilot_check_due: false,
             autopilot_implement: None,
             autopilot_deciding: Vec::new(),
             goal_verdict_seq: None,

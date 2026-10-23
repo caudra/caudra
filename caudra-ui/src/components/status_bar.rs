@@ -464,7 +464,7 @@ pub struct StatusBarContext<'a> {
     pub restoring: bool,
     pub background_waiting: bool,
     pub goal: Option<&'a GoalSnapshot>,
-    /// `None` unless autopilot is engaged with the experiment on.
+    /// `None` unless autopilot is engaged.
     pub autopilot: Option<&'a AutopilotChip>,
     pub active_tasks: usize,
     pub active_shells: usize,

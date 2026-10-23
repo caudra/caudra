@@ -900,6 +900,6 @@ YOLO bypasses decision-engine permission advice, Auto screening, and permission-
 
 ## Autopilot
 
-[Autopilot](/docs/autopilot/) is experimental. While it is engaged, a delegate model decides the prompts that reach you, in Ask, Auto, and plan mode. Your rules and Auto screening run first, unchanged, and YOLO leaves nothing to decide.
+While [autopilot](/docs/autopilot/) is engaged, a delegate model decides the prompts that reach you, in Ask, Auto, and plan mode. Your rules and Auto screening run first, unchanged, and YOLO leaves nothing to decide.
 
 The delegate may allow a call once, deny it with guidance, or leave it to you. It never stores a rule. It never allows prompts from plan mode, forced prompts, protected paths, privilege, indirect code, or lines Caudra cannot read, and it allows nothing while content screening has flagged the session. A prompt from an ask rule is not reserved, so the delegate may allow that call once. Any key or click on a card makes it yours. See [Permission prompts](/docs/autopilot/#permission-prompts) for the full table.

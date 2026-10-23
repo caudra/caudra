@@ -81,7 +81,7 @@ use crate::automation::http::HttpClient;
 use crate::automation::manager::{AutomationRuntime, RuntimeDeps as AutomationDeps};
 use crate::automation::outbox::claim_message;
 use crate::automation::workflows::Workflows;
-use crate::autopilot::{AutopilotHandle, DecisionOutcome, EngagementSpend};
+use crate::autopilot::{AutopilotHandle, DecisionOutcome, EngagementSpend, autopilot_caveats};
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::code::CodeSession;
@@ -1570,6 +1570,18 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             }
             permissions.set_decisions(decisions.map(|service| service.for_session(session_id)));
             permissions.set_autopilot(params.autopilot.clone());
+            if let Some(autopilot) = &params.autopilot {
+                for caveat in autopilot_caveats(
+                    autopilot,
+                    permissions.decisions(),
+                    Arc::new(model.clone()),
+                    Arc::clone(&params.model_policy),
+                )
+                .await
+                {
+                    let _ = event_tx.send(AgentEvent::Autopilot(caveat));
+                }
+            }
             if let Err(error) = permissions.replace_remote_permission_asset(
                 params
                     .remote_project_context
@@ -1799,7 +1811,7 @@ pub struct InteractiveParams {
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     /// `Some` serves the session's automations while `experimental.automations` is on.
     pub automations: Option<AutomationParams>,
-    /// `Some` gives the session an autopilot while `experimental.autopilot` is on.
+    /// `Some` gives the session an autopilot.
     pub autopilot: Option<AutopilotParams>,
 }
 
@@ -1869,6 +1881,8 @@ pub struct InteractiveHandle {
     pub autopilot: Option<AutopilotHandle>,
     /// Where an engagement change the host makes is announced; see [`announce_autopilot`].
     autopilot_events: flume::WeakSender<Envelope>,
+    /// Tells each engagement the host starts what it runs without.
+    autopilot_check: Option<AutopilotCheck>,
     /// The session's record, which a goal the host changes reaches through
     /// [`Self::write_goal_log`]. Weak, so the session's task alone keeps it.
     store: Weak<Mutex<Option<SessionStore>>>,
@@ -2096,6 +2110,36 @@ fn announce_autopilot(events: &flume::WeakSender<Envelope>, event: AutopilotEven
     }
 }
 
+/// What an interactive session reads an engagement's caveats from, and where it announces them.
+#[derive(Clone)]
+struct AutopilotCheck {
+    autopilot: AutopilotHandle,
+    permissions: Arc<PermissionManager>,
+    live_model: Arc<ArcSwap<LiveModel>>,
+    model_policy: Arc<ModelPolicy>,
+    events: flume::WeakSender<Envelope>,
+}
+
+impl AutopilotCheck {
+    fn spawn(&self) {
+        let check = self.clone();
+        smol::spawn(async move {
+            let chat_model = Arc::clone(&check.live_model.load().1);
+            let caveats = autopilot_caveats(
+                &check.autopilot,
+                check.permissions.decisions(),
+                chat_model,
+                Arc::clone(&check.model_policy),
+            )
+            .await;
+            for caveat in caveats {
+                announce_autopilot(&check.events, caveat);
+            }
+        })
+        .detach();
+    }
+}
+
 /// Counts a run autopilot starts without a human. A budget that runs out ends autopilot,
 /// never the run.
 fn count_autopilot_continuation(autopilot: &AutopilotHandle, events: &flume::WeakSender<Envelope>) {
@@ -2313,7 +2357,7 @@ struct SessionAutomations {
     fast: bool,
     host: HostEvents,
     tally: StdMutex<AutomationTally>,
-    /// The session's autopilot, while `experimental.autopilot` is on.
+    /// The session's autopilot, when its host gave it one.
     autopilot: Option<AutopilotHandle>,
 }
 
@@ -2731,6 +2775,7 @@ impl InteractiveHandle {
             automation_events: flume::unbounded().1,
             autopilot: None,
             autopilot_events: flume::unbounded().0.downgrade(),
+            autopilot_check: None,
             store: Weak::new(),
             mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
@@ -2807,6 +2852,9 @@ impl InteractiveHandle {
             .and_then(|autopilot| autopilot.engage(owns_goal, goal))
         {
             announce_autopilot(&self.autopilot_events, engaged);
+            if let Some(check) = &self.autopilot_check {
+                check.spawn();
+            }
         }
     }
 
@@ -3264,11 +3312,7 @@ async fn spawn_prepared_session(
     let (workspace_change_tx, workspace_change_rx) = flume::unbounded::<WorkspaceChangeRequest>();
     let (workflow_wake_tx, workflow_wake_rx) = flume::bounded::<()>(1);
     let mode_route = Arc::new(InteractiveModeRoute::default());
-    let (autopilot, autopilot_fallback) = match params
-        .autopilot
-        .take()
-        .filter(|_| params.config.features.enabled(Feature::Autopilot))
-    {
+    let (autopilot, autopilot_fallback) = match params.autopilot.take() {
         Some(AutopilotParams { limits, mode, fast }) => (
             Some(store.restore_autopilot(limits)),
             Some((routed_mode(&mode_route, mode), fast)),
@@ -3566,6 +3610,19 @@ async fn spawn_prepared_session(
         })
     });
 
+    let autopilot_check = autopilot.clone().map(|autopilot| AutopilotCheck {
+        autopilot,
+        permissions: Arc::clone(&permissions),
+        live_model: Arc::clone(&live_model),
+        model_policy: Arc::clone(&params.model_policy),
+        events: autopilot_events.clone(),
+    });
+    if let Some(check) = autopilot_check
+        .as_ref()
+        .filter(|check| check.autopilot.is_engaged())
+    {
+        check.spawn();
+    }
     let task = smol::spawn({
         let mode_route = Arc::clone(&mode_route);
         let permissions = Arc::clone(&permissions);
@@ -4754,6 +4811,7 @@ async fn spawn_prepared_session(
         automation_events,
         autopilot,
         autopilot_events,
+        autopilot_check,
         store: host_store,
         mode_route,
         workspace_change_tx,
@@ -9228,7 +9286,7 @@ complete(#{ report: first.output });
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const IMPLEMENT_RUN: u64 = 4;
     const CHILD_TASK: &str = "autopilot-child";
-    const NO_AUTOPILOT: &str = "the session must attach an autopilot while the experiment is on";
+    const NO_AUTOPILOT: &str = "the session must attach the autopilot its host asked for";
     const ANNOUNCED_ONCE: &str = "an engagement must be announced once, and its end once";
     const INTERRUPT_ENDS: &str = "an interrupt must end autopilot as the interrupt's stop";
     #[cfg(unix)]

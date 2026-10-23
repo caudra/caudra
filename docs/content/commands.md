@@ -72,7 +72,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/goal` | Work until a completion condition is met (model, log) | Main only |  |
 | `/goal-clear` | Stop the active completion goal | Main only |  |
 | `/goal-model` | Assign the completion goal model | Main only |  |
-| `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model, log) | Main only | `autopilot` |
+| `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model, log) | Main only |  |
 | `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |  |
 | `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  |  |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |

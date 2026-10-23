@@ -5,14 +5,13 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use thiserror::Error;
 
 /// Indexed by [`Feature`] discriminant, so the enum and its config keys stay one list.
-const FEATURE_KEYS: [&str; 7] = [
+const FEATURE_KEYS: [&str; 6] = [
     "workflows",
     "sandboxes",
     "remote_workcell",
     "lua_plugins",
     "cross_session_messaging",
     "automations",
-    "autopilot",
 ];
 
 /// A first-party capability that stays off until the user opts in through the
@@ -25,18 +24,16 @@ pub enum Feature {
     LuaPlugins,
     CrossSessionMessaging,
     Automations,
-    Autopilot,
 }
 
 impl Feature {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Workflows,
         Self::Sandboxes,
         Self::RemoteWorkcell,
         Self::LuaPlugins,
         Self::CrossSessionMessaging,
         Self::Automations,
-        Self::Autopilot,
     ];
 
     pub fn key(self) -> &'static str {
@@ -56,7 +53,6 @@ impl Feature {
             Self::LuaPlugins => "Lua plugins and init.lua",
             Self::CrossSessionMessaging => "cross-session messages",
             Self::Automations => "automations",
-            Self::Autopilot => "Autopilot runs",
         }
     }
 
@@ -195,21 +191,20 @@ mod tests {
     #[test_case(Feature::Workflows, "experimental.workflows"; "workflows")]
     #[test_case(Feature::CrossSessionMessaging, "experimental.cross_session_messaging"; "cross_session_messaging")]
     #[test_case(Feature::Automations, "experimental.automations"; "automations")]
-    #[test_case(Feature::Autopilot, "experimental.autopilot"; "autopilot")]
     fn disabled_error_names_the_key(feature: Feature, key: &str) {
         let message = FeatureDisabled(feature).to_string();
         assert!(message.contains(&format!("`{key} = true`")), "{message}");
         assert!(message.contains("caudra.toml"), "{message}");
     }
 
-    #[test]
-    fn promoted_decision_engine_key_is_unknown() {
-        const PROMOTED: &str = "decision_engine";
-        let error = toml::from_str::<FeatureFlags>(&format!("{PROMOTED} = true")).unwrap_err();
+    #[test_case("decision_engine"; "decision_engine")]
+    #[test_case("autopilot"; "autopilot")]
+    fn promoted_key_is_unknown(promoted: &str) {
+        let error = toml::from_str::<FeatureFlags>(&format!("{promoted} = true")).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains(&format!("unknown field `{PROMOTED}`")),
+                .contains(&format!("unknown field `{promoted}`")),
             "{error}"
         );
     }

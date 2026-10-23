@@ -51,7 +51,7 @@ pub(crate) struct SessionState {
     pub system_prompt_profile_override: bool,
     pub goal: GoalHandle,
     /// Disengaged until the App restores the session's own, which needs the
-    /// decision log and the `experimental.autopilot` flag.
+    /// decision log.
     pub autopilot: AutopilotHandle,
 }
 

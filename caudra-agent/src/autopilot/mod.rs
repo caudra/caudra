@@ -5,6 +5,7 @@ mod budget;
 mod context;
 mod delegate;
 pub(crate) mod question;
+mod readiness;
 pub(crate) mod review;
 mod wire;
 
@@ -37,6 +38,7 @@ pub(crate) use delegate::DecisionSlot;
 #[cfg(test)]
 pub(crate) use delegate::tests::{GatedProvider, ScriptedProvider, Step, engaged_handle};
 pub use delegate::{DecisionOrigin, Delegate, DelegateOutcome};
+pub use readiness::{AutopilotCaveat, autopilot_caveats, running_engagement};
 pub use wire::{
     ActionName, AutopilotDecision, DecisionKind, DelegateAction, DelegateOutput, StoodDown,
     StoredDecisionError, WireError,

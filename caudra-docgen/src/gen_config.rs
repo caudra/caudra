@@ -195,10 +195,6 @@ fn experiment_scope(feature: Feature) -> &'static str {
              `caudra-automation-dev` skill. Messaging triggers and actions also need \
              `cross_session_messaging`, and workflow triggers and actions also need `workflows`."
         }
-        Feature::Autopilot => {
-            "[Autopilot](/docs/autopilot/): keep a session moving toward its goal unattended, \
-             answering permission prompts and questions within the limits in [`[autopilot]`](#autopilot)."
-        }
     }
 }
 
@@ -618,8 +614,7 @@ fn write_autopilot_section(out: &mut String) {
     write_section(out, "[autopilot]", AutopilotConfig::FIELDS);
     writeln!(
         out,
-        "[Autopilot](/docs/autopilot/) is experimental and needs `autopilot = true` under \
-         [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this \
+        "Limits for [autopilot](/docs/autopilot/). Only the global `caudra.toml` may hold this \
          table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty \
          one.\n"
     )

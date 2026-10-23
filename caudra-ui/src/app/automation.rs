@@ -181,12 +181,7 @@ impl App {
                 condition: goal.condition.to_string(),
                 evaluations: goal.evaluations,
             }),
-            autopilot: autopilot_view(
-                self.features
-                    .enabled(Feature::Autopilot)
-                    .then_some(&self.state.autopilot),
-                self.autopilot_wait().is_some(),
-            ),
+            autopilot: autopilot_view(Some(&self.state.autopilot), self.autopilot_wait().is_some()),
             cost: self.state.cost,
             groups: self.automation.groups.clone(),
             work: self.automation.work.clone(),

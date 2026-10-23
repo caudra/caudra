@@ -261,7 +261,7 @@ A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or s
 
 ## Autopilot
 
-[Autopilot](/docs/autopilot/) is experimental and needs `experimental.autopilot`. Scripts can see it, and they cannot engage it.
+Scripts can see [autopilot](/docs/autopilot/), and they cannot engage it.
 
 - `event.session.autopilot` is `()` while autopilot is off or not engaged. While it is engaged, it is a map. `owns_goal` is true when the active goal is the one autopilot set, and `waiting` is true while an item autopilot left to you waits.
 - A `goal_finished` event carries `autopilot`, which is true when the goal that finished was autopilot's.

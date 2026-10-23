@@ -152,7 +152,7 @@ models.dev is a lead, not a source. Confirm every change on the provider's own m
 
 The `model-watch` automation in `.caudra/automations/` runs that routine once a day. It merges `main` into its own branch, surveys, applies confirmed changes with the skill, validates, and then fast-forwards your local `main`. It waits while the main checkout is busy, and it never pushes. To set it up:
 
-1. In your global `caudra.toml`, set `[experimental] autopilot = true` and `[autopilot] max_continuations = 0`.
+1. In your global `caudra.toml`, set `[autopilot] max_continuations = 0`.
 2. Create its worktree: `git worktree add ../caudra-model-watch -b model-watch main`.
 3. In that worktree, start `caudra --autopilot` in Build mode, trust the project's automations in `/automations`, and arm it with the path of your main checkout: `/automations arm model-watch {"main_worktree": "/path/to/caudra"}`.
 

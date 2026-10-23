@@ -53,8 +53,8 @@ const WEBSEARCH_ABOUT: &str = "Backends of the websearch tool. Only the global c
      search queries go. A key left unset reads the variable in its Env column, from Caudra's \
      environment or the global .env; prefer {env:NAME} references over credentials written \
      out. Changes apply at once.";
-const AUTOPILOT_ABOUT: &str = "Limits for autopilot, which needs `autopilot = true` under \
-     [experimental]. Only the global caudra.toml may hold this table.";
+const AUTOPILOT_ABOUT: &str =
+    "Limits for autopilot. Only the global caudra.toml may hold this table.";
 const WEB_ABOUT: &str = "Private targets `webfetch` may reach in local sessions, besides the \
      public internet. A redirect may lead to a listed target only from another one. Only the \
      global caudra.toml may hold this table, and a change applies at once.";

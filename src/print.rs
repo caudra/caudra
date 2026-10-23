@@ -47,6 +47,7 @@ const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_PROMPT: &str = "no prompt: pass --prompt \"<text>\" or pipe text on stdin";
 const SYSTEM_EVENT: &str = "system";
 const AUTOPILOT_ENDED: &str = "Autopilot ended";
+const AUTOPILOT_CAVEAT: &str = "autopilot";
 const CONTINUATIONS_SPENT: &str = "continuation limit reached";
 const COST_SPENT: &str = "cost limit reached";
 const TIME_SPENT: &str = "time limit reached";
@@ -223,7 +224,8 @@ fn subagent_spend(
 }
 
 /// Counts an autopilot event towards the result, and shows it where the run
-/// shows its events.
+/// shows its events. Without them, a caveat still reaches stderr, because a run
+/// whose delegate cannot be used denies every prompt.
 fn note_autopilot(
     event: &AutopilotEvent,
     tally: &mut AutopilotTally,
@@ -237,6 +239,12 @@ fn note_autopilot(
             payload,
             session_id,
         )),
+        (None, _) => {
+            if let AutopilotEvent::Caveat { caveat, .. } = event {
+                eprintln!("{AUTOPILOT_CAVEAT}: {caveat}");
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

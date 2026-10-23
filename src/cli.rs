@@ -345,7 +345,6 @@ impl Cli {
                 arg.hide(off(Feature::CrossSessionMessaging))
             })
             .mut_arg("automations", |arg| arg.hide(off(Feature::Automations)))
-            .mut_arg("autopilot", |arg| arg.hide(off(Feature::Autopilot)))
             .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
@@ -1681,7 +1680,6 @@ mod tests {
     const OTHER_AUTOMATION: &str = "keep-going";
     const AUTOMATION_ARGS: &str = r#"{"goals":["The login tests pass"]}"#;
     const AUTOMATION_ARGS_FILE_NAME: &str = "goals.json";
-    const AUTOPILOT_ARG: &str = "autopilot";
 
     fn arming(name: &str, args: Option<&str>) -> ProfileArming {
         ProfileArming {
@@ -2313,19 +2311,6 @@ mod tests {
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
         assert!(error.to_string().contains(ACP_CONFLICT), "{error}");
-    }
-
-    #[test_case(FeatureFlags::NONE, true; "experiment_off")]
-    #[test_case(FeatureFlags::NONE.with(Feature::Autopilot), false; "experiment_on")]
-    fn autopilot_flag_is_hidden_until_enabled(features: FeatureFlags, hidden: bool) {
-        let command = Cli::command_for(features);
-        assert_eq!(
-            command
-                .get_arguments()
-                .find(|arg| arg.get_id().as_str() == AUTOPILOT_ARG)
-                .map(|arg| arg.is_hide_set()),
-            Some(hidden)
-        );
     }
 
     #[test_case(GROUP_NAME, true; "lowercase_words")]

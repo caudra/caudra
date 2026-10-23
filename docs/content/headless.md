@@ -33,14 +33,14 @@ JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, 
 
 Caudra exits with code 1 when the run ends in an error, such as a provider refusing the request or a goal that was not met. That is every run whose JSON result has `is_error: true`, whatever the output format. A successful run exits with 0.
 
-With `--autopilot`, which needs `experimental.autopilot`, [autopilot](/docs/autopilot/#headless-and-ci) answers the run's permission prompts, and a prompt it leaves to a human is denied. A `/goal <condition>` prompt becomes the goal autopilot owns. The JSON result then carries an `autopilot` object:
+With `--autopilot`, [autopilot](/docs/autopilot/#headless-and-ci) answers the run's permission prompts, and a prompt it leaves to a human is denied. A `/goal <condition>` prompt becomes the goal autopilot owns. The JSON result then carries an `autopilot` object:
 
 ```json
 "autopilot":{"ended":true,"end":{"reason":"budget","kind":"continuations"},
              "continuations":100,"decisions":37,"escalations":2}
 ```
 
-`end` is absent while autopilot is still engaged, and its shapes are listed under [Autopilot events](#autopilot-events). An end for a spent budget or an error makes the run an error, as an impossible goal already does. A stall that autopilot recovered from does not. `--verbose` and `stream-json` also print each autopilot event as the `system` message the SDK sends.
+`end` is absent while autopilot is still engaged, and its shapes are listed under [Autopilot events](#autopilot-events). An end for a spent budget or an error makes the run an error, as an impossible goal already does. A stall that autopilot recovered from does not. `--verbose` and `stream-json` also print each autopilot event as the `system` message the SDK sends. Without them, a [caveat](#caveats) still goes to stderr.
 
 `total_cost_usd` is money owed. When a subscription covers the run, its list
 price lands in `subscription_cost_usd` instead, and the two are never added
@@ -435,7 +435,7 @@ Closing stdin never pauses automations. Once it closes, no automation run starts
 
 ### Autopilot
 
-[Autopilot](/docs/autopilot/) is experimental and needs `experimental.autopilot`. With it on, a stream-json session can hand its permission prompts, plans, and stalls to a delegate model while it works toward a goal. `--autopilot` engages the session Caudra starts with, and the client can engage it later through controls. The `init` message lists the controls and the current state:
+With [autopilot](/docs/autopilot/), a stream-json session can hand its permission prompts, plans, and stalls to a delegate model while it works toward a goal. `--autopilot` engages the session Caudra starts with, and the client can engage it later through controls. The `init` message lists the controls and the current state:
 
 ```json
 {"type":"system","subtype":"init",
@@ -463,7 +463,7 @@ The first three reply with the engagement in `response.response`:
  "limits":{"max_continuations":100,"max_cost":null,"max_minutes":null}}
 ```
 
-`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. `engagement` numbers the session's engagements from 1, and `retries` counts the provider errors the engagement retried. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. A limit that is not set is `null`, and so is `max_continuations` when it is `0`. While the switch is off, each control fails with an error that names it.
+`status` is `engaged`, `ended`, or `none`. A session that never engaged replies with `status` and `limits` alone. `engagement` numbers the session's engagements from 1, and `retries` counts the provider errors the engagement retried. After an end, `last_end` holds the [end](#autopilot-events). `limits` are the [`[autopilot]`](/docs/configuration/#autopilot) values, which a stream-json session reads once at startup. A limit that is not set is `null`, and so is `max_continuations` when it is `0`.
 
 `goal_set` and `goal_clear` leave autopilot engaged, and the goal they set or clear is no longer autopilot's.
 
@@ -490,6 +490,7 @@ Every autopilot event arrives as a `system` message with subtype `autopilot`. `k
 | `settled` | `seq`, `outcome` | Something followed a decision, such as a human answer after an escalation |
 | `retrying` | `attempt`, `limit`, `delay_ms`, `error` | A provider error ended the run, and the run starts again after `delay_ms` |
 | `ended` | `end`, `engagement`, `continuations`, `cost_usd`, `subscription_cost_usd`, `elapsed_ms`, `retries` | Autopilot ended, with what the engagement spent |
+| `caveat` | `engagement`, `caveat`, `message` | After `engaged`, once for each thing the engagement runs without. See [caveats](#caveats) |
 
 A decision's `kind` is `permission`, `question`, `reply`, `plan`, `review`, or `second_opinion`. `agent` names the subagent the decision was for, and is `null` for the main agent. `item` is what the delegate was asked, cut at 2 KiB.
 
@@ -529,6 +530,24 @@ When the delegate allows or denies a permission request, Caudra withdraws it fro
 The `interrupt` control ends autopilot as stopped by `interrupt`, in addition to its other effects. The session saves the engagement and its decision log with the rest of its state. `--resume <ID>` restores both, engaged, with the budget it has used. When a goal is active, one check-in run starts and counts as a continuation.
 
 Delegate spend counts in the engagement's `cost_usd` and in the run's `result`. Like the rest of a stream-json session's model jobs, it stays out of the lifetime ledger in `/usage`.
+
+#### Caveats
+
+A `caveat` event follows `engaged` when autopilot runs without something it relies on. It changes nothing about the engagement, and the log does not keep it. `message` is the text the terminal UI shows, and `caveat.kind` is one of these:
+
+| `caveat.kind` | More fields | Meaning |
+|---------------|-------------|---------|
+| `no_decision_endpoint` | None | No [decision endpoint](/docs/providers/#decision-endpoints) is active, so nothing screens content |
+| `content_screening_off` | None | An endpoint is active, and `content_screening` is `off` |
+| `delegate_unavailable` | `model`, `reason` | The model bound to the Autopilot job cannot be used, so the delegate leaves every item to a human |
+
+```json
+{"type":"system","subtype":"autopilot","kind":"caveat","engagement":3,
+ "caveat":{"kind":"content_screening_off"},
+ "message":"Content screening is off, so autopilot may approve calls ..."}
+```
+
+A `-p` run prints each caveat to stderr as `autopilot: <message>`, with or without `--verbose`.
 
 #### Autopilot log
 

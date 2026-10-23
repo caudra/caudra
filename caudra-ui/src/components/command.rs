@@ -530,7 +530,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Keep the session moving: answer prompts, questions, and plans for you (off, model, log)",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
-        features: &[Feature::Autopilot],
+        features: &[],
     },
     BuiltinCommand {
         name: "/auto",
@@ -1572,7 +1572,6 @@ mod tests {
     #[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
     #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
     #[test_case("/automations", Feature::Automations; "automations")]
-    #[test_case("/autopilot", Feature::Autopilot; "autopilot")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
     fn a_command_is_absent_until_its_experiment_is_on(name: &str, feature: Feature) {
         let mut off = synced_with(name, FeatureFlags::all().without(feature));

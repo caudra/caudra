@@ -416,7 +416,6 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 - Workflow Inspector: `workflows`
 - Workflow Catalog: `workflows`
 - Automation Inspector: `automations`
-- Autopilot Panel: `autopilot`
 - Workbench Transfer: `sandboxes`
 
 ## Context Inheritance

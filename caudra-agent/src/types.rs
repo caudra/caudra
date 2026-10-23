@@ -35,7 +35,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::autopilot::{
-    AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
+    AutopilotCaveat, AutopilotDecision, DecisionKind, DecisionOutcome, EngagementSpend, StoodDown,
 };
 use crate::code::output::{CodeCall, CodeOutput, CodeProgressEvent};
 use crate::decisions::{DecisionNote, PendingDecision};
@@ -3039,6 +3039,12 @@ pub enum AutopilotEvent {
     },
     ImplementPlan {
         seq: u32,
+    },
+    /// What engagement `engagement` runs without. It changes nothing about
+    /// the engagement and is never stored.
+    Caveat {
+        engagement: u32,
+        caveat: AutopilotCaveat,
     },
     Ended {
         reason: AutopilotEnd,

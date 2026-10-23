@@ -232,7 +232,7 @@ Passage review was inspired by [Plannotator](https://plannotator.ai/).
 - **Permissions that read the command.** Shell chains and pipelines split into separate commands for approval. Approve once, for the conversation, the project, or every project, and accept patterns Caudra suggests from repeated approvals.
 - **Plan first, then hear back.** By default, new sessions open in Plan mode, where the agent edits only its plan and asks before commands it cannot prove read-only. Notifications tell you when a turn finishes or a prompt needs your answer.
 
-Unattended work needs a running session, for example in tmux or [Herdr](https://herdr.dev). Closing it cancels background work. Experimental [autopilot](https://caudra.ai/docs/autopilot/) can answer permission prompts, questions, and ready plans while you are away, within budgets you set. Its log lists every decision and what followed. A goal allows 16 automatic continuations by default, and work pauses when it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
+Unattended work needs a running session, for example in tmux or [Herdr](https://herdr.dev). Closing it cancels background work. [Autopilot](https://caudra.ai/docs/autopilot/) can answer permission prompts, questions, and ready plans while you are away, within budgets you set. Its log lists every decision and what followed. A goal allows 16 automatic continuations by default, and work pauses when it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
 
 [Completion goals](https://caudra.ai/docs/commands/#completion-goals) · Watch: [Work toward a goal](https://caudra.ai/gallery/#goal)
 
@@ -346,7 +346,7 @@ Model jobs decide which model serves each kind of work. Pin a job to a model in 
 | Extract | Requirements for `/extract` and compaction, on Fast until you bind it. |
 | Memory | One-line summaries of older memory notes, on the compaction model until you bind it. |
 | Learn | The continual learner, on the Chat model until you bind it. |
-| Autopilot | Answers for experimental autopilot while you are away, on Best until you bind it. |
+| Autopilot | Answers for autopilot while you are away, on Best until you bind it. |
 | Fast | The preferred small model, for routine calls. |
 | Best | The provider's flagship. Point Plan or a prompt profile's subagents at it. |
 
@@ -369,7 +369,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Next, Guide, and Replace queue](https://caudra.ai/docs/queue/)
 - [Completion goals with a log of every check](https://caudra.ai/docs/commands/#completion-goals)
 - [Goals that wait for CI and stop when stuck](https://caudra.ai/docs/commands/#completion-goals)
-- [Autopilot toward a goal](https://caudra.ai/docs/autopilot/) (experimental)
+- [Autopilot toward a goal](https://caudra.ai/docs/autopilot/)
 - [Side questions with `/btw`](https://caudra.ai/docs/commands/#modes-and-toggles)
 - [Questions you can answer later](https://caudra.ai/docs/sessions/#deferred-questions)
 - [Notes on your answers to the agent](https://caudra.ai/docs/keybindings/#form)

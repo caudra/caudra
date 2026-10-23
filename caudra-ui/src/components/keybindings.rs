@@ -530,7 +530,6 @@ impl KeybindContext {
             Self::PeerManager => Some(Feature::CrossSessionMessaging),
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
             Self::AutomationInspector => Some(Feature::Automations),
-            Self::AutopilotPanel => Some(Feature::Autopilot),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
         }

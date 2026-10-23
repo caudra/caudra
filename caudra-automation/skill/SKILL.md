@@ -259,7 +259,7 @@ In `session`:
 - `mode` is the session's mode, such as `"build"`.
 - `status` is `"working"`, `"needs_input"`, or `"idle"`, as other sessions see it: a message held for review counts as `"needs_input"`, and a ready plan does not. `status_since` is when it began, in unix seconds.
 - `goal` is `#{ condition, evaluations }` while a goal is active, and `()` otherwise.
-- `autopilot` is `#{ owns_goal, waiting }` while autopilot is engaged, and `()` otherwise, including while it is off. Autopilot is experimental (`experimental.autopilot`), and a script cannot engage it. `owns_goal` is `true` when the active goal is the one autopilot set, and `waiting` is `true` while a prompt it left to the user waits.
+- `autopilot` is `#{ owns_goal, waiting }` while autopilot is engaged, and `()` otherwise. A script cannot engage autopilot. `owns_goal` is `true` when the active goal is the one autopilot set, and `waiting` is `true` while a prompt it left to the user waits.
 - `cost` is the session's spend in USD, or `()` when it is unknown.
 - `groups` lists the consumer groups the session takes work from.
 - `work` is `#{ held, paused }`. `held` is the work item the session works on, as `#{ group, work, attempt, max_attempts }`, or `()`. `paused` lists the items it paused that still wait for an outcome, as `#{ group, work, pause_reason }`.

@@ -38,6 +38,7 @@ use crate::sandbox::{
     SandboxControl, SandboxReadiness,
 };
 use caudra_agent::automation::frontend::wake_origin;
+use caudra_agent::autopilot::autopilot_caveats;
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::code::runner as code_runner;
 use caudra_agent::command::CustomCommand;
@@ -48,6 +49,7 @@ use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
 };
 use caudra_agent::tools::ToolRegistry;
+use caudra_agent::types::AutopilotEvent;
 use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::worktree::git::Git;
 use caudra_agent::worktree::{
@@ -1657,6 +1659,8 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     title_rx: flume::Receiver<GeneratedTitle>,
     title_tx: flume::Sender<GeneratedTitle>,
+    caveat_rx: flume::Receiver<AutopilotCaveats>,
+    caveat_tx: flume::Sender<AutopilotCaveats>,
     ui_action_rx: flume::Receiver<UiAction>,
     worktrees: Backend,
     host_workspaces: Option<Arc<dyn Workspaces>>,
@@ -1748,7 +1752,14 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Title(GeneratedTitle),
+    Caveats(AutopilotCaveats),
     Config(BTreeSet<ConfigSource>),
+}
+
+/// What an engagement of session `id` runs without, as its autopilot events.
+struct AutopilotCaveats {
+    id: CaudraId,
+    events: Vec<AutopilotEvent>,
 }
 
 /// What a model-written title came back as, for the session that asked. The
@@ -1980,6 +1991,7 @@ impl<'t> EventLoop<'t> {
         let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
         let (title_tx, title_rx) = flume::unbounded::<GeneratedTitle>();
+        let (caveat_tx, caveat_rx) = flume::unbounded::<AutopilotCaveats>();
 
         match ui_config.math {
             caudra_config::MathStyle::Unicode => caudra_markdown::render::MathStyle::Unicode,
@@ -2127,6 +2139,8 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             title_rx,
             title_tx,
+            caveat_rx,
+            caveat_tx,
             ui_action_rx,
             worktrees,
             host_workspaces,
@@ -2219,6 +2233,7 @@ impl<'t> EventLoop<'t> {
                 self.dispatch(self.focused, actions);
                 dirty = Dirty::YES;
             }
+            self.check_autopilots();
             self.checkpoint_all();
             self.persist_workspace_tabs_if_changed();
             // An exit leaves the loop right below, so its frame can never be
@@ -2308,6 +2323,7 @@ impl<'t> EventLoop<'t> {
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.title_rx, |res| res.ok().map(Wake::Title));
+        sel = sel.recv(&self.caveat_rx, |res| res.ok().map(Wake::Caveats));
         sel = sel.recv(self.config_reload.changes(), |res| {
             res.ok().map(Wake::Config)
         });
@@ -2365,6 +2381,13 @@ impl<'t> EventLoop<'t> {
                 self.focused_app().flash(warning);
             }
             Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
+            Wake::Caveats(AutopilotCaveats { id, events }) => {
+                if let Some(index) = self.position(id) {
+                    for event in events {
+                        self.sessions[index].app.note_autopilot_event(event);
+                    }
+                }
+            }
             Wake::Config(sources) => self.apply_config_changes(sources),
         }
         Ok(())
@@ -3623,6 +3646,30 @@ impl<'t> EventLoop<'t> {
             let _ = title_tx.send(GeneratedTitle { id, result });
         })
         .detach();
+    }
+
+    /// Detached, because resolving a bound delegate model may read the
+    /// catalog and credentials. The result comes back as [`Wake::Caveats`].
+    fn check_autopilots(&mut self) {
+        for rt in &mut self.sessions {
+            let app = &mut rt.app;
+            if !app.take_autopilot_check() {
+                continue;
+            }
+            let id = app.state.session.id;
+            let autopilot = app.state.autopilot.clone();
+            let decisions = app.permissions.decisions();
+            let chat_model = Arc::new(app.state.model.clone());
+            let policy = Arc::clone(&self.ctx.model_policy);
+            let caveat_tx = self.caveat_tx.clone();
+            smol::spawn(async move {
+                let events = autopilot_caveats(&autopilot, decisions, chat_model, policy).await;
+                if !events.is_empty() {
+                    let _ = caveat_tx.send(AutopilotCaveats { id, events });
+                }
+            })
+            .detach();
+        }
     }
 
     fn apply_generated_title(&mut self, id: CaudraId, result: Result<String, String>) {

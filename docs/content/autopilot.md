@@ -1,6 +1,6 @@
 ---
 title: "Autopilot"
-description: "Keep a session moving toward its goal while you are away (experimental)."
+description: "Keep a session moving toward its goal while you are away."
 ---
 
 Autopilot answers what would otherwise wait for you, so a session keeps working toward its goal unattended. It answers permission prompts, the `question` tool, questions the assistant asks in prose, and a plan that is ready to implement. It also reviews the stalls that would end a run, such as a goal loop cap or a provider outage.
@@ -8,19 +8,6 @@ Autopilot answers what would otherwise wait for you, so a session keeps working 
 Each answer is a separate model call, the *delegate*, in the way the [goal evaluator](/docs/commands/#completion-goals) judges a goal. The delegate sees your own words, the goal, a bounded tail of the conversation, and the item it decides. It never runs tools. When it cannot decide safely, it leaves the item to you and tells you.
 
 Use autopilot with a [completion goal](/docs/commands/#completion-goals) when a task should run to the end without you. [Automations](/docs/automations/) decide *when* a session acts. Autopilot keeps the session from stopping once it does.
-
-Autopilot is experimental and off by default.
-
-## Turn it on
-
-Set `autopilot = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra:
-
-```toml
-[experimental]
-autopilot = true
-```
-
-While the switch is off, Caudra offers no `/autopilot` command, status chip, or SDK control, and `--autopilot` is hidden and refused. The [`[autopilot]`](/docs/configuration/#autopilot) limits have no effect. See [Experimental features](/docs/configuration/#experimental-features).
 
 ## Engage it
 
@@ -37,6 +24,18 @@ Only you engage autopilot. Scripts, profiles, and the model cannot.
 | `autopilot_start` | Engages from an SDK client. See [Headless Mode](/docs/headless/#autopilot). |
 
 Engaging resets the budget and tells the model, through a `# Autopilot` reminder, that answers may come from a delegate while you are away. The reminder asks it to ask only when the answer changes the outcome, and to ask through `question` where it can.
+
+### Before you leave it alone
+
+Autopilot engages even when something it relies on is missing. The `Autopilot engaged` row is then followed by a notice that says what to do:
+
+| Notice | What it means | What to do |
+|--------|---------------|------------|
+| No decision endpoint is active | Nothing screens fetched pages or tool output, so injected text can lead autopilot to approve calls. | Add an endpoint with `/login`, or select one with `caudra decisions use <name>`. Then turn on content screening. |
+| Content screening is off | An endpoint is active, and [`content_screening`](/docs/configuration/#decisionsfeatures) is `off`. | Turn it on in `/decisions`. |
+| Autopilot's model cannot be used | The model bound to the Autopilot job has no provider or no credentials. A bound model is never replaced, so every item is left to you. | Pick another with `/autopilot model`, or sign in to its provider. |
+
+Caudra checks the delegate's model and its credentials without calling the model. The notices change nothing about the engagement, and they are not saved in the [log](#the-log). In `-p` they go to stderr, and SDK clients receive them as `caveat` events. See [Headless Mode](/docs/headless/#autopilot).
 
 ### Owned goals
 
@@ -199,7 +198,7 @@ A session that you resume stays engaged, with the budget it has used. When a goa
 Autopilot is delegated consent. It approves calls you did not see. Read these limits before you leave a session alone:
 
 - It never approves the reserved classes in the [permission table](#permission-prompts). Those need you, or a rule you wrote.
-- It approves nothing while content screening has flagged the session. That flag needs the decision engine.
+- It approves nothing while content screening has flagged the session. That flag needs an active [decision endpoint](/docs/providers/#decision-endpoints) and [`content_screening`](/docs/configuration/#decisionsfeatures) turned on. Without them, autopilot still runs, and the [engage notice](#before-you-leave-it-alone) says so.
 - It decides permission prompts without tool results, which keeps injected text one step away. A determined injection can still shape the assistant's own requests.
 - It never adds a rule, so an approval does not outlive the call.
 - It is no security boundary. Use [sandboxes](/docs/sandboxes/), [stored rules](/docs/permissions/#stored-rules), and read-only modes for what must never happen.
