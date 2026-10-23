@@ -169,6 +169,7 @@ impl Harness {
         let now_ms = now_millis();
         self.state.health.observe(
             account,
+            QuotaSource::Response,
             vec![QuotaWindow::new(
                 WindowKind::FiveHour,
                 used_percent,

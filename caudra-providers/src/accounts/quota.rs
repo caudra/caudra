@@ -222,7 +222,9 @@ pub fn from_anthropic_headers(headers: &HeaderMap) -> Vec<QuotaWindow> {
 }
 
 /// `x-codex-{primary,secondary}-used-percent`, `-window-minutes`, and
-/// `-reset-at` (epoch seconds) or the older `-reset-after-seconds`.
+/// `-reset-at` (epoch seconds) or the older `-reset-after-seconds`. A slot
+/// without a window length names no window: Codex sends such placeholders
+/// for limits the plan does not have.
 pub fn from_codex_headers(headers: &HeaderMap, now_ms: u64) -> Vec<QuotaWindow> {
     CODEX_WINDOWS
         .iter()
@@ -231,22 +233,17 @@ pub fn from_codex_headers(headers: &HeaderMap, now_ms: u64) -> Vec<QuotaWindow> 
             let used = header_f32(headers, &format!("{prefix}{CODEX_USED_SUFFIX}"))?;
             let length = header_u64(headers, &format!("{prefix}{CODEX_MINUTES_SUFFIX}"))
                 .filter(|minutes| *minutes > 0)
-                .map(|minutes| Duration::from_secs(minutes * 60));
+                .map(|minutes| Duration::from_secs(minutes * 60))?;
             let resets_at = header_u64(headers, &format!("{prefix}{CODEX_RESET_AT_SUFFIX}"))
                 .map(|secs| secs * MILLIS_PER_SEC)
                 .or_else(|| {
                     header_u64(headers, &format!("{prefix}{CODEX_RESET_AFTER_SUFFIX}"))
                         .map(|secs| now_ms + secs * MILLIS_PER_SEC)
                 });
-            let kind = length.map_or_else(
-                || WindowKind::Other((*window).to_owned()),
-                WindowKind::from_length,
-            );
-            let quota = QuotaWindow::new(kind, used, resets_at);
-            Some(match length {
-                Some(length) => quota.with_length(length),
-                None => quota,
-            })
+            Some(
+                QuotaWindow::new(WindowKind::from_length(length), used, resets_at)
+                    .with_length(length),
+            )
         })
         .collect()
 }
@@ -327,6 +324,22 @@ mod tests {
         assert_eq!(parsed[1].kind, WindowKind::Weekly);
         assert_eq!(parsed[1].resets_at, Some(NOW_MS + 60_000));
         assert_eq!(parsed[1].length_secs, Some(WEEK_SECS));
+    }
+
+    #[test_case(&[("x-codex-secondary-reset-at", "1800003600")] ; "no_minutes")]
+    #[test_case(&[("x-codex-secondary-window-minutes", "0"), ("x-codex-secondary-reset-after-seconds", "0")] ; "placeholder")]
+    fn codex_slots_without_a_length_are_not_windows(secondary: &[(&'static str, &str)]) {
+        let mut pairs = vec![
+            ("x-codex-primary-used-percent", "82"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-secondary-used-percent", "0"),
+        ];
+        pairs.extend_from_slice(secondary);
+        let kinds: Vec<WindowKind> = from_codex_headers(&headers(&pairs), NOW_MS)
+            .into_iter()
+            .map(|window| window.kind)
+            .collect();
+        assert_eq!(kinds, vec![WindowKind::FiveHour]);
     }
 
     #[test_case(FIVE_HOURS_SECS, WindowKind::FiveHour ; "five_hours")]

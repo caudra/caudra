@@ -24,6 +24,7 @@ const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.9;
 const DEFAULT_GOAL_SKIP_BELOW: f64 = 0.05;
 const DEFAULT_QUESTION_TOOL_NUDGE: f64 = 0.85;
 const DEFAULT_RELEVANCE_FLOOR: f64 = 0.1;
+const DEFAULT_RECALL_CONFIDENCE: f64 = 0.75;
 const INVALID_BASE_URL_MESSAGE: &str = "must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters";
 const FULL_ENDPOINT_MESSAGE: &str =
     "Caudra appends /v1/systemone; set base_url to the part before it";
@@ -291,7 +292,7 @@ features! {
     history_search: [Enforce],
         "Rerank session history search's keyword matches against the agent's query, drop those judged unrelated, and return the rest best first. Sends the query and each candidate's kind, tool, date, session title, and a redacted excerpt.";
     memory_recall: [Advise],
-        "In main sessions, remind the agent of at most three saved notes likely relevant to a new user message, without loading them. Sends a redacted message excerpt and each keyword-matched note's name, heading, and redacted excerpt.";
+        "Remind the agent of at most three saved notes likely relevant to a new user message, a todo step it starts, an unmet goal, or the work after compaction, without loading them. Sends a redacted excerpt of the request and of the open todos, the previous request when this one is short, and an unmet goal with the evaluator's reason, and each keyword-matched note's name, heading, and redacted excerpt.";
     memory_duplicates: [Advise],
         "When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes.";
     compaction_retention: [Enforce],
@@ -313,6 +314,7 @@ pub struct DecisionThresholds {
     pub goal_skip_below: f64,
     pub question_tool_nudge: f64,
     pub relevance_floor: f64,
+    pub recall_confidence: f64,
     pub shell_writes: Option<f64>,
 }
 
@@ -327,6 +329,7 @@ impl Default for DecisionThresholds {
             goal_skip_below: DEFAULT_GOAL_SKIP_BELOW,
             question_tool_nudge: DEFAULT_QUESTION_TOOL_NUDGE,
             relevance_floor: DEFAULT_RELEVANCE_FLOOR,
+            recall_confidence: DEFAULT_RECALL_CONFIDENCE,
             shell_writes: None,
         }
     }
@@ -382,7 +385,7 @@ impl DecisionThresholds {
             max: None,
             env: None,
             choices: &[],
-            description: "Confidence required for skill suggestions. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. Memory recall, memory duplicates, and output pointers name a candidate only at or above this relevance probability.",
+            description: "Confidence required for skill suggestions. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. Memory duplicates and output pointers name a candidate only at or above this relevance probability.",
         },
         ConfigField {
             name: "goal_skip_below",
@@ -424,6 +427,16 @@ impl DecisionThresholds {
             choices: &[],
             description: "Relevance probability below which an enforcing rerank feature prunes or demotes a candidate. Memory search omits it, compaction retention keeps a newer result in its place, and tool search ranks it after the candidates judged relevant, in keyword order. A list the engine could not judge is never emptied.",
         },
+        ConfigField {
+            name: "recall_confidence",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_RECALL_CONFIDENCE),
+            min: None,
+            max: None,
+            env: None,
+            choices: &[],
+            description: "Relevance probability a note needs before memory recall names it in a reminder.",
+        },
     ];
 
     fn validate(&self) -> Result<(), DecisionsConfigError> {
@@ -445,6 +458,7 @@ impl DecisionThresholds {
                 Some(self.question_tool_nudge),
             ),
             ("thresholds.relevance_floor", Some(self.relevance_floor)),
+            ("thresholds.recall_confidence", Some(self.recall_confidence)),
             ("thresholds.shell_writes", self.shell_writes),
         ] {
             if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
@@ -1710,6 +1724,10 @@ mod tests {
     #[test_case("[thresholds]\nrelevance_floor = -0.1", "thresholds.relevance_floor")]
     #[test_case("[thresholds]\nrelevance_floor = 1.1", "thresholds.relevance_floor")]
     #[test_case("[thresholds]\nrelevance_floor = nan", "thresholds.relevance_floor")]
+    #[test_case(
+        "[thresholds]\nrecall_confidence = 1.1",
+        "thresholds.recall_confidence"
+    )]
     #[test_case("[thresholds]\npermission_flag = nan", "thresholds.permission_flag")]
     #[test_case("[thresholds]\nauto_flag = inf", "thresholds.auto_flag")]
     #[test_case("[thresholds]\nshell_writes = 1.1", "thresholds.shell_writes")]

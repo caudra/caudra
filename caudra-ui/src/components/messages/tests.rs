@@ -2,6 +2,7 @@ use super::segment;
 use super::*;
 use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
+use crate::components::DECISION_SEPARATOR;
 use crate::components::code_view::{BatchViews, RenderLimits, ScrollSpan, render_tool_content};
 use crate::components::command_text::tests::{
     COLOUR_THEME, NOT_TOLD_APART, SHELL_SYNTAX, colour_of, coloured, syntax_colour,
@@ -43,6 +44,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
+use std::iter;
 use std::ops::Range;
 use std::path::Path;
 use std::thread;
@@ -5620,7 +5622,7 @@ fn an_injected_heading_responds_to_hover() {
 }
 
 fn decision_row(outcome: NoteOutcome, details: &[String]) -> DisplayMessage {
-    DisplayMessage::decision(DECISION_FEATURE, outcome, DECISION_SUMMARY, details)
+    DisplayMessage::decision(DECISION_FEATURE, outcome, None, DECISION_SUMMARY, details)
 }
 
 /// The details are the feature's working, so the row reads as one line until
@@ -5661,6 +5663,312 @@ fn a_decision_row_without_details_has_nothing_to_open() {
     render(&mut panel, area.width, area.height);
 
     assert!(!panel.handle_click(0, area));
+}
+
+const DECISION_WAITED: Duration = Duration::from_millis(1_234);
+const DECISION_WAITED_TEXT: &str = "1.2s";
+const DECISION_WAIT_CALL: &str = "t1";
+const SCREENING_WAIT: &str = "screening result…";
+
+fn segment_search_text(panel: &MessagesPanel, msg_index: usize) -> String {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.msg_index == Some(msg_index) && segment.tool_id.is_none())
+        .unwrap()
+        .search_text
+        .clone()
+}
+
+const TURN_PROMPT: &str = "fix the build";
+const RECALL_WAIT: &str = "recalling notes…";
+const RECALLED: &str = "recalled";
+const SKILL_DECIDED: &str = "decided";
+const ALL_QUIET: &str = "checked";
+const NO_NOTES: &str = "no notes";
+const NEAR_MISS: &str = "0.41  release-notes";
+const DECISIONS_AREA: Rect = Rect::new(0, 0, 80, 12);
+const CHIPS_SEARCHED: &str = "a row's chips must not be searched";
+const HEIGHT_KEPT: &str = "chips on a row's first line must leave its height alone";
+
+fn chip(words: &str) -> String {
+    format!("{DECISION_PREFIX}{words}")
+}
+
+/// A panel whose only row is a prompt carrying `decisions` as a turn's.
+fn turn_host(config: UiConfig, decisions: impl IntoIterator<Item = CardDecision>) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, TURN_PROMPT.into()));
+    panel.flush();
+    for decision in decisions {
+        assert!(panel.attach_decision(decision));
+    }
+    panel
+}
+
+fn turn_wait(feature: DecisionFeature) -> CardDecision {
+    CardDecision::pending(DecisionSubject::Turn, feature)
+}
+
+fn turn_note(feature: DecisionFeature, outcome: NoteOutcome) -> CardDecision {
+    CardDecision::settled(
+        DecisionSubject::Turn,
+        feature,
+        outcome,
+        DECISION_SUMMARY,
+        &[DECISION_DETAIL.into()],
+    )
+}
+
+fn prompt_row(seen: &str) -> &str {
+    seen.lines().find(|row| row.contains(TURN_PROMPT)).unwrap()
+}
+
+/// The screen cell `marker` starts at, on a screen of single-width glyphs.
+fn cell_of(seen: &str, marker: &str) -> (u16, u16) {
+    let row = screen_row_of(seen, marker).unwrap();
+    let line = seen.lines().nth(row).unwrap();
+    let column = line[..line.find(marker).unwrap()].chars().count();
+    (u16::try_from(column).unwrap(), u16::try_from(row).unwrap())
+}
+
+fn host_height(panel: &mut MessagesPanel) -> u16 {
+    render(panel, DECISIONS_AREA.width, DECISIONS_AREA.height);
+    panel.segment_heights()[0]
+}
+
+/// A turn's wait spins and counts at the end of the prompt's first line until
+/// the engine answers, then the answer takes its place there, timed by the
+/// wait. Neither moves the row's text nor changes its height.
+#[test]
+fn a_turns_chip_settles_in_place_on_its_hosts_first_line() {
+    let _clock = FrozenClock::at(DECISION_WAITED);
+    let _spinner = FrozenSpinner::at(0);
+    let mut bare = turn_host(UiConfig::default(), []);
+    let height = host_height(&mut bare);
+    let mut panel = turn_host(
+        UiConfig::default(),
+        [turn_wait(DecisionFeature::MemoryRecall)],
+    );
+
+    let waiting = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    let row = prompt_row(&waiting).trim_end();
+    assert!(
+        row.ends_with(&format!("{RECALL_WAIT} {DECISION_WAITED_TEXT}")),
+        "{row}"
+    );
+    assert!(
+        SPINNER_GLYPHS.chars().any(|glyph| row.contains(glyph)),
+        "{row}"
+    );
+    assert_eq!(panel.segment_heights()[0], height, "{HEIGHT_KEPT}");
+    assert_eq!(panel.cadence(), Cadence::SPINNER);
+    assert_eq!(
+        segment_search_text(&panel, 0),
+        TURN_PROMPT,
+        "{CHIPS_SEARCHED}"
+    );
+
+    assert!(panel.attach_decision(turn_note(DecisionFeature::MemoryRecall, NoteOutcome::Acted)));
+
+    let settled = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    let row = prompt_row(&settled).trim_end();
+    assert!(
+        row.ends_with(&format!("{} {DECISION_WAITED_TEXT}", chip(RECALLED))),
+        "{row}"
+    );
+    assert_eq!(panel.message_at(0).unwrap().decisions.len(), 1);
+    assert_eq!(panel.segment_heights()[0], height, "{HEIGHT_KEPT}");
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+}
+
+/// A wait the engine answered with nothing to do leaves a dim chip saying
+/// so, alone or beside one that spoke, and a click still says what came
+/// closest.
+#[test_case(&[], ALL_QUIET ; "all_quiet_collapse_to_checked")]
+#[test_case(&[NoteOutcome::Acted], SKILL_DECIDED ; "a_noted_chip_hides_the_quiet_one")]
+fn a_quiet_answer_keeps_a_chip_on_its_host(noted: &[NoteOutcome], words: &str) {
+    let _clock = FrozenClock::at(DECISION_WAITED);
+    let mut panel = turn_host(
+        UiConfig::default(),
+        iter::once(turn_wait(DecisionFeature::MemoryRecall)).chain(
+            noted
+                .iter()
+                .map(|outcome| turn_note(DecisionFeature::SkillSuggestions, *outcome)),
+        ),
+    );
+
+    panel.quiet_decision(&DecisionFeature::MemoryRecall, &[NEAR_MISS.into()]);
+
+    let seen = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    let row = prompt_row(&seen).trim_end();
+    let shown = chip(words);
+    assert!(row.contains(&shown), "{row}");
+    assert!(!row.contains(NO_NOTES), "{row}");
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+
+    let (column, screen_row) = cell_of(&seen, &shown);
+    assert!(panel.toggle_decisions_at(column, screen_row, DECISIONS_AREA));
+    let opened = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    assert!(opened.contains(NO_NOTES), "{opened}");
+    assert!(opened.contains(NEAR_MISS), "{opened}");
+}
+
+/// A click on the chips opens what each decision said under the row, where
+/// search finds it, and the same click puts it away. A click beside them is
+/// not theirs.
+#[test]
+fn a_click_on_a_rows_chips_toggles_its_details() {
+    let mut panel = turn_host(
+        UiConfig::default(),
+        [turn_note(DecisionFeature::MemoryRecall, NoteOutcome::Acted)],
+    );
+    let height = host_height(&mut panel);
+    let seen = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    assert!(!seen.contains(DECISION_DETAIL), "{DECISION_FOLDED}: {seen}");
+    let recalled = chip(RECALLED);
+    let (column, row) = cell_of(&seen, &recalled);
+
+    assert!(!panel.toggle_decisions_at(DECISIONS_AREA.x, row, DECISIONS_AREA));
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    let opened = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    assert!(
+        opened.contains(DECISION_SUMMARY),
+        "{DECISION_OPENED}: {opened}"
+    );
+    assert!(
+        opened.contains(DECISION_DETAIL),
+        "{DECISION_OPENED}: {opened}"
+    );
+    let search = segment_search_text(&panel, 0);
+    assert!(search.contains(DECISION_DETAIL), "{search}");
+    assert!(!search.contains(&recalled), "{CHIPS_SEARCHED}: {search}");
+
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    assert_eq!(host_height(&mut panel), height);
+    assert_eq!(segment_search_text(&panel, 0), TURN_PROMPT);
+}
+
+#[test]
+fn hidden_decisions_draw_no_chip_and_open_nothing() {
+    let _clock = FrozenClock::at(DECISION_WAITED);
+    let hidden = UiConfig {
+        show_decisions: false,
+        ..UiConfig::default()
+    };
+    let mut panel = turn_host(
+        hidden,
+        [
+            turn_wait(DecisionFeature::MemoryRecall),
+            turn_note(DecisionFeature::SkillSuggestions, NoteOutcome::Acted),
+        ],
+    );
+
+    let seen = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    assert!(!seen.contains(&chip(SKILL_DECIDED)), "{seen}");
+    assert!(!seen.contains(RECALL_WAIT), "{seen}");
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+    let row = u16::try_from(screen_row_of(&seen, TURN_PROMPT).unwrap()).unwrap();
+    assert!(!panel.toggle_decisions_at(DECISIONS_AREA.width - 1, row, DECISIONS_AREA));
+}
+
+/// A turn's decision that lands on a card shows in its header, beside the
+/// call's own.
+#[test]
+fn a_turns_decision_on_a_card_shows_in_its_header() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(DECISION_WAIT_CALL, SHELL_TOOL_NAME));
+
+    assert!(panel.attach_decision(turn_note(DecisionFeature::MemoryRecall, NoteOutcome::Acted)));
+
+    let seen = buffer_text(&render(
+        &mut panel,
+        DECISIONS_AREA.width,
+        DECISIONS_AREA.height,
+    ));
+    assert!(seen.contains(&chip(RECALLED)), "{seen}");
+}
+
+#[test]
+fn a_timed_decision_row_draws_how_long_it_took_but_does_not_search_it() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::decision(
+        DECISION_FEATURE,
+        NoteOutcome::Acted,
+        Some(DECISION_WAITED),
+        DECISION_SUMMARY,
+        &[],
+    ));
+
+    let text = buffer_text(&render(&mut panel, 80, 5));
+
+    let clock = format!("{DECISION_SEPARATOR}{DECISION_WAITED_TEXT}");
+    assert!(
+        text.contains(&format!("{DECISION_SUMMARY}{clock}")),
+        "{text}"
+    );
+    assert!(!segment_search_text(&panel, 0).contains(DECISION_WAITED_TEXT));
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+}
+
+/// Content screening and output pointers ask after the call has ended, so
+/// the card's chip has to keep the panel painting on its own.
+#[test]
+fn a_pending_chip_outlives_its_call_and_keeps_its_clock_out_of_search() {
+    let _clock = FrozenClock::at(DECISION_WAITED);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(DECISION_WAIT_CALL, SHELL_TOOL_NAME));
+    panel.tool_done(done(DECISION_WAIT_CALL));
+    assert!(panel.attach_decision(CardDecision::pending(
+        DecisionSubject::Call(DECISION_WAIT_CALL.into()),
+        DecisionFeature::ContentScreening,
+    )));
+
+    let text = buffer_text(&render(&mut panel, 80, 5));
+
+    assert!(
+        text.contains(&format!("{SCREENING_WAIT} {DECISION_WAITED_TEXT}")),
+        "{text}"
+    );
+    let search = seg_search(&panel, DECISION_WAIT_CALL);
+    assert!(search.contains(SCREENING_WAIT), "{search}");
+    assert!(!search.contains(DECISION_WAITED_TEXT), "{search}");
+    assert_eq!(panel.cadence(), Cadence::SPINNER);
+
+    panel.settle_decision(
+        &DecisionSubject::Call(DECISION_WAIT_CALL.into()),
+        &DecisionFeature::ContentScreening,
+    );
+    assert_eq!(panel.cadence(), Cadence::IDLE);
 }
 
 /// A row that only says what it would have done, and one whose engine failed,

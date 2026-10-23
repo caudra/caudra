@@ -28,7 +28,8 @@ use caudra_agent::worktree::ClosePlan;
 use caudra_config::Feature;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
-    active_history_items, merge_history_items, project_messages, validate_history_items,
+    UserOrigin, active_history_items, merge_history_items, project_messages,
+    validate_history_items,
 };
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::id::CaudraId;
@@ -57,6 +58,7 @@ const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+pub(crate) const NOTHING_TO_FORK: &str = "Nothing to fork yet";
 
 struct PreparedSessionReset {
     session: AppSession,
@@ -643,6 +645,7 @@ impl App {
         self.subagent_answers.clear();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
+        self.subagent_replacements.clear();
         self.unsent_subagent_steers.clear();
         self.parent_task_ids.clear();
         self.subagent_input_box.discard();
@@ -716,6 +719,7 @@ impl App {
             &self.ui_config.tool_output_lines,
             self.ui_config.show_reminders,
             inserts,
+            restored.turns,
         );
         attach_card_decisions(&mut display_msgs, restored.cards);
         let mut reachable_subagents = reachable_subagent_ids(
@@ -1274,15 +1278,51 @@ impl App {
     }
 
     pub fn fork_at(&self, source: DisplaySource) -> Result<ForkedSession, String> {
+        self.fork_at_item(source_target_id(source))
+    }
+
+    /// `/fork`: the whole visible conversation when idle, else everything
+    /// before the prompt that started the running turn, with that prompt
+    /// drafted into the child's composer.
+    pub(super) fn fork_latest(&mut self) -> Vec<Action> {
+        let busy = self.status == Status::Streaming || self.awaiting_input();
+        let item = if busy {
+            crate::active_session_history(&self.state.session)
+                .ok()
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|item| starts_run(&item.kind))
+                        .map(|item| item.id)
+                })
+        } else {
+            crate::session_history_head(&self.state.session)
+        };
+        let Some(item) = item else {
+            self.flash(NOTHING_TO_FORK.into());
+            return Vec::new();
+        };
+        let forked = self.fork_at_item(item);
+        self.fork_actions(forked)
+    }
+
+    pub(super) fn fork_actions(&mut self, forked: Result<ForkedSession, String>) -> Vec<Action> {
+        match forked {
+            Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
+            Err(error) => {
+                self.flash(error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn fork_at_item(&self, item_id: CaudraId) -> Result<ForkedSession, String> {
         if self.cancelling_run.is_some() {
             return Err(REVERT_BUSY_MSG.into());
         }
         let current_head = crate::session_history_head(&self.state.session);
-        let target = resolve_revert_target(
-            self.state.session.messages(),
-            current_head,
-            source_target_id(source),
-        )?;
+        let target = resolve_revert_target(self.state.session.messages(), current_head, item_id)?;
         let ancestor = active_history_items(self.state.session.messages(), target.head)
             .map_err(|error| format!("Failed to read session history: {error}"))?;
         let mut child = self.state.session.workspace_binding().map_or_else(
@@ -1664,6 +1704,16 @@ impl App {
     }
 }
 
+fn starts_run(kind: &HistoryItemKind) -> bool {
+    matches!(
+        kind,
+        HistoryItemKind::User {
+            origin: UserOrigin::Turn | UserOrigin::Observation,
+            ..
+        }
+    )
+}
+
 pub(super) fn source_target_id(source: DisplaySource) -> CaudraId {
     match source {
         DisplaySource::User(id)
@@ -1696,6 +1746,7 @@ fn render_subagent_displays(
             tool_output_lines,
             show_reminders,
             restored.rows,
+            restored.turns,
         );
         attach_card_decisions(&mut display, restored.cards);
         (display, restore)

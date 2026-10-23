@@ -713,6 +713,8 @@ impl App {
         self.chat_index.retain(|id, _| owned.contains(id));
         self.subagent_answers.retain(|id, _| owned.contains(id));
         self.subagent_steers.retain(|id, _| owned.contains(id));
+        self.subagent_replacements
+            .retain(|id, _| owned.contains(id));
     }
 
     /// Subagent chats only, in chat order.

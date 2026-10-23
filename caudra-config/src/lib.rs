@@ -3040,6 +3040,11 @@ pub struct AgentConfig {
     #[config(skip, default = false)]
     pub history_project_only: bool,
 
+    /// Set on the learner's own runs, which judge notes themselves and must
+    /// not be steered by a recall of them.
+    #[config(skip, default = false)]
+    pub no_memory_recall: bool,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -3130,6 +3135,7 @@ impl AgentConfig {
                 .learning_targets
                 .unwrap_or_else(|| LearningTarget::ALL.to_vec()),
             history_project_only: false,
+            no_memory_recall: false,
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,

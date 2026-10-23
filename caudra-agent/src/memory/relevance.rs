@@ -3,6 +3,7 @@
 //! new one may repeat. Each surface only orders, prunes or advises, and
 //! without an answer it behaves as it does with the engine off.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use caudra_providers::{Message, Role};
@@ -10,14 +11,17 @@ use caudra_storage::memory_journal::heading;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use super::search::{Candidate, Hit, MAX_HITS, name_words, significant_words};
-use super::store::{MemoryStore, journal_body};
+use super::search::{Candidate, Document, Hit, MAX_HITS, name_words, significant_words};
+use super::store::{MemoryStore, journal_body, note_name};
 use crate::CancelToken;
 use crate::decisions::{
-    DecisionContext, DecisionFeature, Decisions, NoteDraft, NoteOutcome, RERANK_BUDGET_CANDIDATES,
-    Relevance, Rerank, Reranked, candidate_text, counted, placement, redacted_excerpt, score_line,
+    DecisionContext, DecisionFeature, Decisions, NoteDraft, NoteOutcome, NoteSink,
+    RERANK_BUDGET_CANDIDATES, Relevance, Rerank, Reranked, candidate_text, counted, placement,
+    redacted_excerpt, score_line,
 };
 use crate::permissions::PermissionManager;
+use crate::tools::MEMORY_TOOL_NAME;
+use crate::types::{TodoItem, TodoStatus};
 
 /// Most notes one recall weighs: one deadline budget's worth, because it delays
 /// the start of a turn.
@@ -36,7 +40,30 @@ const NAME_BYTES: usize = 160;
 const HEADING_BYTES: usize = 160;
 const EXCERPT_BYTES: usize = 400;
 const QUERY_BYTES: usize = 400;
+/// What a recall's request and focus share, leaving the state room for its
+/// keys under the decision state's cap.
 const REQUEST_BYTES: usize = 1_200;
+const MAX_FOCUS_BYTES: usize = 700;
+const TODO_BYTES: usize = 160;
+const PREVIOUS_REQUEST_BYTES: usize = 300;
+const GOAL_BYTES: usize = 200;
+const MAX_FOCUS_TODOS: usize = 3;
+/// A request with this few significant words leans on the one before it.
+const SHORT_REQUEST_WORDS: usize = 3;
+const FOCUS_KEY: &str = "focus";
+const WORKING_ON_KEY: &str = "working_on";
+const OPEN_TODOS_KEY: &str = "open_todos";
+const PREVIOUS_REQUEST_KEY: &str = "previous_request";
+const GOAL_KEY: &str = "unmet_goal";
+const GOAL_REASON_KEY: &str = "evaluator_reason";
+const COMMAND_KEY: &str = "command";
+const PATH_KEY: &str = "path";
+const ID_KEY: &str = "id";
+const N_KEY: &str = "n";
+const READ_COMMAND: &str = "read";
+const ZOOM_COMMAND: &str = "zoom";
+/// A zoom with this `n` opens one entry whole.
+const WHOLE_ENTRY: u64 = 1;
 /// Raw text is cut to this many times its limit before redaction, which
 /// then sees whole secrets and never scans more than a window.
 const WINDOW_FACTOR: usize = 2;
@@ -56,6 +83,11 @@ const KEYWORD_MATCH_MANY: &str = "keyword matches";
 const NOTE_ONE: &str = "note";
 const NOTE_MANY: &str = "notes";
 const NAMED: &str = "named";
+/// Most of the notes that scored best without being named a row reports.
+const MAX_NEAR_MISSES: usize = 2;
+const BELOW_THE_BAR: &str = "below";
+const PAST_THE_LIMIT: &str = "past the limit";
+const NO_NOTE_MATCHED: &str = "not asked: no unread note shares a word with the request";
 const NOT_SHOWN: &str = "not shown";
 const LEFT_OUT: &str = "left out";
 const SEARCH: Relevance = Relevance {
@@ -64,8 +96,8 @@ const SEARCH: Relevance = Relevance {
     unrelated: "The note only shares words with the query, or is about something else.",
 };
 const RECALL: Relevance = Relevance {
-    statement: "The project note holds knowledge the agent needs to act on the user's `request`.",
-    relevant: "The note records a fact, decision, gotcha or command the request depends on.",
+    statement: "The project note holds knowledge the agent needs to act on the user's `request`, read together with what the session is working on in `focus`, when given.",
+    relevant: "The note records a fact, decision, gotcha or command the request or the work in focus depends on.",
     unrelated: "The note is about something else, or only shares words with the request.",
 };
 const DUPLICATE: Relevance = Relevance {
@@ -141,6 +173,7 @@ pub struct Advice {
     pub advised: Vec<usize>,
     pub outcome: NoteOutcome,
     reranked: Reranked,
+    threshold: f64,
 }
 
 impl Advice {
@@ -158,14 +191,46 @@ impl Advice {
         self.outcome == NoteOutcome::Acted
     }
 
-    /// The row naming each advised note of `notes` with its score, `acted`
-    /// saying what the advice did.
+    /// Each note's probability of relevance, in the order given.
+    #[cfg(test)]
+    pub(crate) fn scores(&self) -> &[f64] {
+        self.reranked.scores()
+    }
+
+    /// The best scored of `notes` left unnamed, at most [`MAX_NEAR_MISSES`]
+    /// and none below the relevance floor, each with its score and what kept
+    /// it out: the bar, or the limit.
+    pub fn near_misses(&self, notes: &[Candidate]) -> Vec<String> {
+        let scores = self.reranked.scores();
+        let floor = self
+            .reranked
+            .decisions()
+            .config()
+            .thresholds
+            .relevance_floor;
+        self.order()
+            .into_iter()
+            .filter(|index| !self.advised.contains(index) && scores[*index] >= floor)
+            .take(MAX_NEAR_MISSES)
+            .map(|index| {
+                let reason = match scores[index] >= self.threshold {
+                    true => PAST_THE_LIMIT.to_owned(),
+                    false => format!("{BELOW_THE_BAR} {:.2}", self.threshold),
+                };
+                score_line(scores[index], &note_label(&notes[index].hit), &reason)
+            })
+            .collect()
+    }
+
+    /// The row naming each advised note of `notes` with its score, then the
+    /// near misses, `acted` saying what the advice did.
     pub fn note(&self, feature: DecisionFeature, acted: &str, notes: &[Candidate]) -> NoteDraft {
         let scores = self.reranked.scores();
         let details = self
             .advised
             .iter()
             .map(|index| score_line(scores[*index], &note_label(&notes[*index].hit), NAMED))
+            .chain(self.near_misses(notes))
             .collect();
         NoteDraft::new(
             self.reranked.decisions(),
@@ -177,74 +242,230 @@ impl Advice {
     }
 }
 
-/// A turn's recall: the notes its request may need, leaving out those an
-/// earlier reminder in the conversation named.
+/// What a recall judges notes against: the request, and a bounded, redacted
+/// focus on what the session is working on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallQuery {
+    request: String,
+    focus: Option<Value>,
+}
+
+/// Where the session stands when it recalls: its todos, the request before
+/// this one, and a goal the evaluator just found unmet, with its reason.
+#[derive(Default)]
+pub struct RecallFocus<'a> {
+    pub todos: &'a [TodoItem],
+    pub previous_request: Option<&'a str>,
+    pub goal: Option<(&'a str, &'a str)>,
+}
+
+impl RecallQuery {
+    /// The previous request joins the focus only when `request` says too
+    /// little on its own, as "commit this" or "go" do.
+    pub fn new(request: &str, focus: RecallFocus<'_>) -> Self {
+        let mut fields = json!({});
+        if let Some((condition, reason)) = focus.goal {
+            insert_fitting(&mut fields, GOAL_KEY, excerpt(condition, GOAL_BYTES));
+            insert_fitting(&mut fields, GOAL_REASON_KEY, excerpt(reason, GOAL_BYTES));
+        }
+        let mut open = focus
+            .todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::InProgress)
+            .chain(
+                focus
+                    .todos
+                    .iter()
+                    .filter(|todo| todo.status == TodoStatus::Pending),
+            )
+            .peekable();
+        if let Some(todo) = open.next_if(|todo| todo.status == TodoStatus::InProgress) {
+            insert_fitting(
+                &mut fields,
+                WORKING_ON_KEY,
+                excerpt(&todo.content, TODO_BYTES),
+            );
+        }
+        if let Some(previous) = focus
+            .previous_request
+            .filter(|_| significant_words(request).len() <= SHORT_REQUEST_WORDS)
+        {
+            insert_fitting(
+                &mut fields,
+                PREVIOUS_REQUEST_KEY,
+                excerpt(previous, PREVIOUS_REQUEST_BYTES),
+            );
+        }
+        let mut pending = Vec::new();
+        for todo in open.take(MAX_FOCUS_TODOS) {
+            pending.push(excerpt(&todo.content, TODO_BYTES));
+            if !insert_fitting(&mut fields, OPEN_TODOS_KEY, Value::Array(pending.clone())) {
+                break;
+            }
+        }
+        let focus = fields
+            .as_object()
+            .is_some_and(|fields| !fields.is_empty())
+            .then_some(fields);
+        let spent = focus.as_ref().map_or(0, |focus| focus.to_string().len());
+        Self {
+            request: redacted_excerpt(request, REQUEST_BYTES.saturating_sub(spent)),
+            focus,
+        }
+    }
+
+    /// The words the notes are matched on: the request's and the focus's.
+    fn words(&self) -> BTreeSet<String> {
+        let mut words = significant_words(&self.request);
+        if let Some(focus) = &self.focus {
+            leaf_words(focus, &mut words);
+        }
+        words
+    }
+
+    fn state(&self) -> Value {
+        let mut state = json!({REQUEST_KEY: self.request});
+        if let Some(focus) = &self.focus {
+            state[FOCUS_KEY] = focus.clone();
+        }
+        state
+    }
+}
+
+/// A turn's recall: the notes its query may need, leaving out those the
+/// conversation already named or read.
 pub struct Recall {
     judge: Judge,
     store: Arc<MemoryStore>,
-    reminders: Vec<String>,
+    known: Known,
+    query: RecallQuery,
+    rows: NoteSink,
 }
 
-/// What a recall says: the reminder to push when it named notes, and the row
-/// for what it named, would have named in shadow, or newly failed at.
+/// The notes a conversation already has: named by a recall reminder, read
+/// whole by name, or zoomed into at their address.
+#[derive(Default)]
+struct Known {
+    reminders: Vec<String>,
+    read: BTreeSet<String>,
+    zoomed: BTreeSet<u64>,
+}
+
+impl Known {
+    fn new(history: &[Message]) -> Self {
+        let mut known = Self {
+            reminders: recall_reminders(history),
+            ..Self::default()
+        };
+        for (_, tool, input) in history.iter().flat_map(Message::tool_uses) {
+            if tool != MEMORY_TOOL_NAME {
+                continue;
+            }
+            let field = |key: &str| input.get(key);
+            match field(COMMAND_KEY).and_then(Value::as_str) {
+                Some(READ_COMMAND) => {
+                    if let Some(name) = field(PATH_KEY)
+                        .and_then(Value::as_str)
+                        .and_then(|path| note_name(path).ok())
+                    {
+                        known.read.insert(name);
+                    }
+                }
+                Some(ZOOM_COMMAND) if field(N_KEY).and_then(Value::as_u64) == Some(WHOLE_ENTRY) => {
+                    if let Some(id) = field(ID_KEY).and_then(Value::as_u64) {
+                        known.zoomed.insert(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        known
+    }
+
+    fn holds(&self, document: &Document<'_>) -> bool {
+        let row = recall_row_name(document.name);
+        self.read.contains(document.name)
+            || self.zoomed.contains(&document.seq)
+            || self
+                .reminders
+                .iter()
+                .any(|reminder| reminder.contains(&row))
+    }
+}
+
+/// The reminder a recall that named notes pushes, recording `Advised` once
+/// the agent has it.
 pub struct Recalled {
-    pub reminder: Option<String>,
-    pub note: Option<NoteDraft>,
-    advice: Option<Advice>,
+    pub reminder: String,
+    advice: Advice,
 }
 
 impl Recalled {
     pub fn record(&self) {
-        if let Some(advice) = &self.advice {
-            advice.record();
-        }
+        self.advice.record();
     }
 }
 
 impl Recall {
-    pub fn new(judge: Judge, store: Arc<MemoryStore>, history: &[Message]) -> Self {
+    /// `rows` places the recall's row, and says the wait is on while the
+    /// engine judges a pool.
+    pub fn new(
+        judge: Judge,
+        store: Arc<MemoryStore>,
+        history: &[Message],
+        query: RecallQuery,
+        rows: NoteSink,
+    ) -> Self {
         Self {
             judge,
             store,
-            reminders: recall_reminders(history),
+            known: Known::new(history),
+            query,
+            rows,
         }
     }
 
-    /// The reminder naming what the engine judged `request` needs, and its
-    /// row. `None` when nothing cleared the bar and there is no failure to
-    /// report. The notes are read off the executor.
-    pub async fn run(self, request: &str) -> Option<Recalled> {
+    /// The reminder naming what the engine judged the query needs; its row
+    /// says what it named, would have named in shadow, or newly failed at.
+    /// `None` when the pool was empty or nothing cleared the bar. The notes
+    /// are read off the executor.
+    pub async fn run(self) -> Option<Recalled> {
         let Self {
             judge,
             store,
-            reminders,
+            known,
+            query,
+            rows,
         } = self;
-        let owned = request.to_owned();
-        let notes = smol::unblock(move || recall_pool(&store, &owned, &reminders)).await;
-        let advice = match recall_advice(&judge, request, &notes).await {
+        let words = query.words();
+        let notes = smol::unblock(move || recall_pool(&store, &words, &known)).await;
+        if notes.is_empty() {
+            rows.skipped(
+                &judge.decisions,
+                DecisionFeature::MemoryRecall,
+                NO_NOTE_MATCHED,
+            );
+            return None;
+        }
+        let pending = rows.begin(&judge.decisions, DecisionFeature::MemoryRecall);
+        let advice = match recall_advice(&judge, &query, &notes).await {
             Ok(advice) => advice,
             Err(note) => {
-                return note.map(|note| Recalled {
-                    reminder: None,
-                    note: Some(note),
-                    advice: None,
-                });
+                pending.settle(note);
+                return None;
             }
         };
         if advice.advised.is_empty() {
+            pending.quiet(advice.near_misses(&notes));
             return None;
         }
         let acted = format!(
             "named {}",
             counted(advice.advised.len(), NOTE_ONE, NOTE_MANY)
         );
-        Some(Recalled {
-            reminder: advice
-                .applied()
-                .then(|| recall_reminder(advice.advised.iter().map(|index| &notes[*index].hit))),
-            note: Some(advice.note(DecisionFeature::MemoryRecall, &acted, &notes)),
-            advice: Some(advice),
-        })
+        pending.emit(advice.note(DecisionFeature::MemoryRecall, &acted, &notes));
+        let reminder = recall_reminder(advice.advised.iter().map(|index| &notes[*index].hit));
+        advice.applied().then_some(Recalled { reminder, advice })
     }
 }
 
@@ -315,15 +536,14 @@ fn search_lines(
 
 pub async fn recall_advice(
     judge: &Judge,
-    request: &str,
+    query: &RecallQuery,
     notes: &[Candidate],
 ) -> Result<Advice, Option<NoteDraft>> {
-    let state = json!({REQUEST_KEY: redacted_excerpt(request, REQUEST_BYTES)});
     advise(
         judge,
         DecisionFeature::MemoryRecall,
         &RECALL,
-        &state,
+        &query.state(),
         notes,
         MAX_RECALLED,
         NAMED_NO_NOTES,
@@ -356,20 +576,23 @@ pub async fn duplicate_advice(
     .await
 }
 
-/// The notes sharing the most words with `request`, leaving out those an
-/// earlier reminder named.
-pub fn recall_pool(store: &MemoryStore, request: &str, reminders: &[String]) -> Vec<Candidate> {
-    let words = significant_words(request);
+/// The notes sharing the most of a query's `words`, leaving out those the
+/// conversation already has.
+fn recall_pool(store: &MemoryStore, words: &BTreeSet<String>, known: &Known) -> Vec<Candidate> {
     if words.is_empty() {
         return Vec::new();
     }
     store
-        .related(&words, RECALL_CANDIDATES, |name| {
-            let row = recall_row_name(name);
-            reminders.iter().any(|reminder| reminder.contains(&row))
-        })
+        .related(words, RECALL_CANDIDATES, |document| known.holds(document))
         .inspect_err(|error| warn!(scope = store.scope(), %error, "memory recall unreadable"))
         .unwrap_or_default()
+}
+
+/// The pool a recall of `query` judges in a conversation that has read no
+/// notes yet.
+#[cfg(test)]
+pub(crate) fn fresh_recall_pool(store: &MemoryStore, query: &RecallQuery) -> Vec<Candidate> {
+    recall_pool(store, &query.words(), &Known::default())
 }
 
 /// The other notes sharing the most words with the note `name` now holds.
@@ -377,7 +600,7 @@ pub fn duplicate_pool(store: &MemoryStore, name: &str, content: &str) -> Vec<Can
     let mut words = name_words(name);
     words.extend(significant_words(journal_body(content)));
     store
-        .related(&words, DUPLICATE_CANDIDATES, |other| other == name)
+        .related(&words, DUPLICATE_CANDIDATES, |other| other.name == name)
         .inspect_err(
             |error| warn!(scope = store.scope(), %error, "memory duplicate check unreadable"),
         )
@@ -406,6 +629,7 @@ async fn advise(
         advised,
         outcome,
         reranked,
+        threshold,
     })
 }
 
@@ -420,6 +644,30 @@ fn candidate(note: &Candidate) -> Value {
         HEADING_KEY: bounded(&note.hit.heading, HEADING_BYTES),
         EXCERPT_KEY: bounded(&note.excerpt, EXCERPT_BYTES),
     })
+}
+
+fn excerpt(text: &str, limit: usize) -> Value {
+    Value::String(redacted_excerpt(text, limit))
+}
+
+fn insert_fitting(focus: &mut Value, key: &str, value: Value) -> bool {
+    let mut grown = focus.clone();
+    grown[key] = value;
+    let fits = grown.to_string().len() <= MAX_FOCUS_BYTES;
+    if fits {
+        *focus = grown;
+    }
+    fits
+}
+
+/// The words of every string in `value`, never its keys.
+fn leaf_words(value: &Value, words: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => words.extend(significant_words(text)),
+        Value::Array(items) => items.iter().for_each(|item| leaf_words(item, words)),
+        Value::Object(fields) => fields.values().for_each(|field| leaf_words(field, words)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 fn bounded(text: &str, limit: usize) -> String {
@@ -480,17 +728,21 @@ pub(crate) mod tests {
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
     };
+    use caudra_providers::ContentBlock;
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionEffect, DecisionFilter, DecisionLog};
     use caudra_storage::memory_journal::EntryOrigin;
+    use flume::Receiver;
     use futures_lite::future;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
-    use crate::decisions::ENGINE_UNREACHABLE;
+    use crate::decisions::{DecisionNote, ENGINE_UNREACHABLE, NoteAnchor};
     use crate::memory::store::Source;
     use crate::tools::native::tests::tempdir;
+    use crate::types::TodoPriority;
+    use crate::{AgentEvent, Envelope, EventSender};
 
     pub(crate) const RELEVANT: f64 = 0.95;
     pub(crate) const RELATED: f64 = 0.5;
@@ -533,6 +785,15 @@ pub(crate) mod tests {
     const RECALLED_THREE: &str = "named 3 notes";
     const SHADOW_RECALLED_ONE: &str = "would have named 1 note";
     const RECALLED_LINE: &str = "0.95  0+1 release-1.md  named";
+    const ANCHOR: usize = 0;
+    const READ_ID: &str = "toolu_read";
+    const SHORT_REQUEST: &str = "commit this";
+    const DONE_STEP: &str = "Draft the changelog";
+    const CURRENT_STEP: &str = "Sign the release tags";
+    const NEXT_STEP: &str = "Publish the packages";
+    const PREVIOUS_WORD: &str = "publishing";
+    const DONE_WORD: &str = "changelog";
+    const LONG_WORD: &str = "deployment ";
 
     /// Scores a note by the name it carries, and any other note as
     /// unrelated.
@@ -865,38 +1126,98 @@ pub(crate) mod tests {
                     name => (name, RELEVANT),
                 })
                 .collect();
+            let (sink, events) = row_sink();
             let recall = Recall::new(
                 recall_judge(&state, NoteEngine::scoring(&scores)),
                 store_of(&state, &notes),
                 &[],
+                query(REQUEST),
+                sink,
             );
 
-            let recalled = recall.run(REQUEST).await.unwrap();
+            let recalled = recall.run().await.unwrap();
 
-            let reminder = recalled.reminder.as_deref().unwrap();
+            let reminder = recalled.reminder.as_str();
             assert!(reminder.starts_with(RECALL_OPEN));
             assert!(reminder.ends_with(RECALL_CLOSE));
             let rows = rows(reminder);
             assert_eq!(rows.len(), MAX_RECALLED);
             assert!(rows.iter().all(|row| !row.contains(LOOSE)));
-            let note = recalled.note.as_ref().unwrap();
+            let placed = placed(&events);
+            let [note] = placed.as_slice() else {
+                panic!("expected one row, got {placed:?}");
+            };
             assert_eq!(note.outcome, NoteOutcome::Acted);
             assert_eq!(note.summary, RECALLED_THREE);
-            assert_eq!(note.details.len(), MAX_RECALLED);
-            assert!(note.details.iter().all(|line| !line.contains(LOOSE)));
+            let (named, missed) = note.details.split_at(MAX_RECALLED);
+            assert!(
+                named
+                    .iter()
+                    .all(|line| line.ends_with(NAMED) && !line.contains(LOOSE))
+            );
+            let [past_the_limit, below_the_bar] = missed else {
+                panic!("expected two near misses, got {missed:?}");
+            };
+            assert!(past_the_limit.ends_with(PAST_THE_LIMIT));
+            assert!(below_the_bar.contains(LOOSE) && below_the_bar.contains(BELOW_THE_BAR));
             recalled.record();
             assert_effects(state.path(), &[DecisionEffect::Advised]).await;
         });
     }
 
-    fn recall_with(decisions: &Decisions, state: &TempDir, cancel: CancelToken) -> Recall {
+    fn query(request: &str) -> RecallQuery {
+        RecallQuery::new(request, RecallFocus::default())
+    }
+
+    fn row_sink() -> (NoteSink, Receiver<Envelope>) {
+        let (tx, rx) = flume::unbounded();
+        let sink = NoteSink::new(EventSender::new(tx, 0), NoteAnchor::History(ANCHOR));
+        (sink, rx)
+    }
+
+    /// The rows placed so far, leaving out the wait's own events.
+    fn placed(events: &Receiver<Envelope>) -> Vec<DecisionNote> {
+        events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::Decision(note) => Some(*note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs a recall of `request` over one release note, returning what it
+    /// pushed and the rows it placed.
+    async fn recall_with(
+        decisions: &Decisions,
+        state: &TempDir,
+        cancel: CancelToken,
+        request: &str,
+    ) -> (Option<Recalled>, Vec<DecisionNote>) {
         let judge = Judge {
             decisions: decisions.clone(),
             context: DecisionContext::default(),
             permissions: None,
             cancel,
         };
-        Recall::new(judge, store_of(state, &release_notes(1)), &[])
+        recall_of(judge, store_of(state, &release_notes(1)), &[], request).await
+    }
+
+    async fn recall_of(
+        judge: Judge,
+        store: Arc<MemoryStore>,
+        history: &[Message],
+        request: &str,
+    ) -> (Option<Recalled>, Vec<DecisionNote>) {
+        let (sink, events) = row_sink();
+        let recalled = Recall::new(judge, store, history, query(request), sink)
+            .run()
+            .await;
+        (recalled, placed(&events))
+    }
+
+    fn summaries(rows: &[DecisionNote]) -> Vec<&str> {
+        rows.iter().map(|row| row.summary.as_str()).collect()
     }
 
     #[test]
@@ -909,13 +1230,13 @@ pub(crate) mod tests {
                 NoteEngine::scoring(&[(RECALLED, RELEVANT)]),
             );
 
-            let recalled = recall_with(&decisions, &state, CancelToken::none())
-                .run(REQUEST)
-                .await
-                .unwrap();
+            let (recalled, rows) =
+                recall_with(&decisions, &state, CancelToken::none(), REQUEST).await;
 
-            assert_eq!(recalled.reminder, None);
-            let note = recalled.note.unwrap();
+            assert!(recalled.is_none());
+            let [note] = rows.as_slice() else {
+                panic!("expected one row, got {rows:?}");
+            };
             assert_eq!(note.outcome, NoteOutcome::Shadow);
             assert_eq!(note.summary, SHADOW_RECALLED_ONE);
             assert_eq!(note.details, [RECALLED_LINE]);
@@ -934,26 +1255,17 @@ pub(crate) mod tests {
                     ..NoteEngine::scoring(&[(RECALLED, RELEVANT)])
                 },
             );
-            let mut summaries = Vec::new();
+            let mut placed = Vec::new();
             for _ in 0..2 {
-                let recalled = recall_with(&decisions, &state, CancelToken::none())
-                    .run(REQUEST)
-                    .await;
-                assert!(
-                    recalled
-                        .as_ref()
-                        .is_none_or(|recalled| recalled.reminder.is_none())
-                );
-                summaries
-                    .push(recalled.and_then(|recalled| recalled.note.map(|note| note.summary)));
+                let (recalled, rows) =
+                    recall_with(&decisions, &state, CancelToken::none(), REQUEST).await;
+                assert!(recalled.is_none());
+                placed.extend(rows);
             }
 
             assert_eq!(
-                summaries,
-                [
-                    Some(format!("{ENGINE_UNREACHABLE}; {NAMED_NO_NOTES}")),
-                    None
-                ]
+                summaries(&placed),
+                [format!("{ENGINE_UNREACHABLE}; {NAMED_NO_NOTES}")]
             );
         });
     }
@@ -970,12 +1282,10 @@ pub(crate) mod tests {
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
-            assert!(
-                recall_with(&decisions, &state, cancel)
-                    .run(REQUEST)
-                    .await
-                    .is_none()
-            );
+            let (recalled, rows) = recall_with(&decisions, &state, cancel, REQUEST).await;
+
+            assert!(recalled.is_none());
+            assert_eq!(rows, []);
         });
     }
 
@@ -989,12 +1299,13 @@ pub(crate) mod tests {
                 NoteEngine::scoring(&[(RECALLED, RELEVANT)]),
             );
 
-            let recalled = recall_with(&decisions, &state, CancelToken::none())
-                .run(&format!("{REQUEST} {TOKEN_PREFIX}{SECRET}"))
-                .await
-                .unwrap();
+            let request = format!("{REQUEST} {TOKEN_PREFIX}{SECRET}");
+            let (_, rows) = recall_with(&decisions, &state, CancelToken::none(), &request).await;
 
-            let text = row_text(&recalled.note.unwrap());
+            let [row] = rows.as_slice() else {
+                panic!("expected one row, got {rows:?}");
+            };
+            let text = format!("{}\n{}", row.summary, row.details.join("\n"));
             assert!(!text.contains(SECRET));
             assert!(!text.contains(REQUEST));
         });
@@ -1007,20 +1318,54 @@ pub(crate) mod tests {
             let notes = release_notes(SIBLING_COUNT);
             let store = store_of(&state, &notes);
             let earlier = recall_reminder([&candidate(RECALLED).hit]);
-            let recall = Recall::new(
-                recall_judge(
-                    &state,
-                    NoteEngine::scoring(&[(RECALLED, RELEVANT), (SIBLING, RELEVANT)]),
-                ),
-                store,
-                &[Message::synthetic(earlier)],
+            let judge = recall_judge(
+                &state,
+                NoteEngine::scoring(&[(RECALLED, RELEVANT), (SIBLING, RELEVANT)]),
             );
 
-            let recalled = recall.run(REQUEST).await.unwrap();
+            let (recalled, _) =
+                recall_of(judge, store, &[Message::synthetic(earlier)], REQUEST).await;
 
-            let rows = rows(recalled.reminder.as_deref().unwrap());
+            let reminder = recalled.unwrap().reminder;
+            let rows = rows(&reminder);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].contains(&recall_row_name(SIBLING)));
+        });
+    }
+
+    #[test_case(|_| json!({COMMAND_KEY: READ_COMMAND, PATH_KEY: RECALLED}); "read_whole")]
+    #[test_case(|seq| json!({COMMAND_KEY: ZOOM_COMMAND, ID_KEY: seq, N_KEY: WHOLE_ENTRY}); "zoomed_into_whole")]
+    fn a_recall_leaves_out_a_note_the_conversation_read(input: fn(u64) -> Value) {
+        smol::block_on(async {
+            let state = tempdir();
+            let store = store_of(&state, &release_notes(SIBLING_COUNT));
+            let seq = store
+                .search(RECALLED)
+                .unwrap()
+                .into_iter()
+                .find(|hit| hit.name == RECALLED)
+                .unwrap()
+                .seq;
+            let read = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: READ_ID.to_owned(),
+                    name: MEMORY_TOOL_NAME.to_owned(),
+                    input: input(seq),
+                    thought_signature: None,
+                }],
+                ..Message::default()
+            };
+            let judge = recall_judge(
+                &state,
+                NoteEngine::scoring(&[(RECALLED, RELEVANT), (SIBLING, RELEVANT)]),
+            );
+
+            let (recalled, _) = recall_of(judge, store, &[read], REQUEST).await;
+
+            let reminder = recalled.unwrap().reminder;
+            assert!(!reminder.contains(&recall_row_name(RECALLED)));
+            assert!(reminder.contains(&recall_row_name(SIBLING)));
         });
     }
 
@@ -1029,33 +1374,114 @@ pub(crate) mod tests {
     fn a_recall_without_a_confident_answer_names_nothing(engine: NoteEngine) {
         smol::block_on(async {
             let state = tempdir();
-            let recall = Recall::new(
-                recall_judge(&state, engine),
-                store_of(&state, &release_notes(1)),
-                &[],
-            );
+            let judge = recall_judge(&state, engine);
 
-            let recalled = recall.run(REQUEST).await;
+            let (recalled, _) =
+                recall_of(judge, store_of(&state, &release_notes(1)), &[], REQUEST).await;
 
-            assert!(recalled.and_then(|recalled| recalled.reminder).is_none());
+            assert!(recalled.is_none());
         });
     }
 
     #[test]
-    fn a_request_without_significant_words_asks_nothing() {
+    fn a_request_without_significant_words_never_asks_and_says_so() {
         smol::block_on(async {
             let state = tempdir();
             let engine = NoteEngine::scoring(&[(RECALLED, RELEVANT)]);
             let calls = Arc::clone(&engine.calls);
+            let (sink, events) = row_sink();
             let recall = Recall::new(
                 recall_judge(&state, engine),
                 store_of(&state, &release_notes(1)),
                 &[],
+                query(QUIET_REQUEST),
+                sink,
             );
 
-            assert!(recall.run(QUIET_REQUEST).await.is_none());
+            assert!(recall.run().await.is_none());
             assert_eq!(calls.load(Ordering::Relaxed), 0);
+            let heard: Vec<Vec<String>> = events
+                .try_iter()
+                .map(|envelope| match envelope.event {
+                    AgentEvent::DecisionSettled(skipped) => skipped.details,
+                    other => panic!("only a skip, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(heard, [[NO_NOTE_MATCHED]]);
         });
+    }
+
+    #[test]
+    fn a_short_request_carries_the_one_before_it_and_the_step_in_progress() {
+        let todos = [
+            todo(DONE_STEP, TodoStatus::Completed),
+            todo(CURRENT_STEP, TodoStatus::InProgress),
+            todo(NEXT_STEP, TodoStatus::Pending),
+        ];
+        let query = RecallQuery::new(
+            SHORT_REQUEST,
+            RecallFocus {
+                todos: &todos,
+                previous_request: Some(REQUEST),
+                goal: None,
+            },
+        );
+
+        assert_eq!(
+            query.state(),
+            json!({
+                REQUEST_KEY: SHORT_REQUEST,
+                FOCUS_KEY: {
+                    WORKING_ON_KEY: CURRENT_STEP,
+                    PREVIOUS_REQUEST_KEY: REQUEST,
+                    OPEN_TODOS_KEY: [NEXT_STEP],
+                },
+            })
+        );
+        let words = query.words();
+        assert!(words.contains(PREVIOUS_WORD));
+        assert!(!words.contains(DONE_WORD));
+    }
+
+    #[test]
+    fn a_full_request_stands_on_its_own() {
+        let query = RecallQuery::new(
+            REQUEST,
+            RecallFocus {
+                previous_request: Some(SHORT_REQUEST),
+                ..RecallFocus::default()
+            },
+        );
+
+        assert_eq!(query.state(), json!({REQUEST_KEY: REQUEST}));
+    }
+
+    #[test]
+    fn a_focus_stays_within_its_budget() {
+        let long = LONG_WORD.repeat(MAX_FOCUS_BYTES);
+        let todos: Vec<TodoItem> = (0..MAX_FOCUS_TODOS + 2)
+            .map(|_| todo(&long, TodoStatus::Pending))
+            .collect();
+        let query = RecallQuery::new(
+            SHORT_REQUEST,
+            RecallFocus {
+                todos: &todos,
+                previous_request: Some(&long),
+                goal: Some((&long, &long)),
+            },
+        );
+
+        let state = query.state();
+        assert!(state[FOCUS_KEY].to_string().len() <= MAX_FOCUS_BYTES);
+        assert!(state.to_string().len() <= REQUEST_BYTES + MAX_FOCUS_BYTES);
+    }
+
+    fn todo(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            content: content.to_owned(),
+            status,
+            priority: TodoPriority::default(),
+        }
     }
 
     #[test]

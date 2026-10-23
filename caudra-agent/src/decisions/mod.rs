@@ -255,9 +255,8 @@ impl DecisionFeature {
             | Self::HistorySearch
             | Self::CompactionRetention
             | Self::SourceCodeContext => Some(thresholds.relevance_floor),
-            Self::MemoryRecall | Self::MemoryDuplicates | Self::OutputPointers => {
-                Some(thresholds.routing_confidence)
-            }
+            Self::MemoryRecall => Some(thresholds.recall_confidence),
+            Self::MemoryDuplicates | Self::OutputPointers => Some(thresholds.routing_confidence),
             Self::Workflow
             | Self::Code
             | Self::PermissionAdvice
@@ -1042,6 +1041,7 @@ mod tests {
     const FEATURES_KEY: &str = "features";
     const RELEVANCE_FLOOR: f64 = 0.2;
     const ROUTING_CONFIDENCE: f64 = 0.8;
+    const RECALL_CONFIDENCE: f64 = 0.7;
     const FAIL_KEY: &str = "fail";
     const COMMAND_KEY: &str = "command";
     const UNKNOWN_FEATURE: &str = "retired_feature";
@@ -1843,6 +1843,7 @@ mod tests {
     #[test_case(DecisionFeature::SourceCodeContext, Some(RELEVANCE_FLOOR); "source_code_context_uses_the_floor")]
     #[test_case(DecisionFeature::HistorySearch, Some(RELEVANCE_FLOOR); "history_search_uses_the_floor")]
     #[test_case(DecisionFeature::OutputPointers, Some(ROUTING_CONFIDENCE); "advice_uses_routing_confidence")]
+    #[test_case(DecisionFeature::MemoryRecall, Some(RECALL_CONFIDENCE); "recall_uses_its_own_confidence")]
     #[test_case(DecisionFeature::SkillSuggestions, None; "choice_features_keep_the_default")]
     fn rerank_stats_score_candidates_at_the_acting_threshold(
         feature: DecisionFeature,
@@ -1851,6 +1852,7 @@ mod tests {
         let config = DecisionThresholds {
             relevance_floor: RELEVANCE_FLOOR,
             routing_confidence: ROUTING_CONFIDENCE,
+            recall_confidence: RECALL_CONFIDENCE,
             ..Default::default()
         };
         assert_eq!(feature.rerank_threshold(&config), threshold);

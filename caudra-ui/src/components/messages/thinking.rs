@@ -114,6 +114,7 @@ pub(super) fn assemble(
         images: Vec::new(),
         scroll_span: None,
         scroll_footer_line: None,
+        decision_chips: None,
     };
     if let Some(text) = scroll_footer_text(start, total - end, tail) {
         let footer = Line::from(Span::styled(text, theme::current().tool_dim));

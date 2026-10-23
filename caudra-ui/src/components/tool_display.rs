@@ -1,6 +1,6 @@
 use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, task_card};
 
-use super::card_decisions::{self, CardDecision};
+use super::card_decisions::{self, CardDecision, Chips};
 use super::code_view;
 use super::command_text::{command_spans, overlay};
 use super::mcp_card::{McpCall, OUTPUT_DIVIDER as CODE_OUTPUT_DIVIDER, script_argument};
@@ -2206,6 +2206,17 @@ impl ToolLineBuilder {
         ));
     }
 
+    /// Row 0 only, appended after the head like [`Self::append_duration`]. A
+    /// chip searches as its words alone: its spinner and clock move every
+    /// frame.
+    fn append_chips(&mut self, chips: Chips) {
+        let Some(line) = self.lines.first_mut() else {
+            return;
+        };
+        line.spans.extend(chips.spans);
+        self.search_text.push_str(&chips.text);
+    }
+
     fn push_search_text(&mut self, text: &str) {
         if !self.search_text.is_empty() {
             self.search_text.push('\n');
@@ -3183,10 +3194,7 @@ pub fn build_tool_lines(
         msg.tool_output.as_deref(),
         rctx.cwd.as_deref(),
     );
-    let mut annotation = annotation_spans(report.as_deref(), workdir);
-    annotation.extend(card_decisions::chip_spans(card_decisions::about(
-        decisions, call_id,
-    )));
+    let annotation = annotation_spans(report.as_deref(), workdir);
     if rctx.compact {
         b.push_compact_header(
             tool_name,
@@ -3217,6 +3225,9 @@ pub fn build_tool_lines(
         );
         b.prepend_indicator(rctx.started_at);
     }
+    b.append_chips(card_decisions::chip_spans(card_decisions::about(
+        decisions, call_id,
+    )));
     if let Some(elapsed) = call_elapsed(msg, status, job) {
         b.append_duration(elapsed);
     }
@@ -3671,6 +3682,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock], scale: TokenScale) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::card_decisions::DecisionSubject;
     use caudra_providers::estimate_tokens_cached;
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
@@ -9652,7 +9664,7 @@ mod tests {
     fn decided_card(width: u16, shown: bool, expansion: Option<Disclosure>) -> ToolLines {
         let mut msg = bash_msg(DECIDED_COMMAND, ToolStatus::Success, None, None);
         msg.decisions.push(CardDecision::settled(
-            "t1".into(),
+            DecisionSubject::Call("t1".into()),
             DecisionFeature::SourceCodeContext,
             NoteOutcome::Acted,
             DECISION_SUMMARY,

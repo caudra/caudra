@@ -15,7 +15,9 @@ use tracing::{info, warn};
 
 use super::across::{self, CrossRoute, Departure};
 use super::credential::AccountCredential;
-use super::health::{AccountHealth, BLOCKED_BILLING, BLOCKED_RATE_LIMITED, QUOTA_STALE};
+use super::health::{
+    AccountHealth, BLOCKED_BILLING, BLOCKED_RATE_LIMITED, QUOTA_STALE, QuotaSource,
+};
 use super::policy::{
     self, Assessment, Candidate, Decision, Lineage, NoAccountReason, PolicyInput, Selection,
     Unusable,
@@ -430,7 +432,12 @@ impl RoutedProvider {
                         if windows.is_empty() {
                             state.health.mark_no_usage(&name);
                         }
-                        let row = state.health.observe(&name, windows, state.now_ms());
+                        let row = state.health.observe(
+                            &name,
+                            QuotaSource::Usage,
+                            windows,
+                            state.now_ms(),
+                        );
                         state.persist_health(row);
                     }
                     Ok(None) => state.health.mark_no_usage(&name),
@@ -752,7 +759,10 @@ impl Provider for RoutedProvider {
                 .await?;
             let now_ms = self.state.now_ms();
             let quota = std::mem::take(&mut response.quota);
-            let observed = self.state.health.observe(&name, quota, now_ms);
+            let observed = self
+                .state
+                .health
+                .observe(&name, QuotaSource::Response, quota, now_ms);
             self.state.persist_health(observed);
             let served = self.state.health.served(&name, now_ms);
             self.state.persist_health(served);
@@ -902,10 +912,12 @@ impl Provider for RoutedProvider {
                     .iter()
                     .filter_map(crate::types::UsageLimit::quota_window)
                     .collect();
-                let row = self
-                    .state
-                    .health
-                    .observe(&name, windows, self.state.now_ms());
+                let row = self.state.health.observe(
+                    &name,
+                    QuotaSource::Usage,
+                    windows,
+                    self.state.now_ms(),
+                );
                 self.state.persist_health(row);
             }
             Ok(usage)

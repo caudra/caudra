@@ -130,9 +130,14 @@ impl History {
     }
 
     pub fn latest_user_request(&self) -> Option<&str> {
+        self.user_requests().next()
+    }
+
+    /// What the user asked, newest first, across compaction seams.
+    pub fn user_requests(&self) -> impl Iterator<Item = &str> {
         self.transcript()
             .rev()
-            .find_map(|item| user_request(&item.kind))
+            .filter_map(|item| user_request(&item.kind))
     }
 
     /// Bumped by `replace` and `truncate` but not by `extend`, so a caller can

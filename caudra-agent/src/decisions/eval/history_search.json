@@ -1,7 +1,7 @@
 {
   "k": 3,
   "baseline": {"ndcg_at_k": 0.716, "recall_at_k": 0.742, "p50_ms": 7727, "p95_ms": 8012},
-  "baseline_note": "Hand-labelled cases, each pool in keyword order: five synthetic ones, and six whose candidates are the 64 Caudra docs sections a keyword pool returns for the query. Measured 2026-10-21 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The keyword order scored nDCG@k 0.273 and recall@k 0.333 on the same cases; judging only the first 16 scored nDCG@k 0.625 and recall@k 0.652.",
+  "baseline_note": "Hand-labelled cases, each pool in keyword order: five synthetic ones, and six whose candidates are the 64 Caudra docs sections a keyword pool returns for the query. Measured 2026-10-21 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model decision-1. The keyword order scored nDCG@k 0.273 and recall@k 0.333 on the same cases; judging only the first 16 scored nDCG@k 0.625 and recall@k 0.652.",
   "cases": [
     {
       "query": "why did we switch the session store to WAL",

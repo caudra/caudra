@@ -42,6 +42,17 @@ impl PickerItem for QueueActionKind {
     }
 }
 
+/// Which lane changes an item's queue offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueLanes {
+    /// Up next, Guide and Replacing.
+    Main,
+    /// A running task's guidance, which can replace its current turn.
+    Task,
+    /// Guidance left over from a finished task.
+    None,
+}
+
 pub enum QueueActionsAction {
     Consumed,
     Select {
@@ -67,9 +78,10 @@ impl QueueActions {
         }
     }
 
-    /// `main_queue` gates what only the main queue can do: lane changes and
-    /// replacing the running turn have no meaning for subagent guidance.
-    pub fn open(&mut self, entry: &QueueEntry<'_>, main_queue: bool) {
+    /// `lanes` gates the lane changes: only the main queue has Up next to
+    /// move between, and only a running task has a turn to replace.
+    pub fn open(&mut self, entry: &QueueEntry<'_>, lanes: QueueLanes) {
+        let main_queue = lanes == QueueLanes::Main;
         let guided = entry.admission == Some(PromptAdmission::Steer);
         let queued = entry.admission == Some(PromptAdmission::Queue);
         let mut actions = Vec::new();
@@ -88,7 +100,7 @@ impl QueueActions {
         if main_queue && guided {
             actions.push(QueueActionKind::Next);
         }
-        if main_queue && (queued || guided) {
+        if (main_queue && queued) || (lanes != QueueLanes::None && guided) {
             actions.push(QueueActionKind::Replace);
         }
         if entry.movable {
@@ -214,38 +226,50 @@ mod tests {
 
     #[test_case(
         entry(Some(PromptAdmission::Queue)),
-        true,
+        QueueLanes::Main,
         &[QueueActionKind::Guide, QueueActionKind::Replace, QueueActionKind::Delete]
         ; "queued_item_can_guide_or_replace"
     )]
     #[test_case(
         entry(Some(PromptAdmission::Steer)),
-        true,
+        QueueLanes::Main,
         &[QueueActionKind::Next, QueueActionKind::Replace, QueueActionKind::Delete]
         ; "guiding_item_can_defer_or_replace"
     )]
     #[test_case(
         entry(Some(PromptAdmission::Interrupt)),
-        true,
+        QueueLanes::Main,
         &[QueueActionKind::Delete]
         ; "pending_replacement_can_only_be_dropped"
     )]
-    #[test_case(entry(None), true, &[QueueActionKind::Delete] ; "compact_can_only_be_dropped")]
+    #[test_case(entry(None), QueueLanes::Main, &[QueueActionKind::Delete] ; "compact_can_only_be_dropped")]
     #[test_case(
         entry(Some(PromptAdmission::Steer)),
-        false,
+        QueueLanes::Task,
+        &[QueueActionKind::Replace, QueueActionKind::Delete]
+        ; "running_task_guidance_can_replace_the_turn"
+    )]
+    #[test_case(
+        entry(Some(PromptAdmission::Interrupt)),
+        QueueLanes::Task,
         &[QueueActionKind::Delete]
-        ; "subagent_queue_has_no_lane_actions"
+        ; "task_replacement_can_only_be_dropped"
+    )]
+    #[test_case(
+        entry(Some(PromptAdmission::Steer)),
+        QueueLanes::None,
+        &[QueueActionKind::Delete]
+        ; "unsent_guidance_has_no_lane_actions"
     )]
     #[test_case(
         QueueEntry { editable: true, ..entry(Some(PromptAdmission::Steer)) },
-        false,
+        QueueLanes::None,
         &[QueueActionKind::Edit, QueueActionKind::Delete]
         ; "editable_item_can_be_edited"
     )]
     #[test_case(
         QueueEntry { movable: true, ..entry(Some(PromptAdmission::Steer)) },
-        false,
+        QueueLanes::None,
         &[QueueActionKind::MoveMain, QueueActionKind::Delete]
         ; "movable_item_can_reach_main"
     )]
@@ -255,7 +279,7 @@ mod tests {
             can_move_down: true,
             ..entry(Some(PromptAdmission::Queue))
         },
-        true,
+        QueueLanes::Main,
         &[
             QueueActionKind::MoveUp,
             QueueActionKind::MoveDown,
@@ -267,12 +291,12 @@ mod tests {
     )]
     fn menu_matches_item_capabilities(
         entry: QueueEntry<'static>,
-        main_queue: bool,
+        lanes: QueueLanes,
         expected: &[QueueActionKind],
     ) {
         let mut actions = QueueActions::new();
 
-        actions.open(&entry, main_queue);
+        actions.open(&entry, lanes);
 
         assert_eq!(actions.kinds(), expected);
     }
@@ -281,7 +305,7 @@ mod tests {
     fn selection_preserves_the_target_item() {
         let entry = entry(Some(PromptAdmission::Queue));
         let mut actions = QueueActions::new();
-        actions.open(&entry, true);
+        actions.open(&entry, QueueLanes::Main);
 
         let QueueActionsAction::Select { id, kind } = actions.handle_key(enter()) else {
             panic!("expected a selection");
@@ -294,7 +318,7 @@ mod tests {
     fn closing_forgets_the_target_item() {
         let entry = entry(Some(PromptAdmission::Queue));
         let mut actions = QueueActions::new();
-        actions.open(&entry, true);
+        actions.open(&entry, QueueLanes::Main);
 
         actions.close();
 

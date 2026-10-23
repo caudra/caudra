@@ -360,13 +360,13 @@ impl MemoryStore {
         &self,
         words: &BTreeSet<String>,
         limit: usize,
-        skip: impl Fn(&str) -> bool,
+        skip: impl Fn(&Document<'_>) -> bool,
     ) -> Result<Vec<Candidate>, MemoryError> {
         let current = self.journal().current(&self.scope)?;
         let documents = current
             .iter()
-            .filter(|entry| !skip(&entry.meta.name))
-            .map(document);
+            .map(document)
+            .filter(|document| !skip(document));
         Ok(search::related(words, documents, limit))
     }
 

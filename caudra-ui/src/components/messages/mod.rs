@@ -1,12 +1,13 @@
 mod layout;
 mod render;
+mod row_decisions;
 mod segment;
 mod selection;
 #[cfg(test)]
 mod tests;
 mod thinking;
 use self::render::{EXPAND_AFFORDANCE, HoverFeedback, Placement, RenderCursor, RenderFeedback};
-use self::segment::{Segment, SegmentCache, wrapped_line_count};
+use self::segment::{ChipsHit, Segment, SegmentCache, wrapped_line_count};
 use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
@@ -19,7 +20,7 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_rows, automation_inspector,
-    card_decisions::{self, CardDecision},
+    card_decisions::{self, CardDecision, DecisionSubject},
     code_card,
     code_view::{
         self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
@@ -1124,8 +1125,11 @@ pub struct MessagesPanel {
     /// The session's working directory, which a call's `workdir` argument is
     /// resolved against until its result says where the call ran.
     cwd: Option<Arc<Path>>,
-    /// Whether a card draws what the engine decided about its call.
+    /// Whether a row draws what the engine decided about it.
     show_decisions: bool,
+    /// The text rows whose decisions the reader opened under them, by
+    /// message index.
+    decisions_open: HashSet<usize>,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose message changed since the last frame and whose segment is
@@ -1237,6 +1241,7 @@ impl MessagesPanel {
             commit_index: CommitIndex::default(),
             cwd: None,
             show_decisions: ui_config.show_decisions,
+            decisions_open: HashSet::new(),
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
@@ -1319,7 +1324,7 @@ impl MessagesPanel {
     fn last_beside_decisions(&self) -> Option<usize> {
         self.messages
             .iter()
-            .rposition(|msg| !matches!(msg.role, DisplayRole::Decision(_)))
+            .rposition(|msg| !matches!(msg.role, DisplayRole::Decision(..)))
     }
 
     /// Whether the mode alone draws this call's body.
@@ -1609,7 +1614,7 @@ impl MessagesPanel {
     /// every frame anyway.
     fn redraw_thinking(&mut self, block: ThinkingWindow) {
         if let ThinkingWindow::Settled(msg_index) = block {
-            self.rebuild_thinking_segment(msg_index, self.viewport_width);
+            self.rebuild_text_segment(msg_index, self.viewport_width);
         }
     }
 
@@ -1764,7 +1769,7 @@ impl MessagesPanel {
                 self.rebuild_tool_lines(&id);
             }
             DisplayRole::Thinking => {
-                self.rebuild_thinking_segment(msg_index, self.viewport_width);
+                self.rebuild_text_segment(msg_index, self.viewport_width);
             }
             _ => {}
         }
@@ -1809,6 +1814,11 @@ impl MessagesPanel {
         self.messages.remove(index);
         self.cache.clear();
         self.auto_open = None;
+        self.decisions_open = mem::take(&mut self.decisions_open)
+            .into_iter()
+            .filter(|&open| open != index)
+            .map(|open| open - usize::from(open > index))
+            .collect();
         // Every index above `index` now names a different message, which is
         // exactly what the anchor and a reasoning window's key are holding.
         self.held_anchor = None;
@@ -1817,28 +1827,133 @@ impl MessagesPanel {
         );
     }
 
-    /// Puts `decision` on the card that draws its call, a batch child's on
-    /// its batch's card. `false` when no card holds the call.
+    /// Puts `decision` on the row it belongs to, settling the wait it
+    /// answers: a call's on the card that draws it, a batch child's on its
+    /// batch's card, and a turn's on its [host](Self::decision_host). `false`
+    /// when no row can take it.
     pub fn attach_decision(&mut self, decision: CardDecision) -> bool {
-        let Some(root) = self.root_tool_id(&decision.call_id).map(str::to_owned) else {
+        let Some(host) = self.decision_host(&decision.subject, &decision.feature) else {
             return false;
         };
-        self.update_tool(&root, |msg| {
-            card_decisions::record(&mut msg.decisions, decision)
-        });
+        card_decisions::record(&mut self.messages[host].decisions, decision);
+        self.redraw_decisions(host);
         true
     }
 
-    /// The engine answered `feature` about `call_id` with nothing to show.
-    pub fn settle_decision(&mut self, call_id: &str, feature: &DecisionFeature) {
-        let Some(root) = self.root_tool_id(call_id).map(str::to_owned) else {
-            return;
-        };
-        if let Some(msg) = self.find_tool_msg_mut(&root)
-            && card_decisions::settle(&mut msg.decisions, call_id, feature)
+    /// The engine answered `feature` about `subject` with nothing to show, so
+    /// its wait goes.
+    pub fn settle_decision(&mut self, subject: &DecisionSubject, feature: &DecisionFeature) {
+        if let Some(host) = self.waiting_host(subject, feature)
+            && card_decisions::settle(&mut self.messages[host].decisions, subject, feature)
         {
-            self.mark_card_dirty(&root);
+            self.redraw_decisions(host);
         }
+    }
+
+    /// The engine found nothing to do for the turn's `feature`. Its chip
+    /// stays, quiet, with what came closest. Without a wait, the feature had
+    /// nothing to ask, and its untimed chip goes on the turn's
+    /// [host](Self::decision_host), `details` saying why.
+    pub fn quiet_decision(&mut self, feature: &DecisionFeature, details: &[String]) {
+        let host = match self.waiting_host(&DecisionSubject::Turn, feature) {
+            Some(host) => {
+                card_decisions::quiet(&mut self.messages[host].decisions, feature, details);
+                host
+            }
+            None => {
+                let Some(host) = self.decision_host(&DecisionSubject::Turn, feature) else {
+                    return;
+                };
+                card_decisions::skipped(
+                    &mut self.messages[host].decisions,
+                    feature.clone(),
+                    details,
+                );
+                host
+            }
+        };
+        self.redraw_decisions(host);
+    }
+
+    /// The row a decision about `subject` goes on. A call's is the card that
+    /// draws it. A turn's is the row holding its feature's wait, or else the
+    /// row the transcript ends on: the trigger the engine was asked about,
+    /// such as the prompt it recalls notes for or the reply it checks a goal
+    /// against.
+    fn decision_host(&self, subject: &DecisionSubject, feature: &DecisionFeature) -> Option<usize> {
+        match subject {
+            DecisionSubject::Call(call_id) => self.call_host(call_id),
+            DecisionSubject::Turn => self.waiting_host(subject, feature).or_else(|| {
+                self.messages
+                    .iter()
+                    .rposition(|msg| msg.role.hosts_decisions())
+            }),
+        }
+    }
+
+    fn waiting_host(&self, subject: &DecisionSubject, feature: &DecisionFeature) -> Option<usize> {
+        match subject {
+            DecisionSubject::Call(call_id) => self.call_host(call_id),
+            DecisionSubject::Turn => self.messages.iter().rposition(|msg| {
+                msg.decisions
+                    .iter()
+                    .any(|held| held.is_pending_for(subject, feature))
+            }),
+        }
+    }
+
+    fn call_host(&self, call_id: &str) -> Option<usize> {
+        let root = self.root_tool_id(call_id)?;
+        self.tool_card(root).map(|(index, _)| index)
+    }
+
+    /// Redraws the row at `index` for what its decisions now say: a card at
+    /// the next frame, like any other change to it, and a text row at once.
+    fn redraw_decisions(&mut self, index: usize) {
+        match self.messages[index].role.tool_id().map(str::to_owned) {
+            Some(tool_id) => self.mark_card_dirty(&tool_id),
+            None => self.rebuild_text_segment(index, self.viewport_width),
+        }
+    }
+
+    /// Whether anything drawn is waiting on the decision engine, which keeps
+    /// its spinner turning and its clock counting. Only while rows show
+    /// decisions.
+    fn has_pending_decision(&self) -> bool {
+        self.show_decisions
+            && self
+                .messages
+                .iter()
+                .rev()
+                .any(|msg| msg.decisions.iter().any(CardDecision::is_pending))
+    }
+
+    /// Opens or closes what the decisions on the row under the pointer say,
+    /// when the pointer is on their chips. A card answers through its own
+    /// header instead, so only a text row's chips take the click.
+    pub fn toggle_decisions_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if area.height == 0 || row < area.y || column < area.x {
+            return false;
+        }
+        let width = self.viewport_width;
+        let doc_row = self.doc_row(row, area);
+        let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
+            return false;
+        };
+        let Some(msg_index) = segment.msg_index.filter(|_| segment.tool_id.is_none()) else {
+            return false;
+        };
+        let Ok(rel_row) = u16::try_from(doc_row - start) else {
+            return false;
+        };
+        if !segment.on_decision_chips(rel_row, column - area.x, width) {
+            return false;
+        }
+        if !self.decisions_open.remove(&msg_index) {
+            self.decisions_open.insert(msg_index);
+        }
+        self.rebuild_text_segment(msg_index, width);
+        true
     }
 
     /// Drops the newest harness notice reading `text`. Found by content rather
@@ -1890,6 +2005,7 @@ impl MessagesPanel {
         self.held_anchor = None;
         self.card_floor.clear();
         self.disclosure.clear();
+        self.decisions_open.clear();
         self.raw_views.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
@@ -3684,19 +3800,22 @@ impl MessagesPanel {
         self.cwd = Some(Arc::from(cwd));
     }
 
-    /// Redraws only the cards that carry a decision, the rest look the same.
+    /// Redraws only the rows that carry a decision, the rest look the same.
     pub(crate) fn set_show_decisions(&mut self, shown: bool) {
         if self.show_decisions == shown {
             return;
         }
         self.show_decisions = shown;
-        let decided: Vec<String> = self
+        let decided: Vec<usize> = self
             .messages
             .iter()
-            .filter(|msg| !msg.decisions.is_empty())
-            .filter_map(|msg| msg.role.tool_id().map(str::to_owned))
+            .enumerate()
+            .filter(|(_, msg)| !msg.decisions.is_empty())
+            .map(|(index, _)| index)
             .collect();
-        self.dirty_cards.extend(decided);
+        for index in decided {
+            self.redraw_decisions(index);
+        }
     }
 
     /// The text of the reader's own message under the pointer, and how far into
@@ -4370,6 +4489,7 @@ impl MessagesPanel {
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
             Cadence::when(self.has_in_progress(), Cadence::SPINNER),
+            Cadence::when(self.has_pending_decision(), Cadence::SPINNER),
             Cadence::when(!self.streaming_thinking.is_empty(), Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
@@ -4402,7 +4522,9 @@ impl MessagesPanel {
     fn has_foldable_body(msg: &DisplayMessage) -> bool {
         match msg.role {
             DisplayRole::Thinking | DisplayRole::Injected => true,
-            DisplayRole::Decision(_) | DisplayRole::AutopilotDecision(_) => msg.text.contains('\n'),
+            DisplayRole::Decision(..) | DisplayRole::AutopilotDecision(_) => {
+                msg.text.contains('\n')
+            }
             _ => false,
         }
     }
@@ -4493,6 +4615,9 @@ impl MessagesPanel {
         if self.has_in_progress() {
             self.update_spinners();
             self.refresh_live_progress();
+        }
+        if self.has_pending_decision() {
+            self.refresh_decision_waits();
         }
 
         let cached_count = self.cache.len();
@@ -5645,7 +5770,7 @@ impl MessagesPanel {
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
-            DisplayRole::Decision(outcome) => built_decision(msg, outcome, false),
+            DisplayRole::Decision(outcome, took) => built_decision(msg, outcome, took, false),
             DisplayRole::AutopilotDecision(_) => built_autopilot_decision(msg, width, false),
             _ => BuiltMessage::bare(
                 self.build_cached_thinking_indicator(&msg.text, msg.thinking_duration),
@@ -5659,18 +5784,25 @@ impl MessagesPanel {
     /// left it at.
     fn built_message(&self, msg_index: usize, width: u16) -> Option<BuiltMessage> {
         let msg = self.messages.get(msg_index)?;
-        if Self::has_foldable_body(msg) && !self.body_open(msg) {
-            return Some(self.folded_message(msg, width));
+        let mut built = if Self::has_foldable_body(msg) && !self.body_open(msg) {
+            self.folded_message(msg, width)
+        } else {
+            let window = matches!(msg.role, DisplayRole::Thinking)
+                .then(|| self.thinking_window(ThinkingWindow::Settled(msg_index)))
+                .flatten();
+            build_message_lines(msg, width, self.pans_for(msg_index), window)
+        };
+        if self.show_decisions && !msg.decisions.is_empty() {
+            let content_width =
+                SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
+            row_decisions::decorate(
+                &mut built,
+                &msg.decisions,
+                self.decisions_open.contains(&msg_index),
+                content_width,
+            );
         }
-        let window = matches!(msg.role, DisplayRole::Thinking)
-            .then(|| self.thinking_window(ThinkingWindow::Settled(msg_index)))
-            .flatten();
-        Some(build_message_lines(
-            msg,
-            width,
-            self.pans_for(msg_index),
-            window,
-        ))
+        Some(built)
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
@@ -5725,11 +5857,11 @@ impl MessagesPanel {
         }
         let open = self.body_open(msg);
         self.messages[idx].body_open = Some(!open);
-        self.rebuild_thinking_segment(idx, width);
+        self.rebuild_text_segment(idx, width);
         true
     }
 
-    fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
+    fn rebuild_text_segment(&mut self, msg_idx: usize, width: u16) {
         let Some(built) = self.built_message(msg_idx, width) else {
             return;
         };
@@ -5793,6 +5925,25 @@ impl MessagesPanel {
             .collect();
         for tool_id in live {
             self.rebuild_tool_lines(&tool_id);
+        }
+    }
+
+    /// Redraws every row with a pending chip, whose spinner and clock are
+    /// baked into its text. A card's can outlive its call while the engine
+    /// screens the result.
+    fn refresh_decision_waits(&mut self) {
+        let waiting: Vec<(usize, Option<String>)> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| msg.decisions.iter().any(CardDecision::is_pending))
+            .map(|(index, msg)| (index, msg.role.tool_id().map(str::to_owned)))
+            .collect();
+        for (index, tool_id) in waiting {
+            match tool_id {
+                Some(tool_id) => self.rebuild_tool_lines(&tool_id),
+                None => self.rebuild_text_segment(index, self.viewport_width),
+            }
         }
     }
 
@@ -6194,7 +6345,7 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
         )),
         DisplayRole::Error
         | DisplayRole::Done
-        | DisplayRole::Decision(_)
+        | DisplayRole::Decision(..)
         | DisplayRole::AutopilotDecision(_)
         | DisplayRole::GoalEvaluation(..) => None,
     }
@@ -6345,9 +6496,15 @@ fn injected_line(text: &str) -> Vec<Line<'static>> {
 
 /// A decision row's title behind its prefix, and once `open`, each detail
 /// under it. Plain text: a label such as a note name is drawn as written.
-fn built_decision(msg: &DisplayMessage, outcome: NoteOutcome, open: bool) -> BuiltMessage {
+/// How long it `took` is drawn but not searched.
+fn built_decision(
+    msg: &DisplayMessage,
+    outcome: NoteOutcome,
+    took: Option<Duration>,
+    open: bool,
+) -> BuiltMessage {
     BuiltMessage::bare(
-        card_decisions::decision_lines(&msg.text, outcome, open),
+        card_decisions::decision_lines(&msg.text, outcome, took, open),
         format!("{DECISION_PREFIX}{}", msg.text),
     )
 }
@@ -6426,7 +6583,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         | DisplayRole::Injected
         | DisplayRole::Autopilot
         | DisplayRole::AutopilotDecision(_)
-        | DisplayRole::Decision(_) => SegmentKind::Assistant,
+        | DisplayRole::Decision(..) => SegmentKind::Assistant,
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::AutomationDelivery(_) => SegmentKind::AutomationDelivery,
         DisplayRole::PeerMessage(_) => SegmentKind::PeerMessage,
@@ -6504,8 +6661,8 @@ fn build_message_lines(
             ..BuiltMessage::bare(lines, search_text)
         };
     }
-    if let DisplayRole::Decision(outcome) = msg.role {
-        return built_decision(msg, outcome, true);
+    if let DisplayRole::Decision(outcome, took) = msg.role {
+        return built_decision(msg, outcome, took, true);
     }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
@@ -6521,7 +6678,7 @@ fn build_message_lines(
         | DisplayRole::TaskDelivery(_)
         | DisplayRole::AutomationDelivery(_)
         | DisplayRole::PeerMessage(_)
-        | DisplayRole::Decision(_)
+        | DisplayRole::Decision(..)
         | DisplayRole::AutopilotDecision(_) => {
             unreachable!()
         }
@@ -6545,6 +6702,7 @@ fn build_message_lines(
             images: Vec::new(),
             scroll_span: None,
             scroll_footer_line: None,
+            decision_chips: None,
         };
     }
     let (mut lines, mut provenance, mut diagrams, mut links, mut images) = if style.use_markdown {
@@ -6658,6 +6816,7 @@ fn build_message_lines(
         images,
         scroll_span: None,
         scroll_footer_line: None,
+        decision_chips: None,
     }
 }
 
@@ -6713,6 +6872,8 @@ struct BuiltMessage {
     /// rows, and the footer row that says which.
     scroll_span: Option<ScrollSpan>,
     scroll_footer_line: Option<usize>,
+    /// Where the row's decision chips landed, for a click to find them.
+    decision_chips: Option<ChipsHit>,
 }
 
 impl BuiltMessage {
@@ -6727,6 +6888,7 @@ impl BuiltMessage {
             images: Vec::new(),
             scroll_span: None,
             scroll_footer_line: None,
+            decision_chips: None,
         }
     }
 }
@@ -6740,6 +6902,7 @@ fn install_built(seg: &mut Segment, built: BuiltMessage) {
     seg.set_diagrams(built.diagrams);
     seg.set_images(built.images);
     seg.search_text = built.search_text;
+    seg.decision_chips = built.decision_chips;
     seg.scroll_spans = built.scroll_span.into_iter().collect();
     seg.scroll_footer_line = built.scroll_footer_line;
 }

@@ -9824,16 +9824,29 @@ fn sticky_todos_focused_resumption_refreshes_the_task_name(cached: bool) {
     assert!(!app.todo_panel.progress_tip().contains(TODO_FIRST_NAME));
 }
 
-#[test_case(false; "read_only_task")]
-#[test_case(true; "task_composer")]
-fn sticky_todos_collapsed_task_hint_renders_hovers_and_opens(composer: bool) {
+#[test]
+fn a_running_task_composer_gives_its_todo_hint_slot_to_guide_and_replace() {
     let mut app = sticky_todo_app();
     let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
-    if composer {
-        app.subagent_steers.insert(TODO_FIRST_ID.into(), steer_tx);
-    }
+    app.subagent_steers.insert(TODO_FIRST_ID.into(), steer_tx);
     app.focus_task(TODO_FIRST_ID).unwrap();
-    assert_eq!(app.active_subagent_has_composer(), composer);
+    let _ = rendered(&mut app);
+    assert!(app.chord_hint_hit.is_none());
+    let admissions: Vec<_> = app.admission_hits.iter().map(|hit| hit.admission).collect();
+    assert_eq!(
+        admissions,
+        [
+            caudra_agent::PromptAdmission::Steer,
+            caudra_agent::PromptAdmission::Interrupt
+        ]
+    );
+}
+
+#[test]
+fn sticky_todos_collapsed_task_hint_renders_hovers_and_opens() {
+    let mut app = sticky_todo_app();
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert!(!app.active_subagent_has_composer());
     let screen = rendered(&mut app);
     assert!(
         screen.contains(&format!("Task: {TODO_FIRST_NAME} · 0/1")),
@@ -12142,6 +12155,148 @@ fn subagent_queue_edit_updates_the_real_interrupt_queue() {
     app.update(Msg::Key(key(KeyCode::Char('d'))));
     assert!(steer_queue.entries().is_empty());
     assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+const TASK_GUIDANCE: &str = "also check the cookies";
+const TASK_REPLACEMENT: &str = "stop and list the routes";
+const LATER_REPLACEMENT: &str = "stop and list the handlers";
+
+fn running_task_chat() -> (
+    App,
+    caudra_agent::SteeringQueue,
+    caudra_agent::SteeringQueueReceiver,
+) {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, receiver) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    (app, steer_queue, receiver)
+}
+
+fn armed_turn(receiver: &caudra_agent::SteeringQueueReceiver) -> caudra_agent::CancelToken {
+    let (trigger, turn) = caudra_agent::CancelToken::new();
+    receiver.arm(trigger);
+    turn
+}
+
+fn task_queue_rows(app: &App) -> Vec<(String, Option<caudra_agent::PromptAdmission>)> {
+    app.active_queue_entries()
+        .into_iter()
+        .map(|entry| (entry.text.into_owned(), entry.admission))
+        .collect()
+}
+
+#[test]
+fn replace_in_a_task_chat_stops_its_turn_and_supersedes_the_waiting_replacement() {
+    let (mut app, steer_queue, receiver) = running_task_chat();
+    let turn = armed_turn(&receiver);
+    app.subagent_input_box.set_input(TASK_GUIDANCE.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!turn.is_cancelled());
+
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+    let actions = press_chord(&mut app, chord::INTERRUPT_PROMPT);
+
+    assert!(actions.is_empty());
+    assert!(turn.is_cancelled());
+    assert!(app.subagent_input_box.buffer.value().is_empty());
+    app.subagent_input_box.set_input(LATER_REPLACEMENT.into());
+    press_chord(&mut app, chord::INTERRUPT_PROMPT);
+    let interrupt = Some(caudra_agent::PromptAdmission::Interrupt);
+    let steer = Some(caudra_agent::PromptAdmission::Steer);
+    assert_eq!(
+        task_queue_rows(&app),
+        [
+            (LATER_REPLACEMENT.to_owned(), interrupt),
+            (TASK_GUIDANCE.to_owned(), steer),
+        ]
+    );
+    assert_eq!(
+        steer_queue
+            .entries()
+            .into_iter()
+            .map(|entry| (entry.text, Some(entry.admission)))
+            .collect::<Vec<_>>(),
+        [
+            (TASK_GUIDANCE.to_owned(), steer),
+            (LATER_REPLACEMENT.to_owned(), interrupt),
+        ]
+    );
+}
+
+#[test]
+fn a_consumed_task_replacement_marks_the_cancelled_turn_before_its_prompt() {
+    let (mut app, steer_queue, _receiver) = running_task_chat();
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+    press_chord(&mut app, chord::INTERRUPT_PROMPT);
+    let id = steer_queue.entries()[0].id;
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+
+    app.update(subagent_msg_with_info(
+        AgentEvent::QueueItemConsumed {
+            id,
+            text: TASK_REPLACEMENT.into(),
+            images: Vec::new(),
+        },
+        info,
+    ));
+
+    assert!(app.subagent_replacements.is_empty());
+    assert!(app.active_queue_entries().is_empty());
+    let chat = &app.chats[1];
+    let count = chat.message_count();
+    assert_eq!(chat.message_at(count - 2).unwrap().text, CANCEL_MSG);
+    assert_eq!(chat.last_message_text(), TASK_REPLACEMENT);
+}
+
+#[test]
+fn replace_key_on_task_guidance_promotes_it_in_place() {
+    let (mut app, steer_queue, receiver) = running_task_chat();
+    app.subagent_input_box.set_input(TASK_GUIDANCE.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let id = steer_queue.entries()[0].id;
+    let turn = armed_turn(&receiver);
+    app.focus_active_queue();
+
+    app.update(Msg::Key(key(KeyCode::Char('r'))));
+
+    assert!(turn.is_cancelled());
+    assert_eq!(app.subagent_replacements[TASK_ID], id);
+    assert_eq!(
+        task_queue_rows(&app),
+        [(
+            TASK_GUIDANCE.to_owned(),
+            Some(caudra_agent::PromptAdmission::Interrupt)
+        )]
+    );
+    assert_eq!(
+        receiver.take_replacement().map(|(claimed, _)| claimed),
+        Some(id)
+    );
+}
+
+#[test]
+fn replacing_a_task_that_stopped_returns_the_draft() {
+    let (mut app, _steer_queue, _receiver) = running_task_chat();
+    app.subagent_steers.remove(TASK_ID);
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+
+    let actions = app.handle_task_admission(caudra_agent::PromptAdmission::Interrupt);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(TASK_NOT_RUNNING));
+    assert_eq!(app.subagent_input_box.buffer.value(), TASK_REPLACEMENT);
+    assert!(app.subagent_replacements.is_empty());
 }
 
 #[test]
@@ -15649,6 +15804,139 @@ fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
         unreachable!()
     };
     assert_eq!(forked.session.messages(), items);
+}
+
+const FORK_COMMAND: &str = "/fork";
+const FORK_FIRST_PROMPT: &str = "first prompt";
+const FORK_FIRST_REPLY: &str = "first reply";
+const FORK_RUNNING_PROMPT: &str = "running prompt";
+const FORK_CALL_ID: &str = "call-1";
+
+fn fork_reply(text: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        ..Default::default()
+    }
+}
+
+fn fork_call() -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::tool_use(
+            FORK_CALL_ID,
+            "read",
+            serde_json::json!({}),
+        )],
+        ..Default::default()
+    }
+}
+
+fn ending_on_reply() -> Vec<Message> {
+    vec![
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+    ]
+}
+
+fn ending_on_tool_result() -> Vec<Message> {
+    vec![
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_call(),
+        tool_result_msg(FORK_CALL_ID, FORK_FIRST_REPLY),
+    ]
+}
+
+fn forked_by_command(app: &mut App) -> ForkedSession {
+    let mut actions = app.execute_command(cmd(FORK_COMMAND), 0);
+    assert_eq!(actions.len(), 1, "{:?}", app.status_bar.flash_text());
+    let Action::ForkSession(forked) = actions.remove(0) else {
+        panic!("/fork must fork");
+    };
+    *forked
+}
+
+#[test_case(ending_on_reply ; "assistant_text")]
+#[test_case(ending_on_tool_result ; "tool_result")]
+fn fork_command_copies_the_whole_conversation_when_idle(history: fn() -> Vec<Message>) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&history());
+    app.state.session_mut().replace_messages(items.clone());
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), items);
+    assert!(forked.draft.is_none());
+}
+
+#[test]
+fn fork_command_leaves_the_running_turn_behind() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+        Message::user(FORK_RUNNING_PROMPT.into()),
+        fork_call(),
+    ]);
+    app.state.session_mut().replace_messages(items.clone());
+    let head = crate::session_history_head(&app.state.session);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), &items[..2]);
+    assert_eq!(forked.draft.unwrap().text, FORK_RUNNING_PROMPT);
+    assert_eq!(app.state.session.messages(), items);
+    assert_eq!(crate::session_history_head(&app.state.session), head);
+}
+
+#[test_case(Status::Idle ; "idle")]
+#[test_case(Status::Streaming ; "streaming")]
+fn fork_command_with_nothing_to_fork_says_so(status: Status) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.status = status;
+
+    let actions = app.execute_command(cmd(FORK_COMMAND), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::session::NOTHING_TO_FORK)
+    );
+}
+
+#[test]
+fn fork_command_follows_a_pending_revert() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+        Message::user(FORK_RUNNING_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+    ]);
+    app.state.session_mut().replace_messages(items.clone());
+    app.revert_to(items[2].id, RestoreMode::Conversation);
+    assert!(app.state.session.meta.pending_revert.is_some());
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), &items[..2]);
+    assert!(forked.draft.is_none());
+}
+
+#[test]
+fn fork_command_waits_for_a_cancellation() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.state
+        .session_mut()
+        .replace_messages(crate::history_items(&ending_on_reply()));
+    app.cancelling_run = Some(1);
+
+    let actions = app.execute_command(cmd(FORK_COMMAND), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(REVERT_BUSY_MSG));
 }
 
 #[test]
@@ -28834,6 +29122,7 @@ mod engine_decisions {
     use caudra_config::decisions::FeatureMode;
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::sessions::{SessionDatabase, StoredSubagent, StoredSubagentOutcome};
+    use std::iter;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -28873,24 +29162,28 @@ mod engine_decisions {
         title.rsplit(DECISION_SEPARATOR).next().unwrap_or_default()
     }
 
-    /// A card by its call followed by the decisions it carries, a decision
-    /// row by its summary, anything else by its text.
+    /// A card by its call and any other row by its text, each followed by the
+    /// decisions it carries, and a decision row by its summary.
     fn placement(chat: &Chat) -> Vec<&str> {
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
-            .flat_map(|message| match &message.role {
-                DisplayRole::Tool(tool) => {
-                    std::iter::once(tool.id.as_str())
-                        .chain(message.decisions.iter().filter_map(
-                            |decision| match &decision.state {
+            .flat_map(|message| {
+                let shown = match &message.role {
+                    DisplayRole::Tool(tool) => tool.id.as_str(),
+                    DisplayRole::Decision(..) => decision_summary(&message.text),
+                    _ => message.text.as_str(),
+                };
+                iter::once(shown)
+                    .chain(
+                        message
+                            .decisions
+                            .iter()
+                            .filter_map(|decision| match &decision.state {
                                 DecisionState::Settled { text, .. } => Some(decision_summary(text)),
-                                DecisionState::Pending => None,
-                            },
-                        ))
-                        .collect::<Vec<_>>()
-                }
-                DisplayRole::Decision(_) => vec![decision_summary(&message.text)],
-                _ => vec![message.text.as_str()],
+                                DecisionState::Pending { .. } | DecisionState::Quiet { .. } => None,
+                            }),
+                    )
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -28937,8 +29230,8 @@ mod engine_decisions {
     }
 
     /// The App keeps each row through the storage writer, and a reopened
-    /// session draws the main agent's under its call and the task's in the
-    /// task's own transcript, unless decisions are hidden.
+    /// session draws the main agent's on its call's card and the task's on
+    /// the task's prompt, unless decisions are hidden.
     #[test_case(true ; "shown")]
     #[test_case(false ; "hidden")]
     fn decision_rows_survive_a_reload(shown: bool) {

@@ -199,7 +199,7 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
 
 /// Every threshold, in `[decisions.thresholds]` order. An unset `shell_writes`
 /// is `None`, which is what keeps shell-effect warnings off.
-pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str, Option<f64>); 9] {
+pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str, Option<f64>); 10] {
     [
         ("permission_flag", Some(thresholds.permission_flag)),
         ("auto_flag", Some(thresholds.auto_flag)),
@@ -213,6 +213,7 @@ pub(super) fn threshold_rows(thresholds: &DecisionThresholds) -> [(&'static str,
         ("shell_writes", thresholds.shell_writes),
         ("question_tool_nudge", Some(thresholds.question_tool_nudge)),
         ("relevance_floor", Some(thresholds.relevance_floor)),
+        ("recall_confidence", Some(thresholds.recall_confidence)),
     ]
 }
 

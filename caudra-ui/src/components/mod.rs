@@ -1483,11 +1483,12 @@ impl DisplayMessage {
     pub(crate) fn decision(
         feature: &str,
         outcome: NoteOutcome,
+        took: Option<Duration>,
         summary: &str,
         details: &[String],
     ) -> Self {
         Self::new(
-            DisplayRole::Decision(outcome),
+            DisplayRole::Decision(outcome, took),
             card_decisions::decision_text(feature, outcome, summary, details),
         )
     }
@@ -1638,9 +1639,11 @@ pub enum DisplayRole {
     /// log can find it again. It draws as the plain row its tone names.
     GoalEvaluation(u64, GoalTone),
     /// What a decision-engine feature changed, would have changed in shadow,
-    /// or left to the default when the engine failed. Display only: the model
-    /// never sees it. It folds to its title like an injected message.
-    Decision(NoteOutcome),
+    /// or left to the default when the engine failed, and how long the engine
+    /// took when this chat watched it wait. Display only: the model never sees
+    /// it. It folds to its title like an injected message. A turn's decision
+    /// is drawn this way only when no row could carry it as a chip.
+    Decision(NoteOutcome, Option<Duration>),
 }
 
 /// The plain row a [`DisplayRole::GoalEvaluation`] draws as.
@@ -1670,6 +1673,29 @@ impl DisplayRole {
         match self {
             DisplayRole::Tool(t) => Some(&t.id),
             _ => None,
+        }
+    }
+
+    /// Whether a turn's decisions can sit on this row as chips. Reasoning
+    /// folds on a click to its header, a decision row is one already, and a
+    /// reminder is context the turn carries rather than what triggered it.
+    pub fn hosts_decisions(&self) -> bool {
+        match self {
+            DisplayRole::User
+            | DisplayRole::Assistant
+            | DisplayRole::Tool(_)
+            | DisplayRole::Error
+            | DisplayRole::Done
+            | DisplayRole::Notice
+            | DisplayRole::TaskDelivery(_)
+            | DisplayRole::AutomationDelivery(_)
+            | DisplayRole::PeerMessage(_)
+            | DisplayRole::Autopilot
+            | DisplayRole::GoalEvaluation(..) => true,
+            DisplayRole::Thinking
+            | DisplayRole::Injected
+            | DisplayRole::AutopilotDecision(_)
+            | DisplayRole::Decision(..) => false,
         }
     }
 }

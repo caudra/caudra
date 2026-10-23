@@ -31,6 +31,14 @@ pub fn instruction_parent(id: &str) -> Option<&str> {
     id.strip_suffix(INST_SUFFIX)
 }
 
+/// Where a row's decision chips are drawn: the line holding them, and the
+/// content columns they take on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ChipsHit {
+    pub line: usize,
+    pub columns: Range<u16>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CachedHeight {
     at_width: u16,
@@ -143,6 +151,8 @@ pub(super) struct Segment {
     snapshot_skip: usize,
     pub raw_toggle_line: Option<usize>,
     pub scroll_footer_line: Option<usize>,
+    /// A text row's decision chips, the control that opens their details.
+    pub decision_chips: Option<ChipsHit>,
     pub scroll_spans: Vec<ScrollSpan>,
     /// What each line belongs to, parallel to `lines`. Spliced alongside them
     /// so a highlighted card keeps the rows a click names.
@@ -316,6 +326,18 @@ impl Segment {
         let col = rel_col.checked_sub(chrome.left)?;
         let content_width = chrome.content_width(width);
         self.links.target_at(&self.lines, content_width, row, col)
+    }
+
+    /// Whether the cell at (`rel_row`, `rel_col`) is on the row's decision
+    /// chips.
+    pub fn on_decision_chips(&self, rel_row: u16, rel_col: u16, width: u16) -> bool {
+        let Some(chips) = &self.decision_chips else {
+            return false;
+        };
+        rel_col
+            .checked_sub(self.chrome(width).left)
+            .is_some_and(|column| chips.columns.contains(&column))
+            && self.source_line_at(rel_row, width) == Some(chips.line)
     }
 
     /// The markdown behind the cell at (`rel_row`, `rel_col`), with the byte it

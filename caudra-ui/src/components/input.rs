@@ -68,14 +68,25 @@ const RESUME_TASK_PLACEHOLDER: &str = "Continue this failed task...";
 const ASK_PREFIX: &str = "Ask caudra to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
-const ADMISSION_OPTIONS: [(&str, &str, PromptAdmission); 3] = [
+/// A send control: its key, its word, and the admission it sends with.
+pub(crate) type AdmissionOption = (&'static str, &'static str, PromptAdmission);
+const GUIDE_WORD: &str = "guide";
+const REPLACE_WORD: &str = "replace";
+const REPLACE_OPTION: AdmissionOption = (
+    leader::INTERRUPT_PROMPT.label,
+    REPLACE_WORD,
+    PromptAdmission::Interrupt,
+);
+/// The main chat while a run is busy.
+pub(crate) const MAIN_ADMISSIONS: [AdmissionOption; 3] = [
     ("Enter", "next", PromptAdmission::Queue),
-    (leader::STEER_PROMPT.label, "guide", PromptAdmission::Steer),
-    (
-        leader::INTERRUPT_PROMPT.label,
-        "replace",
-        PromptAdmission::Interrupt,
-    ),
+    (leader::STEER_PROMPT.label, GUIDE_WORD, PromptAdmission::Steer),
+    REPLACE_OPTION,
+];
+/// A running task's chat, which has no next run to wait for.
+pub(crate) const TASK_ADMISSIONS: [AdmissionOption; 2] = [
+    ("Enter", GUIDE_WORD, PromptAdmission::Steer),
+    REPLACE_OPTION,
 ];
 const TIP_NEXT: &str = "Waits until this run and its background work finish";
 const TIP_GUIDE: &str = "Joins this run before its next model request, without stopping it";
@@ -91,14 +102,12 @@ pub(crate) fn control_tip(meaning: &str, key: &str) -> String {
 pub(crate) struct AdmissionHit {
     pub area: Rect,
     pub admission: PromptAdmission,
+    key: &'static str,
 }
 
 impl AdmissionHit {
     /// What sending this way does, and the key that does it without the mouse.
     pub(crate) fn tip(self) -> Option<Tip> {
-        let (key, _, _) = ADMISSION_OPTIONS
-            .iter()
-            .find(|(_, _, admission)| *admission == self.admission)?;
         let meaning = match self.admission {
             PromptAdmission::Queue => TIP_NEXT,
             PromptAdmission::Steer => TIP_GUIDE,
@@ -107,7 +116,7 @@ impl AdmissionHit {
         Some(Tip::at(
             TipKey::Admission(self.admission),
             self.area,
-            control_tip(meaning, key),
+            control_tip(meaning, self.key),
         ))
     }
 }
@@ -1037,10 +1046,11 @@ pub(crate) fn content_area(area: Rect) -> Rect {
 pub(crate) fn admission_hint(
     area: Rect,
     hovered: Option<PromptAdmission>,
+    options: &[AdmissionOption],
 ) -> (Line<'static>, Vec<AdmissionHit>) {
     let theme = theme::current();
     let hint_area = top_right_hint_area(area);
-    let full_width = ADMISSION_OPTIONS
+    let full_width = options
         .iter()
         .map(|(key, description, _)| {
             ADMISSION_SEPARATOR.width()
@@ -1054,10 +1064,10 @@ pub(crate) fn admission_hint(
     } else {
         hint_area.x
     };
-    let mut spans = Vec::with_capacity(ADMISSION_OPTIONS.len() * 3);
-    let mut hits = Vec::with_capacity(ADMISSION_OPTIONS.len());
+    let mut spans = Vec::with_capacity(options.len() * 3);
+    let mut hits = Vec::with_capacity(options.len());
 
-    for (key, description, admission) in ADMISSION_OPTIONS {
+    for &(key, description, admission) in options {
         spans.push(Span::raw(ADMISSION_SEPARATOR));
         x = x.saturating_add(ADMISSION_SEPARATOR.width() as u16);
         let key_width = key.width() as u16;
@@ -1081,6 +1091,7 @@ pub(crate) fn admission_hint(
             hits.push(AdmissionHit {
                 area: Rect::new(x, hint_area.y, control_width, 1),
                 admission,
+                key,
             });
         }
         x = x.saturating_add(control_width);
@@ -1776,11 +1787,14 @@ mod tests {
         render_input_with(input, width, height, Placeholder::Suggestion)
     }
 
-    #[test]
-    fn admission_hint_hits_exclude_separators_and_hover_only_the_control() {
+    #[test_case(&MAIN_ADMISSIONS ; "main_chat")]
+    #[test_case(&TASK_ADMISSIONS ; "task_chat")]
+    fn admission_hint_hits_exclude_separators_and_hover_only_the_control(
+        options: &[AdmissionOption],
+    ) {
         let area = Rect::new(0, 0, 80, 3);
-        let (hint, hits) = admission_hint(area, Some(PromptAdmission::Steer));
-        assert_eq!(hits.len(), ADMISSION_OPTIONS.len());
+        let (hint, hits) = admission_hint(area, Some(PromptAdmission::Steer), options);
+        assert_eq!(hits.len(), options.len());
         assert!(hits.iter().all(|hit| {
             hit.area.width > 0 && hit.area.right() <= area.right() && hit.area.y == area.y
         }));
@@ -1821,6 +1835,21 @@ mod tests {
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn a_task_composer_offers_guide_and_replace_but_never_next() {
+        let area = Rect::new(0, 0, 80, 3);
+        let (hint, hits) = admission_hint(area, None, &TASK_ADMISSIONS);
+        let shown = hint.to_string();
+
+        assert!(shown.contains(&format!("Enter{ADMISSION_DESCRIPTION_GAP}{GUIDE_WORD}")));
+        assert!(shown.contains(REPLACE_WORD));
+        assert!(!shown.contains(MAIN_ADMISSIONS[0].1));
+        assert_eq!(
+            hits.iter().map(|hit| hit.admission).collect::<Vec<_>>(),
+            [PromptAdmission::Steer, PromptAdmission::Interrupt]
         );
     }
 

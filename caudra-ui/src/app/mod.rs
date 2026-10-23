@@ -273,6 +273,7 @@ const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
 const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the message";
+pub(super) const TASK_NOT_RUNNING: &str = "Only a running task can have its turn replaced";
 const REVIEW_READY_MSG: &str = "Review notes added to the prompt";
 const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
 const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
@@ -771,6 +772,9 @@ pub struct App {
     subagent_answers: HashMap<String, flume::Sender<String>>,
     subagent_steers: HashMap<String, SteeringQueue>,
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
+    /// Each running task's waiting replacement, the task chat's
+    /// counterpart of `replacement_item`.
+    subagent_replacements: HashMap<String, QueueItemId>,
     unsent_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
     /// Chats opened from a delegation whose call has not run yet, by the
@@ -1072,6 +1076,7 @@ impl App {
             subagent_answers: HashMap::new(),
             subagent_steers: HashMap::new(),
             pending_subagent_steers: HashMap::new(),
+            subagent_replacements: HashMap::new(),
             unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
             pending_delegations: HashSet::new(),
@@ -3225,13 +3230,10 @@ impl App {
             return Vec::new();
         };
         match kind {
-            MessageActionKind::Fork => match self.fork_at(source) {
-                Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
-                Err(error) => {
-                    self.flash(error);
-                    Vec::new()
-                }
-            },
+            MessageActionKind::Fork => {
+                let forked = self.fork_at(source);
+                self.fork_actions(forked)
+            }
             MessageActionKind::RevertBoth => vec![Action::RevertSession {
                 source,
                 mode: RestoreMode::Both,
@@ -4065,13 +4067,18 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return vec![];
         }
-        if self.prompt_defers() {
+        let steerable_task = self.active_task_is_steerable();
+        if steerable_task || self.prompt_defers() {
             for (bind, admission) in [
                 (leader::STEER_PROMPT, PromptAdmission::Steer),
                 (leader::INTERRUPT_PROMPT, PromptAdmission::Interrupt),
             ] {
                 if bind.matches(key) {
-                    return self.handle_deferred_admission(admission);
+                    return if steerable_task {
+                        self.handle_task_admission(admission)
+                    } else {
+                        self.handle_deferred_admission(admission)
+                    };
                 }
             }
         }
@@ -4103,7 +4110,7 @@ impl App {
             ];
         }
         let mut contexts = vec![KeybindContext::General, KeybindContext::Editing];
-        if self.prompt_defers() {
+        if self.prompt_defers() || self.active_task_is_steerable() {
             contexts.push(KeybindContext::Streaming);
         }
         contexts
@@ -4178,6 +4185,30 @@ impl App {
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
+        self.submit_to_task(sub, PromptAdmission::Steer)
+    }
+
+    /// Whether the task on screen is running and so takes guidance or a
+    /// replacement rather than a continuation.
+    pub(super) fn active_task_is_steerable(&self) -> bool {
+        !self.is_main_chat()
+            && self
+                .active_subagent_id()
+                .is_some_and(|id| self.subagent_steers.contains_key(id))
+    }
+
+    /// `Ctrl+X g` and `Ctrl+X x`, and their controls, in a task's chat.
+    pub(super) fn handle_task_admission(&mut self, admission: PromptAdmission) -> Vec<Action> {
+        if self.queue_editor_active() {
+            return vec![];
+        }
+        let Some(sub) = self.subagent_input_box.take_submission() else {
+            return vec![];
+        };
+        self.submit_to_task(sub, admission)
+    }
+
+    fn submit_to_task(&mut self, sub: Submission, admission: PromptAdmission) -> Vec<Action> {
         if self.intercept_inspection_submission(&sub.text) {
             return vec![];
         }
@@ -4191,6 +4222,37 @@ impl App {
         let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
             return vec![];
         };
+        self.send_to_task(&task_id, sub, admission)
+    }
+
+    /// The one place a prompt reaches a running task, shared by the composer
+    /// and by commands that expand into a prompt, so neither can drift from
+    /// the queue bookkeeping the panel renders from. Guidance to a task that
+    /// stopped continues it; a replacement needs it still running and
+    /// otherwise returns the draft to the composer.
+    fn send_to_task(
+        &mut self,
+        task_id: &str,
+        sub: Submission,
+        admission: PromptAdmission,
+    ) -> Vec<Action> {
+        let continuing = self
+            .task_continuation
+            .as_ref()
+            .is_some_and(|pending| pending.task_id() == task_id);
+        let tx = match self.subagent_steers.get(task_id) {
+            Some(tx) if !continuing => tx.clone(),
+            _ if admission == PromptAdmission::Interrupt => {
+                self.subagent_input_box
+                    .set_state(InputState::new(sub.draft, sub.images));
+                self.flash(TASK_NOT_RUNNING.into());
+                return vec![];
+            }
+            _ => {
+                self.start_task_continuation(task_id, sub);
+                return vec![];
+            }
+        };
         let Submission {
             text,
             images,
@@ -4198,44 +4260,6 @@ impl App {
             commits,
             draft,
         } = sub;
-        self.steer_task(&task_id, text, images, mentions, commits, draft)
-    }
-
-    /// The one place a steer reaches a running task, shared by the composer
-    /// and by commands that expand into a prompt, so neither can drift from
-    /// the queue bookkeeping the panel renders from. Returns the draft to the
-    /// composer when the task stopped being steerable.
-    fn steer_task(
-        &mut self,
-        task_id: &str,
-        text: String,
-        images: Vec<ImageSource>,
-        mentions: Vec<Mention>,
-        commits: Vec<CommitRef>,
-        draft: InputDraft,
-    ) -> Vec<Action> {
-        if self
-            .task_continuation
-            .as_ref()
-            .is_some_and(|pending| pending.task_id() == task_id)
-            || !self.subagent_steers.contains_key(task_id)
-        {
-            self.start_task_continuation(
-                task_id,
-                Submission {
-                    text,
-                    images,
-                    mentions,
-                    commits,
-                    draft,
-                },
-            );
-            return vec![];
-        }
-        let Some(tx) = self.subagent_steers.get(task_id) else {
-            self.subagent_input_box.set_draft(draft);
-            return vec![];
-        };
         let input = AgentInput {
             message: text.clone(),
             mode: AgentMode::Build,
@@ -4249,12 +4273,54 @@ impl App {
             prompt: None,
             resume: false,
         };
-        let id = tx.push(input);
-        self.pending_subagent_steers
+        let pending = self
+            .pending_subagent_steers
             .entry(task_id.to_owned())
-            .or_default()
-            .push_back(PendingSteer { id, text, draft });
+            .or_default();
+        if admission != PromptAdmission::Interrupt {
+            let id = tx.push(input);
+            pending.push_back(PendingSteer { id, text, draft });
+            return vec![];
+        }
+        let replacement = tx.replace(input);
+        pending.push_back(PendingSteer {
+            id: replacement.id,
+            text,
+            draft,
+        });
+        self.adopt_task_replacement(task_id, replacement.id, replacement.superseded);
         vec![]
+    }
+
+    /// Records `id` as the task's replacement, which leads its queue the way
+    /// Replacing leads the panel, so moving guidance never crosses it.
+    pub(super) fn adopt_task_replacement(
+        &mut self,
+        task_id: &str,
+        id: QueueItemId,
+        superseded: Option<QueueItemId>,
+    ) {
+        if let Some(pending) = self.pending_subagent_steers.get_mut(task_id) {
+            pending.retain(|item| Some(item.id) != superseded);
+            if let Some(item) = pending
+                .iter()
+                .position(|item| item.id == id)
+                .and_then(|index| pending.remove(index))
+            {
+                pending.push_front(item);
+            }
+        }
+        self.subagent_replacements.insert(task_id.to_owned(), id);
+        self.release_task_interactions(task_id);
+    }
+
+    /// A replaced turn takes its open question and auth wait with it, as a
+    /// cancelled task does, though the task itself keeps running.
+    pub(super) fn release_task_interactions(&mut self, task_id: &str) {
+        self.clear_auth_waiter(Some(task_id));
+        if self.question_subagent.as_deref() == Some(task_id) {
+            self.close_blocking_question();
+        }
     }
 
     fn intercept_inspection_submission(&mut self, text: &str) -> bool {
@@ -4527,6 +4593,7 @@ impl App {
     }
 
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
+        self.subagent_replacements.remove(task_id);
         let remaining = self
             .subagent_steers
             .remove(task_id)
@@ -4804,6 +4871,7 @@ impl App {
         self.preserve_all_unconsumed_steers();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
+        self.subagent_replacements.clear();
         self.shell.cancel_all();
         for chat in &mut self.chats {
             chat.flush();
@@ -5777,6 +5845,13 @@ impl App {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(id, display, images);
             } else if let Some(task_id) = subagent_id {
+                if self.subagent_replacements.get(&task_id) == Some(&id) {
+                    self.subagent_replacements.remove(&task_id);
+                    let chat = &mut self.chats[chat_idx];
+                    chat.flush();
+                    chat.cancel_in_progress();
+                    chat.push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
+                }
                 self.chats[chat_idx].show_user_prompt(display, images);
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
                     pending.retain(|queued| queued.id != id);
@@ -6247,6 +6322,7 @@ impl App {
                 }
             },
             "/rename" => self.rename_session(&cmd.args),
+            "/fork" => self.fork_latest(),
             "/model" => {
                 self.model_picker.open(
                     &self.state.model,
@@ -6472,7 +6548,14 @@ impl App {
                 text: text.clone(),
                 paste_ranges: Vec::new(),
             };
-            return self.steer_task(&task_id, text, Vec::new(), mentions, commits, draft);
+            let sub = Submission {
+                text,
+                images: Vec::new(),
+                mentions,
+                commits,
+                draft,
+            };
+            return self.send_to_task(&task_id, sub, PromptAdmission::Steer);
         }
         self.submit_or_queue(QueuedMessage {
             text,

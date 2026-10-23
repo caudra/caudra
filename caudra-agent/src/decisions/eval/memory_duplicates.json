@@ -1,7 +1,7 @@
 {
   "k": 3,
   "baseline": {"ndcg_at_k": 1.0, "recall_at_k": 1.0, "false_advice_rate": 0.0, "p50_ms": 340, "p95_ms": 480},
-  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model systemone-decision-v7. The word-prefilter order that the feature falls back to scored nDCG@k 0.530 and recall@k 0.900 on the same cases.",
+  "baseline_note": "Synthetic, hand-labelled cases. Measured 2026-10-12 with protocol openai, endpoint http://127.0.0.1:8080/v1 (local ninfer), model decision-1. The word-prefilter order that the feature falls back to scored nDCG@k 0.530 and recall@k 0.900 on the same cases.",
   "cases": [
     {
       "query": "port-conflicts.md\n# Port conflicts in tests\nIntegration tests fail when two of them bind 8080; run them with --test-threads=1.",

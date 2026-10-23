@@ -47,6 +47,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/automations` | Inspect, trust, and pause automations (arm NAME [{json}] \| disarm NAME) | Main only | `automations` |
 | `/sessions` | Browse and switch sessions |  |  |
 | `/rename` | Rename the current session |  |  |
+| `/fork` | Fork the session into a new one at its latest message | Main only |  |
 | `/model` | Switch chat model or assign job models | Main only |  |
 | `/favorite-next` | Switch to the next favorite model | Main only |  |
 | `/accounts` | Choose which account of the model's provider requests go to | Main only |  |
@@ -101,7 +102,7 @@ See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assi
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session opens a new one in its place.
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session, and `/fork` copies it into a new one, the same as [**Fork here**](/docs/sessions/#message-actions) on its latest message. In the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session opens a new one in its place.
 
 ## Stash
 

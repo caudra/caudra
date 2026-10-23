@@ -805,7 +805,11 @@ impl App {
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
                     self.chord_hint_down = None;
-                    return self.handle_deferred_admission(pressed.admission);
+                    return if self.active_task_is_steerable() {
+                        self.handle_task_admission(pressed.admission)
+                    } else {
+                        self.handle_deferred_admission(pressed.admission)
+                    };
                 }
                 if !self.has_modal_overlay()
                     && let Some(pressed) = self.chord_hint_down.take()
@@ -947,7 +951,13 @@ impl App {
                             // The press already armed this window, and that is
                             // the whole of what it does: the card's own control
                             // is its header, above the window.
-                            if self.chats[self.active_chat].armed_card_at(event.column, event.row) {
+                            if self.chats[self.active_chat].armed_card_at(event.column, event.row)
+                                || self.chats[self.active_chat].toggle_decisions_at(
+                                    event.column,
+                                    event.row,
+                                    area,
+                                )
+                            {
                                 return Vec::new();
                             }
                             self.chats[self.active_chat].handle_click(event.row, area);

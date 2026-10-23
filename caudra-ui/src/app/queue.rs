@@ -18,6 +18,7 @@ use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::chat::format_with_images;
 use crate::components::input::{InputAction, InputState, Submission};
 use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
+use crate::components::queue_actions::QueueLanes;
 use crate::components::queue_panel::{QueueEntry, set_movement_flags};
 use crate::input_document::InputDraft;
 use crate::theme;
@@ -314,6 +315,7 @@ impl App {
         let Some(task_id) = self.active_subagent_id() else {
             return Vec::new();
         };
+        let replacement = self.subagent_replacements.get(task_id).copied();
         let mut pending = self
             .pending_subagent_steers
             .get(task_id)
@@ -323,11 +325,15 @@ impl App {
                 id: item.id,
                 text: Cow::Owned(item.text.clone()),
                 color: theme::current().foreground,
-                editable: true,
+                editable: replacement != Some(item.id),
                 movable: false,
                 can_move_up: false,
                 can_move_down: false,
-                admission: Some(PromptAdmission::Steer),
+                admission: Some(if replacement == Some(item.id) {
+                    PromptAdmission::Interrupt
+                } else {
+                    PromptAdmission::Steer
+                }),
             })
             .collect::<Vec<_>>();
         if self.subagent_steers.contains_key(task_id) {
@@ -607,6 +613,9 @@ impl App {
                 {
                     return false;
                 }
+                if self.subagent_replacements.get(&task_id) == Some(&id) {
+                    self.subagent_replacements.remove(&task_id);
+                }
                 remove_pending(&mut self.pending_subagent_steers, &task_id, id)
             } else {
                 remove_pending(&mut self.unsent_subagent_steers, &task_id, id)
@@ -682,9 +691,21 @@ impl App {
         let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
             return;
         };
-        let main_queue = self.is_main_chat();
+        let lanes = if self.is_main_chat() {
+            QueueLanes::Main
+        } else if self.active_task_is_steerable() && self.is_task_pending(id) {
+            QueueLanes::Task
+        } else {
+            QueueLanes::None
+        };
         self.select_active_queue_item(id);
-        self.queue_actions.open(entry, main_queue);
+        self.queue_actions.open(entry, lanes);
+    }
+
+    fn is_task_pending(&self, id: QueueItemId) -> bool {
+        self.active_subagent_id()
+            .and_then(|task_id| self.pending_subagent_steers.get(task_id))
+            .is_some_and(|items| items.iter().any(|item| item.id == id))
     }
 
     pub(super) fn replace_with_focused_queue_item(&mut self) -> Vec<Action> {
@@ -698,7 +719,11 @@ impl App {
     /// replacement path, so it cancels the running turn exactly the way a
     /// freshly typed replacement does. A refusal puts it back where it was.
     pub(super) fn replace_with_queued_item(&mut self, id: QueueItemId) -> Vec<Action> {
-        if !self.is_main_chat() || !self.is_lane_changeable(id) {
+        if !self.is_main_chat() {
+            self.replace_task_turn_with(id);
+            return Vec::new();
+        }
+        if !self.is_lane_changeable(id) {
             return Vec::new();
         }
         if self
@@ -751,6 +776,27 @@ impl App {
         }
         let outcome = self.submit_prepared(submission, PromptAdmission::Interrupt);
         self.handle_submit_outcome(outcome)
+    }
+
+    /// Turns a running task's waiting guidance into its replacement, which
+    /// stops the turn it is in and runs next.
+    fn replace_task_turn_with(&mut self, id: QueueItemId) {
+        let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
+            return;
+        };
+        if !self.is_task_pending(id) || self.subagent_replacements.get(&task_id) == Some(&id) {
+            return;
+        }
+        let Some(superseded) = self
+            .subagent_steers
+            .get(&task_id)
+            .and_then(|queue| queue.promote(id))
+        else {
+            self.flash(ALREADY_SENT_ERR.into());
+            return;
+        };
+        self.adopt_task_replacement(&task_id, id, superseded);
+        self.select_active_queue_item(id);
     }
 
     pub(super) fn pop_active_queue(&mut self) {

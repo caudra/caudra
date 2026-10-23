@@ -6,9 +6,11 @@
 //! painted line keeps the byte ranges `caudra-markdown` reported, and copy
 //! slices the original text.
 
+use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
 
+use caudra_markdown::Source;
 use caudra_markdown::render::{self, SpanSource};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
@@ -83,6 +85,43 @@ impl Provenance {
 
     pub fn push_chrome_line(&mut self, span_count: usize) {
         self.lines.push(LineProvenance::chrome(span_count));
+    }
+
+    /// Marks `span_count` spans drawn at the end of line `index` as chrome.
+    pub fn append_chrome_spans(&mut self, index: usize, span_count: usize) {
+        if let Some(line) = self.lines.get_mut(index) {
+            line.spans
+                .extend(iter::repeat_n(SpanSource::Chrome, span_count));
+        }
+    }
+
+    /// Appends `text` to the source behind `lines`, which draw one line of it
+    /// each: the span spelling a line's text copies as that text, and every
+    /// other span is chrome.
+    pub fn push_verbatim_lines(&mut self, lines: &[Line<'_>], text: &str) {
+        let mut source = format!("{}\n", self.source);
+        for (line, row) in lines.iter().zip(text.split('\n')) {
+            let start = source.len() as u32;
+            source.push_str(row);
+            source.push('\n');
+            let range = start..start + row.len() as u32;
+            let spans = line
+                .spans
+                .iter()
+                .map(|span| match span.content == row {
+                    true => SpanSource::Range(Source {
+                        range: range.clone(),
+                        verbatim: true,
+                    }),
+                    false => SpanSource::Chrome,
+                })
+                .collect();
+            self.lines.push(LineProvenance {
+                line: Some(range),
+                spans,
+            });
+        }
+        self.source = source.into();
     }
 
     pub fn source(&self) -> &Arc<str> {

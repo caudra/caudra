@@ -261,14 +261,14 @@ mod tests {
     const NOT_PROBED: &str = "not_probed";
     const TUNNEL_BASE_URL: &str = "http://100.64.0.2:8080/v1";
     const TUNNEL_HOST: &str = "100.64.0.2:8080";
-    const TUNNEL_MODEL: &str = "systemone-decision-v7";
+    const TUNNEL_MODEL: &str = "decision-1";
     const STORED_KEY: &str = "stored-decision-key";
     const UNSET_VARIABLE: &str = "TEST_CAUDRA_DECISION_LIST_UNSET_KEY";
     const EXPECTED_LIST: &str = "\
-NAME      PROTOCOL  MODEL                  HOST             KEY    ACTIVE
-openai    openai    gpt-6-luna             api.openai.com   none
-tunnel    openai    systemone-decision-v7  100.64.0.2:8080  saved  active
-typesafe  typesafe  jev-latest             (invalid)        none
+NAME      PROTOCOL  MODEL       HOST             KEY    ACTIVE
+openai    openai    gpt-6-luna  api.openai.com   none
+tunnel    openai    decision-1  100.64.0.2:8080  saved  active
+typesafe  typesafe  jev-latest  (invalid)        none
 ";
 
     fn providers() -> ProvidersConfig {

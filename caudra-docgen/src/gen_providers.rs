@@ -412,18 +412,18 @@ api_key_env = "OPENAI_API_KEY"
 {decision_fields}
 `protocol = "typesafe"` appends `/v1/systemone` to a root base URL. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. `protocol = "openai"` appends `/decisions` to a versioned base URL, such as `https://api.openai.com/v1` for the hosted OpenAI Decisions API. Leave the appended path out of `base_url`, because a full endpoint is rejected.
 
-Configuring an endpoint is the consent to send decision context to it, so HTTPS needs no other opt-in. Plain HTTP to numeric loopback, such as `127.0.0.1` or `[::1]`, needs nothing either. Plain HTTP to any other host needs `allow_http = true`, which sends decision context and the key without TLS. Use it only with transport protection you control, such as a trusted encrypted tunnel. `localhost` is a DNS name for this rule, and private and CGNAT addresses get no exemption. For a local ninfer server, or one behind a tunnel, use the OpenAI protocol with the model name the server actually serves. `systemone-decision-v7` is not a Luna alias:
+Configuring an endpoint is the consent to send decision context to it, so HTTPS needs no other opt-in. Plain HTTP to numeric loopback, such as `127.0.0.1` or `[::1]`, needs nothing either. Plain HTTP to any other host needs `allow_http = true`, which sends decision context and the key without TLS. Use it only with transport protection you control, such as a trusted encrypted tunnel. `localhost` is a DNS name for this rule, and private and CGNAT addresses get no exemption. For a local ninfer server, or one behind a tunnel, use the OpenAI protocol with the model name the server actually serves. `decision-1` is not a Luna alias:
 
 ```toml
 [decisions.local]
 protocol = "openai"
 base_url = "http://127.0.0.1:8080/v1"
-model = "systemone-decision-v7"
+model = "decision-1"
 
 [decisions.tunnel]
 protocol = "openai"
 base_url = "http://100.64.0.2:8080/v1"
-model = "systemone-decision-v7"
+model = "decision-1"
 allow_http = true
 ```
 

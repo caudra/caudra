@@ -1197,7 +1197,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             workdir,
         ));
         if let Some(decisions) = limits.decisions.get(&index) {
-            spans.extend(card_decisions::chip_spans(decisions));
+            spans.extend(card_decisions::chip_spans(decisions).spans);
         }
         if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
             let clock = match entry.status {

@@ -138,6 +138,7 @@ impl App {
                         &lines,
                         reminders,
                         restored.rows,
+                        restored.turns,
                     );
                     attach_card_decisions(&mut messages, restored.cards);
                     Ok(ArchivedChat {

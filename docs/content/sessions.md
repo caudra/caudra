@@ -192,6 +192,8 @@ In the main chat, the menu offers:
 
 **Revert both** and **Revert files** appear only when a [file revert](#file-revert) can run from that message. Otherwise the menu title says why. Revert and unrevert require every live session in the workspace to be idle. Active shell commands and subagents also block them. Forking never starts a model request.
 
+`/fork` forks without the menu. When the session is idle, it forks at the latest message, so the child gets the whole conversation. While a turn is running, it forks at the prompt that started the turn: the child stops before that prompt and gets it in its composer, and the running turn carries on in the parent. A prompt you send to steer the turn counts as a new prompt, so the fork stops before it. With no message to fork at, `/fork` says `Nothing to fork yet`.
+
 A message from the turn that is still running shows its details now, and the actions once the turn is saved. A subagent's transcript has the same `⋮` on its messages, with the details and no actions, because fork and revert work from the main chat.
 
 ## Fork boundaries

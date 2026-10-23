@@ -10,7 +10,7 @@ use std::time::Duration;
 use crossterm::event::MouseEvent;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::card_decisions::{CardDecision, DecisionState};
+use crate::components::card_decisions::{CardDecision, DecisionState, DecisionSubject};
 use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::{MessageActionTarget, MessageDetails, MessagesPanel};
 use crate::components::prompt_progress::PromptProgress;
@@ -387,22 +387,18 @@ impl Chat {
             | AgentEvent::MessageStarted { .. }
             | AgentEvent::SubagentFinished { .. }
             | AgentEvent::Autopilot(_) => {}
-            AgentEvent::Decision(note) => {
-                if self.show_decisions {
-                    self.place_decision(*note);
-                }
-            }
+            AgentEvent::Decision(note) => match self.show_decisions {
+                true => self.place_decision(*note),
+                false => self
+                    .messages_panel
+                    .settle_decision(&(&note.anchor).into(), &note.feature),
+            },
             AgentEvent::DecisionPending(pending) => {
                 if self.show_decisions {
                     self.wait_on_decision(*pending);
                 }
             }
-            AgentEvent::DecisionSettled(pending) => {
-                if let NoteAnchor::Tool(call_id) = &pending.anchor {
-                    self.messages_panel
-                        .settle_decision(call_id, &pending.feature);
-                }
-            }
+            AgentEvent::DecisionSettled(pending) => self.end_decision_wait(*pending),
             AgentEvent::StreamReset
             | AgentEvent::AccountRouted { .. }
             | AgentEvent::AccountExhausted(_)
@@ -559,39 +555,66 @@ impl Chat {
         self.messages_panel.push(plan_message(plan));
     }
 
-    /// A call's decision goes on the call's card, settling the wait it
-    /// answers. Anything else, including a call whose card this chat does not
-    /// hold, is a row that follows the transcript.
+    /// A decision goes on the row it belongs to, settling the wait it
+    /// answers: a call's on the call's card, a turn's on the row the
+    /// transcript ended on when it was asked. With no such row, as for a call
+    /// whose card this chat does not hold, it is a row of its own that
+    /// follows the transcript.
     fn place_decision(&mut self, note: DecisionNote) {
-        if let NoteAnchor::Tool(id) = &note.anchor
-            && self.messages_panel.attach_decision(CardDecision::settled(
-                id.clone(),
-                note.feature.clone(),
-                note.outcome,
-                &note.summary,
-                &note.details,
-            ))
-        {
+        let subject = DecisionSubject::from(&note.anchor);
+        if subject == DecisionSubject::Turn {
+            self.messages_panel.flush();
+        }
+        if self.messages_panel.attach_decision(CardDecision::settled(
+            subject,
+            note.feature.clone(),
+            note.outcome,
+            &note.summary,
+            &note.details,
+        )) {
             return;
         }
         self.messages_panel.flush();
         self.messages_panel.push(DisplayMessage::decision(
             note.feature.label(),
             note.outcome,
+            None,
             &note.summary,
             &note.details,
         ));
     }
 
-    /// A wait shows on the card of the call it is about, and nowhere else.
+    /// A wait shows as a chip on the row its answer will go on, and nowhere
+    /// when there is no such row.
     fn wait_on_decision(&mut self, pending: PendingDecision) {
-        if let NoteAnchor::Tool(call_id) = pending.anchor {
-            self.messages_panel.attach_decision(CardDecision {
-                call_id,
-                feature: pending.feature,
-                state: DecisionState::Pending,
-            });
+        let subject = DecisionSubject::from(&pending.anchor);
+        if subject == DecisionSubject::Turn {
+            self.messages_panel.flush();
         }
+        self.messages_panel
+            .attach_decision(CardDecision::pending(subject, pending.feature));
+    }
+
+    /// The engine answered with nothing to do. A call's wait goes off its
+    /// card; a turn's stays on its row as a quiet chip that keeps what came
+    /// closest, or, when the feature had nothing to ask, why.
+    fn end_decision_wait(&mut self, pending: PendingDecision) {
+        match pending.anchor {
+            NoteAnchor::Tool(call_id) => self
+                .messages_panel
+                .settle_decision(&DecisionSubject::Call(call_id), &pending.feature),
+            NoteAnchor::History(_) => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .quiet_decision(&pending.feature, &pending.details);
+            }
+        }
+    }
+
+    /// Opens or closes the details of the decisions whose chips are under the
+    /// pointer, on a text row.
+    pub fn toggle_decisions_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        self.messages_panel.toggle_decisions_at(column, row, area)
     }
 
     /// Offers the wheel to an armed scroll card under the pointer first,
@@ -1247,22 +1270,24 @@ pub fn history_to_display(
         tool_output_lines,
         show_reminders,
         Vec::new(),
+        Vec::new(),
     )
 }
 
-/// Stored decisions split the way a live chat draws them: rows for
-/// [`interleaved_history_to_display`] to place, and the decisions that go on
-/// a call's card.
+/// Stored decisions split the way a live chat draws them: rows and turns'
+/// decisions for [`interleaved_history_to_display`] to place, and the
+/// decisions that go on a call's card.
 pub(crate) struct RestoredDecisions {
     pub(crate) rows: Vec<(usize, DisplayMessage)>,
+    pub(crate) turns: Vec<(usize, CardDecision)>,
     pub(crate) cards: Vec<CardDecision>,
 }
 
-/// A turn's row goes before the item it was made at. A call's decision goes
-/// on the call's card; one whose feature this build does not know cannot say
-/// what its chip is, so it keeps a row right after the item that made the
-/// call, titled by its stored name. A decision whose call `items` no longer
-/// holds is dropped.
+/// A turn's decision goes on the row drawn last before the item it was made
+/// at. A call's goes on the call's card. One whose feature this build does
+/// not know cannot say what its chip is, so it keeps a row, a turn's before
+/// that item and a call's right after the item that made the call, titled by
+/// its stored name. A decision whose call `items` no longer holds is dropped.
 pub(crate) fn decision_inserts<'a>(
     items: &[HistoryItem],
     stored: impl IntoIterator<Item = &'a StoredEngineDecision>,
@@ -1275,23 +1300,34 @@ pub(crate) fn decision_inserts<'a>(
     }
     let mut restored = RestoredDecisions {
         rows: Vec::new(),
+        turns: Vec::new(),
         cards: Vec::new(),
     };
     for row in stored {
         let feature = DecisionFeature::from_name(&row.feature);
+        let settled = |subject, feature| {
+            CardDecision::settled(
+                subject,
+                feature,
+                row.outcome.into(),
+                &row.summary,
+                &row.details,
+            )
+        };
         match (&row.anchor, feature) {
-            (StoredDecisionAnchor::History(len), _) => {
+            (StoredDecisionAnchor::History(len), Some(feature)) => {
+                restored
+                    .turns
+                    .push((*len, settled(DecisionSubject::Turn, feature)));
+            }
+            (StoredDecisionAnchor::History(len), None) => {
                 restored.rows.push((*len, stored_decision_row(row)));
             }
             (StoredDecisionAnchor::Tool(id), Some(feature)) => {
                 if after_call(&after_calls, id).is_some() {
-                    restored.cards.push(CardDecision::settled(
-                        id.clone(),
-                        feature,
-                        row.outcome.into(),
-                        &row.summary,
-                        &row.details,
-                    ));
+                    restored
+                        .cards
+                        .push(settled(DecisionSubject::Call(id.clone()), feature));
                 }
             }
             (StoredDecisionAnchor::Tool(id), None) => {
@@ -1308,7 +1344,10 @@ pub(crate) fn decision_inserts<'a>(
 /// child's on its batch's card.
 pub(crate) fn attach_card_decisions(display: &mut [DisplayMessage], cards: Vec<CardDecision>) {
     for decision in cards {
-        let mut call_id = decision.call_id.as_str();
+        let DecisionSubject::Call(call_id) = &decision.subject else {
+            continue;
+        };
+        let mut call_id = call_id.as_str();
         let card = loop {
             if let Some(card) = display
                 .iter()
@@ -1341,22 +1380,32 @@ fn after_call(after_calls: &HashMap<&str, usize>, mut call_id: &str) -> Option<u
 fn stored_decision_row(row: &StoredEngineDecision) -> DisplayMessage {
     let feature = DecisionFeature::from_name(&row.feature)
         .map_or(row.feature.as_str(), |feature| feature.label());
-    DisplayMessage::decision(feature, row.outcome.into(), &row.summary, &row.details)
+    DisplayMessage::decision(
+        feature,
+        row.outcome.into(),
+        None,
+        &row.summary,
+        &row.details,
+    )
 }
 
 /// [`history_to_display`] with rows kept outside the history, each placed
 /// after the first `n` items where `n` is the position it comes with. Rows
 /// sharing a position keep their order, and a position past the end lands
-/// after everything.
+/// after everything. Each of a turn's `decisions` goes on the last row that
+/// can carry it once its position is reached, after the rows placed there.
 pub fn interleaved_history_to_display(
     items: &[HistoryItem],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
     show_reminders: bool,
     mut inserts: Vec<(usize, DisplayMessage)>,
+    mut decisions: Vec<(usize, CardDecision)>,
 ) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
     inserts.sort_by_key(|(position, _)| *position);
     let mut inserts = inserts.into_iter().peekable();
+    decisions.sort_by_key(|(position, _)| *position);
+    let mut decisions = decisions.into_iter().peekable();
     let results = build_tool_results_map(items);
     let mut group_images: HashMap<CaudraId, Vec<ImageSource>> = HashMap::new();
     for item in items {
@@ -1376,6 +1425,9 @@ pub fn interleaved_history_to_display(
     for (index, item) in items.iter().enumerate() {
         while let Some((_, row)) = inserts.next_if(|(position, _)| *position <= index) {
             display.push(row);
+        }
+        while let Some((_, decision)) = decisions.next_if(|(position, _)| *position <= index) {
+            host_turn_decision(&mut display, decision);
         }
         let first_row = display.len();
         match &item.kind {
@@ -1616,7 +1668,30 @@ pub fn interleaved_history_to_display(
         }
     }
     display.extend(inserts.map(|(_, row)| row));
+    for (_, decision) in decisions {
+        host_turn_decision(&mut display, decision);
+    }
     (display, restore_items)
+}
+
+/// Puts a restored turn's `decision` on the last row that can carry it, or,
+/// in a transcript with none, on a row of its own.
+fn host_turn_decision(display: &mut Vec<DisplayMessage>, decision: CardDecision) {
+    if let Some(host) = display.iter().rposition(|row| row.role.hosts_decisions()) {
+        display[host].decisions.push(decision);
+        return;
+    }
+    if let DecisionState::Settled {
+        outcome,
+        text,
+        took,
+    } = decision.state
+    {
+        display.push(DisplayMessage::new(
+            DisplayRole::Decision(outcome, took),
+            text,
+        ));
+    }
 }
 
 /// A compaction copy is new, but it stands for something said when its
@@ -1860,6 +1935,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
 
+    use crate::animation::test_clock::FrozenClock;
+    use crate::components::card_decisions::DecisionState;
     use crate::components::{DECISION_SEPARATOR, SHADOW_MARKER};
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -4070,6 +4147,7 @@ mod tests {
             &ToolOutputLines::default(),
             false,
             rows,
+            Vec::new(),
         );
 
         let shown: Vec<(&DisplayRole, &str)> = display
@@ -4125,10 +4203,22 @@ mod tests {
     const UNKNOWN_CALL_ROW: &str = "ranked in a call that is gone";
     const COMPACTION_SUMMARY: &str = "## Objective";
     const PENDING_STATE: &str = "pending";
+    const QUIET_STATE: &str = "quiet";
+    const TURN_SUBJECT: &str = "turn";
+    const NEAR_MISS: &str = "0.41  release-notes";
+    const TURN_WAIT: Duration = Duration::from_millis(1_234);
 
     fn decision(outcome: NoteOutcome, anchor: NoteAnchor) -> AgentEvent {
+        turn_decision(DecisionFeature::MemorySearch, outcome, anchor)
+    }
+
+    fn turn_decision(
+        feature: DecisionFeature,
+        outcome: NoteOutcome,
+        anchor: NoteAnchor,
+    ) -> AgentEvent {
         DecisionNote::new(
-            DecisionFeature::MemorySearch,
+            feature,
             FeatureMode::Advise,
             outcome,
             DECISION_SUMMARY,
@@ -4139,44 +4229,76 @@ mod tests {
     }
 
     fn pending(anchor: NoteAnchor) -> AgentEvent {
+        pending_on(DecisionFeature::MemorySearch, anchor)
+    }
+
+    fn pending_on(feature: DecisionFeature, anchor: NoteAnchor) -> AgentEvent {
         AgentEvent::DecisionPending(Box::new(PendingDecision {
-            feature: DecisionFeature::MemorySearch,
+            feature,
             anchor,
+            details: Vec::new(),
         }))
     }
 
     fn settled(anchor: NoteAnchor) -> AgentEvent {
+        settled_on(DecisionFeature::MemorySearch, anchor, Vec::new())
+    }
+
+    fn settled_on(
+        feature: DecisionFeature,
+        anchor: NoteAnchor,
+        details: Vec<String>,
+    ) -> AgentEvent {
         AgentEvent::DecisionSettled(Box::new(PendingDecision {
-            feature: DecisionFeature::MemorySearch,
+            feature,
             anchor,
+            details,
         }))
     }
 
-    /// `t1` followed by `t1=acted` for each decision on the card.
-    fn card_label(id: &str, decisions: &[CardDecision]) -> String {
-        let mut label = id.to_owned();
+    /// `base` followed by `t1=acted` for each decision on the row, a turn's
+    /// as `turn=acted`.
+    fn decided_label(base: &str, decisions: &[CardDecision]) -> String {
+        let mut label = base.to_owned();
         for decision in decisions {
             let state = match &decision.state {
-                DecisionState::Pending => PENDING_STATE,
+                DecisionState::Pending { .. } => PENDING_STATE,
                 DecisionState::Settled { outcome, .. } => outcome.as_str(),
+                DecisionState::Quiet { .. } => QUIET_STATE,
             };
-            label.push_str(&format!(" {}={state}", decision.call_id));
+            let subject = match &decision.subject {
+                DecisionSubject::Call(call_id) => call_id.as_str(),
+                DecisionSubject::Turn => TURN_SUBJECT,
+            };
+            label.push_str(&format!(" {subject}={state}"));
         }
         label
     }
 
-    /// Each message as a reader tells it apart: a card by its call and the
-    /// decisions on it, a decision row by its outcome, anything else by its
-    /// text.
+    /// Each message as a reader tells it apart: a card by its call, a
+    /// decision row by its outcome, anything else by its text, each followed
+    /// by the decisions on it.
     fn live_placement(chat: &Chat) -> Vec<String> {
         (0..chat.message_count())
             .filter_map(|index| chat.message_at(index))
-            .map(|message| match &message.role {
-                DisplayRole::Tool(tool) => card_label(&tool.id, &message.decisions),
-                DisplayRole::Decision(outcome) => outcome.as_str().to_owned(),
-                _ => message.text.clone(),
+            .map(|message| {
+                let base = match &message.role {
+                    DisplayRole::Tool(tool) => tool.id.as_str(),
+                    DisplayRole::Decision(outcome, _) => outcome.as_str(),
+                    _ => message.text.as_str(),
+                };
+                decided_label(base, &message.decisions)
             })
             .collect()
+    }
+
+    fn turn_label(base: &str, state: &str) -> String {
+        format!("{base} {TURN_SUBJECT}={state}")
+    }
+
+    fn prompt(chat: &mut Chat) {
+        chat.messages_panel
+            .push(DisplayMessage::new(DisplayRole::User, USER_TEXT.into()));
     }
 
     /// Two calls run side by side, so a later card is already drawn when the
@@ -4228,18 +4350,63 @@ mod tests {
         );
     }
 
-    #[test_case(NoteAnchor::History(0) ; "a_turns_row")]
-    #[test_case(NoteAnchor::Tool(UNKNOWN_CALL.into()) ; "a_row_for_a_card_this_chat_lacks")]
-    fn a_decision_without_a_card_is_a_row_that_follows_the_transcript(anchor: NoteAnchor) {
+    #[test]
+    fn a_decision_for_a_card_this_chat_lacks_is_a_row_that_follows_the_transcript() {
         let mut chat = chat();
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
         chat.handle_event(tool_start(SECOND_CALL, SHELL_TOOL_NAME), None);
 
-        chat.handle_event(decision(NoteOutcome::Acted, anchor), None);
+        chat.handle_event(
+            decision(NoteOutcome::Acted, NoteAnchor::Tool(UNKNOWN_CALL.into())),
+            None,
+        );
 
         assert_eq!(
             live_placement(&chat),
             [FIRST_CALL, SECOND_CALL, NoteOutcome::Acted.as_str()]
+        );
+    }
+
+    /// A turn's decision goes on the row the transcript ends on, a card's
+    /// header as readily as a prompt, past reasoning and decision rows that
+    /// cannot carry one.
+    #[test]
+    fn a_turns_decision_lands_on_the_last_row_that_can_carry_it() {
+        let mut chat = chat();
+        prompt(&mut chat);
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        chat.handle_event(
+            decision(NoteOutcome::Shadow, NoteAnchor::Tool(UNKNOWN_CALL.into())),
+            None,
+        );
+        chat.messages_panel.push(DisplayMessage::new(
+            DisplayRole::Thinking,
+            REPLY_TEXT.into(),
+        ));
+
+        chat.handle_event(decision(NoteOutcome::Acted, NoteAnchor::History(0)), None);
+
+        assert_eq!(
+            live_placement(&chat),
+            [
+                USER_TEXT.to_owned(),
+                turn_label(FIRST_CALL, NoteOutcome::Acted.as_str()),
+                NoteOutcome::Shadow.as_str().to_owned(),
+                REPLY_TEXT.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turns_decision_with_no_row_to_carry_it_is_an_untimed_row() {
+        let mut chat = chat();
+
+        chat.handle_event(decision(NoteOutcome::Acted, NoteAnchor::History(0)), None);
+
+        let row = chat.message_at(0).unwrap();
+        assert_eq!(
+            (&row.role, row.decisions.is_empty()),
+            (&DisplayRole::Decision(NoteOutcome::Acted, None), true)
         );
     }
 
@@ -4263,18 +4430,198 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_without_a_card_draws_nothing() {
+    fn a_calls_wait_without_its_card_draws_nothing() {
         let mut chat = chat();
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
 
-        for anchor in [
-            NoteAnchor::History(0),
-            NoteAnchor::Tool(UNKNOWN_CALL.into()),
-        ] {
-            chat.handle_event(pending(anchor), None);
-        }
+        chat.handle_event(pending(NoteAnchor::Tool(UNKNOWN_CALL.into())), None);
 
         assert_eq!(live_placement(&chat), [FIRST_CALL]);
+    }
+
+    /// A turn's wait is a chip on the row it was asked about until the
+    /// engine answers, however many rows follow: a note takes its place and a
+    /// quiet answer leaves a quiet chip.
+    #[test_case(None, PENDING_STATE ; "until_then_it_waits")]
+    #[test_case(Some(decision(NoteOutcome::Acted, NoteAnchor::History(0))), NoteOutcome::Acted.as_str() ; "a_note_takes_its_place")]
+    #[test_case(Some(settled(NoteAnchor::History(0))), QUIET_STATE ; "a_quiet_answer_keeps_a_quiet_chip")]
+    fn a_turns_wait_is_a_chip_on_its_host_until_the_engine_answers(
+        answer: Option<AgentEvent>,
+        state: &str,
+    ) {
+        let mut chat = chat();
+        prompt(&mut chat);
+        chat.handle_event(pending(NoteAnchor::History(0)), None);
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+
+        if let Some(answer) = answer {
+            chat.handle_event(answer, None);
+        }
+
+        assert_eq!(
+            live_placement(&chat),
+            [turn_label(USER_TEXT, state), FIRST_CALL.to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_turns_note_is_timed_by_the_wait_it_replaces() {
+        let _clock = FrozenClock::at(TURN_WAIT);
+        let mut chat = chat();
+        prompt(&mut chat);
+        chat.handle_event(pending(NoteAnchor::History(0)), None);
+
+        chat.handle_event(decision(NoteOutcome::Acted, NoteAnchor::History(0)), None);
+
+        let host = chat.message_at(0).unwrap();
+        assert!(matches!(
+            host.decisions.as_slice(),
+            [CardDecision {
+                state: DecisionState::Settled {
+                    took: Some(TURN_WAIT),
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_quiet_answer_keeps_how_long_it_took_and_what_came_closest() {
+        let _clock = FrozenClock::at(TURN_WAIT);
+        let mut chat = chat();
+        prompt(&mut chat);
+        chat.handle_event(pending(NoteAnchor::History(0)), None);
+
+        chat.handle_event(
+            settled_on(
+                DecisionFeature::MemorySearch,
+                NoteAnchor::History(0),
+                vec![NEAR_MISS.into()],
+            ),
+            None,
+        );
+
+        let host = chat.message_at(0).unwrap();
+        let [
+            CardDecision {
+                state: DecisionState::Quiet { text, took },
+                ..
+            },
+        ] = host.decisions.as_slice()
+        else {
+            panic!("{:?}", host.decisions);
+        };
+        assert_eq!(
+            (text.lines().skip(1).collect::<Vec<_>>(), *took),
+            (vec![NEAR_MISS], Some(TURN_WAIT))
+        );
+    }
+
+    /// The reminders a first turn carries come after its prompt, and the chip
+    /// still goes on the prompt.
+    #[test]
+    fn a_turn_with_nothing_to_ask_leaves_an_untimed_quiet_chip_saying_why() {
+        let mut chat = chat();
+        prompt(&mut chat);
+        chat.messages_panel
+            .push(DisplayMessage::injected(INJECTED_TEXT.into(), None));
+
+        chat.handle_event(
+            settled_on(
+                DecisionFeature::MemoryRecall,
+                NoteAnchor::History(0),
+                vec![NEAR_MISS.into()],
+            ),
+            None,
+        );
+
+        let host = chat.message_at(0).unwrap();
+        let [
+            CardDecision {
+                state: DecisionState::Quiet { text, took: None },
+                ..
+            },
+        ] = host.decisions.as_slice()
+        else {
+            panic!("{:?}", host.decisions);
+        };
+        assert_eq!(text.lines().skip(1).collect::<Vec<_>>(), [NEAR_MISS]);
+    }
+
+    /// Recall and skill matching ask the engine side by side, so each answer
+    /// settles the wait of its own feature, whichever comes first, on the row
+    /// both were asked about.
+    #[test]
+    fn concurrent_turn_waits_are_matched_by_feature() {
+        let mut chat = chat();
+        prompt(&mut chat);
+        for feature in [
+            DecisionFeature::MemoryRecall,
+            DecisionFeature::SkillSuggestions,
+        ] {
+            chat.handle_event(pending_on(feature, NoteAnchor::History(0)), None);
+        }
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+
+        chat.handle_event(
+            turn_decision(
+                DecisionFeature::SkillSuggestions,
+                NoteOutcome::Shadow,
+                NoteAnchor::History(0),
+            ),
+            None,
+        );
+        let pending_and_shadow = format!(
+            "{} {TURN_SUBJECT}={}",
+            turn_label(USER_TEXT, PENDING_STATE),
+            NoteOutcome::Shadow.as_str()
+        );
+        assert_eq!(
+            live_placement(&chat),
+            [pending_and_shadow, FIRST_CALL.to_owned()]
+        );
+
+        chat.handle_event(
+            settled_on(
+                DecisionFeature::MemoryRecall,
+                NoteAnchor::History(0),
+                Vec::new(),
+            ),
+            None,
+        );
+        let quiet_and_shadow = format!(
+            "{} {TURN_SUBJECT}={}",
+            turn_label(USER_TEXT, QUIET_STATE),
+            NoteOutcome::Shadow.as_str()
+        );
+        assert_eq!(
+            live_placement(&chat),
+            [quiet_and_shadow, FIRST_CALL.to_owned()]
+        );
+    }
+
+    /// A turn's wait that lands on a card stays there when the card's call
+    /// ends, since it is the turn's to answer, not the call's.
+    #[test]
+    fn a_turns_wait_on_a_card_outlives_the_call() {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        chat.handle_event(pending(NoteAnchor::History(0)), None);
+
+        chat.handle_event(
+            tool_done(
+                FIRST_CALL,
+                SHELL_TOOL_NAME,
+                ToolOutput::Plain(String::new().into()),
+            ),
+            None,
+        );
+
+        assert_eq!(
+            live_placement(&chat),
+            [turn_label(FIRST_CALL, PENDING_STATE)]
+        );
     }
 
     #[test]
@@ -4304,8 +4651,9 @@ mod tests {
         );
         chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
 
-        chat.handle_event(pending(NoteAnchor::Tool(FIRST_CALL.into())), None);
         for anchor in [NoteAnchor::History(0), NoteAnchor::Tool(FIRST_CALL.into())] {
+            chat.handle_event(pending(anchor.clone()), None);
+            assert_eq!(live_placement(&chat), [FIRST_CALL]);
             chat.handle_event(decision(NoteOutcome::Acted, anchor), None);
         }
 
@@ -4352,7 +4700,8 @@ mod tests {
 
     /// A compaction keeps the first call's pair after its summary, so the
     /// transcript holds that call twice and its decision stays on the first
-    /// card. A turn's row counts items across the seam, a batch child's
+    /// card. A turn's decision counts items across the seam and goes on the
+    /// last row drawn before its position, untimed, a batch child's
     /// decision goes on its batch's card, a decision whose call is gone is
     /// dropped, and one this build cannot name keeps a row under its card.
     #[test]
@@ -4410,6 +4759,7 @@ mod tests {
             &ToolOutputLines::default(),
             false,
             restored.rows,
+            restored.turns,
         );
         attach_card_decisions(&mut display, restored.cards);
 
@@ -4422,12 +4772,14 @@ mod tests {
                     .iter()
                     .map(|decision| match &decision.state {
                         DecisionState::Settled { text, .. } => summary(text),
-                        DecisionState::Pending => String::new(),
+                        DecisionState::Pending { .. } | DecisionState::Quiet { .. } => {
+                            String::new()
+                        }
                     })
                     .collect();
                 let shown = match &message.role {
                     DisplayRole::Tool(tool) => tool.id.clone(),
-                    DisplayRole::Decision(_) => summary(&message.text),
+                    DisplayRole::Decision(..) => summary(&message.text),
                     _ => message.text.clone(),
                 };
                 (shown, decisions)
@@ -4438,8 +4790,10 @@ mod tests {
             shown,
             [
                 row(USER_TEXT),
-                (FIRST_CALL.into(), vec![FIRST_CALL_ROW.into()]),
-                row(TURN_ROW),
+                (
+                    FIRST_CALL.into(),
+                    vec![TURN_ROW.into(), FIRST_CALL_ROW.into()]
+                ),
                 row(COMPACTION_BORDER_TEXT),
                 row(COMPACTION_SUMMARY),
                 row(FIRST_CALL),
@@ -4448,6 +4802,82 @@ mod tests {
                     vec![SECOND_CALL_ROW.into(), CHILD_ROW.into()]
                 ),
                 row(DECISION_SUMMARY),
+            ]
+        );
+    }
+
+    /// Each restored turn decision as the rows it is drawn among: a host
+    /// lists its chips' summaries, a row of its own is its summary in
+    /// brackets.
+    fn restored_turn(position: usize, feature: &str) -> Vec<String> {
+        let msgs = [
+            Message::user(USER_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&msgs);
+        let rows = [stored(
+            feature,
+            TURN_ROW,
+            StoredDecisionAnchor::History(position),
+        )];
+        let restored = decision_inserts(&items, &rows);
+        let (display, _) = interleaved_history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+            restored.rows,
+            restored.turns,
+        );
+        display
+            .iter()
+            .map(|message| {
+                let mut shown = match &message.role {
+                    DisplayRole::Decision(..) => format!("[{TURN_ROW}]"),
+                    _ => message.text.clone(),
+                };
+                for decision in &message.decisions {
+                    let DecisionState::Settled { text, took, .. } = &decision.state else {
+                        panic!("{decision:?}");
+                    };
+                    assert_eq!(*took, None);
+                    shown.push_str(&format!(
+                        " {}",
+                        text.rsplit(DECISION_SEPARATOR).next().unwrap()
+                    ));
+                }
+                shown
+            })
+            .collect()
+    }
+
+    #[test_case(1, &[format!("{USER_TEXT} {TURN_ROW}"), REPLY_TEXT.to_owned()] ; "before_the_reply_on_the_prompt")]
+    #[test_case(2, &[USER_TEXT.to_owned(), format!("{REPLY_TEXT} {TURN_ROW}")] ; "after_the_reply_on_the_reply")]
+    #[test_case(0, &[format!("[{TURN_ROW}]"), USER_TEXT.to_owned(), REPLY_TEXT.to_owned()] ; "before_everything_a_row_of_its_own")]
+    fn a_restored_turns_decision_goes_on_the_last_row_before_its_position(
+        position: usize,
+        shown: &[String],
+    ) {
+        assert_eq!(
+            restored_turn(position, DecisionFeature::MemoryRecall.name()),
+            shown
+        );
+    }
+
+    #[test]
+    fn a_restored_turns_decision_this_build_cannot_name_keeps_a_row() {
+        assert_eq!(
+            restored_turn(1, RETIRED_FEATURE),
+            [
+                USER_TEXT.to_owned(),
+                format!("[{TURN_ROW}]"),
+                REPLY_TEXT.to_owned()
             ]
         );
     }
