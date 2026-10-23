@@ -1107,7 +1107,15 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 limits.views.tree_folds(index),
             )
         });
-        let has_body = body.as_ref().is_some_and(|body| !body.lines.is_empty());
+        let decided: Vec<Line<'static>> = match (&body, limits.decisions.get(&index)) {
+            (Some(_), Some(decisions)) => card_decisions::section(decisions)
+                .into_iter()
+                .flat_map(|(lines, _)| lines)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let has_body =
+            !decided.is_empty() || body.as_ref().is_some_and(|body| !body.lines.is_empty());
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
@@ -1209,7 +1217,13 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 t.tool_dim,
             ));
         }
-        if body.is_none() && holds_a_body(entry) {
+        if body.is_none()
+            && (holds_a_body(entry)
+                || limits
+                    .decisions
+                    .get(&index)
+                    .is_some_and(|decisions| card_decisions::any_settled(decisions)))
+        {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         // A child is a section of the card, not another run of its output, so
@@ -1222,6 +1236,10 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         trace.record(lines.len(), heading_rows(&broken, heading));
         rows.resize(rows.len() + broken.len(), target);
         lines.extend(wrapped_lines(broken));
+        // What the engine decided about the child leads its opened body, as
+        // it leads a card's.
+        rows.resize(rows.len() + decided.len(), target);
+        lines.extend(indent_all(decided, &body_indent));
         // A child's own output is content and clears the trunk; what the child
         // dispatched hangs off it as nodes. Content first, so reading down a
         // child never steps back out to a shallower level than the row above.

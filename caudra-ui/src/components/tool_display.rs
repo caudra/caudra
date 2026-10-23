@@ -2225,7 +2225,7 @@ impl ToolLineBuilder {
     }
 
     /// What the engine decided about the call leads its opened body.
-    fn push_decisions(&mut self, decisions: &[CardDecision]) {
+    fn push_decisions<'a>(&mut self, decisions: impl IntoIterator<Item = &'a CardDecision>) {
         for (lines, text) in card_decisions::section(decisions) {
             self.lines.extend(indented(lines, self.body_indent));
             self.push_search_text(text);
@@ -3274,7 +3274,7 @@ pub fn build_tool_lines(
         }
         return b.finish(msg.tool_input.clone(), msg.tool_output.clone());
     }
-    b.push_decisions(decisions);
+    b.push_decisions(card_decisions::about(decisions, call_id));
     if is_report {
         if let Some(message) = report_message(tool_name, msg.tool_raw_input.as_deref()) {
             let start = b.lines.len();
@@ -9702,6 +9702,73 @@ mod tests {
             (opened, opened, opened),
             "{text}"
         );
+    }
+
+    const BATCH_DECISION_SUMMARY: &str = "screened the whole batch";
+    const SEARCHED_NOTES: &str = "batching notes";
+
+    fn decided_batch(views: BatchViews) -> String {
+        let mut msg = bash_msg("batch", ToolStatus::Success, None, None);
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = BATCH_TOOL_NAME.into();
+        }
+        let search = BatchToolEntry {
+            tool: MEMORY_TOOL_NAME.into(),
+            effect: ToolEffect::ReadOnly,
+            summary: SEARCHED_NOTES.into(),
+            ..code_child()
+        };
+        msg.tool_output = Some(Arc::new(ToolOutput::Batch {
+            entries: vec![code_child(), search],
+            text: String::new(),
+        }));
+        msg.decisions = vec![
+            CardDecision::settled(
+                DecisionSubject::Call("t1:1".into()),
+                DecisionFeature::MemorySearch,
+                NoteOutcome::Acted,
+                DECISION_SUMMARY,
+                &[DECISION_DETAIL.into()],
+            ),
+            CardDecision::settled(
+                DecisionSubject::Call("t1".into()),
+                DecisionFeature::ContentScreening,
+                NoteOutcome::Shadow,
+                BATCH_DECISION_SUMMARY,
+                &[],
+            ),
+        ];
+        let views = HashMap::from([("t1".into(), views)]);
+        let rctx = RenderCtx {
+            batch_views: &views,
+            ..test_rctx(UNBROKEN)
+        };
+        lines_text(&build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &rctx,
+            Some(Disclosure::default()),
+        ))
+    }
+
+    /// A batch rests open on its tree, so a child's decision is drawn only
+    /// once that child is opened, and then under the child's own row.
+    #[test_case(BatchViews::default(), false ; "a_folded_child_keeps_its_decision_to_its_chip")]
+    #[test_case(BatchViews::new([1]), true ; "an_opened_child_shows_its_decision_under_its_row")]
+    fn a_childs_decision_opens_with_the_child(views: BatchViews, opened: bool) {
+        let text = decided_batch(views);
+        let position = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            position(BATCH_DECISION_SUMMARY) < position(SOURCE_PATH),
+            "{text}"
+        );
+        assert_eq!(text.contains(DECISION_DETAIL), opened, "{text}");
+        if opened {
+            assert!(
+                position(SEARCHED_NOTES) < position(DECISION_SUMMARY),
+                "{text}"
+            );
+        }
     }
 
     #[test_case(None ; "folded")]

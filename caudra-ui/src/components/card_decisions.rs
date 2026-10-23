@@ -418,7 +418,9 @@ pub fn any_settled(decisions: &[CardDecision]) -> bool {
 
 /// Every answered decision on the card as an open row draws it, with the text
 /// each one copies and searches as.
-pub fn section(decisions: &[CardDecision]) -> Vec<(Vec<Line<'static>>, &str)> {
+pub fn section<'a>(
+    decisions: impl IntoIterator<Item = &'a CardDecision>,
+) -> Vec<(Vec<Line<'static>>, &'a str)> {
     answered(decisions, false)
 }
 
@@ -428,9 +430,12 @@ pub fn details(decisions: &[CardDecision]) -> Vec<(Vec<Line<'static>>, &str)> {
     answered(decisions, true)
 }
 
-fn answered(decisions: &[CardDecision], timed: bool) -> Vec<(Vec<Line<'static>>, &str)> {
+fn answered<'a>(
+    decisions: impl IntoIterator<Item = &'a CardDecision>,
+    timed: bool,
+) -> Vec<(Vec<Line<'static>>, &'a str)> {
     decisions
-        .iter()
+        .into_iter()
         .filter_map(|decision| match &decision.state {
             DecisionState::Settled {
                 outcome,
