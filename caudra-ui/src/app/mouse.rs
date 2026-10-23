@@ -916,6 +916,16 @@ impl App {
                         }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
+                            // Chips answer before the card they ride on, so a
+                            // click on a task or workflow card's chips opens
+                            // its decisions rather than the task.
+                            if self.chats[self.active_chat].toggle_decisions_at(
+                                event.column,
+                                event.row,
+                                area,
+                            ) {
+                                return Vec::new();
+                            }
                             if self.active_chat == 0
                                 && let Some(hit) = self.chats[0].workflow_hit_at(event.row, area)
                             {
@@ -951,13 +961,7 @@ impl App {
                             // The press already armed this window, and that is
                             // the whole of what it does: the card's own control
                             // is its header, above the window.
-                            if self.chats[self.active_chat].armed_card_at(event.column, event.row)
-                                || self.chats[self.active_chat].toggle_decisions_at(
-                                    event.column,
-                                    event.row,
-                                    area,
-                                )
-                            {
+                            if self.chats[self.active_chat].armed_card_at(event.column, event.row) {
                                 return Vec::new();
                             }
                             self.chats[self.active_chat].handle_click(event.row, area);

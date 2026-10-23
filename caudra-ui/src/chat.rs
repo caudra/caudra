@@ -10,7 +10,7 @@ use std::time::Duration;
 use crossterm::event::MouseEvent;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::card_decisions::{CardDecision, DecisionState, DecisionSubject};
+use crate::components::card_decisions::{self, CardDecision, DecisionState, DecisionSubject};
 use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::{MessageActionTarget, MessageDetails, MessagesPanel};
 use crate::components::prompt_progress::PromptProgress;
@@ -25,7 +25,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::background::BackgroundTasks;
-use caudra_agent::decisions::{DecisionFeature, DecisionNote, NoteAnchor, PendingDecision};
+use caudra_agent::decisions::{DecisionFeature, DecisionNote, PendingDecision};
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
@@ -596,24 +596,29 @@ impl Chat {
             .attach_decision(CardDecision::pending(subject, pending.feature));
     }
 
-    /// The engine answered with nothing to do. A call's wait goes off its
-    /// card; a turn's stays on its row as a quiet chip that keeps what came
+    /// The engine answered with nothing to do. A call's own wait goes off its
+    /// card; any other stays on its row as a quiet chip that keeps what came
     /// closest, or, when the feature had nothing to ask, why.
     fn end_decision_wait(&mut self, pending: PendingDecision) {
-        match pending.anchor {
-            NoteAnchor::Tool(call_id) => self
-                .messages_panel
-                .settle_decision(&DecisionSubject::Call(call_id), &pending.feature),
-            NoteAnchor::History(_) => {
-                self.messages_panel.flush();
-                self.messages_panel
-                    .quiet_decision(&pending.feature, &pending.details);
-            }
+        let subject = DecisionSubject::from(&pending.anchor);
+        if !card_decisions::keeps_quiet(&subject, &pending.feature) {
+            self.messages_panel
+                .settle_decision(&subject, &pending.feature);
+            return;
         }
+        if subject == DecisionSubject::Turn {
+            self.messages_panel.flush();
+        }
+        self.messages_panel.quiet_decision(
+            &subject,
+            &pending.feature,
+            pending.cause,
+            &pending.details,
+        );
     }
 
     /// Opens or closes the details of the decisions whose chips are under the
-    /// pointer, on a text row.
+    /// pointer, on a text row or a card's header.
     pub fn toggle_decisions_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
         self.messages_panel.toggle_decisions_at(column, row, area)
     }
@@ -1912,7 +1917,7 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::decisions::NoteOutcome;
+    use caudra_agent::decisions::{NoteAnchor, NoteOutcome};
     use caudra_agent::peers::{
         AssignedWork, PeerSummary, PublishReceipt, QueuedWork, RecipientReceipt, SendReceipt,
     };
@@ -4237,6 +4242,7 @@ mod tests {
         AgentEvent::DecisionPending(Box::new(PendingDecision {
             feature,
             anchor,
+            cause: None,
             details: Vec::new(),
         }))
     }
@@ -4253,6 +4259,7 @@ mod tests {
         AgentEvent::DecisionSettled(Box::new(PendingDecision {
             feature,
             anchor,
+            cause: None,
             details,
         }))
     }
@@ -4349,6 +4356,29 @@ mod tests {
                 FIRST_CALL.to_owned(),
             ]
         );
+    }
+
+    /// A recall started by a todo update waits on that card. Answered with
+    /// nothing to do, it stays as a quiet chip there, as a call's own wait
+    /// would not.
+    #[test_case(DecisionFeature::MemoryRecall, Some(QUIET_STATE) ; "a_recall_stays_quiet")]
+    #[test_case(DecisionFeature::SourceCodeContext, None ; "a_calls_own_wait_goes")]
+    fn a_quiet_answer_on_a_card_stays_only_when_it_was_not_the_calls_own(
+        feature: DecisionFeature,
+        state: Option<&str>,
+    ) {
+        let mut chat = chat();
+        chat.handle_event(tool_start(FIRST_CALL, SHELL_TOOL_NAME), None);
+        let anchor = NoteAnchor::Tool(FIRST_CALL.into());
+        chat.handle_event(pending_on(feature.clone(), anchor.clone()), None);
+
+        chat.handle_event(settled_on(feature, anchor, vec![NEAR_MISS.into()]), None);
+
+        let expected = match state {
+            Some(state) => format!("{FIRST_CALL} {FIRST_CALL}={state}"),
+            None => FIRST_CALL.to_owned(),
+        };
+        assert_eq!(live_placement(&chat), [expected]);
     }
 
     #[test]

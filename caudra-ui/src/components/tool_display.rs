@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::iter;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -185,6 +186,9 @@ pub struct RenderCtx<'a> {
     pub cwd: Option<Arc<Path>>,
     /// Whether the card draws what the engine decided about its call.
     pub show_decisions: bool,
+    /// Whether the reader opened the card's decisions with a click on its
+    /// chips, which draws their details under the header.
+    pub decisions_open: bool,
     pub token_scale: TokenScale,
 }
 
@@ -1550,6 +1554,9 @@ pub struct ToolLines {
     pub source: Option<BodySource>,
     /// The picture a card shows under its output, which a click opens.
     pub images: Vec<ImageSpan>,
+    /// The row the header's decision chips landed on and the columns they
+    /// span, for a click to open their details.
+    pub decision_chips: Option<(usize, Range<u16>)>,
 }
 
 #[derive(Clone)]
@@ -2041,6 +2048,8 @@ struct ToolLineBuilder {
     /// the verb its indicator would give it.
     stage: Option<CallStage>,
     images: Vec<ImageSpan>,
+    /// The spans of row 0 the decision chips took, empty without any.
+    chip_spans: Range<usize>,
 }
 
 impl ToolLineBuilder {
@@ -2069,6 +2078,7 @@ impl ToolLineBuilder {
             markdown: false,
             indicator,
             head: 0,
+            chip_spans: 0..0,
         }
     }
 
@@ -2213,7 +2223,14 @@ impl ToolLineBuilder {
         let Some(line) = self.lines.first_mut() else {
             return;
         };
+        let gap = chips
+            .spans
+            .iter()
+            .take_while(|span| span.content.trim().is_empty())
+            .count();
+        let start = line.spans.len() + gap;
         line.spans.extend(chips.spans);
+        self.chip_spans = start..line.spans.len();
         self.search_text.push_str(&chips.text);
     }
 
@@ -2224,7 +2241,8 @@ impl ToolLineBuilder {
         self.search_text.push_str(text);
     }
 
-    /// What the engine decided about the call leads its opened body.
+    /// What the engine decided about the call, under the header once the
+    /// reader opened it.
     fn push_decisions<'a>(&mut self, decisions: impl IntoIterator<Item = &'a CardDecision>) {
         for (lines, text) in card_decisions::section(decisions) {
             self.lines.extend(indented(lines, self.body_indent));
@@ -2778,7 +2796,6 @@ impl ToolLineBuilder {
             }
         }
         ToolLines {
-            lines,
             links,
             search_text: self.search_text,
             highlight: self
@@ -2819,8 +2836,38 @@ impl ToolLineBuilder {
                     ..image
                 })
                 .collect(),
+            decision_chips: chip_columns(&wrapped, &lines, self.chip_spans),
+            lines,
         }
     }
+}
+
+/// Where the chips that took `spans` of row 0 landed once the header broke:
+/// the last row they reach, where their words end up when a narrow card
+/// breaks one, and the columns they take on it.
+fn chip_columns(
+    wrapped: &WrappedRows,
+    lines: &[Line<'static>],
+    spans: Range<usize>,
+) -> Option<(usize, Range<u16>)> {
+    let marks: Vec<bool> = (0..spans.end).map(|span| spans.contains(&span)).collect();
+    let (offset, pieces) = wrapped
+        .spans_of(0, &marks)
+        .into_iter()
+        .enumerate()
+        .rfind(|(_, pieces)| pieces.contains(&true))?;
+    let first = pieces.iter().position(|chip| *chip)?;
+    let end = pieces.iter().rposition(|chip| *chip)? + 1;
+    let row = wrapped.row_of(0) + offset;
+    let drawn = &lines.get(row)?.spans;
+    let width = |count: usize| -> u16 {
+        let columns: usize = drawn[..count.min(drawn.len())]
+            .iter()
+            .map(Span::width)
+            .sum();
+        u16::try_from(columns).unwrap_or(u16::MAX)
+    };
+    Some((row, width(first)..width(end)))
 }
 
 fn indented(lines: Vec<Line<'static>>, indent: &'static str) -> Vec<Line<'static>> {
@@ -3231,6 +3278,9 @@ pub fn build_tool_lines(
     if let Some(elapsed) = call_elapsed(msg, status, job) {
         b.append_duration(elapsed);
     }
+    if rctx.decisions_open {
+        b.push_decisions(card_decisions::about(decisions, call_id));
+    }
     let progress_body = msg
         .progress
         .as_ref()
@@ -3267,14 +3317,12 @@ pub fn build_tool_lines(
             || msg.tool_input.is_some()
             || msg.tool_output.is_some()
             || msg.live_body.is_some()
-            || card_decisions::any_settled(decisions)
             || body.is_some_and(|body| !body.trim().is_empty());
         if let Some((progress, first, window)) = progress_body {
             b.push_progress_body(progress, first, window);
         }
         return b.finish(msg.tool_input.clone(), msg.tool_output.clone());
     }
-    b.push_decisions(card_decisions::about(decisions, call_id));
     if is_report {
         if let Some(message) = report_message(tool_name, msg.tool_raw_input.as_deref()) {
             let start = b.lines.len();
@@ -3676,6 +3724,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock], scale: TokenScale) -> 
         truncation: true,
         source: None,
         images: Vec::new(),
+        decision_chips: None,
     }
 }
 
@@ -3744,6 +3793,7 @@ mod tests {
             task_cards: None,
             cwd: None,
             show_decisions: true,
+            decisions_open: false,
             token_scale: TokenScale::UNIT,
         }
     }
@@ -9661,7 +9711,12 @@ mod tests {
     const DECISION_DETAIL: &str = "0.97  src/lib.rs:12  moved 4th to 1st";
     const NARROW_CARD: u16 = 24;
 
-    fn decided_card(width: u16, shown: bool, expansion: Option<Disclosure>) -> ToolLines {
+    fn decided_card(
+        width: u16,
+        shown: bool,
+        decisions_open: bool,
+        expansion: Option<Disclosure>,
+    ) -> ToolLines {
         let mut msg = bash_msg(DECIDED_COMMAND, ToolStatus::Success, None, None);
         msg.decisions.push(CardDecision::settled(
             DecisionSubject::Call("t1".into()),
@@ -9672,6 +9727,7 @@ mod tests {
         ));
         let rctx = RenderCtx {
             show_decisions: shown,
+            decisions_open,
             token_scale: TokenScale::UNIT,
             ..test_rctx(width)
         };
@@ -9681,17 +9737,32 @@ mod tests {
     #[test_case(UNBROKEN ; "a_wide_card")]
     #[test_case(NARROW_CARD ; "a_card_too_narrow_for_its_command")]
     fn the_chip_survives_the_header_it_rides_on(width: u16) {
-        let text = lines_text(&decided_card(width, true, None));
-        assert!(text.contains(RERANKED_CHIP), "{text}");
+        let tl = decided_card(width, true, false, None);
+        let (row, columns) = tl
+            .decision_chips
+            .clone()
+            .expect("the chips are a click target");
+        let under: String = tl.lines[row]
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(usize::from(columns.start))
+            .take(columns.len())
+            .collect();
+        assert!(under.contains(RERANKED_CHIP), "{under}");
     }
 
-    #[test_case(None, false ; "a_folded_card_keeps_it_to_the_chip")]
-    #[test_case(Some(Disclosure::default()), true ; "an_opened_card_shows_what_was_decided")]
-    fn the_decision_section_shows_only_in_an_open_body(
+    /// An open card keeps its decisions to their chips, like a folded one,
+    /// until a click on the chips opens them under the header.
+    #[test_case(None, false ; "a_folded_card_keeps_them_to_the_chip")]
+    #[test_case(Some(Disclosure::default()), false ; "an_open_card_keeps_them_to_the_chip")]
+    #[test_case(None, true ; "a_folded_card_with_its_chips_opened")]
+    #[test_case(Some(Disclosure::default()), true ; "an_open_card_with_its_chips_opened")]
+    fn the_decision_section_shows_once_its_chips_are_opened(
         expansion: Option<Disclosure>,
         opened: bool,
     ) {
-        let tl = decided_card(UNBROKEN, true, expansion);
+        let tl = decided_card(UNBROKEN, true, opened, expansion);
         let text = lines_text(&tl);
         assert_eq!(
             (
@@ -9741,6 +9812,7 @@ mod tests {
         let views = HashMap::from([("t1".into(), views)]);
         let rctx = RenderCtx {
             batch_views: &views,
+            decisions_open: true,
             ..test_rctx(UNBROKEN)
         };
         lines_text(&build_tool_lines(
@@ -9774,7 +9846,7 @@ mod tests {
     #[test_case(None ; "folded")]
     #[test_case(Some(Disclosure::default()) ; "opened")]
     fn a_card_hides_its_decisions_while_they_are_switched_off(expansion: Option<Disclosure>) {
-        let tl = decided_card(UNBROKEN, false, expansion);
+        let tl = decided_card(UNBROKEN, false, true, expansion);
         let text = lines_text(&tl);
         assert!(
             !text.contains(RERANKED_CHIP) && !text.contains(DECISION_SUMMARY),

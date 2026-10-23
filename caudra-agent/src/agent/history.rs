@@ -11,6 +11,7 @@ use caudra_providers::{
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
 
+use crate::tools::native::batch;
 use crate::types::{TodoItem, ToolDoneEvent, ToolOutput};
 
 pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
@@ -39,6 +40,9 @@ pub struct History {
     /// saw "ok" for one, so this is the one place the list survives. `None`
     /// until an update lands, which is not the same as a list emptied by one.
     todos: Option<Vec<TodoItem>>,
+    /// The call that set [`Self::todos`] in this run, a batch child's own id
+    /// when a batch did. `None` for a list restored with the session.
+    todos_call: Option<String>,
     /// Whether a plan write was committed since [`Self::take_plan_written`]
     /// last looked.
     plan_written: bool,
@@ -52,6 +56,7 @@ impl History {
             mirror: None,
             archived: Vec::new(),
             todos: None,
+            todos_call: None,
             plan_written: false,
         }
     }
@@ -75,6 +80,7 @@ impl History {
             mirror: None,
             archived: Vec::new(),
             todos: None,
+            todos_call: None,
             plan_written: false,
         })
     }
@@ -102,17 +108,25 @@ impl History {
         self.todos.as_deref()
     }
 
+    pub fn todos_call(&self) -> Option<&str> {
+        self.todos_call.as_deref()
+    }
+
     /// Keeps the list the last todo update among `results` set, and notes a
     /// plan write. Called with the results about to be committed, while their
     /// typed outputs still exist: committing reduces each to the text the
     /// model reads.
     pub(crate) fn record_results(&mut self, results: &[ToolDoneEvent]) {
-        if let Some(items) = results
-            .iter()
-            .rev()
-            .find_map(|done| done.output.todo_update(done.is_error))
-        {
+        if let Some((call, items)) = results.iter().rev().find_map(|done| {
+            let (entry, items) = done.output.todo_update_at(done.is_error)?;
+            let call = match entry {
+                Some(index) => batch::child_tool_use_id(Some(&done.id), index),
+                None => done.id.clone(),
+            };
+            Some((call, items))
+        }) {
             self.todos = Some(items.to_vec());
+            self.todos_call = Some(call);
         }
         self.plan_written |= results.iter().any(ToolDoneEvent::wrote_plan);
     }
@@ -858,7 +872,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::types::{TodoPriority, TodoStatus};
+    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect};
+    use crate::types::{BatchToolEntry, BatchToolStatus, TodoPriority, TodoStatus, ToolAccounting};
 
     const FIRST: &str = "first";
     const SECOND: &str = "second";
@@ -2038,5 +2053,54 @@ mod tests {
 
         assert_eq!(history.todos(), Some(plan(SHIP).as_slice()));
         restored_todos(&history.transcript_items(), &outputs)
+    }
+
+    const BATCH_CALL: &str = "batch";
+
+    fn batched_plan(call_id: &str) -> ToolDoneEvent {
+        let entry = |status, output| BatchToolEntry {
+            tool: TODOWRITE_TOOL_NAME.into(),
+            effect: ToolEffect::Isolated,
+            summary: String::new(),
+            status,
+            input: None,
+            raw_input: None,
+            output,
+            annotation: None,
+            model_suffix: None,
+            refused: false,
+            accounting: ToolAccounting::default(),
+        };
+        ToolDoneEvent {
+            output: ToolOutput::Batch {
+                entries: vec![
+                    entry(BatchToolStatus::Error, None),
+                    entry(
+                        BatchToolStatus::Success,
+                        Some(ToolOutput::TodoList(plan(DRAFT))),
+                    ),
+                ],
+                text: String::new(),
+            },
+            ..ToolDoneEvent::error(call_id.into(), String::new())
+        }
+    }
+
+    #[test_case(vec![todo_done(PLAN_CALL, plan(DRAFT), false)], Some(PLAN_CALL.into()) ; "a_direct_update")]
+    #[test_case(
+        vec![todo_done(PLAN_CALL, plan(DRAFT), false), todo_done(REPLAN_CALL, plan(SHIP), true)],
+        Some(PLAN_CALL.into()) ; "not_a_failed_update"
+    )]
+    #[test_case(vec![batched_plan(BATCH_CALL)], Some(batch::child_tool_use_id(Some(BATCH_CALL), 1)) ; "a_batch_childs_own_id")]
+    #[test_case(vec![failed(READ_CALL)], None ; "none_without_an_update")]
+    fn the_plan_remembers_the_call_that_set_it(
+        results: Vec<ToolDoneEvent>,
+        expected: Option<String>,
+    ) {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+
+        commit(&mut history, &mut HashMap::new(), results);
+
+        assert_eq!(history.todos_call(), expected.as_deref());
     }
 }

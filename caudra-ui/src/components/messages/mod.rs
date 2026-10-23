@@ -1130,6 +1130,9 @@ pub struct MessagesPanel {
     /// The text rows whose decisions the reader opened under them, by
     /// message index.
     decisions_open: HashSet<usize>,
+    /// The cards whose decisions the reader opened under their header, by
+    /// tool id.
+    card_decisions_open: HashSet<String>,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose message changed since the last frame and whose segment is
@@ -1242,6 +1245,7 @@ impl MessagesPanel {
             cwd: None,
             show_decisions: ui_config.show_decisions,
             decisions_open: HashSet::new(),
+            card_decisions_open: HashSet::new(),
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
@@ -1850,23 +1854,39 @@ impl MessagesPanel {
         }
     }
 
-    /// The engine found nothing to do for the turn's `feature`. Its chip
+    /// The engine found nothing to do for `feature` about `subject`. Its chip
     /// stays, quiet, with what came closest. Without a wait, the feature had
-    /// nothing to ask, and its untimed chip goes on the turn's
-    /// [host](Self::decision_host), `details` saying why.
-    pub fn quiet_decision(&mut self, feature: &DecisionFeature, details: &[String]) {
-        let host = match self.waiting_host(&DecisionSubject::Turn, feature) {
-            Some(host) => {
-                card_decisions::quiet(&mut self.messages[host].decisions, feature, details);
+    /// nothing to ask, and its untimed chip goes on the subject's
+    /// [host](Self::decision_host), `details` saying why. `cause` names what
+    /// started it.
+    pub fn quiet_decision(
+        &mut self,
+        subject: &DecisionSubject,
+        feature: &DecisionFeature,
+        cause: Option<&str>,
+        details: &[String],
+    ) {
+        let host = match self.waiting_host(subject, feature) {
+            Some(host)
+                if card_decisions::quiet(
+                    &mut self.messages[host].decisions,
+                    subject,
+                    feature,
+                    cause,
+                    details,
+                ) =>
+            {
                 host
             }
-            None => {
-                let Some(host) = self.decision_host(&DecisionSubject::Turn, feature) else {
+            _ => {
+                let Some(host) = self.decision_host(subject, feature) else {
                     return;
                 };
                 card_decisions::skipped(
                     &mut self.messages[host].decisions,
+                    subject.clone(),
                     feature.clone(),
+                    cause,
                     details,
                 );
                 host
@@ -1929,8 +1949,8 @@ impl MessagesPanel {
     }
 
     /// Opens or closes what the decisions on the row under the pointer say,
-    /// when the pointer is on their chips. A card answers through its own
-    /// header instead, so only a text row's chips take the click.
+    /// when the pointer is on their chips: under a text row, or under a
+    /// card's header.
     pub fn toggle_decisions_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
         if area.height == 0 || row < area.y || column < area.x {
             return false;
@@ -1940,15 +1960,22 @@ impl MessagesPanel {
         let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
             return false;
         };
-        let Some(msg_index) = segment.msg_index.filter(|_| segment.tool_id.is_none()) else {
-            return false;
-        };
         let Ok(rel_row) = u16::try_from(doc_row - start) else {
             return false;
         };
         if !segment.on_decision_chips(rel_row, column - area.x, width) {
             return false;
         }
+        if let Some(tool_id) = segment.tool_id.clone() {
+            if !self.card_decisions_open.remove(&tool_id) {
+                self.card_decisions_open.insert(tool_id.clone());
+            }
+            self.mark_card_dirty(&tool_id);
+            return true;
+        }
+        let Some(msg_index) = segment.msg_index else {
+            return false;
+        };
         if !self.decisions_open.remove(&msg_index) {
             self.decisions_open.insert(msg_index);
         }
@@ -2006,6 +2033,7 @@ impl MessagesPanel {
         self.card_floor.clear();
         self.disclosure.clear();
         self.decisions_open.clear();
+        self.card_decisions_open.clear();
         self.raw_views.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
@@ -5531,6 +5559,7 @@ impl MessagesPanel {
             task_cards: Some(&self.task_cards),
             cwd: self.cwd.clone(),
             show_decisions: self.show_decisions,
+            decisions_open: self.card_decisions_open.contains(tool_id),
             token_scale: self.token_scale,
         }
     }

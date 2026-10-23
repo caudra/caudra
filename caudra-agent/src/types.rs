@@ -2408,18 +2408,23 @@ impl ToolOutput {
     /// when the batch as a whole was cancelled, and the last one to set a list
     /// wins.
     pub fn todo_update(&self, is_error: bool) -> Option<&[TodoItem]> {
+        self.todo_update_at(is_error).map(|(_, items)| items)
+    }
+
+    /// [`Self::todo_update`], with the batch entry that set the list, `None`
+    /// when the result itself did.
+    pub fn todo_update_at(&self, is_error: bool) -> Option<(Option<usize>, &[TodoItem])> {
         match self {
-            Self::TodoList(items) if !is_error => Some(items),
+            Self::TodoList(items) if !is_error => Some((None, items)),
             Self::Batch { entries, .. } => {
-                entries
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match (entry.status, &entry.output) {
+                entries.iter().enumerate().rev().find_map(|(index, entry)| {
+                    match (entry.status, &entry.output) {
                         (BatchToolStatus::Success, Some(Self::TodoList(items))) => {
-                            Some(items.as_slice())
+                            Some((Some(index), items.as_slice()))
                         }
                         _ => None,
-                    })
+                    }
+                })
             }
             _ => None,
         }
@@ -4336,6 +4341,17 @@ mod tests {
         is_error: bool,
     ) -> Option<Vec<TodoItem>> {
         output.todo_update(is_error).map(<[TodoItem]>::to_vec)
+    }
+
+    #[test_case(ToolOutput::TodoList(pending(EARLIER_TODO)) => Some(None) ; "a_direct_update_names_no_entry")]
+    #[test_case(
+        batch(vec![(BatchToolStatus::Success, todo_list(EARLIER_TODO)), (BatchToolStatus::Success, todo_list(LATER_TODO)), (BatchToolStatus::Error, todo_list(EARLIER_TODO))])
+        => Some(Some(1)) ; "a_batch_names_the_last_successful_entry"
+    )]
+    fn todo_update_at_names_the_entry_that_set_the_list(
+        output: ToolOutput,
+    ) -> Option<Option<usize>> {
+        output.todo_update_at(false).map(|(index, _)| index)
     }
 
     const ENVIRONMENT_HEADLINE: &str = "ubuntu 24.04 · linux/x86_64";

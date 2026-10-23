@@ -5807,7 +5807,12 @@ fn a_quiet_answer_keeps_a_chip_on_its_host(noted: &[NoteOutcome], words: &str) {
         ),
     );
 
-    panel.quiet_decision(&DecisionFeature::MemoryRecall, &[NEAR_MISS.into()]);
+    panel.quiet_decision(
+        &DecisionSubject::Turn,
+        &DecisionFeature::MemoryRecall,
+        None,
+        &[NEAR_MISS.into()],
+    );
 
     let seen = buffer_text(&render(
         &mut panel,
@@ -5901,21 +5906,46 @@ fn hidden_decisions_draw_no_chip_and_open_nothing() {
     assert!(!panel.toggle_decisions_at(DECISIONS_AREA.width - 1, row, DECISIONS_AREA));
 }
 
-/// A turn's decision that lands on a card shows in its header, beside the
-/// call's own.
+/// A decision on a card shows as a chip in its header, and a running card
+/// that rests open still keeps what it said to the chip. A click on the chip
+/// opens it under the header and the same click puts it away; a click
+/// beside the chip is the card's own.
 #[test]
-fn a_turns_decision_on_a_card_shows_in_its_header() {
+fn a_click_on_a_cards_chips_toggles_its_details() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(DECISION_WAIT_CALL, SHELL_TOOL_NAME));
-
     assert!(panel.attach_decision(turn_note(DecisionFeature::MemoryRecall, NoteOutcome::Acted)));
+    let render_text = |panel: &mut MessagesPanel| {
+        buffer_text(&render(panel, DECISIONS_AREA.width, DECISIONS_AREA.height))
+    };
 
-    let seen = buffer_text(&render(
-        &mut panel,
-        DECISIONS_AREA.width,
-        DECISIONS_AREA.height,
-    ));
-    assert!(seen.contains(&chip(RECALLED)), "{seen}");
+    let seen = render_text(&mut panel);
+    let recalled = chip(RECALLED);
+    assert!(seen.contains(&recalled), "{seen}");
+    assert!(!seen.contains(DECISION_DETAIL), "{DECISION_FOLDED}: {seen}");
+    let (column, row) = cell_of(&seen, &recalled);
+
+    assert!(!panel.toggle_decisions_at(DECISIONS_AREA.x, row, DECISIONS_AREA));
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    let opened = render_text(&mut panel);
+    let header = screen_row_of(&opened, &recalled).unwrap();
+    assert_eq!(
+        screen_row_of(&opened, DECISION_SUMMARY),
+        Some(header + 1),
+        "{DECISION_OPENED}: {opened}"
+    );
+    assert!(
+        opened.contains(DECISION_DETAIL),
+        "{DECISION_OPENED}: {opened}"
+    );
+
+    let (column, row) = cell_of(&opened, &recalled);
+    assert!(panel.toggle_decisions_at(column, row, DECISIONS_AREA));
+    let folded = render_text(&mut panel);
+    assert!(
+        !folded.contains(DECISION_DETAIL),
+        "{DECISION_FOLDED}: {folded}"
+    );
 }
 
 #[test]

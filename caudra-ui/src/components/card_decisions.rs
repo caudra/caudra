@@ -226,22 +226,24 @@ pub fn settle(
     decisions.len() != before
 }
 
-/// Answers the turn's wait for `feature` with nothing to do. Unlike a call's,
-/// it stays, timed by the wait and holding the `near_misses`, so the row it
-/// sits on keeps its height and a click still says what was weighed.
+/// Answers the wait for `feature` on `subject` with nothing to do. Unlike a
+/// call's own, it stays, timed by the wait and holding the `near_misses`, so
+/// the row it sits on keeps its height and a click still says what was
+/// weighed. `cause` names what started it.
 pub fn quiet(
     decisions: &mut [CardDecision],
+    subject: &DecisionSubject,
     feature: &DecisionFeature,
+    cause: Option<&str>,
     near_misses: &[String],
 ) -> bool {
     for held in decisions.iter_mut() {
         if let DecisionState::Pending { since } = held.state
-            && held.subject == DecisionSubject::Turn
+            && held.subject == *subject
             && held.feature == *feature
         {
-            let words = chip_words(feature).quiet;
             held.state = DecisionState::Quiet {
-                text: decision_text(feature.label(), NoteOutcome::Acted, words, near_misses),
+                text: quiet_text(feature, cause, near_misses),
                 took: Some(live_elapsed(since)),
             };
             return true;
@@ -250,25 +252,53 @@ pub fn quiet(
     false
 }
 
-/// Records that the turn's `feature` had nothing to ask the engine, `reasons`
-/// saying why: a quiet answer with no wait, so no time. A row that already
-/// says what the feature did keeps that.
-pub fn skipped(decisions: &mut Vec<CardDecision>, feature: DecisionFeature, reasons: &[String]) {
+/// Records that `feature` had nothing to ask the engine about `subject`,
+/// `reasons` saying why: a quiet answer with no wait, so no time. A row that
+/// already says what the feature did keeps that.
+pub fn skipped(
+    decisions: &mut Vec<CardDecision>,
+    subject: DecisionSubject,
+    feature: DecisionFeature,
+    cause: Option<&str>,
+    reasons: &[String],
+) {
     if decisions
         .iter()
-        .any(|held| held.subject == DecisionSubject::Turn && held.feature == feature)
+        .any(|held| held.subject == subject && held.feature == feature)
     {
         return;
     }
-    let words = chip_words(&feature).quiet;
     decisions.push(CardDecision {
-        subject: DecisionSubject::Turn,
         state: DecisionState::Quiet {
-            text: decision_text(feature.label(), NoteOutcome::Acted, words, reasons),
+            text: quiet_text(&feature, cause, reasons),
             took: None,
         },
+        subject,
         feature,
     });
+}
+
+/// Whether a wait that ends with nothing to do leaves a quiet chip. A turn's
+/// does, wherever it sits; a call's own goes, since its card says the rest.
+pub fn keeps_quiet(subject: &DecisionSubject, feature: &DecisionFeature) -> bool {
+    *subject == DecisionSubject::Turn
+        || matches!(
+            feature,
+            DecisionFeature::MemoryRecall
+                | DecisionFeature::SkillSuggestions
+                | DecisionFeature::GoalPrescreen
+                | DecisionFeature::QuestionToolNudge
+                | DecisionFeature::CompactionRetention
+        )
+}
+
+fn quiet_text(feature: &DecisionFeature, cause: Option<&str>, details: &[String]) -> String {
+    let words = chip_words(feature).quiet;
+    let summary = match cause {
+        Some(cause) => format!("{cause}{DECISION_SEPARATOR}{words}"),
+        None => words.to_owned(),
+    };
+    decision_text(feature.label(), NoteOutcome::Acted, &summary, details)
 }
 
 /// Drops every wait about a call once the card's call is over. A turn's wait
@@ -684,8 +714,8 @@ mod tests {
 
     use super::{
         ALL_QUIET, CardDecision, DecisionState, DecisionSubject, MANY_DECISIONS, ONE_DECISION,
-        Tone, about, any_settled, children, chip_spans, details, quiet, record, row_chips, section,
-        settle, settle_all, skipped,
+        Tone, about, any_settled, children, chip_spans, details, keeps_quiet, quiet, record,
+        row_chips, section, settle, settle_all, skipped,
     };
     use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
     use crate::components::DECISION_SEPARATOR;
@@ -704,6 +734,7 @@ mod tests {
     const LONG_AGO_PREFIX: &str = " 1m 1.";
     const RECENTLY: Duration = Duration::from_secs(1);
     const NO_NOTES: &str = "no notes";
+    const CAUSE: &str = "step started";
     const NO_SKILL: &str = "no skill";
 
     fn call(call_id: &str) -> DecisionSubject {
@@ -753,7 +784,13 @@ mod tests {
     /// A turn's wait for `feature` the engine answered with nothing to do.
     fn quieted(feature: DecisionFeature) -> CardDecision {
         let mut decisions = vec![pending(DecisionSubject::Turn, feature.clone())];
-        assert!(quiet(&mut decisions, &feature, &[NEAR_MISS.into()]));
+        assert!(quiet(
+            &mut decisions,
+            &DecisionSubject::Turn,
+            &feature,
+            None,
+            &[NEAR_MISS.into()]
+        ));
         decisions.remove(0)
     }
 
@@ -1011,8 +1048,15 @@ mod tests {
         let feature = DecisionFeature::MemoryRecall;
         let mut decisions = Vec::new();
 
-        skipped(&mut decisions, feature.clone(), &[NEAR_MISS.to_owned()]);
-        skipped(&mut decisions, feature.clone(), &[DETAIL.to_owned()]);
+        for reason in [NEAR_MISS, DETAIL] {
+            skipped(
+                &mut decisions,
+                DecisionSubject::Turn,
+                feature.clone(),
+                None,
+                &[reason.to_owned()],
+            );
+        }
 
         let [skip] = decisions.as_slice() else {
             panic!("one chip per feature, got {}", decisions.len());
@@ -1031,17 +1075,54 @@ mod tests {
             feature.clone(),
             NoteOutcome::Acted,
         )];
-        skipped(&mut recalled, feature, &[NEAR_MISS.to_owned()]);
+        skipped(
+            &mut recalled,
+            DecisionSubject::Turn,
+            feature,
+            None,
+            &[NEAR_MISS.to_owned()],
+        );
         assert_eq!(recalled.len(), 1);
     }
 
+    #[test_case(DecisionSubject::Turn, DecisionFeature::ContentScreening => true ; "a_turns_wait")]
+    #[test_case(call(CALL), DecisionFeature::MemoryRecall => true ; "a_recall_waiting_on_a_card")]
+    #[test_case(call(CALL), DecisionFeature::ContentScreening => false ; "a_calls_own_wait")]
+    fn only_a_calls_own_wait_ends_without_a_trace(
+        subject: DecisionSubject,
+        feature: DecisionFeature,
+    ) -> bool {
+        keeps_quiet(&subject, &feature)
+    }
+
     #[test]
-    fn a_calls_wait_never_goes_quiet() {
-        let feature = DecisionFeature::ContentScreening;
+    fn a_quiet_answer_on_a_card_names_what_started_it() {
+        let feature = DecisionFeature::MemoryRecall;
         let mut decisions = vec![pending(call(CALL), feature.clone())];
 
-        assert!(!quiet(&mut decisions, &feature, &[]));
-        assert!(decisions[0].is_pending());
+        assert!(!quiet(
+            &mut decisions,
+            &DecisionSubject::Turn,
+            &feature,
+            None,
+            &[]
+        ));
+        assert!(quiet(
+            &mut decisions,
+            &call(CALL),
+            &feature,
+            Some(CAUSE),
+            &[NEAR_MISS.into()]
+        ));
+
+        let [(_, searched)] = details(&decisions).try_into().unwrap();
+        assert_eq!(
+            searched,
+            format!(
+                "{}{DECISION_SEPARATOR}{CAUSE}{DECISION_SEPARATOR}{NO_NOTES}\n{NEAR_MISS}",
+                feature.label()
+            )
+        );
     }
 
     /// Every chip on a row quiet reads as one dim chip timed by the longest;

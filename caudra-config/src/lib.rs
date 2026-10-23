@@ -2543,7 +2543,7 @@ pub struct UiConfig {
 
     #[config(
         default = true,
-        desc = "Show what the decision engine changed or is deciding. A decision about a tool call is a chip on the call's card, such as `◆ reranking…` while the engine works and `◆ reranked` once it answers, and opening the card shows the candidates and scores behind it. A decision about a turn, such as a skill suggestion or a skipped goal check, is a row that expands on click. Failures say the default applied, and `shadow` marks what a feature in shadow mode would have done. The model never sees them"
+        desc = "Show what the decision engine changed or is deciding. A decision about a tool call is a chip on the call's card, such as `◆ reranking…` while the engine works and `◆ reranked` once it answers, and clicking the chip shows the candidates and scores behind it under the card's header. A decision about a turn, such as a skill suggestion or a skipped goal check, is a row that expands on click. Failures say the default applied, and `shadow` marks what a feature in shadow mode would have done. The model never sees them"
     )]
     pub show_decisions: bool,
 

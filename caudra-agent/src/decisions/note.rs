@@ -28,6 +28,8 @@ const FALLBACK_SEPARATOR: &str = "; ";
 const COLUMN_SEPARATOR: &str = "  ";
 const ORDINAL_SUFFIXES: [&str; 4] = ["th", "st", "nd", "rd"];
 const KEPT_VERB: &str = "kept";
+/// Between what started a decision and what it did: `step started · named 2 notes`.
+const CAUSE_SEPARATOR: &str = " · ";
 const MOVED_VERB: &str = "moved";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -215,14 +217,29 @@ impl NoteDraft {
 pub struct NoteSink {
     event_tx: EventSender,
     anchor: NoteAnchor,
+    cause: Option<&'static str>,
 }
 
 impl NoteSink {
     pub fn new(event_tx: EventSender, anchor: NoteAnchor) -> Self {
-        Self { event_tx, anchor }
+        Self {
+            event_tx,
+            anchor,
+            cause: None,
+        }
     }
 
-    pub fn emit(&self, draft: NoteDraft) {
+    /// Names what started the decisions placed here, which leads each row's
+    /// summary and rides on each wait, for a surface that runs for more than
+    /// one reason.
+    pub fn caused(self, cause: Option<&'static str>) -> Self {
+        Self { cause, ..self }
+    }
+
+    pub fn emit(&self, mut draft: NoteDraft) {
+        if let Some(cause) = self.cause {
+            draft.summary = format!("{cause}{CAUSE_SEPARATOR}{}", draft.summary);
+        }
         self.event_tx.try_send(draft.anchored(self.anchor.clone()));
     }
 
@@ -257,6 +274,7 @@ impl NoteSink {
         PendingDecision {
             feature: feature.clone(),
             anchor: self.anchor.clone(),
+            cause: self.cause,
             details,
         }
     }
@@ -268,6 +286,9 @@ pub struct PendingDecision {
     #[serde(serialize_with = "feature_name")]
     pub feature: DecisionFeature,
     pub anchor: NoteAnchor,
+    /// What started it, when its feature runs for more than one reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<&'static str>,
     /// Empty while it waits. Settled without a note, what the engine weighed
     /// and found short of the bar, one candidate per line, or, settled without
     /// a wait, why the engine was not asked. Never stored.
@@ -427,8 +448,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DecisionNote, ELLIPSIS, MAX_DETAIL_BYTES, MAX_DETAIL_LINES, MAX_NOTE_BYTES,
-        MAX_SUMMARY_BYTES, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, UNASSIGNED_SEQ, placement,
+        CAUSE_SEPARATOR, DecisionNote, ELLIPSIS, MAX_DETAIL_BYTES, MAX_DETAIL_LINES,
+        MAX_NOTE_BYTES, MAX_SUMMARY_BYTES, NoteAnchor, NoteDraft, NoteOutcome, NoteSink,
+        UNASSIGNED_SEQ, placement,
     };
     use crate::decisions::{DecisionFeature, Decisions};
     use crate::{AgentEvent, Envelope, EventSender};
@@ -447,6 +469,7 @@ mod tests {
     const BASE_URL: &str = "http://127.0.0.1:1";
     const PENDING: &str = "pending";
     const SETTLED: &str = "settled";
+    const CAUSE: &str = "step started";
 
     fn note(summary: &str, details: Vec<String>) -> DecisionNote {
         DecisionNote::new(
@@ -672,5 +695,31 @@ mod tests {
                 "anchor": expected_anchor,
             })
         );
+    }
+
+    #[test_case(None, None, SUMMARY.to_owned() ; "a_sink_without_a_cause_keeps_the_summary")]
+    #[test_case(Some(CAUSE), Some(json!(CAUSE)), format!("{CAUSE}{CAUSE_SEPARATOR}{SUMMARY}") ; "a_caused_sink_leads_with_its_cause")]
+    fn a_cause_rides_on_the_wait_and_leads_the_summary(
+        cause: Option<&'static str>,
+        serialized: Option<serde_json::Value>,
+        summary: String,
+    ) {
+        let (sink, decisions, events, _root) = sink_for(FeatureMode::Enforce);
+        sink.caused(cause)
+            .begin(&decisions, DecisionFeature::SourceCodeContext)
+            .emit(draft(DecisionFeature::SourceCodeContext));
+        let heard: Vec<(Option<serde_json::Value>, Option<String>)> = events
+            .try_iter()
+            .map(|envelope| match envelope.event {
+                AgentEvent::DecisionPending(pending) => {
+                    assert_eq!(pending.cause, cause);
+                    let event = serde_json::to_value(&*pending).unwrap();
+                    (event.get("cause").cloned(), None)
+                }
+                AgentEvent::Decision(note) => (None, Some(note.summary)),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(heard, [(serialized, None), (None, Some(summary))]);
     }
 }

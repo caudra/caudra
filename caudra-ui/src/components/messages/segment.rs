@@ -530,6 +530,9 @@ impl Segment {
         self.scroll_spans = tl.scroll_spans;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
+        self.decision_chips = tl
+            .decision_chips
+            .map(|(line, columns)| ChipsHit { line, columns });
         self.set_lines(tl.lines);
         self.set_links(tl.links);
         self.set_images(tl.images);
@@ -1202,6 +1205,7 @@ mod tests {
             truncation: false,
             source: None,
             images: Vec::new(),
+            decision_chips: None,
         }
     }
 

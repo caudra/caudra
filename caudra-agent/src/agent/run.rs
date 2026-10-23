@@ -142,6 +142,9 @@ const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 /// Provider requests a recall the agent starts on its own waits after the
 /// last one, so a burst of todo updates asks the engine once.
 const RECALL_SPACING_REQUESTS: usize = 5;
+const STEP_STARTED_CAUSE: &str = "step started";
+const GOAL_UNMET_CAUSE: &str = "goal unmet";
+const COMPACTED_CAUSE: &str = "after compaction";
 pub(crate) const GOAL_MET_QUESTION: &str = "goal_met";
 const GOAL_PRESCREEN_CONTINUATION: &str =
     "Continue working toward the goal. Verify the remaining requirements before finishing.";
@@ -351,6 +354,17 @@ enum RecallTrigger<'a> {
 impl RecallTrigger<'_> {
     fn spaced(self) -> bool {
         matches!(self, Self::StepStarted | Self::GoalContinued { .. })
+    }
+
+    /// What a recall the agent starts on its own says started it. A request's
+    /// recall sits on the request, which says so already.
+    fn cause(self) -> Option<&'static str> {
+        match self {
+            Self::Request(_) => None,
+            Self::StepStarted => Some(STEP_STARTED_CAUSE),
+            Self::GoalContinued { .. } => Some(GOAL_UNMET_CAUSE),
+            Self::Compacted => Some(COMPACTED_CAUSE),
+        }
     }
 }
 
@@ -3368,6 +3382,7 @@ impl<'h> Agent<'h> {
 
     /// The recall `trigger` asks for, built from what the agent owns so a
     /// turn's first recall can ask the engine next to the skill suggestion.
+    /// A step's recall goes on the todo update that started the step.
     /// The ones the agent starts on its own while it works wait
     /// [`RECALL_SPACING_REQUESTS`] provider requests after the last.
     fn memory_recall(&mut self, trigger: RecallTrigger<'_>) -> Option<Recall> {
@@ -3404,13 +3419,19 @@ impl<'h> Agent<'h> {
             permissions: Some(Arc::clone(&self.permissions)),
             cancel: self.cancel.clone(),
         };
+        let rows = match (trigger, self.history.todos_call()) {
+            (RecallTrigger::StepStarted, Some(call)) => {
+                NoteSink::new(self.event_tx.clone(), NoteAnchor::Tool(call.to_owned()))
+            }
+            _ => self.decision_rows(),
+        };
         self.requests_since_recall = 0;
         Some(Recall::new(
             judge,
             store,
             self.history.as_slice(),
             query,
-            self.decision_rows(),
+            rows.caused(trigger.cause()),
         ))
     }
 
@@ -5864,7 +5885,7 @@ mod tests {
             let provider = MockProvider::new(responses);
             let captured = Arc::clone(&provider.captured_messages);
             let mut history = History::new(Vec::new());
-            let (mut agent, _events) = recalling_agent(
+            let (mut agent, events) = recalling_agent(
                 &mut history,
                 state.path(),
                 FeatureMode::Advise,
@@ -5880,7 +5901,19 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            drop(agent);
 
+            let started_by = NoteAnchor::Tool(history.todos_call().unwrap().to_owned());
+            let recalls: Vec<(NoteAnchor, bool)> = events
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Decision(note) if note.feature == DecisionFeature::MemoryRecall => {
+                        Some((note.anchor, note.summary.starts_with(STEP_STARTED_CAUSE)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(recalls, vec![(started_by, true); reminders]);
             let requests = captured.lock().unwrap();
             assert_eq!(
                 requests[..=waiting]
