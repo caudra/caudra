@@ -988,9 +988,7 @@ class AttributionTests(unittest.TestCase):
             output, self.root, graphs, "fixture-target", policy
         )
         record = manifest["packages"][0]
-        self.assertEqual(
-            record["selected_license"], ["Apache-2.0", "MIT", "MPL-2.0"]
-        )
+        self.assertEqual(record["selected_license"], ["Apache-2.0", "MIT", "MPL-2.0"])
         for path, license_bytes in licenses.items():
             self.assertEqual((output / path).read_bytes(), license_bytes)
         with tarfile.open(output / record["source_archive"], "r:gz") as archive:
