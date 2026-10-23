@@ -15651,6 +15651,139 @@ fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
     assert_eq!(forked.session.messages(), items);
 }
 
+const FORK_COMMAND: &str = "/fork";
+const FORK_FIRST_PROMPT: &str = "first prompt";
+const FORK_FIRST_REPLY: &str = "first reply";
+const FORK_RUNNING_PROMPT: &str = "running prompt";
+const FORK_CALL_ID: &str = "call-1";
+
+fn fork_reply(text: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        ..Default::default()
+    }
+}
+
+fn fork_call() -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::tool_use(
+            FORK_CALL_ID,
+            "read",
+            serde_json::json!({}),
+        )],
+        ..Default::default()
+    }
+}
+
+fn ending_on_reply() -> Vec<Message> {
+    vec![
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+    ]
+}
+
+fn ending_on_tool_result() -> Vec<Message> {
+    vec![
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_call(),
+        tool_result_msg(FORK_CALL_ID, FORK_FIRST_REPLY),
+    ]
+}
+
+fn forked_by_command(app: &mut App) -> ForkedSession {
+    let mut actions = app.execute_command(cmd(FORK_COMMAND), 0);
+    assert_eq!(actions.len(), 1, "{:?}", app.status_bar.flash_text());
+    let Action::ForkSession(forked) = actions.remove(0) else {
+        panic!("/fork must fork");
+    };
+    *forked
+}
+
+#[test_case(ending_on_reply ; "assistant_text")]
+#[test_case(ending_on_tool_result ; "tool_result")]
+fn fork_command_copies_the_whole_conversation_when_idle(history: fn() -> Vec<Message>) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&history());
+    app.state.session_mut().replace_messages(items.clone());
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), items);
+    assert!(forked.draft.is_none());
+}
+
+#[test]
+fn fork_command_leaves_the_running_turn_behind() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+        Message::user(FORK_RUNNING_PROMPT.into()),
+        fork_call(),
+    ]);
+    app.state.session_mut().replace_messages(items.clone());
+    let head = crate::session_history_head(&app.state.session);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), &items[..2]);
+    assert_eq!(forked.draft.unwrap().text, FORK_RUNNING_PROMPT);
+    assert_eq!(app.state.session.messages(), items);
+    assert_eq!(crate::session_history_head(&app.state.session), head);
+}
+
+#[test_case(Status::Idle ; "idle")]
+#[test_case(Status::Streaming ; "streaming")]
+fn fork_command_with_nothing_to_fork_says_so(status: Status) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.status = status;
+
+    let actions = app.execute_command(cmd(FORK_COMMAND), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::session::NOTHING_TO_FORK)
+    );
+}
+
+#[test]
+fn fork_command_follows_a_pending_revert() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user(FORK_FIRST_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+        Message::user(FORK_RUNNING_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+    ]);
+    app.state.session_mut().replace_messages(items.clone());
+    app.revert_to(items[2].id, RestoreMode::Conversation);
+    assert!(app.state.session.meta.pending_revert.is_some());
+
+    let forked = forked_by_command(&mut app);
+
+    assert_eq!(forked.session.messages(), &items[..2]);
+    assert!(forked.draft.is_none());
+}
+
+#[test]
+fn fork_command_waits_for_a_cancellation() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.state
+        .session_mut()
+        .replace_messages(crate::history_items(&ending_on_reply()));
+    app.cancelling_run = Some(1);
+
+    let actions = app.execute_command(cmd(FORK_COMMAND), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(REVERT_BUSY_MSG));
+}
+
 #[test]
 fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() {
     let (_temp, _, _, mut app) = tempdir_app();

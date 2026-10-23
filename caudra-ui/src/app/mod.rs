@@ -3225,13 +3225,10 @@ impl App {
             return Vec::new();
         };
         match kind {
-            MessageActionKind::Fork => match self.fork_at(source) {
-                Ok(forked) => vec![Action::ForkSession(Box::new(forked))],
-                Err(error) => {
-                    self.flash(error);
-                    Vec::new()
-                }
-            },
+            MessageActionKind::Fork => {
+                let forked = self.fork_at(source);
+                self.fork_actions(forked)
+            }
             MessageActionKind::RevertBoth => vec![Action::RevertSession {
                 source,
                 mode: RestoreMode::Both,
@@ -6247,6 +6244,7 @@ impl App {
                 }
             },
             "/rename" => self.rename_session(&cmd.args),
+            "/fork" => self.fork_latest(),
             "/model" => {
                 self.model_picker.open(
                     &self.state.model,

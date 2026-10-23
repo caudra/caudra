@@ -27,7 +27,7 @@ use crate::theme;
 const TICK_TIMEOUT_MS: u64 = 10;
 /// Abbreviations that keep opening the command they opened before a newer,
 /// shorter name tied them: nucleo breaks a score tie towards the shorter name.
-const HELD_ABBREVIATIONS: &[(&str, &str)] = &[("p", "/permissions")];
+const HELD_ABBREVIATIONS: &[(&str, &str)] = &[("p", "/permissions"), ("f", "/fast")];
 pub(crate) const SECTION_BUILTIN: &str = "Built-in";
 const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
@@ -348,6 +348,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Rename the current session",
         max_args: usize::MAX,
         scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
+        name: "/fork",
+        description: "Fork the session into a new one at its latest message",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
         features: &[],
     },
     BuiltinCommand {
@@ -1629,6 +1636,21 @@ mod tests {
         assert!(row.takes_args());
     }
 
+    #[test]
+    fn fork_is_main_only_and_takes_no_arguments() {
+        const COMMAND: &str = "/fork";
+        let mut palette = synced(COMMAND);
+        assert_eq!(palette.confirm(COMMAND).unwrap().name, COMMAND);
+        assert!(palette.is_main_only(COMMAND));
+        let row = palette
+            .rows(true)
+            .into_iter()
+            .find(|row| row.name == COMMAND)
+            .unwrap();
+        assert!(row.disabled);
+        assert!(!row.takes_args());
+    }
+
     #[test_case(false; "main")]
     #[test_case(true; "task")]
     fn decisions_diagnostics_are_available_without_arguments(task_focused: bool) {
@@ -1975,6 +1997,8 @@ mod tests {
     #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
     #[test_case("/cpt", "/compact", ""    ; "fuzzy-match-2")]
     #[test_case("/p", "/permissions", ""  ; "p_keeps_opening_permissions")]
+    #[test_case("/f", "/fast", ""  ; "f_keeps_opening_fast")]
+    #[test_case("/fo", "/fork", ""  ; "fo_opens_fork")]
     #[test_case("/pr", "/projection", ""  ; "pr_opens_projection")]
     #[test_case("/proj", "/projection", "" ; "proj_opens_projection")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
