@@ -49,7 +49,7 @@ use caudra_storage::StateDir;
 use caudra_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
 use serde_json::{Value, json};
 use smol::Timer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use self::call::{CallScope, Elicitor};
 use self::code::view::{ServerState, ServerView, ToolView, cut_instructions};
@@ -83,6 +83,7 @@ pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const STARTUP_EPOCH: u64 = 0;
 const PROMPT_TOOL: &str = "mcp_prompt";
 const MCP_UNAVAILABLE: &str = "MCP not available";
+const INVALID_CONFIG: &str = "invalid server configuration";
 /// How long a server's list changes settle before it is listed again, so a
 /// burst of them costs one listing.
 pub const LIST_CHANGE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -1458,6 +1459,18 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
     }
 
     if enabled {
+        if let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == server_name && entry.config.is_none())
+        {
+            entry.status = McpServerStatus::Failed(INVALID_CONFIG.into());
+            warn!(
+                server = server_name,
+                "cannot enable MCP server with invalid config"
+            );
+            return;
+        }
         let unpinned_url = inner
             .entries
             .iter()
@@ -1995,6 +2008,10 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
                     *pinned = resolved.unwrap_or_default();
                 }
                 (Some(sc), McpServerStatus::Connecting)
+            }
+            Err(e) if disabled => {
+                debug!(server = %name, error = %e, "invalid config for disabled MCP server");
+                (None, McpServerStatus::Disabled)
             }
             Err(e) => {
                 warn!(server = %name, error = %e, "invalid MCP server config");
@@ -3179,8 +3196,11 @@ mod tests {
 
             let mut disabled = stdio_raw(&["unused-disabled-cmd"]);
             disabled.enabled = false;
+            let mut disabled_unparseable = stdio_raw(&[]);
+            disabled_unparseable.enabled = false;
             let config = make_config(vec![
                 ("disabled-srv", disabled),
+                ("disabled-unparseable-srv", disabled_unparseable),
                 ("unparseable-srv", stdio_raw(&[])),
                 ("unspawnable-srv", stdio_raw(&[MISSING_PROGRAM])),
             ]);
@@ -3199,6 +3219,26 @@ mod tests {
             assert!(failed("unparseable-srv"));
             assert!(failed("unspawnable-srv"));
             assert_eq!(*status("disabled-srv"), McpServerStatus::Disabled);
+            assert_eq!(
+                *status("disabled-unparseable-srv"),
+                McpServerStatus::Disabled
+            );
+        });
+    }
+
+    #[test]
+    fn enabling_an_unparseable_server_fails_it() {
+        smol::block_on(async {
+            let mut raw = stdio_raw(&[]);
+            raw.enabled = false;
+            let mut inner = parse_entries(make_config(vec![("srv", raw)]), None);
+
+            handle_toggle(&mut inner, "srv", true).await;
+
+            assert_eq!(
+                inner.entries[0].status,
+                McpServerStatus::Failed(INVALID_CONFIG.into())
+            );
         });
     }
 
