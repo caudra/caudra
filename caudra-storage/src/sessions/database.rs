@@ -93,7 +93,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -910,12 +910,17 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 35,
         to: 36,
-        sql: crate::shell_runs::TABLE,
+        sql: crate::shell_runs::TABLE_V1,
     },
     Migration {
         from: 36,
         to: 37,
         sql: crate::automation::BUNDLED_SCOPE_MIGRATION,
+    },
+    Migration {
+        from: 37,
+        to: 38,
+        sql: crate::shell_runs::DROP_V1,
     },
 ];
 
@@ -5534,6 +5539,9 @@ fn migrate_to_current(
             transaction.execute_batch(crate::account_switches::TABLE)?;
         }
         if step.to == 36 {
+            crate::shell_runs::retire(&transaction)?;
+        }
+        if step.to == 38 {
             crate::shell_runs::migrate(&transaction)?;
         }
         transaction.pragma_update(None, "user_version", step.to)?;
@@ -7183,6 +7191,10 @@ mod tests {
         shell_durations_tables!()
     );
     const SHELL_RUNS_PREVIOUS_SCHEMA: i64 = 35;
+    const SHELL_READINGS_PREVIOUS_SCHEMA: i64 = 37;
+    const FEATURE_HASHES: &[u8] = &[0; 8];
+    const MIGRATION_DROPS_FEATURE_ROWS: &str =
+        "feature hashes cannot become readings, so schema 38 must drop every old row";
     const RETIRED_FEATURE: &str = "shell_duration";
     const KEPT_FEATURE: &str = "permission";
     /// The ledger as schema 30 left it, keyed without the account.
@@ -12877,6 +12889,49 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(features, [KEPT_FEATURE]);
+    }
+
+    #[test]
+    fn shell_readings_step_replaces_feature_rows() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .execute_batch(crate::shell_runs::DROP_V1)
+            .unwrap();
+        database
+            .connection
+            .execute_batch(crate::shell_runs::TABLE_V1)
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO shell_runs (recorded_at, features, elapsed_ms, outcome) \
+                 VALUES (0, ?1, 0, 0)",
+                [FEATURE_HASHES],
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", SHELL_READINGS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: i64 = migrated
+            .connection
+            .query_row("SELECT count(*) FROM shell_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 0, "{MIGRATION_DROPS_FEATURE_ROWS}");
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
     }
 
     #[test]

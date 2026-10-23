@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,7 @@ use crate::{
 use caudra_config::{ToolKey, resolve_shell_background};
 use caudra_providers::TokenScale;
 use caudra_storage::decision_log::DecisionEffect;
+use caudra_storage::shell_runs::reading::Call;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
 
 /// Where a tool's start presentation goes: the transcript, the caller that
@@ -95,6 +97,7 @@ const GH_PR_CREATE: &str = "gh pr create";
 
 const SHELL_METADATA_INVALID: &str = "validated shell invocation is missing command metadata";
 const SHELL_WORKDIR_FIELD: &str = "workdir";
+const SHELL_TIMEOUT_FIELD: &str = "timeoutSec";
 const SHELL_DEFAULT_WORKDIR: &str = ".";
 const SHELL_MODE_BUILD: &str = "build";
 const SHELL_MODE_READ_ONLY: &str = "read_only";
@@ -1359,13 +1362,16 @@ async fn shell_forecast(
         return None;
     }
     let shell_eta = ShellEta::shared(ctx.tool_output_store.as_ref()?.state_dir());
-    let command = invocation
-        .permission_input()
-        .unwrap_or(input)
-        .get(BASH_COMMAND_FIELD)?
-        .as_str()?;
+    let input = invocation.permission_input().unwrap_or(input);
+    let cwd = ctx.host_cwd.clone().or_else(|| env::current_dir().ok());
+    let call = Call {
+        command: input.get(BASH_COMMAND_FIELD)?.as_str()?,
+        workdir: input.get(SHELL_WORKDIR_FIELD).and_then(Value::as_str),
+        cwd: cwd.as_deref().and_then(Path::to_str),
+        timeout_secs: input.get(SHELL_TIMEOUT_FIELD).and_then(Value::as_f64),
+    };
     ctx.cancel
-        .race(shell_eta.forecast(command))
+        .race(shell_eta.forecast(&call))
         .await
         .ok()
         .flatten()
@@ -1968,7 +1974,7 @@ mod tests {
     use caudra_storage::id::SessionRef;
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::shell_history::ShellExecutionState;
-    use caudra_storage::shell_runs::features::features;
+    use caudra_storage::shell_runs::reading::read;
     use caudra_storage::shell_runs::{RunOutcome, ShellRun, ShellRuns};
     use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_workspace::{RecordScope, TransportErrorKind, WorkspaceError, WorkspacePath};
@@ -1989,6 +1995,7 @@ mod tests {
         PERMISSION_DENIED_PREFIX, PermissionManager, PermissionResource, PermissionResourceAccess,
         PermissionResourceKind, PermissionRisk,
     };
+    use crate::shell_eta::MIN_TRAINING_RUNS;
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
@@ -2032,7 +2039,7 @@ mod tests {
     const ASYNC_SHELL_TIMEOUT: Duration = Duration::from_secs(121);
     const DURATION_DEFAULT_SECS: u64 = 120;
     const DURATION_CAP_SECS: u64 = 21_600;
-    const SEEDED_RUNS: usize = 30;
+    const SEEDED_RUNS: usize = MIN_TRAINING_RUNS;
     const SEEDED_RUN_MS: u64 = 40_000;
     const SEEDED_RUN_ETA: &str = "ETA ~40s";
     const SHELL_RESULT_MS: u64 = 123;
@@ -2338,7 +2345,12 @@ mod tests {
             for _ in 0..SEEDED_RUNS {
                 runs.append(
                     &ShellRun {
-                        features: features(SHELL_COMMAND),
+                        reading: read(&Call {
+                            command: SHELL_COMMAND,
+                            workdir: None,
+                            cwd: None,
+                            timeout_secs: None,
+                        }),
                         elapsed_ms,
                         outcome: RunOutcome::Completed,
                     },

@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use super::features::features;
+use super::reading::{Call, Reading, read};
 use super::{MAX_SHELL_RUNS, RunOutcome, ShellRun, insert};
 use crate::sessions::{SessionError, decompress_payload};
 
@@ -45,11 +45,27 @@ struct HistoryCall {
 #[derive(Deserialize, Default)]
 struct CallInput {
     command: Option<String>,
+    workdir: Option<String>,
+    #[serde(rename = "timeoutSec")]
+    timeout_secs: Option<f64>,
 }
 
 struct ShellCall {
     call_id: String,
     command: String,
+    workdir: Option<String>,
+    timeout_secs: Option<f64>,
+}
+
+impl ShellCall {
+    fn reading(&self, cwd: &str) -> Reading {
+        read(&Call {
+            command: &self.command,
+            workdir: self.workdir.as_deref(),
+            cwd: Some(cwd),
+            timeout_secs: self.timeout_secs,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -108,17 +124,17 @@ struct BackgroundOutcome {
 /// the migration: a run the model never sees only costs it one example.
 pub(super) fn backfill(connection: &Connection) -> Result<usize, SessionError> {
     let mut background = background_runs(connection)?;
-    let sessions: Vec<(Vec<u8>, i64)> = connection
-        .prepare("SELECT id, updated_at FROM sessions ORDER BY updated_at DESC, id DESC")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let sessions: Vec<(Vec<u8>, i64, String)> = connection
+        .prepare("SELECT id, updated_at, cwd FROM sessions ORDER BY updated_at DESC, id DESC")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let mut newest_first = Vec::new();
     let mut found = 0;
-    for (session, updated_at) in sessions {
+    for (session, updated_at, cwd) in sessions {
         if found >= MAX_SHELL_RUNS {
             break;
         }
-        let runs = session_runs(connection, &session, &mut background)?;
+        let runs = session_runs(connection, &session, &cwd, &mut background)?;
         found += runs.len();
         newest_first.push((u64::try_from(updated_at).unwrap_or_default(), runs));
     }
@@ -138,6 +154,7 @@ pub(super) fn backfill(connection: &Connection) -> Result<usize, SessionError> {
 fn session_runs(
     connection: &Connection,
     session: &[u8],
+    cwd: &str,
     background: &mut HashMap<CallKey, Measured>,
 ) -> Result<Vec<ShellRun>, SessionError> {
     let mut calls = shell_calls(connection, MAIN_ITEMS, session)?;
@@ -154,13 +171,13 @@ fn session_runs(
             .optional()?
             .and_then(|payload| foreground_output(&payload));
         let Some(measured) =
-            foreground.or_else(|| background.remove(&(session.to_vec(), call.call_id)))
+            foreground.or_else(|| background.remove(&(session.to_vec(), call.call_id.clone())))
         else {
             continue;
         };
         if let Some(outcome) = measured.outcome() {
             runs.push(ShellRun {
-                features: features(&call.command),
+                reading: call.reading(cwd),
                 elapsed_ms: measured.duration_ms,
                 outcome,
             });
@@ -193,6 +210,8 @@ fn shell_call(payload: &[u8]) -> Option<ShellCall> {
     Some(ShellCall {
         call_id: call.call_id,
         command: call.input.command?,
+        workdir: call.input.workdir,
+        timeout_secs: call.input.timeout_secs,
     })
 }
 
@@ -258,10 +277,11 @@ mod tests {
 
     use super::backfill;
     use crate::sessions::compress_payload;
+    use crate::shell_runs::reading::{Call, Reading, decode, read};
     use crate::shell_runs::{RunOutcome, TABLE};
 
     const HISTORY_SCHEMA: &str = "
-        CREATE TABLE sessions (id BLOB PRIMARY KEY, updated_at INTEGER NOT NULL);
+        CREATE TABLE sessions (id BLOB PRIMARY KEY, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL);
         CREATE TABLE main_history_items (session_id BLOB, ordinal INTEGER, payload BLOB);
         CREATE TABLE subagent_history_items
             (session_id BLOB, subagent_id TEXT, ordinal INTEGER, payload BLOB);
@@ -272,6 +292,8 @@ mod tests {
     const NEWER: &[u8] = b"newer-session-id";
     const OLDER_AT: i64 = 100;
     const NEWER_AT: i64 = 200;
+    const OLDER_CWD: &str = "/work/older";
+    const NEWER_CWD: &str = "/work/newer";
     const QUICK_MS: u64 = 20;
     const BACKGROUND_MS: u64 = 40_000;
     const TIMED_OUT_MS: u64 = 120_000;
@@ -279,10 +301,20 @@ mod tests {
     const READ_MS: u64 = 7;
     const SUBAGENT: &str = "toolu_task";
     const NOT_ZSTD: &[u8] = b"not a compressed payload";
+    const STATUS: &str = "git status";
+    const BUILD: &str = "cargo build --release";
+    const BUILD_WORKDIR: &str = "/work/newer/crate";
+    const BUILD_TIMEOUT_SECS: f64 = 600.0;
+    const SLEEP: &str = "sleep 999";
+    const TEST: &str = "cargo test";
 
-    fn call(call_id: &str, name: &str, command: &str) -> Vec<u8> {
-        let item = json!({"type": "tool_call", "name": name, "call_id": call_id, "input": {"command": command}});
+    fn call(call_id: &str, name: &str, input: Value) -> Vec<u8> {
+        let item = json!({"type": "tool_call", "name": name, "call_id": call_id, "input": input});
         compress_payload(&item.to_string()).unwrap()
+    }
+
+    fn shell(call_id: &str, command: &str) -> Vec<u8> {
+        call(call_id, "shell", json!({"command": command}))
     }
 
     fn measured(duration_ms: u64, exit_code: Option<i64>, timed_out: bool) -> Value {
@@ -293,21 +325,41 @@ mod tests {
         i64::try_from(elapsed_ms).unwrap()
     }
 
+    fn in_session(command: &str, cwd: &str) -> Reading {
+        read(&Call {
+            command,
+            workdir: None,
+            cwd: Some(cwd),
+            timeout_secs: None,
+        })
+    }
+
     fn history() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(HISTORY_SCHEMA).unwrap();
         connection.execute_batch(TABLE).unwrap();
-        for (id, at) in [(OLDER, OLDER_AT), (NEWER, NEWER_AT)] {
+        for (id, at, cwd) in [(OLDER, OLDER_AT, OLDER_CWD), (NEWER, NEWER_AT, NEWER_CWD)] {
             connection
-                .execute("INSERT INTO sessions VALUES (?1, ?2)", params![id, at])
+                .execute(
+                    "INSERT INTO sessions VALUES (?1, ?2, ?3)",
+                    params![id, at, cwd],
+                )
                 .unwrap();
         }
+        let build = json!({
+            "command": BUILD,
+            "workdir": BUILD_WORKDIR,
+            "timeoutSec": BUILD_TIMEOUT_SECS,
+        });
         let main = [
-            (OLDER, call("c1", "shell", "git status")),
-            (NEWER, call("c2", "shell", "cargo build --release")),
-            (NEWER, call("c3", "file_read", "src/lib.rs")),
-            (NEWER, call("c4", "shell", "sleep 999")),
-            (NEWER, call("c5", "shell", "echo never finished")),
+            (OLDER, shell("c1", STATUS)),
+            (NEWER, call("c2", "shell", build)),
+            (
+                NEWER,
+                call("c3", "file_read", json!({"command": "src/lib.rs"})),
+            ),
+            (NEWER, shell("c4", SLEEP)),
+            (NEWER, shell("c5", "echo never finished")),
             (NEWER, NOT_ZSTD.to_vec()),
         ];
         for (ordinal, (session, payload)) in main.into_iter().enumerate() {
@@ -321,7 +373,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO subagent_history_items VALUES (?1, ?2, 0, ?3)",
-                params![NEWER, SUBAGENT, call("c6", "shell", "cargo test")],
+                params![NEWER, SUBAGENT, shell("c6", TEST)],
             )
             .unwrap();
         let outputs = [
@@ -362,21 +414,50 @@ mod tests {
 
         assert_eq!(backfill(&connection).unwrap(), 4);
 
-        let stored: Vec<(i64, i64, i64)> = connection
-            .prepare("SELECT recorded_at, elapsed_ms, outcome FROM shell_runs ORDER BY id")
+        let stored: Vec<(i64, Vec<u8>, i64, i64)> = connection
+            .prepare("SELECT recorded_at, reading, elapsed_ms, outcome FROM shell_runs ORDER BY id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
+        let stored: Vec<(i64, Reading, i64, i64)> = stored
+            .into_iter()
+            .map(|(at, reading, elapsed, outcome)| {
+                (at, decode(&reading).unwrap(), elapsed, outcome)
+            })
+            .collect();
+        let build = read(&Call {
+            command: BUILD,
+            workdir: Some(BUILD_WORKDIR),
+            cwd: Some(NEWER_CWD),
+            timeout_secs: Some(BUILD_TIMEOUT_SECS),
+        });
         let completed = RunOutcome::Completed.code();
         assert_eq!(
             stored,
             [
-                (OLDER_AT, ms(QUICK_MS), completed),
-                (NEWER_AT, ms(BACKGROUND_MS), completed),
-                (NEWER_AT, ms(TIMED_OUT_MS), RunOutcome::TimedOut.code()),
-                (NEWER_AT, ms(SUBAGENT_MS), completed),
+                (
+                    OLDER_AT,
+                    in_session(STATUS, OLDER_CWD),
+                    ms(QUICK_MS),
+                    completed
+                ),
+                (NEWER_AT, build, ms(BACKGROUND_MS), completed),
+                (
+                    NEWER_AT,
+                    in_session(SLEEP, NEWER_CWD),
+                    ms(TIMED_OUT_MS),
+                    RunOutcome::TimedOut.code()
+                ),
+                (
+                    NEWER_AT,
+                    in_session(TEST, NEWER_CWD),
+                    ms(SUBAGENT_MS),
+                    completed
+                ),
             ]
         );
     }
