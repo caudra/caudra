@@ -1,7 +1,7 @@
-//! Upstream's `tlc-to-chart.mjs` for one model: it collapses the model onto the reader's states,
-//! groups the counterexamples into bugs, and draws the Mermaid chart. The second model of
-//! `--fixed-dot` and `--against-dot`, which replays each bug and marks states fixed, is not here
-//! yet: it adds a `Status::Fixed` source, second-only edges, and a `second` field per bug.
+//! Upstream's `tlc-to-chart.mjs`: it collapses the model onto the reader's states, groups the
+//! counterexamples into bugs, and draws the Mermaid chart. With a second model, the fix or the
+//! spec the code must follow, the chart also draws the steps only it takes, each bug's replay on
+//! it, and its own bugs, and marks states fixed.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -12,8 +12,9 @@ use thiserror::Error;
 
 use super::mapping::{self, Mapping, MappingError};
 use super::mermaid::MermaidError;
-use super::model::{Model, Trace};
+use super::model::{Model, Trace, Vars};
 use super::ordered::{OrderedMap, OrderedSet};
+use super::second::{self, DEFAULT_AGAINST_LABEL, Replay, Role, SecondModel, Turn};
 use super::story;
 use super::text::{
     FULL_LABELS, GROUP_PALETTE, LEGEND_ID, PLAIN_FILL, STATE_WIDTH, STATUS_CLASSES, STEP_WIDTH,
@@ -24,7 +25,7 @@ use super::text::{
 pub(super) const SEP: char = '\0';
 const CONTEXT: &str = ": ";
 const OR: &str = " or ";
-const BREAK: &str = "<br/>";
+pub(super) const BREAK: &str = "<br/>";
 const GROUP_GAP: &str = "<br/>#160;<br/>";
 const STATEMENT_END: char = ';';
 const STATEMENT_END_STANDIN: &str = ",";
@@ -37,9 +38,8 @@ const STATUS_GROUP_NAMES: [&str; 5] = [
 ];
 const DEFAULT_WORKS: &str = "Works";
 const DEFAULT_WRONG: &str = "Breaks a rule";
-/// What upstream's legend calls a state only the second model has when there is none: its label
-/// defaults to "the spec".
-const DEFAULT_FIXED: &str = "Only in the spec";
+const FIX_WORKS: &str = "Works today";
+const CANNOT_HAPPEN: &str = " cannot happen";
 const PLAIN: &str = "plain";
 const PATH: &str = "Path";
 const BORDERS: [&str; 4] = ["", "Wrong", "Fixed", PATH];
@@ -198,7 +198,18 @@ pub struct Drawing {
 
 /// Draws what one run writes: the overview, then each bug in each view the mapping has.
 pub fn draw(model: &Model, mapping: &Mapping, options: &DrawOptions) -> Result<Charts, ChartError> {
-    let charter = Charter::new(model, mapping, &options.rules)?;
+    draw_with(model, None, mapping, options)
+}
+
+/// Draws what one run with a second model writes: the bugs only the second model has follow the
+/// model's own, each with its charts.
+pub fn draw_with(
+    model: &Model,
+    second: Option<&SecondModel>,
+    mapping: &Mapping,
+    options: &DrawOptions,
+) -> Result<Charts, ChartError> {
+    let charter = Charter::with_second(model, second, mapping, &options.rules)?;
     let cover = !options.comparing && !mapping.reader_actions.is_empty();
     let overview = charter.chart(&ChartOptions {
         full_labels: options.comparing,
@@ -249,7 +260,7 @@ pub fn draw(model: &Model, mapping: &Mapping, options: &DrawOptions) -> Result<C
 }
 
 #[derive(Debug, Clone)]
-struct StepWords {
+pub(super) struct StepWords {
     said: String,
     seconds: Option<f64>,
     guard: String,
@@ -258,7 +269,7 @@ struct StepWords {
 impl StepWords {
     /// Upstream's `stepLabel`: the mapping's words, the action beside them outside the customer
     /// view, and the timer's wait before them.
-    fn label(&self, view: View, action: &str) -> String {
+    pub(super) fn label(&self, view: View, action: &str) -> String {
         let named = if view == View::Customer || self.said == action {
             self.said.clone()
         } else {
@@ -277,6 +288,10 @@ pub(super) struct Bug {
     pub(super) trace: usize,
     pub(super) cause: Option<String>,
     pub(super) count: usize,
+    /// Only the second model has this bug, and `trace` is one of its traces.
+    pub(super) introduced: bool,
+    /// How the bug fares on the second model, when there is one.
+    pub(super) replay: Option<Replay>,
     steps: usize,
     id: String,
 }
@@ -287,40 +302,34 @@ pub(super) struct Palette {
     pub(super) fills: HashMap<String, String>,
 }
 
-/// What every chart of one model shares: the mapping's words for each state and step, read
-/// once, and the bugs.
-pub struct Charter<'a> {
+/// The mapping's words for each state and step of one model, read once.
+pub(super) struct Side<'a> {
     pub(super) model: &'a Model,
-    pub(super) mapping: &'a Mapping,
-    pub(super) rules: &'a HashMap<String, String>,
     vars: Vec<Dynamic>,
     facts: Vec<Dynamic>,
     settled: Vec<bool>,
     customer: Vec<String>,
     detail: Vec<String>,
     groups: Vec<String>,
-    words: Vec<StepWords>,
+    pub(super) words: Vec<StepWords>,
     step_at: HashMap<(usize, usize, Arc<str>), usize>,
-    bad: Vec<bool>,
-    clean: Vec<bool>,
-    pub(super) bugs: Vec<Bug>,
-    pub(super) legend: [String; 3],
-    pub(super) palette: Palette,
+    /// Each state's steps, as indexes of the model's: its moves, then its loops, as upstream
+    /// lists a graph's edges before its loops.
+    pub(super) out: Vec<Vec<usize>>,
 }
 
-impl<'a> Charter<'a> {
-    pub fn new(
-        model: &'a Model,
-        mapping: &'a Mapping,
-        rules: &'a HashMap<String, String>,
-    ) -> Result<Self, ChartError> {
+impl<'a> Side<'a> {
+    fn new(model: &'a Model, mapping: &Mapping, vars: Vec<Dynamic>) -> Result<Self, ChartError> {
         let count = model.states.len();
+        let (loops, moves): (Vec<usize>, Vec<usize>) = (0..model.steps.len())
+            .partition(|&index| model.steps[index].from == model.steps[index].to);
         let mut enabled: Vec<OrderedSet<&str>> = vec![OrderedSet::default(); count];
-        let (loops, moves): (Vec<_>, Vec<_>) = model.steps.iter().partition(|s| s.from == s.to);
-        for step in moves.iter().chain(&loops) {
+        let mut out = vec![Vec::new(); count];
+        for &index in moves.iter().chain(&loops) {
+            let step = &model.steps[index];
             enabled[step.from].insert(step.action.as_deref().unwrap_or_default());
+            out[step.from].push(index);
         }
-        let vars: Vec<Dynamic> = model.states.iter().map(mapping::value).collect();
         let settled: Vec<bool> = enabled
             .iter()
             .map(|actions| mapping.settled(actions.iter().copied()))
@@ -355,39 +364,8 @@ impl<'a> Charter<'a> {
             )?);
             step_at.insert((step.from, step.to, action), index);
         }
-        let mut bad = vec![false; count];
-        for trace in &model.traces {
-            if let Some(&end) = trace.states.last() {
-                bad[end] = true;
-            }
-        }
-        let clean = clean_states(model, &bad);
-        let legend = [
-            mapping
-                .legend
-                .works
-                .clone()
-                .unwrap_or_else(|| DEFAULT_WORKS.to_owned()),
-            mapping
-                .legend
-                .wrong
-                .clone()
-                .unwrap_or_else(|| DEFAULT_WRONG.to_owned()),
-            mapping
-                .legend
-                .fixed
-                .clone()
-                .unwrap_or_else(|| DEFAULT_FIXED.to_owned()),
-        ];
-        let palette = if mapping.has_group() {
-            palette(mapping, &groups, &legend)?
-        } else {
-            Palette::default()
-        };
-        let mut charter = Self {
+        Ok(Self {
             model,
-            mapping,
-            rules,
             vars,
             facts,
             settled,
@@ -396,13 +374,213 @@ impl<'a> Charter<'a> {
             groups,
             words,
             step_at,
-            bad,
-            clean,
+            out,
+        })
+    }
+
+    pub(super) fn step_words(
+        &self,
+        mapping: &Mapping,
+        from: usize,
+        to: usize,
+        action: &Arc<str>,
+    ) -> Result<StepWords, ChartError> {
+        match self.step_at.get(&(from, to, action.clone())) {
+            Some(&index) => Ok(self.words[index].clone()),
+            None => Ok(step_words(
+                mapping,
+                action,
+                &self.vars[from],
+                &self.vars[to],
+            )?),
+        }
+    }
+
+    fn name(&self, state: usize, view: View) -> String {
+        match view {
+            View::Customer => self.customer[state].clone(),
+            View::Developer => self.detail[state].clone(),
+            View::Layered => format!("{}{SEP}{}", self.customer[state], self.detail[state]),
+        }
+    }
+}
+
+/// Which states of one model break a rule: the end of each counterexample, and each state that
+/// no good start reaches through good states only.
+struct Health {
+    bad: Vec<bool>,
+    clean: Vec<bool>,
+}
+
+impl Health {
+    fn new<'t>(model: &Model, traces: impl Iterator<Item = &'t Trace>) -> Self {
+        let mut bad = vec![false; model.states.len()];
+        for trace in traces {
+            if let Some(&end) = trace.states.last() {
+                bad[end] = true;
+            }
+        }
+        let clean = clean_states(model, &bad);
+        Self { bad, clean }
+    }
+
+    /// Upstream's `badKeys`: among the keys of this model's states, each that a bad state has,
+    /// or that no clean state has.
+    fn wrong(&self, key_of: &[usize], keys: usize) -> Vec<bool> {
+        let mut present = vec![false; keys];
+        let mut bad = vec![false; keys];
+        let mut clean = vec![false; keys];
+        for (state, &key) in key_of.iter().enumerate() {
+            present[key] = true;
+            bad[key] |= self.bad[state];
+            clean[key] |= self.clean[state];
+        }
+        (0..keys)
+            .map(|key| present[key] && (bad[key] || !clean[key]))
+            .collect()
+    }
+}
+
+/// The second model as the charts read it.
+pub(super) struct SecondSide<'a> {
+    pub(super) side: Side<'a>,
+    pub(super) role: &'a Role,
+    /// The variables and record fields the first model has and this one lacks.
+    pub(super) lacks: Vec<Vec<String>>,
+    /// Each state's variables without the fields that the first model lacks.
+    pub(super) shared: Vec<Vars>,
+    pub(super) actions: HashSet<Option<Arc<str>>>,
+    mapping: Mapping,
+    health: Health,
+    /// For a fix: the first model's states that break the rules the fix does not check, which
+    /// stay as wrong as they are.
+    unchecked: Option<Health>,
+}
+
+impl<'a> SecondSide<'a> {
+    fn new(
+        model: &Model,
+        second: &'a SecondModel<'_>,
+        mapping: &Mapping,
+    ) -> Result<Self, ChartError> {
+        let label: Arc<str> = second.role.label().into();
+        let (start, second_start) = (first_state(model), first_state(second.model));
+        let lacks = second::lacking(&start, &second_start);
+        let extra = second::lacking(&second_start, &start);
+        let mapping = mapping.for_lacking_states();
+        let vars = second
+            .model
+            .states
+            .iter()
+            .map(|state| mapping::lacking_value(state, &lacks, &label))
+            .collect();
+        let side = Side::new(second.model, &mapping, vars)?;
+        let unchecked = second.role.is_fix().then(|| {
+            Health::new(
+                model,
+                model
+                    .traces
+                    .iter()
+                    .filter(|trace| !second.model.rules.contains(&trace.rule)),
+            )
+        });
+        Ok(Self {
+            shared: second
+                .model
+                .states
+                .iter()
+                .map(|state| second::omit(state, &extra))
+                .collect(),
+            actions: second
+                .model
+                .steps
+                .iter()
+                .map(|step| step.action.clone())
+                .collect(),
+            health: Health::new(second.model, second.model.traces.iter()),
+            side,
+            role: &second.role,
+            lacks,
+            mapping,
+            unchecked,
+        })
+    }
+
+    /// "with the fix, LABEL" or "in the spec, LABEL".
+    pub(super) fn within(&self, label: &str) -> String {
+        format!("{} {}, {label}", self.role.within(), self.role.label())
+    }
+}
+
+fn first_state(model: &Model) -> Vars {
+    model
+        .initial
+        .first()
+        .map(|&state| model.states[state].clone())
+        .unwrap_or_default()
+}
+
+/// What every chart of one run shares: the mapping's words for each state and step of both
+/// models, read once, and the bugs.
+pub struct Charter<'a> {
+    pub(super) model: &'a Model,
+    pub(super) mapping: &'a Mapping,
+    pub(super) rules: &'a HashMap<String, String>,
+    pub(super) main: Side<'a>,
+    health: Health,
+    pub(super) second: Option<SecondSide<'a>>,
+    /// The model's bugs, then those only the second model has.
+    pub(super) bugs: Vec<Bug>,
+    pub(super) legend: [String; 3],
+    pub(super) palette: Palette,
+}
+
+impl<'a> Charter<'a> {
+    pub fn new(
+        model: &'a Model,
+        mapping: &'a Mapping,
+        rules: &'a HashMap<String, String>,
+    ) -> Result<Self, ChartError> {
+        Self::with_second(model, None, mapping, rules)
+    }
+
+    /// The charter of a model and the second model each bug replays on. The mapping labels
+    /// both, and fails when it reads a variable or field that the second model lacks.
+    pub fn with_second(
+        model: &'a Model,
+        second: Option<&'a SecondModel<'_>>,
+        mapping: &'a Mapping,
+        rules: &'a HashMap<String, String>,
+    ) -> Result<Self, ChartError> {
+        let values = model.states.iter().map(mapping::value).collect();
+        let main = Side::new(model, mapping, values)?;
+        let second = second
+            .map(|second| SecondSide::new(model, second, mapping))
+            .transpose()?;
+        let legend = legend(mapping, second.as_ref().map(|second| second.role));
+        let palette = if mapping.has_group() {
+            let groups: Vec<String> = main
+                .groups
+                .iter()
+                .chain(second.iter().flat_map(|second| &second.side.groups))
+                .cloned()
+                .collect();
+            palette(mapping, &groups, &legend)?
+        } else {
+            Palette::default()
+        };
+        let mut charter = Self {
+            model,
+            mapping,
+            rules,
+            health: Health::new(model, model.traces.iter()),
+            main,
+            second,
             bugs: Vec::new(),
             legend,
             palette,
         };
-        charter.bugs = charter.bugs()?;
+        charter.bugs = charter.all_bugs()?;
         Ok(charter)
     }
 
@@ -437,53 +615,46 @@ impl<'a> Charter<'a> {
         self.mapping.has_group()
     }
 
-    fn keys(&self, view: View) -> Result<Keys, ChartError> {
+    pub(super) fn role(&self) -> Option<&Role> {
+        self.second.as_ref().map(|second| second.role)
+    }
+
+    /// The counterexample behind a bug, of the model that has it.
+    pub(super) fn trace(&self, bug: &Bug) -> &Trace {
+        match (&self.second, bug.introduced) {
+            (Some(second), true) => &second.side.model.traces[bug.trace],
+            _ => &self.model.traces[bug.trace],
+        }
+    }
+
+    pub(super) fn keys(&self, view: View) -> Result<Keys, ChartError> {
         if view != View::Customer && !self.mapping.has_detail() {
             return Err(ChartError::NoDetail(view.name()));
         }
         let mut keys = Keys::default();
         let mut known: HashMap<String, usize> = HashMap::new();
         for state in 0..self.model.states.len() {
-            let name = match view {
-                View::Customer => self.customer[state].clone(),
-                View::Developer => self.detail[state].clone(),
-                View::Layered => format!("{}{SEP}{}", self.customer[state], self.detail[state]),
-            };
-            let key = *known.entry(name).or_insert_with_key(|name| {
-                keys.names.push(name.clone());
-                keys.names.len() - 1
-            });
+            let key = keys.intern(&mut known, self.main.name(state, view));
             keys.of.push(key);
+        }
+        keys.main = keys.names.len();
+        if let Some(second) = &self.second {
+            for state in 0..second.side.model.states.len() {
+                let key = keys.intern(&mut known, second.side.name(state, view));
+                keys.second.push(key);
+            }
         }
         Ok(keys)
     }
 
-    fn step_words(
-        &self,
-        from: usize,
-        to: usize,
-        action: &Arc<str>,
-    ) -> Result<StepWords, ChartError> {
-        match self.step_at.get(&(from, to, action.clone())) {
-            Some(&index) => Ok(self.words[index].clone()),
-            None => Ok(step_words(
-                self.mapping,
-                action,
-                &self.vars[from],
-                &self.vars[to],
-            )?),
-        }
-    }
-
     /// Where the reader's view moves along `trace`: its first state, and each step that changes
     /// the reader's state or that the reader takes, as upstream's `readerPath`.
-    fn reader_steps(&self, trace: &Trace, keys: &Keys) -> Vec<usize> {
+    pub(super) fn reader_steps(&self, trace: &Trace, key_of: &[usize]) -> Vec<usize> {
         let mut kept = vec![0];
         for at in 1..trace.states.len() {
             let action = trace.actions[at - 1].as_deref().unwrap_or_default();
-            let previous = keys.of[trace.states[kept[kept.len() - 1]]];
-            if keys.of[trace.states[at]] == previous
-                && !self.mapping.reader_actions.contains(action)
+            let previous = key_of[trace.states[kept[kept.len() - 1]]];
+            if key_of[trace.states[at]] == previous && !self.mapping.reader_actions.contains(action)
             {
                 continue;
             }
@@ -492,15 +663,21 @@ impl<'a> Charter<'a> {
         kept
     }
 
-    fn reader_path(
+    /// The reader's path along a trace of the model, or of `second`.
+    pub(super) fn reader_path(
         &self,
         trace: &Trace,
-        keys: &Keys,
+        key_of: &[usize],
+        second: Option<&SecondSide>,
         view: View,
     ) -> Result<Vec<PathStep>, ChartError> {
+        let (side, mapping) = match second {
+            Some(second) => (&second.side, &second.mapping),
+            None => (&self.main, self.mapping),
+        };
         let mut path = Vec::new();
-        for at in self.reader_steps(trace, keys) {
-            let key = keys.of[trace.states[at]];
+        for at in self.reader_steps(trace, key_of) {
+            let key = key_of[trace.states[at]];
             if at == 0 {
                 path.push(PathStep {
                     key,
@@ -510,62 +687,84 @@ impl<'a> Charter<'a> {
                 continue;
             }
             let action = trace.actions[at - 1].clone().unwrap_or_default();
-            let words = self.step_words(trace.states[at - 1], trace.states[at], &action)?;
-            let label = words.label(view, &action);
+            let words =
+                side.step_words(mapping, trace.states[at - 1], trace.states[at], &action)?;
             path.push(PathStep {
                 key,
-                label: if label.is_empty() {
-                    action.to_string()
-                } else {
-                    label
-                },
+                label: or_action(words.label(view, &action), &action),
                 guard: words.guard,
             });
         }
         Ok(path)
     }
 
+    /// The model's bugs, each with its replay on the second model, then the bugs that only the
+    /// second model has.
+    fn all_bugs(&self) -> Result<Vec<Bug>, ChartError> {
+        let keys = self.keys(View::Customer)?;
+        let mut bugs = self.side_bugs(&self.main, self.mapping, &keys.of, &keys.names, false)?;
+        let Some(second) = &self.second else {
+            return Ok(bugs);
+        };
+        for bug in &mut bugs {
+            bug.replay = Some(self.replay(second, &self.model.traces[bug.trace], &keys)?);
+        }
+        let known: HashSet<String> = bugs.iter().map(|bug| bug.id.clone()).collect();
+        let introduced = self.side_bugs(
+            &second.side,
+            &second.mapping,
+            &keys.second,
+            &keys.names,
+            true,
+        )?;
+        bugs.extend(
+            introduced
+                .into_iter()
+                .filter(|bug| !known.contains(&bug.id)),
+        );
+        Ok(bugs)
+    }
+
     /// Upstream's `group`: counterexamples of one rule with one cause, or one end state, are one
     /// bug, drawn by its shortest reader path; bugs order by fewest reader steps.
-    fn bugs(&self) -> Result<Vec<Bug>, ChartError> {
-        let keys = self.keys(View::Customer)?;
+    fn side_bugs(
+        &self,
+        side: &Side,
+        mapping: &Mapping,
+        key_of: &[usize],
+        names: &[String],
+        introduced: bool,
+    ) -> Result<Vec<Bug>, ChartError> {
+        let traces = &side.model.traces;
         let mut by_id: OrderedMap<String, Bug> = OrderedMap::default();
-        for (index, trace) in self.model.traces.iter().enumerate() {
-            let kept = self.reader_steps(trace, &keys);
+        for (index, trace) in traces.iter().enumerate() {
+            let kept = self.reader_steps(trace, key_of);
             let end = trace.states[trace.states.len() - 1];
-            let cause = self
-                .mapping
-                .cause(&self.vars[end], &self.facts[end], &trace.rule)?;
+            let cause = mapping.cause(&side.vars[end], &side.facts[end], &trace.rule)?;
             let shown = cause
                 .clone()
-                .unwrap_or_else(|| keys.names[keys.of[trace.states[kept[kept.len() - 1]]]].clone());
+                .unwrap_or_else(|| names[key_of[trace.states[kept[kept.len() - 1]]]].clone());
             let id = format!("{}{SEP}{shown}", trace.rule);
             let steps = kept.len();
+            let bug = |count| Bug {
+                trace: index,
+                cause: cause.clone(),
+                count,
+                introduced,
+                replay: None,
+                steps,
+                id: id.clone(),
+            };
             match by_id.get_mut(&id) {
-                Some(bug)
-                    if steps < bug.steps
-                        || (steps == bug.steps
-                            && trace.states.len() < self.model.traces[bug.trace].states.len()) =>
+                Some(found)
+                    if steps < found.steps
+                        || (steps == found.steps
+                            && trace.states.len() < traces[found.trace].states.len()) =>
                 {
-                    *bug = Bug {
-                        trace: index,
-                        cause,
-                        count: bug.count + 1,
-                        steps,
-                        id: id.clone(),
-                    };
+                    *found = bug(found.count + 1);
                 }
-                Some(bug) => bug.count += 1,
-                None => by_id.insert(
-                    id.clone(),
-                    Bug {
-                        trace: index,
-                        cause,
-                        count: 1,
-                        steps,
-                        id,
-                    },
-                ),
+                Some(found) => found.count += 1,
+                None => by_id.insert(id.clone(), bug(1)),
             }
         }
         let mut bugs: Vec<Bug> = by_id.into_values();
@@ -573,15 +772,170 @@ impl<'a> Charter<'a> {
             a.steps
                 .cmp(&b.steps)
                 .then_with(|| {
-                    self.model.traces[a.trace]
+                    traces[a.trace]
                         .states
                         .len()
-                        .cmp(&self.model.traces[b.trace].states.len())
+                        .cmp(&traces[b.trace].states.len())
                 })
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(bugs)
     }
+
+    /// Each key's status: with a fix, a state that the fix no longer breaks is fixed; against a
+    /// spec, a state that either breaks is wrong. A state only the second model has is fixed.
+    fn status(&self, keys: &Keys) -> Vec<Status> {
+        let count = keys.names.len();
+        let now = self.health.wrong(&keys.of, count);
+        let Some(second) = &self.second else {
+            return now
+                .into_iter()
+                .map(|wrong| if wrong { Status::Wrong } else { Status::Works })
+                .collect();
+        };
+        let mut later = second.health.wrong(&keys.second, count);
+        if let Some(unchecked) = &second.unchecked {
+            for (key, wrong) in unchecked.wrong(&keys.of, count).into_iter().enumerate() {
+                later[key] |= wrong;
+            }
+        }
+        (0..count)
+            .map(|key| {
+                let only_second = key >= keys.main;
+                match (second.role, now[key], later[key]) {
+                    (Role::Fix { .. }, _, true) | (Role::Against { .. }, true, _) => Status::Wrong,
+                    (Role::Against { .. }, _, true) => Status::Wrong,
+                    (Role::Fix { .. }, true, _) => Status::Fixed,
+                    _ if only_second => Status::Fixed,
+                    _ => Status::Works,
+                }
+            })
+            .collect()
+    }
+
+    /// Upstream's `divergence`: where the second model takes the reader at a bug's turn, as an
+    /// arrow of this view.
+    fn divergence(
+        &self,
+        turn: &Turn,
+        keys: &Keys,
+        edges: &OrderedMap<EdgeId, Edge>,
+        view: View,
+    ) -> Result<Option<Divergence>, ChartError> {
+        let Some(second) = &self.second else {
+            return Ok(None);
+        };
+        let from = keys.of[turn.before];
+        let (key, label) = match turn.taken {
+            None => {
+                let words =
+                    self.main
+                        .step_words(self.mapping, turn.before, turn.after, &turn.action)?;
+                (
+                    from,
+                    or_action(words.label(view, &turn.action), &turn.action),
+                )
+            }
+            Some(index) => {
+                let step = &second.side.model.steps[index];
+                let action = step.action.clone().unwrap_or_default();
+                let label = second.side.words[index].label(view, &action);
+                (keys.second[step.to], or_action(label, &action))
+            }
+        };
+        let disabled = turn.taken.is_none();
+        let text = second.within(&format!(
+            "{label}{}",
+            if disabled { CANNOT_HAPPEN } else { "" }
+        ));
+        let plain = (from, key, false);
+        let drawn = !disabled
+            && edges
+                .get(&plain)
+                .is_some_and(|edge| edge.labels.contains(&label) || edge.labels.contains(&text));
+        Ok(Some(Divergence {
+            from,
+            key,
+            disabled,
+            text,
+            edge: if drawn { plain } else { (from, key, true) },
+        }))
+    }
+}
+
+/// A step's label, or its action when the mapping gives it no words.
+fn or_action(label: String, action: &str) -> String {
+    if label.is_empty() {
+        action.to_owned()
+    } else {
+        label
+    }
+}
+
+/// The legend's words for each status: the mapping's, or upstream's for the second model's role.
+fn legend(mapping: &Mapping, role: Option<&Role>) -> [String; 3] {
+    let label = role.map_or(DEFAULT_AGAINST_LABEL, Role::label);
+    let fix = role.is_some_and(Role::is_fix);
+    let given = &mapping.legend;
+    [
+        given
+            .works
+            .clone()
+            .unwrap_or_else(|| if fix { FIX_WORKS } else { DEFAULT_WORKS }.to_owned()),
+        given.wrong.clone().unwrap_or_else(|| {
+            if fix {
+                format!("Still wrong with {label}")
+            } else {
+                DEFAULT_WRONG.to_owned()
+            }
+        }),
+        given.fixed.clone().unwrap_or_else(|| {
+            if fix {
+                format!("Fixed or new with {label}")
+            } else {
+                format!("Only in {label}")
+            }
+        }),
+    ]
+}
+
+/// The edges between the reader states of one model's steps, each label once, the most common
+/// first.
+fn quotient(side: &Side, key_of: &[usize], view: View) -> OrderedMap<EdgeId, Edge> {
+    let mut counts: OrderedMap<EdgeId, LabelSteps> = OrderedMap::default();
+    for (index, step) in side.model.steps.iter().enumerate() {
+        let (from, to) = (key_of[step.from], key_of[step.to]);
+        if step.from == step.to || from == to {
+            continue;
+        }
+        let (labels, guards) = counts.entry((from, to, false), Default::default);
+        let words = &side.words[index];
+        let label = words.label(view, step.action.as_deref().unwrap_or_default());
+        if label.is_empty() {
+            continue;
+        }
+        *labels.entry(label.clone(), || 0) += 1;
+        guards.entry(label).or_default().insert(words.guard.clone());
+    }
+    let mut edges: OrderedMap<EdgeId, Edge> = OrderedMap::default();
+    for (&id, (labels, guards)) in counts.iter() {
+        let mut ordered: Vec<(&String, &usize)> = labels.iter().collect();
+        ordered.sort_by(|a, b| b.1.cmp(a.1));
+        edges.insert(
+            id,
+            Edge {
+                from: id.0,
+                to: id.1,
+                labels: ordered
+                    .into_iter()
+                    .map(|(label, _)| label.clone())
+                    .collect(),
+                guards: Some(guards.clone()),
+                second_only: false,
+            },
+        );
+    }
+    edges
 }
 
 fn step_words(
@@ -696,22 +1050,39 @@ fn palette(
 }
 
 /// The reader states of one view: each state's key, and each key's label, in the order the
-/// model first reaches them.
+/// model first reaches them, then the second model.
 #[derive(Debug, Default)]
 pub(super) struct Keys {
     pub(super) names: Vec<String>,
     pub(super) of: Vec<usize>,
+    /// The keys of the second model's states.
+    pub(super) second: Vec<usize>,
+    /// The keys from this one on are only the second model's.
+    pub(super) main: usize,
 }
 
-pub(super) type EdgeId = (usize, usize);
+impl Keys {
+    fn intern(&mut self, known: &mut HashMap<String, usize>, name: String) -> usize {
+        *known.entry(name).or_insert_with_key(|name| {
+            self.names.push(name.clone());
+            self.names.len() - 1
+        })
+    }
+}
+
+/// An edge between two keys. A second edge between the same keys, `true`, says where the second
+/// model takes a bug that it does not take as the chart draws it.
+pub(super) type EdgeId = (usize, usize, bool);
 
 #[derive(Debug, Clone)]
 pub(super) struct Edge {
     pub(super) from: usize,
     pub(super) to: usize,
     pub(super) labels: OrderedSet<String>,
-    /// The mapping's guard words for each label, for edges of the model's own steps.
+    /// The mapping's guard words for each label, for edges of the models' own steps.
     pub(super) guards: Option<HashMap<String, BTreeSet<String>>>,
+    /// Only the second model takes this edge.
+    pub(super) second_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +1095,8 @@ pub(super) struct PathStep {
 pub(super) struct Class<'b> {
     pub(super) bug: &'b Bug,
     pub(super) path: Vec<PathStep>,
+    /// Where the second model takes the reader instead, when it parts from the bug's path.
+    pub(super) divergence: Option<Divergence>,
 }
 
 impl Class<'_> {
@@ -735,8 +1108,18 @@ impl Class<'_> {
     pub(super) fn steps(&self) -> impl Iterator<Item = (EdgeId, &PathStep)> {
         self.path
             .windows(2)
-            .map(|pair| ((pair[0].key, pair[1].key), &pair[1]))
+            .map(|pair| ((pair[0].key, pair[1].key, false), &pair[1]))
     }
+}
+
+/// Where the second model takes a bug at its turn, as an arrow of one view.
+pub(super) struct Divergence {
+    pub(super) from: usize,
+    pub(super) key: usize,
+    pub(super) disabled: bool,
+    /// The arrow's words: "with the fix, STEP", or "... STEP cannot happen".
+    pub(super) text: String,
+    pub(super) edge: EdgeId,
 }
 
 struct Numbered {
@@ -761,10 +1144,11 @@ pub(super) struct Flat {
     pub(super) labels: OrderedSet<String>,
 }
 
+/// One arrow's lines: the numbered steps, then the model's steps, then the second model's.
 struct Arrow {
     from: usize,
     to: usize,
-    groups: [Vec<String>; 2],
+    groups: [Vec<String>; 3],
     plain: bool,
     labels: Vec<String>,
 }
@@ -775,6 +1159,14 @@ struct Line {
     text: String,
     plain: bool,
     labels: Vec<String>,
+}
+
+/// The edges of one model's steps, where it starts, and the settled states whose shortest
+/// paths the cover keeps.
+struct Reach<'r> {
+    edges: &'r OrderedMap<EdgeId, Edge>,
+    initial: Vec<usize>,
+    settled: Vec<usize>,
 }
 
 /// One chart: the model collapsed onto the reader's states of one view.
@@ -795,73 +1187,78 @@ pub(super) struct Chart<'c> {
 
 impl<'c> Chart<'c> {
     fn new(charter: &'c Charter<'c>, options: &'c ChartOptions) -> Result<Self, ChartError> {
-        let model = charter.model;
-        let keys = charter.keys(options.view)?;
-        let mut counts: OrderedMap<EdgeId, LabelSteps> = OrderedMap::default();
-        for (index, step) in model.steps.iter().enumerate() {
-            let (from, to) = (keys.of[step.from], keys.of[step.to]);
-            if step.from == step.to || from == to {
-                continue;
-            }
-            let (labels, guards) = counts.entry((from, to), Default::default);
-            let words = &charter.words[index];
-            let label = words.label(options.view, step.action.as_deref().unwrap_or_default());
-            if label.is_empty() {
-                continue;
-            }
-            *labels.entry(label.clone(), || 0) += 1;
-            guards.entry(label).or_default().insert(words.guard.clone());
-        }
-        let mut edges: OrderedMap<EdgeId, Edge> = OrderedMap::default();
-        for (&(from, to), (labels, guards)) in counts.iter() {
-            let mut ordered: Vec<(&String, &usize)> = labels.iter().collect();
-            ordered.sort_by(|a, b| b.1.cmp(a.1));
-            edges.insert(
-                (from, to),
-                Edge {
-                    from,
-                    to,
-                    labels: ordered
-                        .into_iter()
-                        .map(|(label, _)| label.clone())
-                        .collect(),
-                    guards: Some(guards.clone()),
-                },
-            );
-        }
-        let initial: OrderedSet<usize> = model.initial.iter().map(|&s| keys.of[s]).collect();
-        let mut has_clean = vec![false; keys.names.len()];
-        let mut has_bad = vec![false; keys.names.len()];
-        for (state, &key) in keys.of.iter().enumerate() {
-            has_clean[key] |= charter.clean[state];
-            has_bad[key] |= charter.bad[state];
-        }
-        let status = has_clean
-            .iter()
-            .zip(&has_bad)
-            .map(|(&clean, &bad)| {
-                if bad || !clean {
-                    Status::Wrong
-                } else {
-                    Status::Works
+        let view = options.view;
+        let keys = charter.keys(view)?;
+        let main_edges = quotient(&charter.main, &keys.of, view);
+        let second_edges = charter
+            .second
+            .as_ref()
+            .map(|second| quotient(&second.side, &keys.second, view));
+        let mut edges = main_edges.clone();
+        if let (Some(second), Some(second_edges)) = (&charter.second, &second_edges) {
+            for (&id, edge) in second_edges.iter() {
+                if edges.contains_key(&id) {
+                    continue;
                 }
-            })
+                let guards = edge.guards.as_ref().map(|guards| {
+                    guards
+                        .iter()
+                        .map(|(label, words)| (second.within(label), words.clone()))
+                        .collect()
+                });
+                edges.insert(
+                    id,
+                    Edge {
+                        from: edge.from,
+                        to: edge.to,
+                        labels: edge
+                            .labels
+                            .iter()
+                            .map(|label| second.within(label))
+                            .collect(),
+                        guards,
+                        second_only: true,
+                    },
+                );
+            }
+        }
+        let main_initial: Vec<usize> = charter.model.initial.iter().map(|&s| keys.of[s]).collect();
+        let second_initial: Vec<usize> = charter
+            .second
+            .iter()
+            .flat_map(|second| second.side.model.initial.iter().map(|&s| keys.second[s]))
+            .collect();
+        let initial: OrderedSet<usize> = main_initial
+            .iter()
+            .chain(&second_initial)
+            .copied()
             .collect();
         let mut groups_of = vec![OrderedSet::default(); keys.names.len()];
-        for (state, group) in charter.groups.iter().enumerate() {
+        for (state, group) in charter.main.groups.iter().enumerate() {
             groups_of[keys.of[state]].insert(group.clone());
         }
-        let classes = charter
-            .bugs
-            .iter()
-            .map(|bug| {
-                let trace = &model.traces[bug.trace];
-                Ok(Class {
-                    bug,
-                    path: charter.reader_path(trace, &keys, options.view)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ChartError>>()?;
+        if let Some(second) = &charter.second {
+            for (state, group) in second.side.groups.iter().enumerate() {
+                groups_of[keys.second[state]].insert(group.clone());
+            }
+        }
+        let mut classes = Vec::with_capacity(charter.bugs.len());
+        for bug in &charter.bugs {
+            let (key_of, second) = if bug.introduced {
+                (&keys.second, charter.second.as_ref())
+            } else {
+                (&keys.of, None)
+            };
+            let divergence = match &bug.replay {
+                Some(Replay::Differs(turn)) => charter.divergence(turn, &keys, &edges, view)?,
+                _ => None,
+            };
+            classes.push(Class {
+                bug,
+                path: charter.reader_path(charter.trace(bug), key_of, second, view)?,
+                divergence,
+            });
+        }
         let chosen = options.highlight.checked_sub(1);
         if let Some(index) = chosen
             && index >= classes.len()
@@ -874,27 +1271,52 @@ impl<'c> Chart<'c> {
         }
         let chosen = chosen.filter(|&index| index < classes.len());
         let on_path = chosen
-            .map(|index| classes[index].path.iter().map(|step| step.key).collect())
+            .map(|index| {
+                let class = &classes[index];
+                class
+                    .path
+                    .iter()
+                    .map(|step| step.key)
+                    .chain(class.divergence.as_ref().map(|d| d.key))
+                    .collect()
+            })
             .unwrap_or_default();
-        let settled: OrderedSet<usize> = (0..model.states.len())
-            .filter(|&state| charter.settled[state])
-            .map(|state| keys.of[state])
-            .collect();
+        let settled = |side: &Side, key_of: &[usize]| -> Vec<usize> {
+            (0..side.model.states.len())
+                .filter(|&state| side.settled[state])
+                .map(|state| key_of[state])
+                .collect()
+        };
+        let mut reaches = vec![Reach {
+            edges: &main_edges,
+            initial: main_initial,
+            settled: settled(&charter.main, &keys.of),
+        }];
+        if let (Some(second), Some(second_edges)) = (&charter.second, &second_edges) {
+            reaches.push(Reach {
+                edges: second_edges,
+                initial: second_initial,
+                settled: settled(&second.side, &keys.second)
+                    .into_iter()
+                    .filter(|&key| key >= keys.main)
+                    .collect(),
+            });
+        }
         let mut chart = Self {
             charter,
             options,
+            status: charter.status(&keys),
             keys,
             initial,
             edges,
             path_numbers: HashMap::new(),
             cover: None,
             classes,
-            status,
             groups_of,
             chosen,
             on_path,
         };
-        chart.add_path_and_cover(&settled);
+        chart.add_path_and_cover(&reaches);
         Ok(chart)
     }
 
@@ -936,8 +1358,25 @@ impl<'c> Chart<'c> {
         &self.charter.legend[status as usize]
     }
 
-    fn add_path_and_cover(&mut self, settled: &OrderedSet<usize>) {
-        let quotient = self.edges.len();
+    /// Upstream's `chartEdges`: the arrows of each bug's divergence, the highlighted bug's
+    /// numbered steps, and with `cover` only the shortest path to each settled state of each
+    /// model and every bug's path.
+    fn add_path_and_cover(&mut self, reaches: &[Reach]) {
+        for divergence in self.classes.iter().filter_map(|c| c.divergence.as_ref()) {
+            if !divergence.edge.2 {
+                continue;
+            }
+            self.edges
+                .entry(divergence.edge, || Edge {
+                    from: divergence.from,
+                    to: divergence.key,
+                    labels: OrderedSet::default(),
+                    guards: None,
+                    second_only: true,
+                })
+                .labels
+                .insert(divergence.text.clone());
+        }
         if let Some(chosen) = self.chosen {
             let along: Vec<(EdgeId, PathStep)> = self.classes[chosen]
                 .steps()
@@ -962,6 +1401,7 @@ impl<'c> Chart<'c> {
                             to: id.1,
                             labels: [step.label].into_iter().collect(),
                             guards: None,
+                            second_only: false,
                         },
                     );
                 }
@@ -971,28 +1411,8 @@ impl<'c> Chart<'c> {
             return;
         }
         let mut cover: OrderedSet<EdgeId> = OrderedSet::default();
-        let mut out: HashMap<usize, Vec<EdgeId>> = HashMap::new();
-        for (&id, _) in self.edges.iter().take(quotient) {
-            out.entry(id.0).or_default().push(id);
-        }
-        let mut parent: HashMap<usize, Option<EdgeId>> =
-            self.initial.iter().map(|&key| (key, None)).collect();
-        let mut queue: VecDeque<usize> = self.initial.iter().copied().collect();
-        while let Some(key) = queue.pop_front() {
-            for &id in out.get(&key).into_iter().flatten() {
-                if parent.contains_key(&id.1) {
-                    continue;
-                }
-                parent.insert(id.1, Some(id));
-                queue.push_back(id.1);
-            }
-        }
-        for target in settled.iter() {
-            let mut id = parent.get(target).copied().flatten();
-            while let Some(edge) = id {
-                cover.insert(edge);
-                id = parent.get(&edge.0).copied().flatten();
-            }
+        for reach in reaches {
+            cover_paths(reach, &mut cover);
         }
         let mut path_labels: HashMap<EdgeId, OrderedSet<String>> = HashMap::new();
         for class in &self.classes {
@@ -1002,6 +1422,9 @@ impl<'c> Chart<'c> {
                     .entry(id)
                     .or_default()
                     .insert(step.label.clone());
+            }
+            if let Some(divergence) = &class.divergence {
+                cover.insert(divergence.edge);
             }
         }
         for &id in cover.iter() {
@@ -1013,6 +1436,7 @@ impl<'c> Chart<'c> {
                         to: id.1,
                         labels: path_labels.remove(&id).unwrap_or_default(),
                         guards: None,
+                        second_only: false,
                     },
                 );
             }
@@ -1061,6 +1485,13 @@ impl<'c> Chart<'c> {
     pub(super) fn head(&self, drawn: &[DrawnState]) -> Vec<String> {
         let mut out = front_matter(self.options.title.as_deref());
         out.push("stateDiagram-v2".to_owned());
+        if let Some(role) = self.charter.role() {
+            out.push(format!(
+                "  %% second model ({}): {}",
+                role.name(),
+                role.label()
+            ));
+        }
         if self.options.full_labels {
             out.push(format!("  {FULL_LABELS}"));
         }
@@ -1229,13 +1660,19 @@ impl<'c> Chart<'c> {
             }
         };
 
+        let chosen_turn = chosen.and_then(|class| class.divergence.as_ref());
         let mut labels = OrderedSet::default();
-        let mut arrows: OrderedMap<EdgeId, Arrow> = OrderedMap::default();
+        let mut arrows: OrderedMap<(usize, usize), Arrow> = OrderedMap::default();
         for (id, edge) in self.edges.iter() {
             if !flat_states.contains(&edge.from) || !flat_states.contains(&edge.to) {
                 continue;
             }
-            if options.path_only && chosen.is_some() && !self.path_numbers.contains_key(id) {
+            let chosen_step = chosen_turn.filter(|turn| turn.edge == *id);
+            if options.path_only
+                && chosen.is_some()
+                && !self.path_numbers.contains_key(id)
+                && chosen_step.is_none()
+            {
                 continue;
             }
             if self.cover.as_ref().is_some_and(|cover| !cover.contains(id)) {
@@ -1244,7 +1681,7 @@ impl<'c> Chart<'c> {
             let arrow = arrows.entry((edge.from, edge.to), || Arrow {
                 from: edge.from,
                 to: edge.to,
-                groups: [Vec::new(), Vec::new()],
+                groups: Default::default(),
                 plain: true,
                 labels: Vec::new(),
             });
@@ -1265,9 +1702,24 @@ impl<'c> Chart<'c> {
                     labels.extend(numbers.iter().map(|step| step.label.clone()));
                 }
                 None => {
-                    arrow.groups[1].push(said);
+                    match chosen_step {
+                        Some(turn) if edge.second_only && options.path_only => {
+                            arrow.groups[2].push(turn.text.clone());
+                        }
+                        _ if edge.second_only => arrow.groups[2].push(said),
+                        _ => arrow.groups[1].push(said),
+                    }
                     labels.extend(all.iter().map(|label| (*label).clone()));
                 }
+            }
+            if let Some(turn) = chosen_step {
+                if !edge.second_only {
+                    arrow.groups[2].push(turn.text.clone());
+                }
+                arrow.plain = false;
+            }
+            if id.2 {
+                arrow.plain = false;
             }
             arrow.labels.extend(all.into_iter().cloned());
         }
@@ -1429,6 +1881,33 @@ pub(super) fn guarded(words: Option<&BTreeSet<String>>, label: &str) -> String {
     }
 }
 
+/// The shortest path to each settled state of one model, by its own steps.
+fn cover_paths(reach: &Reach, cover: &mut OrderedSet<EdgeId>) {
+    let mut out: HashMap<usize, Vec<EdgeId>> = HashMap::new();
+    for &id in reach.edges.keys() {
+        out.entry(id.0).or_default().push(id);
+    }
+    let mut parent: HashMap<usize, Option<EdgeId>> =
+        reach.initial.iter().map(|&key| (key, None)).collect();
+    let mut queue: VecDeque<usize> = reach.initial.iter().copied().collect();
+    while let Some(key) = queue.pop_front() {
+        for &id in out.get(&key).into_iter().flatten() {
+            if parent.contains_key(&id.1) {
+                continue;
+            }
+            parent.insert(id.1, Some(id));
+            queue.push_back(id.1);
+        }
+    }
+    for target in &reach.settled {
+        let mut id = parent.get(target).copied().flatten();
+        while let Some(edge) = id {
+            cover.insert(edge);
+            id = parent.get(&edge.0).copied().flatten();
+        }
+    }
+}
+
 /// "1, 2. you look": runs of numbered steps with the same words.
 fn numbered(steps: &[Numbered]) -> Vec<String> {
     let mut runs: Vec<(&str, Vec<usize>)> = Vec::new();
@@ -1452,10 +1931,8 @@ fn numbered(steps: &[Numbered]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-
     use std::collections::BTreeMap;
+    use std::fs;
 
     use regex::Regex;
     use serde_json::json;
@@ -1464,12 +1941,13 @@ mod tests {
     use super::*;
     use crate::scripts::statechart::mermaid::{compare, parse};
     use crate::scripts::statechart::model::{Step, explore};
+    use crate::scripts::statechart::second::listed_breaks;
     use crate::scripts::statechart::testing::{
-        Spec, arrows, explore_text, rule_cfg, unwrapped_lines,
+        CHARGE_AGAIN, PAY_CFG, PAY_MAP, Spec, arrows, explore_text, fixture, pay, rule_cfg,
+        status_of, unwrapped_lines,
     };
     use crate::scripts::statechart::text::rule_sentences;
 
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/statechart");
     const GOLD: &str = "gold";
     const CHART: &str = "chart.mmd";
     const STORIES: &str = "stories.md";
@@ -1492,10 +1970,6 @@ mod tests {
     const BROKEN_FOLDER_MAP: &str = "OutputFolder";
     const BROKEN_FOLDER_BUGS: usize = 50;
     const BROKEN_FOLDER_GOLDEN_BUGS: usize = 3;
-
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(FIXTURES).join(name)
-    }
 
     fn gold(name: &str, file: &str) -> Option<String> {
         fs::read_to_string(fixture(GOLD).join(name).join(file)).ok()
@@ -1585,6 +2059,97 @@ mod tests {
                 .unwrap_or_else(|| panic!("{file} is drawn"));
             assert_gold(UPSTREAM_DREW_NATIVE_COUNTEREXAMPLES, &file, &bug.mermaid);
         }
+    }
+
+    fn explored(spec: &str, cfg: &str) -> Model {
+        explore(
+            &fixture(&format!("{spec}.tla")),
+            &fixture(&format!("{cfg}.cfg")),
+        )
+        .expect("the model explores")
+    }
+
+    fn assert_charts_gold(name: &str, charts: &Charts) {
+        assert_gold(name, CHART, &charts.chart);
+        assert_gold(name, STORIES, &charts.stories);
+        let bugs: Vec<&str> = charts.bugs.iter().map(|bug| bug.file.as_str()).collect();
+        let golden_bugs: Vec<String> = (1..=charts.bugs.len() + 1)
+            .map(|n| format!("{BUG_FILE}{n}{MERMAID_EXTENSION}"))
+            .filter(|file| gold(name, file).is_some())
+            .collect();
+        assert_eq!(bugs, golden_bugs);
+        for bug in &charts.bugs {
+            assert_gold(name, &bug.file, &bug.mermaid);
+        }
+    }
+
+    fn second_charts(code: &str, second: &SecondModel) -> Charts {
+        let main = explored(code, code);
+        let spec = fixture(&format!("{code}.tla"));
+        let mapping =
+            Mapping::load(&fixture(&format!("{code}.map.rhai"))).expect("the mapping parses");
+        let options = DrawOptions {
+            rules: rule_sentences(&fs::read_to_string(&spec).expect("the spec reads")),
+            ..DrawOptions::default()
+        };
+        draw_with(&main, Some(second), &mapping, &options).expect("the charts draw")
+    }
+
+    const SYNC_FIXED_GOLD: &str = "SyncFixed";
+    const SAVE_AGREED_GOLD: &str = "SaveAgreed";
+    const AGREED_LABEL: &str = "the agreed chart";
+    const SUMMARY_SECOND: &str = "second";
+    /// TLC writes a state's variables in its own order, here `retries, screen, note`, and
+    /// tla-checker in the order the spec declares them. `second.lacks` follows that order, so the
+    /// SaveAgreed golden lists `retries` before `note.rev`; the paths are the same.
+    const TLC_ORDERS_A_STATES_VARIABLES: &str = "lacks";
+
+    fn lacks_in_any_order(mut summary: Json) -> Json {
+        if let Some(Json::Array(paths)) =
+            summary[SUMMARY_SECOND].get_mut(TLC_ORDERS_A_STATES_VARIABLES)
+        {
+            paths.sort_by_key(Json::to_string);
+        }
+        summary
+    }
+
+    #[test]
+    fn draws_upstreams_fix_golden() {
+        let fixed = explored("SyncFixed", "Sync");
+        let second = SecondModel {
+            model: &fixed,
+            role: Role::Fix { label: None },
+        };
+
+        let charts = second_charts("Sync", &second);
+
+        assert_charts_gold(SYNC_FIXED_GOLD, &charts);
+        assert_gold(SYNC_FIXED_GOLD, SUMMARY, &summary_text(&charts.summary));
+    }
+
+    #[test]
+    fn draws_upstreams_against_golden() {
+        let agreed = explored("SaveAgreed", "SaveCode");
+        let listed = listed_breaks(&fixture("SaveAgreed.tla")).expect("the folder reads");
+        let second = SecondModel {
+            model: &agreed,
+            role: Role::Against {
+                label: Some(AGREED_LABEL.to_owned()),
+                listed,
+            },
+        };
+
+        let charts = second_charts("SaveCode", &second);
+
+        assert_charts_gold(SAVE_AGREED_GOLD, &charts);
+        let golden: Json = serde_json::from_str(
+            &gold(SAVE_AGREED_GOLD, SUMMARY).expect("SaveAgreed has a summary golden"),
+        )
+        .expect("the golden is json");
+        assert_eq!(
+            lacks_in_any_order(charts.summary.clone()),
+            lacks_in_any_order(golden)
+        );
     }
 
     fn model(
@@ -1696,16 +2261,6 @@ mod tests {
         );
     }
 
-    const PAY_MAP: &str = r#"
-        fn reader_actions() { ["Pay"] }
-        fn state(v) { v.screen + ["", ", charged", ", charged twice"][v.charges] }
-        fn step(a) { #{ Pay: "you pay", Charge: "the bank charges you", Refund: "the bank refunds you" }[a] ?? "" }
-        fn cause() { "each charge request charges again" }
-    "#;
-    const PAY_CFG: &str =
-        "SPECIFICATION Spec\n\\* The reader's rule.\nINVARIANTS\n  NoDoubleCharge\n";
-    const CHARGE_AGAIN: &str =
-        r#"screen = "Paying" /\ charges < 2 /\ charges' = charges + 1 /\ UNCHANGED screen"#;
     const PAY_STORY: &str = "## 1. Paying, charged twice
 
 Rule broken: `NoDoubleCharge`
@@ -1718,51 +2273,9 @@ This is the only way to get here in the model.
 3. The bank charges you. Now: Paying, charged twice
 ";
 
-    fn pay(charge: &str, wait: bool) -> String {
-        let next = if wait {
-            "Wait == screen = \"Paying\" /\\ UNCHANGED vars\nNext =="
-        } else {
-            "Next =="
-        };
-        format!(
-            r#"---- MODULE Pay ----
-EXTENDS Naturals
-VARIABLES screen, charges
-vars == <<screen, charges>>
-Init == screen = "Cart" /\ charges = 0
-Pay == screen = "Cart" /\ screen' = "Paying" /\ UNCHANGED charges
-Charge == {charge}
-Refund == charges = 2 /\ charges' = 1 /\ screen' = "Refunded"
-Next == Pay \/ Charge \/ Refund
-Spec == Init /\ [][Next]_vars
-NoDoubleCharge == charges <= 1
-===="#
-        )
-        .replace("Next ==", next)
-    }
-
-    /// Each drawn state's name, with `<br/>` read as a space, and its class.
-    fn status_of(mermaid: &str) -> BTreeMap<String, String> {
-        let state = Regex::new(r#"(?m)^ {2}state "([^"]+)" as (s\d+)$"#).expect("a pattern");
-        let class = Regex::new(r"(?m)^ {2}class (s\d+) (\w+)$").expect("a pattern");
-        let names: HashMap<&str, String> = state
-            .captures_iter(mermaid)
-            .map(|c| {
-                (
-                    c.get(2).map_or("", |m| m.as_str()),
-                    c[1].replace(BREAK, " "),
-                )
-            })
-            .collect();
-        class
-            .captures_iter(mermaid)
-            .map(|c| (names[&c[1]].clone(), c[2].to_owned()))
-            .collect()
-    }
-
     #[test]
     fn a_state_reached_only_after_a_bug_takes_the_bugs_color() {
-        let spec = Spec::new("Pay", &pay(CHARGE_AGAIN, false), PAY_CFG, PAY_MAP);
+        let spec = Spec::new("Pay", &pay("Pay", CHARGE_AGAIN, false), PAY_CFG, PAY_MAP);
 
         let drawing = spec.chart(&ChartOptions::default());
 
@@ -1780,7 +2293,7 @@ NoDoubleCharge == charges <= 1
     #[test]
     fn each_bug_is_drawn_in_every_view_the_mapping_has() {
         let map = format!("{PAY_MAP}\nfn detail(v) {{ `charges = ${{v.charges}}` }}");
-        let spec = Spec::new("Pay", &pay(CHARGE_AGAIN, true), PAY_CFG, &map);
+        let spec = Spec::new("Pay", &pay("Pay", CHARGE_AGAIN, true), PAY_CFG, &map);
 
         let charts = spec.draw();
 

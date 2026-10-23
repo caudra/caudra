@@ -1,0 +1,33 @@
+---
+config:
+  markdownAutoWrap: false
+  state:
+    useMaxWidth: false
+---
+stateDiagram-v2
+  %% second model (against): the agreed chart
+  classDef works fill:#f4f6f7,stroke:#566573,color:#1b2631
+  classDef wrong fill:#fdedec,stroke:#c0392b,color:#7b241c
+  classDef fixed fill:#e9f7ef,stroke:#1e8449,color:#145a32
+  classDef worksPath fill:#f4f6f7,stroke:#1f3a93,stroke-width:4px,color:#1b2631
+  classDef wrongPath fill:#fdedec,stroke:#1f3a93,stroke-width:4px,color:#7b241c
+  classDef fixedPath fill:#e9f7ef,stroke:#1f3a93,stroke-width:4px,color:#145a32
+  state "Legend" as legend {
+    state "Works" as legendWorks
+    state "Breaks a rule" as legendWrong
+  }
+  class legendWorks works
+  class legendWrong wrong
+  state "Editing, draft" as s0
+  state "Saved, draft" as s1
+  state "Saved, stored" as s2
+  state "Saving, draft" as s3
+  [*] --> s0
+  s0 --> s3 : you press Save
+  s3 --> s2 : the server stores the note
+  s3 --> s1 : the save times out
+  s3 --> s3 : in the agreed chart, the save<br/>times out cannot happen
+  class s0 works
+  class s1 wrong
+  class s2 works
+  class s3 works

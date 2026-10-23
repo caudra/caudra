@@ -489,6 +489,12 @@ impl Chart<'_> {
                     }
                 }
             }
+            let turn = class.divergence.as_ref();
+            if let Some(edge) = turn.and_then(|turn| self.edges.get(&turn.edge)) {
+                for wanted_step in steps_of(edge, "", parts) {
+                    want(&mut wanted, &mut keep, wanted_step);
+                }
+            }
         }
         let price = |step: &FlatStep, keep: &[HashSet<String>; 2]| {
             let unkept = step

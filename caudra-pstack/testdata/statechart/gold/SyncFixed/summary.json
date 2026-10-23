@@ -1,0 +1,31 @@
+{
+  "view": "customer",
+  "second": {
+    "role": "fix",
+    "label": "the fix",
+    "lacks": []
+  },
+  "modelStates": 4,
+  "modelTransitions": 9,
+  "chartStates": 4,
+  "chartTransitions": 9,
+  "chartStatus": {
+    "works": 3,
+    "wrong": 0,
+    "fixed": 1
+  },
+  "classes": [
+    {
+      "n": 1,
+      "end": "Offline | Synced",
+      "invariant": "NeverSyncedWhileOffline",
+      "rule": "You never see \"Synced\" while you are offline.",
+      "cause": null,
+      "readerSteps": 2,
+      "modelSteps": 3,
+      "counterexamples": 1,
+      "fix": "Offline | Waiting to sync"
+    }
+  ],
+  "codeLike": []
+}

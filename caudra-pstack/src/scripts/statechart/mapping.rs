@@ -4,15 +4,19 @@
 //! and `group` take the values upstream passes them, and `reader_actions`, `region_names`,
 //! `legend` and `group_colors` take none and return what upstream's constants hold.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use caudra_script::{SandboxLimits, restricted_engine};
 use regex::Regex;
 use rhai::serde::to_dynamic;
-use rhai::{AST, Array, CallFnOptions, Dynamic, Engine, ImmutableString, Map as RhaiMap, Scope};
+use rhai::{
+    AST, Array, CallFnOptions, Dynamic, Engine, EvalAltResult, EvalContext, ImmutableString,
+    Map as RhaiMap, Position, Scope, Target,
+};
 use serde_json::Value as Json;
 use thiserror::Error;
 
@@ -68,6 +72,12 @@ const PRIMES_OR_UNCHANGED: &str = r"[\w)\]>}]'|\bUNCHANGED\b";
 const BLOCK_COMMENT: &str = r"\(\*[\s\S]*?\*\)";
 const LINE_COMMENT: &str = r"\\\*.*";
 const TOP_LEVEL: &str = r"\n(\S)";
+/// The key under which a map of a second model's state lists the fields it lacks. The mapping
+/// can see it among the map's keys, but no TLA+ name starts with a NUL.
+const LACKS: &str = "\u{0}lacks";
+/// The name upstream's messages give the mapping's state argument.
+const STATE_ARGUMENT: &str = "v";
+const FIELD_SEPARATOR: &str = ".";
 
 #[derive(Debug, Error)]
 pub enum MappingError {
@@ -101,6 +111,60 @@ pub enum MappingError {
         expected: &'static str,
         got: String,
     },
+    #[error(
+        "{name}: {model} has no {path}, and the mapping reads {at}.{field} on its states. Label states and steps only from what both models have, or test \"{field}\" in {at} first."
+    )]
+    Lacks {
+        name: String,
+        model: Arc<str>,
+        path: String,
+        at: String,
+        field: String,
+    },
+}
+
+/// The fields that one map of a second model's state lacks, which the first model has.
+#[derive(Debug, Clone)]
+struct Lacking {
+    model: Arc<str>,
+    at: Vec<String>,
+    fields: BTreeSet<String>,
+}
+
+/// What the mapping read that the second model lacks.
+#[derive(Debug, Clone)]
+struct LackedRead {
+    model: Arc<str>,
+    at: Vec<String>,
+    field: String,
+}
+
+/// The paths a second model's states lack, as a tree: the fields missing at this level, and the
+/// paths below each field.
+#[derive(Debug, Default)]
+struct LackTree {
+    fields: BTreeSet<String>,
+    below: BTreeMap<String, Vec<Vec<String>>>,
+}
+
+impl LackTree {
+    fn new(paths: &[Vec<String>]) -> Self {
+        let mut tree = Self::default();
+        for path in paths {
+            match path.as_slice() {
+                [field] => {
+                    tree.fields.insert(field.clone());
+                }
+                [field, rest @ ..] => tree
+                    .below
+                    .entry(field.clone())
+                    .or_default()
+                    .push(rest.to_vec()),
+                [] => {}
+            }
+        }
+        tree
+    }
 }
 
 /// The legend's words for each status, where the mapping gives them.
@@ -174,6 +238,24 @@ impl Mapping {
         mapping.legend = mapping.legend_of()?;
         mapping.group_colors = mapping.group_colors_of()?;
         Ok(mapping)
+    }
+
+    /// The same mapping for the states of a second model, which `lacking_value` builds: reading
+    /// a field that such a state lacks fails, as upstream's guard does, where any other missing
+    /// field reads as `()`.
+    pub fn for_lacking_states(&self) -> Self {
+        let mut engine = restricted_engine(&LIMITS, HINT);
+        engine.on_map_missing_property(missing_property);
+        Self {
+            name: self.name.clone(),
+            engine,
+            ast: self.ast.clone(),
+            arity: self.arity.clone(),
+            reader_actions: self.reader_actions.clone(),
+            region_names: self.region_names.clone(),
+            legend: self.legend.clone(),
+            group_colors: self.group_colors.clone(),
+        }
     }
 
     pub fn has_detail(&self) -> bool {
@@ -313,10 +395,33 @@ impl Mapping {
                 function,
                 arguments,
             )
-            .map_err(|error| MappingError::Call {
-                name: self.name.clone(),
-                function,
-                message: error.to_string(),
+            .map_err(|error| match lacked_read(&error) {
+                Some(read) => {
+                    let at = [STATE_ARGUMENT.to_owned()]
+                        .into_iter()
+                        .chain(read.at.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(FIELD_SEPARATOR);
+                    let path = read
+                        .at
+                        .iter()
+                        .chain([&read.field])
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(FIELD_SEPARATOR);
+                    MappingError::Lacks {
+                        name: self.name.clone(),
+                        model: read.model,
+                        path,
+                        at,
+                        field: read.field,
+                    }
+                }
+                None => MappingError::Call {
+                    name: self.name.clone(),
+                    function,
+                    message: error.to_string(),
+                },
             })
     }
 
@@ -428,6 +533,70 @@ impl Mapping {
 /// One state's variables as the mapping reads them.
 pub fn value(vars: &Vars) -> Dynamic {
     to_dynamic(vars).unwrap_or_default()
+}
+
+/// One state of a second model as `Mapping::for_lacking_states` reads it: without the `lacks`
+/// paths, which `model`, by its name in the reader's words, does not have.
+pub fn lacking_value(vars: &Vars, lacks: &[Vec<String>], model: &Arc<str>) -> Dynamic {
+    if lacks.is_empty() {
+        return value(vars);
+    }
+    marked(vars, &LackTree::new(lacks), model, &mut Vec::new())
+}
+
+fn marked(vars: &Vars, lacks: &LackTree, model: &Arc<str>, at: &mut Vec<String>) -> Dynamic {
+    let mut map = RhaiMap::new();
+    for (name, field) in vars {
+        let value = match (lacks.below.get(name), field) {
+            (Some(paths), Json::Object(record)) => {
+                at.push(name.clone());
+                let value = marked(record, &LackTree::new(paths), model, at);
+                at.pop();
+                value
+            }
+            _ => to_dynamic(field).unwrap_or_default(),
+        };
+        map.insert(name.as_str().into(), value);
+    }
+    if !lacks.fields.is_empty() {
+        let lacking = Lacking {
+            model: model.clone(),
+            at: at.clone(),
+            fields: lacks.fields.clone(),
+        };
+        map.insert(LACKS.into(), Dynamic::from(lacking));
+    }
+    map.into()
+}
+
+/// A field the second model lacks fails. Any other missing field reads as `()` and joins the map,
+/// since Rhai asks this one callback both to read a field and to assign it.
+fn missing_property<'a>(
+    map: &'a mut RhaiMap,
+    field: &str,
+    _: EvalContext,
+) -> Result<Target<'a>, Box<EvalAltResult>> {
+    let lacked = map
+        .get(LACKS)
+        .and_then(|marker| marker.read_lock::<Lacking>())
+        .filter(|lacking| lacking.fields.contains(field))
+        .map(|lacking| LackedRead {
+            model: lacking.model.clone(),
+            at: lacking.at.clone(),
+            field: field.to_owned(),
+        });
+    if let Some(read) = lacked {
+        return Err(EvalAltResult::ErrorRuntime(Dynamic::from(read), Position::NONE).into());
+    }
+    map.entry(field.into()).or_insert(Dynamic::UNIT).try_into()
+}
+
+fn lacked_read(error: &EvalAltResult) -> Option<LackedRead> {
+    match error {
+        EvalAltResult::ErrorRuntime(value, _) => value.read_lock::<LackedRead>().map(|r| r.clone()),
+        EvalAltResult::ErrorInFunctionCall(.., inner, _) => lacked_read(inner),
+        _ => None,
+    }
 }
 
 /// What the mapping knows of a state beyond its variables: the actions it enables, and whether

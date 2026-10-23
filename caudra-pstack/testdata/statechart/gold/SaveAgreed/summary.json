@@ -1,0 +1,43 @@
+{
+  "view": "customer",
+  "second": {
+    "role": "against",
+    "label": "the agreed chart",
+    "lacks": [
+      "retries",
+      "note.rev"
+    ],
+    "listed": {
+      "spec": "SaveAgreed.tla",
+      "breaks": {
+        "SaveAgreedBug.cfg": "NoFalseSaved"
+      }
+    }
+  },
+  "modelStates": 10,
+  "modelTransitions": 14,
+  "chartStates": 4,
+  "chartTransitions": 4,
+  "chartStatus": {
+    "works": 3,
+    "wrong": 1,
+    "fixed": 0
+  },
+  "classes": [
+    {
+      "n": 1,
+      "end": "Saved, draft",
+      "invariant": "NoFalseSaved",
+      "rule": "You never see \"Saved\" while the note is still a draft.",
+      "cause": "the app stops after one retry and shows Saved anyway",
+      "readerSteps": 2,
+      "modelSteps": 4,
+      "counterexamples": 2,
+      "against": "Saving, draft",
+      "listed": [
+        "SaveAgreedBug.cfg"
+      ]
+    }
+  ],
+  "codeLike": []
+}

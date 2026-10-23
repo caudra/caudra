@@ -2,11 +2,13 @@
 //! place of TLC and draws what the reader sees as Mermaid charts.
 
 pub mod chart;
+pub mod from_chart;
 pub mod mapping;
 pub mod mermaid;
 pub mod model;
 mod ordered;
 mod regions;
+pub mod second;
 mod story;
 #[cfg(test)]
 mod testing;

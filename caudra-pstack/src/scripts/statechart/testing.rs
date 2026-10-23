@@ -1,15 +1,34 @@
 //! What the chart tests share: a spec explored from text, as upstream's tests write one to a
 //! temporary folder and run TLC on it.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::path::PathBuf;
 
-use super::chart::{ChartError, ChartOptions, Charter, Charts, DrawOptions, Drawing, draw};
+use regex::Regex;
+
+use super::chart::{
+    BREAK, ChartError, ChartOptions, Charter, Charts, DrawOptions, Drawing, draw, draw_with,
+};
 use super::mapping::Mapping;
 use super::mermaid::parse;
 use super::model::{Model, explore};
+use super::second::{Role, SecondModel};
 use super::text::rule_sentences;
 
 const MAPPING_NAME: &str = "Test.map.rhai";
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/statechart");
+
+pub(super) const PAY_MAP: &str = r#"
+    fn reader_actions() { ["Pay"] }
+    fn state(v) { v.screen + ["", ", charged", ", charged twice"][v.charges] }
+    fn step(a) { #{ Pay: "you pay", Charge: "the bank charges you", Refund: "the bank refunds you" }[a] ?? "" }
+    fn cause() { "each charge request charges again" }
+"#;
+pub(super) const PAY_CFG: &str =
+    "SPECIFICATION Spec\n\\* The reader's rule.\nINVARIANTS\n  NoDoubleCharge\n";
+pub(super) const CHARGE_AGAIN: &str =
+    r#"screen = "Paying" /\ charges < 2 /\ charges' = charges + 1 /\ UNCHANGED screen"#;
 
 pub(super) struct Spec {
     pub(super) model: Model,
@@ -43,6 +62,45 @@ impl Spec {
     pub(super) fn chart(&self, options: &ChartOptions) -> Drawing {
         self.try_chart(options).expect("the chart draws")
     }
+
+    /// What one `from-spec` run with `--fixed` or `--against` writes.
+    pub(super) fn draw_with(&self, second: &SecondModel) -> Charts {
+        draw_with(&self.model, Some(second), &self.mapping, &self.options).expect("the charts draw")
+    }
+
+    /// What one `tlc-to-chart.mjs` run with `--fixed-dot` or `--against-dot` draws, or why it
+    /// refuses.
+    pub(super) fn try_chart_with(
+        &self,
+        second: &SecondModel,
+        options: &ChartOptions,
+    ) -> Result<Drawing, ChartError> {
+        Charter::with_second(
+            &self.model,
+            Some(second),
+            &self.mapping,
+            &self.options.rules,
+        )?
+        .chart(options)
+    }
+
+    pub(super) fn chart_with(&self, second: &SecondModel, options: &ChartOptions) -> Drawing {
+        self.try_chart_with(second, options)
+            .expect("the chart draws")
+    }
+}
+
+/// The open fix of a spec, by upstream's default name.
+pub(super) fn fix(model: &Model) -> SecondModel<'_> {
+    SecondModel {
+        model,
+        role: Role::Fix { label: None },
+    }
+}
+
+/// A file of the chart tests' fixtures.
+pub(super) fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(FIXTURES).join(name)
 }
 
 /// Explores module `name` from `tla` under `cfg`.
@@ -79,5 +137,47 @@ pub(super) fn unwrapped_lines(mermaid: &str) -> Vec<String> {
         .replace("<br/>", " ")
         .lines()
         .map(str::to_owned)
+        .collect()
+}
+
+pub(super) fn pay(module: &str, charge: &str, wait: bool) -> String {
+    let next = if wait {
+        "Wait == screen = \"Paying\" /\\ UNCHANGED vars\nNext =="
+    } else {
+        "Next =="
+    };
+    format!(
+        r#"---- MODULE {module} ----
+EXTENDS Naturals
+VARIABLES screen, charges
+vars == <<screen, charges>>
+Init == screen = "Cart" /\ charges = 0
+Pay == screen = "Cart" /\ screen' = "Paying" /\ UNCHANGED charges
+Charge == {charge}
+Refund == charges = 2 /\ charges' = 1 /\ screen' = "Refunded"
+Next == Pay \/ Charge \/ Refund
+Spec == Init /\ [][Next]_vars
+NoDoubleCharge == charges <= 1
+===="#
+    )
+    .replace("Next ==", next)
+}
+
+/// Each drawn state's name, with `<br/>` read as a space, and its class.
+pub(super) fn status_of(mermaid: &str) -> BTreeMap<String, String> {
+    let state = Regex::new(r#"(?m)^ {2}state "([^"]+)" as (s\d+)$"#).expect("a pattern");
+    let class = Regex::new(r"(?m)^ {2}class (s\d+) (\w+)$").expect("a pattern");
+    let names: HashMap<&str, String> = state
+        .captures_iter(mermaid)
+        .map(|c| {
+            (
+                c.get(2).map_or("", |m| m.as_str()),
+                c[1].replace(BREAK, " "),
+            )
+        })
+        .collect();
+    class
+        .captures_iter(mermaid)
+        .map(|c| (names[&c[1]].clone(), c[2].to_owned()))
         .collect()
 }

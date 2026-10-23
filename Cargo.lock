@@ -1328,6 +1328,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "tla-checker",
+ "unicode-normalization",
  "yaml_serde",
 ]
 

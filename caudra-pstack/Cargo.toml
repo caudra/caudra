@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tla-checker = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 caudra-automation = { workspace = true }
