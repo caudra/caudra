@@ -391,7 +391,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 - [File read and search, with one editor per model](https://caudra.ai/docs/tools/#file-operations)
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
-- [Source code graph for 37 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
+- [Source code graph for 38 languages and formats](https://caudra.ai/docs/tools/#code-intelligence)
 - [Shell with output filtering](https://caudra.ai/docs/tools/#shell)
 - [Shell ETAs learned on your machine](https://caudra.ai/docs/configuration/#agent)
 - [Python for computation, history search, MCP, and modules loaded on demand](https://caudra.ai/docs/code/)

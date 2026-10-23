@@ -1,0 +1,221 @@
+%YAML 1.2
+---
+# Converted from tlaplus/vscode-tlaplus languages/tlaplus-grammar.json at
+# 2d54234dcb49b52e4b24e750c501e464e9c7aeb8, with local changes.
+# MIT; see ../../THIRD_PARTY_LICENSES/VscodeTlaplus.txt.
+# http://www.sublimetext.com/docs/3/syntax.html
+name: TLA+
+file_extensions:
+  - tla
+  - tlaplus
+scope: source.tlaplus
+contexts:
+  main:
+    - include: module
+    - include: body
+
+  module:
+    - match: '(\s*-{4,}\s*)(MODULE)\s*(\w+)\s*(-{4,})'
+      captures:
+        1: comment.line.tlaplus
+        2: keyword.other.tlaplus
+        3: entity.name.class.tlaplus
+        4: comment.line.tlaplus
+      push: module-body
+
+  module-body:
+    - match: '={4,}\s*'
+      scope: comment.line.tlaplus
+      pop: true
+    - include: module
+    - include: body
+
+  body:
+    - include: fairness
+    - include: keywords
+    - include: control_keywords
+    - include: embedded_operators
+    - include: strings
+    - include: line_comments
+    - include: block_comments
+    - include: lines
+    - include: constants
+    - include: numeric_constants
+    - include: definitions
+    - include: operators
+    - include: inst_module_refs
+    - include: primed_operators
+    - include: temporal_operators
+    - include: sequences
+    - include: set_braces
+    - include: range_operator
+    - include: except_vars
+    - include: record_fields
+    - include: symbolic_operators
+
+  keywords:
+    - match: '\b(?:EXTENDS|VARIABLES?|LET|IN|EXCEPT|ENABLED|UNCHANGED|LAMBDA|DOMAIN|CONSTANTS?|CHOOSE|LOCAL|ASSUME|ASSUMPTION|AXIOM|RECURSIVE|INSTANCE|WITH|THEOREM|SUBSET|UNION|USE|DEFS|BY|DEF|SUFFICES|PROVE|OBVIOUS|NEW|QED|PICK|HIDE|DEFINE|WITNESS|HAVE|TAKE|PROOF|ACTION|COROLLARY|LEMMA|OMITTED|ONLY|PROPOSITION|STATE|TEMPORAL)\b'
+      scope: keyword.other.tlaplus
+
+  control_keywords:
+    - match: '\b(?:IF|THEN|ELSE|CASE|OTHER)\b'
+      scope: keyword.control.tlaplus
+
+  fairness:
+    - match: '\b((?:WF|SF)_)(\w+)?'
+      captures:
+        1: keyword.other.tlaplus
+        2: variable.other.tlaplus
+
+  embedded_operators:
+    - match: '\\(?:in|notin|subseteq|subset|supseteq|supset|union|intersect|cup|cap|sqsubset|sqsupset|sqsubseteq|sqsupseteq|sqcap|sqcup|uplus|setminus)\b|[∈∉⊆⊂⊇⊃∪∩⊏⊐⊑⊒⊓⊔⊎]'
+      scope: keyword.operator.set.tlaplus
+    - match: '\\(?:land|lor|lnot|neg|equiv|implies|iff)\b|[∧∨¬≡⇒]'
+      scope: keyword.operator.logic.tlaplus
+    - match: '\\(?:leq|geq|ll|gg|prec|succ|preceq|succeq|sim|simeq|asymp|approx|cong|neq|doteq|propto|models|perp|mid|parallel|bowtie|ltimes|rtimes|div|cdot|star|circ|bigcirc|bullet|wr|oplus|ominus|otimes|oslash|odot|dagger|ddagger)\b|[≤≥≪≫≺≻⪯⪰∼≃≍≈≅≠≐∝⊨÷⋅⋆∘●◯≀⊕⊖⊗⊘⊙]'
+      scope: keyword.operator.arithmetic.tlaplus
+    - match: '\\(?:A|E|AA|EE|forall|exists)\b|[∀∃]'
+      scope: keyword.operator.quantifier.tlaplus
+    - match: '\\(?:times|X)\b|×'
+      scope: keyword.operator.product.tlaplus
+    - match: '\\[a-zA-Z]+\b'
+      scope: keyword.operator.tlaplus
+
+  constants:
+    - match: '\b(?:TRUE|FALSE)\b'
+      scope: constant.language.boolean.tlaplus
+
+  numeric_constants:
+    - match: '(?:\b\d+(?:\.\d+)?|\\[bB][01]+|\\[oO][0-7]+|\\[hH][0-9a-fA-F]+)\b'
+      scope: constant.numeric.tlaplus
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.tlaplus
+      push:
+        - meta_scope: string.quoted.double.tlaplus
+        - match: '"'
+          scope: punctuation.definition.string.end.tlaplus
+          pop: true
+        - match: '\\.'
+          scope: constant.character.escape.tlaplus
+
+  line_comments:
+    - match: '\\\*.*'
+      scope: comment.line.tlaplus
+
+  block_comments:
+    - match: '\(\*'
+      scope: punctuation.definition.comment.begin.tlaplus
+      push: block_comment
+
+  block_comment:
+    - meta_scope: comment.block.tlaplus
+    - match: '\*\)'
+      scope: punctuation.definition.comment.end.tlaplus
+      pop: true
+    - match: '--((?:fair\s+)?algorithm)\b'
+      captures:
+        1: keyword.other.pluscal
+      set: pluscal
+    - include: block_comments
+
+  pluscal:
+    - match: '(?:(end\s+algorithm);?|\})?\s*(\*\))'
+      captures:
+        1: keyword.other.pluscal
+        2: comment.block.tlaplus punctuation.definition.comment.end.tlaplus
+      pop: true
+    - include: scope:source.tlaplus.pluscal
+
+  lines:
+    - match: '^\s*(?:-{4,}|={4,})\s*$'
+      scope: comment.line.tlaplus
+
+  definitions:
+    - match: '(\w+)\s*(==)(?!\s*INSTANCE|=)'
+      captures:
+        1: entity.name.function.tlaplus
+        2: keyword.operator.definition.tlaplus
+    - match: '(\w+\s*(\^\+|\^\*|\^#))\s*(==)(?!=)'
+      captures:
+        1: variable.parameter.tlaplus
+        2: entity.name.function.tlaplus
+        3: keyword.operator.definition.tlaplus
+    - match: '(\w+\s*(\(?(?!\\\*)[-<:>=&@/%#!X$*+.|?^\\]+\)?|\\[a-z]+\s)\s*\w+)\s*(==)(?!=)'
+      captures:
+        1: variable.parameter.tlaplus
+        2: entity.name.function.tlaplus
+        3: keyword.operator.definition.tlaplus
+    - match: '(\w+)\s*(?=\[.*(?<!=)==(?!=))'
+      captures:
+        1: entity.name.function.tlaplus
+    - match: '(\w+)\s*(==)\s*(INSTANCE)\b'
+      captures:
+        1: entity.name.class.tlaplus
+        2: keyword.operator.definition.tlaplus
+        3: keyword.other.tlaplus
+
+  operators:
+    - match: '(\w+)\s*\((?!\*)'
+      captures:
+        1: entity.name.function.tlaplus
+
+  inst_module_refs:
+    - match: '\b\w+\s*!(?=\w)'
+      scope: entity.name.class.tlaplus
+
+  primed_operators:
+    - match: '\b\w+'''
+      scope: variable.name.tlaplus
+
+  temporal_operators:
+    - match: '\[\]'
+      scope: keyword.operator.temporal.always.tlaplus
+    - match: '<>'
+      scope: keyword.operator.temporal.eventually.tlaplus
+    - match: '~>'
+      scope: keyword.operator.temporal.leadsto.tlaplus
+    - match: '(?:\]|>>)_(?=\w|<<)'
+      scope: keyword.operator.temporal.action.tlaplus
+
+  sequences:
+    - match: '<<'
+      scope: punctuation.definition.sequence.begin.tlaplus
+    - match: '>>'
+      scope: punctuation.definition.sequence.end.tlaplus
+
+  set_braces:
+    - match: '\{'
+      scope: punctuation.definition.set.begin.tlaplus
+    - match: '\}'
+      scope: punctuation.definition.set.end.tlaplus
+
+  range_operator:
+    - match: '\.\.'
+      scope: keyword.operator.range.tlaplus
+
+  except_vars:
+    - match: '(?<!@)@(?!@)|!(?=[\[.])'
+      scope: variable.name.tlaplus
+
+  record_fields:
+    - match: '(?:^|(?<=[\[,]))\s*(\w+)\s*(?=\|->)'
+      captures:
+        1: string.quoted.double.tlaplus
+
+  symbolic_operators:
+    - match: '=='
+      scope: keyword.operator.definition.tlaplus
+    - match: '<=>|=>|-\+->|/\\|\\/|~'
+      scope: keyword.operator.logic.tlaplus
+    - match: ':='
+      scope: keyword.operator.assignment.tlaplus
+    - match: '\|->|->|:>|@@'
+      scope: keyword.operator.function.tlaplus
+    - match: '<-'
+      scope: keyword.operator.substitution.tlaplus
+    - match: '<=|>=|=<|/=|#|=|<|>'
+      scope: keyword.operator.comparison.tlaplus
+    - match: '\^[+*#]|\+\+|--|\*\*|[-+*/%^]'
+      scope: keyword.operator.arithmetic.tlaplus

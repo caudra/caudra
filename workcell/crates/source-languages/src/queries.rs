@@ -51,6 +51,7 @@ pub(crate) const fn source(language: Language) -> &'static str {
         Language::CMake => include_str!("../queries/cmake/tags.scm"),
         Language::Protobuf => include_str!("../queries/proto/tags.scm"),
         Language::Xml => include_str!("../queries/xml/tags.scm"),
+        Language::TlaPlus => include_str!("../queries/tlaplus/tags.scm"),
         Language::ObjC => concat!(
             include_str!("../queries/c/tags.scm"),
             include_str!("../queries/objc/tags.scm")

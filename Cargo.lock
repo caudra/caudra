@@ -9331,6 +9331,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-tlaplus"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddaacc0337bfee38f233a91a704dc36b887a0c385348163f65344d64b73f79e1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-toml-ng"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10697,6 +10707,7 @@ dependencies = [
  "tree-sitter-sequel",
  "tree-sitter-starlark",
  "tree-sitter-swift",
+ "tree-sitter-tlaplus",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-xml",

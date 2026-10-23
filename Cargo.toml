@@ -338,6 +338,7 @@ tree-sitter-cmake = "0.7.5"
 tree-sitter-cuda = "0.21.2"
 tree-sitter-objc = "3.0.2"
 tree-sitter-proto = "0.6.0"
+tree-sitter-tlaplus = "1.5.0"
 tree-sitter-xml = "0.7.0"
 wiremock = "0.6.5"
 
@@ -382,7 +383,7 @@ incremental = false
 debug = false
 
 # `cc` reads DEBUG from here and passes -g when it is on, which covers the C
-# and C++ we build from source: OpenSSL, curl, Luau and 30 tree-sitter
+# and C++ we build from source: OpenSSL, curl, Luau and 38 tree-sitter
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false

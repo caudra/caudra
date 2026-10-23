@@ -14,7 +14,8 @@ use heredoc::Embedding;
 mod heredoc;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
-/// two-face's syntaxes with the bundled Rhai grammar, linked by build.rs.
+/// two-face's syntaxes with the bundled Rhai, TLA+, PlusCal, and TLC config
+/// grammars, linked by build.rs.
 const SYNTAX_DUMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/syntaxes.packdump"));
 /// Every shell grammar's scope starts with this, and only shell lines can
 /// hand a heredoc body to another language.
@@ -379,7 +380,18 @@ mod tests {
 
     const RHAI_NAME: &str = "Rhai";
     const RHAI_SCOPE: &str = "source.rhai";
+    const RHAI_TOKEN: &str = "rhai";
     const TWO_FACE_TOKEN: &str = "rust";
+    const TLA_NAME: &str = "TLA+";
+    const TLA_TOKEN: &str = "tla";
+    const PLUSCAL_NAME: &str = "PlusCal";
+    const PLUSCAL_TOKEN: &str = "pluscal";
+    const TLA_CONFIG_NAME: &str = "TLA+ Config";
+    const TLA_CONFIG_TOKEN: &str = "tlacfg";
+    const TLA_CONFIG_CONSTANTS: &str = "CONSTANTS\n  Size = 3\n";
+    const INI_NAME: &str = "INI";
+    const TLA_PATH: &str = "specs/Counter.tla";
+    const PLUSCAL_SPEC: &str = "---- MODULE Counter ----\n(* --algorithm Counter\nvariables x = 0;\nbegin\n  Inc: x := x + 1;\nend algorithm; *)\nInit == x = 0\n====\n";
 
     const PYTHON_BODY: &str = "import os\nprint(os.getcwd())\n";
     const RHAI_SCRIPT: &str = "let meta = #{ name: \"café\", enabled: true };\n/* outer\n/* nested */ still a comment\n*/\nlet report = `status:\n${if meta.enabled { \"ready\" } else { \"waiting\" }}`;\n";
@@ -515,6 +527,8 @@ mod tests {
     #[test_case("automation.rhai" => "Rhai"; "rhai_extension")]
     #[test_case("missing/directory/workflow.rhai" => "Rhai"; "rhai_without_local_file")]
     #[test_case("Makefile" => "Makefile"; "makefile_no_ext")]
+    #[test_case(TLA_PATH => TLA_NAME; "tla_extension")]
+    #[test_case("specs/Counter.cfg" => INI_NAME; "cfg_stays_ini")]
     fn syntax_for_path_resolves(path: &str) -> String {
         warmup();
         syntax_for_path(path).name.to_string()
@@ -654,8 +668,8 @@ mod tests {
         ));
     }
 
-    fn rhai_scopes(code: &str) -> Vec<(String, ScopeStack)> {
-        let mut parser = ParseState::new(syntax_for_token("rhai"));
+    fn scopes(lang: &str, code: &str) -> Vec<(String, ScopeStack)> {
+        let mut parser = ParseState::new(syntax_for_token(lang));
         let mut stack = ScopeStack::new();
         let mut regions = Vec::new();
         for line in LinesWithEndings::from(code) {
@@ -703,11 +717,15 @@ mod tests {
     #[test_case(r"let s = `C:\path\file`;", r"\path", "string.interpolated"; "verbatim_template")]
     #[test_case(r###"let s = ##"raw "# text"##;"###, "text", "string.quoted.double.raw"; "raw_string")]
     fn rhai_token_has_scope(code: &str, token: &str, scope: &str) {
+        assert_token_scope(RHAI_TOKEN, code, token, scope);
+    }
+
+    fn assert_token_scope(lang: &str, code: &str, token: &str, scope: &str) {
         let selector = ScopeSelectors::from_str(scope).unwrap();
         let start = code.find(token).unwrap();
         let end = start + token.len();
         let mut offset = 0;
-        for (text, stack) in rhai_scopes(code) {
+        for (text, stack) in scopes(lang, code) {
             let next = offset + text.len();
             if offset < end && next > start {
                 assert!(
@@ -719,17 +737,21 @@ mod tests {
         }
     }
 
-    #[test_case(RHAI_SCRIPT; "multiline_script")]
-    #[test_case(include_str!("../../caudra-automation/tests/examples/goal-webhook.rhai"); "automation")]
-    #[test_case(include_str!("../../caudra-workflow/builtins/deep-research.rhai"); "workflow")]
-    fn rhai_scripts_parse_without_invalid_scopes(code: &str) {
+    fn assert_no_invalid_scopes(lang: &str, code: &str) {
         let invalid = ScopeSelectors::from_str("invalid").unwrap();
-        for (text, stack) in rhai_scopes(code) {
+        for (text, stack) in scopes(lang, code) {
             assert!(
                 invalid.does_match(&stack.scopes).is_none(),
                 "{text:?}: {stack:?}"
             );
         }
+    }
+
+    #[test_case(RHAI_SCRIPT; "multiline_script")]
+    #[test_case(include_str!("../../caudra-automation/tests/examples/goal-webhook.rhai"); "automation")]
+    #[test_case(include_str!("../../caudra-workflow/builtins/deep-research.rhai"); "workflow")]
+    fn rhai_scripts_parse_without_invalid_scopes(code: &str) {
+        assert_no_invalid_scopes(RHAI_TOKEN, code);
     }
 
     #[test]
@@ -755,6 +777,115 @@ mod tests {
             streaming.update(RHAI_SCRIPT),
             highlight_code("rhai", RHAI_SCRIPT, "")
         );
+    }
+
+    #[test_case("source.tlaplus", TLA_NAME; "tlaplus")]
+    #[test_case("source.tlaplus.pluscal", PLUSCAL_NAME; "pluscal")]
+    #[test_case("source.tlaplus.cfg", TLA_CONFIG_NAME; "tlc_config")]
+    fn the_bundled_set_links_tlaplus_into_two_face(scope: &str, name: &str) {
+        let syntax = syntax_set().find_syntax_by_scope(Scope::new(scope).unwrap());
+        assert_eq!(syntax.map(|syntax| syntax.name.as_str()), Some(name));
+    }
+
+    #[test_case(TLA_TOKEN, TLA_NAME; "tla")]
+    #[test_case("tlaplus", TLA_NAME; "tlaplus")]
+    #[test_case("tla+", TLA_NAME; "tla_plus_sign")]
+    #[test_case(PLUSCAL_TOKEN, PLUSCAL_NAME; "pluscal")]
+    #[test_case(TLA_CONFIG_TOKEN, TLA_CONFIG_NAME; "tlacfg")]
+    #[test_case("tla-cfg", TLA_CONFIG_NAME; "tla_cfg")]
+    #[test_case("cfg", INI_NAME; "cfg_stays_ini")]
+    fn tlaplus_tokens_resolve(token: &str, name: &str) {
+        assert_eq!(syntax_for_token(token).name, name);
+    }
+
+    #[test]
+    fn tla_path_and_token_share_a_syntax() {
+        assert!(ptr::eq(
+            syntax_for_token(TLA_TOKEN),
+            syntax_for_path(TLA_PATH)
+        ));
+    }
+
+    #[test_case(TLA_TOKEN, "Init == x = 0", "==", "keyword.operator.definition"; "definition_operator")]
+    #[test_case(TLA_TOKEN, "Init == x = 0", "Init", "entity.name.function"; "definition_name")]
+    #[test_case(TLA_TOKEN, "Op(a, b) == a", "Op", "entity.name.function"; "operator_definition")]
+    #[test_case(TLA_TOKEN, r"Next == a /\ b", r"/\", "keyword.operator.logic"; "conjunction")]
+    #[test_case(TLA_TOKEN, r"Next == a \/ b", r"\/", "keyword.operator.logic"; "disjunction")]
+    #[test_case(TLA_TOKEN, "Next == UNCHANGED <<x, y>>", "UNCHANGED", "keyword.other"; "unchanged")]
+    #[test_case(TLA_TOKEN, "Next == UNCHANGED <<x, y>>", "<<", "punctuation.definition.sequence"; "tuple")]
+    #[test_case(TLA_TOKEN, "g == [f EXCEPT ![1] = @ + 1]", "EXCEPT", "keyword.other"; "except")]
+    #[test_case(TLA_TOKEN, "g == [f EXCEPT ![1] = @ + 1]", "!", "variable.name"; "except_path")]
+    #[test_case(TLA_TOKEN, "g == [f EXCEPT ![1] = @ + 1]", "@", "variable.name"; "except_at")]
+    #[test_case(TLA_TOKEN, r"Inv == x \in S", r"\in", "keyword.operator.set"; "membership")]
+    #[test_case(TLA_TOKEN, "Next == x' = x + 1", "x'", "variable.name"; "primed_variable")]
+    #[test_case(TLA_TOKEN, r"x = 1 \* note", "note", "comment.line"; "line_comment")]
+    #[test_case(TLA_TOKEN, "(* note *) x = 1", "note", "comment.block"; "block_comment")]
+    #[test_case(TLA_TOKEN, "(* outer (* inner *) still *) x", "still", "comment.block"; "nested_block_comment")]
+    #[test_case(TLA_TOKEN, r#"s == "say \"hi\"""#, "say", "string.quoted.double"; "string")]
+    #[test_case(TLA_TOKEN, r#"s == "say \"hi\"""#, r#"\""#, "constant.character.escape"; "string_escape")]
+    #[test_case(TLA_TOKEN, "n == 42", "42", "constant.numeric"; "number")]
+    #[test_case(TLA_TOKEN, "b == TRUE", "TRUE", "constant.language.boolean"; "boolean")]
+    #[test_case(TLA_TOKEN, "VARIABLES x, y", "VARIABLES", "keyword.other"; "variables")]
+    #[test_case(TLA_TOKEN, "n == IF x THEN 1 ELSE 2", "THEN", "keyword.control"; "conditional")]
+    #[test_case(TLA_TOKEN, "Spec == Init /\\ [][Next]_vars", "[]", "keyword.operator.temporal"; "always")]
+    #[test_case(TLA_TOKEN, "Spec == Init /\\ [][Next]_vars", "]_", "keyword.operator.temporal"; "action_subscript")]
+    #[test_case(TLA_TOKEN, "Live == WF_vars(Next)", "WF_", "keyword.other"; "fairness")]
+    #[test_case(TLA_TOKEN, "r == [a |-> 1]", "|->", "keyword.operator.function"; "maps_to")]
+    #[test_case(TLA_TOKEN, "---- MODULE Spec ----\nx == 1\n====\n", "----", "comment.line"; "module_rule")]
+    #[test_case(TLA_TOKEN, "---- MODULE Spec ----\nx == 1\n====\n", "MODULE", "keyword.other"; "module_keyword")]
+    #[test_case(TLA_TOKEN, "---- MODULE Spec ----\nx == 1\n====\n", "Spec", "entity.name.class"; "module_name")]
+    #[test_case(TLA_TOKEN, "---- MODULE Spec ----\nx == 1\n====\n", "====", "comment.line"; "module_end")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, "algorithm", "keyword.other.pluscal"; "algorithm_header")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, "variables", "keyword.other.pluscal"; "algorithm_variables")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, "Inc:", "entity.name.label"; "algorithm_label")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, ":=", "keyword.operator.assignment"; "algorithm_assignment")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, "end algorithm", "keyword.other.pluscal"; "algorithm_end")]
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC, "Init", "entity.name.function"; "definition_after_algorithm")]
+    #[test_case(TLA_TOKEN, "(***\n--fair algorithm A {\n  { skip }\n} ***)\nInit == 1\n", "Init", "entity.name.function"; "multiline_algorithm_comment")]
+    #[test_case(PLUSCAL_TOKEN, "--algorithm A {\n  variables x = 0;\n  { x := x + 1 }\n}\n", "variables", "keyword.other.pluscal"; "pluscal_fence")]
+    #[test_case(TLA_CONFIG_TOKEN, "SPECIFICATION Spec", "SPECIFICATION", "keyword.control"; "config_keyword")]
+    #[test_case(TLA_CONFIG_TOKEN, TLA_CONFIG_CONSTANTS, "Size", "support.constant"; "config_constant")]
+    #[test_case(TLA_CONFIG_TOKEN, TLA_CONFIG_CONSTANTS, "=", "keyword.operator.assignment"; "config_assignment")]
+    #[test_case(TLA_CONFIG_TOKEN, TLA_CONFIG_CONSTANTS, "3", "constant.numeric"; "config_number")]
+    #[test_case(TLA_CONFIG_TOKEN, "CONSTANT Procs = {p1, p2}", "p1", "constant.other.model-value"; "config_model_value_set")]
+    #[test_case(TLA_CONFIG_TOKEN, "CONSTANT Nil = none", "none", "constant.other.model-value"; "config_model_value")]
+    #[test_case(TLA_CONFIG_TOKEN, "CONSTANT N <- MyN", "<-", "keyword.operator.substitution"; "config_substitution")]
+    #[test_case(TLA_CONFIG_TOKEN, "CONSTANT N = 3 INVARIANT Inv", "INVARIANT", "keyword.control"; "config_keyword_after_value")]
+    #[test_case(TLA_CONFIG_TOKEN, "CHECK_DEADLOCK FALSE", "FALSE", "constant.language.boolean"; "config_boolean")]
+    #[test_case(TLA_CONFIG_TOKEN, "\\* note\nINIT Init", "note", "comment.line"; "config_line_comment")]
+    #[test_case(TLA_CONFIG_TOKEN, "(* note *) NEXT Next", "note", "comment.block"; "config_block_comment")]
+    fn tlaplus_token_has_scope(lang: &str, code: &str, token: &str, scope: &str) {
+        assert_token_scope(lang, code, token, scope);
+    }
+
+    #[test_case(TLA_TOKEN, "x' = x + 1"; "primed_variable")]
+    #[test_case(TLA_TOKEN, "Init == 1"; "definition")]
+    #[test_case(TLA_TOKEN, "IF x THEN y ELSE z"; "conditional")]
+    #[test_case(TLA_TOKEN, "f[n \\in Nat] == n"; "function_definition")]
+    fn tla_fences_without_a_module_are_highlighted(lang: &str, code: &str) {
+        assert!(scopes(lang, code).iter().any(|(_, stack)| stack.len() > 1));
+    }
+
+    #[test_case(TLA_TOKEN, PLUSCAL_SPEC; "pluscal_spec")]
+    #[test_case(TLA_TOKEN, include_str!("../../caudra-pstack/testdata/statechart/OutputFolder.tla"); "output_folder_spec")]
+    #[test_case(TLA_CONFIG_TOKEN, include_str!("../../caudra-pstack/testdata/statechart/OutputFolder.cfg"); "output_folder_config")]
+    fn tlaplus_sources_parse_without_invalid_scopes(lang: &str, code: &str) {
+        assert_no_invalid_scopes(lang, code);
+    }
+
+    #[test]
+    fn tla_spec_ends_its_module() {
+        let spec = include_str!("../../caudra-pstack/testdata/statechart/OutputFolder.tla");
+        let module_end = ScopeSelectors::from_str("comment.line").unwrap();
+        let regions = scopes(TLA_TOKEN, spec);
+        let (text, stack) = regions
+            .iter()
+            .rev()
+            .find(|(text, _)| !text.trim().is_empty())
+            .unwrap();
+        assert!(text.starts_with("===="), "{text:?}");
+        assert!(module_end.does_match(&stack.scopes).is_some(), "{stack:?}");
+        assert_eq!(stack.len(), 2, "{stack:?}");
     }
 
     #[test]

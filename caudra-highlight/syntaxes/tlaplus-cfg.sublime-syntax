@@ -1,0 +1,86 @@
+%YAML 1.2
+---
+# Converted from tlaplus/vscode-tlaplus languages/cfg-grammar.json at
+# 2d54234dcb49b52e4b24e750c501e464e9c7aeb8, with local changes.
+# MIT; see ../../THIRD_PARTY_LICENSES/VscodeTlaplus.txt.
+# http://www.sublimetext.com/docs/3/syntax.html
+name: TLA+ Config
+file_extensions:
+  - tlacfg
+  - tla-cfg
+scope: source.tlaplus.cfg
+contexts:
+  main:
+    - include: comments
+    - include: keywords
+    - include: strings
+    - include: constants
+    - match: '(\w+)\s*(=)'
+      captures:
+        1: support.constant.tlaplus.cfg
+        2: keyword.operator.assignment.tlaplus.cfg
+      push: value
+    - match: '(\w+)\s*(<-)'
+      captures:
+        1: support.constant.tlaplus.cfg
+        2: keyword.operator.substitution.tlaplus.cfg
+
+  keywords:
+    - match: '\b(?:SPECIFICATION|INVARIANTS?|PROPERTY|PROPERTIES|CONSTANTS?|INIT|NEXT|SYMMETRY|CONSTRAINTS?|ACTION_CONSTRAINTS?|VIEW|CHECK_DEADLOCK|POSTCONDITION|ALIAS)\b'
+      scope: keyword.control.tlaplus.cfg
+
+  comments:
+    - match: '\\\*.*'
+      scope: comment.line.tlaplus.cfg
+    - match: '\(\*'
+      scope: punctuation.definition.comment.begin.tlaplus.cfg
+      push: block_comment
+
+  block_comment:
+    - meta_scope: comment.block.tlaplus.cfg
+    - match: '\*\)'
+      scope: punctuation.definition.comment.end.tlaplus.cfg
+      pop: true
+    - match: '\(\*'
+      push: block_comment
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.tlaplus.cfg
+      push:
+        - meta_scope: string.quoted.double.tlaplus.cfg
+        - match: '"'
+          scope: punctuation.definition.string.end.tlaplus.cfg
+          pop: true
+        - match: '\\.'
+          scope: constant.character.escape.tlaplus.cfg
+
+  constants:
+    - match: '\b(?:TRUE|FALSE)\b'
+      scope: constant.language.boolean.tlaplus.cfg
+    - match: '\b\d+\b'
+      scope: constant.numeric.tlaplus.cfg
+
+  value:
+    - match: '\n|(?=\b(?:SPECIFICATION|INVARIANTS?|PROPERTY|PROPERTIES|CONSTANTS?|INIT|NEXT|SYMMETRY|CONSTRAINTS?|ACTION_CONSTRAINTS?|VIEW|CHECK_DEADLOCK|POSTCONDITION|ALIAS)\b|\w+\s*(?:=|<-))'
+      pop: true
+    - include: value_items
+    - match: '\{'
+      scope: punctuation.definition.set.begin.tlaplus.cfg
+      push: set
+
+  set:
+    - match: '\}'
+      scope: punctuation.definition.set.end.tlaplus.cfg
+      pop: true
+    - include: value_items
+    - match: '\{'
+      scope: punctuation.definition.set.begin.tlaplus.cfg
+      push: set
+
+  value_items:
+    - include: comments
+    - include: strings
+    - include: constants
+    - match: '\b[A-Za-z_]\w*\b'
+      scope: constant.other.model-value.tlaplus.cfg

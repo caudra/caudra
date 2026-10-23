@@ -268,6 +268,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "xml",
         expected: "structure:\n  <project> [2-8]\n    <dependencies> [3-6]\n      <dependency> ×2 [4-5]\n    <build> [7]\n      <plugins> [7]",
     },
+    LanguageCase {
+        filename: "OutputFolder.tla",
+        source: "---- MODULE OutputFolder ----\nEXTENDS Naturals\n\nRuns == {1, 2}\nNoRun == 0\n\nVARIABLES pc, out\n\nInit ==\n  /\\ pc = [r \\in Runs |-> \"idle\"]\n  /\\ out = NoRun\n\nGo(r, to) == pc' = [pc EXCEPT ![r] = to]\n\nStart(r) ==\n  /\\ pc[r] = \"idle\"\n  /\\ Go(r, \"check\")\n  /\\ UNCHANGED out\n\nNext == \\E r \\in Runs : Start(r)\n\nSpec == Init /\\ [][Next]_<<pc, out>>\n====\n",
+        language: "tlaplus",
+        expected: "imports: [2]\n  Naturals\n\nmod: [1-23]\n  OutputFolder\n\nconsts:\n  VARIABLES [7]\n    pc, out\n\nfns:\n  Runs [4]\n  NoRun [5]\n  Init [9-11]\n  Go(r, to) [13]\n  Start(r) [15-18]\n  Next [20]\n  Spec [22]",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -769,6 +775,21 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
             "DEBUG = 1",
             "targets:",
             "build:",
+        ],
+    },
+    NativeConstructCase {
+        filename: "native.tla",
+        source: "---- MODULE native ----\nCONSTANTS Runs, Limit\nCONSTANT Default(_)\nASSUME Positive == Limit > 0\nCounter == INSTANCE Counters WITH n <- Limit\nINSTANCE TLC\nLOCAL Helper == 1\ndouble[n \\in Nat] == 2 * n\na \\oplus b == a + b\nBump(r) ==\n  LET Clamp(x) == x\n  IN Clamp(r)\nTHEOREM Safety == TRUE\nTHEOREM Helper = 1\n(* --algorithm Transfer\nvariables total = 0;\ndefine\n  Busy == total > 0\nend define;\nmacro Reset() begin\n  total := 0;\nend macro;\nprocedure Add(n) begin\n  AddStep: total := total + n;\n  return;\nend procedure;\nprocess Worker \\in Runs\nbegin\n  Work: call Add(1);\n  Done: Reset();\nend process;\nend algorithm; *)\n====\n",
+        required: &[
+            "imports: [6]\n  instance: TLC",
+            "consts:\n  CONSTANTS [2]\n    Runs, Limit\n  CONSTANT [3]\n    Default(_)",
+            "rules:\n  ASSUME Positive [4]\n  THEOREM Safety [13]\n  THEOREM Helper = 1 [14]",
+            "Counter == INSTANCE Counters WITH n <- Limit [5]",
+            "LOCAL Helper [7]",
+            "double[n \\in Nat] [8]",
+            "a \\oplus b [9]",
+            "Bump(r) [10-12]",
+            "classes:\n  --algorithm Transfer [15-32]\n    variables total = 0\n    define Busy [18]\n    macro Reset() [20-22]\n    procedure Add(n) [23-26]\n      AddStep [24]\n    process Worker \\in Runs [27-31]\n      Work [29], Done [30]",
         ],
     },
 ];
@@ -1610,6 +1631,7 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("vcxproj", "xml"),
         ("props", "xml"),
         ("targets", "xml"),
+        ("tla", "tlaplus"),
     ];
     const FILENAMES: &[(&str, &str)] = &[
         ("MODULE.bazel", "bazel_module"),

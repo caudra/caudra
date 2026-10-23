@@ -1410,7 +1410,7 @@ delete sections.
 - Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java,
   C/C++/CUDA/Objective-C/C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown,
   Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake,
-  Protobuf, and XML.
+  Protobuf, XML, and TLA+.
 - A `.h` header is parsed as C++. A C header parses acceptably under the C++ grammar, while a C++
   header under the C grammar loses its namespaces, classes, and templates; the code map resolves C,
   C++, CUDA, and Objective-C symbols against each other so a `.c`, `.cu`, or `.m` definition still
@@ -1447,6 +1447,14 @@ delete sections.
   spanning the first to the last, as in `<dependency> ×12`. In the code map the root element and
   its children are sections named by their tags, and nothing is a call. SVG, `.xib`, and
   `.storyboard` files are not indexed: each is large generated markup.
+- TLA+ specifications (`.tla`) show each module, `EXTENDS` and `INSTANCE` as imports, `CONSTANTS`
+  and `VARIABLES` with their names, every operator and function definition by its left-hand side,
+  named instances, and `THEOREM`, `LEMMA`, and `ASSUME` facts. A PlusCal algorithm in a comment shows
+  its variables, `define` operators, macros, procedures, and processes with their labels. In the code
+  map, operators, functions, constants, variables, and facts are symbols, and every name in
+  expression position is a call, because TLA+ spells a zero-arity operator and a variable read alike:
+  `Next == Edit \/ Start(r)` calls both `Edit` and `Start`. `LET` definitions are local and are not
+  symbols, nor are user-defined infix operators or PlusCal labels. A TLC model's `.cfg` is not indexed.
 - Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
   not embed a scripting runtime or load extractor code at runtime.
 - MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;

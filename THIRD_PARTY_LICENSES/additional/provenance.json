@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "path_base": "repository_root",
-  "scope": "The 40 previously assigned application/worker missing-text package versions plus seven exact-version macOS objc2 package dependencies and the explicitly recorded sublime-rhai embedded asset. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face package entries. Does not select build dependencies or audit other embedded assets. Canonical license terms may be referenced from another collected package directory.",
+  "scope": "The 40 previously assigned application/worker missing-text package versions plus seven exact-version macOS objc2 package dependencies and the explicitly recorded sublime-rhai and vscode-tlaplus embedded assets. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face package entries. Does not select build dependencies or audit other embedded assets. Canonical license terms may be referenced from another collected package directory.",
   "verification": "46 cached .crate SHA-256 values match root or actual worker Cargo.lock. The worker-root monty-runtime archive matches the exact-version crates.io sparse-index checksum because its own lockfile has no checksum. Cached manifests and .cargo_vcs_info.json match the archives. All 47 original manifests match their reported revision Git blobs byte-for-byte. Upstream ancestor legal files match pinned Git blob hashes. Legal texts are unmodified. Existing texts are referenced when exact sources and contents match. The seven objc2 packages explicitly link canonical MIT terms rather than supply full historical license files; those terms are identified separately, with their original text extraction and reuse recorded. Upstream Apple SDK licensing uncertainty remains unresolved.",
   "worker_source": {
     "manifest_pointer": "target/code-worker/source-manifest-path",
@@ -31,9 +31,49 @@
         "The attribution policy includes the verbatim license and archives the complete caudra-highlight source, including the modified grammar, for distribution.",
         "The upstream LICENSE.md supplies no project-specific copyright notice. No copyright holder or year has been inferred from repository ownership or commit metadata."
       ]
+    },
+    {
+      "name": "vscode-tlaplus",
+      "repository": "https://github.com/tlaplus/vscode-tlaplus",
+      "revision": "2d54234dcb49b52e4b24e750c501e464e9c7aeb8",
+      "revision_evidence": "A shallow clone of the default branch resolved to this revision on 2026-10-23.",
+      "upstream_paths": {
+        "languages/tlaplus-grammar.json": "4297361d94ab25839e9ab4267dba2461b8d975b5",
+        "languages/pluscal-grammar.json": "ebcbb32c0375ad0ab367a71e274539c4ff3da66f",
+        "languages/cfg-grammar.json": "535f9c91f804a4a15bb81ef3db3bcb9365d1fa5a"
+      },
+      "paths": [
+        "caudra-highlight/syntaxes/tlaplus.sublime-syntax",
+        "caudra-highlight/syntaxes/pluscal.sublime-syntax",
+        "caudra-highlight/syntaxes/tlaplus-cfg.sublime-syntax"
+      ],
+      "declared_license": "MIT",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/VscodeTlaplus.txt"
+      ],
+      "modifications": [
+        "Converted the TextMate JSON grammars to Sublime syntax YAML for Syntect: repository entries became contexts, begin/end rules became push/pop contexts, and includes of the whole TLA+ grammar became includes of its module body.",
+        "Replaced the variable-width EXCEPT lookbehind and the sub-grammars applied to captures, which Syntect's fancy-regex backend and Sublime syntax do not support, with fixed-width patterns.",
+        "Highlighted TLA+ outside a MODULE header, recognised PlusCal algorithms in multi-line and nested comments, fixed WF_/SF_ fairness, added ASCII logic, comparison, arithmetic, function and definition operators, and aligned number, boolean, definition and label scopes with common theme scopes.",
+        "Extended the TLC model configuration grammar with assignment and substitution operators, model values and nested comments."
+      ],
+      "notes": [
+        "The grammars and their local modifications remain MIT. Other caudra-highlight files retain their own licenses.",
+        "The upstream LICENSE names Andrew Lygin (2019) and the TLA+ Foundation (2020) as copyright holders."
+      ]
     }
   ],
   "files": [
+    {
+      "path": "THIRD_PARTY_LICENSES/VscodeTlaplus.txt",
+      "kind": "license",
+      "sha256": "21cf6bad9e5a3cf3c167f27041e1faef2ddfb4d76bf02c542f0a2209f190bed2",
+      "repository": "https://github.com/tlaplus/vscode-tlaplus",
+      "revision": "2d54234dcb49b52e4b24e750c501e464e9c7aeb8",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tlaplus/vscode-tlaplus/2d54234dcb49b52e4b24e750c501e464e9c7aeb8/LICENSE",
+      "git_blob_sha1": "3d4f39789bc28d455e9d8e00971928aa8b464c7a"
+    },
     {
       "path": "THIRD_PARTY_LICENSES/SublimeRhai.txt",
       "kind": "license",

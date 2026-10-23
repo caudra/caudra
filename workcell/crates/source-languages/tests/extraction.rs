@@ -386,6 +386,70 @@ fn protobuf_reads_a_qualified_type_once() {
     assert_eq!(captured.named_references, 1, "{:?}", captured.references);
 }
 
+fn tla_module(body: &str) -> String {
+    format!("---- MODULE Spec ----\n{body}\n====\n")
+}
+
+#[test_case("", "module:Spec" ; "a module")]
+#[test_case("CONSTANTS Runs, Limit", "constant:Limit" ; "a constant")]
+#[test_case("CONSTANT Default(_)", "constant:Default" ; "a constant operator")]
+#[test_case("VARIABLES pc, count", "constant:count" ; "a variable")]
+#[test_case("Init == pc = 0", "function:Init" ; "a zero arity operator")]
+#[test_case("Go(r, to) == pc' = to", "function:Go" ; "an operator with parameters")]
+#[test_case("double[n \\in Nat] == 2 * n", "function:double" ; "a function definition")]
+#[test_case("LOCAL Helper == 1", "function:Helper" ; "a local operator")]
+#[test_case("Counter == INSTANCE Counters", "module:Counter" ; "a named instance")]
+#[test_case("THEOREM Safety == TRUE", "constant:Safety" ; "a theorem")]
+#[test_case("ASSUME Positive == 1 > 0", "constant:Positive" ; "an assumption")]
+#[test_case("(* --algorithm Transfer\nbegin\n  Step: skip;\nend algorithm; *)", "module:Transfer" ; "a pluscal algorithm")]
+#[test_case("(* --algorithm A\nprocedure Add(n) begin\n  L: return;\nend procedure;\nbegin\n  M: skip;\nend algorithm; *)", "function:Add" ; "a pluscal procedure")]
+#[test_case("(* --algorithm A\nprocess Worker \\in {1}\nbegin\n  L: skip;\nend process;\nend algorithm; *)", "class:Worker" ; "a pluscal process")]
+fn tla_captures_modules_declarations_definitions_and_facts(body: &str, expected: &str) {
+    let captured = capture(Language::TlaPlus, &tla_module(body));
+    assert!(
+        captured.definitions.contains_key(expected),
+        "missing {expected}; captured {:?}",
+        captured.definitions
+    );
+}
+
+#[test_case("Next == Edit \\/ Note", "call:Edit" ; "a zero arity operator")]
+#[test_case("Next == \\E r \\in Runs : Start(r)", "call:Start" ; "an operator application")]
+#[test_case("Next == pc' = 1", "call:pc" ; "a primed variable")]
+#[test_case("Spec == Init /\\ [][Next]_vars", "call:Next" ; "an action in a box")]
+#[test_case("Next == Counter!Step", "call:Step" ; "an instanced operator")]
+#[test_case("EXTENDS Naturals, TLC", "import:TLC" ; "an extended module")]
+#[test_case("INSTANCE Counters WITH n <- 1", "import:Counters" ; "an instanced module")]
+fn tla_captures_every_name_in_expression_position(body: &str, expected: &str) {
+    let captured = capture(Language::TlaPlus, &tla_module(body));
+    assert!(
+        captured.references.contains_key(expected),
+        "missing {expected}; captured {:?}",
+        captured.references
+    );
+}
+
+#[test]
+fn tla_let_definitions_are_not_symbols() {
+    let captured = capture(
+        Language::TlaPlus,
+        &tla_module("Bump == LET Clamp(x) == x IN Clamp(1)"),
+    );
+    assert_eq!(captured.definitions.get("function:Clamp"), None);
+    assert_eq!(captured.references.get("call:Clamp"), Some(&1));
+}
+
+#[test]
+fn tla_module_names_are_imports_and_never_calls() {
+    let captured = capture(
+        Language::TlaPlus,
+        &tla_module("EXTENDS Naturals\nINSTANCE Counters WITH n <- count"),
+    );
+    assert_eq!(captured.references.get("call:Naturals"), None);
+    assert_eq!(captured.references.get("call:Counters"), None);
+    assert_eq!(captured.references.get("call:count"), Some(&1));
+}
+
 #[test_case("<?xml version=\"1.0\"?>\n<project/>\n", &["section:project"] ; "an empty root")]
 #[test_case("<project><build/></project>\n", &["section:build", "section:project"] ; "an empty child")]
 #[test_case("<project><build><plugins><plugin/></plugins></build></project>\n", &["section:build", "section:project"] ; "nothing below the root's children")]

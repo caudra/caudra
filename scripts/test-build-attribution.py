@@ -937,19 +937,32 @@ class AttributionTests(unittest.TestCase):
             )
         self.assertEqual((bundles[0] / "NOTICE").read_text(), "Root attribution")
 
-    def test_rhai_asset_policy_ships_license_and_modified_source(self):
+    def test_highlight_asset_policy_ships_licenses_and_modified_sources(self):
         repository = Path(__file__).resolve().parent.parent
         version = tomllib.loads((repository / "Cargo.toml").read_text())["workspace"][
             "package"
         ]["version"]
         policy = attribution.load_policy(repository)
         self.assertIn(f"caudra-highlight@{version}", policy["packages"])
-        license_path = "THIRD_PARTY_LICENSES/SublimeRhai.txt"
-        grammar_path = "syntaxes/rhai.sublime-syntax"
-        license_bytes = (repository / license_path).read_bytes()
-        grammar_bytes = (repository / "caudra-highlight" / grammar_path).read_bytes()
+        licenses = {
+            path: (repository / path).read_bytes()
+            for path in (
+                "THIRD_PARTY_LICENSES/SublimeRhai.txt",
+                "THIRD_PARTY_LICENSES/VscodeTlaplus.txt",
+            )
+        }
+        grammars = {
+            path: (repository / "caudra-highlight" / path).read_bytes()
+            for path in (
+                "syntaxes/rhai.sublime-syntax",
+                "syntaxes/tlaplus.sublime-syntax",
+                "syntaxes/pluscal.sublime-syntax",
+                "syntaxes/tlaplus-cfg.sublime-syntax",
+            )
+        }
         (self.root / "THIRD_PARTY_LICENSES").mkdir()
-        (self.root / license_path).write_bytes(license_bytes)
+        for path, license_bytes in licenses.items():
+            (self.root / path).write_bytes(license_bytes)
         (self.root / "LICENSE").write_bytes((repository / "LICENSE").read_bytes())
         (self.root / "NOTICE.md").write_bytes((repository / "NOTICE.md").read_bytes())
         (self.root / "Cargo.lock").write_text("version = 4\n")
@@ -957,7 +970,8 @@ class AttributionTests(unittest.TestCase):
         package.update(version=version, source=None)
         root = Path(package["manifest_path"]).parent
         (root / "syntaxes").mkdir()
-        (root / grammar_path).write_bytes(grammar_bytes)
+        for path, grammar_bytes in grammars.items():
+            (root / path).write_bytes(grammar_bytes)
         graphs = [
             (
                 "artifact",
@@ -974,15 +988,21 @@ class AttributionTests(unittest.TestCase):
             output, self.root, graphs, "fixture-target", policy
         )
         record = manifest["packages"][0]
-        self.assertEqual(record["selected_license"], ["Apache-2.0", "MPL-2.0"])
-        self.assertEqual((output / license_path).read_bytes(), license_bytes)
+        self.assertEqual(
+            record["selected_license"], ["Apache-2.0", "MIT", "MPL-2.0"]
+        )
+        for path, license_bytes in licenses.items():
+            self.assertEqual((output / path).read_bytes(), license_bytes)
         with tarfile.open(output / record["source_archive"], "r:gz") as archive:
-            grammar = archive.extractfile(grammar_path)
-            assert grammar is not None
-            self.assertEqual(grammar.read(), grammar_bytes)
+            for path, grammar_bytes in grammars.items():
+                grammar = archive.extractfile(path)
+                assert grammar is not None
+                self.assertEqual(grammar.read(), grammar_bytes)
         compact = self.root / "compact"
         attribution.write_compact_bundle(compact, output)
-        self.assertIn(license_bytes, (compact / "THIRD_PARTY_NOTICES.txt").read_bytes())
+        notices = (compact / "THIRD_PARTY_NOTICES.txt").read_bytes()
+        for license_bytes in licenses.values():
+            self.assertIn(license_bytes, notices)
         with tarfile.open(compact / attribution.EVIDENCE_ARCHIVE, "r:gz") as archive:
             evidence = archive.extractfile(record["source_archive"])
             assert evidence is not None

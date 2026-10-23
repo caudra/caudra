@@ -32,9 +32,9 @@ The versioned origins in the query headers agree with that snapshot. Swift and T
 do not name versions, so their notice sources use its grammar pins. Resolving the original import
 revision remains a provenance gap.
 
-The remaining eighteen (cmake, containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make,
-markdown, nix, proto, scala, sql, starlark, xml, zig) are authored here against the vendored
-grammars and carry no upstream provenance.
+The remaining 19 (cmake, containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make,
+markdown, nix, proto, scala, sql, starlark, tlaplus, xml, zig) are authored here against the
+vendored grammars and carry no upstream provenance.
 
 ## Code-graph pipeline
 

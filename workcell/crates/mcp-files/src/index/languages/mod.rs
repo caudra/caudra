@@ -29,6 +29,7 @@ mod rust;
 mod scala;
 mod sql;
 mod swift;
+mod tlaplus;
 mod toml;
 mod typescript;
 mod xml;
@@ -60,6 +61,7 @@ pub(super) fn extract(
         Language::Containerfile => containerfile::extract(root, context),
         Language::Make => make::extract(root, context),
         Language::Xml => xml::extract(root, context),
+        Language::TlaPlus => tlaplus::extract(root, context),
         _ => extract_default(root, context, spec(language)),
     }
 }
@@ -102,6 +104,7 @@ fn spec(language: Language) -> LanguageSpec {
         | Language::Hcl
         | Language::Containerfile
         | Language::Make
-        | Language::Xml => unreachable!("custom extractor requested as a default extractor"),
+        | Language::Xml
+        | Language::TlaPlus => unreachable!("custom extractor requested as a default extractor"),
     }
 }

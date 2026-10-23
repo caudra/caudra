@@ -68,6 +68,7 @@ pub enum Language {
     CMake,
     Protobuf,
     Xml,
+    TlaPlus,
 }
 
 /// What a language contributes to the graph.
@@ -130,6 +131,7 @@ pub const ALL: &[Language] = &[
     Language::CMake,
     Language::Protobuf,
     Language::Xml,
+    Language::TlaPlus,
 ];
 
 impl Language {
@@ -225,6 +227,7 @@ impl Language {
             "proto" => Self::Protobuf,
             "xml" | "xsd" | "xsl" | "xslt" | "xaml" | "plist" | "resx" | "wsdl" | "csproj"
             | "fsproj" | "vbproj" | "vcxproj" | "props" | "targets" => Self::Xml,
+            "tla" => Self::TlaPlus,
             _ => return None,
         };
         Some(language)
@@ -273,6 +276,7 @@ impl Language {
             Self::CMake => "cmake",
             Self::Protobuf => "proto",
             Self::Xml => "xml",
+            Self::TlaPlus => "tlaplus",
         }
     }
 
@@ -331,6 +335,7 @@ impl Language {
             Self::CMake => tree_sitter_cmake::LANGUAGE.into(),
             Self::Protobuf => tree_sitter_proto::LANGUAGE.into(),
             Self::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
+            Self::TlaPlus => tree_sitter_tlaplus::LANGUAGE.into(),
         }
     }
 
@@ -365,7 +370,8 @@ impl Language {
             | Self::Make
             | Self::Cuda
             | Self::ObjC
-            | Self::CMake => LanguageFamily::Code,
+            | Self::CMake
+            | Self::TlaPlus => LanguageFamily::Code,
             Self::Toml
             | Self::Yaml
             | Self::Json
@@ -496,6 +502,8 @@ mod tests {
     #[test_case("a/pom.xml", Some(Language::Xml) ; "an xml document is xml")]
     #[test_case("a/App.csproj", Some(Language::Xml) ; "an msbuild project is xml")]
     #[test_case("a/Info.plist", Some(Language::Xml) ; "a property list is xml")]
+    #[test_case("a/Spec.tla", Some(Language::TlaPlus) ; "a tla+ module is tlaplus")]
+    #[test_case("a/Spec.cfg", None ; "a tlc model config is unsupported")]
     #[test_case("a/icon.svg", None ; "an svg image is unsupported")]
     #[test_case("a/Main.storyboard", None ; "a storyboard is unsupported")]
     #[test_case("a/View.xib", None ; "an interface builder file is unsupported")]

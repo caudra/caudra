@@ -293,7 +293,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
 fn section_notes(section: &str) -> &'static [&'static str] {
     match section {
         CODE_INTELLIGENCE => &[
-            "The code tools and `file_index` read 37 languages and formats: Rust, Python, TypeScript, JavaScript, Gleam, Go, HTML, Java, C, C++, CUDA, Objective-C, C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, Protobuf, and XML.",
+            "The code tools and `file_index` read 38 languages and formats: Rust, Python, TypeScript, JavaScript, Gleam, Go, HTML, Java, C, C++, CUDA, Objective-C, C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, Protobuf, XML, and TLA+.",
             "Every count and reach set is a lower bound. A call made through dynamic dispatch, a callback, or a macro adds no edge, so a count of zero means that none was found. A symbol name that matches nothing is refused with up to five close matches to try.",
         ],
         _ => &[],

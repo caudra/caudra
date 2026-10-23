@@ -1,0 +1,60 @@
+%YAML 1.2
+---
+# Converted from tlaplus/vscode-tlaplus languages/pluscal-grammar.json at
+# 2d54234dcb49b52e4b24e750c501e464e9c7aeb8, with local changes.
+# MIT; see ../../THIRD_PARTY_LICENSES/VscodeTlaplus.txt.
+# http://www.sublimetext.com/docs/3/syntax.html
+name: PlusCal
+file_extensions:
+  - pluscal
+scope: source.tlaplus.pluscal
+contexts:
+  main:
+    - include: define_blocks
+    - match: '--((?:fair\s+)?algorithm)\b'
+      captures:
+        1: keyword.other.pluscal
+    - include: keywords
+    - include: scope:source.tlaplus#keywords
+    - include: scope:source.tlaplus#control_keywords
+    - include: scope:source.tlaplus#embedded_operators
+    - include: labels
+    - include: scope:source.tlaplus#strings
+    - include: scope:source.tlaplus#line_comments
+    - include: scope:source.tlaplus#block_comments
+    - include: scope:source.tlaplus#constants
+    - include: scope:source.tlaplus#numeric_constants
+    - include: scope:source.tlaplus#operators
+    - include: scope:source.tlaplus#inst_module_refs
+    - include: scope:source.tlaplus#sequences
+    - include: blocks
+    - include: scope:source.tlaplus#range_operator
+    - include: scope:source.tlaplus#except_vars
+    - include: scope:source.tlaplus#record_fields
+    - include: scope:source.tlaplus#symbolic_operators
+
+  keywords:
+    - match: '\b(?:if|then|elsif|else|while|variables?|define|process|macro|begin|end|do|skip|assert|procedure|return|call|fair|either|or|with|await|when|self|goto|print)\b'
+      scope: keyword.other.pluscal
+
+  labels:
+    - match: '^\s*(\w+:)(?!=)'
+      captures:
+        1: entity.name.label.pluscal
+
+  blocks:
+    - match: '\{'
+      scope: punctuation.section.block.begin.pluscal
+    - match: '\}'
+      scope: punctuation.section.block.end.pluscal
+
+  define_blocks:
+    - match: '^\s*(define)\s*$'
+      captures:
+        1: keyword.other.pluscal
+      push:
+        - match: '^\s*(end\s+define);?\s*$'
+          captures:
+            1: keyword.other.pluscal
+          pop: true
+        - include: scope:source.tlaplus#body

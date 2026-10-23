@@ -256,6 +256,16 @@
         }
       ],
       "origin": "Verbatim identical upstream licensing notice at all three package VCS pins. Explicitly licenses objc2, objc2-encode and objc2-foundation under MIT, and the other framework crates under Zlib OR Apache-2.0 OR MIT. Links full terms rather than containing them. Its Apple SDK licensing caveat is preserved without asserting legal clearance."
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/tree-sitter-tlaplus-1.5.0/LICENSE",
+      "kind": "license",
+      "sha256": "bb9ed59c3ddf6631a6138e4656fbcf7fb225b1a3260760e729d6e58a52c6b15a",
+      "repository": "https://github.com/tlaplus-community/tree-sitter-tlaplus",
+      "revision": "8a8413f1d08e7ee40b347206d26eac4324db9fd9",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tlaplus-community/tree-sitter-tlaplus/8a8413f1d08e7ee40b347206d26eac4324db9fd9/LICENSE",
+      "git_blob_sha1": "c6bed1148fb6175b30a56f41c42b905ca1f92e96"
     }
   ],
   "packages": [
@@ -1593,6 +1603,38 @@
       "notes": [
         "Exact new archive and all extracted bytes match Cargo.lock; original manifest matches the recorded upstream Git blob. Ancestor legal files were fetched at the package revision and verified by Git blob SHA-1. Existing evidence is reused only when byte-identical to that exact revision.",
         "The unchanged upstream LICENSE.md grants MIT by reference, with canonical MIT terms supplied separately as before. It still states uncertainty about Apple SDK-derived bindings; this evidence does not resolve that caveat or assert distribution clearance."
+      ]
+    },
+    {
+      "name": "tree-sitter-tlaplus",
+      "version": "1.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ddaacc0337bfee38f233a91a704dc36b887a0c385348163f65344d64b73f79e1",
+      "declared_license": "MIT",
+      "repository": "https://github.com/tlaplus-community/tree-sitter-tlaplus",
+      "revision": "8a8413f1d08e7ee40b347206d26eac4324db9fd9",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "8a8413f1d08e7ee40b347206d26eac4324db9fd9",
+          "dirty": true
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "1988cb27700a55a06a0d66b8cded12ef4823c9c3",
+      "manifest_match": "version 0.0.0 in Git, 1.5.0 in published manifest",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/tree-sitter-tlaplus-1.5.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile": "Cargo.lock",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The published archive omits LICENSE and records git.dirty=true. Its Cargo.toml.orig differs from the pinned revision's Cargo.toml only in the version line, which upstream's release sets from the tag before publishing. That revision supplies this license text. This does not establish that every published source file equals the clean revision."
       ]
     }
   ]
