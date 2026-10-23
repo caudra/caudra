@@ -630,6 +630,7 @@ mod owned_jobs_tests {
             workdir: ".".into(),
             timeout_ms: TIMEOUT_MS,
             mode: "build".into(),
+            eta: None,
         }
     }
 

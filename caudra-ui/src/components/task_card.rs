@@ -727,6 +727,7 @@ mod tests {
             workdir: ".".into(),
             timeout_ms: 120_000,
             mode: "build".into(),
+            eta: None,
         }));
         let (lines, links) = if delivered {
             let origin = TaskEventOrigin {
@@ -882,6 +883,7 @@ mod tests {
                 workdir: ".".into(),
                 timeout_ms: TIMEOUT_MS,
                 mode: card.mode.clone(),
+                eta: None,
             })
         });
         card

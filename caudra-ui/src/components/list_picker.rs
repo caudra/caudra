@@ -58,6 +58,11 @@ pub trait PickerItem {
     fn badge(&self) -> Option<&str> {
         None
     }
+    /// Drawn before the badge and the detail, and measured each time the row
+    /// is drawn, so a clock in it keeps time.
+    fn timing(&self) -> Option<String> {
+        None
+    }
     /// A one-column sigil drawn at the row's right edge, in a column every row
     /// of a [`ListPicker::with_marks`] picker keeps whether it has one or not.
     fn mark(&self) -> Option<&str> {
@@ -1233,11 +1238,23 @@ pub(crate) fn truncate_label(label: &str, max_width: usize) -> String {
 /// whatever stands to its right.
 fn uncut_text<T: PickerItem>(item: &T) -> String {
     let label = item.label();
-    match (item.badge(), item.detail()) {
-        (Some(badge), Some(detail)) => format!("{label}\n{badge}{BADGE_DETAIL_GAP}{detail}"),
-        (Some(trailing), None) | (None, Some(trailing)) => format!("{label}\n{trailing}"),
-        (None, None) => label.to_owned(),
+    match trailing_text(item.timing(), item.badge(), item.detail()) {
+        Some(trailing) => format!("{label}\n{trailing}"),
+        None => label.to_owned(),
     }
+}
+
+/// What stands to a row's right: its timing, its badge, then its detail.
+fn trailing_text(
+    timing: Option<String>,
+    badge: Option<&str>,
+    detail: Option<&str>,
+) -> Option<String> {
+    let parts: Vec<&str> = [timing.as_deref(), badge, detail]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(BADGE_DETAIL_GAP))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1342,10 +1359,11 @@ fn render_list<T: PickerItem>(
         } else {
             item.detail()
         };
-        let trailing = item.badge().map(|badge| match detail {
-            Some(detail) => format!("{badge}{BADGE_DETAIL_GAP}{detail}"),
-            None => badge.to_owned(),
-        });
+        let timing = item.timing();
+        let leads = timing.is_some() || item.badge().is_some();
+        let trailing = leads
+            .then(|| trailing_text(timing, item.badge(), detail))
+            .flatten();
         let detail = trailing.as_deref().or(detail);
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
@@ -1356,7 +1374,7 @@ fn render_list<T: PickerItem>(
             .saturating_sub(checkbox_cols);
         let (mut line, clipped) = match detail {
             Some(detail) => {
-                let row = if item.badge().is_some() {
+                let row = if leads {
                     badge_row(&label, detail, trailing_gap, row_width)
                 } else {
                     detail_row(&label, detail, trailing_gap, row_width)
@@ -1476,6 +1494,10 @@ mod tests {
     const MARKED_ROW_PLAIN: &str = "a selected or disabled row draws its label in the row's style";
     const TIP_ONLY_WHEN_CUT: &str = "a hovered row offers its whole text exactly when it was cut";
     const TIP_OFF_THE_ROWS: &str = "a pointer that left the rows still offered a tip";
+    const BADGE: &str = "bg";
+    const TIMING: &str = "ETA ~40s · 1.2s";
+    const TIMING_FIRST: &str = "a row's timing comes before its badge and its detail";
+    const TIMING_IN_TIP: &str = "a cut row's tip names its timing";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1510,6 +1532,8 @@ mod tests {
         detail: Option<String>,
         spinning: bool,
         mark: Option<&'static str>,
+        badge: Option<&'static str>,
+        timing: Option<&'static str>,
     }
 
     impl Entry {
@@ -1519,6 +1543,8 @@ mod tests {
                 detail: None,
                 spinning: false,
                 mark: None,
+                badge: None,
+                timing: None,
             }
         }
     }
@@ -1529,6 +1555,12 @@ mod tests {
         }
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
+        }
+        fn badge(&self) -> Option<&str> {
+            self.badge
+        }
+        fn timing(&self) -> Option<String> {
+            self.timing.map(str::to_owned)
         }
         fn mark(&self) -> Option<&str> {
             self.mark
@@ -1870,6 +1902,44 @@ mod tests {
         };
         let (tip, _) = hovered_tip(entry, |row| row);
         assert_eq!(tip.map(|tip| tip.text), expected, "{TIP_ONLY_WHEN_CUT}");
+    }
+
+    #[test_case(Some(BADGE), &[TIMING, BADGE, SHORT_DETAIL]; "badged")]
+    #[test_case(None, &[TIMING, SHORT_DETAIL]; "unbadged")]
+    fn a_row_draws_its_timing_before_its_badge_and_detail(
+        badge: Option<&'static str>,
+        order: &[&str],
+    ) {
+        let entry = Entry {
+            detail: Some(SHORT_DETAIL.to_owned()),
+            badge,
+            timing: Some(TIMING),
+            ..Entry::new(LONG_DETAIL)
+        };
+        let mut picker = ListPicker::new();
+        picker.open(vec![entry], " Test ");
+        let buffer = render(&mut picker);
+        let hit = &ready_state(&picker).row_hits[0];
+        let row: String = (hit.area.left()..hit.area.right())
+            .map(|x| buffer[(x, hit.area.y)].symbol())
+            .collect();
+        let at: Vec<usize> = order
+            .iter()
+            .map(|part| row.find(part).unwrap_or_else(|| panic!("{part}: {row}")))
+            .collect();
+        assert!(at.is_sorted(), "{TIMING_FIRST}: {row}");
+        let (tip, _) = hovered_tip(
+            Entry {
+                badge,
+                timing: Some(TIMING),
+                ..Entry::new(LONG_DETAIL)
+            },
+            |row| row,
+        );
+        assert!(
+            tip.is_some_and(|tip| tip.text.contains(TIMING)),
+            "{TIMING_IN_TIP}"
+        );
     }
 
     /// Marks line up whether a row has a detail or not, and a row without a

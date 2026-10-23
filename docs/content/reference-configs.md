@@ -381,9 +381,9 @@ version = 4
 # Type: u64, at least 1.
 # shell_async_threshold_secs = 120
 
-# Show an ETA on a shell card, from a small model trained on this machine's
-# past shell runs. It only labels the card: timeouts and delivery never change.
-# When off, nothing is predicted or recorded.
+# Show an ETA on a shell card and in `/shells`, from a small model trained on
+# this machine's past shell runs. It only labels the command: timeouts and
+# delivery never change. When off, nothing is predicted or recorded.
 # Type: bool.
 # shell_eta = true
 

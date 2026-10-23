@@ -13,12 +13,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_agent::background::{ShellLive, ShellOutputView, ShellSnapshot, ShellView};
-use caudra_agent::{ShellOutput, SnapshotLine, TaskCard, ToolOutput, format_settled_duration};
+use caudra_agent::shell_eta::{ETA_LABEL, eta_label};
+use caudra_agent::{
+    ShellOutput, SnapshotLine, TaskCard, ToolOutput, format_live_duration, format_settled_duration,
+};
 use caudra_grab::grab_scope;
 use caudra_highlight::Highlighter;
 use caudra_storage::auth::now_millis;
 use caudra_storage::background::{JobKind, JobOwner};
-use caudra_storage::now_epoch;
 use caudra_storage::shell_history::ShellExecutionOwner;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
@@ -181,7 +183,11 @@ impl ShellItem {
             item.state(),
             item.id
         );
-        let detail = format!("{}{SEPARATOR}{}", item.owner, item.state());
+        let mut detail = format!("{}{SEPARATOR}{}", item.owner, item.state());
+        if let Some(took) = item.settled() {
+            detail.push_str(SEPARATOR);
+            detail.push_str(&format_settled_duration(took));
+        }
         item.label = label;
         item.search = search;
         item.detail = detail;
@@ -250,6 +256,46 @@ impl ShellItem {
         matches!(self.source, ShellSource::Background { .. })
     }
 
+    /// The estimate the call started with, without its label.
+    fn eta(&self) -> Option<&str> {
+        match &self.source {
+            ShellSource::Foreground(view) => view.record.eta.as_deref(),
+            ShellSource::Background { task, .. } => {
+                task.shell.as_ref().and_then(|shell| shell.eta.as_deref())
+            }
+        }
+    }
+
+    fn started_ms(&self) -> u64 {
+        match &self.source {
+            ShellSource::Foreground(view) => view.record.created_at_ms,
+            ShellSource::Background { task, .. } => {
+                task.created_at.saturating_mul(MILLIS_PER_SECOND)
+            }
+        }
+    }
+
+    /// How long a settled command took: what a background job measured when
+    /// it has that, else the span between its timestamps.
+    fn settled(&self) -> Option<Duration> {
+        if self.active() {
+            return None;
+        }
+        match &self.source {
+            ShellSource::Foreground(view) => view.record.finished_at_ms.map(|finished| {
+                Duration::from_millis(finished.saturating_sub(view.record.created_at_ms))
+            }),
+            ShellSource::Background { task, .. } => Some(task.duration_ms.map_or_else(
+                || Duration::from_secs(task.updated_at.saturating_sub(task.created_at)),
+                Duration::from_millis,
+            )),
+        }
+    }
+
+    fn running_for(&self) -> Duration {
+        Duration::from_millis(now_millis().saturating_sub(self.started_ms()))
+    }
+
     fn live(&self) -> Option<&ShellLive> {
         match &self.source {
             ShellSource::Foreground(view) => match &view.output {
@@ -289,6 +335,17 @@ impl PickerItem for ShellItem {
 
     fn badge(&self) -> Option<&str> {
         self.is_background().then_some(BACKGROUND_BADGE)
+    }
+
+    fn timing(&self) -> Option<String> {
+        if !self.active() {
+            return None;
+        }
+        let clock = format_live_duration(self.running_for());
+        Some(match self.eta() {
+            Some(eta) => format!("{}{SEPARATOR}{clock}", eta_label(eta)),
+            None => clock,
+        })
     }
 
     /// None for a row named by its id, which stands in for a blank first line
@@ -812,15 +869,7 @@ fn header_lines(item: &ShellItem, width: u16) -> Vec<Line<'static>> {
                     t.tool,
                 ));
             }
-            let elapsed = match record.finished_at_ms {
-                Some(finished) => format_settled_duration(Duration::from_millis(
-                    finished.saturating_sub(record.created_at_ms),
-                )),
-                None => format_elapsed(
-                    now_millis().saturating_sub(record.created_at_ms) / MILLIS_PER_SECOND,
-                ),
-            };
-            facts.push(fact(ELAPSED_LABEL, &elapsed, t.tool));
+            facts.extend(timing_facts(item));
             if let ShellOutputView::Kept(output) = &view.output
                 && let ToolOutput::Shell(shell) = output.as_ref()
             {
@@ -842,16 +891,7 @@ fn header_lines(item: &ShellItem, width: u16) -> Vec<Line<'static>> {
                     t.tool,
                 ));
             }
-            let end = if task.active() {
-                now_epoch()
-            } else {
-                task.updated_at
-            };
-            facts.push(fact(
-                ELAPSED_LABEL,
-                &format_elapsed(end.saturating_sub(task.created_at)),
-                t.tool,
-            ));
+            facts.extend(timing_facts(item));
             if let Some(ToolOutput::Shell(shell)) = output.as_deref() {
                 facts.extend(exit_fact(shell, state));
             }
@@ -859,6 +899,21 @@ fn header_lines(item: &ShellItem, width: u16) -> Vec<Line<'static>> {
     }
     facts.push(fact(ID_LABEL, &item.id, t.tool_dim));
     WrappedRows::new(facts, 0, width).lines()
+}
+
+/// The estimate while the command runs, then how long it has run or took.
+fn timing_facts(item: &ShellItem) -> impl Iterator<Item = Line<'static>> {
+    let t = theme::current();
+    let eta = item
+        .eta()
+        .filter(|_| item.active())
+        .map(|eta| fact(ETA_LABEL, eta, t.tool));
+    let elapsed = match item.settled() {
+        Some(took) => format_settled_duration(took),
+        None => format_elapsed(item.running_for().as_secs()),
+    };
+    eta.into_iter()
+        .chain([fact(ELAPSED_LABEL, &elapsed, t.tool)])
 }
 
 fn exit_fact(shell: &ShellOutput, state: &str) -> Option<Line<'static>> {
@@ -1032,6 +1087,14 @@ mod tests {
     const THEME_IGNORED: &str = "a theme switch recolours the command";
     const NOT_REWRAPPED: &str = "a narrower modal rewraps the command rather than clipping it";
     const ID_COLOURED: &str = "a row named by its id is not shell and keeps the row's style";
+    const ETA: &str = "~40s";
+    const ETA_SHOWN: &str = "ETA ~40s";
+    const RUNNING: &str = "running";
+    const JOB_TOOK_MS: u64 = 4_100;
+    /// What `record` puts between a settled execution's timestamps.
+    const FOREGROUND_TOOK_MS: u64 = 1;
+    const TIMING_BESIDE_BADGE: &str = "a running row's timing sits just before its badge";
+    const ETA_ONLY_WHILE_RUNNING: &str = "the estimate is shown only while the command runs";
 
     fn record(id: &str, state: ShellExecutionState, created_at_ms: u64) -> ShellExecutionRecord {
         ShellExecutionRecord {
@@ -1048,6 +1111,7 @@ mod tests {
             state,
             started: true,
             reason: None,
+            eta: None,
         }
     }
 
@@ -1416,6 +1480,102 @@ mod tests {
             rows(&modal)[0].label_colours().is_some(),
             coloured,
             "{ID_COLOURED}"
+        );
+    }
+
+    fn estimated_record(state: ShellExecutionState) -> Arc<ShellView> {
+        let mut record = record(FIRST_ID, state, STARTED_MS);
+        record.eta = Some(ETA.into());
+        view(record, ShellOutputView::Missing)
+    }
+
+    fn estimated_job(state: &str, duration_ms: Option<u64>) -> TaskCard {
+        let mut card = job(state);
+        card.duration_ms = duration_ms;
+        if let Some(shell) = card.shell.as_mut() {
+            shell.eta = Some(ETA.into());
+        }
+        card
+    }
+
+    fn estimated(background: bool, state: ShellExecutionState) -> ShellModal {
+        if background {
+            opened(
+                Vec::new(),
+                vec![estimated_job(state.as_str(), Some(JOB_TOOK_MS))],
+            )
+        } else {
+            opened(vec![estimated_record(state)], Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_running_row_draws_its_eta_and_clock_before_its_badge() {
+        let mut modal = opened(Vec::new(), vec![estimated_job(RUNNING, None)]);
+        let timing = rows(&modal)[0].timing().unwrap();
+        assert!(
+            timing.starts_with(&format!("{ETA_SHOWN}{SEPARATOR}")),
+            "{timing}"
+        );
+        let buffer = draw(&mut modal, WIDTH);
+        let eta = locate(&buffer, ETA_SHOWN).expect(NOT_DRAWN);
+        let badge = locate(&buffer, BACKGROUND_BADGE).expect(NOT_DRAWN);
+        assert_eq!(eta.y, badge.y, "{TIMING_BESIDE_BADGE}");
+        assert!(eta.x < badge.x, "{TIMING_BESIDE_BADGE}");
+    }
+
+    #[test]
+    fn a_running_row_without_an_estimate_draws_only_its_clock() {
+        let modal = opened(vec![running(FIRST_ID, STARTED_MS)], Vec::new());
+        let timing = rows(&modal)[0].timing().unwrap();
+        assert!(!timing.contains(ETA_LABEL), "{timing}");
+    }
+
+    #[test_case(false, FOREGROUND_TOOK_MS; "foreground")]
+    #[test_case(true, JOB_TOOK_MS; "measured_job")]
+    fn a_finished_row_and_its_details_say_how_long_it_took(background: bool, took_ms: u64) {
+        let succeeded = ShellExecutionState::Succeeded;
+        let mut modal = if background {
+            opened(
+                Vec::new(),
+                vec![estimated_job(succeeded.as_str(), Some(JOB_TOOK_MS))],
+            )
+        } else {
+            opened(vec![estimated_record(succeeded)], Vec::new())
+        };
+        let took = format_settled_duration(Duration::from_millis(took_ms));
+        let row = rows(&modal)[0];
+        assert!(row.timing().is_none());
+        assert!(
+            row.detail.ends_with(&format!("{SEPARATOR}{took}")),
+            "{}",
+            row.detail
+        );
+        let _ = modal.handle_key(key_event(KeyCode::Enter));
+        let painted = paint(&mut modal);
+        assert!(painted.contains(&took), "{painted}");
+        assert!(
+            !painted.contains(ETA),
+            "{ETA_ONLY_WHILE_RUNNING}: {painted}"
+        );
+    }
+
+    #[test_case(false, ShellExecutionState::Running, true; "foreground_running")]
+    #[test_case(false, ShellExecutionState::Succeeded, false; "foreground_finished")]
+    #[test_case(true, ShellExecutionState::Running, true; "background_running")]
+    #[test_case(true, ShellExecutionState::Succeeded, false; "background_finished")]
+    fn details_show_the_estimate_only_while_running(
+        background: bool,
+        state: ShellExecutionState,
+        shown: bool,
+    ) {
+        let mut modal = estimated(background, state);
+        let _ = modal.handle_key(key_event(KeyCode::Enter));
+        let painted = paint(&mut modal);
+        assert_eq!(
+            painted.contains(ETA),
+            shown,
+            "{ETA_ONLY_WHILE_RUNNING}: {painted}"
         );
     }
 }

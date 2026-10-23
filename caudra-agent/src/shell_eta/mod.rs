@@ -51,7 +51,7 @@ pub(crate) const MIN_TRAINING_RUNS: usize = 100;
 const RETRAIN_EVERY: usize = 500;
 /// How often an untrained model looks again for enough runs.
 const RETRY_UNTRAINED_EVERY: usize = 50;
-const ETA_PREFIX: &str = "ETA ";
+pub const ETA_LABEL: &str = "ETA";
 const APPROXIMATELY: &str = "~";
 const SECONDS_WORD: &str = "seconds";
 const MINUTES_WORD: &str = "minutes";
@@ -79,9 +79,14 @@ struct Guess {
     eta: Option<String>,
 }
 
+/// An estimate as the card says it, such as `ETA ~40s`.
+pub fn eta_label(estimate: &str) -> String {
+    format!("{ETA_LABEL} {estimate}")
+}
+
 impl Forecast {
-    /// The card annotation: nothing for a command expected to exit at once or
-    /// one the model is unsure of.
+    /// The estimate without its label, such as `~40s`: nothing for a command
+    /// expected to exit at once or one the model is unsure of.
     pub fn eta(&self) -> Option<&str> {
         self.guess.eta.as_deref()
     }
@@ -182,10 +187,10 @@ impl Model {
         } else if let Some(ms) = time_ms {
             (ms > INSTANT_MS).then(|| {
                 let seconds = Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND));
-                format!("{ETA_PREFIX}{APPROXIMATELY}{}", humanize_duration(seconds))
+                format!("{APPROXIMATELY}{}", humanize_duration(seconds))
             })
         } else {
-            class_word(class, confidence).map(|word| format!("{ETA_PREFIX}{word}"))
+            class_word(class, confidence).map(str::to_owned)
         };
         Guess {
             reading,

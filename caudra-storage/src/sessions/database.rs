@@ -7971,6 +7971,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 workdir: CWD.into(),
                 timeout_ms: SHELL_TIMEOUT_MS,
                 mode: "build".into(),
+                eta: None,
             }),
             owner,
             created_at: 1,

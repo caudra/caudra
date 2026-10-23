@@ -106,6 +106,9 @@ pub struct ShellJobMetadata {
     pub workdir: String,
     pub timeout_ms: u64,
     pub mode: String,
+    /// The estimate the call started with, without its label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta: Option<String>,
 }
 
 /// A `question` the main agent asked without waiting for the answer.
@@ -1039,6 +1042,7 @@ mod tests {
                 workdir: CWD.into(),
                 timeout_ms: 120_000,
                 mode: "build".into(),
+                eta: None,
             });
             task.owner = JobOwner::Child {
                 invocation_id: CHILD.into(),

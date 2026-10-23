@@ -2966,6 +2966,7 @@ mod background_runtime {
                         workdir: ".".into(),
                         timeout_ms: SHELL_TIMEOUT_MS,
                         mode: "build".into(),
+                        eta: None,
                     },
                     &fixture.history,
                     |cancel, _| async move {
@@ -3076,6 +3077,7 @@ mod background_runtime {
                         workdir: ".".into(),
                         timeout_ms: SHELL_TIMEOUT_MS,
                         mode: "build".into(),
+                        eta: None,
                     },
                     &fixture.history,
                     |cancel, _| async move {

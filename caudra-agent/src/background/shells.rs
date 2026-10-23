@@ -442,6 +442,7 @@ impl JobScope {
         input: &Value,
         timeout: Duration,
         remote: bool,
+        eta: Option<String>,
     ) -> Result<ShellExecution, String> {
         let command = input
             .get(COMMAND_FIELD)
@@ -474,6 +475,7 @@ impl JobScope {
             state: ShellExecutionState::Preparing,
             started: false,
             reason: None,
+            eta,
         };
         self.shells().begin(ctx, record).await
     }
@@ -691,6 +693,7 @@ mod tests {
     const CALL: &str = "tracked-shell-call";
     const COMMAND: &str = "printf tracked";
     const OUTPUT: &str = "tracked output";
+    const ETA: &str = "~40s";
     const INVOCATION: &str = "observed-shell-job";
     const MISSING: &str = "no-such-execution";
     const RUNNING_ID: &str = "left-running";
@@ -728,6 +731,10 @@ mod tests {
         }
 
         async fn track(&self) -> Result<ShellExecution, String> {
+            self.track_with(None).await
+        }
+
+        async fn track_with(&self, eta: Option<&str>) -> Result<ShellExecution, String> {
             self.ctx
                 .job_scope()
                 .unwrap()
@@ -737,6 +744,7 @@ mod tests {
                     &json!({"command": COMMAND}),
                     TIMEOUT,
                     false,
+                    eta.map(str::to_owned),
                 )
                 .await
         }
@@ -813,6 +821,7 @@ mod tests {
             state,
             started: true,
             reason: None,
+            eta: None,
         }
     }
 
@@ -866,6 +875,22 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(kept, serde_json::to_value(&output).unwrap());
+        });
+    }
+
+    #[test_case(Some(ETA); "estimated")]
+    #[test_case(None; "unestimated")]
+    fn a_tracked_shell_keeps_the_estimate_it_started_with(eta: Option<&str>) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let execution = fixture.track_with(eta).await.unwrap();
+            let shown =
+                |fixture: &Fixture| fixture.shells().snapshot().executions[0].record.eta.clone();
+            assert_eq!(shown(&fixture).as_deref(), eta);
+            execution.finish(&done(shell_output(OUTPUT.into(), false), false));
+            assert_eq!(shown(&fixture).as_deref(), eta);
+            fixture.tasks.shutdown().await.unwrap();
+            assert_eq!(fixture.stored()[0].eta.as_deref(), eta);
         });
     }
 

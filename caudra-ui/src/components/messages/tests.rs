@@ -11590,6 +11590,7 @@ fn shell_job(call: &str) -> TaskCard {
         workdir: ".".into(),
         timeout_ms: JOB_TIMEOUT_MS,
         mode: TASK_MODE.into(),
+        eta: None,
     }));
     card
 }

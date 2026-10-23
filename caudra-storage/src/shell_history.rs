@@ -126,6 +126,9 @@ pub struct ShellExecutionRecord {
     pub started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The estimate the call started with, without its label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta: Option<String>,
 }
 
 /// Keyset position of the oldest record a page returned.
@@ -393,6 +396,7 @@ mod tests {
             state,
             started: true,
             reason: None,
+            eta: None,
         }
     }
 

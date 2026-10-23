@@ -14,7 +14,7 @@ const BUILD: &str = "cargo build --release";
 const UNKNOWN: &str = "frobnicate --all";
 const QUICK_MS: u64 = 20;
 const BUILD_MS: u64 = 39_500;
-const BUILD_ETA: &str = "ETA ~40s";
+const BUILD_ETA: &str = "~40s";
 const REPEATS: usize = 60;
 
 fn reading(command: &str) -> Reading {

@@ -24,7 +24,7 @@ use crate::mcp::call::CallScope;
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
 };
-use crate::shell_eta::{Forecast, ShellEta};
+use crate::shell_eta::{Forecast, ShellEta, eta_label};
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
 use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
@@ -1054,9 +1054,9 @@ async fn run_inner(
         } else {
             None
         };
-        let eta = forecast.as_ref().and_then(Forecast::eta).map(str::to_owned);
-        let shows_eta = eta.is_some();
-        let annotation = match (own_annotation.clone(), eta) {
+        let estimate = forecast.as_ref().and_then(Forecast::eta).map(str::to_owned);
+        let shows_eta = estimate.is_some();
+        let annotation = match (own_annotation.clone(), estimate.as_deref().map(eta_label)) {
             (Some(annotation), Some(estimate)) => Some(format!("{annotation}; {estimate}")),
             (annotation, estimate) => annotation.or(estimate),
         };
@@ -1166,6 +1166,7 @@ async fn run_inner(
                         AgentMode::Plan(_) | AgentMode::RemotePlan(_) => SHELL_MODE_PLAN,
                     }
                     .into(),
+                    eta: estimate.clone(),
                 };
                 let invocation = Arc::new(Mutex::new(Some(invocation)));
                 let owned_invocation = Arc::clone(&invocation);
@@ -1283,6 +1284,7 @@ async fn run_inner(
                     invocation.permission_input().unwrap_or(input),
                     timeout,
                     invocation.runs_remotely(),
+                    estimate,
                 )
                 .await
             {
@@ -2042,6 +2044,7 @@ mod tests {
     const SEEDED_RUNS: usize = MIN_TRAINING_RUNS;
     const SEEDED_RUN_MS: u64 = 40_000;
     const SEEDED_RUN_ETA: &str = "ETA ~40s";
+    const SEEDED_ESTIMATE: &str = "~40s";
     const SHELL_RESULT_MS: u64 = 123;
     const ASYNC_TIMEOUT_SECS: u64 = 600;
     const CONTENT_BASE_URL: &str = "http://127.0.0.1:1";
@@ -2400,9 +2403,18 @@ mod tests {
             assert!(!done.is_error, "{}", done.output.as_text());
             let asynchronous = timeout.is_some();
             assert_eq!(matches!(&done.output, ToolOutput::Tasks(_)), asynchronous);
-            if let ToolOutput::Tasks(cards) = &done.output {
-                fixture.settled(&cards[0]).await;
-            }
+            let stored = match &done.output {
+                ToolOutput::Tasks(cards) => fixture
+                    .settled(&cards[0])
+                    .await
+                    .shell
+                    .and_then(|shell| shell.eta),
+                _ => fixture.tasks.shells().snapshot().executions[0]
+                    .record
+                    .eta
+                    .clone(),
+            };
+            assert_eq!(stored.as_deref(), enabled.then_some(SEEDED_ESTIMATE));
             assert_eq!(*fixture.trace.prepared_input.lock().unwrap(), Some(input));
             let mut events = fixture.events.try_iter().map(|envelope| envelope.event);
             let start = events

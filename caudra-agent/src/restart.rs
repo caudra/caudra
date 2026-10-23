@@ -533,6 +533,7 @@ mod tests {
             state: ShellExecutionState::Interrupted,
             started: true,
             reason: None,
+            eta: None,
         }
     }
 

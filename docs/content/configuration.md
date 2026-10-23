@@ -452,7 +452,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `deferred_questions` | bool | `true` | - | Let the main agent ask a `question` without waiting for the answer, so it keeps working while the form waits for you. The answer reaches it later, and you can also put a waiting question off with F4. When off, every question waits for its answer |
 | `shell_execution` | string | `auto` | - | Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt |
 | `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline |
-| `shell_eta` | bool | `true` | - | Show an ETA on a shell card, from a small model trained on this machine's past shell runs. It only labels the card: timeouts and delivery never change. When off, nothing is predicted or recorded |
+| `shell_eta` | bool | `true` | - | Show an ETA on a shell card and in `/shells`, from a small model trained on this machine's past shell runs. It only labels the command: timeouts and delivery never change. When off, nothing is predicted or recorded |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `summarize_memory` | bool | `true` | - | Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |

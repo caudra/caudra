@@ -1171,6 +1171,7 @@ mod tests {
                 workdir: WORKDIR.into(),
                 timeout_ms: TIMEOUT_MS,
                 mode: SHELL_MODE.into(),
+                eta: None,
             })),
             task_id: TASK.into(),
             invocation_id: INVOCATION.into(),

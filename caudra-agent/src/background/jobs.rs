@@ -1007,6 +1007,7 @@ mod tests {
             workdir: ".".into(),
             timeout_ms: TIMEOUT_MS,
             mode: "build".into(),
+            eta: None,
         }
     }
 

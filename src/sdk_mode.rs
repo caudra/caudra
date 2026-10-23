@@ -4105,6 +4105,7 @@ mod tests {
                 workdir: ".".into(),
                 timeout_ms: 120_000,
                 mode: "build".into(),
+                eta: None,
             });
         }
         SessionDatabase::open(&storage)
