@@ -94,7 +94,7 @@ Never name a model on a page. Caudra appends a **Model roles** table to every pa
 
 ## Scripts
 
-pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Each takes the upstream command line's arguments as strings and returns `{"code", "stdout", "stderr"}`; a nonzero `code` is the script's verdict, not an exception. `log` and the `orch` commands that change the store write files, so plan mode refuses them; `orch`'s help and read-only commands run there. Commands a script runs get the shell tool's environment, so `gh` needs its token or keyring variables forwarded with `/env` or `[agent.shell_env] pass`. In a remote session the calls raise, and the step runs with `shell` instead.
+pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Each takes the upstream command line's arguments as strings and returns `{"code", "stdout", "stderr"}`; a nonzero `code` is the script's verdict, not an exception. `log`, the `orch` commands that change the store, and `statechart`'s `from-spec` and `from-chart` write files, so plan mode refuses them; `orch`'s help and read-only commands, and `statechart`'s `compare` and help, run there. Commands a script runs get the shell tool's environment, so `gh` needs its token or keyring variables forwarded with `/env` or `[agent.shell_env] pass`. In a remote session the calls raise, and the step runs with `shell` instead.
 
 | Upstream | Caudra |
 | --- | --- |
@@ -103,7 +103,8 @@ pstack's scripts are built into Caudra as `pstack` calls in the `code` tool. Eac
 | `scripts/worktree-audit.sh [-b <ref>] [repo]` | `await pstack.worktree_audit("-b", "origin/main")`. `LAST_CHAT` is the last Caudra session that worked in the worktree. |
 | `scripts/watch-pr/watch-pr <args>` | `await pstack.watch_pr("--pr", "123", "--status-only")`, same flags. A polling run streams its lines to the call's row and ends at the run's `timeoutSec`, at most 3600: raise `timeoutSec` for drive mode, or arm the `pstack-watch-pr` automation for a long wait. |
 | `orch <command> <args>` | `await pstack.orch("--store", store, "unit", "add", ...)`. Every call passes `--store`, `init` included. |
-| installing bun, node, or a script's dependencies | drop the step |
+| `node .../statechart.mjs <command> <args>` | `await pstack.statechart("from-spec", "Pay.tla", ...)`, same commands and flags, plus `compare` for `compare-charts.mjs`. It checks with tla-checker, so TLC, Java, and `TLA2TOOLS` go. A mapping is Rhai, `SPEC.map.rhai`, with snake_case names (`reader_actions`); `--png` is gone, and a chart is shown in a ```` ```mermaid ```` block. `from-spec` and `from-chart` write, so plan mode refuses them. |
+| installing bun, node, Java, TLC, or a script's dependencies | drop the step |
 
 ## Paths and state
 

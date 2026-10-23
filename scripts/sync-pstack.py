@@ -48,6 +48,11 @@ PORTED_SCRIPTS = (
     "skills/poteto-mode/scripts/orch/orch.ts",
     "skills/poteto-mode/scripts/orch/store.ts",
     "skills/show-me-your-work/scripts/log.sh",
+    "skills/statechart/scripts/statechart.mjs",
+    "skills/statechart/scripts/tlc-to-chart.mjs",
+    "skills/statechart/scripts/chart-to-tla.mjs",
+    "skills/statechart/scripts/compare-charts.mjs",
+    "skills/statechart/scripts/lib.mjs",
 )
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 URL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)

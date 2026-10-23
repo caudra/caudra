@@ -18,15 +18,17 @@ pub enum Script {
     WorktreeAudit,
     WatchPr,
     Orch,
+    Statechart,
 }
 
 impl Script {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Log,
         Self::CheckPlan,
         Self::WorktreeAudit,
         Self::WatchPr,
         Self::Orch,
+        Self::Statechart,
     ];
 
     /// The member a `code` snippet calls it by.
@@ -37,6 +39,7 @@ impl Script {
             Self::WorktreeAudit => "worktree_audit",
             Self::WatchPr => "watch_pr",
             Self::Orch => "orch",
+            Self::Statechart => "statechart",
         }
     }
 
@@ -52,16 +55,19 @@ impl Script {
             Self::WorktreeAudit => "poteto-mode/scripts/worktree-audit.sh",
             Self::WatchPr => "poteto-mode/scripts/watch-pr/watch-pr",
             Self::Orch => "poteto-mode/scripts/orch/orch.ts",
+            Self::Statechart => "statechart/scripts/statechart.mjs",
         }
     }
 
     /// Whether a run of `argv` can change files, which plan mode refuses and permissions ask about.
     /// `orch` reads its command line, so its help and its read-only commands write nothing; `env`
-    /// answers the variables its options fall back to.
+    /// answers the variables its options fall back to. `statechart` writes its charts, but its
+    /// `compare` and its help write nothing.
     pub fn writes(self, argv: &[String], env: &dyn Fn(&str) -> Option<String>) -> bool {
         match self {
             Self::Log => true,
             Self::Orch => orch::store_use(argv, env).is_some_and(|used| used.writes),
+            Self::Statechart => statechart::cli::writes(argv),
             Self::CheckPlan | Self::WorktreeAudit | Self::WatchPr => false,
         }
     }
@@ -73,6 +79,7 @@ impl Script {
             Self::WorktreeAudit => worktree_audit::run(host, argv),
             Self::WatchPr => watch_pr::run(host, argv),
             Self::Orch => orch::run(host, argv),
+            Self::Statechart => statechart::cli::run(host, argv),
         }
     }
 }

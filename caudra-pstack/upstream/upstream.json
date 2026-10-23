@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/cursor/plugins",
-  "commit": "88d47514b82e7c44f00f2b2a72ff6dd12158038c",
-  "version": "0.15.29",
+  "commit": "8b3326d99fd4b993cb33a24dad8af03175c642c5",
+  "version": "0.15.30",
   "files": {
-    "pstack/README.md": "89dd87ec01491f5f9764b3f57a571418d2a04e6259afc43ed386cf8556c19fd2",
+    "pstack/README.md": "1e31b6200d81fad75cae6acbe09acc5dc58cb70b82dd19781c9fcfb7ec8b9d4d",
     "pstack/LICENSE": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e",
-    "pstack/plugin.json": "8a5811042556a0a981e9fdd08a2c726be76458833d64b484acaa611291308c2a",
+    "pstack/plugin.json": "b17556047a5df5fd2c42550af8d965ece3c2e55aa68082def5951e09f4788ae1",
     "pstack/skills/architect/SKILL.md": "31f8e97a52bfa5432edd61f68ade2a8632ef0bacbc2d2a6802d7a0e6821944ac",
     "pstack/skills/architect/references/design-red-flags.md": "d0e639e4cc588ec865f930d3a4111faad60987ae36925917e319d7ceca7c69ce",
     "pstack/skills/architect/references/rationale-template.md": "0cedfccdc7b47fc881febd5a8293eecbc542c20f8df825639904a8102d2eb5d3",
@@ -36,7 +36,7 @@
     "pstack/skills/maintain-verification-skill/SKILL.md": "515c0eaa054b3f6be1b1fb06f2c2f173c80fddb58bbcac57576f89c479bc68e8",
     "pstack/skills/make-bot-ui/SKILL.md": "ad19d0bc6764287ec08c2521701974e7dac941f72e4d0fe81a24f4614494586f",
     "pstack/skills/no-comments/SKILL.md": "078ecfe224eafbb017f6476870612838bf6dbe38c0b697e12f0c887d0313f17e",
-    "pstack/skills/poteto-help/SKILL.md": "2e30f25ac0ce5f93aeaccbd0fac5c9470be9529e377a7e62883efc86281bc2b6",
+    "pstack/skills/poteto-help/SKILL.md": "72c65cf3d2c39226f10320fec1fbbe61131ffb7105b3a6834f563c70c25888c7",
     "pstack/skills/poteto-help/references/prompting.md": "463f450c44a60afd001a2f69fdf8a5dea174351f339369b12ec3c41515e564d3",
     "pstack/skills/poteto-help/references/recipes.md": "f2d573014f72f7c798b1998b45f4360a8a83e7b8026c4ed9074e56c5a9d49338",
     "pstack/skills/poteto-mode/SKILL.md": "2755f102e7a6d0496b429d1031a22fb353e1f3d523543367caeaae5c4ed6f544",
@@ -98,6 +98,7 @@
     "pstack/skills/sharpen/SKILL.md": "563dfc460c605d311e650726288e2f1cbd61eab817db178d6e7e29643e07e7a2",
     "pstack/skills/show-me-your-work/SKILL.md": "920a8217cbb62f92a2222fb81fc9eab17ecd554a0277e444a95a927195139bd1",
     "pstack/skills/show-me-your-work/references/decision-log-template.tsv": "6779378006a2f5225e8c06deb84f1d913fb532041ebbb6e50d94600bfe3f4b76",
+    "pstack/skills/statechart/SKILL.md": "9b2a6dccf86286646cffb3bd00f7ee060d6c26983e566c766d4be53aa56f9445",
     "pstack/skills/swarm/SKILL.md": "031657cb81e490f9aed5c75d6ff2a4fda35ccafbaf72be604e59481cc4080cdc",
     "pstack/skills/tdd/SKILL.md": "eeb868e2dfebee528d730a67d7b17498fac4bb85dec2e38bc5c5176aca4d5d2f",
     "pstack/skills/teach/SKILL.md": "bd286e5a6290673be2cd28aef7af2ec7f1fb138e6bce156ea657368c7e7fc8a4",
@@ -125,7 +126,7 @@
     "pstack/docs/guide/03-understand.md": "303e5a6dd4437e1987733740a9e45419ca6ffd14aac1362ca79a21a1c81011c6",
     "pstack/docs/guide/04-design.md": "f47e884f482ddc20633878cb4e792d305700671af31f5eb1d91a030b42dc497d",
     "pstack/docs/guide/05-build-and-clean.md": "1284e80595ae4f214dfa7c5c5f7758ff90a47b3273aa7b8142e51e574f5c5290",
-    "pstack/docs/guide/06-verify-and-ship.md": "17b90ca770269618b2a0c860731f8eb66d6f56a73f1624283f57c8623d24edb3",
+    "pstack/docs/guide/06-verify-and-ship.md": "d709c2004a1a0caf719f378f8cf108cd3e311af1fe007f5b5a10b730d054bdc5",
     "pstack/docs/guide/07-overnight.md": "93c8a0f3c27510e4a18d3026d036d24bf4baf6472a82b8c40140cf766817d9f0",
     "pstack/docs/guide/08-principles.md": "0b26b85292f0c09768abe727c9e92987dbf81f5b439a4871034c2fd1c4cb1723",
     "pstack/docs/guide/09-make-it-yours.md": "50642f7f894988f7c263700f46478e7aed7eb94a257683350d91a9a0d70dc141",
@@ -158,6 +159,11 @@
     "skills/poteto-mode/scripts/watch-pr/types.ts": "0cac435294dc85ce1ba755e8e67f6c5ab163dfa252f2722d6e3a2d68c58fec59",
     "skills/poteto-mode/scripts/orch/orch.ts": "47c92c57e8276616d8de94665a126bd832e748036afa8d0ffdbacb7946decb5c",
     "skills/poteto-mode/scripts/orch/store.ts": "558cfda533e1ebe7c8d7842604f07e0be7618759cf129b4c2397a8e29516ecea",
-    "skills/show-me-your-work/scripts/log.sh": "a65a4bc5fb7cdeadbdb7b7ff1ca4682f4d9c42420942b2977cd17b46c4ac338e"
+    "skills/show-me-your-work/scripts/log.sh": "a65a4bc5fb7cdeadbdb7b7ff1ca4682f4d9c42420942b2977cd17b46c4ac338e",
+    "skills/statechart/scripts/statechart.mjs": "3c3ed2a29b9f0b2d037b434ef205f505939ac713c6a16f9a806844d513f957a0",
+    "skills/statechart/scripts/tlc-to-chart.mjs": "77aa854918f9c5d04fd3ad8838da39f24d8e05a2217a5c3be039d678509c6ef2",
+    "skills/statechart/scripts/chart-to-tla.mjs": "9f794e273d0729ae874d68a67bfa1df4ebddc12420b7ab5081fdf58dceb729e4",
+    "skills/statechart/scripts/compare-charts.mjs": "12f4dc4700093156978ef1785b92739c8cf1e8375b8d13201fcdc2006a20c43b",
+    "skills/statechart/scripts/lib.mjs": "941280e42b9dbfd2b40116287a2ebbc6e391b826876a001b1ba7aff365c1e41d"
   }
 }

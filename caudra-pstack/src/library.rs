@@ -850,6 +850,7 @@ mod tests {
         r"built-in PR tool",
         r"\bcreate-skill\b",
         r"check-plan\.mjs|worktree-audit\.sh|\blog\.sh\b|watch-pr/watch-pr|scripts/watch-pr|orch\.ts",
+        r"(statechart|tlc-to-chart|chart-to-tla|compare-charts)\.mjs|\.map\.mjs|tla2tools|--png\b",
         r"\bbunx?\b|\bnode [^ ]*\.m?js",
         r"/loop\b",
         r"cursor\.com/docs",

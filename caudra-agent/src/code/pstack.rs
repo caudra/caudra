@@ -3,10 +3,10 @@
 //! out of the `code` tool's description, so a session without pstack never reads about it.
 //!
 //! Every call asks as the `code` tool, naming the script, its arguments, and the files they name.
-//! A call that writes files, `log` and orch's commands that change the store, is held out of plan
-//! and read-only modes. Commands a script runs, such as `git` and `gh`, start on this machine in
-//! the session's project with the environment a `shell` command gets, and the call ending kills
-//! them.
+//! A call that writes files, `log`, orch's commands that change the store, and statechart's
+//! `from-spec` and `from-chart`, is held out of plan and read-only modes. Commands a script runs,
+//! such as `git` and `gh`, start on this machine in the session's project with the environment a
+//! `shell` command gets, and the call ending kills them.
 
 mod process;
 
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use caudra_config::ToolKey;
 use caudra_config::shell_env::ShellEnvConfig;
+use caudra_pstack::scripts::statechart::cli::{self as statechart, Touched};
 use caudra_pstack::scripts::{Script, check_plan, orch};
 use caudra_pstack::{Cancelled, Host, NAME, Output};
 use caudra_storage::StateDir;
@@ -66,8 +67,8 @@ pub const ELSEWHERE: &str = "pstack's scripts run on this machine, and this sess
      elsewhere; follow the skill's steps with `shell` instead";
 pub static DOC: ModuleDoc = ModuleDoc {
     namespace: NAME,
-    summary: "`pstack`: Rust ports of the scripts pstack's skills run; `pstack.log`, `pstack.check_plan`, `pstack.worktree_audit`, `pstack.watch_pr`, `pstack.orch`.",
-    page: "pstack: the scripts pstack's skills run, ported to Rust. Each call takes the arguments upstream's command line takes, as strings, and returns `{\"code\", \"stdout\", \"stderr\"}`: a nonzero `code` is the script's own verdict, not an error. `log` and the `orch` commands that change the store write files, so plan mode refuses them; `orch`'s help and read-only commands run there. Commands a script runs get the environment shell commands get.\n\
+    summary: "`pstack`: Rust ports of the scripts pstack's skills run; `pstack.log`, `pstack.check_plan`, `pstack.worktree_audit`, `pstack.watch_pr`, `pstack.orch`, `pstack.statechart`.",
+    page: "pstack: the scripts pstack's skills run, ported to Rust. Each call takes the arguments upstream's command line takes, as strings, and returns `{\"code\", \"stdout\", \"stderr\"}`: a nonzero `code` is the script's own verdict, not an error. `log`, the `orch` commands that change the store, and `statechart`'s `from-spec` and `from-chart` write files, so plan mode refuses them; `orch`'s help and read-only commands, and `statechart`'s `compare` and help, run there. Commands a script runs get the environment shell commands get.\n\
 Example: `r = await pstack.check_plan(\"plans/feature.md\")`, then `r[\"code\"] == 0`.",
     members: &[
         MemberDoc {
@@ -104,6 +105,13 @@ Example: `r = await pstack.check_plan(\"plans/feature.md\")`, then `r[\"code\"] 
             awaited: true,
             read_first: false,
             page: "`poteto-mode/scripts/orch/orch.ts`: the orchestrate store, `pstack.orch(\"--store\", dir, \"unit\", \"add\", ...)`. `pstack.orch(\"--help\")` lists every command.",
+        },
+        MemberDoc {
+            name: "statechart",
+            signature: "statechart(*argv: str) -> dict[str, Any]",
+            awaited: true,
+            read_first: false,
+            page: "`statechart/scripts/statechart.mjs`: `pstack.statechart(\"from-spec\", \"Pay.tla\")` checks a TLA+ spec with tla-checker and writes Mermaid charts of what the user sees, labelled by the Rhai mapping `Pay.map.rhai`, into `Pay-statechart/`; `from-chart` writes a spec from an agreed chart, and `compare` compares two charts. `pstack.statechart(\"--help\")` lists every flag.",
         },
     ],
 };
@@ -251,7 +259,7 @@ fn permission(
     let intent = PermissionIntent::new(
         PermissionScopes::single(format!("{PERMISSION_SCOPE_PREFIX}{}", script.name())),
         std::iter::once(script_resource)
-            .chain(path_resource(script, argv, cwd, writes))
+            .chain(path_resources(script, argv, cwd, writes))
             .collect(),
         risk,
     );
@@ -266,34 +274,56 @@ fn permission(
         .with_context(format!("{RUNS} `{}` script", script.upstream()))
 }
 
-/// The file or directory a call's arguments name, so file rules, protected paths, and the
-/// outside-project check hold it as they would a file tool's.
-fn path_resource(
+/// The files and directories a call's arguments name, so file rules, protected paths, and the
+/// outside-project check hold them as they would a file tool's.
+fn path_resources(
     script: Script,
     argv: &[String],
     cwd: &Path,
     writes: bool,
-) -> Option<PermissionResource> {
+) -> Vec<PermissionResource> {
     let access = match writes {
         true => PermissionResourceAccess::Write,
         false => PermissionResourceAccess::Read,
     };
-    let (kind, path) = match script {
-        Script::Log => (PermissionResourceKind::File, argv.first().cloned()),
-        Script::CheckPlan => (
+    let paths = match script {
+        Script::Log => vec![(PermissionResourceKind::File, argv.first().cloned(), access)],
+        Script::CheckPlan => vec![(
             PermissionResourceKind::File,
             argv.first()
                 .filter(|path| *path != SESSION_PLAN_FLAG)
                 .cloned(),
-        ),
-        Script::Orch => (
+            access,
+        )],
+        Script::Orch => vec![(
             PermissionResourceKind::Directory,
             orch::store_use(argv, &global_env).map(|used| used.store),
-        ),
-        Script::WorktreeAudit | Script::WatchPr => return None,
+            access,
+        )],
+        Script::Statechart => statechart::touched(argv)
+            .into_iter()
+            .map(|touched| match touched {
+                Touched::Reads(file) => (
+                    PermissionResourceKind::File,
+                    Some(file),
+                    PermissionResourceAccess::Read,
+                ),
+                Touched::Writes(folder) => (
+                    PermissionResourceKind::Directory,
+                    Some(folder),
+                    PermissionResourceAccess::Write,
+                ),
+            })
+            .collect(),
+        Script::WorktreeAudit | Script::WatchPr => Vec::new(),
     };
-    path.filter(|path| !path.is_empty())
-        .map(|path| filesystem_permission_resource(kind, &cwd.join(path), access, cwd))
+    paths
+        .into_iter()
+        .filter_map(|(kind, path, access)| {
+            path.filter(|path| !path.is_empty())
+                .map(|path| filesystem_permission_resource(kind, &cwd.join(path), access, cwd))
+        })
+        .collect()
 }
 
 /// The row shows what the script printed; the snippet gets the exit code and both streams.
@@ -436,6 +466,22 @@ mod tests {
         "code::pstack::tests::a_project_env_file_cannot_set_what_scripts_read";
     const PROJECT_ENV: &str = ".caudra/.env";
     const VALID_PLAN_HEAD: &str = "# Plan";
+    const FROM_SPEC: &str = "from-spec";
+    const FROM_CHART: &str = "from-chart";
+    const COMPARE: &str = "compare";
+    const CHART: &str = "sync.mmd";
+    const SPEC_FOLDER: &str = "specs";
+    const SPEC_IN_FOLDER: &str = "specs/Pay.tla";
+    const SPEC_OUT: &str = "specs/Pay-statechart";
+    const STATECHART_FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../caudra-pstack/testdata/statechart"
+    );
+    const SYNC_GOLD: &str = "gold/Sync";
+    const SYNC_OUT: &str = "Sync-statechart";
+    const DRAWN_FILES: [&str; 2] = ["chart.mmd", "bug-1.mmd"];
+    /// The exit code of a run whose rules are not as expected: Sync's chart has a design bug.
+    const RULE_BROKEN: i32 = 1;
 
     fn call(name: &str, args: Vec<Value>, kwargs: &[(&str, Value)]) -> ScriptCall {
         ScriptCall {
@@ -467,48 +513,62 @@ mod tests {
     #[test_case("check_plan", &[PLAN], true ; "check_plan_reads")]
     #[test_case("worktree_audit", &[PLAN], true ; "worktree_audit_reads")]
     #[test_case("watch_pr", &[PLAN], true ; "watch_pr_reads")]
+    #[test_case("statechart", &[FROM_SPEC, SPEC_IN_FOLDER], false ; "statechart_from_spec_writes")]
+    #[test_case("statechart", &[FROM_CHART, CHART], false ; "statechart_from_chart_writes")]
+    #[test_case("statechart", &[COMPARE, CHART, CHART], true ; "statechart_compare_reads")]
+    #[test_case("statechart", &[FROM_SPEC, "--help"], true ; "statechart_help_reads")]
+    #[test_case("statechart", &[FROM_SPEC], true ; "statechart_usage_reads")]
     fn only_writing_calls_leave_plan_mode(name: &str, argv: &[&str], read_only: bool) {
         let plan = plan(PathBuf::from(WORK), call(name, strings(argv), &[])).unwrap();
         assert_eq!(plan.read_only, read_only);
         assert_eq!(plan.row.input, json!({ ARGV_FIELD: argv }));
     }
 
-    #[test_case("log", &[PLAN, "p", "d", "w", "e", "r"], Some((PermissionResourceKind::File, PLAN, PermissionResourceAccess::Write)) ; "log_writes_its_logfile")]
-    #[test_case("orch", &["--store", STORE, "init"], Some((PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Write)) ; "orch_writes_its_store")]
-    #[test_case("orch", &["--store", STORE, "gate", "list"], Some((PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Read)) ; "orch_reads_its_store")]
-    #[test_case("orch", &["--help"], None ; "orch_help_names_no_store")]
-    #[test_case("check_plan", &[PLAN], Some((PermissionResourceKind::File, PLAN, PermissionResourceAccess::Read)) ; "check_plan_reads_its_plan")]
-    #[test_case("check_plan", &[SESSION_PLAN_FLAG], None ; "the_session_plan_names_no_file")]
-    #[test_case("watch_pr", &["--pr", "1"], None ; "watch_pr_names_no_file")]
+    #[test_case("log", &[PLAN, "p", "d", "w", "e", "r"], &[(PermissionResourceKind::File, PLAN, PermissionResourceAccess::Write)] ; "log_writes_its_logfile")]
+    #[test_case("orch", &["--store", STORE, "init"], &[(PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Write)] ; "orch_writes_its_store")]
+    #[test_case("orch", &["--store", STORE, "gate", "list"], &[(PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Read)] ; "orch_reads_its_store")]
+    #[test_case("orch", &["--help"], &[] ; "orch_help_names_no_store")]
+    #[test_case("check_plan", &[PLAN], &[(PermissionResourceKind::File, PLAN, PermissionResourceAccess::Read)] ; "check_plan_reads_its_plan")]
+    #[test_case("check_plan", &[SESSION_PLAN_FLAG], &[] ; "the_session_plan_names_no_file")]
+    #[test_case("watch_pr", &["--pr", "1"], &[] ; "watch_pr_names_no_file")]
+    #[test_case("statechart", &[FROM_SPEC, SPEC_IN_FOLDER], &[(PermissionResourceKind::Directory, SPEC_FOLDER, PermissionResourceAccess::Write), (PermissionResourceKind::Directory, SPEC_OUT, PermissionResourceAccess::Write)] ; "statechart_writes_beside_its_spec")]
+    #[test_case("statechart", &[FROM_SPEC, SPEC_IN_FOLDER, "--out", STORE], &[(PermissionResourceKind::Directory, SPEC_FOLDER, PermissionResourceAccess::Write), (PermissionResourceKind::Directory, STORE, PermissionResourceAccess::Write)] ; "statechart_writes_its_out_folder")]
+    #[test_case("statechart", &[COMPARE, CHART, PLAN], &[(PermissionResourceKind::File, CHART, PermissionResourceAccess::Read), (PermissionResourceKind::File, PLAN, PermissionResourceAccess::Read)] ; "statechart_compare_reads_both_charts")]
+    #[test_case("statechart", &["--help"], &[] ; "statechart_help_names_no_file")]
     fn calls_name_the_paths_they_touch(
         name: &str,
         argv: &[&str],
-        expected: Option<(PermissionResourceKind, &str, PermissionResourceAccess)>,
+        expected: &[(PermissionResourceKind, &str, PermissionResourceAccess)],
     ) {
         let script = Script::parse(name).unwrap();
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
         let writes = script.writes(&argv, &global_env);
-        let resource = path_resource(script, &argv, Path::new(WORK), writes);
-        assert_eq!(
-            resource.map(|resource| (resource.kind, resource.value, resource.access)),
-            expected.map(|(kind, path, access)| (
-                kind,
-                Path::new(WORK).join(path).to_string_lossy().into_owned(),
-                Some(access)
-            ))
-        );
+        let resources: Vec<_> = path_resources(script, &argv, Path::new(WORK), writes)
+            .into_iter()
+            .map(|resource| (resource.kind, resource.value, resource.access))
+            .collect();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(kind, path, access)| {
+                (
+                    kind.clone(),
+                    Path::new(WORK).join(path).to_string_lossy().into_owned(),
+                    Some(access.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(resources, expected);
     }
 
     #[test]
     fn a_path_outside_the_project_asks() {
-        let resource = path_resource(
+        let resources = path_resources(
             Script::Log,
             &["/elsewhere/log.tsv".to_owned()],
             Path::new(WORK),
             true,
-        )
-        .unwrap();
-        assert!(resource.requires_prompt);
+        );
+        assert!(resources[0].requires_prompt);
     }
 
     #[test_case(vec![json!(1)], &[] ; "non_string_argument")]
@@ -731,5 +791,47 @@ mod tests {
         let reply = invoke(&gateway, "check_plan", &[SESSION_PLAN_FLAG]).unwrap();
         assert_eq!(reply[CODE_FIELD], 1);
         assert!(!reply[STDERR_FIELD].as_str().unwrap().is_empty());
+    }
+
+    fn statechart_project(planning: bool) -> (TempDir, Gateway) {
+        let (dir, gateway) = gateway(planning);
+        fs::copy(
+            Path::new(STATECHART_FIXTURES)
+                .join("from_chart")
+                .join(CHART),
+            dir.path().join(CHART),
+        )
+        .unwrap();
+        (dir, gateway)
+    }
+
+    #[test]
+    fn a_statechart_run_draws_the_agreed_chart_without_node_or_java() {
+        let (dir, gateway) = statechart_project(false);
+        let reply = invoke(&gateway, "statechart", &[FROM_CHART, CHART]).unwrap();
+        assert_eq!(reply[CODE_FIELD], RULE_BROKEN, "{reply}");
+        for file in DRAWN_FILES {
+            let gold = Path::new(STATECHART_FIXTURES).join(SYNC_GOLD).join(file);
+            assert_eq!(
+                fs::read_to_string(dir.path().join(SYNC_OUT).join(file)).unwrap(),
+                fs::read_to_string(gold).unwrap(),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statechart_run_is_refused_in_plan_mode() {
+        let (dir, gateway) = statechart_project(true);
+        let error = invoke(&gateway, "statechart", &[FROM_CHART, CHART]).unwrap_err();
+        assert_eq!(error.kind, ScriptErrorKind::Permission);
+        assert!(!dir.path().join(SYNC_OUT).exists());
+    }
+
+    #[test]
+    fn statechart_help_runs_in_plan_mode() {
+        let (_dir, gateway) = gateway(true);
+        let reply = invoke(&gateway, "statechart", &["--help"]).unwrap();
+        assert_eq!(reply[CODE_FIELD], 0);
     }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,11 +14,12 @@ use serde_json::{Map, Value as Json};
 use thiserror::Error;
 use tla_checker::ast::{State, Value};
 use tla_checker::checker::{
-    CheckResult, CheckerConfig, ExploredGraph, PrepareSpecError, check, eval_error_to_diagnostic,
+    CheckResult, CheckerConfig, ExploredGraph, LivenessError, PrepareSpecError, check,
+    eval_error_to_diagnostic,
 };
 use tla_checker::config::parse_cfg;
 use tla_checker::diagnostic::Diagnostic;
-use tla_checker::load::{PrepareError, prepare_from_path};
+use tla_checker::load::{PrepareError, Prepared, prepare_from_path};
 use tla_checker::source::Source;
 use tla_checker::span::Span;
 
@@ -28,6 +30,8 @@ pub const MAX_STATES: usize = 5_000_000;
 /// One state's variables, valued as upstream's `parseValue` reads TLC's output: sequences, tuples
 /// and sets become arrays, records and functions become objects, and model values become strings.
 pub type Vars = Map<String, Json>;
+/// A behavior's states, each with the action that reached it.
+pub type Behavior = Vec<(Option<Arc<str>>, Vars)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Step {
@@ -84,10 +88,7 @@ pub enum ModelError {
 /// Explores `spec` under `cfg`. The cfg's `PROPERTY` lines are not checked here: the chart draws
 /// only `INVARIANT` rules.
 pub fn explore(spec: &Path, cfg: &Path) -> Result<Model, ModelError> {
-    let mut prepared = prepare_from_path(spec, Some(cfg), &[]).map_err(|error| match error {
-        PrepareError::Parse { message, span } => ModelError::Spec(parse_error(spec, message, span)),
-        other => ModelError::Spec(format!("{}: {other}", spec.display())),
-    })?;
+    let mut prepared = prepare(spec, cfg)?;
     refuse_action_constraints(cfg)?;
     prepared.spec.liveness_properties.clear();
     prepared.spec.safety_properties.clear();
@@ -148,6 +149,60 @@ pub fn explore(spec: &Path, cfg: &Path) -> Result<Model, ModelError> {
             .flat_map(|(index, rule)| traces(&graph, index, rule))
             .collect(),
         rules,
+    })
+}
+
+/// Checks the `PROPERTY` lines of `cfg` on `spec`, as upstream's one TLC run per property does.
+/// `None` when they hold; otherwise the behavior that breaks one, each state with the action
+/// that reached it.
+pub fn property_counterexample(spec: &Path, cfg: &Path) -> Result<Option<Behavior>, ModelError> {
+    let prepared = prepare(spec, cfg)?;
+    let config = CheckerConfig {
+        allow_deadlock: true,
+        check_liveness: true,
+        quiet: true,
+        max_states: MAX_STATES,
+        max_depth: usize::MAX,
+        ..prepared.checker_config
+    };
+    let named = |states: Vec<State>, actions: Vec<Option<Arc<str>>>| {
+        iter::once(None)
+            .chain(actions)
+            .chain(iter::repeat(None))
+            .zip(states.iter().map(|state| vars(&prepared.spec.vars, state)))
+            .collect()
+    };
+    match check(&prepared.spec, &prepared.domains, &config) {
+        CheckResult::Ok(_) => Ok(None),
+        CheckResult::PropertyViolation(violation, _) => {
+            Ok(Some(named(violation.trace, violation.actions)))
+        }
+        CheckResult::InvariantViolation(counterexample, _) => {
+            Ok(Some(named(counterexample.trace, counterexample.actions)))
+        }
+        CheckResult::LivenessViolation(violation, _) => {
+            let states = [violation.prefix, violation.cycle].concat();
+            Ok(Some(named(states, Vec::new())))
+        }
+        CheckResult::MaxStatesExceeded(_) => Err(ModelError::TooManyStates),
+        CheckResult::NoInitialStates => Err(ModelError::NoInitialStates),
+        CheckResult::InitError(error)
+        | CheckResult::NextError(error, ..)
+        | CheckResult::InvariantError(error, ..)
+        | CheckResult::LivenessError(LivenessError { error, .. }, _) => Err(ModelError::Spec(
+            eval_error_to_diagnostic(&error).render(&prepared.source),
+        )),
+        CheckResult::PrepareError(error) => {
+            Err(ModelError::Spec(prepare_error(error, &prepared.source)))
+        }
+        other => Err(ModelError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+fn prepare(spec: &Path, cfg: &Path) -> Result<Prepared, ModelError> {
+    prepare_from_path(spec, Some(cfg), &[]).map_err(|error| match error {
+        PrepareError::Parse { message, span } => ModelError::Spec(parse_error(spec, message, span)),
+        other => ModelError::Spec(format!("{}: {other}", spec.display())),
     })
 }
 
