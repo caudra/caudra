@@ -66,6 +66,9 @@ const SET_INVALID: &str = "a built-in question set is invalid";
 const FEATURE_DISABLED: &str = "the evaluation service has the feature disabled";
 const UNREACHED: &str = "this case never reaches the engine";
 const REGRESSED: &str = "a feature scored fewer right or more wrong actions than its baseline";
+const BELOW_BASELINE: &str = "scored below its baseline";
+/// Baselines hold metrics to three decimals, as the report prints them.
+const BASELINE_SCALE: f64 = 1_000.0;
 const TIMEOUT_MS: u64 = 10_000;
 /// The pool every reranking surface judged before pools were widened.
 const NARROW_POOL: usize = 16;
@@ -563,7 +566,12 @@ async fn run<C: DeserializeOwned, F: Future<Output = Scored>>(
         "{feature}\n  measured {measured:?}\n  baseline {:?}",
         fixture.baseline
     );
-    measured.wrong <= fixture.baseline.wrong && measured.right >= fixture.baseline.right
+    let passed =
+        measured.wrong <= fixture.baseline.wrong && measured.right >= fixture.baseline.right;
+    if !passed {
+        println!("  {feature} {BELOW_BASELINE}");
+    }
+    passed
 }
 
 fn percentile(sorted: &[u64], quantile: f64) -> u64 {
@@ -625,13 +633,22 @@ async fn run_ranked<F: Future<Output = Ranking>>(
         lexical.tally(advisory).summary(),
         fixture.baseline.summary()
     );
-    measured.ndcg_at_k >= fixture.baseline.ndcg_at_k
-        && measured.recall_at_k >= fixture.baseline.recall_at_k
+    let passed = recorded(measured.ndcg_at_k) >= fixture.baseline.ndcg_at_k
+        && recorded(measured.recall_at_k) >= fixture.baseline.recall_at_k
         && fixture.baseline.false_advice_rate.is_none_or(|baseline| {
             measured
                 .false_advice_rate
-                .is_some_and(|rate| rate <= baseline)
-        })
+                .is_some_and(|rate| recorded(rate) <= baseline)
+        });
+    if !passed {
+        println!("  {feature} {BELOW_BASELINE}");
+    }
+    passed
+}
+
+/// `value` as a baseline records it: to the three decimals the report prints.
+fn recorded(value: f64) -> f64 {
+    (value * BASELINE_SCALE).round() / BASELINE_SCALE
 }
 
 /// Prints how the surface ranks each case when it judges only the first `pool`
@@ -1590,6 +1607,16 @@ fn ranking_metrics_score_order_against_labels(
     let relevant: BTreeSet<usize> = relevant.iter().copied().collect();
     assert!((ndcg_at(order, &relevant, k) - ndcg).abs() < METRIC_TOLERANCE);
     assert!((recall_at(order, &relevant, k) - recall).abs() < METRIC_TOLERANCE);
+}
+
+#[test_case(26.0 / 27.0, 0.963, true; "a_ratio_printed_as_its_baseline_meets_it")]
+#[test_case(0.9624, 0.963, false; "a_ratio_printed_below_its_baseline_misses_it")]
+fn a_metric_meets_its_baseline_at_the_precision_it_was_recorded(
+    measured: f64,
+    baseline: f64,
+    meets: bool,
+) {
+    assert_eq!(recorded(measured) >= baseline, meets);
 }
 
 #[test_case(RANK_ENFORCED, true, true, true; "enforced_ranking_meets_baseline")]

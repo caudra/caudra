@@ -1,10 +1,7 @@
 {
   "goal_met": {
     "type": "noul",
-    "instructions": {
-      "question": "Does `assistant_tail` show that the condition in `goal` is fully met?",
-      "focus": "Judge only `assistant_tail`, `tool_outcomes` and `open_todos`. A plan, a promise, partial progress, a failing check or an open todo item means it is not met."
-    },
+    "instructions": "Does `assistant_tail` show that the condition in `goal` is fully met? Judge only `assistant_tail`, `tool_outcomes` and `open_todos`. A plan, a promise, partial progress, a failing check or an open todo item means it is not met.",
     "criteria": {
       "true": {
         "what": "Reports the condition as done and nothing shown contradicts it"
