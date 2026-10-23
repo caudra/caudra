@@ -15,6 +15,6 @@ pub mod scripts;
 pub use host::{Cancelled, Host, Output};
 pub use library::{Agent, Library, NAME, SKILL_DESCRIPTION, Skill, automations, library};
 pub use roles::{
-    AutoReason, DEFAULT_EFFORT, Favorite, Kind, MODEL_ROLES_REF, ModelFacts, ResolvedSeat, RoleRow,
-    RoleTable, STORED_ROLES_VERSION, Seat, Source, StoredRoles,
+    AutoReason, Candidate, DEFAULT_EFFORT, Kind, MODEL_ROLES_REF, ModelFacts, ResolvedSeat,
+    RoleRow, RoleTable, STORED_ROLES_VERSION, Seat, Source, StoredRoles,
 };

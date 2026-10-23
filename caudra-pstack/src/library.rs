@@ -558,6 +558,7 @@ mod tests {
             &StoredRoles::default(),
             &ModelFacts {
                 favorites: Vec::new(),
+                flagships: Vec::new(),
                 task_model_choice: true,
                 known: &|_| None,
             },

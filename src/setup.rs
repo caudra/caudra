@@ -7,6 +7,7 @@ use color_eyre::eyre::{Context, eyre};
 
 use caudra_providers::manifest::ManifestRegistry;
 use caudra_providers::model::{Model, ModelError, ModelPurpose};
+use caudra_providers::provider::{PROVIDER_PRIORITY, signed_in_defaults};
 use caudra_providers::{HistoryItem, active_history_items, resolve_history_head};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -27,17 +28,6 @@ pub const MODE_ACP: &str = "acp";
 /// Long enough for a queued burst to reach the disk, short enough that a
 /// wedged filesystem does not hold up exit.
 const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-
-const PROVIDER_PRIORITY: &[&str] = &[
-    "anthropic",
-    "openai",
-    "xai",
-    "copilot",
-    "copilot-enterprise",
-    "zai",
-    "synthetic",
-    "deepseek",
-];
 
 pub type StoredSession = caudra_agent::StoredSession;
 
@@ -138,17 +128,9 @@ pub fn signed_out_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
 }
 
 fn auto_detect_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
-    for purpose in [ModelPurpose::Best, ModelPurpose::Fast] {
-        for &slug in PROVIDER_PRIORITY {
-            if caudra_providers::provider::provider_available(slug)
-                && let Some(model) = Model::curated_default(slug, purpose)
-                && policy.allows(&model.spec())
-            {
-                return Some(model);
-            }
-        }
-    }
-    None
+    [ModelPurpose::Best, ModelPurpose::Fast]
+        .into_iter()
+        .find_map(|purpose| signed_in_defaults(purpose, policy).next())
 }
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,

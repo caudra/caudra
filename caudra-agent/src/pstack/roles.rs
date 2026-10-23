@@ -1,12 +1,14 @@
 //! The pstack model roles the user stores in `/settings`, and the table a session that loads
-//! pstack reads them through: every kind resolved against the favorites its policy allows.
+//! pstack reads them through: every kind resolved against the favorites its policy allows, then
+//! the signed-in providers' flagships.
 
 use caudra_config::ModelPolicy;
-use caudra_providers::model::{Model, ModelMarker};
+use caudra_providers::model::{Model, ModelMarker, ModelPurpose};
+use caudra_providers::provider::signed_in_defaults;
 pub use caudra_pstack::{
     AutoReason, DEFAULT_EFFORT, Kind, ResolvedSeat, RoleRow, RoleTable, Seat, Source, StoredRoles,
 };
-use caudra_pstack::{Favorite, ModelFacts};
+use caudra_pstack::{Candidate, ModelFacts};
 use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
 use caudra_storage::{StateClass, StateDir, StorageError};
 use tracing::warn;
@@ -61,27 +63,30 @@ fn store_in(dir: &StateDir, roles: &StoredRoles) -> Result<(), StorageError> {
 }
 
 fn resolve(stored: &StoredRoles, policy: &ModelPolicy, task_model_choice: bool) -> RoleTable {
-    let known = |name: &str| favorite(&resolve_task_model_offline(policy, &[], name).ok()?);
+    let known = |name: &str| candidate(&resolve_task_model_offline(policy, &[], name).ok()?);
     RoleTable::resolve(
         stored,
         &ModelFacts {
             favorites: allowed_favorites(policy),
+            flagships: signed_in_defaults(ModelPurpose::Best, policy)
+                .filter_map(|model| candidate(&model.spec()))
+                .collect(),
             task_model_choice,
             known: &known,
         },
     )
 }
 
-fn allowed_favorites(policy: &ModelPolicy) -> Vec<Favorite> {
+fn allowed_favorites(policy: &ModelPolicy) -> Vec<Candidate> {
     favorites::allowed(policy)
         .iter()
-        .filter_map(|spec| favorite(spec))
+        .filter_map(|spec| candidate(spec))
         .collect()
 }
 
-fn favorite(spec: &str) -> Option<Favorite> {
+fn candidate(spec: &str) -> Option<Candidate> {
     let model = Model::from_spec(spec).ok()?;
-    Some(Favorite {
+    Some(Candidate {
         spec: spec.to_owned(),
         best_lane: Model::marker_of(&model.provider, &model.id) == Some(ModelMarker::Best),
         provider: model.provider.to_string(),
@@ -160,7 +165,7 @@ mod tests {
     }
 
     #[test_case(ModelPolicy::default(), Some(OPUS), AutoReason::BestFavorite ; "an_allowed_best_favorite")]
-    #[test_case(only_haiku(), None, AutoReason::NoFavorite ; "an_excluded_best_favorite")]
+    #[test_case(only_haiku(), None, AutoReason::NoModel ; "an_excluded_best_favorite")]
     fn the_hardest_kind_follows_the_policy(
         policy: ModelPolicy,
         model: Option<&str>,

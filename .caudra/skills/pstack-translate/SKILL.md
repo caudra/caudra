@@ -73,7 +73,7 @@ A completion notification is the background task's final report, which arrives i
 
 ## Models
 
-Never name a model on a page. Caudra appends a **Model roles** table to every page that contains the exact phrase `the **Model roles** table` (bold included), computed when the page is served from the user's `/settings` → pstack choices, else from their favorite models and model jobs, so it only lists models they can run. Each row gives ready `task` arguments: `model` and `thinking`, or `inherit`. A page that tells the agent which model to use must contain that phrase, as in "the Code row of the **Model roles** table below", and names rows by their kind exactly.
+Never name a model on a page. Caudra appends a **Model roles** table to every page that contains the exact phrase `the **Model roles** table` (bold included), computed when the page is served from the user's `/settings` → pstack choices, else from their favorite models, model jobs and signed-in providers' flagships, so it only lists models they can run. Each row gives ready `task` arguments: `model` and `thinking`, or `inherit`. A page that tells the agent which model to use must contain that phrase, as in "the Code row of the **Model roles** table below", and names rows by their kind exactly.
 
 | Upstream role, default, or model slug | Kind |
 | --- | --- |

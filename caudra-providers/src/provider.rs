@@ -16,7 +16,7 @@ use caudra_storage::StateDir;
 use caudra_storage::thinking::{self, StoredThinking};
 
 use crate::accounts::{AccountCredential, Failover, RoutedAccount, RoutedProvider};
-use crate::model::{Model, ModelFamily, ModelInfo, TokenUsage};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPurpose, TokenUsage};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -52,6 +52,17 @@ const POST: &str = "POST";
 const SETUP_THINKING_EFFORT: &str = "medium";
 /// Anthropic's default `ephemeral` breakpoint lifetime, the only one Caudra sets.
 const EPHEMERAL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// The providers Caudra takes a model from, in order, when the user named none.
+pub const PROVIDER_PRIORITY: &[&str] = &[
+    "anthropic",
+    "openai",
+    "xai",
+    "copilot",
+    "copilot-enterprise",
+    "zai",
+    "synthetic",
+    "deepseek",
+];
 
 /// Where the accounts of a provider may come from besides `caudra auth login`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -569,6 +580,20 @@ fn build_provider(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, A
 
 pub fn provider_available(slug: &str) -> bool {
     provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
+/// The curated default for `purpose` of each signed-in provider in [`PROVIDER_PRIORITY`] that
+/// `policy` allows, in that order. Only a table's declared default qualifies, so a premium model
+/// beside it, such as Fable, is never picked for a user who did not name it.
+pub fn signed_in_defaults(
+    purpose: ModelPurpose,
+    policy: &ModelPolicy,
+) -> impl Iterator<Item = Model> + '_ {
+    PROVIDER_PRIORITY
+        .iter()
+        .filter(|slug| provider_available(slug))
+        .filter_map(move |slug| Model::curated_default(slug, purpose))
+        .filter(|model| policy.allows(&model.spec()))
 }
 
 /// Non-blocking variant of [`provider_available`] for offline model discovery:

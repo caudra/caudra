@@ -100,7 +100,7 @@ impl Default for StoredRoles {
 
 /// A model `task` can run, as auto seats need to know it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Favorite {
+pub struct Candidate {
     pub spec: String,
     pub provider: String,
     pub best_lane: bool,
@@ -110,10 +110,13 @@ pub struct Favorite {
 
 pub struct ModelFacts<'a> {
     /// The allowed favorites, newest first.
-    pub favorites: Vec<Favorite>,
+    pub favorites: Vec<Candidate>,
+    /// The allowed curated flagship of each signed-in provider, in Caudra's provider order: what
+    /// auto seats take after the favorites run out.
+    pub flagships: Vec<Candidate>,
     pub task_model_choice: bool,
     /// The usable model a stored name means, or `None` when `task` could not run it.
-    pub known: &'a dyn Fn(&str) -> Option<Favorite>,
+    pub known: &'a dyn Fn(&str) -> Option<Candidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,10 +154,13 @@ pub enum Source {
 pub enum AutoReason {
     SubagentJob,
     BestFavorite,
+    Flagship,
     PanelFavorites,
+    PanelFlagships,
+    PanelFlagshipAdded,
     NotDiverse,
     FromPanel,
-    NoFavorite,
+    NoModel,
 }
 
 impl AutoReason {
@@ -162,12 +168,19 @@ impl AutoReason {
         match self {
             Self::SubagentJob => "auto: runs as a Subagent job",
             Self::BestFavorite => "auto: newest Best-lane favorite",
+            Self::Flagship => "auto: no Best-lane favorite, so a signed-in provider's flagship",
             Self::PanelFavorites => {
                 "auto: newest favorites on different providers, Best lane first"
             }
-            Self::NotDiverse => "auto: every favorite shares one provider, so the seat repeats",
+            Self::PanelFlagships => "auto: signed-in providers' flagships, one per provider",
+            Self::PanelFlagshipAdded => {
+                "auto: favorites, plus a signed-in provider's flagship for a second provider"
+            }
+            Self::NotDiverse => {
+                "auto: every model to hand shares one provider, so the seat repeats"
+            }
             Self::FromPanel => "auto: the Panel's seats",
-            Self::NoFavorite => "auto: no Best-lane favorite",
+            Self::NoModel => "auto: no favorite, and no signed-in provider with a flagship",
         }
     }
 }
@@ -183,7 +196,7 @@ impl Source {
 }
 
 impl ResolvedSeat {
-    fn auto(favorite: &Favorite, effort: &str) -> Self {
+    fn auto(favorite: &Candidate, effort: &str) -> Self {
         Self {
             model: Some(favorite.spec.clone()),
             thinking: snap(effort, &favorite.levels),
@@ -213,7 +226,7 @@ impl RoleTable {
                 .iter()
                 .find(|row| row.kind == Kind::Panel)
                 .map_or(&[][..], |row| row.seats.as_slice());
-            let automatic = || auto(kind, &facts.favorites, &effort, panel);
+            let automatic = || auto(kind, facts, &effort, panel);
             let (seats, source) = match stored.kinds.get(&kind).filter(|seats| !seats.is_empty()) {
                 None => {
                     let (seats, reason) = automatic();
@@ -279,52 +292,61 @@ impl RoleTable {
 
 fn auto(
     kind: Kind,
-    favorites: &[Favorite],
+    facts: &ModelFacts,
     effort: &str,
     panel: &[ResolvedSeat],
 ) -> (Vec<ResolvedSeat>, AutoReason) {
+    let best_favorite = || facts.favorites.iter().find(|favorite| favorite.best_lane);
     match kind {
         Kind::Code | Kind::Verify => (vec![ResolvedSeat::default()], AutoReason::SubagentJob),
-        Kind::Hardest | Kind::Judgment => {
-            match favorites.iter().find(|favorite| favorite.best_lane) {
-                Some(best) => (
-                    vec![ResolvedSeat::auto(best, effort)],
-                    AutoReason::BestFavorite,
-                ),
-                None => (vec![ResolvedSeat::default()], AutoReason::NoFavorite),
-            }
-        }
-        Kind::Panel => auto_panel(favorites, effort),
+        Kind::Hardest | Kind::Judgment => match (best_favorite(), facts.flagships.first()) {
+            (Some(best), _) => (
+                vec![ResolvedSeat::auto(best, effort)],
+                AutoReason::BestFavorite,
+            ),
+            (None, Some(flagship)) => (
+                vec![ResolvedSeat::auto(flagship, effort)],
+                AutoReason::Flagship,
+            ),
+            (None, None) => (vec![ResolvedSeat::default()], AutoReason::NoModel),
+        },
+        Kind::Panel => auto_panel(facts, effort),
         Kind::CrossJudge => (panel.to_vec(), AutoReason::FromPanel),
     }
 }
 
-/// Newest favorites on distinct providers, Best lane first: a panel exists to compare models, so
-/// a favorite outside the Best lane beats running one model twice.
-fn auto_panel(favorites: &[Favorite], effort: &str) -> (Vec<ResolvedSeat>, AutoReason) {
-    let Some(first) = favorites
+/// Two seats on distinct providers, drawn from the favorites, Best lane first, then the
+/// flagships: a panel exists to compare models, so any of them beats running one model twice.
+fn auto_panel(facts: &ModelFacts, effort: &str) -> (Vec<ResolvedSeat>, AutoReason) {
+    let (best, rest): (Vec<&Candidate>, Vec<&Candidate>) = facts
+        .favorites
         .iter()
-        .find(|favorite| favorite.best_lane)
-        .or_else(|| favorites.first())
-    else {
+        .partition(|favorite| favorite.best_lane);
+    let pool: Vec<&Candidate> = best
+        .into_iter()
+        .chain(rest)
+        .chain(&facts.flagships)
+        .collect();
+    let Some(&first) = pool.first() else {
         return (
             vec![ResolvedSeat::default(); PANEL_SEATS],
-            AutoReason::NoFavorite,
+            AutoReason::NoModel,
         );
     };
-    let elsewhere = |favorite: &&Favorite| favorite.provider != first.provider;
-    let second = favorites
+    let second = pool
         .iter()
-        .filter(|favorite| favorite.best_lane)
-        .find(elsewhere)
-        .or_else(|| favorites.iter().find(elsewhere));
+        .position(|candidate| candidate.provider != first.provider);
     match second {
-        Some(second) => (
+        Some(at) => (
             vec![
                 ResolvedSeat::auto(first, effort),
-                ResolvedSeat::auto(second, effort),
+                ResolvedSeat::auto(pool[at], effort),
             ],
-            AutoReason::PanelFavorites,
+            match facts.favorites.len() {
+                0 => AutoReason::PanelFlagships,
+                favorites if at < favorites => AutoReason::PanelFavorites,
+                _ => AutoReason::PanelFlagshipAdded,
+            },
         ),
         None => (
             vec![ResolvedSeat::auto(first, effort); PANEL_SEATS],
@@ -387,6 +409,7 @@ mod tests {
     const GROK: &str = "xai/grok-4.7";
     const GROK_SHORT: &str = "grok-4.7";
     const GROK_FAST: &str = "xai/grok-4.7-fast";
+    const ASTRA: &str = "openai/gpt-6-astra";
     const XHIGH: &str = "xhigh";
     const HIGH: &str = "high";
     const LOW: &str = "low";
@@ -398,8 +421,8 @@ mod tests {
     const UNUSABLE: &str = "auto: your stored grok-4.7 xhigh isn't usable";
     const OFF_LINE: &str = "so every kind runs as `inherit`";
 
-    fn favorite(spec: &str, best_lane: bool, levels: &[&str]) -> Favorite {
-        Favorite {
+    fn favorite(spec: &str, best_lane: bool, levels: &[&str]) -> Candidate {
+        Candidate {
             spec: spec.to_owned(),
             provider: spec.split_once('/').unwrap().0.to_owned(),
             best_lane,
@@ -407,7 +430,20 @@ mod tests {
         }
     }
 
-    fn table(favorites: Vec<Favorite>, stored: &StoredRoles, task_model_choice: bool) -> RoleTable {
+    fn table(
+        favorites: Vec<Candidate>,
+        stored: &StoredRoles,
+        task_model_choice: bool,
+    ) -> RoleTable {
+        table_with(favorites, Vec::new(), stored, task_model_choice)
+    }
+
+    fn table_with(
+        favorites: Vec<Candidate>,
+        flagships: Vec<Candidate>,
+        stored: &StoredRoles,
+        task_model_choice: bool,
+    ) -> RoleTable {
         let usable = favorites.clone();
         let known = move |name: &str| {
             usable
@@ -421,10 +457,15 @@ mod tests {
             stored,
             &ModelFacts {
                 favorites,
+                flagships,
                 task_model_choice,
                 known: &known,
             },
         )
+    }
+
+    fn flagships() -> Vec<Candidate> {
+        vec![favorite(OPUS, true, FULL), favorite(ASTRA, true, FULL)]
     }
 
     fn seat(model: &str, thinking: Option<&str>) -> ResolvedSeat {
@@ -453,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn without_favorites_every_kind_inherits() {
+    fn without_favorites_or_flagships_every_kind_inherits() {
         let table = table(Vec::new(), &StoredRoles::default(), true);
         let inherit = ResolvedSeat::default();
         assert_eq!(
@@ -462,13 +503,13 @@ mod tests {
         );
         assert_eq!(
             row(&table, Kind::Hardest),
-            (vec![inherit.clone()], Source::Auto(AutoReason::NoFavorite))
+            (vec![inherit.clone()], Source::Auto(AutoReason::NoModel))
         );
         assert_eq!(
             row(&table, Kind::Panel),
             (
                 vec![inherit.clone(); PANEL_SEATS],
-                Source::Auto(AutoReason::NoFavorite)
+                Source::Auto(AutoReason::NoModel)
             )
         );
         assert_eq!(
@@ -568,7 +609,77 @@ mod tests {
             row(&table, Kind::Judgment),
             (
                 vec![ResolvedSeat::default()],
-                Source::Auto(AutoReason::NoFavorite)
+                Source::Auto(AutoReason::NoModel)
+            )
+        );
+    }
+
+    #[test]
+    fn without_favorites_the_flagships_fill_the_seats() {
+        let table = table_with(Vec::new(), flagships(), &StoredRoles::default(), true);
+        let opus = seat(OPUS, Some(XHIGH));
+        for kind in [Kind::Hardest, Kind::Judgment] {
+            assert_eq!(
+                row(&table, kind),
+                (vec![opus.clone()], Source::Auto(AutoReason::Flagship))
+            );
+        }
+        assert_eq!(
+            row(&table, Kind::Panel),
+            (
+                vec![opus, seat(ASTRA, Some(XHIGH))],
+                Source::Auto(AutoReason::PanelFlagships)
+            )
+        );
+        assert_eq!(
+            row(&table, Kind::Code),
+            (
+                vec![ResolvedSeat::default()],
+                Source::Auto(AutoReason::SubagentJob)
+            )
+        );
+    }
+
+    #[test]
+    fn a_flagship_completes_a_panel_the_favorites_cannot() {
+        let table = table_with(
+            vec![favorite(SONNET, true, TO_HIGH)],
+            flagships(),
+            &StoredRoles::default(),
+            true,
+        );
+        assert_eq!(
+            row(&table, Kind::Hardest),
+            (
+                vec![seat(SONNET, Some(HIGH))],
+                Source::Auto(AutoReason::BestFavorite)
+            )
+        );
+        assert_eq!(
+            row(&table, Kind::Panel),
+            (
+                vec![seat(SONNET, Some(HIGH)), seat(ASTRA, Some(XHIGH))],
+                Source::Auto(AutoReason::PanelFlagshipAdded)
+            )
+        );
+    }
+
+    #[test]
+    fn a_favorite_outranks_a_flagship_for_the_second_seat() {
+        let table = table_with(
+            vec![
+                favorite(OPUS, true, FULL),
+                favorite(GROK_FAST, false, NO_LEVELS),
+            ],
+            flagships(),
+            &StoredRoles::default(),
+            true,
+        );
+        assert_eq!(
+            row(&table, Kind::Panel),
+            (
+                vec![seat(OPUS, Some(XHIGH)), seat(GROK_FAST, None)],
+                Source::Auto(AutoReason::PanelFavorites)
             )
         );
     }

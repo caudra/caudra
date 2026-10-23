@@ -136,13 +136,13 @@ The pages never name a model. They name six kinds of work, and every page that s
 | Kind | Used for | Unless you set it |
 |---|---|---|
 | Code | code-writing delegates, explorers, investigators | `inherit`: the profile's `subagent_model`, else the Subagent [model job](/docs/providers/#model-jobs) |
-| Hardest | the hardest changes | your newest Best-lane favorite |
-| Judgment | prose, judgment, explainers, synthesizers | your newest Best-lane favorite |
+| Hardest | the hardest changes | your newest Best-lane favorite, else a provider flagship |
+| Judgment | prose, judgment, explainers, synthesizers | your newest Best-lane favorite, else a provider flagship |
 | Verify | verification lanes | `inherit` |
 | Panel | a diverse panel, one task per seat, such as arena runners and interrogate reviewers | two Best-lane favorites on different providers |
 | Cross-judge pool | the model that judges an arena, on a provider other than the session's when it can | the Panel's models |
 
-The lane is the one `caudra models` and the `# Model favorites` reminder show. Short of Best-lane favorites on two providers, the Panel takes your newest favorites on different providers from any lane. With every favorite on one provider, the table repeats one model and says the panel is not diverse. With no favorites, every kind is `inherit`. Each value gets the default effort, `xhigh` unless you change it, lowered to the highest level the model supports.
+The lane is the one `caudra models` and the `# Model favorites` reminder show. A provider flagship is the Best-lane model Caudra starts on for a provider you are signed in to, such as `claude-opus-5-5` for Anthropic and `gpt-6-astra` for OpenAI, never a pricier model beside it such as Fable. Caudra checks Anthropic, OpenAI, xAI, Copilot, Copilot Enterprise, Z.AI, Synthetic and DeepSeek, in that order, and Hardest and Judgment take the first flagship. Short of Best-lane favorites on two providers, the Panel fills its second seat from your other favorites, then from the flagships on another provider. With every candidate on one provider, the table repeats one model and says the panel is not diverse. With no favorites and none of those providers signed in, every kind is `inherit`. Each value gets the default effort, `xhigh` unless you change it, lowered to the highest level the model supports.
 
 Open `/settings` and its **pstack** tab, the last one, shown while pstack is on, to choose a kind's model. `Enter` opens the model list with `inherit` and your favorites first, `t` changes a row's thinking level, and `R` returns the kind to automatic. On the Effort row, `Enter` steps the default effort and `R` restores `xhigh`. A Panel or Cross-judge pool has a line per seat, `+ add seat` adds one, and `d` removes one. The choices are saved globally with your model jobs and apply the next time a page loads, in every session, including `--print` and ACP. A saved model you can no longer use, because it is unstarred and Caudra cannot resolve it or `allowed_models` rules it out, is replaced by the automatic choice, and the table says so. With `agent.task_model_choice = false`, `task` has no `model` or `thinking`, so every kind runs as `inherit`.
 
