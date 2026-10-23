@@ -31,8 +31,13 @@ const MINUTES: usize = 2;
 const INSTANT_MS: u64 = 1_000;
 const MINUTES_MS: u64 = 120_000;
 const MILLIS_PER_SECOND: u64 = 1_000;
-/// Probability a class needs before the card says it.
-const CONFIDENCE_BAR: f64 = 0.9;
+/// Probability of exiting at once that hides the ETA, kept high so a long
+/// run is rarely left unlabelled.
+const INSTANT_BAR: f64 = 0.9;
+/// Probability that shows `seconds` or `minutes`. In recorded runs those
+/// words were right about 85% of the time from here, and little better than
+/// a guess below 0.7.
+const WORD_BAR: f64 = 0.75;
 /// Similarity the nearest earlier run needs before its time is shown.
 const NEIGHBOUR_TRUST: f64 = 0.5;
 const NEIGHBOUR_CAPACITY: usize = 5_000;
@@ -111,8 +116,8 @@ impl Model {
     fn guess(&self, features: Vec<u64>) -> Guess {
         let probabilities = self.classifier.predict(&features);
         let (class, confidence) = most_likely(&probabilities);
-        let confident = confidence >= CONFIDENCE_BAR;
-        let neighbour_ms = (!(confident && class == INSTANT))
+        let instant = class == INSTANT && confidence >= INSTANT_BAR;
+        let neighbour_ms = (!instant)
             .then(|| self.neighbours.estimate(&query(features.clone())))
             .flatten()
             .filter(|estimate| estimate.similarity >= NEIGHBOUR_TRUST)
@@ -122,9 +127,7 @@ impl Model {
                 let seconds = Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND));
                 format!("{ETA_PREFIX}{APPROXIMATELY}{}", humanize_duration(seconds))
             }),
-            None if confident && class == SECONDS => Some(format!("{ETA_PREFIX}{SECONDS_WORD}")),
-            None if confident && class == MINUTES => Some(format!("{ETA_PREFIX}{MINUTES_WORD}")),
-            None => None,
+            None => class_word(class, confidence).map(|word| format!("{ETA_PREFIX}{word}")),
         };
         Guess {
             features,
@@ -268,6 +271,14 @@ fn class_of(outcome: RunOutcome, elapsed_ms: u64) -> Option<usize> {
         RunOutcome::Completed if elapsed_ms <= INSTANT_MS => Some(INSTANT),
         RunOutcome::Completed if elapsed_ms < MINUTES_MS => Some(SECONDS),
         _ if elapsed_ms >= MINUTES_MS => Some(MINUTES),
+        _ => None,
+    }
+}
+
+fn class_word(class: usize, confidence: f64) -> Option<&'static str> {
+    match class {
+        SECONDS if confidence >= WORD_BAR => Some(SECONDS_WORD),
+        MINUTES if confidence >= WORD_BAR => Some(MINUTES_WORD),
         _ => None,
     }
 }

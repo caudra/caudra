@@ -4,7 +4,10 @@ use caudra_storage::shell_runs::{RunOutcome, ShellRun, ShellRuns};
 use tempfile::TempDir;
 use test_case::test_case;
 
-use super::{Model, ShellEta, class_of};
+use super::{
+    INSTANT, INSTANT_BAR, MINUTES, MINUTES_WORD, Model, SECONDS, SECONDS_WORD, ShellEta, WORD_BAR,
+    class_of, class_word,
+};
 
 const QUICK: &str = "git status";
 const BUILD: &str = "cargo build --release";
@@ -42,7 +45,15 @@ fn a_quick_command_gets_no_eta() {
     let forecast = Model::trained(history()).guess(features(QUICK));
     assert_eq!(forecast.eta, None);
     assert_eq!(forecast.prediction.class, 0);
-    assert!(forecast.prediction.confidence >= super::CONFIDENCE_BAR);
+    assert!(forecast.prediction.confidence >= INSTANT_BAR);
+}
+
+#[test_case(SECONDS, WORD_BAR, Some(SECONDS_WORD); "seconds_at_the_bar")]
+#[test_case(MINUTES, WORD_BAR, Some(MINUTES_WORD); "minutes_at_the_bar")]
+#[test_case(SECONDS, WORD_BAR - 0.01, None; "seconds_below_the_bar")]
+#[test_case(INSTANT, INSTANT_BAR, None; "instant_has_no_word")]
+fn a_word_needs_the_word_bar(class: usize, confidence: f64, expected: Option<&str>) {
+    assert_eq!(class_word(class, confidence), expected);
 }
 
 #[test]
