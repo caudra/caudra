@@ -24,6 +24,8 @@ The bundled pstack (`caudra-pstack/upstream/pstack/`) is copied from [cursor/plu
 
 The bundled Monty interpreter is copyright (c) Pydantic Services Inc., licensed under the MIT License. See `THIRD_PARTY_LICENSES/Monty.txt`.
 
+The statechart model checker is [tla-checker](https://github.com/fabracht/tla-rs), built from Caudra's fork at [tensorninja/tla-rs](https://github.com/tensorninja/tla-rs), copyright (c) 2026 Fabrício Bracht, licensed under the MIT License or the Apache License, Version 2.0, at your option. Caudra uses it under the MIT License. See `THIRD_PARTY_LICENSES/TlaChecker.txt`.
+
 The file, shell, web, code, and Python tools are built on [Workcell](https://github.com/caudra/caudra/tree/main/workcell), copyright The Workcell MCP authors, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/Workcell.txt`.
 
 The Workcell shell output filter includes declarative filter rules copied without modification from [RTK](https://github.com/rtk-ai/rtk) at revision `4ef8730cf3a0dea11c8d64a9b90bc0616fe52100` (tag `v1.0.1`), copyright 2026 RTK AI Labs, licensed under the Apache License, Version 2.0. See `THIRD_PARTY_LICENSES/RTK.txt`.

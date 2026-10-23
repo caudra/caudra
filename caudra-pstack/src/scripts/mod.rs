@@ -5,6 +5,7 @@
 pub mod check_plan;
 pub mod log;
 pub mod orch;
+pub mod statechart;
 pub mod watch_pr;
 pub mod worktree_audit;
 

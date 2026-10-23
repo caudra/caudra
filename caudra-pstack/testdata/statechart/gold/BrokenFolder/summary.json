@@ -1,0 +1,596 @@
+{
+  "view": "customer",
+  "modelStates": 4294,
+  "modelTransitions": 11824,
+  "chartStates": 19,
+  "chartTransitions": 71,
+  "chartStatus": {
+    "works": 10,
+    "fixed": 0,
+    "wrong": 9
+  },
+  "chartGroups": [
+    {
+      "name": "Finished",
+      "color": "#d6eaf8",
+      "states": 1
+    },
+    {
+      "name": "Not started",
+      "color": "#fdebd0",
+      "states": 1
+    },
+    {
+      "name": "Running",
+      "color": "#e8daef",
+      "states": 2
+    }
+  ],
+  "mixedGroups": [],
+  "regions": {
+    "drawn": true,
+    "states": [
+      4,
+      15
+    ],
+    "transitions": 71,
+    "all": 110,
+    "flat": {
+      "states": 47,
+      "transitions": 408
+    }
+  },
+  "classes": [
+    {
+      "n": 1,
+      "end": "Done: no folder",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 2,
+      "modelSteps": 3,
+      "counterexamples": 145,
+      "fix": null
+    },
+    {
+      "n": 2,
+      "end": "Done: no folder",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 2,
+      "modelSteps": 7,
+      "counterexamples": 61,
+      "fix": null
+    },
+    {
+      "n": 3,
+      "end": "Done: your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 3,
+      "modelSteps": 4,
+      "counterexamples": 214,
+      "fix": null
+    },
+    {
+      "n": 4,
+      "end": "One run going: no folder",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 3,
+      "modelSteps": 4,
+      "counterexamples": 210,
+      "fix": null
+    },
+    {
+      "n": 5,
+      "end": "Done: your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 3,
+      "modelSteps": 8,
+      "counterexamples": 74,
+      "fix": null
+    },
+    {
+      "n": 6,
+      "end": "One run going: no folder",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 3,
+      "modelSteps": 8,
+      "counterexamples": 63,
+      "fix": null
+    },
+    {
+      "n": 7,
+      "end": "One run going: no folder, your notes moved aside",
+      "invariant": "NoNotesAside",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 3,
+      "modelSteps": 8,
+      "counterexamples": 98,
+      "fix": null
+    },
+    {
+      "n": 8,
+      "end": "One run going: your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 5,
+      "counterexamples": 308,
+      "fix": null
+    },
+    {
+      "n": 9,
+      "end": "Done: no folder, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 9,
+      "counterexamples": 85,
+      "fix": null
+    },
+    {
+      "n": 10,
+      "end": "One run going: chart of the spec",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 9,
+      "counterexamples": 16,
+      "fix": null
+    },
+    {
+      "n": 11,
+      "end": "Done: no folder, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 9,
+      "counterexamples": 98,
+      "fix": null
+    },
+    {
+      "n": 12,
+      "end": "One run going: your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 9,
+      "counterexamples": 63,
+      "fix": null
+    },
+    {
+      "n": 13,
+      "end": "Two runs going: no folder, your notes moved aside",
+      "invariant": "NoNotesAside",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 9,
+      "counterexamples": 71,
+      "fix": null
+    },
+    {
+      "n": 14,
+      "end": "One run going: chart of the spec",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 4,
+      "modelSteps": 13,
+      "counterexamples": 5,
+      "fix": null
+    },
+    {
+      "n": 15,
+      "end": "Done: chart of the spec",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 10,
+      "counterexamples": 32,
+      "fix": null
+    },
+    {
+      "n": 16,
+      "end": "One run going: chart of the edited spec",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 10,
+      "counterexamples": 9,
+      "fix": null
+    },
+    {
+      "n": 17,
+      "end": "One run going: chart of the spec and your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 10,
+      "counterexamples": 24,
+      "fix": null
+    },
+    {
+      "n": 18,
+      "end": "One run going: no folder, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 10,
+      "counterexamples": 96,
+      "fix": null
+    },
+    {
+      "n": 19,
+      "end": "One run going: no folder, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 10,
+      "counterexamples": 79,
+      "fix": null
+    },
+    {
+      "n": 20,
+      "end": "One run going: no folder, the old chart moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 14,
+      "counterexamples": 8,
+      "fix": null
+    },
+    {
+      "n": 21,
+      "end": "Done: chart of the spec",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 14,
+      "counterexamples": 10,
+      "fix": null
+    },
+    {
+      "n": 22,
+      "end": "One run going: chart of the edited spec",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 14,
+      "counterexamples": 3,
+      "fix": null
+    },
+    {
+      "n": 23,
+      "end": "One run going: chart of the spec and your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 14,
+      "counterexamples": 5,
+      "fix": null
+    },
+    {
+      "n": 24,
+      "end": "One run going: no folder, the old chart moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 14,
+      "counterexamples": 8,
+      "fix": null
+    },
+    {
+      "n": 25,
+      "end": "Two runs going: chart of the spec, the old chart moved aside",
+      "invariant": "NotBothWrote",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 5,
+      "modelSteps": 15,
+      "counterexamples": 5,
+      "fix": null
+    },
+    {
+      "n": 26,
+      "end": "Done: chart of the edited spec",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 11,
+      "counterexamples": 18,
+      "fix": null
+    },
+    {
+      "n": 27,
+      "end": "Done: chart of the spec and your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 11,
+      "counterexamples": 48,
+      "fix": null
+    },
+    {
+      "n": 28,
+      "end": "One run going: chart of the edited spec and your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 11,
+      "counterexamples": 14,
+      "fix": null
+    },
+    {
+      "n": 29,
+      "end": "Done: no folder, the old chart moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 16,
+      "fix": null
+    },
+    {
+      "n": 30,
+      "end": "One run going: chart of the spec, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 10,
+      "fix": null
+    },
+    {
+      "n": 31,
+      "end": "One run going: your notes, the old chart moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 16,
+      "fix": null
+    },
+    {
+      "n": 32,
+      "end": "Done: chart of the edited spec",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 6,
+      "fix": null
+    },
+    {
+      "n": 33,
+      "end": "Done: chart of the spec and your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 10,
+      "fix": null
+    },
+    {
+      "n": 34,
+      "end": "Done: no folder, the old chart moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 16,
+      "fix": null
+    },
+    {
+      "n": 35,
+      "end": "One run going: chart of the edited spec and your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 3,
+      "fix": null
+    },
+    {
+      "n": 36,
+      "end": "One run going: chart of the spec, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 5,
+      "fix": null
+    },
+    {
+      "n": 37,
+      "end": "One run going: your notes, the old chart moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 15,
+      "counterexamples": 8,
+      "fix": null
+    },
+    {
+      "n": 38,
+      "end": "One run going: chart of the spec, the old chart moved aside",
+      "invariant": "NotBothWrote",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 16,
+      "counterexamples": 10,
+      "fix": null
+    },
+    {
+      "n": 39,
+      "end": "Two runs going: chart of the edited spec, the old chart moved aside",
+      "invariant": "NotBothWrote",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 6,
+      "modelSteps": 16,
+      "counterexamples": 3,
+      "fix": null
+    },
+    {
+      "n": 40,
+      "end": "Done: chart of the edited spec and your notes",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 12,
+      "counterexamples": 28,
+      "fix": null
+    },
+    {
+      "n": 41,
+      "end": "Done: chart of the spec, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 20,
+      "fix": null
+    },
+    {
+      "n": 42,
+      "end": "Done: your notes, the old chart moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 32,
+      "fix": null
+    },
+    {
+      "n": 43,
+      "end": "One run going: chart of the edited spec, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 6,
+      "fix": null
+    },
+    {
+      "n": 44,
+      "end": "Done: chart of the edited spec and your notes",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 6,
+      "fix": null
+    },
+    {
+      "n": 45,
+      "end": "Done: chart of the spec, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 10,
+      "fix": null
+    },
+    {
+      "n": 46,
+      "end": "Done: your notes, the old chart moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 16,
+      "fix": null
+    },
+    {
+      "n": 47,
+      "end": "One run going: chart of the edited spec, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 16,
+      "counterexamples": 3,
+      "fix": null
+    },
+    {
+      "n": 48,
+      "end": "One run going: chart of the edited spec, the old chart moved aside",
+      "invariant": "NotBothWrote",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 7,
+      "modelSteps": 17,
+      "counterexamples": 6,
+      "fix": null
+    },
+    {
+      "n": 49,
+      "end": "Done: chart of the edited spec, your notes moved aside",
+      "invariant": "NeverExitTwo",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 8,
+      "modelSteps": 17,
+      "counterexamples": 12,
+      "fix": null
+    },
+    {
+      "n": 50,
+      "end": "Done: chart of the edited spec, your notes moved aside",
+      "invariant": "NoBroke",
+      "rule": null,
+      "cause": null,
+      "readerSteps": 8,
+      "modelSteps": 17,
+      "counterexamples": 6,
+      "fix": null
+    }
+  ],
+  "codeLike": []
+}

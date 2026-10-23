@@ -1,0 +1,462 @@
+---
+config:
+  markdownAutoWrap: false
+  state:
+    useMaxWidth: false
+---
+stateDiagram-v2
+  state "Before any run | no folder" as p0
+  state "Before any run | your notes" as p1
+  state "Done | chart of the edited spec" as p2
+  state "Done | chart of the edited spec and your notes" as p3
+  state "Done | chart of the edited spec and your notes, the old chart moved aside" as p4
+  state "Done | chart of the edited spec, the old chart moved aside" as p5
+  state "Done | chart of the edited spec, your notes moved aside" as p6
+  state "Done | chart of the spec" as p7
+  state "Done | chart of the spec and your notes" as p8
+  state "Done | chart of the spec and your notes, the old chart moved aside" as p9
+  state "Done | chart of the spec, the old chart moved aside" as p10
+  state "Done | chart of the spec, your notes moved aside" as p11
+  state "Done | no folder" as p12
+  state "Done | no folder, the old chart moved aside" as p13
+  state "Done | no folder, your notes moved aside" as p14
+  state "Done | your notes" as p15
+  state "Done | your notes, the old chart moved aside" as p16
+  state "One run going | chart of the edited spec" as p17
+  state "One run going | chart of the edited spec and your notes" as p18
+  state "One run going | chart of the edited spec and your notes, the old chart moved aside" as p19
+  state "One run going | chart of the edited spec, the old chart moved aside" as p20
+  state "One run going | chart of the edited spec, your notes moved aside" as p21
+  state "One run going | chart of the spec" as p22
+  state "One run going | chart of the spec and your notes" as p23
+  state "One run going | chart of the spec and your notes, the old chart moved aside" as p24
+  state "One run going | chart of the spec, the old chart moved aside" as p25
+  state "One run going | chart of the spec, your notes moved aside" as p26
+  state "One run going | no folder" as p27
+  state "One run going | no folder, the old chart moved aside" as p28
+  state "One run going | no folder, your notes moved aside" as p29
+  state "One run going | your notes" as p30
+  state "One run going | your notes, the old chart moved aside" as p31
+  state "Two runs going | chart of the edited spec" as p32
+  state "Two runs going | chart of the edited spec and your notes" as p33
+  state "Two runs going | chart of the edited spec and your notes, the old chart moved aside" as p34
+  state "Two runs going | chart of the edited spec, the old chart moved aside" as p35
+  state "Two runs going | chart of the edited spec, your notes moved aside" as p36
+  state "Two runs going | chart of the spec" as p37
+  state "Two runs going | chart of the spec and your notes" as p38
+  state "Two runs going | chart of the spec and your notes, the old chart moved aside" as p39
+  state "Two runs going | chart of the spec, the old chart moved aside" as p40
+  state "Two runs going | chart of the spec, your notes moved aside" as p41
+  state "Two runs going | no folder" as p42
+  state "Two runs going | no folder, the old chart moved aside" as p43
+  state "Two runs going | no folder, your notes moved aside" as p44
+  state "Two runs going | your notes" as p45
+  state "Two runs going | your notes, the old chart moved aside" as p46
+  [*] --> p0
+  p0 --> p1 : you save notes in the folder
+  p0 --> p27 : you start run 1 with a typo
+  p0 --> p27 : you start run 1
+  p1 --> p30 : you start run 1 with a typo
+  p1 --> p30 : you start run 1
+  p27 --> p30 : you save notes in the folder
+  p27 --> p12 : you stop run 1 with Ctrl-C
+  p27 --> p12 : you stop run 2 with Ctrl-C
+  p27 --> p12 : run 1 says the spec changed while it read it
+  p27 --> p12 : you kill run 1's Node, and its TLC keeps running
+  p27 --> p12 : you kill run 2's Node, and its TLC keeps running
+  p27 --> p12 : run 2 says the input is wrong
+  p27 --> p12 : run 2 says the spec changed while it read it
+  p27 --> p12 : run 2 cannot rename a folder and stops
+  p27 --> p12 : run 1 says the input is wrong
+  p27 --> p12 : run 1 cannot rename a folder and stops
+  p27 --> p42 : you start run 2 in a second shell with a typo
+  p27 --> p42 : you start run 2 in a second shell
+  p30 --> p15 : you stop run 1 with Ctrl-C
+  p30 --> p15 : you stop run 2 with Ctrl-C
+  p30 --> p15 : run 2 says the folder has a file that it did not write
+  p30 --> p15 : run 1 says the spec changed while it read it
+  p30 --> p15 : you kill run 1's Node, and its TLC keeps running
+  p30 --> p15 : run 1 says the folder has a file that it did not write
+  p30 --> p15 : you kill run 2's Node, and its TLC keeps running
+  p30 --> p15 : run 2 says the input is wrong
+  p30 --> p15 : run 2 cannot rename a folder and stops
+  p30 --> p15 : run 1 says the input is wrong
+  p30 --> p15 : run 1 cannot rename a folder and stops
+  p30 --> p15 : run 2 says the spec changed while it read it
+  p30 --> p45 : you start run 2 in a second shell with a typo
+  p30 --> p45 : you start run 2 in a second shell
+  p12 --> p15 : you save notes in the folder
+  p12 --> p27 : you start run 2 with a typo
+  p12 --> p27 : you start run 2
+  p42 --> p45 : you save notes in the folder
+  p42 --> p27 : you stop run 1 with Ctrl-C
+  p42 --> p27 : you stop run 2 with Ctrl-C
+  p42 --> p27 : run 1 says the spec changed while it read it
+  p42 --> p27 : you kill run 1's Node, and its TLC keeps running
+  p42 --> p27 : you kill run 2's Node, and its TLC keeps running
+  p42 --> p27 : run 2 says the input is wrong
+  p42 --> p27 : run 2 cannot rename a folder and stops
+  p42 --> p27 : run 2 says the spec changed while it read it
+  p42 --> p27 : run 1 says the input is wrong
+  p42 --> p27 : run 1 cannot rename a folder and stops
+  p15 --> p30 : you start run 2 with a typo
+  p15 --> p30 : you start run 2
+  p45 --> p30 : you stop run 1 with Ctrl-C
+  p45 --> p30 : you stop run 2 with Ctrl-C
+  p45 --> p30 : run 2 says the folder has a file that it did not write
+  p45 --> p30 : run 1 says the spec changed while it read it
+  p45 --> p30 : you kill run 1's Node, and its TLC keeps running
+  p45 --> p30 : you kill run 2's Node, and its TLC keeps running
+  p45 --> p30 : run 1 says the folder has a file that it did not write
+  p45 --> p30 : run 2 says the input is wrong
+  p45 --> p30 : run 2 cannot rename a folder and stops
+  p45 --> p30 : run 2 says the spec changed while it read it
+  p45 --> p30 : run 1 says the input is wrong
+  p45 --> p30 : run 1 cannot rename a folder and stops
+  p27 --> p22 : run 1 moves its folder into place
+  p27 --> p22 : run 2 moves its folder into place
+  p27 --> p17 : run 2 moves its folder into place
+  p27 --> p17 : run 1 moves its folder into place
+  p42 --> p37 : run 1 moves its folder into place
+  p42 --> p37 : run 2 moves its folder into place
+  p30 --> p29 : run 2 moves the old folder aside
+  p30 --> p29 : run 1 moves the old folder aside
+  p22 --> p23 : you save notes in the folder
+  p22 --> p7 : you stop run 2 with Ctrl-C
+  p22 --> p7 : you stop run 1 with Ctrl-C
+  p22 --> p7 : run 1 deletes the old folder and finishes
+  p22 --> p7 : run 2 deletes the old folder and finishes
+  p22 --> p7 : you kill run 2's Node, and its TLC keeps running
+  p22 --> p7 : run 2 says the input is wrong
+  p22 --> p7 : you kill run 1's Node, and its TLC keeps running
+  p22 --> p7 : run 2 says the spec changed while it read it
+  p22 --> p7 : run 2 cannot rename a folder and stops
+  p22 --> p7 : run 1 says the spec changed while it read it
+  p22 --> p7 : run 1 says the input is wrong
+  p22 --> p7 : run 1 cannot rename a folder and stops
+  p22 --> p37 : you start run 2 in a second shell with a typo
+  p22 --> p37 : you start run 2 in a second shell
+  p42 --> p32 : run 2 moves its folder into place
+  p42 --> p32 : run 1 moves its folder into place
+  p17 --> p18 : you save notes in the folder
+  p17 --> p2 : you stop run 1 with Ctrl-C
+  p17 --> p2 : you stop run 2 with Ctrl-C
+  p17 --> p2 : run 2 deletes the old folder and finishes
+  p17 --> p2 : run 1 deletes the old folder and finishes
+  p17 --> p2 : you kill run 1's Node, and its TLC keeps running
+  p17 --> p2 : run 1 says the spec changed while it read it
+  p17 --> p2 : run 1 says the input is wrong
+  p17 --> p2 : run 1 cannot rename a folder and stops
+  p17 --> p2 : run 2 says the input is wrong
+  p17 --> p2 : you kill run 2's Node, and its TLC keeps running
+  p17 --> p2 : run 2 cannot rename a folder and stops
+  p17 --> p32 : you start run 2 in a second shell with a typo
+  p17 --> p32 : you start run 2 in a second shell
+  p45 --> p44 : run 2 moves the old folder aside
+  p45 --> p44 : run 1 moves the old folder aside
+  p37 --> p38 : you save notes in the folder
+  p37 --> p22 : you stop run 1 with Ctrl-C
+  p37 --> p22 : you stop run 2 with Ctrl-C
+  p37 --> p22 : run 1 deletes the old folder and finishes
+  p37 --> p22 : run 2 deletes the old folder and finishes
+  p37 --> p22 : you kill run 2's Node, and its TLC keeps running
+  p37 --> p22 : run 2 says the input is wrong
+  p37 --> p22 : you kill run 1's Node, and its TLC keeps running
+  p37 --> p22 : run 2 says the spec changed while it read it
+  p37 --> p22 : run 2 cannot rename a folder and stops
+  p37 --> p22 : run 1 says the spec changed while it read it
+  p37 --> p22 : run 1 says the input is wrong
+  p37 --> p22 : run 1 cannot rename a folder and stops
+  p29 --> p15 : run 2 puts the folder with your notes back and stops
+  p29 --> p15 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p29 --> p15 : run 1 puts the folder with your notes back and stops
+  p29 --> p15 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p29 --> p14 : you stop run 1 with Ctrl-C
+  p29 --> p14 : you stop run 2 with Ctrl-C
+  p29 --> p14 : run 2 cannot rename a folder and says where the old folder is
+  p29 --> p14 : run 1 cannot rename a folder and says where the old folder is
+  p29 --> p14 : you kill run 1's Node, and its TLC keeps running
+  p29 --> p14 : run 1 says the spec changed while it read it
+  p29 --> p14 : you kill run 2's Node, and its TLC keeps running
+  p29 --> p14 : run 1 says the input is wrong
+  p29 --> p14 : run 2 says the input is wrong
+  p29 --> p14 : run 2 cannot rename a folder and stops
+  p29 --> p14 : run 1 cannot rename a folder and stops
+  p29 --> p14 : run 1 deletes the old folder and finishes
+  p29 --> p14 : run 2 deletes the old folder and finishes
+  p29 --> p14 : run 2 says the spec changed while it read it
+  p29 --> p44 : you start run 2 in a second shell with a typo
+  p29 --> p44 : you start run 2 in a second shell
+  p23 --> p8 : you stop run 2 with Ctrl-C
+  p23 --> p8 : you stop run 1 with Ctrl-C
+  p23 --> p8 : run 1 deletes the old folder and finishes
+  p23 --> p8 : run 2 deletes the old folder and finishes
+  p23 --> p8 : run 2 says the folder has a file that it did not write
+  p23 --> p8 : you kill run 2's Node, and its TLC keeps running
+  p23 --> p8 : run 2 says the input is wrong
+  p23 --> p8 : run 1 says the folder has a file that it did not write
+  p23 --> p8 : you kill run 1's Node, and its TLC keeps running
+  p23 --> p8 : run 2 says the spec changed while it read it
+  p23 --> p8 : run 2 cannot rename a folder and stops
+  p23 --> p8 : run 1 says the spec changed while it read it
+  p23 --> p8 : run 1 says the input is wrong
+  p23 --> p8 : run 1 cannot rename a folder and stops
+  p23 --> p38 : you start run 2 in a second shell with a typo
+  p23 --> p38 : you start run 2 in a second shell
+  p7 --> p8 : you save notes in the folder
+  p7 --> p22 : you start run 2 with a typo
+  p7 --> p22 : you start run 2
+  p32 --> p33 : you save notes in the folder
+  p32 --> p17 : you stop run 1 with Ctrl-C
+  p32 --> p17 : you stop run 2 with Ctrl-C
+  p32 --> p17 : run 2 deletes the old folder and finishes
+  p32 --> p17 : run 1 deletes the old folder and finishes
+  p32 --> p17 : you kill run 1's Node, and its TLC keeps running
+  p32 --> p17 : run 1 says the spec changed while it read it
+  p32 --> p17 : run 1 says the input is wrong
+  p32 --> p17 : run 1 cannot rename a folder and stops
+  p32 --> p17 : run 2 says the input is wrong
+  p32 --> p17 : you kill run 2's Node, and its TLC keeps running
+  p32 --> p17 : run 2 cannot rename a folder and stops
+  p18 --> p3 : you stop run 1 with Ctrl-C
+  p18 --> p3 : you stop run 2 with Ctrl-C
+  p18 --> p3 : run 2 deletes the old folder and finishes
+  p18 --> p3 : run 1 deletes the old folder and finishes
+  p18 --> p3 : run 1 says the folder has a file that it did not write
+  p18 --> p3 : you kill run 1's Node, and its TLC keeps running
+  p18 --> p3 : run 1 says the spec changed while it read it
+  p18 --> p3 : run 1 says the input is wrong
+  p18 --> p3 : run 2 says the folder has a file that it did not write
+  p18 --> p3 : run 1 cannot rename a folder and stops
+  p18 --> p3 : run 2 says the input is wrong
+  p18 --> p3 : you kill run 2's Node, and its TLC keeps running
+  p18 --> p3 : run 2 cannot rename a folder and stops
+  p18 --> p33 : you start run 2 in a second shell with a typo
+  p18 --> p33 : you start run 2 in a second shell
+  p2 --> p3 : you save notes in the folder
+  p2 --> p17 : you start run 2 with a typo
+  p2 --> p17 : you start run 2
+  p44 --> p29 : you stop run 1 with Ctrl-C
+  p44 --> p29 : you stop run 2 with Ctrl-C
+  p44 --> p29 : run 2 cannot rename a folder and says where the old folder is
+  p44 --> p29 : run 1 cannot rename a folder and says where the old folder is
+  p44 --> p29 : you kill run 1's Node, and its TLC keeps running
+  p44 --> p29 : run 1 says the spec changed while it read it
+  p44 --> p29 : you kill run 2's Node, and its TLC keeps running
+  p44 --> p29 : run 1 says the input is wrong
+  p44 --> p29 : run 2 says the input is wrong
+  p44 --> p29 : run 2 cannot rename a folder and stops
+  p44 --> p29 : run 1 cannot rename a folder and stops
+  p44 --> p29 : run 1 deletes the old folder and finishes
+  p44 --> p29 : run 2 deletes the old folder and finishes
+  p44 --> p29 : run 2 says the spec changed while it read it
+  p44 --> p30 : run 2 puts the folder with your notes back and stops
+  p44 --> p30 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p44 --> p30 : run 1 puts the folder with your notes back and stops
+  p44 --> p30 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p38 --> p23 : you stop run 1 with Ctrl-C
+  p38 --> p23 : you stop run 2 with Ctrl-C
+  p38 --> p23 : run 1 deletes the old folder and finishes
+  p38 --> p23 : run 2 deletes the old folder and finishes
+  p38 --> p23 : run 2 says the folder has a file that it did not write
+  p38 --> p23 : you kill run 2's Node, and its TLC keeps running
+  p38 --> p23 : run 2 says the input is wrong
+  p38 --> p23 : run 1 says the folder has a file that it did not write
+  p38 --> p23 : you kill run 1's Node, and its TLC keeps running
+  p38 --> p23 : run 2 says the spec changed while it read it
+  p38 --> p23 : run 2 cannot rename a folder and stops
+  p38 --> p23 : run 1 says the spec changed while it read it
+  p38 --> p23 : run 1 says the input is wrong
+  p38 --> p23 : run 1 cannot rename a folder and stops
+  p14 --> p29 : you start run 2 with a typo
+  p14 --> p29 : you start run 2
+  p8 --> p23 : you start run 2 with a typo
+  p8 --> p23 : you start run 2
+  p33 --> p18 : you stop run 1 with Ctrl-C
+  p33 --> p18 : you stop run 2 with Ctrl-C
+  p33 --> p18 : run 2 deletes the old folder and finishes
+  p33 --> p18 : run 1 deletes the old folder and finishes
+  p33 --> p18 : run 1 says the folder has a file that it did not write
+  p33 --> p18 : you kill run 1's Node, and its TLC keeps running
+  p33 --> p18 : run 1 says the spec changed while it read it
+  p33 --> p18 : run 1 says the input is wrong
+  p33 --> p18 : run 2 says the folder has a file that it did not write
+  p33 --> p18 : run 1 cannot rename a folder and stops
+  p33 --> p18 : run 2 says the input is wrong
+  p33 --> p18 : you kill run 2's Node, and its TLC keeps running
+  p33 --> p18 : run 2 cannot rename a folder and stops
+  p3 --> p18 : you start run 2 with a typo
+  p3 --> p18 : you start run 2
+  p37 --> p43 : run 2 moves the old folder aside
+  p37 --> p43 : run 1 moves the old folder aside
+  p32 --> p43 : run 1 moves the old folder aside
+  p32 --> p43 : run 2 moves the old folder aside
+  p44 --> p41 : run 1 moves its folder into place
+  p44 --> p41 : run 2 moves its folder into place
+  p22 --> p28 : run 2 moves the old folder aside
+  p22 --> p28 : run 1 moves the old folder aside
+  p38 --> p44 : run 2 moves the old folder aside
+  p38 --> p44 : run 1 moves the old folder aside
+  p43 --> p46 : you save notes in the folder
+  p43 --> p28 : you stop run 1 with Ctrl-C
+  p43 --> p28 : you stop run 2 with Ctrl-C
+  p43 --> p28 : run 1 deletes the old folder and finishes
+  p43 --> p28 : run 2 cannot rename a folder and says where the old folder is
+  p43 --> p28 : run 1 cannot rename a folder and says where the old folder is
+  p43 --> p28 : run 2 deletes the old folder and finishes
+  p43 --> p22 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p43 --> p22 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p44 --> p36 : run 2 moves its folder into place
+  p44 --> p36 : run 1 moves its folder into place
+  p17 --> p28 : run 1 moves the old folder aside
+  p17 --> p28 : run 2 moves the old folder aside
+  p33 --> p44 : run 1 moves the old folder aside
+  p33 --> p44 : run 2 moves the old folder aside
+  p43 --> p17 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p43 --> p17 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p29 --> p26 : run 1 moves its folder into place
+  p29 --> p26 : run 2 moves its folder into place
+  p41 --> p26 : you stop run 1 with Ctrl-C
+  p41 --> p26 : you stop run 2 with Ctrl-C
+  p41 --> p26 : run 1 deletes the old folder and finishes
+  p41 --> p26 : run 2 keeps the folder with your notes aside and says where
+  p41 --> p26 : run 2 cannot rename a folder and says where the old folder is
+  p41 --> p26 : run 1 keeps the folder with your notes aside and says where
+  p41 --> p26 : run 1 cannot rename a folder and says where the old folder is
+  p41 --> p26 : run 2 deletes the old folder and finishes
+  p23 --> p29 : run 2 moves the old folder aside
+  p23 --> p29 : run 1 moves the old folder aside
+  p28 --> p31 : you save notes in the folder
+  p28 --> p7 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p28 --> p7 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p28 --> p13 : you stop run 2 with Ctrl-C
+  p28 --> p13 : you stop run 1 with Ctrl-C
+  p28 --> p13 : run 2 cannot rename a folder and says where the old folder is
+  p28 --> p13 : run 1 cannot rename a folder and says where the old folder is
+  p28 --> p13 : run 1 deletes the old folder and finishes
+  p28 --> p13 : run 2 deletes the old folder and finishes
+  p44 --> p23 : run 2 puts the folder with your notes back and stops
+  p44 --> p23 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p44 --> p23 : run 1 puts the folder with your notes back and stops
+  p44 --> p23 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p46 --> p31 : you stop run 1 with Ctrl-C
+  p46 --> p31 : you stop run 2 with Ctrl-C
+  p46 --> p31 : run 1 deletes the old folder and finishes
+  p46 --> p31 : run 2 cannot rename a folder and says where the old folder is
+  p46 --> p31 : run 1 cannot rename a folder and says where the old folder is
+  p46 --> p31 : run 2 deletes the old folder and finishes
+  p46 --> p31 : run 2 keeps the folder with your notes aside and says where
+  p46 --> p31 : run 1 keeps the folder with your notes aside and says where
+  p43 --> p40 : run 1 moves its folder into place
+  p43 --> p40 : run 2 moves its folder into place
+  p29 --> p21 : run 2 moves its folder into place
+  p29 --> p21 : run 1 moves its folder into place
+  p36 --> p21 : you stop run 1 with Ctrl-C
+  p36 --> p21 : you stop run 2 with Ctrl-C
+  p36 --> p21 : run 1 keeps the folder with your notes aside and says where
+  p36 --> p21 : run 1 cannot rename a folder and says where the old folder is
+  p36 --> p21 : run 2 deletes the old folder and finishes
+  p36 --> p21 : run 1 deletes the old folder and finishes
+  p36 --> p21 : run 2 keeps the folder with your notes aside and says where
+  p36 --> p21 : run 2 cannot rename a folder and says where the old folder is
+  p18 --> p29 : run 1 moves the old folder aside
+  p18 --> p29 : run 2 moves the old folder aside
+  p28 --> p2 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p28 --> p2 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p44 --> p18 : run 1 puts the folder with your notes back and stops
+  p44 --> p18 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p44 --> p18 : run 2 puts the folder with your notes back and stops
+  p44 --> p18 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p43 --> p35 : run 2 moves its folder into place
+  p43 --> p35 : run 1 moves its folder into place
+  p26 --> p11 : you stop run 1 with Ctrl-C
+  p26 --> p11 : you stop run 2 with Ctrl-C
+  p26 --> p11 : run 1 deletes the old folder and finishes
+  p26 --> p11 : run 2 deletes the old folder and finishes
+  p26 --> p11 : run 2 keeps the folder with your notes aside and says where
+  p26 --> p11 : run 2 cannot rename a folder and says where the old folder is
+  p26 --> p11 : run 1 keeps the folder with your notes aside and says where
+  p26 --> p11 : run 1 cannot rename a folder and says where the old folder is
+  p29 --> p8 : run 2 puts the folder with your notes back and stops
+  p29 --> p8 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p29 --> p8 : run 1 puts the folder with your notes back and stops
+  p29 --> p8 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p31 --> p16 : you stop run 2 with Ctrl-C
+  p31 --> p16 : you stop run 1 with Ctrl-C
+  p31 --> p16 : run 2 cannot rename a folder and says where the old folder is
+  p31 --> p16 : run 1 cannot rename a folder and says where the old folder is
+  p31 --> p16 : run 1 deletes the old folder and finishes
+  p31 --> p16 : run 2 deletes the old folder and finishes
+  p31 --> p16 : run 2 keeps the folder with your notes aside and says where
+  p31 --> p16 : run 1 keeps the folder with your notes aside and says where
+  p28 --> p25 : run 1 moves its folder into place
+  p28 --> p25 : run 2 moves its folder into place
+  p13 --> p16 : you save notes in the folder
+  p40 --> p39 : you save notes in the folder
+  p40 --> p25 : you stop run 1 with Ctrl-C
+  p40 --> p25 : you stop run 2 with Ctrl-C
+  p40 --> p25 : run 2 deletes the old folder and finishes
+  p40 --> p25 : run 1 deletes the old folder and finishes
+  p40 --> p22 : run 1 deletes the old folder and finishes
+  p40 --> p22 : run 2 deletes the old folder and finishes
+  p21 --> p6 : you stop run 2 with Ctrl-C
+  p21 --> p6 : you stop run 1 with Ctrl-C
+  p21 --> p6 : run 2 deletes the old folder and finishes
+  p21 --> p6 : run 1 keeps the folder with your notes aside and says where
+  p21 --> p6 : run 1 cannot rename a folder and says where the old folder is
+  p21 --> p6 : run 1 deletes the old folder and finishes
+  p21 --> p6 : run 2 keeps the folder with your notes aside and says where
+  p21 --> p6 : run 2 cannot rename a folder and says where the old folder is
+  p29 --> p3 : run 1 puts the folder with your notes back and stops
+  p29 --> p3 : run 1 cannot rename a folder, puts the old folder back, and stops
+  p29 --> p3 : run 2 puts the folder with your notes back and stops
+  p29 --> p3 : run 2 cannot rename a folder, puts the old folder back, and stops
+  p28 --> p20 : run 2 moves its folder into place
+  p28 --> p20 : run 1 moves its folder into place
+  p35 --> p34 : you save notes in the folder
+  p35 --> p20 : you stop run 1 with Ctrl-C
+  p35 --> p20 : you stop run 2 with Ctrl-C
+  p35 --> p20 : run 1 deletes the old folder and finishes
+  p35 --> p20 : run 2 deletes the old folder and finishes
+  p35 --> p17 : run 2 deletes the old folder and finishes
+  p35 --> p17 : run 1 deletes the old folder and finishes
+  p25 --> p24 : you save notes in the folder
+  p25 --> p7 : run 1 deletes the old folder and finishes
+  p25 --> p7 : run 2 deletes the old folder and finishes
+  p25 --> p10 : you stop run 1 with Ctrl-C
+  p25 --> p10 : you stop run 2 with Ctrl-C
+  p25 --> p10 : run 2 deletes the old folder and finishes
+  p25 --> p10 : run 1 deletes the old folder and finishes
+  p39 --> p24 : you stop run 1 with Ctrl-C
+  p39 --> p24 : you stop run 2 with Ctrl-C
+  p39 --> p24 : run 2 deletes the old folder and finishes
+  p39 --> p24 : run 1 deletes the old folder and finishes
+  p39 --> p23 : run 1 deletes the old folder and finishes
+  p39 --> p23 : run 2 deletes the old folder and finishes
+  p20 --> p19 : you save notes in the folder
+  p20 --> p2 : run 2 deletes the old folder and finishes
+  p20 --> p2 : run 1 deletes the old folder and finishes
+  p20 --> p5 : you stop run 2 with Ctrl-C
+  p20 --> p5 : you stop run 1 with Ctrl-C
+  p20 --> p5 : run 1 deletes the old folder and finishes
+  p20 --> p5 : run 2 deletes the old folder and finishes
+  p34 --> p19 : you stop run 1 with Ctrl-C
+  p34 --> p19 : you stop run 2 with Ctrl-C
+  p34 --> p19 : run 1 deletes the old folder and finishes
+  p34 --> p19 : run 2 deletes the old folder and finishes
+  p34 --> p18 : run 2 deletes the old folder and finishes
+  p34 --> p18 : run 1 deletes the old folder and finishes
+  p24 --> p8 : run 1 deletes the old folder and finishes
+  p24 --> p8 : run 2 deletes the old folder and finishes
+  p24 --> p9 : you stop run 1 with Ctrl-C
+  p24 --> p9 : you stop run 2 with Ctrl-C
+  p24 --> p9 : run 2 deletes the old folder and finishes
+  p24 --> p9 : run 1 deletes the old folder and finishes
+  p10 --> p9 : you save notes in the folder
+  p19 --> p3 : run 2 deletes the old folder and finishes
+  p19 --> p3 : run 1 deletes the old folder and finishes
+  p19 --> p4 : you stop run 2 with Ctrl-C
+  p19 --> p4 : you stop run 1 with Ctrl-C
+  p19 --> p4 : run 1 deletes the old folder and finishes
+  p19 --> p4 : run 2 deletes the old folder and finishes
+  p5 --> p4 : you save notes in the folder

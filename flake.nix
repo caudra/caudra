@@ -118,6 +118,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead" =
           "sha256-yOpD/aPZz/BBkICINUhNghfrmkXxwz6eN4fFZ3/DrtE=";
+        "git+https://github.com/tensorninja/tla-rs?rev=807f334a2825cd6f225fc9a61870d1ab6e4acd86#807f334a2825cd6f225fc9a61870d1ab6e4acd86" =
+          "sha256-PjuAUIedfnuk9I3rYzWjbqhdirzmyJBQWnbmbJKhVm4=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;

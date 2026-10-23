@@ -1,0 +1,199 @@
+---
+config:
+  markdownAutoWrap: false
+  state:
+    useMaxWidth: false
+---
+stateDiagram-v2
+  classDef plain fill:#f4f6f7,stroke:#566573,color:#1b2631
+  classDef plainWrong fill:#f4f6f7,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  classDef group0 fill:#d6eaf8,stroke:#6b757c,color:#1b2631
+  classDef group0Wrong fill:#d6eaf8,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  classDef group1 fill:#fdebd0,stroke:#7f7668,color:#1b2631
+  classDef group2 fill:#e8daef,stroke:#746d78,color:#1b2631
+  classDef group2Wrong fill:#e8daef,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  state "Legend" as legend {
+    state "Finished" as legendGroup0
+    state "Not started" as legendGroup1
+    state "Running" as legendGroup2
+    state "Breaks a rule" as legendWrong
+  }
+  class legendGroup0 group0
+  class legendGroup1 group1
+  class legendGroup2 group2
+  class legendWrong plainWrong
+  state "At the same time" as regions {
+    [*] --> r0s0
+    state "Before any run" as r0s0
+    state "Done" as r0s1
+    state "One run going" as r0s2
+    state "Two runs going" as r0s3
+    r0s0 --> r0s2 : you start run 1
+    r0s0 --> r0s2 : you start run 1 with a typo
+    r0s1 --> r0s2 : you start run 2 [when chart of<br/>the edited spec or chart of<br/>the edited spec and your notes<br/>or chart of the spec or chart<br/>of the spec and your notes or<br/>no folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s1 --> r0s2 : you start run 2 with a typo<br/>[when chart of the edited spec<br/>or chart of the edited spec<br/>and your notes or chart of the<br/>spec or chart of the spec and<br/>your notes or no folder or no<br/>folder, your notes moved aside<br/>or your notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 1 cannot rename a folder<br/>and says where the old folder<br/>is [when chart of the edited<br/>spec, your notes moved aside<br/>or chart of the spec, your<br/>notes moved aside or no<br/>folder, the old chart moved<br/>aside or no folder, your notes<br/>moved aside or your notes, the<br/>old chart moved aside]
+    %% when r1s4, r1s9, r1s11, r1s12, r1s14
+    r0s2 --> r0s1 : run 1 cannot rename a folder<br/>and stops [when chart of the<br/>edited spec or chart of the<br/>edited spec and your notes or<br/>chart of the spec or chart of<br/>the spec and your notes or no<br/>folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [when no folder, the old<br/>chart moved aside or no<br/>folder, your notes moved<br/>aside]
+    %% when r1s11, r1s12
+    r0s2 --> r0s1 : run 1 keeps the folder with<br/>your notes aside and says<br/>where [when chart of the<br/>edited spec, your notes moved<br/>aside or chart of the spec,<br/>your notes moved aside or your<br/>notes, the old chart moved<br/>aside]
+    %% when r1s4, r1s9, r1s14
+    r0s2 --> r0s1 : run 1 puts the folder with<br/>your notes back and stops<br/>[when no folder, your notes<br/>moved aside]
+    %% when r1s12
+    r0s2 --> r0s1 : run 1 says the folder has a<br/>file that it did not write<br/>[when chart of the edited spec<br/>and your notes or chart of the<br/>spec and your notes or your<br/>notes]
+    %% when r1s1, r1s6, r1s13
+    r0s2 --> r0s1 : run 1 says the input is wrong<br/>[when chart of the edited spec<br/>or chart of the edited spec<br/>and your notes or chart of the<br/>spec or chart of the spec and<br/>your notes or no folder or no<br/>folder, your notes moved aside<br/>or your notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 1 says the spec changed<br/>while it read it [when chart<br/>of the edited spec or chart of<br/>the edited spec and your notes<br/>or chart of the spec or chart<br/>of the spec and your notes or<br/>no folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 2 cannot rename a folder<br/>and says where the old folder<br/>is [when chart of the edited<br/>spec, your notes moved aside<br/>or chart of the spec, your<br/>notes moved aside or no<br/>folder, the old chart moved<br/>aside or no folder, your notes<br/>moved aside or your notes, the<br/>old chart moved aside]
+    %% when r1s4, r1s9, r1s11, r1s12, r1s14
+    r0s2 --> r0s1 : run 2 cannot rename a folder<br/>and stops [when chart of the<br/>edited spec or chart of the<br/>edited spec and your notes or<br/>chart of the spec or chart of<br/>the spec and your notes or no<br/>folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [when no folder, the old<br/>chart moved aside or no<br/>folder, your notes moved<br/>aside]
+    %% when r1s11, r1s12
+    r0s2 --> r0s1 : run 2 keeps the folder with<br/>your notes aside and says<br/>where [when chart of the<br/>edited spec, your notes moved<br/>aside or chart of the spec,<br/>your notes moved aside or your<br/>notes, the old chart moved<br/>aside]
+    %% when r1s4, r1s9, r1s14
+    r0s2 --> r0s1 : run 2 puts the folder with<br/>your notes back and stops<br/>[when no folder, your notes<br/>moved aside]
+    %% when r1s12
+    r0s2 --> r0s1 : run 2 says the folder has a<br/>file that it did not write<br/>[when chart of the edited spec<br/>and your notes or chart of the<br/>spec and your notes or your<br/>notes]
+    %% when r1s1, r1s6, r1s13
+    r0s2 --> r0s1 : run 2 says the input is wrong<br/>[when chart of the edited spec<br/>or chart of the edited spec<br/>and your notes or chart of the<br/>spec or chart of the spec and<br/>your notes or no folder or no<br/>folder, your notes moved aside<br/>or your notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : run 2 says the spec changed<br/>while it read it [when chart<br/>of the spec or chart of the<br/>spec and your notes or no<br/>folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : you kill run 1's Node, and its<br/>TLC keeps running [when chart<br/>of the edited spec or chart of<br/>the edited spec and your notes<br/>or chart of the spec or chart<br/>of the spec and your notes or<br/>no folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : you kill run 2's Node, and its<br/>TLC keeps running [when chart<br/>of the edited spec or chart of<br/>the edited spec and your notes<br/>or chart of the spec or chart<br/>of the spec and your notes or<br/>no folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s3 : you start run 2 in a second<br/>shell [when chart of the<br/>edited spec or chart of the<br/>edited spec and your notes or<br/>chart of the spec or chart of<br/>the spec and your notes or no<br/>folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s3 : you start run 2 in a second<br/>shell with a typo [when chart<br/>of the edited spec or chart of<br/>the edited spec and your notes<br/>or chart of the spec or chart<br/>of the spec and your notes or<br/>no folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s2 --> r0s1 : you stop run 1 with Ctrl-C
+    r0s2 --> r0s1 : you stop run 2 with Ctrl-C
+    r0s3 --> r0s2 : run 1 cannot rename a folder<br/>and says where the old folder<br/>is [when chart of the edited<br/>spec, your notes moved aside<br/>or chart of the spec, your<br/>notes moved aside or no<br/>folder, the old chart moved<br/>aside or no folder, your notes<br/>moved aside or your notes, the<br/>old chart moved aside]
+    %% when r1s4, r1s9, r1s11, r1s12, r1s14
+    r0s3 --> r0s2 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [when no folder, the old<br/>chart moved aside or no<br/>folder, your notes moved<br/>aside]
+    %% when r1s11, r1s12
+    r0s3 --> r0s2 : run 1 deletes the old folder<br/>and finishes [unless no folder<br/>or your notes]
+    %% when not r1s10, r1s13
+    r0s3 --> r0s2 : run 1 keeps the folder with<br/>your notes aside and says<br/>where [when chart of the<br/>edited spec, your notes moved<br/>aside or chart of the spec,<br/>your notes moved aside or your<br/>notes, the old chart moved<br/>aside]
+    %% when r1s4, r1s9, r1s14
+    r0s3 --> r0s2 : run 1 puts the folder with<br/>your notes back and stops<br/>[when no folder, your notes<br/>moved aside]
+    %% when r1s12
+    r0s3 --> r0s2 : run 1 says the input is wrong<br/>[when chart of the edited spec<br/>or chart of the edited spec<br/>and your notes or chart of the<br/>spec or chart of the spec and<br/>your notes or no folder or no<br/>folder, your notes moved aside<br/>or your notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s3 --> r0s2 : run 2 cannot rename a folder<br/>and says where the old folder<br/>is [when chart of the edited<br/>spec, your notes moved aside<br/>or chart of the spec, your<br/>notes moved aside or no<br/>folder, the old chart moved<br/>aside or no folder, your notes<br/>moved aside or your notes, the<br/>old chart moved aside]
+    %% when r1s4, r1s9, r1s11, r1s12, r1s14
+    r0s3 --> r0s2 : run 2 cannot rename a folder<br/>and stops [when chart of the<br/>edited spec or chart of the<br/>edited spec and your notes or<br/>chart of the spec or chart of<br/>the spec and your notes or no<br/>folder or no folder, your<br/>notes moved aside or your<br/>notes]
+    %% when r1s0, r1s1, r1s5, r1s6, r1s10, r1s12, r1s13
+    r0s3 --> r0s2 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [when no folder, the old<br/>chart moved aside or no<br/>folder, your notes moved<br/>aside]
+    %% when r1s11, r1s12
+    r0s3 --> r0s2 : run 2 deletes the old folder<br/>and finishes [unless no folder<br/>or your notes]
+    %% when not r1s10, r1s13
+    r0s3 --> r0s2 : run 2 puts the folder with<br/>your notes back and stops<br/>[when no folder, your notes<br/>moved aside]
+    %% when r1s12
+    --
+    [*] --> r1s10
+    state "chart of the edited spec" as r1s0
+    state "chart of the edited spec<br/>and your notes" as r1s1
+    state "chart of the edited spec<br/>and your notes, the old<br/>chart moved aside" as r1s2
+    state "chart of the edited spec,<br/>the old chart moved aside" as r1s3
+    state "chart of the edited spec,<br/>your notes moved aside" as r1s4
+    state "chart of the spec" as r1s5
+    state "chart of the spec and your<br/>notes" as r1s6
+    state "chart of the spec and your<br/>notes, the old chart moved<br/>aside" as r1s7
+    state "chart of the spec, the old<br/>chart moved aside" as r1s8
+    state "chart of the spec, your<br/>notes moved aside" as r1s9
+    state "no folder" as r1s10
+    state "no folder, the old chart<br/>moved aside" as r1s11
+    state "no folder, your notes<br/>moved aside" as r1s12
+    state "your notes" as r1s13
+    state "your notes, the old chart<br/>moved aside" as r1s14
+    r1s0 --> r1s11 : run 2 moves the old folder<br/>aside [unless Done]
+    %% when not r0s1
+    r1s0 --> r1s1 : you save notes in the folder
+    r1s3 --> r1s2 : you save notes in the folder
+    r1s5 --> r1s11 : run 2 moves the old folder<br/>aside [unless Done]
+    %% when not r0s1
+    r1s5 --> r1s6 : you save notes in the folder
+    r1s8 --> r1s7 : you save notes in the folder
+    r1s10 --> r1s5 : run 1 moves its folder into<br/>place [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+    r1s10 --> r1s0 : run 1 moves its folder into<br/>place [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+    r1s10 --> r1s5 : run 2 moves its folder into<br/>place [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+    r1s10 --> r1s0 : run 2 moves its folder into<br/>place [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+    r1s10 --> r1s13 : you save notes in the folder
+    r1s11 --> r1s5 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s0 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s5 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s0 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s8 : run 2 moves its folder into<br/>place [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s3 : run 2 moves its folder into<br/>place [unless Done]
+    %% when not r0s1
+    r1s11 --> r1s14 : you save notes in the folder
+    r1s12 --> r1s13 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s6 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s1 : run 1 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s13 : run 1 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s12 --> r1s6 : run 1 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s12 --> r1s1 : run 1 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s12 --> r1s13 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s6 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s1 : run 2 cannot rename a folder,<br/>puts the old folder back, and<br/>stops [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s9 : run 2 moves its folder into<br/>place [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s4 : run 2 moves its folder into<br/>place [unless Done]
+    %% when not r0s1
+    r1s12 --> r1s13 : run 2 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s12 --> r1s6 : run 2 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s12 --> r1s1 : run 2 puts the folder with<br/>your notes back and stops<br/>[unless Done]
+    %% when not r0s1
+    r1s13 --> r1s12 : run 1 moves the old folder<br/>aside [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+    r1s13 --> r1s12 : run 2 moves the old folder<br/>aside [when One run going or<br/>Two runs going]
+    %% when r0s2, r0s3
+  }
+  class r0s0 group1
+  class r0s1 group0Wrong
+  class r0s2 group2Wrong
+  class r0s3 group2
+  class r1s0 plain
+  class r1s1 plain
+  class r1s2 plainWrong
+  class r1s3 plainWrong
+  class r1s4 plainWrong
+  class r1s5 plain
+  class r1s6 plain
+  class r1s7 plainWrong
+  class r1s8 plainWrong
+  class r1s9 plainWrong
+  class r1s10 plain
+  class r1s11 plain
+  class r1s12 plainWrong
+  class r1s13 plain
+  class r1s14 plain

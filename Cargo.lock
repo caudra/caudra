@@ -1316,15 +1316,18 @@ version = "0.2.0-preview.12"
 dependencies = [
  "caudra-automation",
  "caudra-docs",
+ "caudra-script",
  "include_dir",
  "jiff",
  "regex",
+ "rhai",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tla-checker",
  "yaml_serde",
 ]
 
@@ -8714,6 +8717,20 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "tla-checker"
+version = "0.25.0"
+source = "git+https://github.com/tensorninja/tla-rs?rev=807f334a2825cd6f225fc9a61870d1ab6e4acd86#807f334a2825cd6f225fc9a61870d1ab6e4acd86"
+dependencies = [
+ "fastrand",
+ "indexmap 2.14.2",
+ "libc",
+ "serde",
+ "serde_json",
+ "stacker",
+ "toml",
+]
 
 [[package]]
 name = "tokio"

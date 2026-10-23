@@ -10,13 +10,16 @@ rust-version.workspace = true
 
 [dependencies]
 caudra-docs = { workspace = true }
+caudra-script = { workspace = true, features = ["rhai"] }
 include_dir = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
+rhai = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+tla-checker = { workspace = true }
 
 [dev-dependencies]
 caudra-automation = { workspace = true }

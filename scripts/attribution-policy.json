@@ -233,6 +233,22 @@
           "path": "THIRD_PARTY_LICENSES/Monty.txt"
         }
       ]
+    },
+    "git+https://github.com/tensorninja/tla-rs?rev=807f334a2825cd6f225fc9a61870d1ab6e4acd86#807f334a2825cd6f225fc9a61870d1ab6e4acd86": {
+      "reason": "Caudra's fork of fabracht/tla-rs (MIT OR Apache-2.0, MIT selected). License and original package manifest verified against the exact locked Git revision. Accepted manifest hashes are original Git bytes and Cargo 1.99.1 vendor-normalized bytes generated from that source; neither requires .git or Cargo.toml.orig in the vendor tree.",
+      "packages": {
+        "tla-checker@0.25.0": [
+          "1e6a9be560ce479e20b6e49edbf60a34d03c9c5f9af767f98718f84c3726f913",
+          "e458fec3d9e12c78983b758c4d4edd69117b5f1190b64d2a7b1b6a1600c02b91"
+        ]
+      },
+      "notices": [
+        {
+          "name": "tla-rs/LICENSE-MIT",
+          "sha256": "e1ab919ecc46f433bd0fc3c10d1627b6c7738d39b1b4d597b1433ff4fbf4f5d4",
+          "path": "THIRD_PARTY_LICENSES/TlaChecker.txt"
+        }
+      ]
     }
   },
   "workspace_sources": [

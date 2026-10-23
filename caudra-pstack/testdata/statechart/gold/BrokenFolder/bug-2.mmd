@@ -1,0 +1,33 @@
+---
+config:
+  markdownAutoWrap: false
+  state:
+    useMaxWidth: false
+---
+stateDiagram-v2
+  classDef plainWrong fill:#f4f6f7,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  classDef group0 fill:#d6eaf8,stroke:#6b757c,color:#1b2631
+  classDef group0Wrong fill:#d6eaf8,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  classDef group1 fill:#fdebd0,stroke:#7f7668,color:#1b2631
+  classDef group1Path fill:#fdebd0,stroke:#1f3a93,stroke-width:4px,color:#1b2631
+  classDef group2 fill:#e8daef,stroke:#746d78,color:#1b2631
+  classDef group2Wrong fill:#e8daef,stroke:#c0392b,stroke-width:4px,color:#7b241c
+  state "Legend" as legend {
+    state "Finished" as legendGroup0
+    state "Not started" as legendGroup1
+    state "Running" as legendGroup2
+    state "Breaks a rule" as legendWrong
+  }
+  class legendGroup0 group0
+  class legendGroup1 group1
+  class legendGroup2 group2
+  class legendWrong plainWrong
+  state "Before any run: no folder" as s0
+  state "Done: no folder" as s1
+  state "One run going: no folder" as s2
+  [*] --> s0
+  s0 --> s2 : 1. you start run 1
+  s2 --> s1 : 2. run 1 cannot rename a<br/>folder and stops
+  class s0 group1Path
+  class s1 group0Wrong
+  class s2 group2Wrong

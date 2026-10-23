@@ -1,0 +1,45 @@
+{
+  "view": "customer",
+  "modelStates": 4294,
+  "modelTransitions": 11824,
+  "chartStates": 19,
+  "chartTransitions": 63,
+  "chartStatus": {
+    "works": 19,
+    "fixed": 0,
+    "wrong": 0
+  },
+  "chartGroups": [
+    {
+      "name": "Finished",
+      "color": "#d6eaf8",
+      "states": 1
+    },
+    {
+      "name": "Not started",
+      "color": "#fdebd0",
+      "states": 1
+    },
+    {
+      "name": "Running",
+      "color": "#e8daef",
+      "states": 2
+    }
+  ],
+  "mixedGroups": [],
+  "regions": {
+    "drawn": true,
+    "states": [
+      4,
+      15
+    ],
+    "transitions": 63,
+    "all": 110,
+    "flat": {
+      "states": 47,
+      "transitions": 407
+    }
+  },
+  "classes": [],
+  "codeLike": []
+}
