@@ -98,7 +98,7 @@ pub use caudra_providers::{
 pub use caudra_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use editable_queue::{
     EditableQueue, EditableQueueReceiver, PromptAdmission, QueueDelivery, QueueItemId,
-    SteeringQueue, SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
+    Replacement, SteeringQueue, SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
 };
 pub use types::{
     ActivityChild, AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot,

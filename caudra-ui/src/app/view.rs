@@ -438,7 +438,17 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let panel_hint = self.chord_hint(layout.input_area);
+            let panel_hint = if self.active_task_is_steerable() && !self.queue_editor_active() {
+                let (hint, hits) = input::admission_hint(
+                    layout.input_area,
+                    self.admission_hover,
+                    &input::TASK_ADMISSIONS,
+                );
+                self.admission_hits = hits;
+                Some(hint)
+            } else {
+                self.chord_hint(layout.input_area)
+            };
             if self.active_subagent_has_composer() || self.queue_editor_active() {
                 self.subagent_input_box.view(
                     frame,
@@ -509,7 +519,11 @@ impl App {
                 Placeholder::Blank
             };
             let panel_hint = if defers && !self.queue_editor_active() {
-                let (hint, hits) = input::admission_hint(layout.input_area, self.admission_hover);
+                let (hint, hits) = input::admission_hint(
+                    layout.input_area,
+                    self.admission_hover,
+                    &input::MAIN_ADMISSIONS,
+                );
                 self.admission_hits = hits;
                 Some(hint)
             } else {

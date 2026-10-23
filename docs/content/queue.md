@@ -13,7 +13,7 @@ Queued user input takes priority over automatic `/goal` checks. If no input is w
 
 Queued prompts appear above the input. A section header names each group and counts what is waiting in it, and the sections appear in the order Caudra claims them. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click.
 
-Every row opens with a `⋯` handle. Click it, or press `.` on the focused row, to open the item menu. The menu carries Edit, Move up, Move down, Move to Guide, Move to Up next, Replace current run, Move to Main, and Delete, filtered to what that item allows right now. `Shift+Up` and `Shift+Down` also reorder the focused item. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
+Every row opens with a `⋯` handle. Click it, or press `.` on the focused row, to open the item menu. The menu carries Edit, Move up, Move down, Move to Guide, Move to Up next, Replace current run, Move to Main, and Delete, filtered to what that item allows right now. `Shift+Up` and `Shift+Down` also reorder the focused item. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. In a running [task chat](#task-chats), guidance rows also offer Replace current run. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
 
 Press `b` while the queue is focused or click its mode control to toggle Together. Together sends compatible pending next-run prompts as separate user messages in one model turn. Prompts with different execution modes run in separate turns. The setting resets after those batches are claimed.
 
@@ -37,7 +37,7 @@ Press `Ctrl+X g` or click `guide` to send the input as guidance. Caudra waits fo
 
 A late guide may arrive after the run's final boundary. It then starts before queued next-run prompts instead of being lost. If a replacement is pending, compatible waiting guides enter its first model request before the replacement message. Guidance in a different execution mode waits for its own turn.
 
-When the main agent is waiting for background work, guide wakes it without cancelling the running tasks or commands. Main-chat guidance goes to the main agent, not to every child. Open a task chat to guide that child directly.
+When the main agent is waiting for background work, guide wakes it without cancelling the running tasks or commands. Main-chat guidance goes to the main agent, not to every child. Open a [task chat](#task-chats) to guide or replace that child directly.
 
 ## Stop and replace
 
@@ -50,6 +50,12 @@ Deleting a pending replacement turns the operation into a plain cancellation. Ca
 `Esc Esc` stops the main run and all session tasks and workflows, clears the queue, and suppresses automatic continuation from late reports or completion notices. To pick the cancelled turn back up later, use `/continue`, which resumes without adding a message of your own. See [Commands](/docs/commands/#resuming-after-an-interruption).
 
 Replacing a main run also stops and drains its session tasks, shell commands, and workflows before the replacement starts. This applies while the main agent is waiting for background work too. A new user turn re-enables automatic continuation. For task-specific cancellation and promotion, see [Background tasks](/docs/sessions/#background-tasks).
+
+## Task chats
+
+A running task chat offers guide and replace, with no Up next group. `Enter`, `Ctrl+X g`, or the `guide` control sends guidance to that child. `Ctrl+X x` or the `replace` control stops the child's current turn, including its model response, tool calls, nested tasks, and background jobs. The child then runs again on the same history with the replacement message. The task keeps running, and the agent that started it receives the result of that new turn.
+
+Waiting guidance can take over too. Press `r` on its row or choose Replace current run from its menu. The main chat rules apply here as well. A newer replacement drops the older one, waiting guidance stays queued, and deleting a pending replacement before it starts ends the task as cancelled. `Esc Esc` still cancels the task, and nothing runs again. A finished task cannot be replaced, so the draft stays in the input.
 
 ## Recovery
 

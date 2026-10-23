@@ -645,6 +645,7 @@ impl App {
         self.subagent_answers.clear();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
+        self.subagent_replacements.clear();
         self.unsent_subagent_steers.clear();
         self.parent_task_ids.clear();
         self.subagent_input_box.discard();

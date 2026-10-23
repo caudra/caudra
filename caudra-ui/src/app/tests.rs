@@ -9824,16 +9824,29 @@ fn sticky_todos_focused_resumption_refreshes_the_task_name(cached: bool) {
     assert!(!app.todo_panel.progress_tip().contains(TODO_FIRST_NAME));
 }
 
-#[test_case(false; "read_only_task")]
-#[test_case(true; "task_composer")]
-fn sticky_todos_collapsed_task_hint_renders_hovers_and_opens(composer: bool) {
+#[test]
+fn a_running_task_composer_gives_its_todo_hint_slot_to_guide_and_replace() {
     let mut app = sticky_todo_app();
     let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
-    if composer {
-        app.subagent_steers.insert(TODO_FIRST_ID.into(), steer_tx);
-    }
+    app.subagent_steers.insert(TODO_FIRST_ID.into(), steer_tx);
     app.focus_task(TODO_FIRST_ID).unwrap();
-    assert_eq!(app.active_subagent_has_composer(), composer);
+    let _ = rendered(&mut app);
+    assert!(app.chord_hint_hit.is_none());
+    let admissions: Vec<_> = app.admission_hits.iter().map(|hit| hit.admission).collect();
+    assert_eq!(
+        admissions,
+        [
+            caudra_agent::PromptAdmission::Steer,
+            caudra_agent::PromptAdmission::Interrupt
+        ]
+    );
+}
+
+#[test]
+fn sticky_todos_collapsed_task_hint_renders_hovers_and_opens() {
+    let mut app = sticky_todo_app();
+    app.focus_task(TODO_FIRST_ID).unwrap();
+    assert!(!app.active_subagent_has_composer());
     let screen = rendered(&mut app);
     assert!(
         screen.contains(&format!("Task: {TODO_FIRST_NAME} · 0/1")),
@@ -12142,6 +12155,148 @@ fn subagent_queue_edit_updates_the_real_interrupt_queue() {
     app.update(Msg::Key(key(KeyCode::Char('d'))));
     assert!(steer_queue.entries().is_empty());
     assert!(!app.pending_subagent_steers.contains_key(TASK_ID));
+}
+
+const TASK_GUIDANCE: &str = "also check the cookies";
+const TASK_REPLACEMENT: &str = "stop and list the routes";
+const LATER_REPLACEMENT: &str = "stop and list the handlers";
+
+fn running_task_chat() -> (
+    App,
+    caudra_agent::SteeringQueue,
+    caudra_agent::SteeringQueueReceiver,
+) {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_queue, receiver) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    (app, steer_queue, receiver)
+}
+
+fn armed_turn(receiver: &caudra_agent::SteeringQueueReceiver) -> caudra_agent::CancelToken {
+    let (trigger, turn) = caudra_agent::CancelToken::new();
+    receiver.arm(trigger);
+    turn
+}
+
+fn task_queue_rows(app: &App) -> Vec<(String, Option<caudra_agent::PromptAdmission>)> {
+    app.active_queue_entries()
+        .into_iter()
+        .map(|entry| (entry.text.into_owned(), entry.admission))
+        .collect()
+}
+
+#[test]
+fn replace_in_a_task_chat_stops_its_turn_and_supersedes_the_waiting_replacement() {
+    let (mut app, steer_queue, receiver) = running_task_chat();
+    let turn = armed_turn(&receiver);
+    app.subagent_input_box.set_input(TASK_GUIDANCE.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!turn.is_cancelled());
+
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+    let actions = press_chord(&mut app, chord::INTERRUPT_PROMPT);
+
+    assert!(actions.is_empty());
+    assert!(turn.is_cancelled());
+    assert!(app.subagent_input_box.buffer.value().is_empty());
+    app.subagent_input_box.set_input(LATER_REPLACEMENT.into());
+    press_chord(&mut app, chord::INTERRUPT_PROMPT);
+    let interrupt = Some(caudra_agent::PromptAdmission::Interrupt);
+    let steer = Some(caudra_agent::PromptAdmission::Steer);
+    assert_eq!(
+        task_queue_rows(&app),
+        [
+            (LATER_REPLACEMENT.to_owned(), interrupt),
+            (TASK_GUIDANCE.to_owned(), steer),
+        ]
+    );
+    assert_eq!(
+        steer_queue
+            .entries()
+            .into_iter()
+            .map(|entry| (entry.text, Some(entry.admission)))
+            .collect::<Vec<_>>(),
+        [
+            (TASK_GUIDANCE.to_owned(), steer),
+            (LATER_REPLACEMENT.to_owned(), interrupt),
+        ]
+    );
+}
+
+#[test]
+fn a_consumed_task_replacement_marks_the_cancelled_turn_before_its_prompt() {
+    let (mut app, steer_queue, _receiver) = running_task_chat();
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+    press_chord(&mut app, chord::INTERRUPT_PROMPT);
+    let id = steer_queue.entries()[0].id;
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue.clone());
+
+    app.update(subagent_msg_with_info(
+        AgentEvent::QueueItemConsumed {
+            id,
+            text: TASK_REPLACEMENT.into(),
+            images: Vec::new(),
+        },
+        info,
+    ));
+
+    assert!(app.subagent_replacements.is_empty());
+    assert!(app.active_queue_entries().is_empty());
+    let chat = &app.chats[1];
+    let count = chat.message_count();
+    assert_eq!(chat.message_at(count - 2).unwrap().text, CANCEL_MSG);
+    assert_eq!(chat.last_message_text(), TASK_REPLACEMENT);
+}
+
+#[test]
+fn replace_key_on_task_guidance_promotes_it_in_place() {
+    let (mut app, steer_queue, receiver) = running_task_chat();
+    app.subagent_input_box.set_input(TASK_GUIDANCE.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let id = steer_queue.entries()[0].id;
+    let turn = armed_turn(&receiver);
+    app.focus_active_queue();
+
+    app.update(Msg::Key(key(KeyCode::Char('r'))));
+
+    assert!(turn.is_cancelled());
+    assert_eq!(app.subagent_replacements[TASK_ID], id);
+    assert_eq!(
+        task_queue_rows(&app),
+        [(
+            TASK_GUIDANCE.to_owned(),
+            Some(caudra_agent::PromptAdmission::Interrupt)
+        )]
+    );
+    assert_eq!(
+        receiver.take_replacement().map(|(claimed, _)| claimed),
+        Some(id)
+    );
+}
+
+#[test]
+fn replacing_a_task_that_stopped_returns_the_draft() {
+    let (mut app, _steer_queue, _receiver) = running_task_chat();
+    app.subagent_steers.remove(TASK_ID);
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+
+    let actions = app.handle_task_admission(caudra_agent::PromptAdmission::Interrupt);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(TASK_NOT_RUNNING));
+    assert_eq!(app.subagent_input_box.buffer.value(), TASK_REPLACEMENT);
+    assert!(app.subagent_replacements.is_empty());
 }
 
 #[test]

@@ -39,7 +39,7 @@ use super::favorites;
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
 use crate::background::JobScope;
-use crate::cancel::{CancelMap, CancelSlot};
+use crate::cancel::{CancelMap, CancelSlot, CancelToken};
 use crate::code::CodeSession;
 use crate::code::output::snippet_summary;
 use crate::decisions::questions as decision_questions;
@@ -60,7 +60,7 @@ use crate::tools::{
 };
 use crate::types::counted;
 use crate::{
-    ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    ActivityChild, Agent, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History, InterruptSource,
     McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentEnd,
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryStore, SubagentInfo,
@@ -602,6 +602,12 @@ impl Subagent {
         self.closed
     }
 
+    /// The queue the UI steers through, before the first prompt hands it over.
+    #[cfg(test)]
+    pub(crate) fn steer_queue(&self) -> Option<SteeringQueue> {
+        self.steer_tx.clone()
+    }
+
     pub fn model_spec(&self) -> String {
         self.params.model.spec()
     }
@@ -722,6 +728,73 @@ impl Subagent {
             });
         }
 
+        let mut input = AgentInput {
+            resume,
+            message: message.unwrap_or_default(),
+            mode: self.mode.clone(),
+            plan: self.plan.clone(),
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble,
+            thinking: self.thinking.clone(),
+            fast: self.fast,
+            prompt: None,
+        };
+        // A replacement stops only the turn it lands in; the task carries on
+        // with the replacement as its next turn, and its caller keeps waiting.
+        let (result, text) = loop {
+            let (trigger, turn) = self.child_cancel.child();
+            self.interrupt_source.arm(trigger);
+            let outcome = self.run_turn(input, turn).await;
+            self.interrupt_source.disarm();
+            if self.child_cancel.is_cancelled() {
+                break outcome;
+            }
+            let Some((id, replacement)) = self.interrupt_source.take_replacement() else {
+                break outcome;
+            };
+            self.stop_jobs().await;
+            let _ = self.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+                id,
+                text: replacement.message.clone(),
+                images: replacement.images.clone(),
+            });
+            input = AgentInput {
+                resume: false,
+                message: replacement.message,
+                mode: self.mode.clone(),
+                plan: self.plan.clone(),
+                images: replacement.images,
+                mentions: replacement.mentions,
+                commits: replacement.commits,
+                preamble: Vec::new(),
+                thinking: self.thinking.clone(),
+                fast: self.fast,
+                prompt: None,
+            };
+        };
+        self.finish_prompt(result, text)
+    }
+
+    /// Stops the background work this task started, leaving it free to start
+    /// more: a replacement ends a turn, not the task.
+    async fn stop_jobs(&self) {
+        let Some(jobs) = &self.params.jobs else {
+            return;
+        };
+        for card in jobs.list().into_iter().filter(|card| card.active()) {
+            if let Err(error) = jobs.cancel(&card.task_id).await {
+                warn!(name = %self.name, task_id = %card.task_id, %error, "replacement could not stop a job");
+            }
+        }
+    }
+
+    async fn run_turn(
+        &mut self,
+        input: AgentInput,
+        cancel: CancelToken,
+    ) -> (Result<DoneReason, AgentError>, String) {
         let interrupt_source: Arc<dyn InterruptSource> = self.interrupt_source.clone();
         let mut agent = Agent::new(
             self.params.clone(),
@@ -741,7 +814,7 @@ impl Subagent {
         )
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(interrupt_source)
-        .with_cancel(self.child_cancel.clone())
+        .with_cancel(cancel)
         .with_mcp(self.mcp.clone())
         .with_code(self.code.clone())
         .with_local_tools(Arc::clone(&self.local_tools))
@@ -766,21 +839,7 @@ impl Subagent {
             agent = agent.with_terminal_report(Arc::clone(ready));
         }
 
-        let result = agent
-            .run(AgentInput {
-                resume,
-                message: message.unwrap_or_default(),
-                mode: self.mode.clone(),
-                plan: self.plan.clone(),
-                images: Vec::new(),
-                mentions: Vec::new(),
-                commits: Vec::new(),
-                preamble,
-                thinking: self.thinking.clone(),
-                fast: self.fast,
-                prompt: None,
-            })
-            .await;
+        let result = agent.run(input).await;
         // Compaction can replace the transcript, invalidating its old length as
         // an output boundary. The agent's run-local response survives that rewrite.
         let text = agent.response_text().unwrap_or_default().to_owned();
@@ -800,6 +859,14 @@ impl Subagent {
                 ),
             }
         }
+        (result, text)
+    }
+
+    fn finish_prompt(
+        &self,
+        result: Result<DoneReason, AgentError>,
+        text: String,
+    ) -> Result<PromptResult, PromptFailure> {
         // A normal runtime exit can still leave the task unfinished. Only a
         // completed response may enter task-report validation or correction.
         let cut_short = match &result {

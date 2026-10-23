@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentInput, ExtractedCommand, InterruptSource};
+use crate::{AgentInput, CancelTrigger, ExtractedCommand, InterruptSource};
 
 static NEXT_QUEUE_ITEM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -468,13 +468,43 @@ impl<T> EditableQueueReceiver<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+type Steer = (PromptAdmission, AgentInput);
+
+/// The trigger that stops the turn a task is running right now, so a
+/// replacement can end that turn without ending the task.
+type TurnTrigger = Arc<Mutex<Option<CancelTrigger>>>;
+
+fn is_replacement((admission, _): &Steer) -> bool {
+    *admission == PromptAdmission::Interrupt
+}
+
+fn is_guidance((admission, _): &Steer) -> bool {
+    *admission == PromptAdmission::Steer
+}
+
+/// Removes the waiting replacement other than `keep`, returning its id.
+fn drop_replacement(items: &mut VecDeque<Item<Steer>>, keep: QueueItemId) -> Option<QueueItemId> {
+    let index = items
+        .iter()
+        .position(|item| item.id != keep && is_replacement(&item.value))?;
+    items.remove(index).map(|item| item.id)
+}
+
+#[derive(Clone)]
 pub struct SteeringQueue {
-    queue: EditableQueue<AgentInput>,
+    queue: EditableQueue<Steer>,
+    turn: TurnTrigger,
+}
+
+impl fmt::Debug for SteeringQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.queue.fmt(f)
+    }
 }
 
 pub struct SteeringQueueReceiver {
-    queue: EditableQueueReceiver<AgentInput>,
+    queue: EditableQueueReceiver<Steer>,
+    turn: TurnTrigger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,40 +512,95 @@ pub struct SteeringQueueEntry {
     pub id: QueueItemId,
     pub text: String,
     pub editing: bool,
+    pub admission: PromptAdmission,
+}
+
+/// A replacement now waiting, and the earlier one it dropped, if any was
+/// still unclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Replacement {
+    pub id: QueueItemId,
+    pub superseded: Option<QueueItemId>,
 }
 
 pub fn steering_queue() -> (SteeringQueue, SteeringQueueReceiver) {
     let (queue, receiver) = editable_queue();
+    let turn = TurnTrigger::default();
     (
-        SteeringQueue { queue },
-        SteeringQueueReceiver { queue: receiver },
+        SteeringQueue {
+            queue,
+            turn: Arc::clone(&turn),
+        },
+        SteeringQueueReceiver {
+            queue: receiver,
+            turn,
+        },
     )
 }
 
 impl SteeringQueue {
     pub fn push(&self, input: AgentInput) -> QueueItemId {
-        self.queue.push(input)
+        self.queue.push((PromptAdmission::Steer, input))
+    }
+
+    /// Queues `input` as the task's next turn and stops the turn it is
+    /// running. A replacement still waiting is dropped in its favour.
+    pub fn replace(&self, input: AgentInput) -> Replacement {
+        let id = QueueItemId::new();
+        let mut state = lock(&self.queue.state);
+        let superseded = drop_replacement(&mut state.items, id);
+        state.items.push_back(Item {
+            id,
+            value: (PromptAdmission::Interrupt, input),
+            editing: false,
+        });
+        drop(state);
+        self.queue.wake();
+        self.stop_turn();
+        Replacement { id, superseded }
+    }
+
+    /// Turns waiting guidance into the replacement, keeping its id. `None`
+    /// when the item was already claimed, is being edited, or is not guidance.
+    pub fn promote(&self, id: QueueItemId) -> Option<Option<QueueItemId>> {
+        let mut state = lock(&self.queue.state);
+        let index = state
+            .items
+            .iter()
+            .position(|item| item.id == id && !item.editing && is_guidance(&item.value))?;
+        state.items[index].value.0 = PromptAdmission::Interrupt;
+        let superseded = drop_replacement(&mut state.items, id);
+        drop(state);
+        self.queue.wake();
+        self.stop_turn();
+        Some(superseded)
+    }
+
+    fn stop_turn(&self) {
+        drop(lock(&self.turn).take());
     }
 
     pub fn entries(&self) -> Vec<SteeringQueueEntry> {
-        self.queue.entries(|id, input, editing| SteeringQueueEntry {
-            id,
-            text: input.message.clone(),
-            editing,
-        })
+        self.queue
+            .entries(|id, (admission, input), editing| SteeringQueueEntry {
+                id,
+                text: input.message.clone(),
+                editing,
+                admission: *admission,
+            })
     }
 
     pub fn remove(&self, id: QueueItemId) -> Option<AgentInput> {
-        self.queue.remove(id)
+        self.queue.remove(id).map(|(_, input)| input)
     }
 
     pub fn begin_edit(&self, id: QueueItemId) -> Option<String> {
         self.queue
-            .begin_edit(id, |input| Some(input.message.clone()))
+            .begin_edit(id, |(_, input)| Some(input.message.clone()))
     }
 
     pub fn finish_edit(&self, id: QueueItemId, text: String) -> bool {
-        self.queue.finish_edit(id, |input| input.message = text)
+        self.queue.finish_edit(id, |(_, input)| input.message = text)
     }
 
     pub fn cancel_edit(&self, id: QueueItemId) -> bool {
@@ -523,15 +608,19 @@ impl SteeringQueue {
     }
 
     pub fn move_up(&self, id: QueueItemId) -> bool {
-        self.queue.move_up_by(id, |_| Some(()))
+        self.queue.move_up_by(id, |(admission, _)| Some(*admission))
     }
 
     pub fn move_down(&self, id: QueueItemId) -> bool {
-        self.queue.move_down_by(id, |_| Some(()))
+        self.queue.move_down_by(id, |(admission, _)| Some(*admission))
     }
 
     pub fn drain(&self) -> Vec<(QueueItemId, AgentInput)> {
-        self.queue.drain()
+        self.queue
+            .drain()
+            .into_iter()
+            .map(|(id, (_, input))| (id, input))
+            .collect()
     }
 
     pub fn delivery(&self) -> QueueDelivery {
@@ -547,11 +636,67 @@ impl SteeringQueue {
     }
 }
 
+impl SteeringQueueReceiver {
+    /// Holds the trigger of the turn about to run, or fires it at once when a
+    /// replacement is already waiting. Taking the turn lock first means a
+    /// replacement pushed concurrently either sees this trigger or is seen here.
+    pub fn arm(&self, trigger: CancelTrigger) {
+        let mut turn = lock(&self.turn);
+        if self.queue.has_matching(is_replacement) {
+            drop(trigger);
+        } else {
+            *turn = Some(trigger);
+        }
+    }
+
+    /// Retires the finished turn's trigger, firing it as a retired run's is.
+    pub fn disarm(&self) {
+        drop(lock(&self.turn).take());
+    }
+
+    pub fn take_replacement(&self) -> Option<(QueueItemId, AgentInput)> {
+        self.queue
+            .claim_one_matching(is_replacement)
+            .pop()
+            .map(|(id, (_, input))| (id, input))
+    }
+
+    /// Guidance in queue order, skipping the replacement, which only ever
+    /// starts a turn of its own.
+    fn claim_guidance(&self) -> Vec<(QueueItemId, AgentInput)> {
+        let mut state = lock(&self.queue.state);
+        let mut indices = state
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| is_guidance(&item.value))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let together = state.delivery == QueueDelivery::TogetherNextTurn;
+        if !together {
+            indices.truncate(1);
+        }
+        if indices.is_empty() || indices.iter().any(|index| state.items[*index].editing) {
+            return Vec::new();
+        }
+        if together {
+            state.delivery = QueueDelivery::Separate;
+        }
+        let mut claimed = indices
+            .into_iter()
+            .rev()
+            .filter_map(|index| state.items.remove(index))
+            .map(|item| (item.id, item.value.1))
+            .collect::<Vec<_>>();
+        claimed.reverse();
+        claimed
+    }
+}
+
 impl InterruptSource for SteeringQueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
         let mut inputs = self
-            .queue
-            .claim(|_| true)
+            .claim_guidance()
             .into_iter()
             .map(|(id, input)| crate::QueuedInterrupt {
                 id,
@@ -803,5 +948,112 @@ mod tests {
             ]
         );
         assert_eq!(receiver.pop(), Some((other, Some((2, "other")))));
+    }
+
+    const GUIDANCE: &str = "guidance";
+    const FIRST_REPLACEMENT: &str = "first replacement";
+    const SECOND_REPLACEMENT: &str = "second replacement";
+
+    fn input(message: &str) -> AgentInput {
+        AgentInput {
+            message: message.into(),
+            mode: crate::AgentMode::Build,
+            plan: None,
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble: Vec::new(),
+            thinking: crate::ThinkingConfig::default(),
+            fast: false,
+            prompt: None,
+            resume: false,
+        }
+    }
+
+    fn armed(receiver: &SteeringQueueReceiver) -> crate::CancelToken {
+        let (trigger, turn) = crate::CancelToken::new();
+        receiver.arm(trigger);
+        turn
+    }
+
+    fn polled(receiver: &SteeringQueueReceiver) -> Vec<String> {
+        match receiver.poll() {
+            None => Vec::new(),
+            Some(ExtractedCommand::Interrupt(input, _, _)) => vec![input.message],
+            Some(ExtractedCommand::InterruptBatch(inputs)) => {
+                inputs.into_iter().map(|queued| queued.input.message).collect()
+            }
+            Some(ExtractedCommand::Compact(_)) => panic!("steering never compacts"),
+        }
+    }
+
+    #[test]
+    fn replacement_supersedes_the_waiting_one_and_stops_the_turn() {
+        let (queue, receiver) = steering_queue();
+        let turn = armed(&receiver);
+        let first = queue.replace(input(FIRST_REPLACEMENT));
+        assert_eq!(first.superseded, None);
+        assert!(turn.is_cancelled());
+
+        let second = queue.replace(input(SECOND_REPLACEMENT));
+
+        assert_eq!(second.superseded, Some(first.id));
+        let (id, replacement) = receiver.take_replacement().expect("replacement missing");
+        assert_eq!((id, replacement.message.as_str()), (second.id, SECOND_REPLACEMENT));
+        assert!(receiver.take_replacement().is_none());
+    }
+
+    #[test_case(true; "replacement_waiting")]
+    #[test_case(false; "nothing_waiting")]
+    fn arming_fires_at_once_only_when_a_replacement_waits(waiting: bool) {
+        let (queue, receiver) = steering_queue();
+        if waiting {
+            queue.replace(input(FIRST_REPLACEMENT));
+        }
+
+        let turn = armed(&receiver);
+
+        assert_eq!(turn.is_cancelled(), waiting);
+        receiver.disarm();
+        assert!(turn.is_cancelled());
+    }
+
+    #[test_case(QueueDelivery::Separate; "separate")]
+    #[test_case(QueueDelivery::TogetherNextTurn; "together")]
+    fn guidance_polls_never_claim_the_replacement(delivery: QueueDelivery) {
+        let (queue, receiver) = steering_queue();
+        let replacement = queue.replace(input(FIRST_REPLACEMENT));
+        queue.push(input(GUIDANCE));
+        queue.set_delivery(delivery);
+
+        assert_eq!(polled(&receiver), [GUIDANCE]);
+        assert!(polled(&receiver).is_empty());
+        assert_eq!(
+            receiver.take_replacement().map(|(id, _)| id),
+            Some(replacement.id)
+        );
+    }
+
+    #[test]
+    fn promotion_keeps_the_id_stops_the_turn_and_refuses_claimed_items() {
+        let (queue, receiver) = steering_queue();
+        let earlier = queue.push(input(GUIDANCE));
+        let later = queue.push(input(GUIDANCE));
+        let turn = armed(&receiver);
+
+        assert_eq!(queue.promote(earlier), Some(None));
+        assert!(turn.is_cancelled());
+        assert_eq!(queue.promote(later), Some(Some(earlier)));
+
+        assert_eq!(
+            queue
+                .entries()
+                .iter()
+                .map(|entry| (entry.id, entry.admission))
+                .collect::<Vec<_>>(),
+            [(later, PromptAdmission::Interrupt)]
+        );
+        assert_eq!(receiver.take_replacement().map(|(id, _)| id), Some(later));
+        assert_eq!(queue.promote(later), None);
     }
 }

@@ -956,7 +956,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentEvent;
+    use crate::{AgentEvent, AgentInput, SubagentEnd, ThinkingConfig};
     use crate::agent::history::is_run_failure_marker;
     use crate::cancel::CancelTrigger;
     use crate::permissions::PermissionMode;
@@ -2622,6 +2622,163 @@ mod tests {
             assert_eq!(reply.input_tokens, expected_usage.total_input());
             assert_eq!(reply.output_tokens, expected_usage.output);
             assert_eq!(observed.lock().unwrap().len(), 4);
+        });
+    }
+
+    type ParkHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+    /// Runs `hook` on its first request and then never answers it; every
+    /// later request is answered from `responses`.
+    struct ParkingProvider {
+        hook: ParkHook,
+        responses: Mutex<Vec<StreamResponse>>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl Provider for ParkingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(messages.to_vec());
+                let hook = self.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                    return futures_lite::future::pending().await;
+                }
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Err(AgentError::Config {
+                        message: SCRIPT_EXHAUSTED.into(),
+                    });
+                }
+                Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AfterReplacing {
+        Keep,
+        Delete,
+        CancelTask,
+    }
+
+    const REPLACEMENT: &str = "stop that and list the routes instead";
+
+    fn replacement_input() -> AgentInput {
+        AgentInput {
+            message: REPLACEMENT.into(),
+            mode: AgentMode::Build,
+            plan: None,
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble: Vec::new(),
+            thinking: ThinkingConfig::default(),
+            fast: false,
+            prompt: None,
+            resume: false,
+        }
+    }
+
+    #[test_case(AfterReplacing::Keep; "replacement_runs_as_the_next_turn")]
+    #[test_case(AfterReplacing::Delete; "deleted_replacement_leaves_the_turn_cancelled")]
+    #[test_case(AfterReplacing::CancelTask; "cancelling_the_task_beats_the_replacement")]
+    fn a_replacement_stops_the_turn_and_carries_on_with_its_message(after: AfterReplacing) {
+        smol::block_on(async {
+            let hook = ParkHook::default();
+            let provider = ParkingProvider {
+                hook: Arc::clone(&hook),
+                responses: Mutex::new(vec![text_response(SUMMARY, FIRST_TURN)]),
+                requests: Arc::default(),
+            };
+            let requests = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let (events_tx, events_rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(events_tx, 0);
+            let mut session = OpenSession(
+                subagent::open_task(
+                    &ctx,
+                    subagent::TaskOptions {
+                        name: LABEL.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        model: Default::default(),
+                        routing_prompt: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let steering = session.0.steer_queue().unwrap();
+            let cancels = Arc::clone(&ctx.subagent_cancels);
+            let task_id = session.0.id().to_owned();
+            let (replaced_tx, replaced_rx) = flume::bounded(1);
+            *hook.lock().unwrap() = Some(Box::new(move || {
+                let id = steering.replace(replacement_input()).id;
+                match after {
+                    AfterReplacing::Keep => {}
+                    AfterReplacing::Delete => {
+                        steering.remove(id);
+                    }
+                    AfterReplacing::CancelTask => cancels.cancel_or_precancel(task_id),
+                }
+                replaced_tx.send(id).unwrap();
+            }));
+
+            let result = session.0.prompt(Some(PROMPT.into())).await;
+
+            let replacement = replaced_rx.recv_async().await.unwrap();
+            let mut consumed = Vec::new();
+            let end = loop {
+                match events_rx.recv_async().await.unwrap().event {
+                    AgentEvent::QueueItemConsumed { id, .. } => consumed.push(id),
+                    AgentEvent::SubagentFinished { end } => break end,
+                    _ => {}
+                }
+            };
+            let requests = requests.lock().unwrap();
+            match after {
+                AfterReplacing::Keep => {
+                    assert_eq!(result.map_err(failure_message).unwrap().text, SUMMARY);
+                    assert_eq!(consumed, [replacement]);
+                    assert_eq!(
+                        end,
+                        SubagentEnd::Completed {
+                            output: SUMMARY.into()
+                        }
+                    );
+                    assert_eq!(requests.len(), 2);
+                    let last = requests[1].last().unwrap();
+                    assert!(matches!(last.role, Role::User));
+                    assert!(last.content.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text } if text.contains(REPLACEMENT))
+                    ));
+                }
+                AfterReplacing::Delete | AfterReplacing::CancelTask => {
+                    assert_eq!(result.err().unwrap().error, subagent::CANCELLED);
+                    assert!(consumed.is_empty());
+                    assert_eq!(end, SubagentEnd::Cancelled { partial: None });
+                    assert_eq!(requests.len(), 1);
+                }
+            }
         });
     }
 
