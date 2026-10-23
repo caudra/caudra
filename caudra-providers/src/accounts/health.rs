@@ -25,13 +25,45 @@ const KIND_WEEKLY_SCOPED: &str = "weekly_scoped";
 const KIND_MONTHLY: &str = "monthly";
 const KIND_OTHER: &str = "other";
 
+const SOURCE_RESPONSE: &str = "response";
+const SOURCE_USAGE: &str = "usage";
+
 pub(crate) const BLOCKED_RATE_LIMITED: &str = "rate_limited";
 pub(crate) const BLOCKED_BILLING: &str = "billing";
+
+/// Where a reading came from. Each source reports its own set of windows,
+/// so a reading speaks only for the windows its source reported before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaSource {
+    /// Headers on a model response.
+    Response,
+    /// The provider's usage endpoint.
+    Usage,
+}
+
+impl QuotaSource {
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Response => SOURCE_RESPONSE,
+            Self::Usage => SOURCE_USAGE,
+        }
+    }
+
+    fn from_stored(stored: &str) -> Option<Self> {
+        match stored {
+            SOURCE_RESPONSE => Some(Self::Response),
+            SOURCE_USAGE => Some(Self::Usage),
+            _ => None,
+        }
+    }
+}
 
 /// One account's latest reading.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AccountHealth {
     pub windows: Vec<QuotaWindow>,
+    /// The source of each window, when known.
+    sources: HashMap<WindowKind, QuotaSource>,
     pub blocked_until: Option<u64>,
     pub blocked_reason: Option<String>,
     /// Epoch milliseconds of the reading, 0 when there is none.
@@ -108,12 +140,14 @@ impl HealthBook {
         }
     }
 
-    /// Merges windows a response or usage request reported, by kind, and
-    /// lifts a block the reading shows is over. Returns the row to store when
-    /// it moved enough to be worth a write.
+    /// Takes a reading's windows in place of what its source reported last
+    /// time, keeping windows only the other source reports, and lifts a block
+    /// the reading shows is over. Returns the row to store when it moved
+    /// enough to be worth a write.
     pub(crate) fn observe(
         &self,
         account: &str,
+        source: QuotaSource,
         windows: Vec<QuotaWindow>,
         now_ms: u64,
     ) -> Option<StoredAccountHealth> {
@@ -122,18 +156,29 @@ impl HealthBook {
         }
         let mut book = self.book.lock().unwrap();
         let entry = book.entries.entry(account.to_owned()).or_default();
+        let health = &mut entry.health;
+        health.windows.retain(|known| {
+            windows.iter().any(|window| window.kind == known.kind)
+                || health
+                    .sources
+                    .get(&known.kind)
+                    .is_some_and(|known_source| *known_source != source)
+        });
         for window in windows {
-            match entry
-                .health
+            health.sources.insert(window.kind.clone(), source);
+            match health
                 .windows
                 .iter_mut()
                 .find(|known| known.kind == window.kind)
             {
                 Some(known) => *known = window,
-                None => entry.health.windows.push(window),
+                None => health.windows.push(window),
             }
         }
-        entry.health.observed_at = now_ms;
+        health
+            .sources
+            .retain(|kind, _| health.windows.iter().any(|window| window.kind == *kind));
+        health.observed_at = now_ms;
         if entry
             .health
             .blocked_until
@@ -213,6 +258,7 @@ impl HealthBook {
 fn moved(before: &AccountHealth, after: &AccountHealth) -> bool {
     before.blocked_until != after.blocked_until
         || before.windows.len() != after.windows.len()
+        || before.sources != after.sources
         || after.windows.iter().any(|window| {
             before
                 .windows
@@ -229,7 +275,11 @@ fn to_stored(provider: &str, account: &str, health: &AccountHealth) -> StoredAcc
     StoredAccountHealth {
         provider: provider.to_owned(),
         account: account.to_owned(),
-        windows: health.windows.iter().map(stored_window).collect(),
+        windows: health
+            .windows
+            .iter()
+            .map(|window| stored_window(window, health.sources.get(&window.kind).copied()))
+            .collect(),
         blocked_until: health.blocked_until,
         blocked_reason: health.blocked_reason.clone(),
         observed_at: health.observed_at,
@@ -237,15 +287,25 @@ fn to_stored(provider: &str, account: &str, health: &AccountHealth) -> StoredAcc
 }
 
 fn from_stored(row: &StoredAccountHealth) -> AccountHealth {
-    AccountHealth {
-        windows: row.windows.iter().filter_map(quota_window).collect(),
+    let mut health = AccountHealth {
         blocked_until: row.blocked_until,
         blocked_reason: row.blocked_reason.clone(),
         observed_at: row.observed_at,
+        ..AccountHealth::default()
+    };
+    for stored in &row.windows {
+        let Some(window) = quota_window(stored) else {
+            continue;
+        };
+        if let Some(source) = stored.source.as_deref().and_then(QuotaSource::from_stored) {
+            health.sources.insert(window.kind.clone(), source);
+        }
+        health.windows.push(window);
     }
+    health
 }
 
-fn stored_window(window: &QuotaWindow) -> StoredQuotaWindow {
+fn stored_window(window: &QuotaWindow, source: Option<QuotaSource>) -> StoredQuotaWindow {
     let (kind, scope) = match &window.kind {
         WindowKind::FiveHour => (KIND_FIVE_HOUR, None),
         WindowKind::Weekly => (KIND_WEEKLY, None),
@@ -259,6 +319,7 @@ fn stored_window(window: &QuotaWindow) -> StoredQuotaWindow {
         used_percent: window.used_percent,
         resets_at: window.resets_at,
         length_secs: window.length_secs,
+        source: source.map(|source| source.stored().to_owned()),
     }
 }
 
@@ -294,10 +355,23 @@ mod tests {
         QuotaWindow::new(kind, used, Some(NOW_MS + 60_000))
     }
 
+    fn kinds(book: &HealthBook) -> Vec<WindowKind> {
+        book.get(ACCOUNT)
+            .windows
+            .into_iter()
+            .map(|window| window.kind)
+            .collect()
+    }
+
     #[test]
     fn first_reading_is_stored() {
         let book = HealthBook::new(SLUG);
-        let stored = book.observe(ACCOUNT, vec![window(WindowKind::FiveHour, 40.0)], NOW_MS);
+        let stored = book.observe(
+            ACCOUNT,
+            QuotaSource::Response,
+            vec![window(WindowKind::FiveHour, 40.0)],
+            NOW_MS,
+        );
         assert_eq!(stored.map(|row| row.windows.len()), Some(1));
     }
 
@@ -305,9 +379,15 @@ mod tests {
     #[test_case(41.0, true ; "a_point")]
     fn small_moves_are_not_stored(next: f32, expect_write: bool) {
         let book = HealthBook::new(SLUG);
-        book.observe(ACCOUNT, vec![window(WindowKind::FiveHour, 40.0)], NOW_MS);
+        book.observe(
+            ACCOUNT,
+            QuotaSource::Response,
+            vec![window(WindowKind::FiveHour, 40.0)],
+            NOW_MS,
+        );
         let stored = book.observe(
             ACCOUNT,
+            QuotaSource::Response,
             vec![window(WindowKind::FiveHour, next)],
             NOW_MS + 1,
         );
@@ -315,24 +395,88 @@ mod tests {
     }
 
     #[test]
-    fn readings_merge_by_kind() {
+    fn a_reading_replaces_what_its_source_reported() {
         let book = HealthBook::new(SLUG);
         book.observe(
             ACCOUNT,
+            QuotaSource::Response,
             vec![
                 window(WindowKind::FiveHour, 10.0),
-                window(WindowKind::WeeklyScoped("opus".into()), 50.0),
+                window(WindowKind::Other("secondary".into()), 0.0),
+            ],
+            NOW_MS,
+        );
+        let stored = book.observe(
+            ACCOUNT,
+            QuotaSource::Response,
+            vec![
+                window(WindowKind::FiveHour, 10.0),
+                window(WindowKind::Weekly, 23.0),
+            ],
+            NOW_MS + 1,
+        );
+        assert_eq!(kinds(&book), vec![WindowKind::FiveHour, WindowKind::Weekly]);
+        assert!(stored.is_some());
+    }
+
+    #[test]
+    fn windows_only_the_other_source_reports_stay() {
+        let book = HealthBook::new(SLUG);
+        book.observe(
+            ACCOUNT,
+            QuotaSource::Usage,
+            vec![
+                window(WindowKind::FiveHour, 10.0),
+                window(WindowKind::WeeklyScoped("sonnet".into()), 50.0),
             ],
             NOW_MS,
         );
         book.observe(
             ACCOUNT,
+            QuotaSource::Response,
             vec![window(WindowKind::FiveHour, 20.0)],
             NOW_MS + 1,
         );
         let health = book.get(ACCOUNT);
-        assert_eq!(health.windows.len(), 2);
+        assert_eq!(
+            kinds(&book),
+            vec![
+                WindowKind::FiveHour,
+                WindowKind::WeeklyScoped("sonnet".into())
+            ]
+        );
         assert_eq!(health.windows[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn windows_stored_without_a_source_are_replaced() {
+        let row = to_stored(
+            SLUG,
+            ACCOUNT,
+            &AccountHealth {
+                windows: vec![
+                    window(WindowKind::FiveHour, 10.0),
+                    window(WindowKind::Other("secondary".into()), 0.0),
+                ],
+                observed_at: NOW_MS,
+                ..AccountHealth::default()
+            },
+        );
+        let book = HealthBook::new(SLUG);
+        book.book
+            .lock()
+            .unwrap()
+            .entries
+            .entry(ACCOUNT.to_owned())
+            .or_default()
+            .health = from_stored(&row);
+        book.observe(
+            ACCOUNT,
+            QuotaSource::Usage,
+            vec![window(WindowKind::FiveHour, 12.0)],
+            NOW_MS + 1,
+        );
+        assert_eq!(kinds(&book), vec![WindowKind::FiveHour]);
     }
 
     #[test]
@@ -363,7 +507,15 @@ mod tests {
     #[test_case(WindowKind::Monthly ; "monthly")]
     #[test_case(WindowKind::Other("2d".into()) ; "other")]
     fn windows_round_trip_through_storage(kind: WindowKind) {
-        let original = window(kind, 33.0);
-        assert_eq!(quota_window(&stored_window(&original)), Some(original));
+        let book = HealthBook::new(SLUG);
+        let row = book
+            .observe(
+                ACCOUNT,
+                QuotaSource::Usage,
+                vec![window(kind, 33.0)],
+                NOW_MS,
+            )
+            .unwrap();
+        assert_eq!(from_stored(&row), book.get(ACCOUNT));
     }
 }

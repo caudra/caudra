@@ -25,7 +25,7 @@ use caudra_storage::auth::now_millis;
 use tracing::warn;
 
 use super::credential::{AccountCredential, AccountSecret, CredentialSource};
-use super::health::HealthBook;
+use super::health::{HealthBook, QuotaSource};
 use super::policy::{Strategy, Thresholds, Unusable};
 use super::quota::QuotaWindow;
 use super::route::{AccountTier, SelectionMode};
@@ -940,7 +940,9 @@ pub async fn fetch_account_usage(
             .iter()
             .filter_map(crate::types::UsageLimit::quota_window)
             .collect();
-        let row = state.health.observe(account, windows, now_millis());
+        let row = state
+            .health
+            .observe(account, QuotaSource::Usage, windows, now_millis());
         state.persist_health(row);
     }
     Ok(usage)

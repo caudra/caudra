@@ -39,6 +39,9 @@ pub struct StoredQuotaWindow {
     pub resets_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_secs: Option<u64>,
+    /// What reported the window, absent on rows written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +166,7 @@ mod tests {
     const FIVE_HOUR: &str = "five_hour";
     const WEEKLY: &str = "weekly";
     const OPUS_SCOPE: &str = "opus";
+    const SOURCE: &str = "response";
     const OBSERVED_AT: u64 = 1_767_225_600_000;
     const RESETS_AT: u64 = OBSERVED_AT + 3_600_000;
     const FIVE_HOURS_SECS: u64 = 5 * 60 * 60;
@@ -189,6 +193,7 @@ mod tests {
                     used_percent,
                     resets_at: Some(RESETS_AT),
                     length_secs: Some(FIVE_HOURS_SECS),
+                    source: Some(SOURCE.into()),
                 },
                 StoredQuotaWindow {
                     kind: WEEKLY.into(),
@@ -196,6 +201,7 @@ mod tests {
                     used_percent,
                     resets_at: None,
                     length_secs: None,
+                    source: None,
                 },
             ],
             blocked_until: Some(RESETS_AT),
