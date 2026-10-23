@@ -86,7 +86,7 @@ maths. Whichever opens first wins.
 
 ## Diagrams
 
-A ```` ```mermaid ```` block holding a flowchart is laid out and drawn with
+A ```` ```mermaid ```` block holding a flowchart or a state diagram is laid out and drawn with
 box-drawing characters. Nothing is downloaded and no browser is involved, so
 diagrams appear at the same speed as the rest of the reply.
 
@@ -110,19 +110,20 @@ flowchart LR
                          └────────────┘
 ```
 
-Only `flowchart` and `graph` are drawn. Both keywords accept `TD`, `TB`,
-`BT`, `LR`, and `RL`.
+Flowcharts start with `flowchart` or `graph`. Both keywords accept `TD`,
+`TB`, `BT`, `LR`, and `RL`.
 
 | Syntax | Support |
 | --- | --- |
 | `A --> B`, `A --- B`, `A -.-> B`, `A ==> B` | arrows, open links, dotted, thick |
 | `A -->\|text\| B`, `A -- text --> B` | edge labels |
 | `A --> B --> C`, `A & B --> C & D` | chains and fan-out |
+| `A --> A` | self-loops, drawn as a hook beside the node |
 | `[]`, `()`, `([])`, `[[]]`, `[()]`, `(())`, `{}`, `{{}}`, `>]` | node shapes |
 | `[//]`, `[\\\\]`, `[/\\]`, `[\\/]` | parallelograms and trapezoids |
 | `subgraph Name ... end` | one level, drawn as a dashed frame |
 | `<br/>` in a label | line break |
-| `%%`, `style`, `classDef`, `class`, `click`, `linkStyle` | accepted and skipped |
+| `%%`, `style`, `classDef`, `class`, `click`, `linkStyle`, front matter | accepted and skipped |
 
 A terminal cell cannot carry a distinct outline per shape, so upright shapes
 collapse onto square corners, round corners, and a doubled edge for
@@ -151,9 +152,67 @@ up offset from each other by the same amount. Edges stop hard against a slant
 rather than landing on it, since there is no junction glyph that joins a
 diagonal to a line.
 
-Anything outside that table leaves the block as a highlighted code fence.
-Sequence diagrams, class diagrams, pie charts, nested subgraphs, and self
-loops all fall back this way. A half-drawn diagram would be worse than the
+State diagrams start with `stateDiagram` or `stateDiagram-v2` and reuse the
+flowchart layout, so they run top to bottom unless a top-level `direction`
+says otherwise.
+
+````markdown
+```mermaid
+stateDiagram-v2
+  [*] --> Editing
+  Editing --> Saving : you press Save
+  Saving --> Saving : it times out
+  Saving --> Saved
+  Saved --> [*]
+```
+````
+
+```
+          ╭─────╮
+          │  ●  │
+          ╰──┬──╯
+             │
+             ▼
+        ╭─────────╮
+        │ Editing │
+        ╰────┬────╯
+     ┌───────┘you press Save
+     ▼
+╭────────╮
+│ Saving ├─┐ it times out
+│        │◀┘
+╰────┬───╯
+     └───────┐
+             ▼
+         ╭───────╮
+         │ Saved │
+         ╰───┬───╯
+             │
+             ▼
+          ╭─────╮
+          │  ◉  │
+          ╰─────╯
+```
+
+| Syntax | Support |
+| --- | --- |
+| `[*] --> A`, `A --> [*]` | start `●` and end `◉` markers, one pair per region |
+| `A --> B`, `A --> B : text` | transitions and their labels, with `<br/>` drawn as a space |
+| `state "Long name" as id`, `id : text` | state labels, where `<br/>` breaks the line |
+| `state id { ... }` | composite states, drawn as a dashed frame |
+| `--` inside a composite | concurrent regions, one frame each |
+| `state id <<choice>>` | choices, drawn as a decision |
+| `direction LR` | the chart's direction at the top level, skipped inside a composite |
+| `%%`, `classDef`, `class`, `:::name`, `style`, `note`, front matter | accepted and skipped |
+
+Frames do not nest. A composite inside another composite gets a frame of its
+own beside its parent's. A transition that starts or ends at a composite
+meets a box named after it, drawn inside the composite's frame. Colours from
+`classDef` are dropped, so a legend that explains them shows only its labels.
+
+Anything outside these tables leaves the block as a highlighted code fence.
+Sequence diagrams, class diagrams, pie charts, nested subgraphs, and the forks
+and joins of state diagrams all fall back this way. A half-drawn diagram would be worse than the
 source, so Caudra draws only what it fully understands, and it waits for the
 closing fence before laying anything out.
 

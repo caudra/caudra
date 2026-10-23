@@ -1896,6 +1896,9 @@ mod tests {
 
     const FLOWCHART: &str = "```mermaid\nflowchart TD\n  A[Start] --> B[Stop]\n```";
     const UNSUPPORTED: &str = "```mermaid\nsequenceDiagram\n  A ->> B: hi\n```";
+    const STATE_DIAGRAM: &str = "```mermaid\nstateDiagram-v2\n  [*] --> Editing\n  \
+        Editing --> Saving : you press Save\n  Saving --> Saving : it times out\n  \
+        Saving --> Saved\n  Saved --> [*]\n```";
 
     fn diagram_rows(lines: &[Line]) -> Vec<String> {
         lines
@@ -1924,9 +1927,26 @@ mod tests {
         );
     }
 
+    #[test_case(STATE_DIAGRAM, &["Saving", "Saved", "you press Save", "it times out"] ; "state_diagram")]
+    #[test_case("```mermaid\nflowchart TD\n  A[Retry] -->|again| A\n```", &["Retry", "again"] ; "self_loop")]
+    fn a_mermaid_fence_draws_its_labels(source: &str, expected: &[&str]) {
+        let lines = mermaid_render(source, TEST_WIDTH);
+        let rows = diagram_rows(&lines);
+        assert!(
+            !lines.iter().any(|line| line.kind == LineKind::Code),
+            "{rows:?}"
+        );
+        for text in expected {
+            assert!(
+                rows.iter().any(|row| row.contains(text)),
+                "{text:?}: {rows:?}"
+            );
+        }
+    }
+
     #[test_case(UNSUPPORTED                                     ; "other_diagram_family")]
     #[test_case("```mermaid\nflowchart TD\n  A ~~~ B\n```"      ; "unknown_operator")]
-    #[test_case("```mermaid\nflowchart TD\n  A --> A\n```"      ; "self_loop")]
+    #[test_case("```mermaid\nstateDiagram-v2\n  state F <<fork>>\n  [*] --> F\n```" ; "state_fork")]
     fn unsupported_mermaid_falls_back_to_a_code_block(source: &str) {
         let lines = mermaid_render(source, TEST_WIDTH);
         assert!(diagram_rows(&lines).is_empty());

@@ -30,6 +30,16 @@ const FAR: usize = 1;
 const LABEL_NUDGE_LIMIT: isize = 8;
 /// A cluster border plus the blank ring that keeps it off its members.
 const CLUSTER_PAD: usize = 2;
+/// Cells a self-loop reaches past the border it leaves and re-enters.
+const LOOP_REACH: usize = 2;
+/// Along-extent a node needs for a self-loop to leave and come back on two
+/// distinct cells of one side, between the corners.
+const LOOP_SPAN: usize = 4;
+/// Cells from the border a self-loop leaves to the start of its label: two
+/// for the hook and one blank after it.
+const LOOP_LABEL_INSET: usize = 4;
+/// Several self-loops on one node share a single drawn loop.
+const LOOP_LABEL_SEPARATOR: &str = "; ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Arrow {
@@ -98,6 +108,16 @@ struct Vertex {
     across_size: usize,
     along_size: usize,
     cluster: Option<usize>,
+    /// Across cells reserved beyond the box for its self-loop and label.
+    loop_room: usize,
+}
+
+/// The loop drawn beside a node for every edge from it to itself. Only the
+/// first of those edges carries the joined label.
+#[derive(Clone, Debug)]
+struct SelfLoop {
+    edge: usize,
+    label: String,
 }
 
 /// One rank-to-rank hop. Long edges become several, sharing an `edge` index.
@@ -195,12 +215,14 @@ struct Builder<'a> {
     vertices: Vec<Vertex>,
     hops: Vec<Hop>,
     order: Vec<Vec<usize>>,
+    loops: Vec<Option<SelfLoop>>,
 }
 
 impl<'a> Builder<'a> {
     fn new(graph: &'a Graph) -> Self {
         let vertical = graph.direction.is_vertical();
         let ranks = rank_nodes(graph);
+        let loops = self_loops(graph);
         let mut owner = vec![None; graph.nodes.len()];
         for (idx, subgraph) in graph.subgraphs.iter().enumerate() {
             for &node in &subgraph.nodes {
@@ -221,19 +243,38 @@ impl<'a> Builder<'a> {
                 let height = node.label.len() + BORDER;
                 let width =
                     text + 2 * shape_padding(node.shape) + BORDER + node.shape.shear(height);
+                let (across_size, along_size) = match vertical {
+                    true => (width, height),
+                    false => (height, width),
+                };
+                // A horizontal chart writes the loop's label under the box,
+                // so the box grows to hold it rather than let it spill into
+                // the gap where the edges run.
+                let along_floor = loops[idx].as_ref().map_or(0, |self_loop| {
+                    match (vertical, self_loop.label.width()) {
+                        (false, label) if label > 0 => {
+                            node.shape.shear(height) + LOOP_LABEL_INSET + label + LABEL_CLEARANCE
+                        }
+                        _ => LOOP_SPAN,
+                    }
+                });
                 Vertex {
                     kind: Kind::Real(idx),
                     rank: ranks[idx],
                     across: 0,
-                    across_size: if vertical { width } else { height },
-                    along_size: if vertical { height } else { width },
+                    across_size,
+                    along_size: along_size.max(along_floor),
                     cluster: owner[idx],
+                    loop_room: 0,
                 }
             })
             .collect();
 
         let mut hops = Vec::new();
         for (idx, edge) in graph.edges.iter().enumerate() {
+            if edge.from == edge.to {
+                continue;
+            }
             let (low, high) = (ranks[edge.from], ranks[edge.to]);
             if low.abs_diff(high) <= 1 {
                 hops.push(Hop {
@@ -259,6 +300,7 @@ impl<'a> Builder<'a> {
                     across_size: 1,
                     along_size: 1,
                     cluster: inside,
+                    loop_room: 0,
                 });
                 let waypoint = vertices.len() - 1;
                 hops.push(Hop {
@@ -293,6 +335,16 @@ impl<'a> Builder<'a> {
                 vertex.across_size = vertex.across_size.max(sides[NEAR].max(sides[FAR]) + BORDER);
             }
         }
+        // The loop is reserved after the box has its final size, so packing
+        // keeps neighbours clear of it while the box itself stays as drawn.
+        for (vertex, self_loop) in vertices.iter_mut().zip(&loops) {
+            let Some(self_loop) = self_loop else { continue };
+            vertex.loop_room = match (vertical, self_loop.label.width()) {
+                (true, label) if label > 0 => LOOP_LABEL_INSET + label,
+                _ => LOOP_REACH,
+            };
+            vertex.across_size += vertex.loop_room;
+        }
 
         let depth = vertices.iter().map(|v| v.rank).max().unwrap_or(0) + 1;
         let mut order = vec![Vec::new(); depth];
@@ -306,7 +358,13 @@ impl<'a> Builder<'a> {
             vertices,
             hops,
             order,
+            loops,
         }
+    }
+
+    /// Across-extent of the box itself, without the room kept for its loop.
+    fn box_across(&self, vertex: usize) -> usize {
+        self.vertices[vertex].across_size - self.vertices[vertex].loop_room
     }
 
     fn neighbours(&self, vertex: usize, previous_rank: bool) -> Vec<usize> {
@@ -670,15 +728,15 @@ impl<'a> Builder<'a> {
     /// across origin. A slant runs along the across axis only when the ranks
     /// stack vertically, and there it narrows both horizontal faces.
     fn port_window(&self, vertex: usize) -> (usize, usize) {
-        let vertex = &self.vertices[vertex];
-        let whole = (0, vertex.across_size.saturating_sub(1));
-        let Kind::Real(node) = vertex.kind else {
+        let across = self.box_across(vertex);
+        let whole = (0, across.saturating_sub(1));
+        let Kind::Real(node) = self.vertices[vertex].kind else {
             return whole;
         };
         match self.vertical {
             true => self.graph.nodes[node]
                 .shape
-                .rule_window(vertex.across_size, vertex.along_size),
+                .rule_window(across, self.vertices[vertex].along_size),
             false => whole,
         }
     }
@@ -871,15 +929,17 @@ impl<'a> Builder<'a> {
         let mut nodes: Vec<PlacedNode> = self
             .vertices
             .iter()
-            .filter_map(|vertex| {
+            .enumerate()
+            .filter_map(|(idx, vertex)| {
                 let Kind::Real(node) = vertex.kind else {
                     return None;
                 };
                 let along = bands[vertex.rank].start;
                 let (x, y) = mapper.rect(along, vertex.across, vertex.along_size);
+                let across = self.box_across(idx);
                 let (width, height) = match self.vertical {
-                    true => (vertex.across_size, vertex.along_size),
-                    false => (vertex.along_size, vertex.across_size),
+                    true => (across, vertex.along_size),
+                    false => (vertex.along_size, across),
                 };
                 Some(PlacedNode {
                     node,
@@ -892,7 +952,7 @@ impl<'a> Builder<'a> {
             .collect();
         nodes.sort_by_key(|placed| placed.node);
 
-        let mut edges = self.assemble(routes, &mapper);
+        let mut edges = self.assemble(routes, bands, &mapper);
         seat_ends(&mut edges, &nodes, self.graph);
         place_labels(&mut edges, &nodes, self.vertical);
         let clusters = self.enclose(bands, &mapper);
@@ -952,9 +1012,13 @@ impl<'a> Builder<'a> {
     }
 
     /// Stitches per-rank hops back into one polyline for each original edge.
-    fn assemble(&self, routes: &[Route], mapper: &Mapper) -> Vec<PlacedEdge> {
+    fn assemble(&self, routes: &[Route], bands: &[Band], mapper: &Mapper) -> Vec<PlacedEdge> {
         let mut edges = Vec::new();
-        for index in 0..self.graph.edges.len() {
+        for (index, edge) in self.graph.edges.iter().enumerate() {
+            if edge.from == edge.to {
+                edges.extend(self.self_loop(index, bands, mapper));
+                continue;
+            }
             let legs: Vec<&Route> = routes
                 .iter()
                 .filter(|route| self.hops[route.hop].edge == index)
@@ -1002,12 +1066,79 @@ impl<'a> Builder<'a> {
             });
             edges.push(PlacedEdge {
                 points,
-                style: self.graph.edges[index].style,
+                style: edge.style,
                 arrow,
                 label,
             });
         }
         edges
+    }
+
+    /// A hook beside the box: out of the far across side, two cells over,
+    /// and back in one cell further along. Every self-loop on a node takes
+    /// the same hook, so only the first writes the joined label.
+    fn self_loop(&self, index: usize, bands: &[Band], mapper: &Mapper) -> Option<PlacedEdge> {
+        let edge = &self.graph.edges[index];
+        let self_loop = self.loops[edge.from].as_ref()?;
+        let vertex = &self.vertices[edge.from];
+        let across = self.box_across(edge.from);
+        // A horizontal chart hooks under the bottom rule, which a slant can
+        // shorten at either end.
+        let inset = match self.vertical {
+            true => 0,
+            false => {
+                self.graph.nodes[edge.from]
+                    .shape
+                    .rule_window(vertex.along_size, across)
+                    .0
+            }
+        };
+        let start = bands[vertex.rank].start + inset;
+        let leave = start + 1;
+        let back = leave + 1;
+        let border = vertex.across + across - 1;
+        let corner = border + LOOP_REACH;
+        let end = border + usize::from(edge.arrow);
+        let points = [
+            (leave, border),
+            (leave, corner),
+            (back, corner),
+            (back, end),
+        ]
+        .map(|(along, across)| mapper.point(along, across))
+        .to_vec();
+        let arrow = edge.arrow.then(|| {
+            let (x, y) = mapper.point(back, end);
+            let head = match self.vertical {
+                true => Arrow::Left,
+                false => Arrow::Up,
+            };
+            (x, y, head)
+        });
+        let label = (self_loop.edge == index && !self_loop.label.is_empty()).then(|| {
+            // Text always runs left to right, so under a box in a reversed
+            // chart it starts from the far end of the span it covers.
+            let (x, y) = match self.vertical {
+                true => mapper.point(leave, border + LOOP_LABEL_INSET),
+                false => {
+                    let first = start + LOOP_LABEL_INSET;
+                    let last = first + self_loop.label.width() - 1;
+                    let (from, row) = mapper.point(first, corner);
+                    (from.min(mapper.point(last, corner).0), row)
+                }
+            };
+            PlacedLabel {
+                x,
+                y,
+                text: self_loop.label.clone(),
+            }
+        });
+        Some(PlacedEdge {
+            points,
+            style: edge.style,
+            arrow,
+            label,
+        })
     }
 }
 
@@ -1152,6 +1283,27 @@ fn extent(
         .max()
         .unwrap_or(0);
     boxes.max(points).max(labels).max(1)
+}
+
+/// One loop per node that has edges to itself, keyed by node.
+fn self_loops(graph: &Graph) -> Vec<Option<SelfLoop>> {
+    let mut loops: Vec<Option<SelfLoop>> = vec![None; graph.nodes.len()];
+    for (index, edge) in graph.edges.iter().enumerate() {
+        if edge.from != edge.to {
+            continue;
+        }
+        let self_loop = loops[edge.from].get_or_insert_with(|| SelfLoop {
+            edge: index,
+            label: String::new(),
+        });
+        if let Some(text) = &edge.label {
+            if !self_loop.label.is_empty() {
+                self_loop.label.push_str(LOOP_LABEL_SEPARATOR);
+            }
+            self_loop.label.push_str(text);
+        }
+    }
+    loops
 }
 
 /// Longest-path ranking over the acyclic view of the graph.
@@ -1314,6 +1466,16 @@ mod tests {
         \x20   TG --> ADP\n\
         \x20   ADP -.->|convert, then serve| RT\n";
 
+    /// A loop on a node with a neighbour in the same rank, which the hook
+    /// and its label must not run into.
+    const LOOP_TD: &str =
+        "flowchart TD\n A[Saving] -->|it times out| A\n A --> B[Saved]\n C[Beside] --> B";
+    const LOOP_LR: &str =
+        "flowchart LR\n A[Saving] -->|it times out| A\n A --> B[Saved]\n C[Beside] --> B";
+    const LOOP_BT: &str = "flowchart BT\n A[Saving] -->|again| A\n A --> B[Saved]";
+    const LOOP_RL: &str = "flowchart RL\n A[Saving] -->|again| A\n A --> B[Saved]";
+    const TWO_LOOPS: &str = "flowchart TD\n A[Saving] -->|one| A\n A -->|two| A\n A --> B";
+
     fn place(source: &str) -> Layout {
         layout(&parse::parse(source).expect("fixture should parse"))
     }
@@ -1460,6 +1622,10 @@ mod tests {
     #[test_case(DIAMOND  ; "diamond")]
     #[test_case(CYCLE    ; "cycle")]
     #[test_case(LEANING  ; "leaning")]
+    #[test_case(LOOP_TD  ; "loop_td")]
+    #[test_case(LOOP_LR  ; "loop_lr")]
+    #[test_case(LOOP_BT  ; "loop_bt")]
+    #[test_case(LOOP_RL  ; "loop_rl")]
     fn every_edge_starts_on_the_border_of_its_own_source(source: &str) {
         let graph = parse::parse(source).expect("fixture should parse");
         let placed = place(source);
@@ -1548,6 +1714,7 @@ mod tests {
     #[test_case(BRANCHES ; "two_branches_out_of_one_decision")]
     #[test_case(LOOPING  ; "a_branch_beside_a_returning_edge")]
     #[test_case(DIAMOND  ; "a_diamond")]
+    #[test_case(LOOP_TD  ; "a_self_loop_beside_a_neighbour")]
     fn edge_labels_never_share_a_cell(source: &str) {
         let layout = place(source);
         let labels = label_rects(&layout);
@@ -1563,6 +1730,8 @@ mod tests {
 
     #[test_case(BRANCHES ; "two_branches_out_of_one_decision")]
     #[test_case(LOOPING  ; "a_branch_beside_a_returning_edge")]
+    #[test_case(LOOP_TD  ; "a_self_loop_beside_a_neighbour_td")]
+    #[test_case(LOOP_LR  ; "a_self_loop_beside_a_neighbour_lr")]
     fn an_edge_label_never_lands_on_a_box(source: &str) {
         let layout = place(source);
         for (x, y, width, text) in label_rects(&layout) {
@@ -1585,6 +1754,7 @@ mod tests {
     #[test_case(CYCLE     ; "cycle")]
     #[test_case(DIAMOND   ; "diamond")]
     #[test_case(CLUSTERED ; "clustered")]
+    #[test_case(TWO_LOOPS ; "two_loops")]
     fn layout_is_deterministic(source: &str) {
         assert_eq!(place(source), place(source));
     }
@@ -1594,6 +1764,8 @@ mod tests {
     #[test_case(CYCLE                                               ; "cycle")]
     #[test_case(CLUSTERED                                           ; "clustered")]
     #[test_case("flowchart LR\n A --> B --> C --> D\n A --> D"      ; "long_edge_lr")]
+    #[test_case(LOOP_TD                                             ; "loop_td")]
+    #[test_case(LOOP_LR                                             ; "loop_lr")]
     fn boxes_never_overlap(source: &str) {
         let placed = place(source);
         for (index, node) in placed.nodes.iter().enumerate() {
@@ -1607,6 +1779,10 @@ mod tests {
     #[test_case(DIAMOND                                             ; "diamond")]
     #[test_case(CLUSTERED                                           ; "clustered")]
     #[test_case("flowchart LR\n A --> B --> C --> D\n A --> D"      ; "long_edge_lr")]
+    #[test_case(LOOP_TD                                             ; "loop_td")]
+    #[test_case(LOOP_LR                                             ; "loop_lr")]
+    #[test_case(LOOP_BT                                             ; "loop_bt")]
+    #[test_case(LOOP_RL                                             ; "loop_rl")]
     fn everything_fits_inside_the_reported_extent(source: &str) {
         let placed = place(source);
         for node in &placed.nodes {
@@ -1697,6 +1873,10 @@ mod tests {
     }
     #[test_case(PIPELINE ; "pipeline")]
     #[test_case(LEANING  ; "leaning")]
+    #[test_case(LOOP_TD  ; "loop_td")]
+    #[test_case(LOOP_LR  ; "loop_lr")]
+    #[test_case(LOOP_BT  ; "loop_bt")]
+    #[test_case(LOOP_RL  ; "loop_rl")]
     fn every_arrow_points_at_the_outline_it_terminates_on(source: &str) {
         let graph = parse(source).expect("fixture should parse");
         let placed = place(source);
@@ -1726,6 +1906,63 @@ mod tests {
                 graph.nodes[edge.to].label,
             );
         }
+    }
+
+    #[test_case(LOOP_TD ; "td")]
+    #[test_case(LOOP_LR ; "lr")]
+    fn a_self_loop_is_a_closed_orthogonal_hook(source: &str) {
+        let placed = place(source);
+        let hook = &placed.edges[0];
+        assert_eq!(hook.points.len(), 4, "{:?}", hook.points);
+        for pair in hook.points.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            assert!(from.0 == to.0 || from.1 == to.1, "{:?}", hook.points);
+        }
+        let label = hook.label.as_ref().expect("the loop keeps its label");
+        assert_eq!(label.text, "it times out");
+    }
+
+    #[test_case(LOOP_TD, true  ; "td_writes_it_beside")]
+    #[test_case(LOOP_LR, false ; "lr_writes_it_underneath")]
+    #[test_case(LOOP_RL, false ; "rl_writes_it_underneath")]
+    #[test_case(LOOP_BT, true  ; "bt_writes_it_beside")]
+    fn a_self_loop_label_stays_within_the_room_of_its_box(source: &str, beside: bool) {
+        let placed = place(source);
+        let (node, label) = (
+            &placed.nodes[0],
+            placed.edges[0].label.as_ref().expect("label"),
+        );
+        let end = label.x + label.text.width();
+        match beside {
+            true => assert!(
+                (node.y..node.y + node.height).contains(&label.y) && label.x > node.x + node.width,
+                "{label:?} strays from the side of {node:?}"
+            ),
+            false => assert!(
+                label.y >= node.y + node.height && node.x <= label.x && end < node.x + node.width,
+                "{label:?} spills past the bottom of {node:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn several_self_loops_share_one_hook_and_one_label() {
+        let placed = place(TWO_LOOPS);
+        let (first, second) = (&placed.edges[0], &placed.edges[1]);
+        assert_eq!(first.points, second.points);
+        assert_eq!(
+            first.label.as_ref().map(|label| label.text.as_str()),
+            Some("one; two")
+        );
+        assert!(second.label.is_none());
+    }
+
+    #[test]
+    fn a_self_loop_leaves_the_box_its_own_size() {
+        let plain = place("flowchart TD\n A[Saving] --> B");
+        let looped = place("flowchart TD\n A[Saving] -->|again| A\n A --> B");
+        assert_eq!(plain.nodes[0].width, looped.nodes[0].width);
+        assert_eq!(looped.nodes[0].height, LOOP_SPAN);
     }
 
     #[test]

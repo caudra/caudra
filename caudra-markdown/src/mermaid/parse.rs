@@ -1,4 +1,4 @@
-//! Mermaid flowchart parser.
+//! Mermaid parser for flowcharts and, through `state`, state diagrams.
 //!
 //! Strict by design. Anything outside the supported grammar is an error so
 //! the caller can fall back to rendering the fence as a code block. Drawing a
@@ -8,11 +8,15 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-const COMMENT: &str = "%%";
+use super::state;
+
+pub(super) const COMMENT: &str = "%%";
+const FRONT_MATTER: &str = "---";
 const SUBGRAPH: &str = "subgraph";
 const END: &str = "end";
 const DIRECTION: &str = "direction";
 const FLOWCHART_KEYWORDS: [&str; 2] = ["flowchart", "graph"];
+const STATE_KEYWORDS: [&str; 2] = ["stateDiagram-v2", "stateDiagram"];
 const IGNORED_KEYWORDS: [&str; 6] = [
     "style",
     "classDef",
@@ -21,12 +25,12 @@ const IGNORED_KEYWORDS: [&str; 6] = [
     "linkStyle",
     "accTitle",
 ];
-const LINE_BREAKS: [&str; 3] = ["<br/>", "<br />", "<br>"];
+pub(super) const LINE_BREAKS: [&str; 3] = ["<br/>", "<br />", "<br>"];
 const ARROW_HEADS: [char; 3] = ['>', 'o', 'x'];
 const STATEMENT_SEPARATOR: char = ';';
 const FAN_OUT: char = '&';
 const LABEL_PIPE: char = '|';
-const QUOTE: char = '"';
+pub(super) const QUOTE: char = '"';
 
 /// Longer openers first so `([` is not mistaken for `(`. The leaning pairs
 /// share an opener and differ only in how they close, so they are tried in
@@ -49,18 +53,24 @@ const SHAPES: [(&str, &str, Shape); 13] = [
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ParseError {
-    #[error("not a flowchart")]
-    NotFlowchart,
+    #[error("not a flowchart or state diagram")]
+    UnknownDiagram,
     #[error("unsupported syntax: {0}")]
     Unsupported(String),
     #[error("nested subgraphs are not supported")]
     NestedSubgraph,
     #[error("`end` without a matching `subgraph`")]
     UnmatchedEnd,
-    #[error("self-loops are not supported")]
-    SelfLoop,
     #[error("unterminated subgraph")]
     UnterminatedSubgraph,
+    #[error("`}}` without a matching composite state")]
+    UnmatchedBrace,
+    #[error("unterminated composite state")]
+    UnterminatedComposite,
+    #[error("`note` without a matching `end note`")]
+    UnterminatedNote,
+    #[error("front matter without a closing `---`")]
+    UnterminatedFrontMatter,
     #[error("diagram has no nodes")]
     Empty,
 }
@@ -81,7 +91,7 @@ impl Direction {
         matches!(self, Self::Down | Self::Up)
     }
 
-    fn parse(token: &str) -> Option<Self> {
+    pub(super) fn parse(token: &str) -> Option<Self> {
         match token {
             "TD" | "TB" => Some(Self::Down),
             "BT" => Some(Self::Up),
@@ -250,15 +260,50 @@ impl Builder {
 }
 
 pub fn parse(source: &str) -> Result<Graph, ParseError> {
-    let mut lines = source
+    let mut lines = without_front_matter(source)?
         .lines()
         .map(strip_comment)
         .map(str::trim)
         .filter(|line| !line.is_empty());
 
-    let header = lines.next().ok_or(ParseError::NotFlowchart)?;
+    let header = lines.next().ok_or(ParseError::UnknownDiagram)?;
+    let mut tokens = header.split_whitespace();
+    let keyword = tokens.next().ok_or(ParseError::UnknownDiagram)?;
+    if STATE_KEYWORDS.contains(&keyword) {
+        return match tokens.next() {
+            None => state::parse(lines),
+            Some(token) => Err(ParseError::Unsupported(token.to_owned())),
+        };
+    }
     let direction = parse_header(header)?;
+    parse_flowchart(direction, lines)
+}
 
+/// YAML front matter configures how mermaid renders, which a terminal
+/// drawing has no use for, so it is skipped whole.
+fn without_front_matter(source: &str) -> Result<&str, ParseError> {
+    let Some(rest) = source.trim_start().strip_prefix(FRONT_MATTER) else {
+        return Ok(source);
+    };
+    let mut consumed = 0;
+    for (index, line) in rest.split_inclusive('\n').enumerate() {
+        consumed += line.len();
+        match index {
+            0 if !line.trim().is_empty() => {
+                return Err(ParseError::Unsupported(FRONT_MATTER.to_owned()));
+            }
+            0 => {}
+            _ if line.trim() == FRONT_MATTER => return Ok(&rest[consumed..]),
+            _ => {}
+        }
+    }
+    Err(ParseError::UnterminatedFrontMatter)
+}
+
+fn parse_flowchart<'a>(
+    direction: Direction,
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<Graph, ParseError> {
     let mut builder = Builder::default();
     let mut open: Option<Subgraph> = None;
 
@@ -347,7 +392,7 @@ fn subgraph_title(rest: &str) -> String {
     }
 }
 
-fn strip_comment(line: &str) -> &str {
+pub(super) fn strip_comment(line: &str) -> &str {
     match line.find(COMMENT) {
         Some(at) => &line[..at],
         None => line,
@@ -356,9 +401,9 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_header(header: &str) -> Result<Direction, ParseError> {
     let mut tokens = header.split_whitespace();
-    let keyword = tokens.next().ok_or(ParseError::NotFlowchart)?;
+    let keyword = tokens.next().ok_or(ParseError::UnknownDiagram)?;
     if !FLOWCHART_KEYWORDS.contains(&keyword) {
-        return Err(ParseError::NotFlowchart);
+        return Err(ParseError::UnknownDiagram);
     }
     match tokens.next() {
         None => Ok(Direction::Down),
@@ -383,9 +428,6 @@ fn parse_chain(statement: &str, builder: &mut Builder) -> Result<Vec<usize>, Par
         touched.extend_from_slice(&next);
         for &from in &previous {
             for &to in &next {
-                if from == to {
-                    return Err(ParseError::SelfLoop);
-                }
                 builder.edges.push(Edge {
                     from,
                     to,
@@ -421,7 +463,7 @@ fn read_group(
     }
 }
 
-fn is_id_char(c: char) -> bool {
+pub(super) fn is_id_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -478,7 +520,7 @@ fn find_close(body: &str, close: &str) -> Option<usize> {
     None
 }
 
-fn unquote(text: &str) -> &str {
+pub(super) fn unquote(text: &str) -> &str {
     let trimmed = text.trim();
     trimmed
         .strip_prefix(QUOTE)
@@ -486,7 +528,7 @@ fn unquote(text: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-fn split_label(raw: &str) -> Vec<String> {
+pub(super) fn split_label(raw: &str) -> Vec<String> {
     let mut text = unquote(raw).to_owned();
     for tag in LINE_BREAKS {
         text = text.replace(tag, "\n");
@@ -847,6 +889,28 @@ mod tests {
     #[test_case("flowchart TD\n  A ~~~ B"       ; "unknown_operator")]
     fn malformed_statements_are_rejected(source: &str) {
         assert!(parse(source).is_err());
+    }
+
+    #[test]
+    fn a_self_loop_is_an_edge() {
+        let g = graph("flowchart TD\n  A -->|again| A");
+        assert_eq!((g.edges[0].from, g.edges[0].to), (0, 0));
+        assert_eq!(edge_labels(&g), vec![Some("again")]);
+    }
+
+    #[test_case("---\ntitle: x\n---\nflowchart LR\n  A --> B" ; "with_keys")]
+    #[test_case("\n---\n---\nflowchart LR\n  A --> B"          ; "empty_after_blank_line")]
+    fn front_matter_is_skipped(source: &str) {
+        let g = graph(source);
+        assert_eq!(g.direction, Direction::Right);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test_case("---\ntitle: x\nflowchart LR\n  A --> B", ParseError::UnterminatedFrontMatter ; "unterminated")]
+    #[test_case("--- x\n---\nflowchart LR\n  A --> B", ParseError::Unsupported(FRONT_MATTER.to_owned()) ; "text_after_opener")]
+    #[test_case("stateDiagram-v2 LR\n  A --> B", ParseError::Unsupported("LR".to_owned()) ; "state_header_with_a_direction")]
+    fn malformed_headers_are_rejected(source: &str, expected: ParseError) {
+        assert_eq!(parse(source), Err(expected));
     }
 
     #[test]

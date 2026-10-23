@@ -158,7 +158,7 @@ impl Canvas {
     }
 
     #[cfg(test)]
-    fn to_text(&self) -> String {
+    pub(super) fn to_text(&self) -> String {
         self.rows()
             .map(|row| {
                 row.iter()
