@@ -43,6 +43,9 @@ serde_json = { workspace = true }
 criterion = { workspace = true }
 flate2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+
 [[bench]]
 name = "payload_codecs"
 harness = false

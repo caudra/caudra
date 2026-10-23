@@ -58,6 +58,8 @@ const DAY_FORMAT: &str = "%Y-%m-%d";
 const MONTH_FORMAT: &str = "%Y-%m";
 const USAGE_TOTAL: &str = "all recorded spend";
 const UNREPRESENTABLE_DURATION: &str = "duration does not land in the representable range";
+const UNKNOWN_FRAMES: &str = "unknown (another process was checkpointing)";
+const CHECKPOINT_SKIPPED: &str = "WAL checkpoint skipped: another process was checkpointing";
 
 /// One aggregated line of `storage usage`.
 #[derive(Serialize, Default)]
@@ -181,8 +183,13 @@ pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
                 .checkpoint(truncate)
                 .context("checkpoint session database")?;
             println!("busy: {}", result.busy);
-            println!("log_frames: {}", result.log_frames);
-            println!("checkpointed_frames: {}", result.checkpointed_frames);
+            match result.frames {
+                Some(frames) => {
+                    println!("log_frames: {}", frames.logged);
+                    println!("checkpointed_frames: {}", frames.checkpointed);
+                }
+                None => println!("log_frames: {UNKNOWN_FRAMES}"),
+            }
         }
         StorageAction::Vacuum { pages } => {
             let database = SessionDatabase::open(&state_dir).context("open session database")?;
@@ -746,17 +753,24 @@ fn render_prune(report: &PruneReport) -> String {
         );
     }
     if let Some(checkpoint) = report.checkpoint {
-        let _ = writeln!(
-            out,
-            "  checkpointed {} of {} WAL frames{}",
-            checkpoint.checkpointed_frames,
-            checkpoint.log_frames,
-            if checkpoint.busy > 0 {
-                " (readers kept the WAL busy)"
-            } else {
-                ""
+        match checkpoint.frames {
+            Some(frames) => {
+                let _ = writeln!(
+                    out,
+                    "  checkpointed {} of {} WAL frames{}",
+                    frames.checkpointed,
+                    frames.logged,
+                    if checkpoint.busy {
+                        " (readers kept the WAL busy)"
+                    } else {
+                        ""
+                    }
+                );
             }
-        );
+            None => {
+                let _ = writeln!(out, "  {CHECKPOINT_SKIPPED}");
+            }
+        }
     }
     let _ = writeln!(
         out,

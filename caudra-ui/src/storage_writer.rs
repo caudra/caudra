@@ -60,6 +60,8 @@ const WAL_WARNING_BYTES: u64 = 2 * WAL_RETENTION_LIMIT_BYTES;
 const SESSION_LOAD_WARNING_PERCENT: usize = 80;
 const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
+const CHECKPOINT_STALLED: &str = "Session WAL checkpoint made no progress";
+const CHECKPOINT_LOCK_HELD: &str = "another process holds the checkpoint";
 const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
 const WRITER_TIMEOUT: &str = "storage writer operation timed out";
 const DECISION_ROW: &str = "decision";
@@ -1266,19 +1268,23 @@ impl Writer {
             Ok(result) => {
                 tracing::debug!(
                     busy = result.busy,
-                    log_frames = result.log_frames,
-                    checkpointed_frames = result.checkpointed_frames,
+                    log_frames = result.frames.map(|frames| frames.logged),
+                    checkpointed_frames = result.frames.map(|frames| frames.checkpointed),
                     "session database passive checkpoint"
                 );
-                let stalled =
-                    result.busy > 0 || (result.log_frames > 0 && result.checkpointed_frames == 0);
+                let stalled = result.busy
+                    || result
+                        .frames
+                        .is_some_and(|frames| frames.logged > 0 && frames.checkpointed == 0);
                 if stalled {
                     self.checkpoint_stalls = self.checkpoint_stalls.saturating_add(1);
                     if self.checkpoint_stalls == CHECKPOINT_STALL_WARNING_COUNT {
-                        let _ = self.warn_tx.send(format!(
-                            "Session WAL checkpoint made no progress ({} frames remain)",
-                            result.log_frames
-                        ));
+                        let _ = self.warn_tx.send(match result.frames {
+                            Some(frames) => {
+                                format!("{CHECKPOINT_STALLED} ({} frames remain)", frames.logged)
+                            }
+                            None => format!("{CHECKPOINT_STALLED} ({CHECKPOINT_LOCK_HELD})"),
+                        });
                     }
                 } else {
                     self.checkpoint_stalls = 0;

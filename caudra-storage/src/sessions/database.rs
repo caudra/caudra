@@ -150,6 +150,9 @@ const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
 /// Pages between progress reports while a freelist is being reclaimed.
 const RECLAIM_PROGRESS_INTERVAL: u64 = 1024;
 const WAL_JOURNAL_MODE: &str = "wal";
+/// What `wal_checkpoint` reports for both frame counts when it could not read
+/// the WAL, as when another connection holds the checkpoint lock.
+const UNKNOWN_WAL_FRAMES: i64 = -1;
 /// Rows one decode worker must have before a second one is worth starting.
 const PARALLEL_DECODE_MIN_ROWS: usize = 256;
 const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
@@ -1435,9 +1438,16 @@ pub struct TrimReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CheckpointResult {
-    pub busy: u64,
-    pub log_frames: u64,
-    pub checkpointed_frames: u64,
+    pub busy: bool,
+    /// `None` when another connection held the checkpoint lock, or no WAL was
+    /// open, so SQLite could not read the log.
+    pub frames: Option<WalFrames>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WalFrames {
+    pub logged: u64,
+    pub checkpointed: u64,
 }
 
 /// Why a cleanup job may run. `Stale` means the session was written after
@@ -5436,17 +5446,24 @@ fn checkpoint_on(
     // because long readers, not the size setting, determine active WAL size.
     let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
     let sql = format!("PRAGMA wal_checkpoint({mode})");
-    let (busy, log_frames, checkpointed_frames) = connection.query_row(&sql, [], |row| {
+    let (busy, logged, checkpointed) = connection.query_row(&sql, [], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)?,
         ))
     })?;
+    let frames = if (logged, checkpointed) == (UNKNOWN_WAL_FRAMES, UNKNOWN_WAL_FRAMES) {
+        None
+    } else {
+        Some(WalFrames {
+            logged: from_i64(logged, "checkpoint log frames")?,
+            checkpointed: from_i64(checkpointed, "checkpoint completed frames")?,
+        })
+    };
     Ok(CheckpointResult {
-        busy: from_i64(busy, "checkpoint busy")?,
-        log_frames: from_i64(log_frames, "checkpoint log frames")?,
-        checkpointed_frames: from_i64(checkpointed_frames, "checkpoint completed frames")?,
+        busy: from_i64(busy, "checkpoint busy")? != 0,
+        frames,
     })
 }
 
@@ -6936,6 +6953,10 @@ mod tests {
     use std::ffi::{CStr, c_char, c_void};
     use std::fs::{self, TryLockError};
     use std::iter;
+    #[cfg(target_os = "linux")]
+    use std::mem;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     #[cfg(target_os = "linux")]
@@ -6985,6 +7006,9 @@ mod tests {
     const LOCK_PATH_ALIAS: &str = "lock-path-alias";
     #[cfg(target_os = "linux")]
     const POSIX_LOCK: &str = "POSIX";
+    /// SQLite's `WALINDEX_LOCK_OFFSET` (120) plus `WAL_CKPT_LOCK` (1).
+    #[cfg(target_os = "linux")]
+    const WAL_CHECKPOINT_LOCK_BYTE: libc::off_t = 121;
     const REMOTE_CWD: &str = ".";
     const MISSING_LEGACY_CWD: &str = "/definitely/missing/legacy/project";
     const MODEL: &str = "test/model";
@@ -11639,6 +11663,51 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         drop(File::open(path).unwrap());
 
         assert!(posix_locks(&files).is_empty());
+    }
+
+    /// Takes the WAL checkpoint lock the way another process's checkpoint
+    /// holds it. An OFD lock conflicts with SQLite's own POSIX locks even in
+    /// this process. Dropping the file releases it.
+    #[cfg(target_os = "linux")]
+    fn hold_checkpoint_lock(database: &Path) -> File {
+        let shm = File::options()
+            .read(true)
+            .write(true)
+            .open(database_sidecar(database, SHM_SUFFIX))
+            .unwrap();
+        // SAFETY: `flock` is plain old data, so all zeroes is a valid value.
+        let mut lock: libc::flock = unsafe { mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        lock.l_start = WAL_CHECKPOINT_LOCK_BYTE;
+        lock.l_len = 1;
+        // SAFETY: the descriptor is open for the call and `lock` outlives it.
+        let status = unsafe { libc::fcntl(shm.as_raw_fd(), libc::F_OFD_SETLK, &lock) };
+        assert_eq!(status, 0, "{}", io::Error::last_os_error());
+        shm
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_case(false; "passive")]
+    #[test_case(true; "truncate")]
+    fn checkpoint_reports_busy_while_another_connection_checkpoints(truncate: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open_state(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+
+        let held = hold_checkpoint_lock(&database.path());
+        assert_eq!(
+            database.checkpoint(truncate).unwrap(),
+            CheckpointResult {
+                busy: true,
+                frames: None,
+            }
+        );
+
+        drop(held);
+        let released = database.checkpoint(truncate).unwrap();
+        assert!(!released.busy);
+        assert!(released.frames.is_some());
     }
 
     #[cfg(target_os = "linux")]
