@@ -4,7 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caudra_providers::Message;
 use caudra_storage::{
@@ -21,11 +21,14 @@ use caudra_storage::{
 };
 use futures_lite::{FutureExt, future};
 use serde_json::{Value, json};
+use tracing::warn;
 
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES, STALE_INVOCATION, State, TASK_DURATION_FIELD, TRANSITION, TaskHistoryPage,
-    bounded, deliverable, shells::ShellExecutions,
+    MAX_RESULT_BYTES, RUNNING_STATE, STALE_INVOCATION, State, TASK_DURATION_FIELD, TRANSITION,
+    TaskHistoryPage, bounded, deliverable,
+    shells::{ShellExecutions, ShellLive},
+    wait_nudge::{self, WaitNudge},
 };
 use crate::{
     CancelToken, CancelTrigger, History, SubagentHistoryStore, TaskCard, TaskProvenance,
@@ -128,6 +131,8 @@ struct JobSpec {
     /// What lists and reminders show for the job.
     label: String,
     mode: String,
+    /// How often to ask the owner whether a running shell still deserves the wait.
+    wait_nudge: Option<WaitNudge>,
 }
 
 #[derive(Clone)]
@@ -415,6 +420,7 @@ impl JobScope {
             history,
             &CancelToken::none(),
             Deadline::None,
+            None,
             execute,
         )
         .await
@@ -426,6 +432,7 @@ impl JobScope {
         history: &SubagentHistoryStore,
         cancel: &CancelToken,
         deadline: Deadline,
+        wait_nudge: Option<WaitNudge>,
         execute: F,
     ) -> Result<TaskCard, String>
     where
@@ -450,6 +457,7 @@ impl JobScope {
             },
             mode: metadata.mode.clone(),
             payload: JobPayload::Shell(metadata),
+            wait_nudge,
         };
         self.admit_job(spec, history, cancel, deadline, execute)
             .await
@@ -462,12 +470,14 @@ impl JobScope {
     /// Every refusal fires the job's own cancel before its execution starts,
     /// so a job that starts cancelled leaves the command where it is, to be
     /// handed back or, once admitted, dropped and so stopped.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn adopt_shell<S, Fut>(
         &self,
         metadata: ShellJobMetadata,
         history: &SubagentHistoryStore,
         cancel: &CancelToken,
         deadline: Deadline,
+        wait_nudge: Option<WaitNudge>,
         running: RunningShell,
         settle: S,
     ) -> Result<TaskCard, (String, Option<RunningShell>)>
@@ -484,6 +494,7 @@ impl JobScope {
                 history,
                 cancel,
                 deadline,
+                wait_nudge,
                 move |cancel, _| async move {
                     let adopted = match cancel.is_cancelled() {
                         true => None,
@@ -531,6 +542,7 @@ impl JobScope {
             identity: QUESTION_IDENTITY.into(),
             mode: QUESTION_MODE.into(),
             payload: JobPayload::Question(metadata),
+            wait_nudge: None,
         };
         self.admit_job(
             spec,
@@ -576,6 +588,7 @@ impl JobScope {
             return Err("job metadata exceeds admission byte limit".into());
         }
         let questions = matches!(spec.payload, JobPayload::Question(_));
+        let wait_nudge = spec.wait_nudge;
         let admission = Admission {
             scope: self.clone(),
             cancel: cancel.clone(),
@@ -740,7 +753,9 @@ impl JobScope {
                 if current.is_ok() {
                     let _ = admitted_tx.send(Ok(card));
                 }
-                let result = scope.run_job(&driver_id, cancel, provenance, execute).await;
+                let result = scope
+                    .run_job(&driver_id, cancel, provenance, wait_nudge, execute)
+                    .await;
                 if let Err(error) = result {
                     let mut state = scope.tasks.lock();
                     state.failure = Some(error.clone());
@@ -769,6 +784,7 @@ impl JobScope {
         invocation: &str,
         cancel: CancelToken,
         provenance: TaskProvenance,
+        wait_nudge: Option<WaitNudge>,
         execute: F,
     ) -> Result<(), String>
     where
@@ -790,10 +806,26 @@ impl JobScope {
             execute_job(execute, cancel, provenance).await?;
             return Err(error);
         }
-        let done = execute_job(execute, cancel.clone(), provenance).await?;
+        let nudges = wait_nudge.map(|nudge| {
+            let (stop, stopped) = flume::bounded::<()>(1);
+            let scope = self.clone();
+            let invocation = invocation.to_owned();
+            let nudges =
+                smol::spawn(async move { scope.keep_nudging(&invocation, nudge, stopped).await });
+            (stop, nudges)
+        });
+        let done = execute_job(execute, cancel.clone(), provenance).await;
+        if let Some((stop, nudges)) = nudges {
+            drop(stop);
+            nudges.await;
+        }
+        let done = done?;
         let _gate = self.tasks.0.gate.lock().await;
         let mut record = self.tasks.record(invocation)?;
         record.state = shell_job_state(cancel.is_cancelled(), &done).into();
+        for event in &mut record.events {
+            event.suppressed |= event.wait_nudge && !event.accepted;
+        }
         let terminal = done.composed_model_output();
         let reference = match done.output_ref {
             Some(reference) => reference,
@@ -837,7 +869,99 @@ impl JobScope {
             terminal: true,
             accepted: false,
             suppressed,
+            wait_nudge: false,
         });
+        self.tasks.persist(record).await
+    }
+
+    /// Asks the owner every interval the shell runs whether it is still
+    /// worth the wait, until `stop` closes.
+    async fn keep_nudging(&self, invocation: &str, nudge: WaitNudge, stop: flume::Receiver<()>) {
+        let mut previous: Option<String> = None;
+        let mut due = nudge.started;
+        loop {
+            while due <= Instant::now() {
+                due += nudge.interval;
+            }
+            let ticked = async {
+                smol::Timer::at(due).await;
+                true
+            }
+            .or(async {
+                let _ = stop.recv_async().await;
+                false
+            })
+            .await;
+            if !ticked {
+                return;
+            }
+            let tail = self
+                .tasks
+                .shells()
+                .snapshot()
+                .jobs
+                .get(invocation)
+                .and_then(ShellLive::lines)
+                .and_then(|lines| nudge.tail(&lines));
+            let output = wait_nudge::Output::since(tail, previous.as_deref());
+            if let Err(error) = self
+                .nudge(invocation, nudge.started.elapsed(), nudge.interval, &output)
+                .await
+            {
+                warn!(invocation, %error, "shell wait nudge save failed");
+            }
+            previous = output.tail().map(str::to_owned);
+        }
+    }
+
+    /// Puts one nudge in front of the owner. One it has not claimed yet is
+    /// brought up to date rather than joined by another, and one it holds
+    /// already will reach it, so this one is left out.
+    async fn nudge(
+        &self,
+        invocation: &str,
+        elapsed: Duration,
+        interval: Duration,
+        output: &wait_nudge::Output,
+    ) -> Result<(), String> {
+        let _gate = self.tasks.0.gate.lock().await;
+        if self.current().is_err() {
+            return Ok(());
+        }
+        let mut record = self.tasks.record(invocation)?;
+        let JobPayload::Shell(metadata) = &record.payload else {
+            return Ok(());
+        };
+        if record.state != RUNNING_STATE {
+            return Ok(());
+        }
+        let body = wait_nudge::render(&record.task_id, metadata, elapsed, interval, output);
+        let pending = record
+            .events
+            .iter()
+            .position(|event| event.wait_nudge && deliverable(&record, event));
+        match pending {
+            Some(index)
+                if self
+                    .tasks
+                    .lock()
+                    .claims
+                    .contains_key(&record.events[index].event_id) =>
+            {
+                return Ok(());
+            }
+            Some(index) => record.events[index].body = body,
+            None => record.events.push(TaskEvent {
+                sequence: self.tasks.next_sequence(),
+                event_id: CaudraId::generate().to_string(),
+                call_id: invocation.into(),
+                body,
+                terminal: false,
+                accepted: false,
+                suppressed: false,
+                wait_nudge: true,
+            }),
+        }
         self.tasks.persist(record).await
     }
 
@@ -1017,11 +1141,14 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::{
-        StateDir, background::JobKind, id::CaudraId, sessions::SessionDatabase,
+        StateDir,
+        background::{JobKind, TaskEvent},
+        id::CaudraId,
+        sessions::SessionDatabase,
         tool_outputs::ToolOutputStore,
     };
     use futures_lite::future::poll_once;
@@ -1030,13 +1157,13 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BackgroundTasks, CLOSED, FOREIGN_JOB, MAX_DEFERRED_QUESTIONS, QUESTION_CAPACITY,
+        BackgroundTasks, CLOSED, FOREIGN_JOB, JobScope, MAX_DEFERRED_QUESTIONS, QUESTION_CAPACITY,
         QUESTION_CLOSED, QuestionJobMetadata, RETRY_MISMATCH, RunningShell, STALE_INVOCATION,
-        ShellJobMetadata,
+        ShellJobMetadata, WaitNudge,
     };
     use crate::{
-        AgentEvent, AgentMode, Envelope, History, StoredSession, SubagentHistoryStore,
-        SubagentInfo, TaskCard, TaskProvenance, ToolDoneEvent,
+        AgentEvent, AgentMode, Envelope, History, SharedBuf, SnapshotLine, StoredSession,
+        SubagentHistoryStore, SubagentInfo, TaskCard, TaskProvenance, ToolDoneEvent,
         agent::{
             subagent::{
                 RESERVATION_SESSION_MISMATCH, TaskIdentity, TaskOptions, open_task,
@@ -1045,7 +1172,7 @@ mod tests {
             task_runner::{ModelResolver, SubagentTaskRunner, TaskRunner, WorkflowHostContext},
         },
         background::{
-            ADMISSION_CANCELLED, MAX_BATCH_BYTES, MAX_HISTORY_PAGE, MAX_INVOCATIONS,
+            ADMISSION_CANCELLED, DELIVERY_CUE, MAX_BATCH_BYTES, MAX_HISTORY_PAGE, MAX_INVOCATIONS,
             MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES, QUESTION_INTERRUPTED,
             tests::{
                 ARCHIVE_LIFECYCLE_COUNT, assert_archive_count, hold_writer, seed_archived_tasks,
@@ -1054,7 +1181,8 @@ mod tests {
         background_reminder::render,
         cancel::{CancelMap, CancelToken},
         tools::{
-            DEADLINE_EXCEEDED, Deadline, LocalTools, native::question, test_support::stub_ctx,
+            DEADLINE_EXCEEDED, Deadline, LocalTools, PartialOutputFilter, native::question,
+            test_support::stub_ctx,
         },
         types::BACKGROUND_EVENT_RUN_ID,
     };
@@ -1229,6 +1357,7 @@ mod tests {
                     &fixture.history,
                     &CancelToken::none(),
                     Deadline::None,
+                    None,
                     running,
                     move |done| async move {
                         counted.fetch_add(1, Ordering::SeqCst);
@@ -1268,6 +1397,7 @@ mod tests {
                     &fixture.history,
                     &CancelToken::none(),
                     Deadline::None,
+                    None,
                     running,
                     |_| async { panic!("a refused adoption cannot settle") },
                 )
@@ -1436,6 +1566,7 @@ mod tests {
                         &history,
                         &cancel,
                         Deadline::None,
+                        None,
                         move |cancel, _| async move {
                             factory_count.fetch_add(1, Ordering::SeqCst);
                             if !cancel.is_cancelled() {
@@ -1528,6 +1659,7 @@ mod tests {
                         &history,
                         &cancel,
                         Deadline::None,
+                        None,
                         |_, _| async { panic!("cancelled admission executed") },
                     )
                     .await
@@ -1566,6 +1698,7 @@ mod tests {
                     &fixture.history,
                     &CancelToken::none(),
                     deadline,
+                    None,
                     |cancel, _| async move {
                         assert!(cancel.is_cancelled());
                         done()
@@ -1614,6 +1747,7 @@ mod tests {
                         &history,
                         &cancel,
                         Deadline::None,
+                        None,
                         move |cancel, _| async move {
                             cleanup_tx.send(()).unwrap();
                             execute_rx.recv_async().await.unwrap();
@@ -2829,6 +2963,138 @@ mod tests {
                 Some(QUESTION_INTERRUPTED)
             );
             restored.shutdown().await.unwrap();
+        });
+    }
+
+    const NUDGE_HEADING: &str = "# Long-running shell";
+    const NUDGE_INTERVAL: Duration = Duration::from_millis(1);
+    const PRINTED: &str = "Compiling caudra v0.2.0";
+    const FILTERED: &str = "[filtered: 1 compile line]";
+    const ONE_NUDGE: &str = "a nudge nobody claimed yet is updated, never stacked";
+    const NO_CUE: &str = "a nudge alone is not a task report, so it needs no delivery cue";
+    const STALE_NUDGE: &str = "a finished shell must not ask whether to keep waiting on it";
+
+    struct HungShell {
+        card: TaskCard,
+        release: flume::Sender<()>,
+    }
+
+    /// A shell that prints [`PRINTED`] and runs until released, asked about
+    /// at every [`NUDGE_INTERVAL`] once its receipt reached the owner.
+    async fn hung_shell(fixture: &Fixture, scope: &JobScope) -> HungShell {
+        let (release, released) = flume::bounded::<()>(1);
+        let (attached, printed) = flume::bounded::<()>(1);
+        let shells = fixture.tasks.shells().clone();
+        let reduce: PartialOutputFilter = Arc::new(|_: &str| FILTERED.to_owned());
+        let nudge = WaitNudge {
+            interval: NUDGE_INTERVAL,
+            reduce: Some(reduce),
+            started: Instant::now(),
+        };
+        let card = scope
+            .admit_shell_cancellable(
+                metadata(),
+                &fixture.history,
+                &CancelToken::none(),
+                Deadline::None,
+                Some(nudge),
+                move |_, provenance| async move {
+                    let observed = shells.observe_job(&provenance.invocation_id);
+                    let buffer = Arc::new(SharedBuf::new());
+                    buffer.append(SnapshotLine::plain(PRINTED.into()));
+                    observed.live().attach(&buffer);
+                    attached.send(()).unwrap();
+                    let _ = released.recv_async().await;
+                    done()
+                },
+            )
+            .await
+            .unwrap();
+        scope.settle_launches(&[receipt()]).await.unwrap();
+        printed.recv_async().await.unwrap();
+        // The second save after the output appeared read it after the first.
+        let revision = scope.wait_for_change(scope.revision()).await.unwrap();
+        scope.wait_for_change(revision).await.unwrap();
+        HungShell { card, release }
+    }
+
+    fn nudges(fixture: &Fixture, invocation: &str) -> Vec<TaskEvent> {
+        fixture
+            .tasks
+            .record(invocation)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.wait_nudge)
+            .collect()
+    }
+
+    fn says_nudge(message: &Message) -> bool {
+        message
+            .first_text_content()
+            .is_some_and(|text| text.contains(NUDGE_HEADING))
+    }
+
+    #[test_case(false ; "main")]
+    #[test_case(true ; "child")]
+    fn a_long_shell_asks_its_owner_whether_to_keep_waiting(child: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = if child {
+                fixture.tasks.child_scope(CHILD)
+            } else {
+                fixture.tasks.main_scope()
+            };
+            let shell = hung_shell(&fixture, &scope).await;
+            assert_eq!(
+                nudges(&fixture, &shell.card.invocation_id).len(),
+                1,
+                "{ONE_NUDGE}"
+            );
+
+            let messages = scope.claim_messages().unwrap();
+            assert_eq!(messages.len(), 1, "{NO_CUE}");
+            let nudge = &messages[0];
+            assert!(nudge.task_event.is_some());
+            let text = nudge.first_text_content().unwrap();
+            for expected in [
+                NUDGE_HEADING,
+                shell.card.task_id.as_str(),
+                COMMAND,
+                FILTERED,
+            ] {
+                assert!(text.contains(expected), "{expected} missing: {text}");
+            }
+            assert!(!text.contains(PRINTED), "the output is filtered: {text}");
+
+            shell.release.send(()).unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let delivered = scope.claim_messages().unwrap();
+            assert!(!delivered.iter().any(says_nudge), "{STALE_NUDGE}");
+            assert!(delivered.iter().any(|message| message.task_event.is_some()));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_finished_shell_drops_the_nudge_nobody_claimed() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let shell = hung_shell(&fixture, &scope).await;
+            shell.release.send(()).unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+
+            let stale = nudges(&fixture, &shell.card.invocation_id);
+            assert!(stale.iter().all(|event| event.suppressed), "{STALE_NUDGE}");
+            let delivered = scope.claim_messages().unwrap();
+            assert!(!delivered.iter().any(says_nudge), "{STALE_NUDGE}");
+            assert_eq!(
+                delivered[0].first_text_content(),
+                Some(DELIVERY_CUE),
+                "a result keeps its delivery cue"
+            );
+            fixture.tasks.shutdown().await.unwrap();
         });
     }
 }

@@ -153,6 +153,8 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_BACKGROUND_REMINDER_TURNS: u32 = 0;
 pub const DEFAULT_WORK_NUDGE_COMPACTIONS: u32 = 2;
+pub const DEFAULT_SHELL_WAIT_NUDGE_MINUTES: u32 = 30;
+const SECS_PER_MINUTE: u64 = 60;
 pub const DEFAULT_SHELL_FOREGROUND_LIMIT_SECS: u64 = 600;
 pub const DEFAULT_RESUME_MAX_AGE_HOURS: u64 = 24;
 const MIN_RESUME_MAX_AGE_HOURS: u64 = 1;
@@ -1596,6 +1598,7 @@ pub struct AgentFileConfig {
     pub background_reminder_turns: Option<u32>,
     pub todo_reminder: Option<bool>,
     pub work_nudge_compactions: Option<u32>,
+    pub shell_wait_nudge_minutes: Option<u32>,
     pub task_model_choice: Option<bool>,
     pub deferred_questions: Option<bool>,
     pub shell_foreground_limit_secs: Option<u64>,
@@ -1643,6 +1646,7 @@ impl AgentFileConfig {
             background_reminder_turns,
             todo_reminder,
             work_nudge_compactions,
+            shell_wait_nudge_minutes,
             task_model_choice,
             deferred_questions,
             shell_foreground_limit_secs,
@@ -2906,6 +2910,12 @@ pub struct AgentConfig {
     pub work_nudge_compactions: u32,
 
     #[config(
+        default = DEFAULT_SHELL_WAIT_NUDGE_MINUTES,
+        desc = "Minutes a background shell may run before Caudra asks the agent waiting on it whether to keep waiting or to check whether the command hangs. Repeated at every further interval while it runs. Foreground shells are never nudged. 0 disables"
+    )]
+    pub shell_wait_nudge_minutes: u32,
+
+    #[config(
         default = true,
         desc = "Let the main agent choose a model and reasoning level for each `task` call, such as when you ask it to run work on a named model. When off, `task` has no `model` or `thinking` argument and tasks run on the Subagent model or a profile's pin"
     )]
@@ -3070,6 +3080,14 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// How often a background shell's owner is asked whether to keep waiting
+    /// on it, or `None` when it never is.
+    pub fn shell_wait_nudge(&self) -> Option<Duration> {
+        (self.shell_wait_nudge_minutes > 0).then(|| {
+            Duration::from_secs(u64::from(self.shell_wait_nudge_minutes) * SECS_PER_MINUTE)
+        })
+    }
+
     fn from_file(
         file: AgentFileConfig,
         no_rtk: bool,
@@ -3106,6 +3124,9 @@ impl AgentConfig {
             work_nudge_compactions: file
                 .work_nudge_compactions
                 .unwrap_or(DEFAULT_WORK_NUDGE_COMPACTIONS),
+            shell_wait_nudge_minutes: file
+                .shell_wait_nudge_minutes
+                .unwrap_or(DEFAULT_SHELL_WAIT_NUDGE_MINUTES),
             generate_titles: file.generate_titles.unwrap_or(true),
             summarize_memory: file.summarize_memory.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
@@ -4806,6 +4827,7 @@ mod tests {
     const TASK_MODEL_CHOICE_FIELD: &str = "task_model_choice";
     const DEFERRED_QUESTIONS_FIELD: &str = "deferred_questions";
     const WORK_NUDGE_FIELD: &str = "work_nudge_compactions";
+    const SHELL_WAIT_NUDGE_FIELD: &str = "shell_wait_nudge_minutes";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_LIMIT_FIELD: &str = "shell_foreground_limit_secs";
     const CUSTOM_SHELL_LIMIT: u64 = 31;
@@ -6421,6 +6443,61 @@ mod tests {
         assert!(
             error.to_string().contains(UNSIGNED_REMINDER_ERROR),
             "{error}"
+        );
+    }
+
+    #[test_case("", DEFAULT_SHELL_WAIT_NUDGE_MINUTES ; "enabled_by_default")]
+    #[test_case("shell_wait_nudge_minutes = 0", 0 ; "disabled")]
+    #[test_case("shell_wait_nudge_minutes = 5", 5 ; "custom")]
+    fn shell_wait_nudge_config(source: &str, expected: u32) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agent.shell_wait_nudge_minutes, expected);
+    }
+
+    #[test_case(0 => None ; "disabled")]
+    #[test_case(2 => Some(Duration::from_secs(120)) ; "minutes")]
+    fn shell_wait_nudge_interval(minutes: u32) -> Option<Duration> {
+        AgentConfig {
+            shell_wait_nudge_minutes: minutes,
+            ..Default::default()
+        }
+        .shell_wait_nudge()
+    }
+
+    #[test_case(None, Some(0), 0 ; "overlay_disables")]
+    #[test_case(Some(0), Some(45), 45 ; "overlay_reenables")]
+    #[test_case(Some(10), None, 10 ; "base_kept")]
+    fn shell_wait_nudge_config_merge(base: Option<u32>, overlay: Option<u32>, expected: u32) {
+        let layer = |shell_wait_nudge_minutes| RawConfig {
+            agent: AgentFileConfig {
+                shell_wait_nudge_minutes,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw = layer(base);
+        raw.merge(layer(overlay));
+        assert_eq!(
+            raw.into_config(false)
+                .unwrap()
+                .agent
+                .shell_wait_nudge_minutes,
+            expected
+        );
+    }
+
+    #[test]
+    fn shell_wait_nudge_metadata_matches_runtime_default() {
+        let field = AgentConfig::FIELDS
+            .iter()
+            .find(|field| field.name == SHELL_WAIT_NUDGE_FIELD)
+            .unwrap();
+        assert_eq!(field.ty, "u32");
+        assert_eq!(
+            field.default.format_default(),
+            AgentConfig::default().shell_wait_nudge_minutes.to_string()
         );
     }
 

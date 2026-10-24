@@ -169,6 +169,15 @@ pub const WORK_NUDGE_BUILD_PROMPT: &str = include_str!("prompts/work_nudge_build
 pub const WORK_NUDGE_PLAN_PROMPT: &str = include_str!("prompts/work_nudge_plan.md");
 pub const WORK_NUDGE_REPORT_PROMPT: &str = include_str!("prompts/work_nudge_report.md");
 pub const COMPACTIONS_SLOT: &str = "{compactions}";
+/// Asks the agent waiting on a background shell, once per interval it runs,
+/// whether the wait is still worth it or the command hangs.
+pub const SHELL_WAIT_NUDGE_PROMPT: &str = include_str!("prompts/shell_wait_nudge.md");
+pub const TASK_ID_SLOT: &str = "{task_id}";
+pub const ELAPSED_SLOT: &str = "{elapsed}";
+pub const FACTS_SLOT: &str = "{facts}";
+pub const COMMAND_SLOT: &str = "{command}";
+pub const OUTPUT_SLOT: &str = "{output}";
+pub const INTERVAL_SLOT: &str = "{interval}";
 /// Two fragments rather than one with a substituted clause, because the claim
 /// that differs is the useful one: locally the scratch directory is where
 /// `TMPDIR` already points and a command falls into it by itself, and on a

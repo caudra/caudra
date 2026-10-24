@@ -160,6 +160,8 @@ pub(crate) const DECISION_SEPARATOR: &str = " · ";
 /// have done.
 pub(crate) const SHADOW_MARKER: &str = "shadow · ";
 const DIGIT_GROUP: usize = 3;
+/// Opens what Caudra itself tells the model, as against what a task reports.
+const REMINDER_OPEN: &str = "<system-reminder>";
 /// Columns a modal pans per key press. Roughly one column of a token table, so
 /// a reader walks the table a field at a time rather than a glyph at a time.
 const PAN_STEP: i32 = 8;
@@ -1454,9 +1456,14 @@ impl DisplayMessage {
     }
 
     pub(crate) fn injected(text: String, task_event: Option<TaskEventOrigin>) -> Self {
-        let role = task_event.map_or(DisplayRole::Injected, |origin| {
-            DisplayRole::TaskDelivery(Box::new(origin))
-        });
+        // A wait nudge comes from a shell's record but is Caudra asking, not the
+        // shell reporting, so it folds to its heading like any reminder.
+        let role = match task_event {
+            Some(origin) if !text.starts_with(REMINDER_OPEN) => {
+                DisplayRole::TaskDelivery(Box::new(origin))
+            }
+            _ => DisplayRole::Injected,
+        };
         Self::new(role, text)
     }
 

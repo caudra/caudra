@@ -7998,6 +7998,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 terminal: true,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             }],
         }
     }

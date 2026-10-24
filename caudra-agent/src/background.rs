@@ -78,6 +78,7 @@ const RESTART_CONTINUATION_FIELD: &str = "restart_continuation";
 /// How many restarts a task's run has been resumed across, so a task that
 /// dies with every resume is not restarted forever.
 const RESTARTS_FIELD: &str = "restarts";
+const RUNNING_STATE: &str = "running";
 const INTERRUPTED_STATE: &str = "interrupted";
 const INTERRUPTED_TASK_REQUIRED: &str =
     "only an interrupted managed agent task owned by this session can be resumed";
@@ -102,12 +103,14 @@ pub struct TaskHistoryPage {
 }
 mod jobs;
 mod shells;
+mod wait_nudge;
 mod work;
 
 pub use caudra_storage::background::{QuestionJobMetadata, ShellJobMetadata};
 pub(crate) use jobs::RunningShell;
 pub use jobs::{JobScope, MAX_DEFERRED_QUESTIONS};
 pub use shells::{ShellExecutions, ShellLive, ShellOutputView, ShellSnapshot, ShellView};
+pub use wait_nudge::WaitNudge;
 pub use work::SessionWork;
 
 impl From<&TaskRecord> for TaskStatus {
@@ -124,7 +127,11 @@ impl From<&TaskRecord> for TaskStatus {
             }
         }
         let mut remaining = MAX_REPORT_BYTES;
-        for event in record.events.iter().filter(|event| !event.terminal) {
+        for event in record
+            .events
+            .iter()
+            .filter(|event| !event.terminal && !event.wait_nudge)
+        {
             if remaining == 0 {
                 card.reports_truncated = true;
                 break;
@@ -427,6 +434,7 @@ impl TaskReporter {
             terminal: blocked,
             accepted: false,
             suppressed: false,
+            wait_nudge: false,
         });
         self.tasks.persist(record).await?;
         if blocked {
@@ -1596,64 +1604,14 @@ impl BackgroundTasks {
             })
             .collect::<Vec<_>>();
         events.sort_by_key(|(_, event)| event.sequence);
+        let mut reports = false;
         for (record, event) in events {
-            let kind = match (event.terminal, record.kind(), record.state.as_str()) {
-                (false, ..) => "report",
-                (true, JobKind::Question, "succeeded") => question::ANSWERED_KIND,
-                (true, JobKind::Question, "cancelled") => question::WITHDRAWN_KIND,
-                (true, _, "succeeded") => "success",
-                (true, _, "failed") => "failure",
-                (true, _, state) => state,
-            };
-            let body = if event.terminal {
-                record.outcome.as_ref().map(outcome_text)
+            let (text, reference) = if event.wait_nudge {
+                (event.body.clone(), None)
             } else {
-                None
+                reports = true;
+                delivery_text(record, event)
             };
-            let mut body = body.unwrap_or_else(|| event.body.clone());
-            if event.terminal
-                && event.call_id != record.invocation_id
-                && !body.contains(&event.body)
-            {
-                body = format!("{}\n\n{body}", event.body);
-            }
-            let truncated = body.len() > MAX_RESULT_BYTES;
-            let body = bounded(&body, MAX_RESULT_BYTES);
-            let mut text = match &record.payload {
-                JobPayload::Shell(metadata) => {
-                    let command = bounded(&metadata.command, MAX_SHELL_COMMAND_BYTES);
-                    let longest_run = command
-                        .split(|character| character != '`')
-                        .map(str::len)
-                        .max()
-                        .unwrap_or_default();
-                    let fence = "`".repeat((longest_run + 1).max(MIN_SHELL_COMMAND_FENCE_LENGTH));
-                    format!(
-                        "Shell {}: {kind}.\n\nCommand:\n{fence}bash\n{command}\n{fence}\n\n{body}",
-                        record.task_id
-                    )
-                }
-                JobPayload::Question(_) => question::delivery_text(&record.task_id, kind, &body),
-                JobPayload::Agent => {
-                    let ran_on = match event.terminal {
-                        true => ran_on(record.outcome.as_ref()),
-                        false => String::new(),
-                    };
-                    format!("Task {}: {kind}.{ran_on}\n\n{body}", record.task_id)
-                }
-            };
-            let reference = event
-                .terminal
-                .then_some(record.output_ref.as_ref())
-                .flatten();
-            if (truncated || record.outcome.is_none())
-                && let Some(reference) = reference
-            {
-                text.push_str(&format!(
-                    "\n\nRead complete task outcome: {}",
-                    task_output_access(reference)
-                ));
-            }
             if bytes + text.len() > MAX_BATCH_BYTES {
                 break;
             }
@@ -1676,7 +1634,7 @@ impl BackgroundTasks {
                 state.claims.insert(origin.event_id.clone(), claim);
             }
         }
-        if !messages.is_empty() {
+        if reports {
             messages.insert(0, Message::observation(DELIVERY_CUE.into()));
         }
         Ok(messages)
@@ -2525,10 +2483,79 @@ impl BackgroundTasks {
                 terminal: true,
                 accepted: false,
                 suppressed,
+                wait_nudge: false,
             });
         }
         self.persist(record).await
     }
+}
+
+/// What one report or outcome reads as when delivered, and the stored output
+/// it points to.
+fn delivery_text<'a>(
+    record: &'a TaskRecord,
+    event: &TaskEvent,
+) -> (String, Option<&'a ToolOutputRef>) {
+    let kind = match (event.terminal, record.kind(), record.state.as_str()) {
+        (false, ..) => "report",
+        (true, JobKind::Question, "succeeded") => question::ANSWERED_KIND,
+        (true, JobKind::Question, "cancelled") => question::WITHDRAWN_KIND,
+        (true, _, "succeeded") => "success",
+        (true, _, "failed") => "failure",
+        (true, _, state) => state,
+    };
+    let body = if event.terminal {
+        record.outcome.as_ref().map(outcome_text)
+    } else {
+        None
+    };
+    let mut body = body.unwrap_or_else(|| event.body.clone());
+    if event.terminal && event.call_id != record.invocation_id && !body.contains(&event.body) {
+        body = format!("{}\n\n{body}", event.body);
+    }
+    let truncated = body.len() > MAX_RESULT_BYTES;
+    let body = bounded(&body, MAX_RESULT_BYTES);
+    let mut text = match &record.payload {
+        JobPayload::Shell(metadata) => format!(
+            "Shell {}: {kind}.\n\nCommand:\n{}\n\n{body}",
+            record.task_id,
+            command_block(&metadata.command)
+        ),
+        JobPayload::Question(_) => question::delivery_text(&record.task_id, kind, &body),
+        JobPayload::Agent => {
+            let ran_on = match event.terminal {
+                true => ran_on(record.outcome.as_ref()),
+                false => String::new(),
+            };
+            format!("Task {}: {kind}.{ran_on}\n\n{body}", record.task_id)
+        }
+    };
+    let reference = event
+        .terminal
+        .then_some(record.output_ref.as_ref())
+        .flatten();
+    if (truncated || record.outcome.is_none())
+        && let Some(reference) = reference
+    {
+        text.push_str(&format!(
+            "\n\nRead complete task outcome: {}",
+            task_output_access(reference)
+        ));
+    }
+    (text, reference)
+}
+
+/// The command fenced as bash, bounded, with a fence longer than any run of
+/// backticks inside it.
+fn command_block(command: &str) -> String {
+    let command = bounded(command, MAX_SHELL_COMMAND_BYTES);
+    let longest_run = command
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat((longest_run + 1).max(MIN_SHELL_COMMAND_FENCE_LENGTH));
+    format!("{fence}bash\n{command}\n{fence}")
 }
 
 /// Which model answered, so a caller that sent one request to several models
@@ -2667,8 +2694,13 @@ fn current_event(state: &State, record: &TaskRecord) -> bool {
         && record.state != "cancelling"
 }
 
+/// A wait nudge asks about a command still running, so it lapses with the
+/// command, even one a restart left without its terminal event.
 fn deliverable(record: &TaskRecord, event: &TaskEvent) -> bool {
-    !event.accepted && !event.suppressed && (!event.terminal || !record.active())
+    !event.accepted
+        && !event.suppressed
+        && (!event.terminal || !record.active())
+        && (!event.wait_nudge || record.state == RUNNING_STATE)
 }
 
 fn bounded(text: &str, maximum: usize) -> String {
@@ -2714,10 +2746,11 @@ mod tests {
 
     use super::{
         ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, EMPTY_CONTINUATION,
-        FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_HISTORY_PAGE, MAX_INVOCATIONS, MAX_REPORT_BYTES,
-        MAX_REPORTS, MAX_RESULT_BYTES, RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION,
-        StopCause, TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_SETTLING, TRANSITION, TaskDelivery,
-        TaskReporter, TaskStatus, ran_on,
+        FAILED_TASK_REQUIRED, FOREIGN_SESSION, INTERRUPTED_STATE, MAX_HISTORY_PAGE,
+        MAX_INVOCATIONS, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES, RETRY_MISMATCH,
+        RUNNING_STATE, SELECTED_HISTORY_MISSING, STALE_INVOCATION, StopCause, TASK_DURATION_FIELD,
+        TASK_OUTPUT_LABEL, TASK_SETTLING, TRANSITION, TaskDelivery, TaskReporter, TaskStatus,
+        deliverable, ran_on,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -3240,6 +3273,44 @@ mod tests {
         }
     }
 
+    #[test_case(RUNNING_STATE, false => true ; "a_running_shell_hears_its_nudge")]
+    #[test_case(QUEUED, false => false ; "a_queued_shell_is_not_waited_on_yet")]
+    #[test_case(INTERRUPTED_STATE, false => false ; "an_interrupted_shell_drops_its_nudge")]
+    #[test_case(SUCCEEDED, false => false ; "a_finished_shell_drops_its_nudge")]
+    #[test_case(RUNNING_STATE, true => true ; "a_running_report_is_delivered")]
+    #[test_case(SUCCEEDED, true => true ; "a_finished_report_is_still_delivered")]
+    fn wait_nudges_lapse_with_the_running_shell(state: &str, report: bool) -> bool {
+        let mut record = projection_record();
+        record.state = state.into();
+        let event = TaskEvent {
+            sequence: 2,
+            event_id: EVENT.into(),
+            call_id: INVOCATION.into(),
+            body: RESULT.into(),
+            terminal: false,
+            accepted: false,
+            suppressed: false,
+            wait_nudge: !report,
+        };
+        deliverable(&record, &event)
+    }
+
+    #[test]
+    fn status_reports_leave_out_wait_nudges() {
+        let mut record = projection_record();
+        record.events.push(TaskEvent {
+            sequence: 2,
+            event_id: EVENT.into(),
+            call_id: INVOCATION.into(),
+            body: RESULT.into(),
+            terminal: false,
+            accepted: false,
+            suppressed: false,
+            wait_nudge: true,
+        });
+        assert!(TaskStatus::from(&record).reports.is_empty());
+    }
+
     #[test_case(json!({"answer": [1, true, null]}); "object")]
     #[test_case(json!([1, {"answer": true}]); "array")]
     #[test_case(json!(42); "number")]
@@ -3296,6 +3367,7 @@ mod tests {
                 terminal: true,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             });
             fixture.tasks.persist(record).await.unwrap();
             let messages = fixture.tasks.claim_messages().unwrap();
@@ -3379,6 +3451,7 @@ mod tests {
                 terminal: false,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             });
             fixture.tasks.persist(record).await.unwrap();
             let messages = fixture.tasks.claim_messages().unwrap();
@@ -3418,6 +3491,7 @@ mod tests {
                 terminal: false,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             })
             .collect();
         let status = TaskStatus::from(&record);
@@ -5027,6 +5101,7 @@ mod tests {
                 terminal: true,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             });
             fixture.tasks.persist(old.clone()).await.unwrap();
             let mut latest = old;
@@ -5085,6 +5160,7 @@ mod tests {
                 terminal: true,
                 accepted: false,
                 suppressed: true,
+                wait_nudge: false,
             });
             fixture.tasks.persist(record.clone()).await.unwrap();
             if protection == "child" {
@@ -5362,6 +5438,7 @@ mod tests {
                         terminal: true,
                         accepted: false,
                         suppressed: false,
+                        wait_nudge: false,
                     });
                 }
                 fixture.tasks.persist(record).await.unwrap();

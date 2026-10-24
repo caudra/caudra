@@ -138,6 +138,10 @@ pub struct TaskEvent {
     pub terminal: bool,
     pub accepted: bool,
     pub suppressed: bool,
+    /// Asks the owner whether a long-running shell still deserves the wait.
+    /// Delivered only while the shell runs, and replaced rather than stacked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_nudge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,6 +753,7 @@ mod tests {
                 terminal: true,
                 accepted: false,
                 suppressed: false,
+                wait_nudge: false,
             }],
         }
     }

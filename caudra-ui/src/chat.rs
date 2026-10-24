@@ -2048,6 +2048,8 @@ mod tests {
     const PRIVATE_EVENT: &str = "private-event";
     const DELIVERY_TASK: &str = "neat-wanted-cowbird";
     const DELIVERY_SUCCESS: &str = "All checks passed.";
+    const WAIT_NUDGE_TEXT: &str =
+        "<system-reminder>\n# Long-running shell\n\nStill running.\n</system-reminder>";
     const DELIVERY_BLOCKER: &str = "Permission is needed before continuing.";
     const DELIVERY_PREVIEW: &str =
         "First useful line.\nResult truncated; tool_output calm-blue-wren";
@@ -3641,6 +3643,29 @@ mod tests {
         assert_eq!(display[1].role, DisplayRole::Injected);
         assert_eq!(display[1].text, SYNTHETIC_TEXT);
         assert_eq!(display[2].role, DisplayRole::Assistant);
+    }
+
+    fn delivery_origin() -> TaskEventOrigin {
+        TaskEventOrigin {
+            task_id: DELIVERY_TASK.into(),
+            invocation_id: PRIVATE_INVOCATION.into(),
+            event_id: PRIVATE_EVENT.into(),
+        }
+    }
+
+    #[test_case(WAIT_NUDGE_TEXT, DisplayRole::Injected ; "a_wait_nudge_folds_like_a_reminder")]
+    #[test_case(DELIVERY_SUCCESS, DisplayRole::TaskDelivery(Box::new(delivery_origin())) ; "a_result_keeps_its_task_card")]
+    fn a_shell_observation_is_drawn_by_who_wrote_it(text: &str, role: DisplayRole) {
+        let msgs = vec![Message::task_observation(text.into(), delivery_origin())];
+        let display = history_to_display(
+            &crate::history_items(&msgs),
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        )
+        .0;
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, role);
     }
 
     #[test]

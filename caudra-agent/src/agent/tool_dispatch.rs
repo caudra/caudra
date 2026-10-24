@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, error, info_span, warn};
 
 use super::change_recording;
 use super::relative_paths::{MAX_SUGGESTIONS, PathBase, PathSuggestion};
-use crate::background::{JobScope, RunningShell, ShellJobMetadata, ShellLive};
+use crate::background::{JobScope, RunningShell, ShellJobMetadata, ShellLive, WaitNudge};
 use crate::code::hosted::direct_call_refusal;
 use crate::decisions::output_pointers::{self, OmittedOutput};
 use crate::decisions::{
@@ -1241,6 +1241,7 @@ async fn run_inner(
                 )
                 .await;
             }
+            let wait_nudge = wait_nudge(ctx, invocation.partial_output_filter(), started);
             let invocation = Arc::new(Mutex::new(Some(invocation)));
             let owned_invocation = Arc::clone(&invocation);
             let owned_id = id.clone();
@@ -1254,6 +1255,7 @@ async fn run_inner(
                     &ctx.subagent_history,
                     &ctx.cancel,
                     ctx.deadline,
+                    wait_nudge,
                     move |cancel, provenance| async move {
                         let _guards = (_preparation_guards, _guards);
                         let mut settlement = settlement;
@@ -1525,6 +1527,7 @@ async fn promote_at_limit(
                 &ctx.subagent_history,
                 &ctx.cancel,
                 ctx.deadline,
+                wait_nudge(ctx, reduce.clone(), started),
                 running,
                 move |done| settlement.settle(done),
             )
@@ -1590,6 +1593,20 @@ fn refused(
 
 /// Tells the model its command moved to the background, with the last of
 /// what it printed so far, reduced as its final result will be.
+/// Counts from when the command started, so a shell moved to the background
+/// at the foreground limit is asked about as early as one started there.
+fn wait_nudge(
+    ctx: &ToolContext,
+    reduce: Option<PartialOutputFilter>,
+    started: Instant,
+) -> Option<WaitNudge> {
+    ctx.config.shell_wait_nudge().map(|interval| WaitNudge {
+        interval,
+        reduce,
+        started,
+    })
+}
+
 fn promotion_notice(
     limit: Duration,
     task_id: &str,

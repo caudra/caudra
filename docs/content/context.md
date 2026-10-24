@@ -196,6 +196,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
 | Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items and no background work is running, at most once per run |
 | Stalled work | After a compaction, when a request has gone through `work_nudge_compactions` compactions with no work started |
+| Long-running shell | Every `shell_wait_nudge_minutes` while a background shell runs, to the agent waiting on it |
 | Autopilot | When [autopilot](/docs/autopilot/) engages, and again to withdraw that when it ends |
 | Model favorites | On the first message once the main agent can choose a task's model and you have [favorite models](/docs/commands/#models-and-reasoning), again when they or the jobs bound to them change, and once to withdraw them when none apply |
 
@@ -224,7 +225,7 @@ background_reminder_turns = 32
 
 The interval counts parent response groups committed to history. A response with several tool calls counts once, as does a committed partial or reasoning-only response. Child responses, compaction summaries, and retries without a committed response do not advance the count. Set `0` to disable periodic refresh. State-change and successful post-compaction refresh remain enabled.
 
-Reminders accompany requests the main agent was already going to make. They do not wake an idle chat, poll on a timer, or override Stop. Actual task reports and outcomes retain their [automatic continuation behavior](/docs/sessions/#background-tasks).
+These snapshots accompany requests the main agent was already going to make. They do not wake an idle chat, poll on a timer, or override Stop. The [long-running shell](#long-running-background-shells) reminder is the one reminder that can start a turn. Actual task reports and outcomes retain their [automatic continuation behavior](/docs/sessions/#background-tasks).
 
 Compaction preserves a Delegated work section with assignments, scope, expected results, and the parent's next steps. After summarization, Caudra reads runtime state again so a child that finished during compaction is not described as still running. Summary status is last observed. The host snapshot supplies current execution state, while attributed reports supply results. When nothing remains active, a clearing snapshot does not claim that the user's overall request is complete.
 
@@ -262,6 +263,27 @@ Set the number of compactions, or `0` to turn the reminder off:
 ```toml
 [agent]
 work_nudge_compactions = 3
+```
+
+### Long-running background shells
+
+A command can hang: it waits for input nobody gives, for a lock, or for a server that never answers. A background shell does not hold up the turn, so the agent waiting on it may not notice until the command reaches its `timeoutSec` deadline. Every 30 minutes a background shell runs, Caudra asks the agent waiting on it whether waiting longer is still necessary.
+
+The reminder gives the command, how long it has run, its estimate and timeout, and the last 20 lines of its output, filtered like a final result. When the output has not changed since the previous reminder, it says so. The agent then keeps waiting, cancels the command with `task_control` and fixes the cause, or checks on it first.
+
+The reminder reaches the agent the same way a shell result does:
+
+- A main agent that ended its turn is woken for it while the session is idle. A session waiting on your answer, or one whose automatic continuation you stopped, is woken once it can be again.
+- A subagent waiting on its own shell gets the reminder and continues.
+- A reminder nobody has read yet is updated in place, so one reminder waits at most. It is dropped once the command ends.
+
+The intervals count from the start of the command, including a command that [moved to the background](/docs/sessions/#execution-policies) at the foreground limit. Commands that run in the foreground are never asked about. Each reminder costs one model request.
+
+Set the interval in minutes, or `0` to turn the reminder off:
+
+```toml
+[agent]
+shell_wait_nudge_minutes = 60
 ```
 
 ## Four places to put knowledge

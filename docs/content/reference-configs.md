@@ -352,6 +352,13 @@ version = 5
 # Type: u32.
 # work_nudge_compactions = 2
 
+# Minutes a background shell may run before Caudra asks the agent waiting on it
+# whether to keep waiting or to check whether the command hangs. Repeated at
+# every further interval while it runs. Foreground shells are never nudged. 0
+# disables.
+# Type: u32.
+# shell_wait_nudge_minutes = 30
+
 # Let the main agent choose a model and reasoning level for each `task` call,
 # such as when you ask it to run work on a named model. When off, `task` has no
 # `model` or `thinking` argument and tasks run on the Subagent model or a

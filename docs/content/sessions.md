@@ -46,7 +46,7 @@ A shell command waits for up to 10 minutes. A command still running then moves t
 shell_foreground_limit_secs = 600
 ```
 
-A moved command keeps its row in `/shells`, and `/tasks cancel <task_id>` stops it.
+A moved command keeps its row in `/shells`, and `/tasks cancel <task_id>` stops it. Every 30 minutes a background shell runs, the agent waiting on it is asked whether the command [still deserves the wait](/docs/context/#long-running-background-shells).
 
 One-shot `--print` always waits: tasks and shell commands have no `background` argument, and every shell command waits for termination with no limit. Use the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK for background work.
 
@@ -54,7 +54,7 @@ One-shot `--print` always waits: tasks and shell commands have no `background` a
 
 The parent can keep working on a separate scope. When nothing independent remains, it gives a normal final answer explaining what is still pending. Background reports and final outcomes then start another parent run automatically at a safe boundary, even after that answer. The parent checks them against the latest instructions, verifies claims, and continues the original work without asking whether to continue. This works while the session stays open and automatic continuation has not been stopped. There is no need to poll, sleep, or repeat the delegated work.
 
-The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns.
+The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns. The reminder about a [long-running background shell](/docs/context/#long-running-background-shells) does, like a result.
 
 The footer keeps a differently styled spinner and a waiting label while background work or result delivery will wake the main agent. It does not mean a model request is running. Queued next messages and goal checks wait until that work settles and the main agent processes its results. See [Queue and Steering](/docs/queue/) for guide and replace behavior.
 
