@@ -5,6 +5,8 @@
 //! every refresh rebuilds the rows from [`crate::app::App::picker_tasks`], and
 //! previewing is a real focus with a restore on cancel.
 
+use std::cmp::Reverse;
+
 use caudra_agent::TaskCard;
 use caudra_grab::grab_scope;
 use caudra_storage::background::JobKind;
@@ -434,8 +436,7 @@ fn footer_with(controls: &[Hint]) -> Vec<Hint> {
 
 /// The main chat comes first and has no status. The subagents follow, running
 /// ones above finished ones so a long job never gets buried under the ones
-/// that already returned. Within a section, chat order. A workflow agent
-/// without a chat shows its roster state.
+/// that already returned. A workflow agent without a chat shows its roster state.
 fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
     let (mut main, mut running, mut finished) = (Vec::new(), Vec::new(), Vec::new());
     for mut task in tasks {
@@ -476,6 +477,7 @@ fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
             workflow: task.workflow.map(|workflow| workflow.run_id),
         });
     }
+    finished.sort_by_key(|item| Reverse(item.runtime.as_ref().map(|task| task.updated_at)));
     for (heading, bucket) in [
         (RUNNING_SECTION, &mut running),
         (FINISHED_SECTION, &mut finished),
@@ -644,7 +646,10 @@ mod tests {
         let _ = picker.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), position));
         let mut tasks = click_tasks(true, true, "succeeded");
         match change {
-            "reorder" => tasks.swap(1, 2),
+            "reorder" => {
+                tasks[2] = timed_task(DONE_ID, "succeeded", 1, 2);
+                tasks.swap(1, 2);
+            }
             "remove" => {
                 tasks.remove(1);
             }
@@ -686,6 +691,79 @@ mod tests {
             .unwrap(),
         );
         item
+    }
+
+    fn timed_task(id: &str, state: &str, created_at: u64, updated_at: u64) -> TaskInfo {
+        let mut item = runtime_task(state, false);
+        item.id = Arc::from(id);
+        let card = item.runtime.as_mut().unwrap();
+        card.task_id = id.into();
+        card.created_at = created_at;
+        card.updated_at = updated_at;
+        item
+    }
+
+    #[test_case("succeeded"; "success")]
+    #[test_case("failed"; "failure")]
+    #[test_case("cancelled"; "cancellation")]
+    fn finished_tasks_sort_by_completion_not_creation(state: &str) {
+        const EARLY_START: u64 = 10;
+        const LATE_START: u64 = 20;
+        const EARLY_FINISH: u64 = 30;
+        const LATE_FINISH: u64 = 40;
+        let items = build_items(vec![
+            timed_task(DONE_ID, "succeeded", LATE_START, EARLY_FINISH),
+            timed_task(RUNNING_ID, state, EARLY_START, LATE_FINISH),
+            task(MAIN_ID, LABEL, None, true),
+            task(INVOCATION, LABEL, Some(TaskStatus::Working), false),
+        ]);
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, [MAIN_ID, INVOCATION, RUNNING_ID, DONE_ID]);
+        let sections: Vec<_> = items.iter().map(PickerItem::section).collect();
+        assert_eq!(
+            sections,
+            [None, Some(RUNNING_SECTION), Some(FINISHED_SECTION), None]
+        );
+    }
+
+    #[test_case(0; "zero_timestamp")]
+    #[test_case(20; "equal_timestamps")]
+    fn finished_timestamp_ties_and_missing_times_keep_their_order(finished_at: u64) {
+        let items = build_items(vec![
+            task(INVOCATION, LABEL, Some(TaskStatus::Done), false),
+            timed_task(DONE_ID, "succeeded", 0, finished_at),
+            task(OUTPUT_ID, LABEL, Some(TaskStatus::Error), false),
+            timed_task(RUNNING_ID, "failed", 0, finished_at),
+        ]);
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, [DONE_ID, RUNNING_ID, INVOCATION, OUTPUT_ID]);
+    }
+
+    #[test_case(DONE_ID; "keep_finished_selection")]
+    #[test_case(RUNNING_ID; "keep_settling_selection")]
+    fn settlement_reorders_finished_tasks_without_changing_selection(selected: &str) {
+        const STARTED: u64 = 10;
+        const FINISHED: u64 = 20;
+        const LATEST: u64 = 30;
+        let tasks = |state, updated_at| {
+            vec![
+                timed_task(DONE_ID, "succeeded", STARTED, FINISHED),
+                timed_task(RUNNING_ID, state, STARTED, updated_at),
+            ]
+        };
+        let mut picker = TaskPicker::new();
+        picker.open(tasks("running", STARTED));
+        assert!(picker.select(selected));
+        assert!(picker.refresh(tasks("succeeded", LATEST)));
+        assert_eq!(picker.selected_id().as_deref(), Some(selected));
+        assert_eq!(picker.picker.item(0).unwrap().id, RUNNING_ID);
+        assert_eq!(
+            picker.picker.item(0).unwrap().section(),
+            Some(FINISHED_SECTION)
+        );
+        assert_eq!(picker.picker.item(1).unwrap().id, DONE_ID);
+        assert_eq!(picker.picker.item(1).unwrap().section(), None);
+        assert!(!picker.refresh(tasks("succeeded", LATEST)));
     }
 
     #[test_case(false; "result")]

@@ -1300,6 +1300,33 @@ mod tests {
         );
     }
 
+    #[test_case("succeeded"; "success")]
+    #[test_case("failed"; "failure")]
+    #[test_case("cancelled"; "cancellation")]
+    fn finished_shells_sort_by_completion_across_foreground_and_background(state: &str) {
+        const BACKGROUND_FINISHED_SECS: u64 = 10;
+        const LATEST_FINISHED_MS: u64 = 11_000;
+        const EARLIER_FINISHED_MS: u64 = 9_000;
+        let mut latest = record(FIRST_ID, ShellExecutionState::Succeeded, STARTED_MS);
+        latest.finished_at_ms = Some(LATEST_FINISHED_MS);
+        let mut earlier = record(SECOND_ID, ShellExecutionState::Failed, STARTED_MS + 1);
+        earlier.finished_at_ms = Some(EARLIER_FINISHED_MS);
+        let mut background = job(state);
+        background.updated_at = BACKGROUND_FINISHED_SECS;
+        let modal = opened(
+            vec![
+                view(earlier, ShellOutputView::Stored),
+                view(latest, ShellOutputView::Stored),
+            ],
+            vec![background],
+        );
+        let listed = rows(&modal);
+        let ids: Vec<_> = listed.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, [FIRST_ID, JOB_ID, SECOND_ID]);
+        let sections: Vec<_> = listed.iter().map(|item| item.section()).collect();
+        assert_eq!(sections, [Some(FINISHED_SECTION), None, None]);
+    }
+
     #[test_case(ShellExecutionState::Running, true; "running")]
     #[test_case(ShellExecutionState::Preparing, true; "preparing")]
     #[test_case(ShellExecutionState::Cancelling, false; "cancelling")]
