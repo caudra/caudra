@@ -82,6 +82,12 @@ impl LedgerPurpose {
             _ => None,
         }
     }
+
+    /// Whether whoever spends writes the ledger row itself, so a runtime that also
+    /// sees the spend as an event must not write another.
+    pub const fn ledgered_at_source(self) -> bool {
+        matches!(self, Self::Decision)
+    }
 }
 
 /// One turn's contribution, before it is folded into its bucket.

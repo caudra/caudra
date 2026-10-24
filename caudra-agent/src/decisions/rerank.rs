@@ -405,6 +405,7 @@ mod tests {
 
     struct RerankEngine {
         requests: Arc<Mutex<Vec<(DecisionRequest, Duration)>>>,
+        started: flume::Sender<()>,
         barrier: Option<Barrier>,
     }
 
@@ -419,6 +420,7 @@ mod tests {
                 request.clone(),
                 deadline.saturating_duration_since(Instant::now()),
             ));
+            let _ = self.started.send(());
             if let Some(barrier) = &self.barrier {
                 barrier.wait().await;
             }
@@ -453,6 +455,7 @@ mod tests {
         decisions: Decisions,
         session: CaudraId,
         requests: Arc<Mutex<Vec<(DecisionRequest, Duration)>>>,
+        started: flume::Receiver<()>,
         root: TempDir,
     }
 
@@ -482,12 +485,14 @@ mod tests {
             config.features.memory_search = mode.clone();
             config.features.history_search = mode;
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let (started, entered) = flume::unbounded();
             let session = CaudraId::generate();
             let decisions = Decisions::with_engine(
                 config,
                 &StateDir::from_path(root.path().into()),
                 RerankEngine {
                     requests: requests.clone(),
+                    started,
                     barrier: concurrent_batches.map(Barrier::new),
                 },
             )
@@ -498,6 +503,7 @@ mod tests {
                 decisions,
                 session,
                 requests,
+                started: entered,
                 root,
             }
         }
@@ -737,7 +743,7 @@ mod tests {
             candidates[0][REPLY] = json!(PENDING);
             let mut pending = Box::pin(fixture.rerank(&candidates, Some(&manager), &cancel));
             assert!(future::poll_once(&mut pending).await.is_none());
-            assert!(!fixture.requests().is_empty());
+            fixture.started.recv_async().await.unwrap();
             if cancelled {
                 trigger.cancel();
             } else {

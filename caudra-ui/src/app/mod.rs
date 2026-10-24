@@ -7579,6 +7579,9 @@ impl App {
         self.state
             .session_mut()
             .add_model_usage(&key, purpose, usage.billed(cost, billing));
+        if purpose.ledgered_at_source() {
+            return;
+        }
         self.storage_writer.record_usage(TurnUsage {
             provider: provider.to_owned(),
             account: account.unwrap_or_default().to_owned(),

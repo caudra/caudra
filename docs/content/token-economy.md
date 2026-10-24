@@ -211,6 +211,7 @@ Two things worth knowing about the numbers:
 
 - Runs started with `--ephemeral` leave no session behind, and their spend is still recorded and labelled, so the totals stay complete.
 - A model with no published price contributes tokens but no cost. Caudra reports how many turns those were rather than counting them as free, so the total is a floor.
+- Decision calls also count toward the session's cost, a goal's spend, and Autopilot's `max_cost`. A provider bills a decision call whether or not Caudra waits for it, so a call that timed out or was cancelled keeps reading its reply for up to 30 seconds and books what it cost.
 
 The ledger holds one row per hour, model, project, and purpose, so it stays small on its own. [Retention](/docs/sessions/#retention) never touches it, and `--prune-older-than` is how you trim it.
 

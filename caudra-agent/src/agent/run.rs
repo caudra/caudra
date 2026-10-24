@@ -68,8 +68,8 @@ use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
-    NoteDraft, NoteOutcome, NoteSink, PendingNote, push_fitting, question_tool_nudge,
-    redact_decision_text, redacted_excerpt,
+    NoteDraft, NoteOutcome, NoteSink, PendingNote, USAGE_PROVIDER as DECISION_PROVIDER,
+    push_fitting, question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
 use crate::mcp::code::catalog;
@@ -2372,6 +2372,7 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         self.hold_cache_warmer();
+        self.drain_decision_spend();
         // Whatever the previous turn started and nobody took is reported
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
@@ -3809,6 +3810,7 @@ impl<'h> Agent<'h> {
         if let Some(warmer) = &self.cache_warmer {
             warmer.run_settled();
         }
+        self.drain_decision_spend();
         info!(
             self.num_turns,
             total_input = self.total_usage.input,
@@ -3957,6 +3959,28 @@ impl<'h> Agent<'h> {
         warmer.hold();
         for spend in warmer.take_spend() {
             self.record_spend(spend.usage, spend.cost, spend.billing);
+        }
+    }
+
+    /// Books what decision calls spent since the last drain against the run's budgets,
+    /// and reports it so the runtime counts it in the session's spend. A subagent drains
+    /// the queue it shares with its parent, and the runtime books its report as the
+    /// subagent's.
+    fn drain_decision_spend(&self) {
+        let Some(decisions) = self.permissions.decisions() else {
+            return;
+        };
+        for (model, spent) in decisions.take_spend() {
+            self.record_spend(spent.usage, spent.cost, Billing::Api);
+            self.event_tx.try_send(AgentEvent::ModelUsage {
+                usage: spent.usage,
+                cost: spent.cost,
+                billing: Billing::Api,
+                provider: DECISION_PROVIDER.into(),
+                model,
+                purpose: LedgerPurpose::Decision,
+                account: None,
+            });
         }
     }
 
@@ -5089,6 +5113,11 @@ mod tests {
     const AUTH_ERROR_STATUS: u16 = 401;
     const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
     const DECISION_GOAL: &str = "tests pass";
+    const FEATURE_INPUT_TOKENS: u64 = 1_000;
+    /// `jev-latest`, the default TypeSafe model, per million input tokens.
+    const JEV_INPUT_RATE: f64 = 0.042;
+    const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+    const COST_TOLERANCE: f64 = 1e-12;
     const LOGS_EVERY_CHECK: &str = "each goal check must log one evaluation and report its fields";
     const DECISION_VERDICT: &str = "not yet verified";
     const DECISION_SKILL: &str = "test-helper";
@@ -5198,7 +5227,7 @@ mod tests {
                 model: request.model.clone(),
                 answers,
                 usage: Usage {
-                    input_tokens: 0,
+                    input_tokens: FEATURE_INPUT_TOKENS,
                     output_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
@@ -5246,6 +5275,65 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn decision_spend_is_counted_against_the_goal_and_reported_before_done() {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(MockProvider::new(vec![]), &mut history);
+            agent.goal.set(DECISION_GOAL).unwrap();
+            let decisions = feature_decisions(
+                &directory,
+                FeatureMode::Shadow,
+                0.0,
+                1.0,
+                false,
+                Arc::default(),
+            );
+            agent.permissions.set_decisions(Some(decisions.clone()));
+            decisions
+                .evaluate(
+                    DecisionFeature::Workflow,
+                    &json!({"reply": DECISION_VERDICT}),
+                    decision_questions::QUESTION_TOOL_NUDGE.as_ref().unwrap(),
+                    &DecisionContext::default(),
+                )
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            agent.emit_done(DoneReason::EndTurn).unwrap();
+            let expected = FEATURE_INPUT_TOKENS as f64 * JEV_INPUT_RATE / TOKENS_PER_MILLION;
+            let reported: Vec<_> = events.try_iter().map(|envelope| envelope.event).collect();
+            let [
+                AgentEvent::ModelUsage {
+                    provider,
+                    purpose: LedgerPurpose::Decision,
+                    cost: Some(cost),
+                    billing: Billing::Api,
+                    ..
+                },
+                AgentEvent::Done { .. },
+            ] = reported.as_slice()
+            else {
+                panic!("expected the decision spend, then done: {reported:?}");
+            };
+            assert_eq!(provider, DECISION_PROVIDER);
+            assert!((cost - expected).abs() < COST_TOLERANCE);
+            let goal_cost = agent.goal.snapshot().unwrap().cost.unwrap();
+            assert!((goal_cost - expected).abs() < COST_TOLERANCE);
+            agent.emit_done(DoneReason::EndTurn).unwrap();
+            assert!(matches!(
+                events
+                    .try_iter()
+                    .map(|envelope| envelope.event)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [AgentEvent::Done { .. }]
+            ));
+        });
     }
 
     fn decision_skill(name: &str) -> SkillInventoryEntry {

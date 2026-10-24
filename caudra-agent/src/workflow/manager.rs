@@ -1472,7 +1472,9 @@ complete(result);
     #[test_case(RunStatus::Paused; "pause")]
     #[test_case(RunStatus::Cancelled; "stop")]
     #[test_case(RunStatus::Interrupted; "shutdown")]
-    fn workflow_decision_cancellation_drops_pending_engine(status: RunStatus) {
+    fn workflow_decision_cancellation_fails_the_call_and_lets_the_engine_read_on(
+        status: RunStatus,
+    ) {
         smol::block_on(async {
             let fixture = Fixture::new();
             fixture.user_workflow(DECIDING, DECISION_FAILURE_BODY);
@@ -1505,13 +1507,13 @@ complete(result);
                     }
                     _ => runtime.shutdown().await,
                 }
-                ended.recv_async().await.unwrap();
             };
             futures_lite::future::race(interrupt, async {
                 smol::Timer::after(CONTROL_TEST_TIMEOUT).await;
                 panic!("{CONTROL_TIMEOUT_ERROR}");
             })
             .await;
+            assert!(ended.is_empty());
             let runtime = fixture.spawn().await;
             let store = &runtime.store;
             let row = store

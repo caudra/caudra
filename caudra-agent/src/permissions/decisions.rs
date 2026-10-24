@@ -934,6 +934,7 @@ mod tests {
             let mut enforcement =
                 Box::pin(controlled_enforcement(&manager, &scopes, &sender, &cancel));
             assert!(future::poll_once(&mut enforcement).await.is_none());
+            service.started.recv_async().await.unwrap();
             assert_eq!(service.calls.load(Ordering::Relaxed), 1);
             assert!(shown_events(&events).is_empty());
             manager.set_session_mode(Some(mode));

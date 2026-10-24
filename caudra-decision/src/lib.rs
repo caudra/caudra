@@ -7,7 +7,9 @@ pub mod question_set;
 pub mod wire;
 
 pub use client::HttpDecisionClient;
-pub use engine::{CachedDecisionEngine, DecisionEngine, DecisionError};
+pub use engine::{
+    Billed, CachedDecisionEngine, Deadlines, DecisionEngine, DecisionError, Meter, Unmetered,
+};
 pub use question_set::QuestionSet;
 pub use wire::{
     Answer, ChoiceAnswer, DecisionRequest, DecisionResponse, NoulAnswer, Question, QuestionType,

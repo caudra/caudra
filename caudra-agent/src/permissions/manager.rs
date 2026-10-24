@@ -600,10 +600,15 @@ impl PermissionManager {
             .mutation_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        *self
+        let mut current = self
             .decisions
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = decisions;
+            .unwrap_or_else(|error| error.into_inner());
+        if let (Some(next), Some(previous)) = (&decisions, current.as_ref()) {
+            next.inherit_spend(previous);
+        }
+        *current = decisions;
+        drop(current);
         self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
     }

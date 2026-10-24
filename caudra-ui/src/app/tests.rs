@@ -14178,6 +14178,31 @@ fn repair_accounting_persists_once_without_changing_context(subagent: bool, stal
     assert_eq!(rows[0].cost, GOAL_COST);
 }
 
+#[test]
+fn decision_spend_counts_for_the_session_without_a_second_ledger_row() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let usage = TokenUsage {
+        input: GOAL_INPUT,
+        ..Default::default()
+    };
+    app.update(agent_msg(AgentEvent::ModelUsage {
+        usage,
+        cost: Some(GOAL_COST),
+        billing: Billing::Api,
+        provider: OTHER_PROVIDER.into(),
+        model: LEDGER_MODEL.into(),
+        purpose: LedgerPurpose::Decision,
+        account: None,
+    }));
+    assert_eq!(app.state.cost, Some(GOAL_COST));
+    assert_eq!(
+        app.state.session.usage_by_model()[&format!("{OTHER_PROVIDER}/{LEDGER_MODEL}")].cost,
+        Some(GOAL_COST)
+    );
+    drain_writer(app, writer);
+    assert!(UsageLedger::open(&dir).unwrap().buckets(None).unwrap().is_empty());
+}
+
 const GAP_CALL: &str = "unrecorded-call";
 const GAP_REASON: &str = "a workspace quota is exhausted";
 const GAP_UNSAVED: &str = "a call that ran unrecorded must stay on the session it changed";

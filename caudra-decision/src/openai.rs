@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::engine::DecisionError;
+use crate::engine::{Billed, DecisionError};
 use crate::question_set::{bounded_json, rendered_text};
 use crate::wire::{
     Answer, ChoiceAnswer, DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_STATE_CHARS,
@@ -13,7 +13,7 @@ use crate::wire::{
 const MIN_CHOICES: usize = 2;
 const PREDICATE_CRITERIA: &str = "\n\nCriteria (false and true outcomes):\n";
 const INVALID_SCHEMA: &str = "response does not match the OpenAI Decisions JSON schema";
-const INVALID_NAMES: &str = "answer names do not match the requested questions";
+pub(crate) const INVALID_NAMES: &str = "answer names do not match the requested questions";
 const DUPLICATE_VALUE: &str = "answer contains duplicate probability values";
 const INVALID_CACHED_USAGE: &str = "cached and cache-write tokens exceed the input tokens";
 const LEVEL_LABEL: &str = "label";
@@ -182,6 +182,21 @@ impl OpenAiUsage {
             cache_write_tokens,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct BilledReply {
+    model: String,
+    usage: OpenAiUsage,
+}
+
+/// The model and usage of a reply whose answers may not decode.
+pub(crate) fn billed(bytes: &[u8]) -> Option<Billed> {
+    let reply: BilledReply = serde_json::from_slice(bytes).ok()?;
+    Some(Billed {
+        model: reply.model,
+        usage: reply.usage.normalized().ok()?,
+    })
 }
 
 #[derive(Deserialize)]

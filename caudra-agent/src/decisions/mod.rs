@@ -10,12 +10,13 @@ pub(crate) mod questions;
 mod rerank;
 mod shell_effect;
 mod source_code_context;
+mod spend;
 mod state;
 mod workflow;
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_io::Timer;
@@ -25,8 +26,8 @@ use caudra_config::decisions::{
 };
 use caudra_config::providers::{PROVIDERS_FILE, ProvidersFileError};
 use caudra_decision::{
-    CachedDecisionEngine, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
-    HttpDecisionClient, QuestionSet, Usage,
+    Billed, CachedDecisionEngine, Deadlines, DecisionEngine, DecisionError, DecisionRequest,
+    DecisionResponse, HttpDecisionClient, QuestionSet, Usage,
 };
 use caudra_providers::TokenUsage;
 use caudra_providers::decision_pricing::decision_cost;
@@ -65,13 +66,15 @@ pub use rerank::{
 pub use source_code_context::{
     CodeSymbol, reordered_note, rerank_source_code_context, source_code_context_out_of_deadline,
 };
+use spend::{DECISION_LINGER, MeteredCall};
+pub use spend::{DecisionSpend, Spent};
 pub use state::{DecisionState, DecisionStateError};
 pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt, redacted_leaves};
 
 const CACHE_ENTRIES: usize = 128;
 const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
 const DEADLINE_REJECTED: &str = "timeout exceeds the supported clock range";
-const USAGE_PROVIDER: &str = "decision";
+pub(crate) const USAGE_PROVIDER: &str = "decision";
 const EFFECT_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_META: &str = "protocol";
 const ENDPOINT_META: &str = "endpoint";
@@ -415,6 +418,9 @@ struct Inner {
     state_dir: StateDir,
     log: Arc<Mutex<Option<DecisionLog>>>,
     usage: Mutex<Option<UsageLedger>>,
+    /// Shared by every service on this engine, to bound the calls left lingering.
+    lingering: Arc<AtomicUsize>,
+    spend: OnceLock<Arc<DecisionSpend>>,
     permission_questions: QuestionSet,
     tainted: AtomicBool,
     status: Mutex<DecisionStatus>,
@@ -459,7 +465,13 @@ impl Decisions {
             Self::permission_questions()?
         };
         Ok(Self::build(
-            config, state_dir, engine, key_source, None, questions,
+            config,
+            state_dir,
+            engine,
+            key_source,
+            None,
+            questions,
+            Arc::default(),
         ))
     }
 
@@ -479,6 +491,7 @@ impl Decisions {
             None,
             None,
             Self::permission_questions()?,
+            Arc::default(),
         ))
     }
 
@@ -489,6 +502,7 @@ impl Decisions {
         key_source: Option<DecisionKeySource>,
         session: Option<CaudraId>,
         permission_questions: QuestionSet,
+        lingering: Arc<AtomicUsize>,
     ) -> Self {
         Self(Arc::new(Inner {
             config,
@@ -498,6 +512,8 @@ impl Decisions {
             state_dir: state_dir.clone(),
             log: Arc::new(Mutex::new(None)),
             usage: Mutex::new(None),
+            lingering,
+            spend: OnceLock::new(),
             permission_questions,
             tainted: AtomicBool::new(false),
             status: Mutex::new(DecisionStatus::default()),
@@ -532,11 +548,33 @@ impl Decisions {
             self.0.key_source,
             Some(session),
             self.0.permission_questions.clone(),
+            Arc::clone(&self.0.lingering),
         )
     }
 
     pub fn session(&self) -> Option<CaudraId> {
         self.0.session
+    }
+
+    /// What this service's calls spent and nobody has booked yet.
+    fn spend(&self) -> &Arc<DecisionSpend> {
+        self.0.spend.get_or_init(Arc::default)
+    }
+
+    /// Takes the spend not booked yet, for the agent to count.
+    pub fn take_spend(&self) -> BTreeMap<String, Spent> {
+        self.spend().take()
+    }
+
+    /// Books this service's spend where `previous` booked its own, so a session that
+    /// switches engines keeps what the old one's calls spent, even those still lingering.
+    pub fn inherit_spend(&self, previous: &Self) {
+        let spend = Arc::clone(previous.spend());
+        if let Err(spend) = self.0.spend.set(spend)
+            && !Arc::ptr_eq(&spend, self.spend())
+        {
+            self.spend().absorb(&spend);
+        }
     }
 
     pub fn mode(&self, feature: &DecisionFeature) -> &FeatureMode {
@@ -650,7 +688,7 @@ impl Decisions {
         timeout_ms: u64,
     ) -> DecisionOutcome {
         let started = Instant::now();
-        let result = self.call(&request, started, timeout_ms).await;
+        let result = self.call(&request, started, timeout_ms, context).await;
         let latency_ms = elapsed_ms(started);
         {
             let mut status = self
@@ -672,9 +710,6 @@ impl Decisions {
         let receipt = self
             .record(&feature, questions, &request, &result, latency_ms, context)
             .await;
-        if let Ok(response) = &result {
-            self.record_usage(&request.model, response, context).await;
-        }
         DecisionOutcome {
             newly_failing: self.track_failure(&feature, result.is_err()),
             result,
@@ -707,11 +742,14 @@ impl Decisions {
         }
     }
 
+    /// Books what the endpoint billed for the call, whether it answered, failed, ran past
+    /// `timeout_ms`, or its caller stopped waiting.
     async fn call(
         &self,
         request: &DecisionRequest,
         started: Instant,
         timeout_ms: u64,
+        context: &DecisionContext,
     ) -> Result<DecisionResponse, DecisionError> {
         let deadline = started
             .checked_add(Duration::from_millis(timeout_ms))
@@ -720,21 +758,29 @@ impl Decisions {
         if Instant::now() >= deadline {
             return Err(DecisionError::Timeout);
         }
-        let engine = self.0.engine.as_ref().ok_or(DecisionError::Unreachable)?;
-        let result = future::race(
-            async {
-                Timer::at(deadline).await;
-                Err(DecisionError::Timeout)
-            },
-            engine.decide(request, deadline),
-        )
-        .await;
-        if Instant::now() >= deadline {
-            return Err(DecisionError::Timeout);
-        }
-        let response = result?;
-        response.validate_for(request)?;
-        Ok(response)
+        let engine = self.0.engine.clone().ok_or(DecisionError::Unreachable)?;
+        let deadlines = Deadlines {
+            answer: deadline,
+            linger: deadline.checked_add(DECISION_LINGER).unwrap_or(deadline),
+        };
+        let mut call = MeteredCall::start(
+            self,
+            engine,
+            request.clone(),
+            deadlines,
+            ledger_cwd(context),
+        );
+        let reply = call.reply(deadline).await.ok_or(DecisionError::Timeout)?;
+        let result = if Instant::now() >= deadline {
+            Err(DecisionError::Timeout)
+        } else {
+            reply.and_then(|response| {
+                response.validate_for(request)?;
+                Ok(response)
+            })
+        };
+        call.book().await;
+        result
     }
 
     async fn record(
@@ -872,38 +918,38 @@ impl Decisions {
         Ok(())
     }
 
-    async fn record_usage(
-        &self,
-        model: &str,
-        response: &DecisionResponse,
-        context: &DecisionContext,
-    ) {
-        if response.cache_hit {
+    /// Books each billed reply of a call for `model` in the usage ledger, and in the
+    /// spend the session's agent counts next.
+    async fn book(&self, model: &str, cwd: &str, billed: Vec<Billed>) {
+        if billed.is_empty() {
             return;
         }
-        let cwd = context
-            .project
-            .as_ref()
-            .and_then(|project| DecisionState::new(&Value::String(project.clone())).ok())
-            .and_then(|state| state.value().as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let usage = token_usage(&response.usage);
-        let cost = self.endpoint().and_then(|endpoint| {
-            decision_cost(&endpoint.protocol, &[&response.model, model], &usage)
-        });
-        let turn = TurnUsage {
-            provider: USAGE_PROVIDER.into(),
-            account: String::new(),
-            model: model.into(),
-            cwd,
-            purpose: LedgerPurpose::Decision,
-            input: usage.input,
-            output: usage.output,
-            cache_creation: usage.cache_creation,
-            cache_read: usage.cache_read,
-            cost,
-            subscription: false,
-        };
+        let spent: Vec<_> = billed
+            .iter()
+            .map(|billed| {
+                let usage = token_usage(&billed.usage);
+                let cost = self.endpoint().and_then(|endpoint| {
+                    decision_cost(&endpoint.protocol, &[&billed.model, model], &usage)
+                });
+                (usage, cost)
+            })
+            .collect();
+        let turns: Vec<_> = spent
+            .iter()
+            .map(|(usage, cost)| TurnUsage {
+                provider: USAGE_PROVIDER.into(),
+                account: String::new(),
+                model: model.into(),
+                cwd: cwd.into(),
+                purpose: LedgerPurpose::Decision,
+                input: usage.input,
+                output: usage.output,
+                cache_creation: usage.cache_creation,
+                cache_read: usage.cache_read,
+                cost: *cost,
+                subscription: false,
+            })
+            .collect();
         let service = self.clone();
         let result = smol::unblock(move || {
             let mut ledger = service
@@ -915,15 +961,30 @@ impl Decisions {
                 *ledger = Some(UsageLedger::open(&service.0.state_dir)?);
             }
             if let Some(ledger) = ledger.as_ref() {
-                ledger.record(&turn)?;
+                for turn in &turns {
+                    ledger.record(turn)?;
+                }
             }
             Ok::<_, SessionError>(())
         })
         .await;
         if result.is_err() {
-            tracing::warn!("decision usage could not be recorded");
+            tracing::warn!(model, "decision usage could not be recorded");
+        }
+        for (usage, cost) in spent {
+            self.spend().add(model, usage, cost);
         }
     }
+}
+
+/// The project a decision's spend is filed under, as its decision rows name it.
+fn ledger_cwd(context: &DecisionContext) -> String {
+    context
+        .project
+        .as_ref()
+        .and_then(|project| DecisionState::new(&Value::String(project.clone())).ok())
+        .and_then(|state| state.value().as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// The ledger counts uncached input apart from cache reads and writes, where
@@ -1008,14 +1069,16 @@ fn failure_phrase(error: &DecisionError, latency_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, Instant};
 
-    use std::collections::BTreeSet;
-
     use async_io::{Async, Timer};
     use async_trait::async_trait;
+    use caudra_config::PermissionsConfig;
     use caudra_config::decisions::{
         DecisionEndpoint, DecisionFeatures, DecisionProtocol, DecisionThresholds, DecisionsConfig,
         FeatureMode, RawDecisionsConfig,
@@ -1025,6 +1088,7 @@ mod tests {
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
         QuestionSet, Usage,
     };
+    use caudra_providers::TokenUsage;
     use caudra_storage::decision_log::{
         DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, StatsThresholds,
     };
@@ -1036,11 +1100,14 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
+    use crate::permissions::PermissionManager;
+
+    use super::spend::MAX_LINGERING_CALLS;
     use super::state::MAX_STATE_BYTES;
     use super::{
         DecisionContext, DecisionFeature, Decisions, DecisionsError, ENDPOINT_META, ENGINE_HTTP,
         ENGINE_INVALID, ENGINE_REFUSED, ENGINE_TIMED_OUT, ENGINE_UNREACHABLE, PROTOCOL_META,
-        PermissionAction, PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED, Screening,
+        PermissionAction, PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED, Screening, Spent,
         Withholding, questions, record_meta, stats_thresholds,
     };
 
@@ -1072,6 +1139,12 @@ mod tests {
     const UNKNOWN_FEATURE: &str = "retired_feature";
     const HTTP_STATUS: u16 = 503;
     const INVALID_ANSWER: &str = "missing answer";
+    const PRICED_MODEL: &str = "jev-1.14.0";
+    const GATED_INPUT_TOKENS: u64 = 2_000;
+    const JEV_INPUT_RATE: f64 = 0.042;
+    const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+    const SPEND_WAIT: Duration = Duration::from_secs(10);
+    const SPEND_POLL: Duration = Duration::from_millis(5);
     static CHOICE_SET: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
         Some(QuestionSet::new("routing", serde_json::from_value(json!({
             "tool": {"type": "choice", "instructions": {"question": "Which tool fits?"}, "criteria": {"candidate_0": "Reads files", "none": "No match"}},
@@ -2118,5 +2191,232 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome.fresh_failure(), Some(expected(outcome.latency_ms)));
         });
+    }
+
+    /// Holds every call until released, and says when it starts and when its
+    /// future is gone, whether it answered or was cancelled.
+    struct GatedEngine {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        dropped: flume::Sender<()>,
+    }
+
+    struct DropSignal(flume::Sender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[async_trait]
+    impl DecisionEngine for GatedEngine {
+        async fn decide(
+            &self,
+            request: &DecisionRequest,
+            _deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            let _signal = DropSignal(self.dropped.clone());
+            let _ = self.entered.send(());
+            let _ = self.release.recv_async().await;
+            Ok(DecisionResponse {
+                model: request.model.clone(),
+                answers: request
+                    .questions
+                    .keys()
+                    .map(|id| (id.clone(), Answer::Noul(NoulAnswer { noul: 0.0 })))
+                    .collect(),
+                usage: Usage {
+                    input_tokens: GATED_INPUT_TOKENS,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                cache_hit: false,
+            })
+        }
+    }
+
+    struct Gate {
+        service: Decisions,
+        entered: flume::Receiver<()>,
+        release: flume::Sender<()>,
+        dropped: flume::Receiver<()>,
+        root: tempfile::TempDir,
+    }
+
+    fn gated(timeout_ms: u64) -> Gate {
+        let root = tempfile::tempdir().unwrap();
+        let (entered_tx, entered) = flume::unbounded();
+        let (release, release_rx) = flume::unbounded();
+        let (dropped_tx, dropped) = flume::unbounded();
+        let mut config = config(false);
+        config.timeout_ms = timeout_ms;
+        config.endpoint.as_mut().unwrap().model = PRICED_MODEL.into();
+        let service = Decisions::with_engine(
+            config,
+            &StateDir::from_path(root.path().into()),
+            GatedEngine {
+                entered: entered_tx,
+                release: release_rx,
+                dropped: dropped_tx,
+            },
+        )
+        .unwrap();
+        Gate {
+            service,
+            entered,
+            release,
+            dropped,
+            root,
+        }
+    }
+
+    async fn screen(service: &Decisions) -> Result<DecisionResponse, DecisionError> {
+        service
+            .evaluate(
+                DecisionFeature::AutoScreening,
+                &json!({COMMAND_KEY: "pwd"}),
+                &Decisions::permission_questions().unwrap(),
+                &DecisionContext::default(),
+            )
+            .await
+            .unwrap()
+            .result
+    }
+
+    /// What a call left lingering books, once it does, or nothing by `SPEND_WAIT`.
+    async fn booked(service: &Decisions) -> BTreeMap<String, Spent> {
+        let deadline = Instant::now() + SPEND_WAIT;
+        loop {
+            let spent = service.take_spend();
+            if !spent.is_empty() || Instant::now() >= deadline {
+                return spent;
+            }
+            Timer::after(SPEND_POLL).await;
+        }
+    }
+
+    fn gated_spend() -> Spent {
+        Spent {
+            usage: TokenUsage {
+                input: GATED_INPUT_TOKENS as u32,
+                ..TokenUsage::default()
+            },
+            cost: Some(GATED_INPUT_TOKENS as f64 * JEV_INPUT_RATE / TOKENS_PER_MILLION),
+        }
+    }
+
+    enum Abandoned {
+        TimedOut,
+        CallerDropped,
+    }
+
+    #[test_case(Abandoned::TimedOut; "timed_out")]
+    #[test_case(Abandoned::CallerDropped; "caller_dropped")]
+    fn an_abandoned_call_reads_on_and_books_its_reply(abandoned: Abandoned) {
+        smol::block_on(async {
+            let gate = gated(match abandoned {
+                Abandoned::TimedOut => TEST_TIMEOUT_MS,
+                Abandoned::CallerDropped => TEST_NORMAL_TIMEOUT_MS,
+            });
+            match abandoned {
+                Abandoned::TimedOut => {
+                    assert_eq!(screen(&gate.service).await, Err(DecisionError::Timeout));
+                }
+                Abandoned::CallerDropped => {
+                    future::race(
+                        async {
+                            screen(&gate.service).await.ok();
+                        },
+                        async {
+                            gate.entered.recv_async().await.unwrap();
+                        },
+                    )
+                    .await;
+                }
+            }
+            assert!(gate.service.take_spend().is_empty());
+            gate.release.send(()).unwrap();
+            assert_eq!(
+                booked(&gate.service).await,
+                BTreeMap::from([(PRICED_MODEL.to_owned(), gated_spend())])
+            );
+            let ledger = UsageLedger::open(&StateDir::from_path(gate.root.path().into()))
+                .unwrap()
+                .lifetime()
+                .unwrap();
+            assert_eq!(ledger.priced_turns, 1);
+        });
+    }
+
+    #[test]
+    fn past_the_lingering_cap_an_abandoned_call_is_cancelled() {
+        smol::block_on(async {
+            let gate = gated(TEST_TIMEOUT_MS);
+            gate.service
+                .0
+                .lingering
+                .store(MAX_LINGERING_CALLS, Ordering::Release);
+            assert_eq!(screen(&gate.service).await, Err(DecisionError::Timeout));
+            gate.dropped.recv_async().await.unwrap();
+            assert!(gate.service.take_spend().is_empty());
+        });
+    }
+
+    #[test]
+    fn an_answered_call_is_booked_before_it_returns() {
+        smol::block_on(async {
+            let gate = gated(TEST_NORMAL_TIMEOUT_MS);
+            gate.release.send(()).unwrap();
+            screen(&gate.service).await.unwrap();
+            assert_eq!(
+                gate.service.take_spend(),
+                BTreeMap::from([(PRICED_MODEL.to_owned(), gated_spend())])
+            );
+        });
+    }
+
+    #[test_case(false; "fresh_successor")]
+    #[test_case(true; "successor_with_its_own_spend")]
+    fn a_switched_service_keeps_the_spend_of_the_one_it_replaced(successor_spent: bool) {
+        let gate = gated(TEST_NORMAL_TIMEOUT_MS);
+        let session = CaudraId::generate();
+        let previous = gate.service.for_session(session);
+        let next = gate.service.for_session(session);
+        let spent = gated_spend();
+        previous.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+        if successor_spent {
+            next.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+        }
+        next.inherit_spend(&previous);
+        let taken = next.take_spend();
+        let expected_input = spent.usage.input * if successor_spent { 2 } else { 1 };
+        assert_eq!(taken[PRICED_MODEL].usage.input, expected_input);
+        assert!(previous.take_spend().is_empty());
+    }
+
+    #[test]
+    fn subagents_share_a_session_spend_and_other_sessions_do_not() {
+        let gate = gated(TEST_NORMAL_TIMEOUT_MS);
+        let manager = PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            PathBuf::from(SECRET_PATH),
+            Arc::default(),
+        );
+        let session = CaudraId::generate();
+        let replaced = gate.service.for_session(session);
+        manager.set_decisions(Some(replaced.clone()));
+        manager.set_decisions(Some(gate.service.for_session(session)));
+        let spent = gated_spend();
+        replaced.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+        let other_session = manager.fork_session(CaudraId::generate());
+        assert!(other_session.decisions().unwrap().take_spend().is_empty());
+        let subagent = manager.fork();
+        assert_eq!(
+            subagent.decisions().unwrap().take_spend(),
+            BTreeMap::from([(PRICED_MODEL.to_owned(), spent)])
+        );
+        assert!(manager.decisions().unwrap().take_spend().is_empty());
     }
 }

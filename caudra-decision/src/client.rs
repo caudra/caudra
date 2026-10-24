@@ -9,12 +9,17 @@ use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use isahc::{HttpClient, Request};
 use jiff::fmt::rfc2822::DateTimeParser;
+use serde::Deserialize;
 use url::Url;
 
-use crate::engine::{DecisionEngine, DecisionError, check_deadline};
+use crate::engine::{
+    Billed, Deadlines, DecisionEngine, DecisionError, Meter, Unmetered, check_deadline,
+};
 use crate::openai;
 use crate::question_set::bounded_json;
-use crate::wire::{DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
+use crate::wire::{
+    DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Usage,
+};
 
 const MAX_RETRIES: u32 = 2;
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
@@ -103,11 +108,16 @@ impl HttpDecisionClient {
         })
     }
 
+    /// Reads a reply until `deadlines.linger` and meters it before checking
+    /// it, but never starts an attempt after `deadlines.answer`, so a caller
+    /// that stopped waiting pays for nothing new.
     async fn send(
         &self,
         request: &DecisionRequest,
-        deadline: Instant,
+        deadlines: &Deadlines,
+        meter: &dyn Meter,
     ) -> Result<DecisionResponse, DecisionError> {
+        let deadline = deadlines.answer;
         let body = match self.protocol {
             Protocol::TypeSafe => bounded_json(request, MAX_REQUEST_BYTES)?,
             Protocol::OpenAi => openai::encode(request)?,
@@ -116,7 +126,7 @@ impl HttpDecisionClient {
         loop {
             check_deadline(deadline)?;
             let mut builder = Request::post(self.endpoint.clone())
-                .timeout(deadline.saturating_duration_since(Instant::now()))
+                .timeout(deadlines.linger.saturating_duration_since(Instant::now()))
                 .redirect_policy(RedirectPolicy::None)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json");
@@ -184,6 +194,9 @@ impl HttpDecisionClient {
             if bytes.len() > MAX_RESPONSE_BYTES {
                 return Err(DecisionError::Invalid("response exceeds the byte limit"));
             }
+            if let Some(billed) = self.billed(&bytes) {
+                meter.billed(billed);
+            }
             check_deadline(deadline)?;
             let response = match self.protocol {
                 Protocol::TypeSafe => serde_json::from_slice(&bytes).map_err(|_| {
@@ -196,6 +209,25 @@ impl HttpDecisionClient {
             return Ok(response);
         }
     }
+
+    /// Only the model and usage of a reply, whatever its answers say.
+    fn billed(&self, bytes: &[u8]) -> Option<Billed> {
+        match self.protocol {
+            Protocol::TypeSafe => serde_json::from_slice::<BilledReply>(bytes)
+                .ok()
+                .map(|reply| Billed {
+                    model: reply.model,
+                    usage: reply.usage,
+                }),
+            Protocol::OpenAi => openai::billed(bytes),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BilledReply {
+    model: String,
+    usage: Usage,
 }
 
 fn is_retryable(status: StatusCode) -> bool {
@@ -244,10 +276,20 @@ impl DecisionEngine for HttpDecisionClient {
         request: &DecisionRequest,
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError> {
-        check_deadline(deadline)?;
+        self.decide_metered(request, Deadlines::at(deadline), &Unmetered)
+            .await
+    }
+
+    async fn decide_metered(
+        &self,
+        request: &DecisionRequest,
+        deadlines: Deadlines,
+        meter: &dyn Meter,
+    ) -> Result<DecisionResponse, DecisionError> {
+        check_deadline(deadlines.answer)?;
         request.validate()?;
-        future::race(self.send(request, deadline), async {
-            Timer::at(deadline).await;
+        future::race(self.send(request, &deadlines, meter), async {
+            Timer::at(deadlines.linger).await;
             Err(DecisionError::Timeout)
         })
         .await
@@ -272,8 +314,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{BACKOFF_INITIAL, BACKOFF_MAX, HttpDecisionClient, backoff, retry_delay};
-    use crate::engine::{CachedDecisionEngine, DecisionEngine, DecisionError};
-    use crate::openai::tests as openai_fixture;
+    use crate::engine::{
+        Billed, CachedDecisionEngine, Deadlines, DecisionEngine, DecisionError, Meter,
+    };
+    use crate::openai::{INVALID_NAMES, tests as openai_fixture};
     use crate::wire::{
         DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
         tests::{request, response},
@@ -803,6 +847,94 @@ mod tests {
         release.send(()).unwrap();
         task.join().unwrap();
         assert_eq!(result, Err(DecisionError::Timeout));
+    }
+
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<Billed>>);
+
+    impl Meter for Recorded {
+        fn billed(&self, billed: Billed) {
+            self.0.lock().unwrap().push(billed);
+        }
+    }
+
+    enum Reply {
+        Refused,
+        WrongNames,
+        Late,
+    }
+
+    #[test_case(Reply::Refused, DecisionError::Refused; "refusal")]
+    #[test_case(Reply::WrongNames, DecisionError::Invalid(INVALID_NAMES); "invalid_answers")]
+    #[test_case(Reply::Late, DecisionError::Timeout; "after_the_answer_deadline")]
+    fn billed_replies_are_metered_whatever_the_caller_gets(reply: Reply, expected: DecisionError) {
+        let mut body = openai_fixture::response();
+        match reply {
+            Reply::Refused => body["answers"][0] = json!({"type": "refusal", "name": "damaged"}),
+            Reply::WrongNames => body["answers"][0]["name"] = json!("unasked"),
+            Reply::Late => {}
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/decisions", listener.local_addr().unwrap());
+        let now = Instant::now();
+        let deadlines = Deadlines {
+            answer: now + STREAM_DEADLINE,
+            linger: now + TEST_TIMEOUT,
+        };
+        let answer = deadlines.answer;
+        let late = matches!(reply, Reply::Late);
+        let task = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            read_request(&mut stream);
+            if late {
+                thread::sleep(answer.saturating_duration_since(Instant::now()));
+            }
+            let _ = stream.write_all(http_response(STATUS_OK, &body.to_string(), "").as_bytes());
+        });
+        let meter = Recorded::default();
+        let result = future::block_on(client_for(&endpoint, true).decide_metered(
+            &openai_fixture::request(),
+            deadlines,
+            &meter,
+        ));
+        task.join().unwrap();
+        assert_eq!(result, Err(expected));
+        let normalized = openai_fixture::normalized();
+        assert_eq!(
+            *meter.0.lock().unwrap(),
+            [Billed {
+                model: normalized.model,
+                usage: normalized.usage,
+            }]
+        );
+    }
+
+    #[test]
+    fn no_attempt_starts_after_the_answer_deadline() {
+        let server = server(vec![http_response(
+            STATUS_UNAVAILABLE,
+            "",
+            "Retry-After: 1\r\n",
+        )]);
+        let now = Instant::now();
+        let meter = Recorded::default();
+        let result = future::block_on(client(&server.endpoint).decide_metered(
+            &request(),
+            Deadlines {
+                answer: now + STREAM_DEADLINE,
+                linger: now + TEST_TIMEOUT,
+            },
+            &meter,
+        ));
+        server.task.join().unwrap();
+        assert_eq!(
+            result,
+            Err(DecisionError::Http {
+                status: STATUS_UNAVAILABLE
+            })
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert!(meter.0.lock().unwrap().is_empty());
     }
 
     #[test_case(false; "typesafe")]

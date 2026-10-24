@@ -8,10 +8,48 @@ use futures_lite::future;
 use thiserror::Error;
 
 use crate::question_set::{bounded_json, request_hash};
-use crate::wire::{DecisionRequest, DecisionResponse, MAX_RESPONSE_BYTES};
+use crate::wire::{DecisionRequest, DecisionResponse, MAX_RESPONSE_BYTES, Usage};
 
 pub const MAX_CACHE_ENTRIES: usize = 256;
 pub const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// What one reply from the endpoint was billed for, read before the answers
+/// are checked, so a reply that is refused, invalid or late still counts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Billed {
+    pub model: String,
+    pub usage: Usage,
+}
+
+/// Where an engine reports each billed reply as it arrives.
+pub trait Meter: Send + Sync {
+    fn billed(&self, billed: Billed);
+}
+
+/// A meter for callers that book nothing.
+pub struct Unmetered;
+
+impl Meter for Unmetered {
+    fn billed(&self, _: Billed) {}
+}
+
+/// `answer` is when the caller stops waiting. A request already sent may read
+/// its reply until `linger`, so its usage can still be metered, but no new
+/// attempt starts after `answer`.
+#[derive(Clone, Debug)]
+pub struct Deadlines {
+    pub answer: Instant,
+    pub linger: Instant,
+}
+
+impl Deadlines {
+    pub fn at(deadline: Instant) -> Self {
+        Self {
+            answer: deadline,
+            linger: deadline,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum DecisionError {
@@ -36,6 +74,24 @@ pub trait DecisionEngine: Send + Sync {
         request: &DecisionRequest,
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError>;
+
+    /// `decide`, reporting every billed reply to `meter`. An engine that only
+    /// implements `decide` meters the answers it returns.
+    async fn decide_metered(
+        &self,
+        request: &DecisionRequest,
+        deadlines: Deadlines,
+        meter: &dyn Meter,
+    ) -> Result<DecisionResponse, DecisionError> {
+        let response = self.decide(request, deadlines.answer).await?;
+        if !response.cache_hit {
+            meter.billed(Billed {
+                model: response.model.clone(),
+                usage: response.usage.clone(),
+            });
+        }
+        Ok(response)
+    }
 }
 
 #[async_trait]
@@ -46,6 +102,17 @@ impl<E: DecisionEngine + ?Sized> DecisionEngine for Arc<E> {
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError> {
         self.as_ref().decide(request, deadline).await
+    }
+
+    async fn decide_metered(
+        &self,
+        request: &DecisionRequest,
+        deadlines: Deadlines,
+        meter: &dyn Meter,
+    ) -> Result<DecisionResponse, DecisionError> {
+        self.as_ref()
+            .decide_metered(request, deadlines, meter)
+            .await
     }
 }
 
@@ -83,6 +150,20 @@ impl<E: DecisionEngine> DecisionEngine for CachedDecisionEngine<E> {
         request: &DecisionRequest,
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError> {
+        self.decide_metered(request, Deadlines::at(deadline), &Unmetered)
+            .await
+    }
+
+    /// A late reply that validates is still cached, so the next identical
+    /// call gets what was already paid for.
+    async fn decide_metered(
+        &self,
+        request: &DecisionRequest,
+        deadlines: Deadlines,
+        meter: &dyn Meter,
+    ) -> Result<DecisionResponse, DecisionError> {
+        let deadline = deadlines.answer;
+        let linger = deadlines.linger;
         check_deadline(deadline)?;
         request.validate()?;
         let key = request_hash(request)?;
@@ -101,12 +182,14 @@ impl<E: DecisionEngine> DecisionEngine for CachedDecisionEngine<E> {
             check_deadline(deadline)?;
             return Ok(response);
         }
-        let response = future::race(self.inner.decide(request, deadline), async {
-            Timer::at(deadline).await;
-            Err(DecisionError::Timeout)
-        })
+        let response = future::race(
+            self.inner.decide_metered(request, deadlines, meter),
+            async {
+                Timer::at(linger).await;
+                Err(DecisionError::Timeout)
+            },
+        )
         .await?;
-        check_deadline(deadline)?;
         response.validate_for(request)?;
         if self.capacity > 0 {
             let bytes = bounded_json(&response, MAX_RESPONSE_BYTES)
@@ -152,7 +235,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CachedDecisionEngine, DecisionEngine, DecisionError, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES,
+        Billed, CachedDecisionEngine, Deadlines, DecisionEngine, DecisionError, MAX_CACHE_BYTES,
+        MAX_CACHE_ENTRIES, Meter,
     };
     use crate::wire::{
         DecisionRequest, DecisionResponse,
@@ -242,6 +326,31 @@ mod tests {
             assert!(cache.decide(&request(), deadline).await.is_err());
             assert_eq!(cache.inner.calls.load(Ordering::Relaxed), 2);
             assert!(cache.cache.lock().unwrap().entries.is_empty());
+        });
+    }
+
+    #[derive(Default)]
+    struct Counted(AtomicUsize);
+
+    impl Meter for Counted {
+        fn billed(&self, _: Billed) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn only_a_cache_miss_is_metered() {
+        future::block_on(async {
+            let cache = CachedDecisionEngine::new(FakeEngine::default(), 1);
+            let meter = Counted::default();
+            let deadlines = || Deadlines::at(Instant::now() + TEST_TIMEOUT);
+            for _ in 0..2 {
+                cache
+                    .decide_metered(&request(), deadlines(), &meter)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(meter.0.load(Ordering::Relaxed), 1);
         });
     }
 
