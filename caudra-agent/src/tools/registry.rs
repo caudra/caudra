@@ -597,6 +597,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Holds the parsed input so start-event and `execute` share one parse pass.
 /// Permission and mutation metadata belongs here because only the parsed call
 /// knows which authorities and files it will touch.
+/// See [`ToolInvocation::partial_output_filter`].
+pub type PartialOutputFilter = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub trait ToolInvocation: Send + Sync {
     fn active_plan_access(&self) -> Option<PlanAccess> {
         None
@@ -604,6 +607,12 @@ pub trait ToolInvocation: Send + Sync {
 
     fn start_header(&self) -> HeaderFuture;
     fn shell_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// Reduces what a shell command has printed so far as its final result
+    /// will be reduced, so output shown before the command ends costs no more.
+    /// Taken before `execute` consumes the invocation.
+    fn partial_output_filter(&self) -> Option<PartialOutputFilter> {
         None
     }
     /// Whether the effect happens on a remote host, where a cancelled call

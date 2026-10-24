@@ -1,5 +1,5 @@
 use caudra_config::AgentConfig;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::prompt::{ResolvedSlots, execution_guidance, shell_execution_guidance};
 
@@ -9,6 +9,8 @@ use super::{
 };
 
 const SHELL_EXECUTION_HEADING: &str = "\n\nExecution:\n";
+const SHELL_BACKGROUND_PROPERTY: &str = "background";
+const SHELL_BACKGROUND_DESCRIPTION: &str = "Start the command in the background and return a receipt at once, for a server, a watcher, or anything expected to outlast the foreground limit. Its terminal result arrives automatically. Default false.";
 
 pub fn configure_declared(
     tools: &mut Value,
@@ -32,8 +34,21 @@ pub fn configure_declared(
             description.push_str(SHELL_EXECUTION_HEADING);
             description.push_str(&shell_execution_guidance(
                 shell_supported,
-                config.shell_async_threshold_secs,
+                config.shell_foreground_limit_secs,
             ));
+        }
+        if let Some(properties) = tool
+            .get_mut("input_schema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        {
+            match shell_supported {
+                true => properties.insert(
+                    SHELL_BACKGROUND_PROPERTY.into(),
+                    json!({"type": "boolean", "default": false, "description": SHELL_BACKGROUND_DESCRIPTION}),
+                ),
+                false => properties.remove(SHELL_BACKGROUND_PROPERTY),
+            };
         }
     }
 }
@@ -87,7 +102,8 @@ mod tests {
     const SHELL_DESCRIPTION: &str = "Execute a Bash command. Workcell validates the requested timeout and enforces its deadline. Descendants retaining output pipes are terminated.";
     const SHELL_DEFAULT_TIMEOUT: u64 = 120;
     const SHELL_MAX_TIMEOUT: u64 = 21600;
-    const CUSTOM_THRESHOLD: u64 = 937;
+    const CUSTOM_LIMIT_SECS: u64 = 937;
+    const CUSTOM_LIMIT: &str = "15m37s";
     const PROFILE_SUMMARY: &str = "- builtin: Built-in delegation instructions";
     const CUSTOM_INSTRUCTION: &str =
         "Custom background and foreground wording must remain untouched.";
@@ -164,7 +180,11 @@ mod tests {
         let text = definition.to_string().to_lowercase();
         if background {
             assert!(text.contains("receipt"));
-            assert!(text.contains(if task { "foreground" } else { "synchronously" }));
+            assert!(text.contains(if task {
+                "foreground"
+            } else {
+                "moves to the background"
+            }));
         } else {
             for forbidden in ["background", "async", "receipt", "promot"] {
                 assert!(!text.contains(forbidden), "{forbidden}: {text}");
@@ -206,8 +226,17 @@ mod tests {
             );
             assert!(text.contains("find auth middleware"));
         } else {
-            assert_eq!(*schema, ShellContract.schema());
-            assert_eq!(text.contains(&CUSTOM_THRESHOLD.to_string()), background);
+            let mut expected = ShellContract.schema();
+            if background {
+                expected["properties"]["background"] = json!({"type": "boolean", "default": false, "description": super::SHELL_BACKGROUND_DESCRIPTION});
+            }
+            assert_eq!(*schema, expected);
+            assert_eq!(text.contains(CUSTOM_LIMIT), background);
+            let validator = jsonschema::validator_for(schema).unwrap();
+            assert_eq!(
+                validator.is_valid(&json!({"command": "make serve", "background": true})),
+                background
+            );
             assert!(
                 definition["description"]
                     .as_str()
@@ -221,7 +250,7 @@ mod tests {
     fn actual_inventory_and_prompt_match_session_support() {
         let registry = registry();
         let config = AgentConfig {
-            shell_async_threshold_secs: CUSTOM_THRESHOLD,
+            shell_foreground_limit_secs: CUSTOM_LIMIT_SECS,
             ..AgentConfig::default()
         };
         for (task_cap, shell_cap) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -245,7 +274,7 @@ mod tests {
                 assert!(system.contains(&prompt::task_execution_guidance(task_cap)));
                 assert!(system.contains(&prompt::shell_execution_guidance(
                     shell_cap,
-                    CUSTOM_THRESHOLD
+                    CUSTOM_LIMIT_SECS
                 )));
                 let mut published = definitions.declared;
                 assert_contract(find(&published, "task"), task_cap, true);
@@ -276,7 +305,7 @@ mod tests {
         let registry = registry();
         let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
         let config = AgentConfig {
-            shell_async_threshold_secs: CUSTOM_THRESHOLD,
+            shell_foreground_limit_secs: CUSTOM_LIMIT_SECS,
             ..AgentConfig::default()
         };
         for (task_cap, shell_cap) in [(true, true), (false, false), (true, false), (false, true)] {
@@ -327,7 +356,7 @@ mod tests {
             }
             assert!(rendered.contains(&prompt::shell_execution_guidance(
                 supported,
-                config.shell_async_threshold_secs
+                config.shell_foreground_limit_secs
             )));
         }
     }

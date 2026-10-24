@@ -366,10 +366,11 @@ version = 5
 # Type: bool.
 # deferred_questions = true
 
-# Requested shell timeout above which a shell call returns an admission receipt
-# instead of waiting; independent of the enforced execution deadline.
+# How long a shell call waits for its command before a command still running
+# moves to the background and the call returns a receipt; the command keeps
+# running until it exits or reaches its own timeout.
 # Type: u64, at least 1.
-# shell_async_threshold_secs = 120
+# shell_foreground_limit_secs = 600
 
 # Show an ETA on a shell card and in `/shells`, from a small model trained on
 # this machine's past shell runs. It only labels the command: timeouts and

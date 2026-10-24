@@ -105,6 +105,7 @@ mod shells;
 mod work;
 
 pub use caudra_storage::background::{QuestionJobMetadata, ShellJobMetadata};
+pub(crate) use jobs::RunningShell;
 pub use jobs::{JobScope, MAX_DEFERRED_QUESTIONS};
 pub use shells::{ShellExecutions, ShellLive, ShellOutputView, ShellSnapshot, ShellView};
 pub use work::SessionWork;

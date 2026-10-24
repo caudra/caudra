@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use caudra_config::AgentConfig;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
@@ -10,8 +11,8 @@ use crate::{
     template::Vars,
     tools::{
         BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GREP_TOOL_NAME,
-        FILE_INDEX_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, native::plan::SESSION_PLAN_LABEL,
-        profile_policy::PLAN_TOOL_NAME,
+        FILE_INDEX_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, humanize_duration,
+        native::plan::SESSION_PLAN_LABEL, profile_policy::PLAN_TOOL_NAME,
     },
 };
 
@@ -75,10 +76,13 @@ pub fn task_execution_guidance(background_supported: bool) -> String {
     }
 }
 
-pub fn shell_execution_guidance(background_supported: bool, threshold_secs: u64) -> String {
+pub fn shell_execution_guidance(background_supported: bool, foreground_limit_secs: u64) -> String {
     match background_supported {
         false => "Shell calls wait for termination and return the terminal result. timeoutSec is the enforced execution deadline.".into(),
-        true => format!("Shell delivery is selected at admission, never promoted by elapsed runtime. By default, an effective timeout at or below {threshold_secs} seconds returns the terminal result synchronously; above {threshold_secs} seconds it returns an async admission receipt and the terminal result arrives automatically. When configured duration estimates are enforced, the lesser of the estimate and execution deadline selects delivery against that threshold. The tool's default applies when timeoutSec is omitted unless an enabled duration estimate supplies a longer bounded default. Explicit timeoutSec is never changed and remains the enforced execution deadline; never extend it just to influence scheduling.\n\n{ASYNC_RESULT_GUIDANCE}"),
+        true => {
+            let limit = humanize_duration(Duration::from_secs(foreground_limit_secs));
+            format!("A call waits for the command for up to {limit}. A command still running then moves to the background instead of stopping: the call returns a receipt with the output so far, the command keeps running until it exits or reaches timeoutSec, and its terminal result arrives automatically. timeoutSec is only the execution deadline, so set it to what the command needs. Pass `background: true` to start a server, a watcher, or anything you expect to outlast {limit} in the background at once.\n\n{ASYNC_RESULT_GUIDANCE}")
+        }
     }
 }
 
@@ -96,7 +100,7 @@ pub fn execution_guidance(
     if shell_exposed {
         fragments.push(shell_execution_guidance(
             shell_background_supported,
-            config.shell_async_threshold_secs,
+            config.shell_foreground_limit_secs,
         ));
     }
     fragments.join("\n\n")
@@ -916,7 +920,8 @@ mod tests {
     const PLUGIN_EFFICIENT_TOOL: &str = "plugin_tool";
     const INSTRUCTIONS: &str = "<instructions>project rules</instructions>";
     const MEMORY_VIEW: &str = "# Memory\n\n<memory>\n0+1|note a.md\n</memory>\n";
-    const EXECUTION_TEST_THRESHOLD: u64 = 937;
+    const EXECUTION_TEST_LIMIT_SECS: u64 = 937;
+    const EXECUTION_TEST_LIMIT: &str = "15m37s";
     const CUSTOM_EXECUTION_INSTRUCTION: &str =
         "User-authored background and foreground instructions remain intact.";
     const ACTIVE_PLAN: &str = "active-plan";
@@ -1022,7 +1027,7 @@ mod tests {
     #[test_case(true; "task_may_background")]
     fn composed_execution_guidance_respects_independent_support(task_supported: bool) {
         let config = AgentConfig {
-            shell_async_threshold_secs: EXECUTION_TEST_THRESHOLD,
+            shell_foreground_limit_secs: EXECUTION_TEST_LIMIT_SECS,
             ..AgentConfig::default()
         };
         for shell_supported in [false, true] {
@@ -1037,12 +1042,9 @@ mod tests {
                 assert!(rendered.contains(&task_execution_guidance(task_supported)));
                 assert!(rendered.contains(&shell_execution_guidance(
                     shell_supported,
-                    EXECUTION_TEST_THRESHOLD
+                    EXECUTION_TEST_LIMIT_SECS
                 )));
-                assert_eq!(
-                    rendered.contains(&EXECUTION_TEST_THRESHOLD.to_string()),
-                    shell_supported
-                );
+                assert_eq!(rendered.contains(EXECUTION_TEST_LIMIT), shell_supported);
                 if !task_supported && !shell_supported {
                     for forbidden in ["background", "async", "receipt", "promote"] {
                         assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");

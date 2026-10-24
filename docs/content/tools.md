@@ -196,7 +196,7 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 Execute a Bash command on the MCP server host.
 
-In the TUI, ACP, and the persistent stream-JSON SDK, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt, and a timeout at or below it waits for the command. Print always waits. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.
+In the TUI, ACP, and the persistent stream-JSON SDK, a call waits for up to `agent.shell_foreground_limit_secs` (10 minutes by default). A command still running then moves to the background without a restart: the call returns a receipt with the output so far, reduced by the same filter as the final result, and the result arrives when the command exits or reaches its `timeoutSec` deadline. `background: true` starts a command in the background at once. Print always waits, with no limit. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.
 
 Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
 

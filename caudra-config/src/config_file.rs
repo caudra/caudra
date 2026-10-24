@@ -56,7 +56,8 @@ const ALLOW_REMOTE_WHY: &str =
 const DECISION_ENGINE_WHY: &str = "the decision engine is no longer experimental";
 const AUTOPILOT_WHY: &str = "autopilot is no longer experimental";
 const TASK_EXECUTION_WHY: &str = "the model now chooses per task whether it runs in the background";
-const SHELL_EXECUTION_WHY: &str = "a shell call now returns early only when its requested timeout exceeds `agent.shell_async_threshold_secs`";
+const SHELL_EXECUTION_WHY: &str = "a shell call now waits up to `agent.shell_foreground_limit_secs` and then moves to the background, or starts there with `background: true`";
+const SHELL_ASYNC_THRESHOLD_WHY: &str = "timeoutSec is now only the deadline; a shell call moves to the background after `agent.shell_foreground_limit_secs`, or starts there with `background: true`";
 const CONTINUATION_TURNS_WHY: &str =
     "truncation is now a steering rule, limited by `agent.steering.rules.truncation.max_attempts`";
 const SHELL_ETA_WHY: &str = "shell ETAs come from a local model now, switched by `agent.shell_eta`";
@@ -270,6 +271,9 @@ fn upgrade_from_4(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
     upgrade
         .because(SHELL_EXECUTION_WHY)
         .retire_key(&["agent"], "shell_execution");
+    upgrade
+        .because(SHELL_ASYNC_THRESHOLD_WHY)
+        .retire_key(&["agent"], "shell_async_threshold_secs");
     Ok(())
 }
 
@@ -386,7 +390,7 @@ version = 5
 # autopilot = true
 workflows = true
 ";
-    const EXECUTION_V4: &str = "version = 4\n\n[agent]\ntask_execution = \"sync\"\nshell_execution = \"async\"\ntodo_reminder = false\n";
+    const EXECUTION_V4: &str = "version = 4\n\n[agent]\ntask_execution = \"sync\"\nshell_execution = \"async\"\nshell_async_threshold_secs = 300\ntodo_reminder = false\n";
     const EXECUTION_V4_UPGRADED: &str = "\
 # Upgraded by Caudra 9.9.9 on 2026-10-20: version 4 → 5.
 version = 5
@@ -394,8 +398,10 @@ version = 5
 [agent]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.task_execution`, because the model now chooses per task whether it runs in the background.
 # task_execution = \"sync\"
-# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.shell_execution`, because a shell call now returns early only when its requested timeout exceeds `agent.shell_async_threshold_secs`.
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.shell_execution`, because a shell call now waits up to `agent.shell_foreground_limit_secs` and then moves to the background, or starts there with `background: true`.
 # shell_execution = \"async\"
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.shell_async_threshold_secs`, because timeoutSec is now only the deadline; a shell call moves to the background after `agent.shell_foreground_limit_secs`, or starts there with `background: true`.
+# shell_async_threshold_secs = 300
 todo_reminder = false
 ";
     const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ncross_session_messaging = true\nautomations = true\n";

@@ -115,9 +115,9 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 
 ### Background tasks
 
-Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. `shell_execution.async_threshold_secs` gives the requested-timeout threshold.
+Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. `shell_execution.foreground_limit_secs` gives how long a shell command waits before it moves to the background, and is `null` when commands always wait.
 
-One-shot `--print`, including `--output-format stream-json` without stream input, always waits: tasks have no `background` argument, and every shell command waits for termination. See [execution policies](/docs/sessions/#execution-policies) for the timeout threshold.
+One-shot `--print`, including `--output-format stream-json` without stream input, always waits: tasks have no `background` argument, and every shell command waits for termination. See [execution policies](/docs/sessions/#execution-policies) for the foreground limit.
 
 Task controls use the same `control_request` envelope as workflow controls:
 

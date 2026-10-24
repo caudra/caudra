@@ -26,10 +26,10 @@ pub use caudra_config::{
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG, stale_read_message};
 pub use path_locks::{LockKey, PathGuards, PathLocks};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
-    PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
-    ToolDefinitions, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
-    ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PartialOutputFilter,
+    PermissionIntent, PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool,
+    ToolAudience, ToolDefinitions, ToolEffect, ToolError, ToolExecResult, ToolFailure,
+    ToolInvocation, ToolRegistry, ToolSource,
 };
 pub use report::{ToolReport, ToolState, builtin_report};
 

@@ -503,6 +503,10 @@ impl ShellExecution {
         context
     }
 
+    pub(crate) fn live(&self) -> ShellLive {
+        self.live.clone()
+    }
+
     pub(crate) fn finish(mut self, done: &ToolDoneEvent) {
         let state = if done.is_error && self.cancel.is_cancelled() {
             ShellExecutionState::Cancelled

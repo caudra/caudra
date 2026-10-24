@@ -2856,8 +2856,9 @@ fn init_payload(
     payload["background_tasks"] = Value::Bool(jobs);
     payload["background_shell"] = Value::Bool(jobs);
     payload["background_jobs"] = Value::Bool(jobs);
-    payload["shell_execution"] =
-        serde_json::json!({"async_threshold_secs": config.shell_async_threshold_secs});
+    payload["shell_execution"] = serde_json::json!({
+        "foreground_limit_secs": jobs.then_some(config.shell_foreground_limit_secs)
+    });
     payload["job_kinds"] = if jobs {
         serde_json::json!(["agent", "shell"])
     } else {
@@ -3946,7 +3947,9 @@ mod tests {
         assert!(payload.get("task_execution").is_none());
         assert_eq!(
             payload["shell_execution"],
-            serde_json::json!({"async_threshold_secs": config.shell_async_threshold_secs})
+            serde_json::json!({
+                "foreground_limit_secs": jobs.then_some(config.shell_foreground_limit_secs)
+            })
         );
         assert_eq!(payload["background_tasks"], jobs);
         assert_eq!(payload["background_shell"], jobs);

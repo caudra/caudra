@@ -3,7 +3,8 @@ use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use caudra_providers::Message;
 use caudra_storage::{
@@ -18,7 +19,7 @@ use caudra_storage::{
     tool_ledger::ToolOutcome,
     tool_outputs::ToolOutputStore,
 };
-use futures_lite::FutureExt;
+use futures_lite::{FutureExt, future};
 use serde_json::{Value, json};
 
 use super::{
@@ -27,8 +28,11 @@ use super::{
     bounded, deliverable, shells::ShellExecutions,
 };
 use crate::{
-    CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
-    background_reminder::RuntimeSnapshot, tool_output::shell_output_label, tools::Deadline,
+    CancelToken, CancelTrigger, History, SubagentHistoryStore, TaskCard, TaskProvenance,
+    ToolDoneEvent,
+    background_reminder::RuntimeSnapshot,
+    tool_output::shell_output_label,
+    tools::{Deadline, ToolFailure},
 };
 
 const MAX_OWNER_ACTIVE: usize = 16;
@@ -46,6 +50,73 @@ const RETRY_MISMATCH: &str = "job retry differs from the admitted request";
 const FOREIGN_JOB: &str = "job does not belong to this invocation";
 const JOB_PANIC: &str =
     "owned job execution panicked; execution effects may require reconciliation";
+const ADOPTION_WITHDRAWN: &str =
+    "the command stayed with its caller because its job was stopped before it ran";
+const ADOPTION_RETRIED: &str = "this call already has a job, so the command stayed with its caller";
+const SHELL_TASK_GONE: &str = "the shell command's task was already released";
+
+/// A foreground shell command still running on a task of its own, which a
+/// job can take over without restarting it. Dropping it stops the command
+/// and lets it clean up on its own.
+pub(crate) struct RunningShell {
+    task: Option<smol::Task<ToolDoneEvent>>,
+    trigger: Option<CancelTrigger>,
+}
+
+impl RunningShell {
+    /// `trigger` is the only way to stop `task`: it must be rooted, not a
+    /// child of the turn, or the command would stop when the turn does.
+    pub(crate) fn new(task: smol::Task<ToolDoneEvent>, trigger: CancelTrigger) -> Self {
+        Self {
+            task: Some(task),
+            trigger: Some(trigger),
+        }
+    }
+
+    /// The command's result, stopping it first once `cancel` fires.
+    pub(crate) async fn finish(&mut self, cancel: &CancelToken) -> ToolDoneEvent {
+        let Some(task) = self.task.as_mut() else {
+            return ToolDoneEvent::error(String::new(), SHELL_TASK_GONE);
+        };
+        if let Ok(done) = cancel.race(&mut *task).await {
+            return done;
+        }
+        self.trigger.take();
+        task.await
+    }
+
+    /// `None` when `limit` passes first, with the command still running.
+    pub(crate) async fn wait(
+        &mut self,
+        cancel: &CancelToken,
+        limit: Duration,
+    ) -> Option<ToolDoneEvent> {
+        let task = self.task.as_mut()?;
+        let settled = future::race(async { Some(cancel.race(task).await) }, async {
+            smol::Timer::after(limit).await;
+            None
+        })
+        .await;
+        match settled {
+            Some(Ok(done)) => Some(done),
+            Some(Err(_)) => Some(self.finish(cancel).await),
+            None => None,
+        }
+    }
+}
+
+impl Drop for RunningShell {
+    fn drop(&mut self) {
+        self.trigger.take();
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
+}
+
+fn lock_running(slot: &Mutex<Option<RunningShell>>) -> MutexGuard<'_, Option<RunningShell>> {
+    slot.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 /// What one admission writes on its record, whatever kind of job it is.
 struct JobSpec {
@@ -382,6 +453,59 @@ impl JobScope {
         };
         self.admit_job(spec, history, cancel, deadline, execute)
             .await
+    }
+
+    /// Hands a foreground command that is still running to a new shell job,
+    /// without restarting it. `settle` turns its result into the job's. A
+    /// refused admission hands the command back, still running.
+    ///
+    /// Every refusal fires the job's own cancel before its execution starts,
+    /// so a job that starts cancelled leaves the command where it is, to be
+    /// handed back or, once admitted, dropped and so stopped.
+    pub(crate) async fn adopt_shell<S, Fut>(
+        &self,
+        metadata: ShellJobMetadata,
+        history: &SubagentHistoryStore,
+        cancel: &CancelToken,
+        deadline: Deadline,
+        running: RunningShell,
+        settle: S,
+    ) -> Result<TaskCard, (String, Option<RunningShell>)>
+    where
+        S: FnOnce(ToolDoneEvent) -> Fut + Send + 'static,
+        Fut: Future<Output = ToolDoneEvent> + Send + 'static,
+    {
+        let call_id = metadata.call_id.clone();
+        let slot = Arc::new(Mutex::new(Some(running)));
+        let held = Arc::clone(&slot);
+        let admitted = self
+            .admit_shell_cancellable(
+                metadata,
+                history,
+                cancel,
+                deadline,
+                move |cancel, _| async move {
+                    let adopted = match cancel.is_cancelled() {
+                        true => None,
+                        false => lock_running(&held).take(),
+                    };
+                    let done = match adopted {
+                        Some(mut running) => running.finish(&cancel).await,
+                        None => ToolDoneEvent::error(call_id, ADOPTION_WITHDRAWN)
+                            .with_failure(ToolFailure::Cancelled),
+                    };
+                    settle(done).await
+                },
+            )
+            .await;
+        match admitted {
+            // A retried admission drops `execute` unrun, so the command is still here.
+            Ok(_) if Arc::strong_count(&slot) == 1 && lock_running(&slot).is_some() => {
+                Err((ADOPTION_RETRIED.into(), lock_running(&slot).take()))
+            }
+            Ok(card) => Ok(card),
+            Err(message) => Err((message, lock_running(&slot).take())),
+        }
     }
 
     /// Admits a `question` the main agent asked without waiting. `execute`
@@ -907,7 +1031,8 @@ mod tests {
 
     use super::{
         BackgroundTasks, CLOSED, FOREIGN_JOB, MAX_DEFERRED_QUESTIONS, QUESTION_CAPACITY,
-        QUESTION_CLOSED, QuestionJobMetadata, RETRY_MISMATCH, STALE_INVOCATION, ShellJobMetadata,
+        QUESTION_CLOSED, QuestionJobMetadata, RETRY_MISMATCH, RunningShell, STALE_INVOCATION,
+        ShellJobMetadata,
     };
     use crate::{
         AgentEvent, AgentMode, Envelope, History, StoredSession, SubagentHistoryStore,
@@ -1075,6 +1200,87 @@ mod tests {
                 .unwrap_err();
             assert!(error.starts_with(super::CAPACITY));
             assert_eq!(fixture.tasks.active_count(), count);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    /// A command that finishes with [`OUTPUT`] once `release` sends.
+    fn running_shell() -> (RunningShell, flume::Sender<()>) {
+        let (release, released) = flume::bounded::<()>(1);
+        let (trigger, cancel) = CancelToken::new();
+        let task = smol::spawn(async move {
+            let _ = cancel.race(released.recv_async()).await;
+            done()
+        });
+        (RunningShell::new(task, trigger), release)
+    }
+
+    #[test]
+    fn an_adopted_shell_settles_as_its_job_without_rerunning() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (running, release) = running_shell();
+            let settled = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&settled);
+            let card = scope
+                .adopt_shell(
+                    metadata(),
+                    &fixture.history,
+                    &CancelToken::none(),
+                    Deadline::None,
+                    running,
+                    move |done| async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        done
+                    },
+                )
+                .await
+                .map_err(|(message, _)| message)
+                .unwrap();
+            release.send(()).unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            assert_eq!(scope.status(&card.task_id).unwrap().state, SUCCEEDED);
+            assert_eq!(settled.load(Ordering::SeqCst), 1);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "admission_closed")]
+    #[test_case(true; "call_already_admitted")]
+    fn a_refused_adoption_hands_the_command_back_still_running(retried: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            if retried {
+                scope
+                    .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
+                    .await
+                    .unwrap();
+                fixture.tasks.join_jobs().await.unwrap();
+            } else {
+                fixture.tasks.stop().await.unwrap();
+            }
+            let (running, release) = running_shell();
+            let (message, returned) = scope
+                .adopt_shell(
+                    metadata(),
+                    &fixture.history,
+                    &CancelToken::none(),
+                    Deadline::None,
+                    running,
+                    |_| async { panic!("a refused adoption cannot settle") },
+                )
+                .await
+                .unwrap_err();
+            if retried {
+                assert_eq!(message, super::ADOPTION_RETRIED);
+            }
+            let mut returned = returned.unwrap();
+            release.send(()).unwrap();
+            let finished = returned.finish(&CancelToken::none()).await;
+            assert!(!finished.is_error);
+            assert_eq!(finished.output.as_text(), OUTPUT);
             fixture.tasks.shutdown().await.unwrap();
         });
     }

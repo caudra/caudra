@@ -516,80 +516,26 @@ impl ShellToolGroup {
         if !output_filter {
             return (unfiltered, None);
         }
-        let mut stages: Vec<String> = Vec::new();
-
         // Both reductions read the full retained window rather than the preview
         // already in the structured result, so the preview budget is spent on
         // what survived instead of on the raw end of the stream.
-        let stdout = stdout_tail.text();
-        let stderr = stderr_tail.text();
-
-        // Runs before rule selection for two reasons. Rule patterns are authored
-        // against clean text, so a coloured line silently evades a
-        // `strip_lines_matching` that was written to catch it; and the progress
-        // collapse compares line shapes, which decoration makes incomparable.
-        let (stdout, stdout_escapes) = strip_escape_sequences(&stdout);
-        let (stderr, stderr_escapes) = strip_escape_sequences(&stderr);
-        if stdout_escapes > 0 || stderr_escapes > 0 {
-            stages.push(ESCAPE_STAGE.to_owned());
-        }
-
-        let mut consumed_stderr = false;
-        let mut body = stdout;
-        if let Some(rule) = Self::matching_rule(analysis, output_filter) {
-            let filtered = rule.apply(&body, &stderr, output.exit_code);
-            // A rule that matched but removed nothing is not announced.
-            // Announcing a filter that did not filter would tell a reader to go
-            // looking for output that was never dropped.
-            if filtered.lossy {
-                body = filtered.text;
-                consumed_stderr = filtered.consumed_stderr;
-                stages.push(rule.name().to_owned());
+        match filtered_rendering(
+            Self::matching_rule(analysis, output_filter),
+            &stdout_tail.text(),
+            &stderr_tail.text(),
+            output.exit_code,
+            &unfiltered,
+        ) {
+            Some((candidate, stages)) => {
+                let filter = ShellFilterInfo {
+                    stages,
+                    unfiltered_utf8_bytes: unfiltered.len(),
+                    filtered_utf8_bytes: candidate.len(),
+                };
+                (candidate, Some(filter))
             }
+            None => (unfiltered, None),
         }
-
-        let mut rendered = body;
-        if !consumed_stderr && !stderr.is_empty() {
-            // A rule that describes stdout must not make a diagnostic written to
-            // stderr disappear from the rendering.
-            if !rendered.is_empty() {
-                rendered.push('\n');
-            }
-            rendered.push_str("stderr tail:\n");
-            rendered.push_str(&stderr);
-        }
-
-        // Runs last so a rule that already knows the format gets first refusal,
-        // and so the collapse sees whatever that rule left behind.
-        let (collapsed, removed) = collapse_progress_lines(&rendered);
-        if removed > 0 {
-            rendered = collapsed;
-            stages.push(PROGRESS_STAGE.to_owned());
-        }
-
-        if stages.is_empty() || rendered.trim().is_empty() {
-            return (unfiltered, None);
-        }
-        // The notice is deliberately terse. It is paid on every filtered result
-        // and is compared against the complete capture below, so a verbose
-        // notice would stop small reductions from ever being worth taking.
-        let candidate = format!(
-            "{}\n[filtered: {}]",
-            bound_rendering(&rendered),
-            stages.join(", ")
-        );
-        // Filtering exists to reduce what a model reads, and the notice is not
-        // free. A rendering that is not smaller than the complete capture is
-        // strictly worse than it: it costs more and says less.
-        if candidate.len() >= unfiltered.len() {
-            return (unfiltered, None);
-        }
-        let filter = ShellFilterInfo {
-            stages,
-            unfiltered_utf8_bytes: unfiltered.len(),
-            filtered_utf8_bytes: candidate.len(),
-        };
-        (candidate, Some(filter))
     }
 
     /// Selects the rule for a command, or `None` when none should apply.
@@ -715,6 +661,108 @@ fn tool_error(error: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.into())])
 }
 
+/// The filtered rendering and the stages that changed it, or `None` when
+/// filtering would not make `unfiltered` smaller.
+///
+/// The escape strip runs before rule selection for two reasons. Rule patterns
+/// are authored against clean text, so a coloured line silently evades a
+/// `strip_lines_matching` that was written to catch it, and the progress
+/// collapse compares line shapes, which decoration makes incomparable.
+fn filtered_rendering(
+    rule: Option<&FilterRule>,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    unfiltered: &str,
+) -> Option<(String, Vec<String>)> {
+    let mut stages: Vec<String> = Vec::new();
+    let (stdout, stdout_escapes) = strip_escape_sequences(stdout);
+    let (stderr, stderr_escapes) = strip_escape_sequences(stderr);
+    if stdout_escapes > 0 || stderr_escapes > 0 {
+        stages.push(ESCAPE_STAGE.to_owned());
+    }
+
+    let mut consumed_stderr = false;
+    let mut body = stdout;
+    if let Some(rule) = rule {
+        let filtered = rule.apply(&body, &stderr, exit_code);
+        // A rule that matched but removed nothing is not announced.
+        // Announcing a filter that did not filter would tell a reader to go
+        // looking for output that was never dropped.
+        if filtered.lossy {
+            body = filtered.text;
+            consumed_stderr = filtered.consumed_stderr;
+            stages.push(rule.name().to_owned());
+        }
+    }
+
+    let mut rendered = body;
+    if !consumed_stderr && !stderr.is_empty() {
+        // A rule that describes stdout must not make a diagnostic written to
+        // stderr disappear from the rendering.
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str("stderr tail:\n");
+        rendered.push_str(&stderr);
+    }
+
+    // Runs last so a rule that already knows the format gets first refusal,
+    // and so the collapse sees whatever that rule left behind.
+    let (collapsed, removed) = collapse_progress_lines(&rendered);
+    if removed > 0 {
+        rendered = collapsed;
+        stages.push(PROGRESS_STAGE.to_owned());
+    }
+
+    if stages.is_empty() || rendered.trim().is_empty() {
+        return None;
+    }
+    // The notice is deliberately terse. It is paid on every filtered result
+    // and is compared against the complete capture below, so a verbose
+    // notice would stop small reductions from ever being worth taking.
+    let candidate = format!(
+        "{}\n[filtered: {}]",
+        bound_rendering(&rendered),
+        stages.join(", ")
+    );
+    // Filtering exists to reduce what a model reads, and the notice is not
+    // free. A rendering that is not smaller than the complete capture is
+    // strictly worse than it: it costs more and says less.
+    (candidate.len() < unfiltered.len()).then_some((candidate, stages))
+}
+
+/// Reduces what a command has printed so far the way its final result will
+/// be reduced. With no exit code yet, a rule never collapses the output to a
+/// success message and keeps both ends of a long one.
+#[derive(Clone, Copy)]
+pub struct PartialOutputFilter {
+    enabled: bool,
+    rule: Option<&'static FilterRule>,
+}
+
+impl PartialOutputFilter {
+    #[must_use]
+    pub fn apply(&self, text: &str) -> String {
+        if !self.enabled {
+            return text.to_owned();
+        }
+        filtered_rendering(self.rule, text, "", None, text)
+            .map_or_else(|| text.to_owned(), |(candidate, _)| candidate)
+    }
+}
+
+impl PreparedShell {
+    /// Taken before execution consumes the prepared shell.
+    #[must_use]
+    pub fn partial_output_filter(&self) -> PartialOutputFilter {
+        PartialOutputFilter {
+            enabled: self.output_filter_enabled(),
+            rule: ShellToolGroup::matching_rule(self.analysis(), self.output_filter_enabled()),
+        }
+    }
+}
+
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::*;
@@ -805,6 +853,28 @@ mod tests {
         assert!(rendered.starts_with("gcc -O2 foo.c"), "{rendered}");
         assert!(!rendered.contains("Entering directory"), "{rendered}");
         assert!(rendered.contains("[filtered: make]"), "{rendered}");
+    }
+
+    #[test_case::test_case(true; "filtered")]
+    #[test_case::test_case(false; "filter_off")]
+    #[tokio::test]
+    async fn output_so_far_is_reduced_like_the_final_result(enabled: bool) {
+        let (_root, group) = group_for_render(enabled).await;
+        let prepared = group
+            .prepare(ShellInput {
+                command: "make build".into(),
+                timeout_sec: None,
+                workdir: None,
+            })
+            .await
+            .unwrap();
+        let reduced = prepared.partial_output_filter().apply(MAKE_OUTPUT);
+        assert_eq!(
+            !reduced.contains("Entering directory"),
+            enabled,
+            "{reduced}"
+        );
+        assert_eq!(reduced.contains("[filtered: make]"), enabled, "{reduced}");
     }
 
     #[tokio::test]

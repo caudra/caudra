@@ -39,16 +39,16 @@ In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), tasks and sh
 
 Tasks wait for their final result by default. The model passes `background: true` for independent work, and you can promote a running task with `/tasks background`. A `batch` still waits for tasks that wait, so each task that should return early needs its own `background: true`.
 
-A shell command returns a receipt when its requested timeout exceeds `agent.shell_async_threshold_secs`, and otherwise waits:
+A shell command waits for up to 10 minutes. A command still running then moves to the background as a shell job: it is not restarted or stopped, the call returns a receipt with the output so far, filtered like a final result, and the result arrives like any other background result. The command keeps its `timeoutSec` deadline, so `timeoutSec` only says how long the command may run. The model passes `background: true` to start a server, a watcher, or a long build in the background at once. Change the wait with:
 
 ```toml
 [agent]
-shell_async_threshold_secs = 120
+shell_foreground_limit_secs = 600
 ```
 
-An omitted `timeoutSec` uses Workcell's 120-second default. With the default threshold, `timeoutSec: 120` waits and `timeoutSec: 121` returns a receipt, even when the command finishes quickly. The positive threshold measures the requested timeout, not elapsed runtime. It never extends the command's hard deadline. Shell has no per-call `background` argument, and timeouts should reflect execution needs rather than a scheduling preference.
+A moved command keeps its row in `/shells`, and `/tasks cancel <task_id>` stops it.
 
-One-shot `--print` always waits: tasks have no `background` argument, and every shell command waits for termination. Use the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK for background work.
+One-shot `--print` always waits: tasks and shell commands have no `background` argument, and every shell command waits for termination with no limit. Use the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK for background work.
 
 ### Results and continuation
 

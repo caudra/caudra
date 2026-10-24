@@ -153,12 +153,14 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_BACKGROUND_REMINDER_TURNS: u32 = 0;
 pub const DEFAULT_WORK_NUDGE_COMPACTIONS: u32 = 2;
-pub const DEFAULT_SHELL_ASYNC_THRESHOLD_SECS: u64 = 120;
+pub const DEFAULT_SHELL_FOREGROUND_LIMIT_SECS: u64 = 600;
 pub const DEFAULT_RESUME_MAX_AGE_HOURS: u64 = 24;
 const MIN_RESUME_MAX_AGE_HOURS: u64 = 1;
-pub const MIN_SHELL_ASYNC_THRESHOLD_SECS: u64 = 1;
+pub const MIN_SHELL_FOREGROUND_LIMIT_SECS: u64 = 1;
 const TASK_SYNC_REQUIRED: &str =
     "this session cannot run background tasks; omit background or set it to false";
+pub const SHELL_SYNC_REQUIRED: &str =
+    "this session cannot run background shell commands; omit background or set it to false";
 pub const CODE_REQUIRED: &str = "`code` cannot be disabled: it hosts the `image`, `host`, `workflow`, `automation`, `history`, `mcp` and `decisions` modules; turn off a module's tool group instead (`images`, `execution`, `delegation`)";
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
@@ -1444,18 +1446,25 @@ pub fn resolve_task_background(
     background_supported: bool,
     requested: Option<bool>,
 ) -> Result<bool, &'static str> {
-    match (background_supported, requested) {
-        (false, Some(true)) => Err(TASK_SYNC_REQUIRED),
-        (supported, requested) => Ok(supported && requested.unwrap_or(false)),
-    }
+    resolve_background(background_supported, requested, TASK_SYNC_REQUIRED)
 }
 
 pub fn resolve_shell_background(
-    config: &AgentConfig,
     background_supported: bool,
-    effective_timeout_secs: u64,
-) -> bool {
-    background_supported && effective_timeout_secs > config.shell_async_threshold_secs
+    requested: Option<bool>,
+) -> Result<bool, &'static str> {
+    resolve_background(background_supported, requested, SHELL_SYNC_REQUIRED)
+}
+
+fn resolve_background(
+    background_supported: bool,
+    requested: Option<bool>,
+    unsupported: &'static str,
+) -> Result<bool, &'static str> {
+    match (background_supported, requested) {
+        (false, Some(true)) => Err(unsupported),
+        (supported, requested) => Ok(supported && requested.unwrap_or(false)),
+    }
 }
 
 /// Which GPT Image 2.5 model the hosted `image_generation` tool runs.
@@ -1589,7 +1598,7 @@ pub struct AgentFileConfig {
     pub work_nudge_compactions: Option<u32>,
     pub task_model_choice: Option<bool>,
     pub deferred_questions: Option<bool>,
-    pub shell_async_threshold_secs: Option<u64>,
+    pub shell_foreground_limit_secs: Option<u64>,
     pub shell_eta: Option<bool>,
     pub generate_titles: Option<bool>,
     pub summarize_memory: Option<bool>,
@@ -1636,7 +1645,7 @@ impl AgentFileConfig {
             work_nudge_compactions,
             task_model_choice,
             deferred_questions,
-            shell_async_threshold_secs,
+            shell_foreground_limit_secs,
             shell_eta,
             generate_titles,
             summarize_memory,
@@ -2908,8 +2917,8 @@ pub struct AgentConfig {
     )]
     pub deferred_questions: bool,
 
-    #[config(default = DEFAULT_SHELL_ASYNC_THRESHOLD_SECS, min = MIN_SHELL_ASYNC_THRESHOLD_SECS, desc = "Requested shell timeout above which a shell call returns an admission receipt instead of waiting; independent of the enforced execution deadline")]
-    pub shell_async_threshold_secs: u64,
+    #[config(default = DEFAULT_SHELL_FOREGROUND_LIMIT_SECS, min = MIN_SHELL_FOREGROUND_LIMIT_SECS, desc = "How long a shell call waits for its command before a command still running moves to the background and the call returns a receipt; the command keeps running until it exits or reaches its own timeout")]
+    pub shell_foreground_limit_secs: u64,
 
     #[config(
         default = true,
@@ -3086,9 +3095,9 @@ impl AgentConfig {
             compaction_requirements: file.compaction_requirements.unwrap_or(true),
             task_model_choice: file.task_model_choice.unwrap_or(true),
             deferred_questions: file.deferred_questions.unwrap_or(true),
-            shell_async_threshold_secs: file
-                .shell_async_threshold_secs
-                .unwrap_or(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS),
+            shell_foreground_limit_secs: file
+                .shell_foreground_limit_secs
+                .unwrap_or(DEFAULT_SHELL_FOREGROUND_LIMIT_SECS),
             shell_eta: file.shell_eta.unwrap_or(true),
             background_reminder_turns: file
                 .background_reminder_turns
@@ -4798,7 +4807,8 @@ mod tests {
     const DEFERRED_QUESTIONS_FIELD: &str = "deferred_questions";
     const WORK_NUDGE_FIELD: &str = "work_nudge_compactions";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
-    const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
+    const SHELL_LIMIT_FIELD: &str = "shell_foreground_limit_secs";
+    const CUSTOM_SHELL_LIMIT: u64 = 31;
     const SHELL_WORKDIR_REDIRECT_FIELD: &str = "shell_workdir_redirect";
     const EMPTY_SOURCE_DIGEST: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -5396,34 +5406,37 @@ mod tests {
     }
 
     #[test]
-    fn shell_threshold_merges_and_serializes() {
-        let mut raw: RawConfig =
-            toml::from_str("[agent]\nshell_async_threshold_secs = 31").unwrap();
+    fn shell_foreground_limit_merges_and_serializes() {
+        let mut raw: RawConfig = toml::from_str(&format!(
+            "[agent]\n{SHELL_LIMIT_FIELD} = {CUSTOM_SHELL_LIMIT}"
+        ))
+        .unwrap();
         raw.merge(RawConfig::default());
         let config = raw.into_config(false).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.agent.shell_async_threshold_secs, 31);
+        assert_eq!(config.agent.shell_foreground_limit_secs, CUSTOM_SHELL_LIMIT);
         assert_eq!(
-            serde_json::to_value(&config.agent).unwrap()[SHELL_THRESHOLD_FIELD],
-            31
+            serde_json::to_value(&config.agent).unwrap()[SHELL_LIMIT_FIELD],
+            CUSTOM_SHELL_LIMIT
         );
         assert_eq!(config.agent.background_reminder_turns, 0);
     }
 
     #[test_case("task_execution = 'auto'")]
     #[test_case("shell_execution = 'auto'")]
-    #[test_case("shell_async_threshold_secs = -1")]
-    #[test_case("shell_async_threshold_secs = 1.5")]
-    #[test_case("shell_async_threshold_secs = '120'")]
+    #[test_case("shell_async_threshold_secs = 120")]
+    #[test_case("shell_foreground_limit_secs = -1")]
+    #[test_case("shell_foreground_limit_secs = 1.5")]
+    #[test_case("shell_foreground_limit_secs = '600'")]
     fn invalid_execution_config_is_rejected(source: &str) {
         assert!(toml::from_str::<RawConfig>(&format!("[agent]\n{source}")).is_err());
     }
 
     #[test_case(0, false)]
     #[test_case(1, true)]
-    fn shell_threshold_requires_positive_value(value: u64, valid: bool) {
+    fn shell_foreground_limit_requires_positive_value(value: u64, valid: bool) {
         let raw: RawConfig =
-            toml::from_str(&format!("[agent]\n{SHELL_THRESHOLD_FIELD} = {value}")).unwrap();
+            toml::from_str(&format!("[agent]\n{SHELL_LIMIT_FIELD} = {value}")).unwrap();
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.validate().is_ok(), valid);
     }
@@ -5441,20 +5454,23 @@ mod tests {
         resolve_task_background(supported, requested)
     }
 
-    #[test_case(false, 121 => false; "unsupported_waits")]
-    #[test_case(true, 119 => false; "below_threshold_waits")]
-    #[test_case(true, 120 => false; "at_threshold_waits")]
-    #[test_case(true, 121 => true; "above_threshold_returns_a_receipt")]
-    fn shell_background_follows_the_requested_timeout(supported: bool, timeout: u64) -> bool {
-        resolve_shell_background(&AgentConfig::default(), supported, timeout)
+    #[test_case(false, None => Ok(false); "unsupported_omitted")]
+    #[test_case(false, Some(true) => Err(SHELL_SYNC_REQUIRED); "unsupported_background")]
+    #[test_case(true, None => Ok(false); "supported_omitted")]
+    #[test_case(true, Some(true) => Ok(true); "supported_background")]
+    fn shell_background_follows_the_request_where_supported(
+        supported: bool,
+        requested: Option<bool>,
+    ) -> Result<bool, &'static str> {
+        resolve_shell_background(supported, requested)
     }
 
-    #[test_case(SHELL_THRESHOLD_FIELD, "120", Some(1))]
+    #[test_case(SHELL_LIMIT_FIELD, "600", Some(1))]
     fn execution_defaults_and_metadata(name: &str, default: &str, min: Option<u64>) {
         let config = RawConfig::default().into_config(false).unwrap();
         assert_eq!(
-            config.agent.shell_async_threshold_secs,
-            DEFAULT_SHELL_ASYNC_THRESHOLD_SECS
+            config.agent.shell_foreground_limit_secs,
+            DEFAULT_SHELL_FOREGROUND_LIMIT_SECS
         );
         let field = AgentConfig::FIELDS
             .iter()

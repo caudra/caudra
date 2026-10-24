@@ -7,7 +7,6 @@ mod owned_jobs_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use caudra_config::MIN_SHELL_ASYNC_THRESHOLD_SECS;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
         CacheKey, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -131,7 +130,6 @@ mod owned_jobs_tests {
                 make_agent_with_output_store(provider, &mut history, Some(store));
             agent.session_id = Some(fixture.session.id.into());
             agent.jobs = Some(fixture.tasks.main_scope());
-            agent.config.shell_async_threshold_secs = MIN_SHELL_ASYNC_THRESHOLD_SECS;
             agent
                 .registry
                 .register_audited(
@@ -180,7 +178,7 @@ mod owned_jobs_tests {
             responses
                 .send(tool_use_response(
                     SHELL_TOOL_NAME,
-                    json!({"command": COMMAND}),
+                    json!({"command": COMMAND, "background": true}),
                 ))
                 .unwrap();
             loop {

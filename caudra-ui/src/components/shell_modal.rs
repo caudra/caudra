@@ -751,10 +751,26 @@ impl Overlay for ShellModal {
 /// The running rows the modal would list, for the chip that opens it.
 pub(crate) fn active_count(snapshot: Option<&ShellSnapshot>, cards: &[TaskCard]) -> usize {
     snapshot.map_or(0, ShellSnapshot::active_count)
-        + cards
-            .iter()
-            .filter(|task| task.kind == JobKind::Shell && task.active())
+        + background_jobs(snapshot, cards)
+            .filter(|task| task.active())
             .count()
+}
+
+/// Shell jobs, less those a foreground command moved into: its own row
+/// already shows that command.
+fn background_jobs<'a>(
+    snapshot: Option<&'a ShellSnapshot>,
+    cards: &'a [TaskCard],
+) -> impl Iterator<Item = &'a TaskCard> {
+    cards.iter().filter(move |task| {
+        task.kind == JobKind::Shell
+            && !snapshot.is_some_and(|snapshot| {
+                snapshot
+                    .executions
+                    .iter()
+                    .any(|view| view.record.call_id == task.call_id)
+            })
+    })
 }
 
 fn find<'a>(picker: &'a ListPicker<ShellItem>, id: &str) -> Option<&'a ShellItem> {
@@ -783,11 +799,7 @@ fn build_items(inputs: &ShellInputs) -> Vec<ShellItem> {
         }
     }
     let jobs = inputs.snapshot.as_ref().map(|snapshot| &snapshot.jobs);
-    for task in inputs
-        .cards
-        .iter()
-        .filter(|task| task.kind == JobKind::Shell)
-    {
+    for task in background_jobs(inputs.snapshot.as_deref(), &inputs.cards) {
         let item = ShellItem::background(task, &inputs.cards, jobs);
         if task.active() {
             running.push((task.created_at.saturating_mul(MILLIS_PER_SECOND), item));
@@ -1272,6 +1284,19 @@ mod tests {
         assert_eq!(
             active_count(modal.inputs.snapshot.as_deref(), &modal.inputs.cards),
             listed.iter().filter(|row| row.active()).count()
+        );
+    }
+
+    #[test]
+    fn a_command_moved_to_the_background_is_listed_and_counted_once() {
+        let modal = opened(vec![running(JOB_ID, STARTED_MS)], vec![job(RUNNING)]);
+        let listed = rows(&modal);
+        let ids: Vec<_> = listed.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, [JOB_ID]);
+        assert_eq!(listed[0].badge(), None);
+        assert_eq!(
+            active_count(modal.inputs.snapshot.as_deref(), &modal.inputs.cards),
+            1
         );
     }
 

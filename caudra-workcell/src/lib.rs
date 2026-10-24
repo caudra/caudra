@@ -67,10 +67,10 @@ use caudra_agent::permissions::{
 };
 use caudra_agent::tools::{
     BoxFuture, DEADLINE_EXCEEDED, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
-    LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes,
-    PlanModeAccess, RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect,
-    ToolError, ToolExecResult, ToolFailure, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    expand_tilde, stale_read_message,
+    LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PartialOutputFilter, PermissionIntent,
+    PermissionScopes, PlanModeAccess, RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience,
+    ToolContext, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation, ToolLive,
+    ToolRegistry, ToolSource, expand_tilde, stale_read_message,
 };
 use caudra_agent::{
     AgentEvent, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry, GrepMatchGroup,
@@ -2880,6 +2880,22 @@ impl ToolInvocation for WorkcellInvocation {
         self.input.shell_timeout()
     }
 
+    fn partial_output_filter(&self) -> Option<PartialOutputFilter> {
+        match self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|prepared| &prepared.execution)
+        {
+            Some(PreparedExecution::Shell(_, shell)) => {
+                let filter = shell.partial_output_filter();
+                Some(Arc::new(move |text: &str| filter.apply(text)))
+            }
+            _ => None,
+        }
+    }
+
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
     }
@@ -4944,8 +4960,7 @@ mod tests {
     };
     use caudra_config::shell_env::ShellEnvConfig;
     use caudra_config::{
-        AgentConfig, DefaultEffect, Effect, MIN_SHELL_ASYNC_THRESHOLD_SECS, PermissionRule,
-        PermissionsConfig, ToolKey,
+        AgentConfig, DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey,
     };
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
@@ -5121,9 +5136,11 @@ mod tests {
         }
     }
 
-    #[test_case(false; "timeout_routed_completion")]
-    #[test_case(true; "cancel_cleans_parent_and_descendant")]
-    fn embedded_shell_async_dispatch_smoke(cancel: bool) {
+    #[test_case(false, false; "requested_background_completion")]
+    #[test_case(false, true; "cancel_cleans_parent_and_descendant")]
+    #[test_case(true, false; "promoted_at_the_limit_completion")]
+    #[test_case(true, true; "promoted_cancel_cleans_parent_and_descendant")]
+    fn embedded_shell_async_dispatch_smoke(promoted: bool, cancel: bool) {
         smol::block_on(bounded_shell_test(async {
             let root = TempDir::new().unwrap();
             let (_host, registry) = host_and_registry(root.path());
@@ -5143,14 +5160,17 @@ mod tests {
             ctx.jobs = Some(scope.clone());
             ctx.session_id = Some(SessionRef::from_id(session.id));
             ctx.tool_output_store = Some(Arc::new(ToolOutputStore::new(dir.clone())));
-            ctx.config.shell_async_threshold_secs = MIN_SHELL_ASYNC_THRESHOLD_SECS;
+            ctx.config.shell_foreground_limit_secs = 0;
             ctx.config.shell_output_filter = false;
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let command = format!(
                 "exec 3<>/dev/tcp/127.0.0.1/{port}; bash -c 'printf \"ready\\n\" >&3; IFS= read -r release <&3; printf \"{EMBEDDED_SHELL_OUTPUT}\\n\"' & wait"
             );
-            let input = json!({"command":command, "timeoutSec":EMBEDDED_SHELL_TIMEOUT_SECS});
+            let mut input = json!({"command":command, "timeoutSec":EMBEDDED_SHELL_TIMEOUT_SECS});
+            if !promoted {
+                input["background"] = json!(true);
+            }
             let dispatch = tool_dispatch::run(
                 &registry,
                 None,
@@ -5183,6 +5203,16 @@ mod tests {
             let card = &cards[0];
             assert_eq!(card.kind, JobKind::Shell);
             assert_eq!(card.shell.as_ref().unwrap().command, command);
+            assert_eq!(
+                done.model_suffix
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains(&card.task_id)),
+                promoted
+            );
+            assert_eq!(
+                tasks.shells().snapshot().executions.len(),
+                usize::from(promoted)
+            );
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut ready = vec![0; EMBEDDED_SHELL_READY.len()];
             socket.read_exact(&mut ready).await.unwrap();
@@ -5292,16 +5322,17 @@ mod tests {
             let declared = definitions.declared.as_array().unwrap();
             assert_eq!(declared.len(), 1);
             let definition = &declared[0];
-            assert_eq!(definition["input_schema"], original_schema);
-            assert!(
-                definition["input_schema"]["properties"]
-                    .get("background")
-                    .is_none()
-            );
+            let mut published = definition["input_schema"].clone();
+            let background = published["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("background");
+            assert_eq!(published, original_schema);
+            assert_eq!(background.is_some(), supported);
             let description = definition["description"].as_str().unwrap().to_lowercase();
             assert!(description.contains("timeout"));
             if supported {
-                assert!(description.contains("120 seconds"));
+                assert!(description.contains("10m"));
                 assert!(description.contains("receipt"));
             } else {
                 for forbidden in ["background", "async", "receipt"] {
