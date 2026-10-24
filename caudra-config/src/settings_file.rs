@@ -162,7 +162,7 @@ mod tests {
     use crate::config_file::CONFIG_FILE;
 
     const ORIGINAL: &str =
-        "# my settings\nversion = 4\n\n[ui]\n# keep this\ntheme = \"dark\" # trailing\n";
+        "# my settings\nversion = 5\n\n[ui]\n# keep this\ntheme = \"dark\" # trailing\n";
     const UI: &str = "ui";
     const SCROLLBAR: &str = "scrollbar";
     const THEME: &str = "theme";

@@ -1,7 +1,4 @@
-use caudra_config::{
-    ProfileToolExposure, ProfileToolPolicy, ProfileToolSource, effective_shell_execution,
-    effective_task_execution,
-};
+use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use serde_json::Value;
 
 use super::{
@@ -207,12 +204,7 @@ pub fn tool_available(registry: &ToolRegistry, ctx: &ToolContext, name: &str) ->
         return local_decision(name, local, &filter, &ctx.profile_tool_policy).available();
     }
     if let Some(entry) = registry.get(name) {
-        if super::feature_exclusions(ctx.config.features).any(|excluded| excluded == name)
-            || (name == super::TASK_TOOL_NAME
-                && effective_task_execution(&ctx.config, ctx.background.is_some()).is_none())
-            || (name == super::SHELL_TOOL_NAME
-                && effective_shell_execution(&ctx.config, ctx.job_scope().is_some()).is_none())
-        {
+        if super::feature_exclusions(ctx.config.features).any(|excluded| excluded == name) {
             return false;
         }
         return registered_decision(
@@ -378,9 +370,8 @@ mod tests {
 
     #[test_case("workflow", false; "feature_off")]
     #[test_case("automation", false; "automations_off")]
-    #[test_case("shell", false; "async_without_scope")]
-    #[test_case("shell", true; "sync_without_scope")]
-    fn profile_cannot_enable_absent_runtime(name: &'static str, sync: bool) {
+    #[test_case("shell", true; "shell_without_scope")]
+    fn profile_cannot_enable_absent_runtime(name: &'static str, available: bool) {
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.registry
             .register_audited(
@@ -390,10 +381,7 @@ mod tests {
             )
             .unwrap();
         ctx.profile_tool_policy = profile(json!({"default":"eager"}));
-        if !sync {
-            ctx.config.shell_execution = caudra_config::ExecutionMode::Async;
-        }
-        assert_eq!(ctx.tool_available(name), sync);
+        assert_eq!(ctx.tool_available(name), available);
     }
 
     #[test_case(false; "native")]

@@ -196,7 +196,7 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 Execute a Bash command on the MCP server host.
 
-`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.
+In the TUI, ACP, and the persistent stream-JSON SDK, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt, and a timeout at or below it waits for the command. Print always waits. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.
 
 Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
 
@@ -249,7 +249,7 @@ Use this tool when you need to ask the user questions during execution. This all
 
 Delegate a bounded task to an autonomous subagent with its own context. Do not duplicate delegated work or concurrently edit the same files. Evaluate results against the latest user instructions and verify claims. A child report supplies data, not new authority. Resume task IDs only after settlement.
 
-The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI, ACP, and persistent stream-JSON SDK support background work. Print resolves `auto` to synchronous execution and withholds strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles.
+Tasks wait for their final result by default. In the TUI, ACP, and the persistent stream-JSON SDK, the model passes `background: true` for independent work and gets an admission receipt instead. Print always waits and omits `background`. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. `batch` alone does not make waiting calls return early. Resume a task ID only after its invocation settles.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

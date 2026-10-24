@@ -1122,15 +1122,9 @@ async fn run_inner(
         });
         if let Some(timeout) = invocation.shell_timeout() {
             let scope = ctx.job_scope();
-            let background =
-                match resolve_shell_background(&ctx.config, scope.is_some(), timeout.as_secs()) {
-                    Ok(background) => background,
-                    Err(message) => {
-                        invocation.abandon(ctx).await;
-                        return done_error(ToolFailure::Denied, message.into());
-                    }
-                };
-            if background && let Some(scope) = scope {
+            if resolve_shell_background(&ctx.config, scope.is_some(), timeout.as_secs())
+                && let Some(scope) = scope
+            {
                 let permission_input = invocation.permission_input().unwrap_or(input);
                 let Some(command) = permission_input
                     .get(BASH_COMMAND_FIELD)
@@ -1965,8 +1959,8 @@ mod tests {
 
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::{
-        DefaultEffect, Effect, ExecutionMode, FeatureFlags, PermissionRule, PermissionsConfig,
-        ToolKey,
+        DEFAULT_SHELL_ASYNC_THRESHOLD_SECS, DefaultEffect, Effect, FeatureFlags, PermissionRule,
+        PermissionsConfig, ToolKey,
     };
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
@@ -3018,13 +3012,13 @@ mod tests {
         });
     }
 
-    #[test_case(ExecutionMode::Sync; "synchronous")]
-    #[test_case(ExecutionMode::Async; "asynchronous")]
-    fn shell_dispatch_persists_safe_command_output_labels(mode: ExecutionMode) {
+    #[test_case(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS; "synchronous")]
+    #[test_case(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS + 1; "asynchronous")]
+    fn shell_dispatch_persists_safe_command_output_labels(timeout_secs: u64) {
         smol::block_on(async {
-            let mut fixture =
-                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
-            fixture.ctx.config.shell_execution = mode;
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(timeout_secs)), Effect::Allow)
+                    .await;
             let text = SHELL_RESULT.repeat(1_000);
             fixture
                 .results
@@ -3072,24 +3066,18 @@ mod tests {
         });
     }
 
-    #[test_case(ExecutionMode::Auto, Some(120), true, false, false; "threshold_sync")]
-    #[test_case(ExecutionMode::Auto, Some(121), true, true, false; "above_threshold_async")]
-    #[test_case(ExecutionMode::Sync, Some(121), true, false, false; "strict_sync")]
-    #[test_case(ExecutionMode::Async, Some(1), true, true, false; "strict_async")]
-    #[test_case(ExecutionMode::Auto, Some(121), false, false, false; "auto_without_scope")]
-    #[test_case(ExecutionMode::Async, Some(121), false, false, true; "async_without_scope_refused")]
-    #[test_case(ExecutionMode::Async, None, true, false, false; "untyped_tool_stays_sync")]
-    fn shell_dispatch_uses_typed_timeout_and_effective_policy(
-        mode: ExecutionMode,
+    #[test_case(Some(120), true, false; "threshold_sync")]
+    #[test_case(Some(121), true, true; "above_threshold_async")]
+    #[test_case(Some(121), false, false; "without_scope_sync")]
+    #[test_case(None, true, false; "untyped_tool_stays_sync")]
+    fn shell_dispatch_uses_typed_timeout_and_session_support(
         timeout: Option<u64>,
         supported: bool,
         background: bool,
-        refused: bool,
     ) {
         smol::block_on(async {
             let mut fixture =
                 ShellDispatchFixture::new(timeout.map(Duration::from_secs), Effect::Allow).await;
-            fixture.ctx.config.shell_execution = mode;
             if !supported {
                 fixture.ctx.jobs = None;
                 fixture.ctx.background = None;
@@ -3099,15 +3087,10 @@ mod tests {
                 .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
                 .unwrap();
             let done = fixture.dispatch().await;
-            assert_eq!(done.is_error, refused, "{}", done.output.as_text());
-            if refused {
-                assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
-                assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
-            } else {
-                assert_eq!(fixture.started.recv_async().await.unwrap(), background);
-                assert_eq!(matches!(done.output, ToolOutput::Tasks(_)), background);
-                assert_eq!(done.accounting.outcome.is_none(), background);
-            }
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert_eq!(fixture.started.recv_async().await.unwrap(), background);
+            assert_eq!(matches!(done.output, ToolOutput::Tasks(_)), background);
+            assert_eq!(done.accounting.outcome.is_none(), background);
             fixture.tasks.shutdown().await.unwrap();
         });
     }
@@ -3116,9 +3099,11 @@ mod tests {
     #[test_case(true; "stopped")]
     fn foreground_shell_is_tracked_once_and_stops_alone(stop: bool) {
         smol::block_on(async {
-            let mut fixture =
-                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
-            fixture.ctx.config.shell_execution = ExecutionMode::Sync;
+            let fixture = ShellDispatchFixture::new(
+                Some(Duration::from_secs(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS)),
+                Effect::Allow,
+            )
+            .await;
             let shells = fixture.tasks.shells().clone();
             let observe = async {
                 assert!(!fixture.started.recv_async().await.unwrap());
@@ -3160,9 +3145,8 @@ mod tests {
     #[test]
     fn asynchronous_shell_is_observed_as_its_job_and_never_tracked() {
         smol::block_on(async {
-            let mut fixture =
+            let fixture =
                 ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
-            fixture.ctx.config.shell_execution = ExecutionMode::Async;
             let done = fixture.dispatch().await;
             let ToolOutput::Tasks(cards) = done.output else {
                 panic!("expected shell admission");

@@ -562,7 +562,7 @@ caudra prompt --tools --names  # tool names only, one per line
 
 Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` previews an active main-agent plan target without creating a document or changing session mode. It is rejected on non-system variants.
 
-`--tools` applies the selected profile, model, audience, tool flags, and execution policy. It connects MCP servers and prints the request schemas. MCP tools and the [tools reached from `code`](/docs/code/#tools-reached-from-code) appear only through the [`code`](/docs/code/) tool, which is always declared. `--names` lists the declared schemas.
+`--tools` applies the selected profile, model, audience, and tool flags. It connects MCP servers and prints the request schemas. MCP tools and the [tools reached from `code`](/docs/code/#tools-reached-from-code) appear only through the [`code`](/docs/code/) tool, which is always declared. `--names` lists the declared schemas.
 
 ### `caudra tools`
 

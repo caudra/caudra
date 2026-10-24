@@ -895,7 +895,6 @@ mod tests {
     };
     use std::time::Duration;
 
-    use caudra_config::ExecutionMode;
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::{
         StateDir, background::JobKind, id::CaudraId, sessions::SessionDatabase,
@@ -1830,12 +1829,10 @@ mod tests {
         });
     }
 
-    #[test_case(ExecutionMode::Sync; "task_sync_does_not_disable_shell")]
-    #[test_case(ExecutionMode::Async; "task_async_does_not_change_shell")]
-    fn shell_policy_independence_and_scoped_reminders(mode: ExecutionMode) {
+    #[test]
+    fn shell_reminders_are_scoped_to_their_owner() {
         smol::block_on(async {
             let fixture = Fixture::new().await;
-            fixture.tasks.set_task_execution(mode);
             let main = fixture.tasks.main_scope();
             let child = fixture.tasks.child_scope(CHILD);
             let main_card = main

@@ -180,7 +180,7 @@ The `question` tool becomes a native form in an editor that supports ACP form el
 
 ## Subagents and background tasks
 
-Subagents and background shell commands work as they do in the TUI, so the `auto` and `async` [execution policies](/docs/sessions/#background-tasks) can move them to the background. Workflows are not available over ACP. Cancelling a turn cancels its subagents and stops the session's background work. Closing a session stops both too.
+Subagents and background shell commands work as they do in the TUI: a task the model starts with `background: true` and a shell command whose requested timeout exceeds the [threshold](/docs/sessions/#execution-policies) run in the background. Workflows are not available over ACP. Cancelling a turn cancels its subagents and stops the session's background work. Closing a session stops both too.
 
 Caudra picks one of three ways to show this work, from the editor's `initialize` request:
 

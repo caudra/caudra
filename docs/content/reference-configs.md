@@ -34,7 +34,7 @@ description: "Every TOML config file in full, with each key commented out and de
 #
 # Full reference: https://caudra.ai/docs/configuration/
 
-version = 4
+version = 5
 
 # Start every session with YOLO mode (skip permission prompts, deny rules still
 # apply); global config only.
@@ -352,11 +352,6 @@ version = 4
 # Type: u32.
 # work_nudge_compactions = 2
 
-# Task delivery: sync waits for the completed result, auto lets the model
-# choose, async returns an admission receipt.
-# Type: string.
-# task_execution = "auto"
-
 # Let the main agent choose a model and reasoning level for each `task` call,
 # such as when you ask it to run work on a named model. When off, `task` has no
 # `model` or `thinking` argument and tasks run on the Subagent model or a
@@ -371,13 +366,8 @@ version = 4
 # Type: bool.
 # deferred_questions = true
 
-# Shell delivery: sync waits for termination, auto routes by requested timeout,
-# async returns an admission receipt.
-# Type: string.
-# shell_execution = "auto"
-
-# Requested shell timeout above which auto delivery returns an admission
-# receipt; independent of the enforced execution deadline.
+# Requested shell timeout above which a shell call returns an admission receipt
+# instead of waiting; independent of the enforced execution deadline.
 # Type: u64, at least 1.
 # shell_async_threshold_secs = 120
 

@@ -131,7 +131,7 @@ Groups are authoring shortcuts. They do not guarantee that every member exists i
 
 ### Restrictions and infrastructure
 
-A profile cannot restore tools removed by global or CLI restrictions, disabled experimental features, model compatibility, execution policy, audience, or mode. A task in plan mode stays read-only. Permissions still authorize each call, and explicit denies remain effective.
+A profile cannot restore tools removed by global or CLI restrictions, disabled experimental features, model compatibility, audience, or mode. A task in plan mode stays read-only. Permissions still authorize each call, and explicit denies remain effective.
 
 The trusted `tool_output` pager stays available for truncated results, and `code` stays available as the home of the modules. Host-required task-report and structured-output sinks also remain where their protocol needs them. These are infrastructure exceptions, identified by their trusted bindings. `todo_write`, `question`, `batch`, `plan`, `memory`, `skill`, `task`, and `workflow` require normal opt-in under `default: disabled`.
 

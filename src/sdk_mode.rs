@@ -45,10 +45,7 @@ use caudra_automation::request::{
 };
 use caudra_automation::snapshot::{ArmOrigin, AutomationEvent, FiringSummary, PauseSource};
 use caudra_config::decisions::DecisionsConfig;
-use caudra_config::{
-    AutomationsConfig, AutopilotConfig, ExecutionMode, Feature, ModelPolicy, SnapshotsConfig,
-    effective_shell_execution, effective_task_execution,
-};
+use caudra_config::{AutomationsConfig, AutopilotConfig, Feature, ModelPolicy, SnapshotsConfig};
 use caudra_providers::accounts::{AccountExhaustion, AccountSwitch, Reroute, RoutedAccount};
 use caudra_providers::model::Model;
 use caudra_providers::{
@@ -2856,29 +2853,21 @@ fn init_payload(
     payload["automations"] = Value::Bool(automations);
     payload["automation_controls"] = serde_json::json!(automation_controls);
     payload["goal_controls"] = serde_json::json!(GOAL_CONTROLS);
-    let task_mode = effective_task_execution(config, jobs);
-    let shell_mode = effective_shell_execution(config, jobs);
-    let background_capable = |mode: &Option<ExecutionMode>| {
-        jobs && matches!(mode, Some(ExecutionMode::Auto | ExecutionMode::Async))
-    };
-    payload["background_tasks"] = Value::Bool(background_capable(&task_mode));
-    payload["background_shell"] = Value::Bool(background_capable(&shell_mode));
+    payload["background_tasks"] = Value::Bool(jobs);
+    payload["background_shell"] = Value::Bool(jobs);
     payload["background_jobs"] = Value::Bool(jobs);
-    payload["task_execution"] =
-        serde_json::json!({"configured": config.task_execution, "effective": task_mode});
-    payload["shell_execution"] = serde_json::json!({"configured": config.shell_execution, "effective": shell_mode, "async_threshold_secs": config.shell_async_threshold_secs});
+    payload["shell_execution"] =
+        serde_json::json!({"async_threshold_secs": config.shell_async_threshold_secs});
     payload["job_kinds"] = if jobs {
         serde_json::json!(["agent", "shell"])
     } else {
         serde_json::json!([])
     };
-    payload["task_controls"] = serde_json::json!(
-        TASK_CONTROLS
-            .iter()
-            .filter(|control| jobs
-                && (**control != "task_promote" || task_mode == Some(ExecutionMode::Auto)))
-            .collect::<Vec<_>>()
-    );
+    payload["task_controls"] = if jobs {
+        serde_json::json!(TASK_CONTROLS)
+    } else {
+        serde_json::json!([])
+    };
     payload
 }
 
@@ -3948,78 +3937,36 @@ mod tests {
     const TASK_INVOCATION: &str = "task-runtime-invocation";
     const TASK_SUCCEEDED: &str = "succeeded";
     const LARGE_TASK_RESULT_BYTES: usize = 64 * 1024;
-    const TASK_PROMOTION_ERROR: &str =
-        "task promotion requires task_execution = auto and an agent task";
 
     #[test_case(false; "unsupported_frontend")]
     #[test_case(true; "persistent_frontend")]
-    fn init_execution_capabilities_are_independent(jobs: bool) {
-        for task in [
-            ExecutionMode::Sync,
-            ExecutionMode::Auto,
-            ExecutionMode::Async,
-        ] {
-            for shell in [
-                ExecutionMode::Sync,
-                ExecutionMode::Auto,
-                ExecutionMode::Async,
-            ] {
-                let config = AgentConfig {
-                    task_execution: task.clone(),
-                    shell_execution: shell.clone(),
-                    ..Default::default()
-                };
-                let payload =
-                    init_payload(serde_json::json!({}), false, false, None, &config, jobs);
-                assert_eq!(
-                    payload["task_execution"]["configured"],
-                    serde_json::json!(task)
-                );
-                assert_eq!(
-                    payload["shell_execution"]["configured"],
-                    serde_json::json!(shell)
-                );
-                assert_eq!(
-                    payload["task_execution"]["effective"],
-                    serde_json::json!(task.effective(jobs))
-                );
-                assert_eq!(
-                    payload["shell_execution"]["effective"],
-                    serde_json::json!(shell.effective(jobs))
-                );
-                assert_eq!(
-                    payload["background_tasks"],
-                    jobs && task != ExecutionMode::Sync
-                );
-                assert_eq!(
-                    payload["background_shell"],
-                    jobs && shell != ExecutionMode::Sync
-                );
-                let controls = payload["task_controls"].as_array().unwrap();
-                assert_eq!(
-                    controls.contains(&serde_json::json!("task_promote")),
-                    jobs && task == ExecutionMode::Auto
-                );
-                for control in ["task_list", "task_status", "task_cancel"] {
-                    assert_eq!(controls.contains(&serde_json::json!(control)), jobs);
-                }
-                assert_eq!(
-                    payload["job_kinds"],
-                    if jobs {
-                        serde_json::json!(["agent", "shell"])
-                    } else {
-                        serde_json::json!([])
-                    }
-                );
-            }
+    fn init_execution_capabilities_follow_the_frontend(jobs: bool) {
+        let config = AgentConfig::default();
+        let payload = init_payload(serde_json::json!({}), false, false, None, &config, jobs);
+        assert!(payload.get("task_execution").is_none());
+        assert_eq!(
+            payload["shell_execution"],
+            serde_json::json!({"async_threshold_secs": config.shell_async_threshold_secs})
+        );
+        assert_eq!(payload["background_tasks"], jobs);
+        assert_eq!(payload["background_shell"], jobs);
+        let controls = payload["task_controls"].as_array().unwrap();
+        for control in ["task_list", "task_status", "task_cancel", "task_promote"] {
+            assert_eq!(controls.contains(&serde_json::json!(control)), jobs);
         }
+        assert_eq!(
+            payload["job_kinds"],
+            if jobs {
+                serde_json::json!(["agent", "shell"])
+            } else {
+                serde_json::json!([])
+            }
+        );
     }
 
-    #[test_case(ExecutionMode::Sync, Value::Null, TASK_PROMOTION_ERROR; "sync")]
-    #[test_case(ExecutionMode::Async, Value::Null, TASK_PROMOTION_ERROR; "async_mode")]
-    #[test_case(ExecutionMode::Auto, serde_json::json!({"invocation_id": "stale"}), STALE_TASK_INVOCATION; "stale_invocation")]
-    #[test_case(ExecutionMode::Auto, serde_json::json!({"generation": 0}), STALE_TASK_INVOCATION; "stale_generation")]
-    fn stale_sdk_promotion_is_rejected(mode: ExecutionMode, extra: Value, error: &str) {
+    #[test_case(serde_json::json!({"invocation_id": "stale"}), STALE_TASK_INVOCATION; "stale_invocation")]
+    #[test_case(serde_json::json!({"generation": 0}), STALE_TASK_INVOCATION; "stale_generation")]
+    fn stale_sdk_promotion_is_rejected(extra: Value, error: &str) {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().into());
         let mut session = StoredSession::new("provider/model", "/repo");
@@ -4029,7 +3976,6 @@ mod tests {
             .save_background_task(session.id, &task_record(Value::Null))
             .unwrap();
         let tasks = smol::block_on(BackgroundTasks::spawn(storage, session.id)).unwrap();
-        tasks.set_task_execution(mode);
         let (pump, out, _) = permission_event_pump(permission_manager(), PermissionMode::Default);
         let mut arguments = serde_json::json!({"task_id": PHRASE_TASK});
         if let Some(extra) = extra.as_object() {

@@ -304,7 +304,7 @@ fn section_notes(section: &str) -> &'static [&'static str] {
 fn tool_notes(name: &str) -> &'static [&'static str] {
     match name {
         "task" => &[
-            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI, ACP, and persistent stream-JSON SDK support background work. Print resolves `auto` to synchronous execution and withholds strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles.",
+            "Tasks wait for their final result by default. In the TUI, ACP, and the persistent stream-JSON SDK, the model passes `background: true` for independent work and gets an admission receipt instead. Print always waits and omits `background`. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. `batch` alone does not make waiting calls return early. Resume a task ID only after its invocation settles.",
         ],
         "file_edit" | "file_apply_patch" => &[
             "Each model is offered one editor. GPT-5 and later GPT models and the o3, o4, and Codex families get `file_apply_patch`, the patch format they were trained on. Every other model gets `file_edit`.",
@@ -321,7 +321,7 @@ fn tool_notes(name: &str) -> &'static [&'static str] {
             "Enabled servers and their tools reach the model in a `# MCP servers` reminder, so a server connecting or changing its tools never changes the tool definitions. Each server call a snippet makes goes through [permissions](/docs/permissions/#mcp-tool-calls) on its own, and reading a resource asks first.",
         ],
         "shell" => &[
-            "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.",
+            "In the TUI, ACP, and the persistent stream-JSON SDK, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt, and a timeout at or below it waits for the command. Print always waits. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.",
             "Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.",
             "A rule that would report success applies only when the command exited zero, so a failure is never shown as a success. When a failing command reaches a rule's line cap, the result keeps its first and last lines. Filtering never makes a result larger than the raw output, and a filtered result ends with a `[filtered: …]` line that names the stages which changed it. Most rules come from [RTK](https://github.com/rtk-ai/rtk), credited in Workcell's notice file.",
             "A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it. The footer reports how many frames were absorbed.",
@@ -559,12 +559,10 @@ mod tests {
         const TASK_HEADING: &str = "### `task` {#task}";
         const EXPECTED: &[&str] = &[
             "Delegate a bounded task to an autonomous subagent",
-            "`agent.task_execution`",
-            "`sync` waits for final results and omits `background`",
-            "`async` always returns an admission receipt",
+            "the model passes `background: true` for independent work",
+            "Print always waits and omits `background`.",
             "[background tasks](/docs/sessions/#background-tasks)",
-            "Print resolves `auto` to synchronous execution",
-            "`batch` alone does not make synchronous calls asynchronous.",
+            "`batch` alone does not make waiting calls return early.",
             "Resume a task ID only after its invocation settles.",
             "| `output_schema` | any (JSON) | no | JSON Schema (object)",
         ];

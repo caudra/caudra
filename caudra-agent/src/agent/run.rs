@@ -616,9 +616,6 @@ impl<'h> Agent<'h> {
             params.background.is_some(),
             jobs.is_some(),
         );
-        if let Some(background) = &params.background {
-            background.set_task_execution(params.config.task_execution.clone());
-        }
         let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
             && params.model.provider == params.chat_model.provider
             && params.model.id == params.chat_model.id;

@@ -71,7 +71,7 @@ timeout_secs = 180
 max_file_size_mb = 4
 ```
 
-All fields are optional. A file starts with `version = 4`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
+All fields are optional. A file starts with `version = 5`, and Caudra upgrades one without it, see [Config file versions](#config-file-versions). Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
 For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
@@ -447,11 +447,9 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `background_reminder_turns` | u32 | `0` | - | Committed main-agent response groups between unchanged active background-work reminders; 0 disables periodic refresh only, not state-change or post-compaction reminders |
 | `todo_reminder` | bool | `true` | - | Before the main agent hands control back with pending or in-progress todos and no background work running, remind it once per run, repeating the full todo list, to verify the work and update the list |
 | `work_nudge_compactions` | u32 | `2` | - | Compactions within one request, with no work started since it, before Caudra reminds the agent to act: make a change or delegate one in build mode, write the plan or ask in plan mode, report in a read-only task. Repeated at every compaction after that. 0 disables |
-| `task_execution` | string | `auto` | - | Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt |
 | `task_model_choice` | bool | `true` | - | Let the main agent choose a model and reasoning level for each `task` call, such as when you ask it to run work on a named model. When off, `task` has no `model` or `thinking` argument and tasks run on the Subagent model or a profile's pin |
 | `deferred_questions` | bool | `true` | - | Let the main agent ask a `question` without waiting for the answer, so it keeps working while the form waits for you. The answer reaches it later, and you can also put a waiting question off with F4. When off, every question waits for its answer |
-| `shell_execution` | string | `auto` | - | Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt |
-| `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline |
+| `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which a shell call returns an admission receipt instead of waiting; independent of the enforced execution deadline |
 | `shell_eta` | bool | `true` | - | Show an ETA on a shell card and in `/shells`, from a small model trained on this machine's past shell runs. It only labels the command: timeouts and delivery never change. When off, nothing is predicted or recorded |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `summarize_memory` | bool | `true` | - | Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them |
@@ -972,7 +970,7 @@ Each TOML config file starts with a top-level `version`, the version of its form
 
 | File | Version | Without `version` | Newer than this build reads |
 |------|---------|-------------------|-----------------------------|
-| `caudra.toml` | 4 | Read as version 1 | Caudra stops with an error |
+| `caudra.toml` | 5 | Read as version 1 | Caudra stops with an error |
 | `permissions.toml` | 2 | Read as version 1 | Fails closed. Tool calls are denied until the file is fixed |
 | `mcp.toml` | 2 | Read as version 1 | Servers from that file do not start, and Caudra shows the error |
 | `providers.toml` | 1 | Read as version 1 | Caudra stops with an error |
@@ -1013,7 +1011,7 @@ reads like this after the upgrade:
 # My settings
 
 # Added by Caudra 0.2.0-preview.12 on 2026-10-20: the format version of this file, which Caudra now requires.
-version = 4
+version = 5
 
 [ui.tool_output_lines]
 # Upgraded by Caudra 0.2.0-preview.12 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.

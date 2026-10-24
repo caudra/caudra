@@ -12,7 +12,6 @@ use caudra_agent::{AgentEvent, CancelToken, Envelope, SubagentInfo, TaskCard, Ta
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use caudra_config::ExecutionMode;
 use caudra_providers::{RequestOptions, project_messages};
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
@@ -46,7 +45,7 @@ const TASKS_NOUN: &str = "tasks";
 const TASK_USAGE: &str = "Usage: /tasks [list | status <id> | cancel <id>]";
 const AUTO_TASK_USAGE: &str = "Usage: /tasks [list | status <id> | background <id> | cancel <id>]";
 const TASK_UNAVAILABLE: &str = "Background tasks are unavailable in this session";
-const PROMOTION_UNAVAILABLE: &str = "Only agent tasks in auto execution mode can be promoted";
+const PROMOTION_UNAVAILABLE: &str = "Only agent tasks can be promoted";
 pub(super) const CONTINUATION_PENDING: &str =
     "A task continuation is being admitted; your draft is kept";
 pub(super) const CONTINUATION_TEXT_ONLY: &str = "Task continuation accepts text only; remove images, file mentions, and commit references to retry";
@@ -443,9 +442,7 @@ impl App {
             self.flash(TASK_UNAVAILABLE.into());
             return;
         };
-        if promote
-            && (task.kind != JobKind::Agent || runtime.task_execution() != ExecutionMode::Auto)
-        {
+        if promote && task.kind != JobKind::Agent {
             self.flash(PROMOTION_UNAVAILABLE.into());
             return;
         }
@@ -682,17 +679,11 @@ impl App {
                     Err(error) => self.flash(error),
                 }
             }
-            _ => self.flash(
-                if self
-                    .background
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto)
-                {
-                    AUTO_TASK_USAGE.into()
-                } else {
-                    TASK_USAGE.into()
-                },
-            ),
+            _ => self.flash(if self.background.is_some() {
+                AUTO_TASK_USAGE.into()
+            } else {
+                TASK_USAGE.into()
+            }),
         }
         Vec::new()
     }
@@ -1019,11 +1010,8 @@ impl App {
     pub(super) fn tasks_browse(&mut self) -> Vec<Action> {
         self.shell_modal.close();
         self.load_task_history(false);
-        self.task_picker.set_promotion_enabled(
-            self.background
-                .as_ref()
-                .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto),
-        );
+        self.task_picker
+            .set_promotion_enabled(self.background.is_some());
         let _ = self.reconcile_tasks();
         if self.task_picker.is_open() {
             let _ = self.refresh_task_picker();
@@ -1038,11 +1026,8 @@ impl App {
         if !self.task_picker.is_open() {
             return Dirty::NO;
         }
-        self.task_picker.set_promotion_enabled(
-            self.background
-                .as_ref()
-                .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto),
-        );
+        self.task_picker
+            .set_promotion_enabled(self.background.is_some());
         let tasks = self.picker_tasks();
         Dirty::from(self.task_picker.refresh(tasks))
     }

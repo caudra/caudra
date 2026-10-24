@@ -37,26 +37,18 @@ In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), tasks and sh
 
 ### Execution policies
 
-Configure task and shell execution independently:
+Tasks wait for their final result by default. The model passes `background: true` for independent work, and you can promote a running task with `/tasks background`. A `batch` still waits for tasks that wait, so each task that should return early needs its own `background: true`.
+
+A shell command returns a receipt when its requested timeout exceeds `agent.shell_async_threshold_secs`, and otherwise waits:
 
 ```toml
 [agent]
-task_execution = "auto"
-shell_execution = "auto"
 shell_async_threshold_secs = 120
 ```
 
-| Mode | Tasks | Shell commands |
-|------|-------|----------------|
-| `sync` | Wait for the final result. No background launch or promotion. | Wait for command termination. |
-| `auto` (default) | Wait by default. The model can pass `background: true` for independent work. | Return a receipt when the requested timeout exceeds the threshold. Otherwise wait. |
-| `async` | Return a receipt for every admitted task. | Return a receipt for every admitted command. |
+An omitted `timeoutSec` uses Workcell's 120-second default. With the default threshold, `timeoutSec: 120` waits and `timeoutSec: 121` returns a receipt, even when the command finishes quickly. The positive threshold measures the requested timeout, not elapsed runtime. It never extends the command's hard deadline. Shell has no per-call `background` argument, and timeouts should reflect execution needs rather than a scheduling preference.
 
-In shell `auto` mode, omitted `timeoutSec` uses Workcell's 120-second default. With the default threshold, `timeoutSec: 120` waits and `timeoutSec: 121` returns a receipt, even when the command finishes quickly. The positive threshold measures the requested timeout, not elapsed runtime. It never extends the command's hard deadline. Shell has no per-call `background` argument, and timeouts should reflect execution needs rather than a scheduling preference.
-
-Tool descriptions, instructions, and task arguments follow the effective policy. A `batch` still waits for calls that use synchronous execution. With task `auto`, each task that should return early needs its own `background: true`.
-
-One-shot `--print` resolves `auto` to synchronous execution. Strict `async` withholds the affected tool and rejects stale calls. Use `sync` or `auto` there, or switch to the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK.
+One-shot `--print` always waits: tasks have no `background` argument, and every shell command waits for termination. Use the TUI, [ACP](/docs/acp/#subagents-and-background-tasks), or the persistent stream-JSON SDK for background work.
 
 ### Results and continuation
 
@@ -74,7 +66,7 @@ Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running child
 |---------|--------|
 | `/tasks`, `/tasks list` | Open or refresh the task picker |
 | `/tasks status <id>` | Open the picker with that task selected and its details visible |
-| `/tasks background <id>` | Promote an agent task without restarting it, in task `auto` mode |
+| `/tasks background <id>` | Promote an agent task without restarting it |
 | `/tasks cancel <id>` | Cancel that invocation, showing cancelling until it settles |
 | `/shells` | Open the shell modal to inspect or stop shell commands |
 

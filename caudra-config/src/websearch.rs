@@ -428,7 +428,7 @@ mod tests {
     use crate::config_file::{CONFIG_FILE, load_global_config};
 
     const ORIGINAL: &str =
-        "# my settings\nversion = 4\n\n[ui]\n# keep this\ntheme = \"dark\" # trailing\n";
+        "# my settings\nversion = 5\n\n[ui]\n# keep this\ntheme = \"dark\" # trailing\n";
     const URL: &str = "http://100.64.0.2:8787";
     const SECRET: &str = "secret-canary";
     const KEY_REFERENCE: &str = "{env:HOME}";

@@ -115,9 +115,9 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 
 ### Background tasks
 
-Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. The `task_execution` and `shell_execution` objects include configured and effective policies. `shell_execution.async_threshold_secs` gives the requested-timeout threshold.
+Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. `shell_execution.async_threshold_secs` gives the requested-timeout threshold.
 
-One-shot `--print`, including `--output-format stream-json` without stream input, resolves `auto` to synchronous execution. Strict `async` has no effective policy there: the affected tool is withheld and stale calls fail with an actionable error. See [execution policies](/docs/sessions/#execution-policies) for defaults and timeout boundaries.
+One-shot `--print`, including `--output-format stream-json` without stream input, always waits: tasks have no `background` argument, and every shell command waits for termination. See [execution policies](/docs/sessions/#execution-policies) for the timeout threshold.
 
 Task controls use the same `control_request` envelope as workflow controls:
 
@@ -130,7 +130,7 @@ Task controls use the same `control_request` envelope as workflow controls:
 | `task_list` | None | List session-owned agent and shell jobs |
 | `task_status` | `task_id` | Return one task's status |
 | `task_cancel` | `task_id` | Cancel one task |
-| `task_promote` | `task_id` | Promote an agent task without restarting it, in task `auto` mode |
+| `task_promote` | `task_id` | Promote an agent task without restarting it |
 
 A successful `control_response` carries the task list or status in `response.response`. Failures use `response.error`.
 

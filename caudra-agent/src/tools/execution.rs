@@ -1,4 +1,4 @@
-use caudra_config::{AgentConfig, effective_shell_execution};
+use caudra_config::AgentConfig;
 use serde_json::Value;
 
 use crate::prompt::{ResolvedSlots, execution_guidance, shell_execution_guidance};
@@ -18,9 +18,6 @@ pub fn configure_declared(
 ) {
     task::configure_execution(tools, config, tasks_supported, shell_supported);
     question::configure_deferral(tools, config.deferred_questions && tasks_supported);
-    let Some(mode) = effective_shell_execution(config, shell_supported) else {
-        return;
-    };
     let Some(tools) = tools.as_array_mut() else {
         return;
     };
@@ -34,7 +31,7 @@ pub fn configure_declared(
             }
             description.push_str(SHELL_EXECUTION_HEADING);
             description.push_str(&shell_execution_guidance(
-                &mode,
+                shell_supported,
                 config.shell_async_threshold_secs,
             ));
         }
@@ -68,9 +65,7 @@ pub fn execution_slots(
 mod tests {
     use std::{borrow::Cow, sync::Arc};
 
-    use caudra_config::{
-        AgentConfig, ExecutionMode, effective_shell_execution, effective_task_execution,
-    };
+    use caudra_config::AgentConfig;
     use serde_json::{Value, json};
     use test_case::test_case;
 
@@ -164,27 +159,15 @@ mod tests {
             .find(|tool| tool["name"] == name)
     }
 
-    fn assert_contract(definition: Option<&Value>, mode: Option<ExecutionMode>, task: bool) {
-        assert_eq!(definition.is_some(), mode.is_some());
-        let (Some(definition), Some(mode)) = (definition, mode) else {
-            return;
-        };
+    fn assert_contract(definition: Option<&Value>, background: bool, task: bool) {
+        let definition = definition.unwrap();
         let text = definition.to_string().to_lowercase();
-        match mode {
-            ExecutionMode::Sync => {
-                for forbidden in ["background", "async", "receipt", "promot"] {
-                    assert!(!text.contains(forbidden), "{forbidden}: {text}");
-                }
-            }
-            ExecutionMode::Auto => {
-                assert!(text.contains("receipt"));
-                assert!(text.contains(if task { "foreground" } else { "synchronously" }));
-            }
-            ExecutionMode::Async => {
-                for forbidden in ["foreground", "synchronous", "background: false", "promot"] {
-                    assert!(!text.contains(forbidden), "{forbidden}: {text}");
-                }
-                assert!(text.contains("receipt"));
+        if background {
+            assert!(text.contains("receipt"));
+            assert!(text.contains(if task { "foreground" } else { "synchronously" }));
+        } else {
+            for forbidden in ["background", "async", "receipt", "promot"] {
+                assert!(!text.contains(forbidden), "{forbidden}: {text}");
             }
         }
         let schema = &definition["input_schema"];
@@ -196,23 +179,17 @@ mod tests {
             let mut unknown = input.clone();
             unknown["unknown"] = json!(true);
             assert!(!validator.is_valid(&unknown));
-            for background in [false, true] {
+            for requested in [false, true] {
                 let mut input = input.clone();
-                input["background"] = json!(background);
-                let valid = match mode {
-                    ExecutionMode::Sync => false,
-                    ExecutionMode::Auto => true,
-                    ExecutionMode::Async => background,
-                };
-                assert_eq!(validator.is_valid(&input), valid);
+                input["background"] = json!(requested);
+                assert_eq!(validator.is_valid(&input), background);
             }
-            let background = &schema["properties"]["background"];
             assert_eq!(
-                background["default"],
-                match mode {
-                    ExecutionMode::Sync => Value::Null,
-                    ExecutionMode::Auto => json!(false),
-                    ExecutionMode::Async => json!(true),
+                schema["properties"]["background"]["default"],
+                if background {
+                    json!(false)
+                } else {
+                    Value::Null
                 }
             );
             assert!(
@@ -230,10 +207,7 @@ mod tests {
             assert!(text.contains("find auth middleware"));
         } else {
             assert_eq!(*schema, ShellContract.schema());
-            assert_eq!(
-                text.contains(&CUSTOM_THRESHOLD.to_string()),
-                mode == ExecutionMode::Auto
-            );
+            assert_eq!(text.contains(&CUSTOM_THRESHOLD.to_string()), background);
             assert!(
                 definition["description"]
                     .as_str()
@@ -243,84 +217,55 @@ mod tests {
         }
     }
 
-    #[test_case(ExecutionMode::Sync; "task_sync")]
-    #[test_case(ExecutionMode::Auto; "task_auto")]
-    #[test_case(ExecutionMode::Async; "task_async")]
-    fn actual_inventory_and_prompt_match_execution_policy(task_mode: ExecutionMode) {
+    #[test]
+    fn actual_inventory_and_prompt_match_session_support() {
         let registry = registry();
-        for shell_mode in [
-            ExecutionMode::Sync,
-            ExecutionMode::Auto,
-            ExecutionMode::Async,
-        ] {
-            let config = AgentConfig {
-                task_execution: task_mode.clone(),
-                shell_execution: shell_mode,
-                shell_async_threshold_secs: CUSTOM_THRESHOLD,
-                ..AgentConfig::default()
-            };
-            for (task_cap, shell_cap) in
-                [(false, false), (false, true), (true, false), (true, true)]
-            {
-                for examples in [false, true] {
-                    let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
-                    configure_declared(&mut definitions.declared, &config, task_cap, shell_cap);
-                    let slots = execution_slots(
-                        &ResolvedSlots::default(),
-                        &config,
-                        task_cap,
-                        shell_cap,
-                        &definitions.declared,
-                    );
-                    let system = build_system_prompt(
-                        "",
-                        &slots,
-                        &ToolFilter::Only(TOOL_NAMES.iter().map(|name| (*name).into()).collect()),
-                        None,
-                        None,
-                    );
-                    let effective_task = effective_task_execution(&config, task_cap);
-                    let effective_shell = effective_shell_execution(&config, shell_cap);
-                    if let Some(mode) = &effective_task {
-                        assert!(system.contains(&prompt::task_execution_guidance(mode)));
-                    } else {
-                        assert!(!system.contains("Task calls"));
-                    }
-                    if let Some(mode) = &effective_shell {
-                        assert!(
-                            system.contains(&prompt::shell_execution_guidance(
-                                mode,
-                                CUSTOM_THRESHOLD
-                            ))
-                        );
-                    } else {
-                        assert!(!system.contains("Shell calls"));
-                    }
-                    let mut published = definitions.declared;
-                    assert_contract(find(&published, "task"), effective_task.clone(), true);
-                    assert_contract(find(&published, "shell"), effective_shell.clone(), false);
-                    if let Some(control) = find(&published, "task_control") {
-                        assert_eq!(
-                            control.to_string().contains("background"),
-                            effective_task == Some(ExecutionMode::Auto)
-                        );
-                    }
-                    if effective_task
-                        .as_ref()
-                        .is_none_or(|mode| *mode == ExecutionMode::Sync)
-                        && effective_shell
-                            .as_ref()
-                            .is_none_or(|mode| *mode == ExecutionMode::Sync)
-                    {
-                        let all = format!("{system}\n{published}").to_lowercase();
-                        for forbidden in ["background", "async"] {
-                            assert!(!all.contains(forbidden), "{forbidden}: {all}");
-                        }
-                    }
-                    let once = published.clone();
-                    configure_declared(&mut published, &config, task_cap, shell_cap);
-                    assert_eq!(published, once);
+        let config = AgentConfig {
+            shell_async_threshold_secs: CUSTOM_THRESHOLD,
+            ..AgentConfig::default()
+        };
+        for (task_cap, shell_cap) in [(false, false), (false, true), (true, false), (true, true)] {
+            for examples in [false, true] {
+                let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
+                configure_declared(&mut definitions.declared, &config, task_cap, shell_cap);
+                let slots = execution_slots(
+                    &ResolvedSlots::default(),
+                    &config,
+                    task_cap,
+                    shell_cap,
+                    &definitions.declared,
+                );
+                let system = build_system_prompt(
+                    "",
+                    &slots,
+                    &ToolFilter::Only(TOOL_NAMES.iter().map(|name| (*name).into()).collect()),
+                    None,
+                    None,
+                );
+                assert!(system.contains(&prompt::task_execution_guidance(task_cap)));
+                assert!(system.contains(&prompt::shell_execution_guidance(
+                    shell_cap,
+                    CUSTOM_THRESHOLD
+                )));
+                let mut published = definitions.declared;
+                assert_contract(find(&published, "task"), task_cap, true);
+                assert_contract(find(&published, "shell"), shell_cap, false);
+                assert_eq!(
+                    find(&published, "task_control").is_some(),
+                    task_cap || shell_cap
+                );
+                if let Some(control) = find(&published, "task_control") {
+                    assert_eq!(control.to_string().contains("background"), task_cap);
                 }
+                if !task_cap && !shell_cap {
+                    let all = format!("{system}\n{published}").to_lowercase();
+                    for forbidden in ["background", "async"] {
+                        assert!(!all.contains(forbidden), "{forbidden}: {all}");
+                    }
+                }
+                let once = published.clone();
+                configure_declared(&mut published, &config, task_cap, shell_cap);
+                assert_eq!(published, once);
             }
         }
     }
@@ -330,47 +275,33 @@ mod tests {
     fn execution_reconfiguration_preserves_examples_and_canonical_facts(examples: bool) {
         let registry = registry();
         let mut definitions = definitions(&registry, ToolAudience::MAIN, examples);
-        for mode in [
-            ExecutionMode::Auto,
-            ExecutionMode::Async,
-            ExecutionMode::Sync,
-            ExecutionMode::Auto,
-        ] {
-            let config = AgentConfig {
-                task_execution: mode.clone(),
-                shell_execution: mode.clone(),
-                shell_async_threshold_secs: CUSTOM_THRESHOLD,
-                ..AgentConfig::default()
-            };
-            configure_declared(&mut definitions.declared, &config, true, true);
+        let config = AgentConfig {
+            shell_async_threshold_secs: CUSTOM_THRESHOLD,
+            ..AgentConfig::default()
+        };
+        for (task_cap, shell_cap) in [(true, true), (false, false), (true, false), (false, true)] {
+            configure_declared(&mut definitions.declared, &config, task_cap, shell_cap);
             let published = &definitions.declared;
-            assert_contract(find(published, "task"), Some(mode.clone()), true);
-            assert_contract(find(published, "shell"), Some(mode.clone()), false);
+            assert_contract(find(published, "task"), task_cap, true);
+            assert_contract(find(published, "shell"), shell_cap, false);
             let description = find(published, "task").unwrap()["description"]
                 .as_str()
                 .unwrap();
             assert_eq!(
                 description
-                    .matches(&prompt::task_execution_guidance(&mode))
+                    .matches(&prompt::task_execution_guidance(task_cap))
                     .count(),
                 1
             );
         }
     }
 
-    #[test_case(ExecutionMode::Sync)]
-    #[test_case(ExecutionMode::Auto)]
-    #[test_case(ExecutionMode::Async)]
-    fn child_inventory_replaces_inherited_execution_guidance(shell_mode: ExecutionMode) {
+    #[test]
+    fn child_inventory_replaces_inherited_execution_guidance() {
         let registry = registry();
-        let config = AgentConfig {
-            task_execution: ExecutionMode::Auto,
-            shell_execution: shell_mode.clone(),
-            ..AgentConfig::default()
-        };
-        let mut inherited = ResolvedSlots::default().with_execution_guidance(
-            &prompt::execution_guidance(&AgentConfig::default(), true, true, true, true),
-        );
+        let config = AgentConfig::default();
+        let mut inherited = ResolvedSlots::default()
+            .with_execution_guidance(&prompt::execution_guidance(&config, true, true, true, true));
         inherited.insert(
             PromptId::General,
             Slot::ToolUsage,
@@ -394,14 +325,10 @@ mod tests {
                 assert!(!control.to_string().contains("background"));
                 assert!(!control.to_string().contains("foreground"));
             }
-            if let Some(mode) = effective_shell_execution(&config, supported) {
-                assert!(rendered.contains(&prompt::shell_execution_guidance(
-                    &mode,
-                    config.shell_async_threshold_secs
-                )));
-            } else {
-                assert!(!rendered.contains("Shell calls"));
-            }
+            assert!(rendered.contains(&prompt::shell_execution_guidance(
+                supported,
+                config.shell_async_threshold_secs
+            )));
         }
     }
 }

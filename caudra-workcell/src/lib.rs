@@ -4944,8 +4944,8 @@ mod tests {
     };
     use caudra_config::shell_env::ShellEnvConfig;
     use caudra_config::{
-        AgentConfig, DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig,
-        ToolKey,
+        AgentConfig, DefaultEffect, Effect, MIN_SHELL_ASYNC_THRESHOLD_SECS, PermissionRule,
+        PermissionsConfig, ToolKey,
     };
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
@@ -5121,10 +5121,9 @@ mod tests {
         }
     }
 
-    #[test_case(ExecutionMode::Auto, false; "timeout_routed_completion")]
-    #[test_case(ExecutionMode::Async, false; "forced_async_completion")]
-    #[test_case(ExecutionMode::Async, true; "cancel_cleans_parent_and_descendant")]
-    fn embedded_shell_async_dispatch_smoke(mode: ExecutionMode, cancel: bool) {
+    #[test_case(false; "timeout_routed_completion")]
+    #[test_case(true; "cancel_cleans_parent_and_descendant")]
+    fn embedded_shell_async_dispatch_smoke(cancel: bool) {
         smol::block_on(bounded_shell_test(async {
             let root = TempDir::new().unwrap();
             let (_host, registry) = host_and_registry(root.path());
@@ -5144,10 +5143,7 @@ mod tests {
             ctx.jobs = Some(scope.clone());
             ctx.session_id = Some(SessionRef::from_id(session.id));
             ctx.tool_output_store = Some(Arc::new(ToolOutputStore::new(dir.clone())));
-            ctx.config.shell_execution = mode.clone();
-            if mode == ExecutionMode::Auto {
-                ctx.config.shell_async_threshold_secs = 1;
-            }
+            ctx.config.shell_async_threshold_secs = MIN_SHELL_ASYNC_THRESHOLD_SECS;
             ctx.config.shell_output_filter = false;
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -5276,18 +5272,13 @@ mod tests {
         }));
     }
 
-    #[test_case(ExecutionMode::Sync; "sync")]
-    #[test_case(ExecutionMode::Auto; "auto")]
-    #[test_case(ExecutionMode::Async; "async_mode")]
-    fn embedded_shell_catalog_execution_contract(mode: ExecutionMode) {
+    #[test]
+    fn embedded_shell_catalog_execution_contract() {
         let root = TempDir::new().unwrap();
         let (_host, registry) = host_and_registry(root.path());
         let original_schema = registry.get(SHELL_TOOL_NAME).unwrap().tool.schema();
+        let config = AgentConfig::default();
         for supported in [false, true] {
-            let config = AgentConfig {
-                shell_execution: mode.clone(),
-                ..AgentConfig::default()
-            };
             let mut definitions = registry.definitions_split(
                 &Vars::new(),
                 &DescriptionContext {
@@ -5299,10 +5290,6 @@ mod tests {
             );
             configure_declared(&mut definitions.declared, &config, false, supported);
             let declared = definitions.declared.as_array().unwrap();
-            let Some(effective) = mode.effective(supported) else {
-                assert!(declared.is_empty());
-                continue;
-            };
             assert_eq!(declared.len(), 1);
             let definition = &declared[0];
             assert_eq!(definition["input_schema"], original_schema);
@@ -5313,22 +5300,12 @@ mod tests {
             );
             let description = definition["description"].as_str().unwrap().to_lowercase();
             assert!(description.contains("timeout"));
-            match effective {
-                ExecutionMode::Sync => {
-                    for forbidden in ["background", "async", "receipt"] {
-                        assert!(!description.contains(forbidden), "{description}");
-                    }
-                }
-                ExecutionMode::Auto => {
-                    assert!(description.contains("120 seconds"));
-                    assert!(description.contains("receipt"));
-                }
-                ExecutionMode::Async => {
-                    for forbidden in ["foreground", "synchronous", "holds the call", "120 seconds"]
-                    {
-                        assert!(!description.contains(forbidden), "{description}");
-                    }
-                    assert!(description.contains("receipt"));
+            if supported {
+                assert!(description.contains("120 seconds"));
+                assert!(description.contains("receipt"));
+            } else {
+                for forbidden in ["background", "async", "receipt"] {
+                    assert!(!description.contains(forbidden), "{description}");
                 }
             }
         }

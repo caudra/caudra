@@ -7,10 +7,7 @@
 
 use std::borrow::Cow;
 
-use caudra_config::{
-    AgentConfig, ExecutionMode, effective_shell_execution, effective_task_execution,
-    resolve_task_background,
-};
+use caudra_config::{AgentConfig, resolve_task_background};
 use caudra_storage::thinking::StoredThinking;
 use serde_json::{Value, json};
 
@@ -143,35 +140,23 @@ pub fn configure_execution(
     let Some(definitions) = tools.as_array_mut() else {
         return;
     };
-    let task_mode = effective_task_execution(config, task_background_supported);
-    let shell_mode = effective_shell_execution(config, shell_background_supported);
-    definitions.retain(
-        |definition| match definition.get("name").and_then(Value::as_str) {
-            Some("task") => task_mode.is_some(),
-            Some("shell") => shell_mode.is_some(),
-            Some("task_control") => task_background_supported || shell_background_supported,
-            _ => true,
-        },
-    );
+    definitions.retain(|definition| {
+        definition.get("name").and_then(Value::as_str) != Some("task_control")
+            || task_background_supported
+            || shell_background_supported
+    });
     for definition in definitions {
         if definition.get("name").and_then(Value::as_str) == Some("task_control") {
-            task_control::configure_execution(definition, task_mode.as_ref());
+            task_control::configure_execution(definition, task_background_supported);
             continue;
         }
         if definition.get("name").and_then(Value::as_str) != Some(crate::tools::TASK_TOOL_NAME) {
             continue;
         }
-        let Some(mode) = task_mode.as_ref() else {
-            continue;
-        };
         if let Some(Value::String(description)) = definition.get_mut("description") {
             let model_guidance = format!("\n\n{MODEL_CHOICE_GUIDANCE}");
-            let execution_guidance = [
-                ExecutionMode::Sync,
-                ExecutionMode::Auto,
-                ExecutionMode::Async,
-            ]
-            .map(|previous| format!("\n\n{}", task_execution_guidance(&previous)));
+            let execution_guidance =
+                [false, true].map(|previous| format!("\n\n{}", task_execution_guidance(previous)));
             for guidance in execution_guidance.iter().chain([&model_guidance]) {
                 if let Some(offset) = description.find(guidance.as_str()) {
                     description.replace_range(offset..offset + guidance.len(), "");
@@ -182,7 +167,7 @@ pub fn configure_execution(
                 description.push_str(&model_guidance);
             }
             description.push_str("\n\n");
-            description.push_str(&task_execution_guidance(mode));
+            description.push_str(&task_execution_guidance(task_background_supported));
         }
         if let Some(properties) = definition
             .get_mut("input_schema")
@@ -198,24 +183,12 @@ pub fn configure_execution(
                     false => properties.remove(name),
                 };
             }
-            match mode {
-                ExecutionMode::Sync => {
-                    properties.remove("background");
-                }
-                ExecutionMode::Auto => {
-                    let mut background = to_json_schema(&BACKGROUND_PARAM);
-                    background["default"] = json!(false);
-                    properties.insert("background".into(), background);
-                }
-                ExecutionMode::Async => {
-                    properties.insert(
-                        "background".into(),
-                        json!({
-                            "type": "boolean", "enum": [true], "default": true,
-                            "description": "Launch background work. Omission defaults to true."
-                        }),
-                    );
-                }
+            if task_background_supported {
+                let mut background = to_json_schema(&BACKGROUND_PARAM);
+                background["default"] = json!(false);
+                properties.insert("background".into(), background);
+            } else {
+                properties.remove("background");
             }
         }
     }
@@ -229,7 +202,7 @@ impl Tool for TaskTool {
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
         Cow::Owned(format!(
             "{DESCRIPTION}\n{MODEL_CHOICE_GUIDANCE}\n\n{}",
-            task_execution_guidance(&ExecutionMode::Auto)
+            task_execution_guidance(true)
         ))
     }
 
@@ -310,16 +283,9 @@ impl ToolInvocation for TaskCall {
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
             let supported = ctx.background.is_some();
-            let background = match resolve_task_background(&ctx.config, supported, self.background)
-            {
+            let background = match resolve_task_background(supported, self.background) {
                 Ok(background) => background,
-                Err(message) => {
-                    let failure = match effective_task_execution(&ctx.config, supported) {
-                        Some(_) => ToolFailure::InvalidInput,
-                        None => ToolFailure::Denied,
-                    };
-                    return error(failure, message.into());
-                }
+                Err(message) => return error(ToolFailure::InvalidInput, message.into()),
             };
             let chooses_model = self.model.name.is_some() || self.model.thinking.is_some();
             if chooses_model && !ctx.config.task_model_choice {
@@ -512,7 +478,7 @@ mod tests {
             input["background"] = Value::Bool(true);
             let ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
             let result = parse(input).unwrap().execute(&ctx).await;
-            assert!(result.is_error);
+            assert_eq!(result.failure, Some(ToolFailure::InvalidInput));
             assert!(ctx.subagent_history.snapshot().records().is_empty());
         });
     }
@@ -524,17 +490,10 @@ mod tests {
         assert!(DESCRIPTION.contains("Resume task IDs only after settlement"));
     }
 
-    #[test_case(ExecutionMode::Sync, true; "sync_supported")]
-    #[test_case(ExecutionMode::Auto, true; "auto_supported")]
-    #[test_case(ExecutionMode::Async, true; "async_supported")]
-    #[test_case(ExecutionMode::Sync, false; "sync_unsupported")]
-    #[test_case(ExecutionMode::Auto, false; "auto_unsupported")]
-    #[test_case(ExecutionMode::Async, false; "async_unsupported")]
-    fn execution_contract_matches_effective_mode(mode: ExecutionMode, supported: bool) {
-        let config = AgentConfig {
-            task_execution: mode,
-            ..AgentConfig::default()
-        };
+    #[test_case(true; "supported")]
+    #[test_case(false; "unsupported")]
+    fn execution_contract_matches_session_capability(supported: bool) {
+        let config = AgentConfig::default();
         let mut tools = json!([
             {"name":"task", "description":DESCRIPTION, "input_schema":TaskTool.schema(), "examples":TaskTool.examples()},
             {"name":"task_control", "description":task_control::DESCRIPTION, "input_schema":{}}
@@ -543,38 +502,23 @@ mod tests {
         let once = tools.clone();
         configure_execution(&mut tools, &config, supported, true);
         assert_eq!(tools, once);
-        let effective = effective_task_execution(&config, supported);
         let task = tools
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "task");
-        let Some(mode) = effective else {
-            assert!(task.is_none());
-            return;
-        };
-        let task = task.unwrap();
+            .find(|tool| tool["name"] == "task")
+            .unwrap();
         let description = task["description"].as_str().unwrap();
         let background = &task["input_schema"]["properties"]["background"];
-        match mode {
-            ExecutionMode::Sync => {
-                for forbidden in ["background", "async", "receipt", "promotion"] {
-                    assert!(!task.to_string().contains(forbidden), "{forbidden}: {task}");
-                }
-                assert!(background.is_null());
+        if supported {
+            assert!(description.contains("foreground"));
+            assert!(description.contains("background"));
+            assert_eq!(background["default"], false);
+        } else {
+            for forbidden in ["background", "async", "receipt", "promotion"] {
+                assert!(!task.to_string().contains(forbidden), "{forbidden}: {task}");
             }
-            ExecutionMode::Auto => {
-                assert!(description.contains("foreground"));
-                assert!(description.contains("background"));
-                assert_eq!(background["default"], false);
-            }
-            ExecutionMode::Async => {
-                for forbidden in ["foreground", "synchronous", "background: false"] {
-                    assert!(!description.contains(forbidden));
-                }
-                assert_eq!(background["enum"], json!([true]));
-                assert_eq!(background["default"], true);
-            }
+            assert!(background.is_null());
         }
         let control = tools
             .as_array()
@@ -587,29 +531,8 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("background")),
-            mode == ExecutionMode::Auto
+            supported
         );
-    }
-
-    #[test_case(ExecutionMode::Sync, Some(true), ToolFailure::InvalidInput; "sync_rejects_launch")]
-    #[test_case(ExecutionMode::Async, Some(false), ToolFailure::Denied; "async_rejects_wait")]
-    #[test_case(ExecutionMode::Async, None, ToolFailure::Denied; "async_requires_session")]
-    fn contradictory_or_unsupported_calls_never_admit(
-        mode: ExecutionMode,
-        requested: Option<bool>,
-        expected: ToolFailure,
-    ) {
-        smol::block_on(async {
-            let mut input = minimal();
-            if let Some(background) = requested {
-                input["background"] = json!(background);
-            }
-            let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
-            ctx.config.task_execution = mode;
-            let result = parse(input).unwrap().execute(&ctx).await;
-            assert_eq!(result.failure, Some(expected));
-            assert!(ctx.subagent_history.snapshot().records().is_empty());
-        });
     }
 
     fn admitted_card() -> TaskCard {

@@ -15,7 +15,7 @@ use crate::migration::{self, ArrayRename, ConfigFormat, MigrationError, ReadErro
 use crate::{CODE_TOOL_NAME, PROJECT_DIR, RawConfig};
 
 pub const CONFIG_FILE: &str = "caudra.toml";
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 pub const CONFIG_FORMAT: ConfigFormat = ConfigFormat {
     file: CONFIG_FILE,
     latest: CONFIG_VERSION,
@@ -35,6 +35,11 @@ pub const CONFIG_FORMAT: ConfigFormat = ConfigFormat {
             why: Some(AUTOPILOT_WHY),
             apply: upgrade_from_3,
         },
+        Step {
+            from: 4,
+            why: None,
+            apply: upgrade_from_4,
+        },
     ],
     requires_version: false,
 };
@@ -50,6 +55,8 @@ const ALLOW_REMOTE_WHY: &str =
     "configuring a decision endpoint is now the consent to send decision context to it";
 const DECISION_ENGINE_WHY: &str = "the decision engine is no longer experimental";
 const AUTOPILOT_WHY: &str = "autopilot is no longer experimental";
+const TASK_EXECUTION_WHY: &str = "the model now chooses per task whether it runs in the background";
+const SHELL_EXECUTION_WHY: &str = "a shell call now returns early only when its requested timeout exceeds `agent.shell_async_threshold_secs`";
 const CONTINUATION_TURNS_WHY: &str =
     "truncation is now a steering rule, limited by `agent.steering.rules.truncation.max_attempts`";
 const SHELL_ETA_WHY: &str = "shell ETAs come from a local model now, switched by `agent.shell_eta`";
@@ -256,6 +263,16 @@ fn upgrade_from_3(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
     Ok(())
 }
 
+fn upgrade_from_4(upgrade: &mut Upgrade<'_>) -> Result<(), MigrationError> {
+    upgrade
+        .because(TASK_EXECUTION_WHY)
+        .retire_key(&["agent"], "task_execution");
+    upgrade
+        .because(SHELL_EXECUTION_WHY)
+        .retire_key(&["agent"], "shell_execution");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -307,8 +324,8 @@ workflows = true
     const LEGACY_GLOBAL_UPGRADED: &str = "\
 # My Caudra config
 
-# Upgraded by Caudra 9.9.9 on 2026-10-20: version 1 → 4.
-version = 4
+# Upgraded by Caudra 9.9.9 on 2026-10-20: version 1 → 5.
+version = 5
 
 [ui.tool_output_lines]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `ui.tool_output_lines.python_execution` to `code`, because the `code` tool now runs plain computation.
@@ -350,7 +367,7 @@ disabled_tools = [\"code_refs\", \"mcp\", \"code\"]
 ";
     const LEGACY_PROJECT_UPGRADED: &str = "\
 # Added by Caudra 9.9.9 on 2026-10-20: the format version of this file, which Caudra now requires.
-version = 4
+version = 5
 
 [agent]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: renamed `code_refs` to `source_code_refs` in `agent.disabled_tools`, because the code-graph tools are now `source_code_context` and `source_code_refs`.
@@ -361,13 +378,25 @@ disabled_tools = [\"source_code_refs\"]
     const AUTOPILOT_V3: &str =
         "version = 3\n\n[experimental]\nautopilot = true\nworkflows = true\n";
     const AUTOPILOT_V3_UPGRADED: &str = "\
-# Upgraded by Caudra 9.9.9 on 2026-10-20: version 3 → 4.
-version = 4
+# Upgraded by Caudra 9.9.9 on 2026-10-20: version 3 → 5.
+version = 5
 
 [experimental]
 # Upgraded by Caudra 9.9.9 on 2026-10-20: retired `experimental.autopilot`, because autopilot is no longer experimental.
 # autopilot = true
 workflows = true
+";
+    const EXECUTION_V4: &str = "version = 4\n\n[agent]\ntask_execution = \"sync\"\nshell_execution = \"async\"\ntodo_reminder = false\n";
+    const EXECUTION_V4_UPGRADED: &str = "\
+# Upgraded by Caudra 9.9.9 on 2026-10-20: version 4 → 5.
+version = 5
+
+[agent]
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.task_execution`, because the model now chooses per task whether it runs in the background.
+# task_execution = \"sync\"
+# Upgraded by Caudra 9.9.9 on 2026-10-20: retired `agent.shell_execution`, because a shell call now returns early only when its requested timeout exceeds `agent.shell_async_threshold_secs`.
+# shell_execution = \"async\"
+todo_reminder = false
 ";
     const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ncross_session_messaging = true\nautomations = true\n";
 
@@ -394,7 +423,7 @@ workflows = true
     }
 
     #[test_case("", FeatureFlags::NONE; "empty_file")]
-    #[test_case("version = 4\n[experimental]\n", FeatureFlags::NONE; "empty_table")]
+    #[test_case("version = 5\n[experimental]\n", FeatureFlags::NONE; "empty_table")]
     #[test_case("[experimental]\nworkflows = false\n", FeatureFlags::NONE; "explicit_false")]
     #[test_case("[experimental]\nlua_plugins = true\n", FeatureFlags::NONE.with(Feature::LuaPlugins); "one_flag")]
     #[test_case("[experimental]\ncross_session_messaging = false\n", FeatureFlags::NONE; "messaging_false")]
@@ -419,7 +448,7 @@ workflows = true
     #[test]
     fn settings_share_the_file_with_flags() {
         let (_dir, path) = write(
-            "version = 4\nalways_fast = true\n[experimental]\nworkflows = true\n[ui]\nscrollbar = false\n",
+            "version = 5\nalways_fast = true\n[experimental]\nworkflows = true\n[ui]\nscrollbar = false\n",
         );
         let loaded = load_global_config(&path).unwrap();
         assert!(loaded.features.enabled(Feature::Workflows));
@@ -446,9 +475,9 @@ workflows = true
     }
 
     #[test_case("[experimental]\nworkflow = true\n", "unknown field `workflow`"; "unknown_flag")]
-    #[test_case("version = 4\n[experimental]\nworkflows = 1\n", "line 3"; "non_bool_flag")]
-    #[test_case("version = 4\nexperimental = true\n", "line 2"; "flag_table_not_a_table")]
-    #[test_case("version = 4\n[ui]\nsho_thinking = true\n", "line 3"; "unknown_setting_keeps_its_line")]
+    #[test_case("version = 5\n[experimental]\nworkflows = 1\n", "line 3"; "non_bool_flag")]
+    #[test_case("version = 5\nexperimental = true\n", "line 2"; "flag_table_not_a_table")]
+    #[test_case("version = 5\n[ui]\nsho_thinking = true\n", "line 3"; "unknown_setting_keeps_its_line")]
     fn invalid_global_files_are_refused(contents: &str, expected: &str) {
         let (_dir, path) = write(contents);
         let error = load_global_config(&path).unwrap_err();
@@ -456,7 +485,7 @@ workflows = true
         assert!(error.to_string().contains(expected), "{error}");
     }
 
-    #[test_case("version = 5\n", "newer"; "newer_version")]
+    #[test_case("version = 6\n", "newer"; "newer_version")]
     #[test_case("version = 0\n", "version"; "invalid_version")]
     #[test_case("[ui\n", "line 1"; "syntax_error")]
     fn unreadable_formats_are_refused_with_the_path(contents: &str, expected: &str) {
@@ -492,7 +521,7 @@ workflows = true
         let dir = tempfile::tempdir().unwrap();
         let path = project_config_path(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "version = 4\n[agent]\ntodo_reminder = false\n").unwrap();
+        fs::write(&path, "version = 5\n[agent]\ntodo_reminder = false\n").unwrap();
         assert_eq!(
             load_project_config(&path).unwrap().agent.todo_reminder,
             Some(false)
@@ -526,7 +555,7 @@ workflows = true
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            format!("version = 4\n[ui]\ntheme = \"{open}{MISSING_THEME}}}\"\n"),
+            format!("version = 5\n[ui]\ntheme = \"{open}{MISSING_THEME}}}\"\n"),
         )
         .unwrap();
         let error = if scope == GLOBAL_SCOPE {
@@ -646,6 +675,25 @@ workflows = true
         assert_eq!(
             load_global_config(&path).unwrap().features,
             FeatureFlags::NONE.with(Feature::Workflows)
+        );
+    }
+
+    #[test]
+    fn execution_modes_retire_into_text_that_loads() {
+        let (_dir, path) = write(EXECUTION_V4);
+
+        let migrated = migrate(EXECUTION_V4, &CONFIG_FORMAT, &test_stamp()).unwrap();
+        let text = migrated.text.unwrap();
+
+        assert_eq!(text, EXECUTION_V4_UPGRADED);
+        assert_eq!(validate_global(&path, &text), Ok(()));
+        assert_eq!(
+            load_global_config(&path)
+                .unwrap()
+                .settings
+                .agent
+                .todo_reminder,
+            Some(false)
         );
     }
 

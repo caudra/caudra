@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use caudra_config::{ExecutionMode, effective_task_execution};
 use caudra_storage::background::{BackgroundCursor, JobOwner, MAX_HISTORY_PAGE};
 use serde_json::{Value, json};
 
@@ -18,13 +17,11 @@ use crate::{
 pub const DESCRIPTION: &str = "Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop.";
 const PROMOTION_GUIDANCE: &str =
     "The background action promotes a running foreground task without restarting it.";
-const PROMOTION_DENIED: &str =
-    "task promotion requires agent.task_execution = auto and a supported session";
+const PROMOTION_DENIED: &str = "task promotion requires a session that supports background tasks";
 /// The actions that only report on jobs, so their cards fold like any lookup's.
 const READ_ACTIONS: &[&str] = &["list", "status"];
 
-pub fn configure_execution(definition: &mut Value, task_mode: Option<&ExecutionMode>) {
-    let promote = task_mode == Some(&ExecutionMode::Auto);
+pub fn configure_execution(definition: &mut Value, promote: bool) {
     definition["description"] = if promote {
         json!(format!("{DESCRIPTION} {PROMOTION_GUIDANCE}"))
     } else {
@@ -135,8 +132,7 @@ impl ToolInvocation for ControlCall {
             let mut model_output = None;
             let result = async {
                 if self.action == "background"
-                    && (effective_task_execution(&ctx.config, ctx.background.is_some())
-                        != Some(ExecutionMode::Auto)
+                    && (ctx.background.is_none()
                         || ctx
                             .jobs
                             .as_ref()
@@ -229,18 +225,14 @@ mod tests {
     use crate::tools::ToolEffect;
     use crate::tools::registry::{Tool, ToolFailure};
     use crate::tools::test_support::stub_ctx;
-    use caudra_config::ExecutionMode;
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    #[test_case(None; "shell_only")]
-    #[test_case(Some(ExecutionMode::Sync); "sync")]
-    #[test_case(Some(ExecutionMode::Auto); "auto")]
-    #[test_case(Some(ExecutionMode::Async); "async_mode")]
-    fn promotion_only_published_in_auto(mode: Option<ExecutionMode>) {
+    #[test_case(false; "shell_only")]
+    #[test_case(true; "tasks_supported")]
+    fn promotion_only_published_with_background_tasks(promote: bool) {
         let mut definition = json!({"name":"task_control"});
-        configure_execution(&mut definition, mode.as_ref());
-        let promote = mode == Some(ExecutionMode::Auto);
+        configure_execution(&mut definition, promote);
         assert_eq!(definition.to_string().contains("background"), promote);
         assert_eq!(definition.to_string().contains("foreground"), promote);
         assert!(
@@ -259,12 +251,10 @@ mod tests {
         }
     }
 
-    #[test_case(ExecutionMode::Sync)]
-    #[test_case(ExecutionMode::Async)]
-    fn stale_promotion_is_denied(mode: ExecutionMode) {
+    #[test]
+    fn promotion_without_background_tasks_is_denied() {
         smol::block_on(async {
-            let mut ctx = stub_ctx(&AgentMode::Build);
-            ctx.config.task_execution = mode;
+            let ctx = stub_ctx(&AgentMode::Build);
             let call = TaskControl
                 .parse(&json!({"action":"background", "task_id":"unknown"}))
                 .unwrap();

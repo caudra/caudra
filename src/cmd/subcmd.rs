@@ -2115,7 +2115,7 @@ mod auth_tests {
     };
     use caudra_agent::tools::report::{REASON_CODE_MODULE, REASON_CONFIG};
     use caudra_agent::tools::{AUTOMATION_TOOL_NAME, cli_tool_ctx};
-    use caudra_config::{Effect, ExecutionMode, Feature, FeatureFlags, PermissionRule, RawConfig};
+    use caudra_config::{Effect, Feature, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2642,10 +2642,7 @@ Title     default       provider/title\n"
     fn inspection_shapes_execution_for_profile_tools() {
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
-        let config = AgentConfig {
-            task_execution: ExecutionMode::Sync,
-            ..AgentConfig::default()
-        };
+        let config = AgentConfig::default();
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
             "default": "disabled", "overrides": {INSPECTION_TASK: "eager"}
         }))
@@ -2671,10 +2668,9 @@ Title     default       provider/title\n"
             .iter()
             .find(|tool| tool["name"] == INSPECTION_TASK)
             .unwrap();
-        assert!(
-            task["input_schema"]["properties"]
-                .get("background")
-                .is_none()
+        assert_eq!(
+            task["input_schema"]["properties"]["background"]["default"],
+            false
         );
     }
 

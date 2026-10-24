@@ -157,10 +157,8 @@ pub const DEFAULT_SHELL_ASYNC_THRESHOLD_SECS: u64 = 120;
 pub const DEFAULT_RESUME_MAX_AGE_HOURS: u64 = 24;
 const MIN_RESUME_MAX_AGE_HOURS: u64 = 1;
 pub const MIN_SHELL_ASYNC_THRESHOLD_SECS: u64 = 1;
-const TASK_ASYNC_UNSUPPORTED: &str = "task_execution = async requires a frontend with task delivery support; use a supported session or change agent.task_execution";
-const SHELL_ASYNC_UNSUPPORTED: &str = "shell_execution = async requires a frontend with shell delivery support; use a supported session or change agent.shell_execution";
-const TASK_SYNC_REQUIRED: &str = "agent.task_execution requires task calls to wait for completion";
-const TASK_ASYNC_REQUIRED: &str = "agent.task_execution requires background: true or omission";
+const TASK_SYNC_REQUIRED: &str =
+    "this session cannot run background tasks; omit background or set it to false";
 pub const CODE_REQUIRED: &str = "`code` cannot be disabled: it hosts the `image`, `host`, `workflow`, `automation`, `history`, `mcp` and `decisions` modules; turn off a module's tool group instead (`images`, `execution`, `delegation`)";
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
@@ -1442,50 +1440,13 @@ impl LearningTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionMode {
-    Sync,
-    #[default]
-    Auto,
-    Async,
-}
-
-impl ExecutionMode {
-    pub fn effective(&self, background_supported: bool) -> Option<Self> {
-        match (self, background_supported) {
-            (Self::Async, false) => None,
-            (Self::Auto, false) => Some(Self::Sync),
-            _ => Some(self.clone()),
-        }
-    }
-}
-
-pub fn effective_task_execution(
-    config: &AgentConfig,
-    background_supported: bool,
-) -> Option<ExecutionMode> {
-    config.task_execution.effective(background_supported)
-}
-
-pub fn effective_shell_execution(
-    config: &AgentConfig,
-    background_supported: bool,
-) -> Option<ExecutionMode> {
-    config.shell_execution.effective(background_supported)
-}
-
 pub fn resolve_task_background(
-    config: &AgentConfig,
     background_supported: bool,
     requested: Option<bool>,
 ) -> Result<bool, &'static str> {
-    match effective_task_execution(config, background_supported).ok_or(TASK_ASYNC_UNSUPPORTED)? {
-        ExecutionMode::Sync if requested == Some(true) => Err(TASK_SYNC_REQUIRED),
-        ExecutionMode::Sync => Ok(false),
-        ExecutionMode::Auto => Ok(requested.unwrap_or(false)),
-        ExecutionMode::Async if requested == Some(false) => Err(TASK_ASYNC_REQUIRED),
-        ExecutionMode::Async => Ok(true),
+    match (background_supported, requested) {
+        (false, Some(true)) => Err(TASK_SYNC_REQUIRED),
+        (supported, requested) => Ok(supported && requested.unwrap_or(false)),
     }
 }
 
@@ -1493,12 +1454,8 @@ pub fn resolve_shell_background(
     config: &AgentConfig,
     background_supported: bool,
     effective_timeout_secs: u64,
-) -> Result<bool, &'static str> {
-    match effective_shell_execution(config, background_supported).ok_or(SHELL_ASYNC_UNSUPPORTED)? {
-        ExecutionMode::Sync => Ok(false),
-        ExecutionMode::Auto => Ok(effective_timeout_secs > config.shell_async_threshold_secs),
-        ExecutionMode::Async => Ok(true),
-    }
+) -> bool {
+    background_supported && effective_timeout_secs > config.shell_async_threshold_secs
 }
 
 /// Which GPT Image 2.5 model the hosted `image_generation` tool runs.
@@ -1630,10 +1587,8 @@ pub struct AgentFileConfig {
     pub background_reminder_turns: Option<u32>,
     pub todo_reminder: Option<bool>,
     pub work_nudge_compactions: Option<u32>,
-    pub task_execution: Option<ExecutionMode>,
     pub task_model_choice: Option<bool>,
     pub deferred_questions: Option<bool>,
-    pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
     pub shell_eta: Option<bool>,
     pub generate_titles: Option<bool>,
@@ -1679,10 +1634,8 @@ impl AgentFileConfig {
             background_reminder_turns,
             todo_reminder,
             work_nudge_compactions,
-            task_execution,
             task_model_choice,
             deferred_questions,
-            shell_execution,
             shell_async_threshold_secs,
             shell_eta,
             generate_titles,
@@ -2943,9 +2896,6 @@ pub struct AgentConfig {
     )]
     pub work_nudge_compactions: u32,
 
-    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt", choices = ["sync", "auto", "async"])]
-    pub task_execution: ExecutionMode,
-
     #[config(
         default = true,
         desc = "Let the main agent choose a model and reasoning level for each `task` call, such as when you ask it to run work on a named model. When off, `task` has no `model` or `thinking` argument and tasks run on the Subagent model or a profile's pin"
@@ -2958,10 +2908,7 @@ pub struct AgentConfig {
     )]
     pub deferred_questions: bool,
 
-    #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt", choices = ["sync", "auto", "async"])]
-    pub shell_execution: ExecutionMode,
-
-    #[config(default = DEFAULT_SHELL_ASYNC_THRESHOLD_SECS, min = MIN_SHELL_ASYNC_THRESHOLD_SECS, desc = "Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline")]
+    #[config(default = DEFAULT_SHELL_ASYNC_THRESHOLD_SECS, min = MIN_SHELL_ASYNC_THRESHOLD_SECS, desc = "Requested shell timeout above which a shell call returns an admission receipt instead of waiting; independent of the enforced execution deadline")]
     pub shell_async_threshold_secs: u64,
 
     #[config(
@@ -3137,10 +3084,8 @@ impl AgentConfig {
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             compaction_requirements: file.compaction_requirements.unwrap_or(true),
-            task_execution: file.task_execution.unwrap_or_default(),
             task_model_choice: file.task_model_choice.unwrap_or(true),
             deferred_questions: file.deferred_questions.unwrap_or(true),
-            shell_execution: file.shell_execution.unwrap_or_default(),
             shell_async_threshold_secs: file
                 .shell_async_threshold_secs
                 .unwrap_or(DEFAULT_SHELL_ASYNC_THRESHOLD_SECS),
@@ -5450,29 +5395,23 @@ mod tests {
         ));
     }
 
-    #[test_case("sync", ExecutionMode::Sync)]
-    #[test_case("auto", ExecutionMode::Auto)]
-    #[test_case("async", ExecutionMode::Async)]
-    fn execution_config_merge_and_serialization(value: &str, expected: ExecutionMode) {
+    #[test]
+    fn shell_threshold_merges_and_serializes() {
         let mut raw: RawConfig =
-            toml::from_str("[agent]\nshell_execution = 'sync'\nshell_async_threshold_secs = 31")
-                .unwrap();
-        raw.merge(toml::from_str(&format!("[agent]\ntask_execution = '{value}'")).unwrap());
+            toml::from_str("[agent]\nshell_async_threshold_secs = 31").unwrap();
         raw.merge(RawConfig::default());
         let config = raw.into_config(false).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.agent.task_execution, expected);
-        assert_eq!(config.agent.shell_execution, ExecutionMode::Sync);
         assert_eq!(config.agent.shell_async_threshold_secs, 31);
         assert_eq!(
-            serde_json::to_value(&config.agent).unwrap()["task_execution"],
-            value
+            serde_json::to_value(&config.agent).unwrap()[SHELL_THRESHOLD_FIELD],
+            31
         );
         assert_eq!(config.agent.background_reminder_turns, 0);
     }
 
-    #[test_case("task_execution = 'invalid'")]
-    #[test_case("shell_execution = 'invalid'")]
+    #[test_case("task_execution = 'auto'")]
+    #[test_case("shell_execution = 'auto'")]
     #[test_case("shell_async_threshold_secs = -1")]
     #[test_case("shell_async_threshold_secs = 1.5")]
     #[test_case("shell_async_threshold_secs = '120'")]
@@ -5489,53 +5428,30 @@ mod tests {
         assert_eq!(config.validate().is_ok(), valid);
     }
 
-    #[test_case(ExecutionMode::Sync)]
-    #[test_case(ExecutionMode::Auto)]
-    #[test_case(ExecutionMode::Async)]
-    fn execution_policy_capability_and_input_matrix(mode: ExecutionMode) {
-        let config = AgentConfig {
-            task_execution: mode.clone(),
-            shell_execution: mode.clone(),
-            ..AgentConfig::default()
-        };
-        for supported in [false, true] {
-            for requested in [None, Some(false), Some(true)] {
-                let expected = match (&mode, supported, requested) {
-                    (ExecutionMode::Async, false, _) => Err(TASK_ASYNC_UNSUPPORTED),
-                    (ExecutionMode::Async, true, Some(false)) => Err(TASK_ASYNC_REQUIRED),
-                    (ExecutionMode::Async, true, _) => Ok(true),
-                    (ExecutionMode::Sync, _, Some(true))
-                    | (ExecutionMode::Auto, false, Some(true)) => Err(TASK_SYNC_REQUIRED),
-                    (ExecutionMode::Auto, true, requested) => Ok(requested.unwrap_or(false)),
-                    _ => Ok(false),
-                };
-                assert_eq!(
-                    resolve_task_background(&config, supported, requested),
-                    expected
-                );
-            }
-            for timeout in [119, 120, 121] {
-                let expected = match (&mode, supported) {
-                    (ExecutionMode::Async, false) => Err(SHELL_ASYNC_UNSUPPORTED),
-                    (ExecutionMode::Async, true) => Ok(true),
-                    (ExecutionMode::Auto, true) => Ok(timeout > DEFAULT_SHELL_ASYNC_THRESHOLD_SECS),
-                    _ => Ok(false),
-                };
-                assert_eq!(
-                    resolve_shell_background(&config, supported, timeout),
-                    expected
-                );
-            }
-        }
+    #[test_case(false, None => Ok(false); "unsupported_omitted")]
+    #[test_case(false, Some(false) => Ok(false); "unsupported_foreground")]
+    #[test_case(false, Some(true) => Err(TASK_SYNC_REQUIRED); "unsupported_background")]
+    #[test_case(true, None => Ok(false); "supported_omitted")]
+    #[test_case(true, Some(false) => Ok(false); "supported_foreground")]
+    #[test_case(true, Some(true) => Ok(true); "supported_background")]
+    fn task_background_follows_the_request_where_supported(
+        supported: bool,
+        requested: Option<bool>,
+    ) -> Result<bool, &'static str> {
+        resolve_task_background(supported, requested)
     }
 
-    #[test_case("task_execution", "auto", None)]
-    #[test_case("shell_execution", "auto", None)]
+    #[test_case(false, 121 => false; "unsupported_waits")]
+    #[test_case(true, 119 => false; "below_threshold_waits")]
+    #[test_case(true, 120 => false; "at_threshold_waits")]
+    #[test_case(true, 121 => true; "above_threshold_returns_a_receipt")]
+    fn shell_background_follows_the_requested_timeout(supported: bool, timeout: u64) -> bool {
+        resolve_shell_background(&AgentConfig::default(), supported, timeout)
+    }
+
     #[test_case(SHELL_THRESHOLD_FIELD, "120", Some(1))]
     fn execution_defaults_and_metadata(name: &str, default: &str, min: Option<u64>) {
         let config = RawConfig::default().into_config(false).unwrap();
-        assert_eq!(config.agent.task_execution, ExecutionMode::Auto);
-        assert_eq!(config.agent.shell_execution, ExecutionMode::Auto);
         assert_eq!(
             config.agent.shell_async_threshold_secs,
             DEFAULT_SHELL_ASYNC_THRESHOLD_SECS

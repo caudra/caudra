@@ -2,9 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use caudra_config::{
-    AgentConfig, ExecutionMode, effective_shell_execution, effective_task_execution,
-};
+use caudra_config::AgentConfig;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 use crate::{
@@ -24,7 +22,6 @@ use profile::{PromptProfileLayout, SystemPromptProfile};
 const EXECUTION_HINT_OWNER: &str = "native:execution";
 const TASK_SYNC_GUIDANCE: &str = "Task calls wait for the completed result.";
 const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (background: false), waiting for the completed result. Use background: true for independent work: the call returns an admission receipt and reports and final results arrive automatically.";
-const TASK_ASYNC_GUIDANCE: &str = "Task calls launch background work and return an admission receipt. Omit background or set it to true. Reports and final results arrive automatically, including after you end your turn.";
 const ASYNC_RESULT_GUIDANCE: &str = "An admission receipt is not completion or success. Continue independent work without duplicating pending work or concurrently editing the same files. Do not poll, sleep, or repeat a launch. If only pending work remains, state what is pending and return control without claiming completion. Later results arrive at a safe boundary; evaluate them against current user instructions and verify claims before continuing.";
 const LOCAL_PLAN_WRITE_TOOLS: &[&str] = &["file_write", "file_edit", "file_apply_patch"];
 const PLAN_TOOL_GUIDANCE: &str = "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference. It may already hold this session's earlier plan, so read it before revising.";
@@ -71,24 +68,17 @@ pub fn plan_mode_prompt(mode: &AgentMode, available: impl Fn(&str) -> bool) -> O
     )
 }
 
-pub fn task_execution_guidance(mode: &ExecutionMode) -> String {
-    let delivery = match mode {
-        ExecutionMode::Sync => TASK_SYNC_GUIDANCE,
-        ExecutionMode::Auto => TASK_AUTO_GUIDANCE,
-        ExecutionMode::Async => TASK_ASYNC_GUIDANCE,
-    };
-    if *mode == ExecutionMode::Sync {
-        delivery.into()
-    } else {
-        format!("{delivery}\n\n{ASYNC_RESULT_GUIDANCE}")
+pub fn task_execution_guidance(background_supported: bool) -> String {
+    match background_supported {
+        true => format!("{TASK_AUTO_GUIDANCE}\n\n{ASYNC_RESULT_GUIDANCE}"),
+        false => TASK_SYNC_GUIDANCE.into(),
     }
 }
 
-pub fn shell_execution_guidance(mode: &ExecutionMode, threshold_secs: u64) -> String {
-    match mode {
-        ExecutionMode::Sync => "Shell calls wait for termination and return the terminal result. timeoutSec is the enforced execution deadline.".into(),
-        ExecutionMode::Auto => format!("Shell delivery is selected at admission, never promoted by elapsed runtime. By default, an effective timeout at or below {threshold_secs} seconds returns the terminal result synchronously; above {threshold_secs} seconds it returns an async admission receipt and the terminal result arrives automatically. When configured duration estimates are enforced, the lesser of the estimate and execution deadline selects delivery against that threshold. The tool's default applies when timeoutSec is omitted unless an enabled duration estimate supplies a longer bounded default. Explicit timeoutSec is never changed and remains the enforced execution deadline; never extend it just to influence scheduling.\n\n{ASYNC_RESULT_GUIDANCE}"),
-        ExecutionMode::Async => format!("Shell calls return an async admission receipt and the terminal result arrives automatically. timeoutSec remains the enforced execution deadline.\n\n{ASYNC_RESULT_GUIDANCE}"),
+pub fn shell_execution_guidance(background_supported: bool, threshold_secs: u64) -> String {
+    match background_supported {
+        false => "Shell calls wait for termination and return the terminal result. timeoutSec is the enforced execution deadline.".into(),
+        true => format!("Shell delivery is selected at admission, never promoted by elapsed runtime. By default, an effective timeout at or below {threshold_secs} seconds returns the terminal result synchronously; above {threshold_secs} seconds it returns an async admission receipt and the terminal result arrives automatically. When configured duration estimates are enforced, the lesser of the estimate and execution deadline selects delivery against that threshold. The tool's default applies when timeoutSec is omitted unless an enabled duration estimate supplies a longer bounded default. Explicit timeoutSec is never changed and remains the enforced execution deadline; never extend it just to influence scheduling.\n\n{ASYNC_RESULT_GUIDANCE}"),
     }
 }
 
@@ -100,15 +90,12 @@ pub fn execution_guidance(
     shell_exposed: bool,
 ) -> String {
     let mut fragments = Vec::new();
-    if task_exposed && let Some(mode) = effective_task_execution(config, task_background_supported)
-    {
-        fragments.push(task_execution_guidance(&mode));
+    if task_exposed {
+        fragments.push(task_execution_guidance(task_background_supported));
     }
-    if shell_exposed
-        && let Some(mode) = effective_shell_execution(config, shell_background_supported)
-    {
+    if shell_exposed {
         fragments.push(shell_execution_guidance(
-            &mode,
+            shell_background_supported,
             config.shell_async_threshold_secs,
         ));
     }
@@ -1031,22 +1018,15 @@ mod tests {
         assert!(plan_mode_prompt(&mode, |_| true).is_none());
     }
 
-    #[test_case(ExecutionMode::Sync)]
-    #[test_case(ExecutionMode::Auto)]
-    #[test_case(ExecutionMode::Async)]
-    fn composed_execution_guidance_respects_independent_modes(task_mode: ExecutionMode) {
-        for shell_mode in [
-            ExecutionMode::Sync,
-            ExecutionMode::Auto,
-            ExecutionMode::Async,
-        ] {
-            let config = AgentConfig {
-                task_execution: task_mode.clone(),
-                shell_execution: shell_mode.clone(),
-                shell_async_threshold_secs: EXECUTION_TEST_THRESHOLD,
-                ..AgentConfig::default()
-            };
-            let guidance = execution_guidance(&config, true, true, true, true);
+    #[test_case(false; "task_waits")]
+    #[test_case(true; "task_may_background")]
+    fn composed_execution_guidance_respects_independent_support(task_supported: bool) {
+        let config = AgentConfig {
+            shell_async_threshold_secs: EXECUTION_TEST_THRESHOLD,
+            ..AgentConfig::default()
+        };
+        for shell_supported in [false, true] {
+            let guidance = execution_guidance(&config, task_supported, shell_supported, true, true);
             let slots = ResolvedSlots::default().with_execution_guidance(&guidance);
             for prompt in [PromptId::System, PromptId::Research, PromptId::General] {
                 let rendered = if prompt == PromptId::System {
@@ -1054,22 +1034,17 @@ mod tests {
                 } else {
                     assemble_task(prompt, &slots, "", None)
                 };
-                assert!(rendered.contains(&task_execution_guidance(&task_mode)));
+                assert!(rendered.contains(&task_execution_guidance(task_supported)));
                 assert!(rendered.contains(&shell_execution_guidance(
-                    &shell_mode,
+                    shell_supported,
                     EXECUTION_TEST_THRESHOLD
                 )));
                 assert_eq!(
                     rendered.contains(&EXECUTION_TEST_THRESHOLD.to_string()),
-                    shell_mode == ExecutionMode::Auto
+                    shell_supported
                 );
-                if task_mode == ExecutionMode::Sync && shell_mode == ExecutionMode::Sync {
+                if !task_supported && !shell_supported {
                     for forbidden in ["background", "async", "receipt", "promote"] {
-                        assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
-                    }
-                }
-                if task_mode == ExecutionMode::Async && shell_mode == ExecutionMode::Async {
-                    for forbidden in ["foreground", "synchronous", "background: false", "promote"] {
                         assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
                     }
                 }
@@ -1082,16 +1057,18 @@ mod tests {
     #[test_case(false, true; "shell_only_child")]
     #[test_case(true, true; "both_tools")]
     fn execution_guidance_only_exposes_supported_tools(task_exposed: bool, shell_exposed: bool) {
-        let mut config = AgentConfig::default();
-        let guidance = execution_guidance(&config, false, false, task_exposed, shell_exposed);
+        let guidance = execution_guidance(
+            &AgentConfig::default(),
+            false,
+            false,
+            task_exposed,
+            shell_exposed,
+        );
         assert_eq!(guidance.contains("Task calls"), task_exposed);
         assert_eq!(guidance.contains("Shell calls"), shell_exposed);
         for forbidden in ["background", "async", "receipt", "promote"] {
             assert!(!guidance.contains(forbidden));
         }
-        config.task_execution = ExecutionMode::Async;
-        config.shell_execution = ExecutionMode::Async;
-        assert!(execution_guidance(&config, false, false, task_exposed, shell_exposed).is_empty());
     }
 
     #[test_case(PromptId::System)]
@@ -1099,13 +1076,11 @@ mod tests {
     #[test_case(PromptId::General)]
     fn execution_guidance_refresh_preserves_custom_instructions(prompt: PromptId) {
         let base = slots(prompt, &[(Slot::ToolUsage, CUSTOM_EXECUTION_INSTRUCTION)]);
-        let configured =
-            base.with_execution_guidance(&task_execution_guidance(&ExecutionMode::Async));
-        let refreshed =
-            configured.with_execution_guidance(&task_execution_guidance(&ExecutionMode::Sync));
+        let configured = base.with_execution_guidance(&task_execution_guidance(true));
+        let refreshed = configured.with_execution_guidance(&task_execution_guidance(false));
         let rendered = assemble(prompt, &refreshed, "");
         assert!(rendered.contains(CUSTOM_EXECUTION_INSTRUCTION));
-        assert!(!rendered.contains(TASK_ASYNC_GUIDANCE));
+        assert!(!rendered.contains(TASK_AUTO_GUIDANCE));
         assert_eq!(rendered.matches(TASK_SYNC_GUIDANCE).count(), 1);
         assert_eq!(
             assemble(prompt, &refreshed.with_execution_guidance(""), ""),
