@@ -70,7 +70,7 @@ use caudra_agent::tools::{
     LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PartialOutputFilter, PermissionIntent,
     PermissionScopes, PlanModeAccess, RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience,
     ToolContext, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation, ToolLive,
-    ToolRegistry, ToolSource, expand_tilde, stale_read_message,
+    ToolRegistry, ToolSource, expand_tilde, output_so_far, stale_read_message,
 };
 use caudra_agent::{
     AgentEvent, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry, GrepMatchGroup,
@@ -3225,6 +3225,8 @@ impl WorkcellInvocation {
             (Input::Shell(_), PreparedExecution::Shell(group, prepared)) => {
                 let progress = Arc::new(NativeProgressSink::new(ctx));
                 progress.publish_live_buf(ctx);
+                let printed = Arc::clone(&progress.body);
+                let reduce = prepared.partial_output_filter();
                 match self
                     .host
                     .run(ctx, move |token| async move {
@@ -3235,7 +3237,13 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(Some(execution))) => shell_result(execution),
-                    Ok(Ok(None)) => ToolExecResult::failed(ToolFailure::Cancelled, SHELL_CANCELLED),
+                    Ok(Ok(None)) => ToolExecResult::failed(
+                        ToolFailure::Cancelled,
+                        match output_so_far(&printed.read(), |text| reduce.apply(&text)) {
+                            Some(printed) => format!("{SHELL_CANCELLED}\n\n{printed}"),
+                            None => SHELL_CANCELLED.to_owned(),
+                        },
+                    ),
                     Ok(Err(error)) => ToolExecResult::failed(ToolFailure::Other, error),
                     Err(error) => failed(error),
                 }
@@ -4948,8 +4956,8 @@ mod tests {
     use caudra_agent::template::Vars;
     use caudra_agent::tools::execution::configure_declared;
     use caudra_agent::tools::{
-        Deadline, FileReadTracker, PLAN_WRITE_RESTRICTED, READ_ONLY_TOOL_RESTRICTED,
-        STALE_READ_MSG, interpreter_ctx,
+        Deadline, FileReadTracker, OUTPUT_SO_FAR_HEADING, PLAN_WRITE_RESTRICTED,
+        READ_ONLY_TOOL_RESTRICTED, STALE_READ_MSG, interpreter_ctx,
     };
     use caudra_agent::{
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
@@ -11049,6 +11057,46 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.failure, Some(ToolFailure::Cancelled));
         assert_eq!(result.output.expect_err(SHELL_CANCELLED), SHELL_CANCELLED);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_shell_reports_its_output_so_far() {
+        const PRINTED: &str = "halfway there";
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let (trigger, token) = CancelToken::new();
+        let mut ctx = context(root.path(), Arc::clone(&registry), token);
+        let live = ShellLive::default();
+        ctx.shell_live = Some(live.clone());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(
+                &json!({ "command": format!("echo '{PRINTED}' && exec sleep {SLEEPER_SECONDS}") }),
+            )
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let printed = || {
+            live.lines().is_some_and(|lines| {
+                lines
+                    .iter()
+                    .any(|line| line.spans.iter().any(|span| span.text.contains(PRINTED)))
+            })
+        };
+
+        let result = smol::block_on(future::or(invocation.execute(&ctx), async {
+            assert!(eventually(printed).await, "the command printed nothing");
+            trigger.cancel();
+            future::pending().await
+        }));
+
+        assert_eq!(result.failure, Some(ToolFailure::Cancelled));
+        let message = result.output.expect_err(SHELL_CANCELLED);
+        assert!(message.starts_with(SHELL_CANCELLED), "{message}");
+        assert!(message.contains(OUTPUT_SO_FAR_HEADING), "{message}");
+        assert!(message.contains(PRINTED), "{message}");
     }
 
     #[cfg(target_os = "linux")]

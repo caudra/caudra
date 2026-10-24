@@ -36,11 +36,11 @@ use crate::tools::registry::{
 use crate::tools::{
     CODE_TOOL_NAME, DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED, PathGuards,
     READ_ONLY_CALL_GUIDANCE, READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect, ToolError,
-    ToolExecResult, ToolFailure, ToolSource, humanize_duration,
+    ToolExecResult, ToolFailure, ToolSource, humanize_duration, output_so_far,
 };
 use crate::{
-    AgentError, AgentEvent, AgentMode, CancelToken, LuaToolProvenance, SnapshotLine,
-    ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentError, AgentEvent, AgentMode, CancelToken, LuaToolProvenance, ToolAccounting,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolKey, resolve_shell_background};
 use caudra_providers::TokenScale;
@@ -107,12 +107,9 @@ const SHELL_INVOCATION_LOST: &str = "shell execution was already consumed";
 const SHELL_BACKGROUND_FIELD: &str = "background";
 const SHELL_BACKGROUND_INVALID: &str = "background must be a boolean";
 const PROMOTION_NOTICE: &str = "This command was still running when it reached the {limit} foreground limit, so it moved to the background as task {task_id}. It was not restarted or stopped. It keeps running until it exits or reaches its timeoutSec deadline. Its terminal result arrives automatically, including after you end this turn. Continue independent work, or tell the user what is pending and return control. Do not re-run it, poll it, or sleep waiting for it.";
-const PROMOTION_TAIL_HEADING: &str = "Output so far";
 const PROMOTED_ANNOTATION: &str = "moved to background after";
 const LIMIT_PLACEHOLDER: &str = "{limit}";
 const TASK_ID_PLACEHOLDER: &str = "{task_id}";
-const PROMOTION_TAIL_LINES: usize = 20;
-const PROMOTION_TAIL_BYTES: usize = 2048;
 
 const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
@@ -927,7 +924,7 @@ async fn run_inner(
                 Ok(background) => background,
                 Err(message) => {
                     ctx.mark_tool_result_repairable();
-                    return done_error(ToolFailure::InvalidInput, message.into());
+                    return done_error(ToolFailure::InvalidInput, message);
                 }
             },
             None => false,
@@ -1602,52 +1599,14 @@ fn promotion_notice(
     let notice = PROMOTION_NOTICE
         .replace(LIMIT_PLACEHOLDER, &humanize_duration(limit))
         .replace(TASK_ID_PLACEHOLDER, task_id);
-    let printed = live_text(&live.lines().unwrap_or_default());
-    let reduced = match reduce {
+    let printed = output_so_far(&live.lines().unwrap_or_default(), |printed| match reduce {
         Some(reduce) => reduce(&printed),
         None => printed,
-    };
-    let tail = output_tail(&reduced);
-    if tail.is_empty() {
-        return notice;
+    });
+    match printed {
+        Some(printed) => format!("{notice}\n\n{printed}"),
+        None => notice,
     }
-    let shown = tail.lines().count();
-    format!("{notice}\n\n{PROMOTION_TAIL_HEADING} (last {shown} lines):\n```\n{tail}\n```")
-}
-
-fn live_text(lines: &[SnapshotLine]) -> String {
-    lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// At most [`PROMOTION_TAIL_LINES`] lines and [`PROMOTION_TAIL_BYTES`] bytes,
-/// cut at a line, or failing that a character, boundary.
-fn output_tail(text: &str) -> String {
-    let text = text.trim_end();
-    let start = text
-        .rmatch_indices('\n')
-        .nth(PROMOTION_TAIL_LINES - 1)
-        .map_or(0, |(newline, _)| newline + 1);
-    let text = &text[start..];
-    if text.len() <= PROMOTION_TAIL_BYTES {
-        return text.to_owned();
-    }
-    let mut start = text.len() - PROMOTION_TAIL_BYTES;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    let kept = &text[start..];
-    kept.split_once('\n')
-        .map_or(kept, |(_, whole_lines)| whole_lines)
-        .to_owned()
 }
 
 /// Asked after the verdict, of the command that will run. The first call of
@@ -2307,12 +2266,13 @@ mod tests {
         PermissionResourceKind, PermissionRisk,
     };
     use crate::shell_eta::MIN_TRAINING_RUNS;
-    use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::tools::{BATCH_TOOL_NAME, OUTPUT_SO_FAR_HEADING};
     use crate::{
-        AgentMode, Envelope, EventSender, SharedBuf, ShellOutput, StoredSession, TaskCard,
+        AgentMode, Envelope, EventSender, SharedBuf, ShellOutput, SnapshotLine, StoredSession,
+        TaskCard,
     };
 
     const OBSERVED_TOOL: &str = "observed";
@@ -2352,7 +2312,6 @@ mod tests {
     const DURATION_DEFAULT_SECS: u64 = 120;
     const ASYNC_ERA_TIMEOUT_SECS: u64 = 3_600;
     const PROMOTION_FORBIDS_RERUN: &str = "Do not re-run it";
-    const WIDE_CHAR: &str = "é";
     const FILTERED_TAIL: &str = "[filtered: progress]";
     const DURATION_DEFAULT: Duration = Duration::from_secs(DURATION_DEFAULT_SECS);
     const DURATION_CAP_SECS: u64 = 21_600;
@@ -3590,7 +3549,7 @@ mod tests {
             let notice = done.model_suffix.as_deref().unwrap();
             assert!(notice.contains(&cards[0].task_id), "{notice}");
             assert!(notice.contains(PROMOTION_FORBIDS_RERUN), "{notice}");
-            assert!(!notice.contains(PROMOTION_TAIL_HEADING), "{notice}");
+            assert!(!notice.contains(OUTPUT_SO_FAR_HEADING), "{notice}");
             assert!(
                 done.annotation
                     .as_deref()
@@ -3718,23 +3677,6 @@ mod tests {
         });
     }
 
-    #[test_case(0, 0; "no_output")]
-    #[test_case(3, 3; "short_output_whole")]
-    #[test_case(PROMOTION_TAIL_LINES + 5, PROMOTION_TAIL_LINES; "long_output_keeps_the_last_lines")]
-    fn the_promotion_tail_keeps_the_last_lines(printed: usize, kept: usize) {
-        let lines: Vec<_> = (0..printed)
-            .map(|line| SnapshotLine::plain(format!("line {line}")))
-            .collect();
-        let tail = output_tail(&live_text(&lines));
-        assert_eq!(tail.lines().count(), kept);
-        if kept > 0 {
-            assert_eq!(
-                tail.lines().last().unwrap(),
-                format!("line {}", printed - 1)
-            );
-        }
-    }
-
     #[test]
     fn the_promotion_tail_is_what_the_filter_leaves() {
         let live = ShellLive::default();
@@ -3745,15 +3687,6 @@ mod tests {
         let notice = promotion_notice(Duration::ZERO, NAMED_SHELL_TASK, &live, Some(&reduce));
         assert!(notice.contains(FILTERED_TAIL), "{notice}");
         assert!(!notice.contains(SHELL_RESULT), "{notice}");
-    }
-
-    #[test]
-    fn the_promotion_tail_cuts_at_a_char_boundary_within_its_byte_budget() {
-        let wide = WIDE_CHAR.repeat(PROMOTION_TAIL_BYTES);
-        let tail = output_tail(&wide);
-        assert!(tail.len() <= PROMOTION_TAIL_BYTES);
-        assert!(!tail.is_empty());
-        assert!(tail.chars().all(|char| char.to_string() == WIDE_CHAR));
     }
 
     #[test]

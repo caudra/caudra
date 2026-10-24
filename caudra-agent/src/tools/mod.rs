@@ -12,6 +12,7 @@ pub(crate) mod image_bytes;
 pub mod interpreter_bridge;
 pub mod json_repair;
 pub mod native;
+mod output_so_far;
 mod path_locks;
 pub mod profile_policy;
 pub mod registry;
@@ -24,6 +25,7 @@ pub use caudra_config::{
     is_tool_enabled,
 };
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG, stale_read_message};
+pub use output_so_far::{OUTPUT_SO_FAR_HEADING, output_so_far};
 pub use path_locks::{LockKey, PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PartialOutputFilter,

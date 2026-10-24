@@ -154,7 +154,7 @@ Starring or unstarring a model in `/model` updates the list with your next messa
 
 Press Enter or click a row to see the whole command with its owner, working directory, timeout, ETA while it runs, elapsed time, exit status, and output. A command longer than 8 KiB is shown without highlighting. Output appears as the command wrote it, with terminal control sequences escaped and no Markdown rendering. Output of a running command updates in place. Ordinary letters filter the list. Escape leaves the details, and a second Escape closes the modal without stopping anything.
 
-`Ctrl+K` stops the selected running command, from the list or its details. Only that call is cancelled. The row shows `cancelling` until the command settles. Its owner receives an ordinary cancelled result, and the rest of its work continues. Background shell jobs also accept `/tasks cancel <task_id>`. A command that moved to the background at the [foreground limit](/docs/sessions/#execution-policies) stays one row. Shell jobs cannot be promoted by hand or resumed.
+`Ctrl+K` stops the selected running command, from the list or its details. Only that call is cancelled. The row shows `cancelling` until the command settles. Its owner receives a cancelled result with the output so far, and the rest of its work continues. Background shell jobs also accept `/tasks cancel <task_id>`. A command that moved to the background at the [foreground limit](/docs/sessions/#execution-policies) stays one row. Shell jobs cannot be promoted by hand or resumed.
 
 Finished commands stay listed after a reload. See [shell history](/docs/sessions/#shell-history) for what a session keeps and how commands cut short by a crash appear.
 
