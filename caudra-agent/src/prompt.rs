@@ -23,6 +23,7 @@ use profile::{PromptProfileLayout, SystemPromptProfile};
 const EXECUTION_HINT_OWNER: &str = "native:execution";
 const TASK_SYNC_GUIDANCE: &str = "Task calls wait for the completed result.";
 const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (background: false), waiting for the completed result. Use background: true for independent work: the call returns an admission receipt and reports and final results arrive automatically.";
+const SHELL_DURATION_GUIDANCE: &str = "A result's status line says how long the command took once it ran for a second or more. When you run it again, set timeoutSec with headroom over that rather than matching it.";
 const ASYNC_RESULT_GUIDANCE: &str = "An admission receipt is not completion or success. Continue independent work without duplicating pending work or concurrently editing the same files. Do not poll, sleep, or repeat a launch. If only pending work remains, state what is pending and return control without claiming completion. Later results arrive at a safe boundary; evaluate them against current user instructions and verify claims before continuing.";
 const LOCAL_PLAN_WRITE_TOOLS: &[&str] = &["file_write", "file_edit", "file_apply_patch"];
 const PLAN_TOOL_GUIDANCE: &str = "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference. It may already hold this session's earlier plan, so read it before revising.";
@@ -78,10 +79,14 @@ pub fn task_execution_guidance(background_supported: bool) -> String {
 
 pub fn shell_execution_guidance(background_supported: bool, foreground_limit_secs: u64) -> String {
     match background_supported {
-        false => "Shell calls wait for termination and return the terminal result. timeoutSec is the enforced execution deadline.".into(),
+        false => format!(
+            "Shell calls wait for termination and return the terminal result. timeoutSec is the enforced execution deadline. {SHELL_DURATION_GUIDANCE}"
+        ),
         true => {
             let limit = humanize_duration(Duration::from_secs(foreground_limit_secs));
-            format!("A call waits for the command for up to {limit}. A command still running then moves to the background instead of stopping: the call returns a receipt with the output so far, the command keeps running until it exits or reaches timeoutSec, and its terminal result arrives automatically. timeoutSec is only the execution deadline, so set it to what the command needs. Pass `background: true` to start a server, a watcher, or anything you expect to outlast {limit} in the background at once.\n\n{ASYNC_RESULT_GUIDANCE}")
+            format!(
+                "A call waits for the command for up to {limit}. A command still running then moves to the background instead of stopping: the call returns a receipt with the output so far, the command keeps running until it exits or reaches timeoutSec, and its terminal result arrives automatically. timeoutSec is only the execution deadline, so set it to what the command needs. {SHELL_DURATION_GUIDANCE} Pass `background: true` to start a server, a watcher, or anything you expect to outlast {limit} in the background at once.\n\n{ASYNC_RESULT_GUIDANCE}"
+            )
         }
     }
 }

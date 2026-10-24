@@ -70,7 +70,7 @@ use caudra_agent::tools::{
     LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PartialOutputFilter, PermissionIntent,
     PermissionScopes, PlanModeAccess, RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience,
     ToolContext, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation, ToolLive,
-    ToolRegistry, ToolSource, expand_tilde, output_so_far, stale_read_message,
+    ToolRegistry, ToolSource, expand_tilde, humanize_duration, output_so_far, stale_read_message,
 };
 use caudra_agent::{
     AgentEvent, DocumentSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry, GrepMatchGroup,
@@ -164,6 +164,10 @@ const NO_CODE_WORKER_PATH: &str = "no code worker path was supplied";
 const CODE_WORKER_INIT_FAILED: &str = "code worker initialization failed";
 const CODE_WORKER_NO_CACHE: &str = "no cache directory for the code worker";
 const SHELL_CANCELLED: &str = "Shell execution cancelled";
+const MILLIS_PER_SEC: u64 = 1000;
+/// Shorter runs say nothing a model could plan around, so they leave the
+/// status line as it was.
+const SHELL_DURATION_SHOWN_FROM_SECS: u64 = 1;
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
@@ -4359,9 +4363,11 @@ fn shell_exec_result(output: AgentShellOutput, model_output: String) -> ToolExec
 }
 
 fn shell_status(output: &WorkcellShellOutput) -> String {
+    let secs = output.duration_ms / MILLIS_PER_SEC;
+    let took = humanize_duration(Duration::from_secs(secs));
     let mut statuses = Vec::new();
     if output.timed_out {
-        statuses.push("timed out".into());
+        statuses.push(format!("timed out after {took}"));
     }
     if output.output_limit_exceeded {
         statuses.push("output limit exceeded".into());
@@ -4372,6 +4378,9 @@ fn shell_status(output: &WorkcellShellOutput) -> String {
         statuses.push(format!("signal {signal}"));
     } else if statuses.is_empty() {
         statuses.push("exit unknown".into());
+    }
+    if !output.timed_out && secs >= SHELL_DURATION_SHOWN_FROM_SECS {
+        statuses.push(format!("took {took}"));
     }
     format!("[shell status: {}]", statuses.join("; "))
 }
@@ -7932,6 +7941,23 @@ mod tests {
             failure.output.as_ref().unwrap(),
             ToolOutput::Shell(output) if output.filter.is_none()
         ));
+    }
+
+    #[test_case(10, false, Some(0) => "[shell status: exit code 0]" ; "a_quick_run_states_no_duration")]
+    #[test_case(192_400, false, Some(0) => "[shell status: exit code 0; took 3m12s]" ; "a_long_run_states_its_duration")]
+    #[test_case(120_000, true, None => "[shell status: timed out after 2m]" ; "a_timeout_states_when_it_was_cut_off")]
+    fn the_status_line_states_how_long_a_command_ran(
+        duration_ms: u64,
+        timed_out: bool,
+        exit_code: Option<i32>,
+    ) -> String {
+        let output = WorkcellShellOutput {
+            duration_ms,
+            timed_out,
+            exit_code,
+            ..shell_output(0)
+        };
+        shell_status(&output)
     }
 
     /// Workcell's flags place a command's failure, never its output. A host
