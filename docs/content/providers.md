@@ -675,6 +675,15 @@ A key saved by login, in `auth/decisions/<name>.json` under the state directory,
 
 Switch the active endpoint with the **Decisions** row of `/model`, `/decision-model`, `/decision-next` (`Ctrl+X d`), or `caudra decisions use <name|off>`. `caudra decisions list` shows every endpoint, its key source, and which one is active. The choice is saved globally. A switch in the TUI applies to every open session of that process at once, and other Caudra processes and headless runs read it when they start. An edit to the active endpoint's table applies when you select the endpoint again or restart. When the active endpoint's table is gone, decisions are off and Caudra logs a warning that names it. `caudra auth logout --decision <name>` deletes the saved key and the table, and turns decisions off when that endpoint was active.
 
+#### Decision prices
+
+Each decision call that reaches an endpoint counts toward [`/usage`](/docs/token-economy/#lifetime-spend) under the `decision` purpose, priced from the table below by the model id the endpoint answered with, then by the configured `model`. Prices are per 1M tokens, and a prompt past a threshold bills in full at that row's long rates. Answers Caudra reuses from its own cache cost nothing. A model outside the table, such as a local `decision-1`, adds its tokens without a cost, and Caudra counts it as an unpriced turn.
+
+| Protocol | Models | Input | Cache read | Cache write | Output | Prompts past a threshold |
+|----------|--------|-------|------------|-------------|--------|--------------------------|
+| `openai` | `gpt-6-luna` | $0.10 | $0.01 | $0.125 | free | past 272K tokens: $0.20 input, $0.02 cache read, $0.25 cache write |
+| `typesafe` | `jev-1.14`, `jev-1.13`, `jev-latest`, `jev-preview` | $0.042 | free | free | free | same rates |
+
 ### Plans
 
 Some built-ins ship multiple plans (different base URLs or default models). `caudra auth login <provider>` asks which plan to use when more than one exists. You can also set it in TOML:

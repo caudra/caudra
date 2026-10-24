@@ -190,8 +190,10 @@ mod tests {
 
     const SECRET: &str = "do-not-send-this-value";
     const BASE_URL: &str = "http://127.0.0.1:1";
-    const MODEL: &str = "workflow-model";
+    const MODEL: &str = "jev-1.14.0";
     const OTHER_MODEL: &str = "other-workflow-model";
+    const JEV_INPUT_RATE_PER_TOKEN: f64 = 0.042 / 1_000_000.0;
+    const COST_TOLERANCE: f64 = 1e-15;
     const TIMEOUT_MS: u64 = 5_000;
     const SHORT_RERANK_TIMEOUT_MS: u64 = TIMEOUT_MS / 4;
     const LONG_RERANK_TIMEOUT_MS: u64 = TIMEOUT_MS * 3;
@@ -228,6 +230,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: INPUT_TOKENS,
                     output_tokens: OUTPUT_TOKENS,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 cache_hit: false,
             })
@@ -257,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_off_workflows_redact_log_and_count_uncached_usage_by_model() {
+    fn passive_off_workflows_redact_log_and_price_uncached_usage_by_model() {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("state");
@@ -339,8 +343,14 @@ mod tests {
             let usage = UsageLedger::open(&state_dir).unwrap().lifetime().unwrap();
             assert_eq!(usage.input, INPUT_TOKENS * 2);
             assert_eq!(usage.output, OUTPUT_TOKENS * 2);
-            assert_eq!(usage.unpriced_turns, 2);
-            assert_eq!(usage.priced_turns, 0);
+            assert_eq!(usage.unpriced_turns, 1);
+            assert_eq!(usage.priced_turns, 1);
+            let expected = INPUT_TOKENS as f64 * JEV_INPUT_RATE_PER_TOKEN;
+            assert!(
+                (usage.cost - expected).abs() < COST_TOLERANCE,
+                "{}",
+                usage.cost
+            );
             assert_eq!(usage.by_purpose[0].label, "decision");
         });
     }

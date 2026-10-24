@@ -1,6 +1,6 @@
 ---
 name: model-updates
-description: Add, update, or remove Caudra's built-in models, their prices, limits, defaults, and thinking levels, from the provider's own pages. Use for the model-watch run (survey, apply, report) and for any change to the static model tables in caudra-providers.
+description: Add, update, or remove Caudra's built-in models, their prices, limits, defaults, and thinking levels, from the provider's own pages, including the decision models behind decision endpoints (TypeSafe Jev, OpenAI Decisions). Use for the model-watch run (survey, apply, report) and for any change to the static model tables or the decision price table in caudra-providers.
 ---
 
 # Keeping the built-in model list current
@@ -28,6 +28,7 @@ Read the changelogs and feeds for entries since the survey date, then the model,
 | Mistral | https://docs.mistral.ai/getting-started/changelog/ | https://docs.mistral.ai/getting-started/models/models_overview/, https://mistral.ai/pricing |
 | DeepSeek | https://api-docs.deepseek.com/updates | https://api-docs.deepseek.com/quick_start/pricing |
 | Z.AI | https://docs.z.ai/release-notes/new-released | https://docs.z.ai/guides/overview/pricing |
+| Decision endpoints | https://developers.openai.com/api/docs/guides/decisions (OpenAI Decisions API) | https://developers.openai.com/api/docs/guides/decisions#pricing-and-availability, https://docs.typesafe.ai/models (TypeSafe Jev) |
 
 Pages that render with JavaScript may need `webfetch` with `format: "text"`, or `curl -sL -A 'Mozilla/5.0'`.
 
@@ -35,7 +36,8 @@ Pages that render with JavaScript may need `webfetch` with `format: "text"`, or 
 
 1. Run `make model-watch ARGS='-- --since <YYYY-MM-DD>'`. It prints new models released since that date, older models no table names, deprecated models, changed prices and limits, table models that models.dev does not list, and stale acceptances. An older model is a finding like a new one: add it, or accept its omission as an `ACCEPTED` row with `Field::Unlisted`, the catalog id, and its release date as printed. Leaving it unsettled reports it again every run.
 2. Read every source above for entries since the same date. A release the catalog has not picked up yet still counts.
-3. Write `target/model-watch/<run date>.md`:
+3. Check decision models by hand. models.dev does not list them, so the report's **Decision models** section only restates `caudra-providers/src/decision_pricing.rs` with each row's source page. Read every source it names, whatever the date, and compare the input, output, cache read, cache write, and long-prompt rates, and the model ids and aliases (a TypeSafe alias such as `jev-latest` can move to a release with another price). A new release or alias, a retired one, or a changed rate is a finding with provider `decision/<protocol>`, such as `decision/typesafe`.
+4. Write `target/model-watch/<run date>.md`:
    - A table with one row per finding: kind (new, deprecated, retired, price, limit, default, thinking), provider, model, ours, theirs, the source URL, and `apply`, `due <date>`, or `unconfirmed`.
    - A "For a person" section listing every `unconfirmed` row and anything you chose not to apply, each with the reason.
 
@@ -47,6 +49,7 @@ A run where nothing needs changing is a normal outcome, not a problem for a pers
 
 - Apply every `apply` row, including default switches and removals.
 - Add a model the provider has released through its API with tool calling.
+- Add a decision model once its provider serves and prices it on the decision endpoint (`POST /v1/systemone` for TypeSafe, `POST /v1/decisions` for OpenAI). It needs no tool calling. A decision model has no models.dev row, so `ACCEPTED` and `CAPS` never apply to it.
 - Remove a model once the provider says it is retired or its shutdown date has passed. Before that date, keep it: the report lists it as `due <date>`.
 - Switch a lane's default (Best, Fast, or the first-run model) when the provider presents the new model as the successor in that lane.
 - Announced future prices become a `PriceChange`, never an edit of today's price.
@@ -61,12 +64,13 @@ A run where nothing needs changing is a normal outcome, not a problem for a pers
 - **Copilot** (`providers/copilot/mod.rs`). Ids are dotted (`claude-opus-5.5`). `guess_endpoint` uses `contains` on `RESPONSES_FAMILIES`. Copilot's `/models` reports base rates only, so a long-prompt tier belongs in the static entry when its threshold falls inside Copilot's 200K window. Promotional prices get the static entry and a dated comment, never a `PriceChange`, because the live listing wins.
 - **Anthropic** (`providers/anthropic/shared.rs`, `types.rs`). Thinking `off` goes through `explicit_off`, matched per family and version: a new family that reasons unasked needs its own arm, or `off` silently thinks. Families without a toggle resolve `off` to the lowest effort. Note whether the model keeps preserved thinking.
 - **Gemini** (`providers/google/`). Gemini 3 and later take `thinkingLevel` only, so `off` is the lowest level the model accepts. `validates_thought_signatures` parses `gemini-<major>`. Cap `max_output_tokens` at the per-request streaming limit.
+- **Decision models** (`caudra-providers/src/decision_pricing.rs`). Decision endpoint prices live in their own table keyed by protocol, never in a provider manifest, so they stay out of `/model` and the chat price tables. Each entry names its `source` page, which the model-watch report prints. A new Jev release or alias gets its own prefix, never a broader one such as `jev-`, so an unknown release stays unpriced instead of guessed. When OpenAI supports a second Decisions model, add an entry for it. OpenAI Decisions cache rates follow the chat `gpt-6-luna` entry, which a test enforces, so a gpt-6-luna cache price change updates both. Update the preset's `model` in `caudra-config/src/decisions.rs` only when the provider presents a new default. The docs' **Decision prices** table is generated from this table by `make gen-docs`.
 - **Long context.** A `-1m` suffix is handled in `model.rs` (`long_context_window`, `strip_long_context`), and needs nothing per model.
 - **Prices.** `PricingTier { above, .. }` bills the whole request at the tier once the prompt passes `above`. `PriceChange { prefix, from, pricing }` goes in the manifest's `price_changes`. Tests never read the real clock for a price: use `billed_cost_at` with fixed instants.
 - **A new `Model` field** goes into every `Model { .. }` literal, about nine files including `caudra-ui/src/components/mod.rs`.
 - **Docs.** `make gen-docs` rewrites the providers tables. Prose notes live in the consts of `caudra-docgen/src/gen_providers.rs`.
-- **Release notes.** Only a change users notice gets a bullet: a model added or removed, or a changed price, limit, default, or thinking level. Add it under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, keep the highlights at the top in step, and run `make gen-docs`. A change to `ACCEPTED` or `CAPS` alone, a test, or the report gets none, because CONTRIBUTING's release-notes section leaves out internal tooling.
+- **Release notes.** Only a change users notice gets a bullet: a model added or removed, or a changed price, limit, default, or thinking level. A decision model's price or a new decision model counts too. Add it under `### Models` in the newest `release-notes/*.md` whose version `git tag -l v<version>` does not list yet, in the style of its neighbours, keep the highlights at the top in step, and run `make gen-docs`. A change to `ACCEPTED` or `CAPS` alone, a test, or the report gets none, because CONTRIBUTING's release-notes section leaves out internal tooling.
 
 ## Commits
 
-One commit per provider, `feat(providers): …` for additions and `fix(providers): …` for corrections and removals, with every source URL in the body. Changes to `ACCEPTED` alone go in a `chore(providers): …` commit. Run `make check` before each commit, and `make lint`, `make test`, and `make gen-docs-check` before the work is called done.
+One commit per provider, `feat(providers): …` for additions and `fix(providers): …` for corrections and removals, with every source URL in the body. Decision models count as one provider of their own. Changes to `ACCEPTED` alone go in a `chore(providers): …` commit. Run `make check` before each commit, and `make lint`, `make test`, and `make gen-docs-check` before the work is called done.

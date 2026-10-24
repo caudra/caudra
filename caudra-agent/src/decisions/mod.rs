@@ -26,8 +26,10 @@ use caudra_config::decisions::{
 use caudra_config::providers::{PROVIDERS_FILE, ProvidersFileError};
 use caudra_decision::{
     CachedDecisionEngine, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
-    HttpDecisionClient, QuestionSet,
+    HttpDecisionClient, QuestionSet, Usage,
 };
+use caudra_providers::TokenUsage;
+use caudra_providers::decision_pricing::decision_cost;
 use caudra_storage::decision_log::{
     DecisionEffect, DecisionLabel, DecisionLog, DecisionLogError, DecisionRecord, EndpointKind,
     StatsThresholds,
@@ -885,17 +887,21 @@ impl Decisions {
             .and_then(|project| DecisionState::new(&Value::String(project.clone())).ok())
             .and_then(|state| state.value().as_str().map(str::to_owned))
             .unwrap_or_default();
+        let usage = token_usage(&response.usage);
+        let cost = self.endpoint().and_then(|endpoint| {
+            decision_cost(&endpoint.protocol, &[&response.model, model], &usage)
+        });
         let turn = TurnUsage {
             provider: USAGE_PROVIDER.into(),
             account: String::new(),
             model: model.into(),
             cwd,
             purpose: LedgerPurpose::Decision,
-            input: u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX),
-            output: u32::try_from(response.usage.output_tokens).unwrap_or(u32::MAX),
-            cache_creation: 0,
-            cache_read: 0,
-            cost: None,
+            input: usage.input,
+            output: usage.output,
+            cache_creation: usage.cache_creation,
+            cache_read: usage.cache_read,
+            cost,
             subscription: false,
         };
         let service = self.clone();
@@ -917,6 +923,22 @@ impl Decisions {
         if result.is_err() {
             tracing::warn!("decision usage could not be recorded");
         }
+    }
+}
+
+/// The ledger counts uncached input apart from cache reads and writes, where
+/// a decision reply counts all three in `input_tokens`.
+fn token_usage(usage: &Usage) -> TokenUsage {
+    let tokens = |count: u64| u32::try_from(count).unwrap_or(u32::MAX);
+    let uncached = usage
+        .input_tokens
+        .saturating_sub(usage.cache_read_tokens)
+        .saturating_sub(usage.cache_write_tokens);
+    TokenUsage {
+        input: tokens(uncached),
+        output: tokens(usage.output_tokens),
+        cache_creation: tokens(usage.cache_write_tokens),
+        cache_read: tokens(usage.cache_read_tokens),
     }
 }
 
@@ -1035,6 +1057,9 @@ mod tests {
     const HTTP_TEST_PATH: &str = "POST /v1/decisions HTTP/1.1\r\n";
     const HTTP_TEST_TOKENS: u64 = 17;
     const HTTP_TEST_CACHED_TOKENS: u64 = 5;
+    const LUNA_DECISION_INPUT_RATE: f64 = 0.10;
+    const LUNA_DECISION_CACHE_READ_RATE: f64 = 0.01;
+    const COST_TOLERANCE: f64 = 1e-15;
     const REFUSED_ERROR: &str = "refused";
     const HTTP_TEST_CREDENTIAL_ENV: &str = "CAUDRA_DECISION_TEST_NO_CREDENTIAL";
     const HTTP_TEST_TIMEOUT_MESSAGE: &str = "decision HTTP integration test timed out";
@@ -1109,6 +1134,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 },
                 cache_hit: false,
             })
@@ -1364,8 +1391,15 @@ mod tests {
                 assert!(cached.cache_hit);
                 assert_eq!(cached.answers, response.answers);
                 let ledger = UsageLedger::open(&state_dir).unwrap().lifetime().unwrap();
-                assert_eq!(ledger.input, HTTP_TEST_TOKENS);
+                let uncached = HTTP_TEST_TOKENS - HTTP_TEST_CACHED_TOKENS;
+                assert_eq!(ledger.input, uncached);
+                assert_eq!(ledger.cache_read, HTTP_TEST_CACHED_TOKENS);
                 assert_eq!(ledger.output, 0);
+                let expected_cost = (uncached as f64 * LUNA_DECISION_INPUT_RATE
+                    + HTTP_TEST_CACHED_TOKENS as f64 * LUNA_DECISION_CACHE_READ_RATE)
+                    / 1_000_000.0;
+                assert_eq!(ledger.priced_turns, 1);
+                assert!((ledger.cost - expected_cost).abs() < COST_TOLERANCE);
                 let log = DecisionLog::open_read_only(&state_dir).unwrap().unwrap();
                 let rows = log.recent(&DecisionFilter::default(), 2).unwrap();
                 assert_eq!(rows.len(), 2);

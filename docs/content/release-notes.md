@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
+
+[v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)
+
+- Decision calls to TypeSafe Jev and the OpenAI Decisions API count toward your spend in `/usage`.
+
+### Changes
+
+- **Decision calls are priced**: Every call to a decision endpoint was booked in `/usage` and `caudra storage usage` without a cost, so it showed only as an unpriced turn and the decision engine's spend was missing from the total. Calls to TypeSafe Jev (`jev-1.14.0`, `jev-1.13.0`, `jev-latest`, `jev-preview`) now cost $0.042 per 1M input tokens, and calls to the OpenAI Decisions API on `gpt-6-luna` cost $0.10 per 1M input tokens, with cache reads and writes at gpt-6-luna's cache rates and higher rates for prompts past 272K tokens. Output is free on both. The `decision` purpose also splits OpenAI cache reads and writes from the rest of the input. Other models, such as a local `decision-1`, still count as unpriced. See [Decision prices](/docs/providers/#decision-prices).
+
 ## Caudra 0.2 Preview 13 {#v0-2-0-preview-13}
 
 [v0.2.0-preview.13 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.13)

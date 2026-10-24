@@ -12,6 +12,7 @@ use jiff::civil::Date;
 use serde::Deserialize;
 
 use crate::AgentError;
+use crate::decision_pricing;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
 use crate::providers::anthropic::shared::{WIDE_CONTEXT_WINDOW, declares_input_budget};
@@ -40,6 +41,7 @@ const NO_TIERS: &str = "none";
 const TIER_SEPARATOR: &str = "; ";
 const NO_DIFFERENCES: &str = "No differences.";
 const NEW_MODELS_HEADING: &str = "## New models\n";
+const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `caudra-providers/src/decision_pricing.rs` when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
 const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `ACCEPTED` as `Field::Unlisted` with the reason.\n";
 const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
 const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
@@ -565,8 +567,48 @@ impl fmt::Display for Audit {
         )?;
         writeln!(f, "{LEAD_NOT_SOURCE}\n")?;
         if self.findings.is_empty() && self.stale.is_empty() {
-            return writeln!(f, "{NO_DIFFERENCES}");
+            writeln!(f, "{NO_DIFFERENCES}\n")?;
+        } else {
+            self.write_findings(f)?;
         }
+        write_decision_models(f)
+    }
+}
+
+/// models.dev has no decision models, so the report restates the table for a
+/// run to check against each entry's source page by hand.
+fn write_decision_models(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    writeln!(f, "{DECISION_MODELS_HEADING}")?;
+    writeln!(
+        f,
+        "| Protocol | Models | Input / output / cache read / cache write | Tiers | Source |"
+    )?;
+    writeln!(f, "|---|---|---|---|---|")?;
+    for entry in decision_pricing::entries() {
+        let pricing = &entry.pricing;
+        writeln!(
+            f,
+            "| {} | {} | {} / {} / {} / {} | {} | {} |",
+            entry.protocol.as_str(),
+            entry
+                .prefixes
+                .iter()
+                .map(|prefix| format!("`{prefix}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            pricing.input,
+            pricing.output,
+            pricing.cache_read,
+            pricing.cache_write,
+            tiers_text(&pricing.tiers),
+            entry.source
+        )?;
+    }
+    Ok(())
+}
+
+impl Audit {
+    fn write_findings(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let since = self.since.to_string();
         let (new, older): (Vec<&Finding>, Vec<&Finding>) = self
             .section(&[Field::Unlisted])
@@ -657,6 +699,7 @@ impl fmt::Display for Audit {
                     row.reason
                 )?;
             }
+            writeln!(f)?;
         }
         Ok(())
     }
@@ -695,6 +738,8 @@ mod tests {
     const SKIPPED: &str = "the catalog id must not be reported as new";
     const ALIAS: &str = "a dated snapshot of a table prefix is covered";
     const REPORT_EMPTY: &str = "an audit without findings must say so";
+    const DECISION_MODELS_LISTED: &str =
+        "every report must restate the decision models and where to check them";
     const UNKNOWN_SLUG: &str = "an acceptance must name a builtin slug";
     const PREFIX_RULE: &str =
         "an unlisted model must name no table prefix, and every other field must name one";
@@ -960,6 +1005,38 @@ mod tests {
             stale: Vec::new(),
         };
         assert!(audit.to_string().contains(NO_DIFFERENCES), "{REPORT_EMPTY}");
+    }
+
+    #[test_case(false ; "without_findings")]
+    #[test_case(true ; "with_findings")]
+    fn every_report_lists_the_decision_models_with_their_sources(with_findings: bool) {
+        let findings = with_findings
+            .then(|| Finding {
+                provider: PROVIDER,
+                model: OPUS.into(),
+                field: Field::Input,
+                ours: CHANGED_PRICE.into(),
+                catalog: CHANGED_PRICE.into(),
+            })
+            .into_iter()
+            .collect();
+        let report = Audit {
+            today: TODAY,
+            since: SINCE,
+            findings,
+            stale: Vec::new(),
+        }
+        .to_string();
+        let section = report
+            .split_once(DECISION_MODELS_HEADING)
+            .map(|(_, rest)| rest)
+            .expect(DECISION_MODELS_LISTED);
+        for entry in decision_pricing::entries() {
+            assert!(section.contains(entry.source), "{DECISION_MODELS_LISTED}");
+            for prefix in entry.prefixes {
+                assert!(section.contains(prefix), "{DECISION_MODELS_LISTED}");
+            }
+        }
     }
 
     fn cap_limit(entry: &ModelEntry, field: Field) -> Option<u32> {

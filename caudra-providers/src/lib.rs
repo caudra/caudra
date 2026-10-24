@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod calibration;
 mod cassette;
+pub mod decision_pricing;
 pub(crate) mod error;
 pub mod history;
 pub mod manifest;

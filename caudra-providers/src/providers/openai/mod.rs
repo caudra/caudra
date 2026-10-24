@@ -24,7 +24,7 @@ const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// the input and cache rates and one and a half times the output rate. The
 /// wide window sits above it, so the last stretch before compaction always
 /// pays the long rate.
-const LONG_CONTEXT_ABOVE: u32 = 272_000;
+pub(crate) const LONG_CONTEXT_ABOVE: u32 = 272_000;
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "openai",

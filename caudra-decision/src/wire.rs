@@ -319,8 +319,17 @@ fn distribution(
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {
+    /// Every input token, cache reads and writes included.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+
+fn is_zero(tokens: &u64) -> bool {
+    *tokens == 0
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

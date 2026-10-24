@@ -15,6 +15,7 @@ const PREDICATE_CRITERIA: &str = "\n\nCriteria (false and true outcomes):\n";
 const INVALID_SCHEMA: &str = "response does not match the OpenAI Decisions JSON schema";
 const INVALID_NAMES: &str = "answer names do not match the requested questions";
 const DUPLICATE_VALUE: &str = "answer contains duplicate probability values";
+const INVALID_CACHED_USAGE: &str = "cached and cache-write tokens exceed the input tokens";
 const LEVEL_LABEL: &str = "label";
 const LEVEL_DESCRIPTION: &str = "description";
 const LEVEL_FIELDS: [&str; 2] = [LEVEL_LABEL, LEVEL_DESCRIPTION];
@@ -145,7 +146,42 @@ pub(crate) fn encode(request: &DecisionRequest) -> Result<Vec<u8>, DecisionError
 struct Response {
     model: String,
     answers: Vec<NamedAnswer>,
-    usage: Usage,
+    usage: OpenAiUsage,
+}
+
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+}
+
+/// Both counts are part of `input_tokens`, not on top of it.
+#[derive(Default, Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+}
+
+impl OpenAiUsage {
+    fn normalized(self) -> Result<Usage, DecisionError> {
+        let InputTokensDetails {
+            cached_tokens,
+            cache_write_tokens,
+        } = self.input_tokens_details.unwrap_or_default();
+        if cached_tokens.saturating_add(cache_write_tokens) > self.input_tokens {
+            return Err(DecisionError::Invalid(INVALID_CACHED_USAGE));
+        }
+        Ok(Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: cached_tokens,
+            cache_write_tokens,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -193,6 +229,7 @@ pub(crate) fn decode(
 ) -> Result<DecisionResponse, DecisionError> {
     let response: Response =
         serde_json::from_slice(bytes).map_err(|_| DecisionError::Invalid(INVALID_SCHEMA))?;
+    let usage = response.usage.normalized()?;
     let mut named = BTreeMap::new();
     for answer in response.answers {
         if named.insert(answer.name, answer.answer).is_some() {
@@ -285,7 +322,7 @@ pub(crate) fn decode(
     Ok(DecisionResponse {
         model: response.model,
         answers,
-        usage: response.usage,
+        usage,
         cache_hit: false,
     })
 }
@@ -395,7 +432,7 @@ pub(crate) mod tests {
                     "legend": {"0": "low", "1": "{\n  \"priority\": \"medium\"\n}", "2": "[\n  \"high\"\n]"}
                 }
             },
-            "usage": {"input_tokens": 96, "output_tokens": 7}
+            "usage": {"input_tokens": 96, "output_tokens": 7, "cache_read_tokens": 64}
         }))
         .unwrap()
     }
@@ -580,6 +617,29 @@ pub(crate) mod tests {
         assert_eq!(validated(&response).unwrap(), normalized());
     }
 
+    #[test_case(Some(json!({"cached_tokens": 64, "cache_write_tokens": 32})), 64, 32; "reads_and_writes")]
+    #[test_case(Some(json!({})), 0, 0; "empty_details")]
+    #[test_case(Some(Value::Null), 0, 0; "null_details")]
+    #[test_case(None, 0, 0; "no_details")]
+    fn maps_cache_details_into_usage(details: Option<Value>, read: u64, write: u64) {
+        let mut response = response();
+        let usage = response["usage"].as_object_mut().unwrap();
+        match details {
+            Some(details) => usage.insert("input_tokens_details".into(), details),
+            None => usage.remove("input_tokens_details"),
+        };
+        let input = response["usage"]["input_tokens"].as_u64();
+        let usage = validated(&response).unwrap().usage;
+        assert_eq!(
+            (
+                Some(usage.input_tokens),
+                usage.cache_read_tokens,
+                usage.cache_write_tokens
+            ),
+            (input, read, write)
+        );
+    }
+
     #[test_case("/answers/0/name", json!(null); "null_name")]
     #[test_case("/answers/0/name", json!("Damaged"); "case_sensitive_name")]
     #[test_case("/answers/0/name", json!("unknown"); "unknown_name")]
@@ -614,6 +674,9 @@ pub(crate) mod tests {
     #[test_case("/answers/2/probabilities/0/probability", json!(1.0); "unnormalized_score")]
     #[test_case("/usage/input_tokens", json!(-1); "negative_usage")]
     #[test_case("/usage/output_tokens", json!(null); "missing_usage")]
+    #[test_case("/usage/input_tokens_details/cached_tokens", json!(97); "cached_above_input")]
+    #[test_case("/usage/input_tokens_details/cache_write_tokens", json!(33); "cache_reads_and_writes_above_input")]
+    #[test_case("/usage/input_tokens_details/cached_tokens", json!(-1); "negative_cached")]
     fn rejects_malformed_answers(pointer: &str, replacement: Value) {
         let mut response = response();
         *response.pointer_mut(pointer).unwrap() = replacement;

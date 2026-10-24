@@ -4,6 +4,7 @@ use caudra_config::example;
 use caudra_config::files;
 use caudra_config::providers::{BUILTIN_IGNORED_FIELDS, BUILTIN_MODEL_FIELDS};
 use caudra_providers::copilot_auth::ENTERPRISE_HOST_ENV;
+use caudra_providers::decision_pricing;
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::model::{ModelEntry, ModelPricing};
 use caudra_providers::provider::ProviderKind;
@@ -232,6 +233,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
     let switching_fields = keys_table(&document, &[example::providers::SWITCHING]);
     let account_fields = keys_table(&document, &[example::providers::ACCOUNTS]);
     let decision_fields = keys_table(&document, &[example::providers::DECISION_ENDPOINT]);
+    let decision_prices = decision_prices_table();
     let provider_order_fields = keys_table(&document, &[example::providers::PROVIDER_ORDER]);
     let builtin_ignored = join_and(&BUILTIN_IGNORED_FIELDS.map(|name| format!("`{name}`")));
     let builtin_model = join_and(&BUILTIN_MODEL_FIELDS.map(|name| format!("`{name}`")));
@@ -433,6 +435,11 @@ A key saved by login, in `auth/decisions/<name>.json` under the state directory,
 
 Switch the active endpoint with the **Decisions** row of `/model`, `/decision-model`, `/decision-next` (`Ctrl+X d`), or `caudra decisions use <name|off>`. `caudra decisions list` shows every endpoint, its key source, and which one is active. The choice is saved globally. A switch in the TUI applies to every open session of that process at once, and other Caudra processes and headless runs read it when they start. An edit to the active endpoint's table applies when you select the endpoint again or restart. When the active endpoint's table is gone, decisions are off and Caudra logs a warning that names it. `caudra auth logout --decision <name>` deletes the saved key and the table, and turns decisions off when that endpoint was active.
 
+#### Decision prices
+
+Each decision call that reaches an endpoint counts toward [`/usage`](/docs/token-economy/#lifetime-spend) under the `decision` purpose, priced from the table below by the model id the endpoint answered with, then by the configured `model`. Prices are per 1M tokens, and a prompt past a threshold bills in full at that row's long rates. Answers Caudra reuses from its own cache cost nothing. A model outside the table, such as a local `decision-1`, adds its tokens without a cost, and Caudra counts it as an unpriced turn.
+
+{decision_prices}
 ### Plans
 
 {plans_body}"#
@@ -509,6 +516,60 @@ Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy
         valid_values.join(", "),
         efforts.join(", "),
     )
+}
+
+fn decision_prices_table() -> String {
+    let mut out = String::from(
+        "| Protocol | Models | Input | Cache read | Cache write | Output | Prompts past a threshold |\n\
+         |----------|--------|-------|------------|-------------|--------|--------------------------|\n",
+    );
+    for entry in decision_pricing::entries() {
+        let pricing = &entry.pricing;
+        let models = entry
+            .prefixes
+            .iter()
+            .map(|prefix| format!("`{prefix}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tiers = pricing
+            .tiers
+            .iter()
+            .map(|tier| {
+                format!(
+                    "past {}K tokens: {} input, {} cache read, {} cache write",
+                    tier.above / 1_000,
+                    format_rate(tier.input),
+                    format_rate(tier.cache_read),
+                    format_rate(tier.cache_write)
+                )
+            })
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            out,
+            "| `{}` | {models} | {} | {} | {} | {} | {} |",
+            entry.protocol.as_str(),
+            format_rate(pricing.input),
+            format_rate(pricing.cache_read),
+            format_rate(pricing.cache_write),
+            format_rate(pricing.output),
+            if tiers.is_empty() {
+                "same rates".into()
+            } else {
+                tiers.join(", and ")
+            },
+        );
+    }
+    out
+}
+
+/// A per-million rate with two decimals, or three when the third is not zero.
+fn format_rate(rate: f64) -> String {
+    if rate == 0.0 {
+        return "free".into();
+    }
+    let precise = format!("{rate:.3}");
+    let trimmed = precise.strip_suffix('0').unwrap_or(&precise);
+    format!("${trimmed}")
 }
 
 /// Today's rates, then any announced change with its date. Reads no clock, so

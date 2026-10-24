@@ -201,6 +201,7 @@ Every row records why the model was called, so you can separate the conversation
 | `extract` | `/extract` lists and the requirements section of a compaction summary |
 | `memory` | Summarizing [project memory](/docs/memory/#summaries-and-spend) in the background |
 | `autopilot` | [Autopilot](/docs/autopilot/) decisions about prompts, questions, plans, and stalls |
+| `decision` | [Decision engine](/docs/providers/#decision-endpoints) calls: Auto mode, advice, screening, reranking, and `decide()` / `rerank()` |
 | `tool_json_repair` | Isolated syntax repair for malformed tool arguments |
 | `cache_warm` | [Cache warming](#cache-warming) refreshes, booked on the model whose cache they kept |
 
