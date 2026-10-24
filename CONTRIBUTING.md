@@ -224,6 +224,9 @@ When you draft:
 - Write for someone updating: what they will notice and what they must do, not how it was built.
 - Fold a follow-up into the bullet it refines, and remove the bullet of a reverted change.
 - Keep the highlights in step as the release grows, so they still sum up the whole release.
+- Size each bullet to its change. A headline change gets a full bullet. A small fix or a cosmetic change gets one sentence, or a clause in the bullet it belongs to. Before you add a bullet, look for one about the same work and extend it.
+- Leave out how it was built and what a user does not notice: internal names, algorithms, every edge case, and the reasoning behind a fix. The docs link carries the details.
+- Write in the voice of [`docs/AGENTS.md`](docs/AGENTS.md): no em dashes, semicolons, or contractions outside code.
 
 Every file follows the same format. Run `make gen-docs` after editing one, because CI fails while the docs page is out of date:
 
@@ -232,6 +235,8 @@ Every file follows the same format. Run `make gen-docs` after editing one, becau
 3. Group changes under `###` headings, never `#` or `##`.
 4. Start each bullet with a bold lead-in that names the change.
 5. Leave out install and update steps. The pipeline adds a "New to Caudra?" section with the [Quick Start](https://caudra.ai/docs/quick-start/), and an "Updating from" section that names the previous release and the update command for its channel.
+
+The Rust tests also hold every file to these limits: at most 8 highlights of up to 35 words each, bullets of up to 180 words, and 3,000 words for the whole release. The test names each bullet over a limit.
 
 The pipeline reads the file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes, unresolved placeholders, and notes that break these rules stop validation, and the Rust tests check every file in `release-notes/` the same way. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
 

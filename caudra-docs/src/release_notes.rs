@@ -256,8 +256,9 @@ mod tests {
     use semver::Version;
     use test_case::test_case;
 
-    use super::{Release, ReleaseNotes, title};
+    use super::{HIGHLIGHT_MARKER, QUOTE, Release, ReleaseNotes, title};
     use crate::fixture::leak;
+    use crate::markdown::{Fences, code_span};
 
     const LEAD: &str = "- A change.\n\n";
     const PREVIEW_3: &str = "0.2.0-preview.3";
@@ -272,6 +273,19 @@ mod tests {
     const NOTES_DIR: &str = "../release-notes";
     const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
     const DRAFTS_AHEAD: usize = 1;
+    const MAX_HIGHLIGHTS: usize = 8;
+    const MAX_HIGHLIGHT_WORDS: usize = 35;
+    const MAX_BULLET_WORDS: usize = 180;
+    const MAX_RELEASE_WORDS: usize = 3000;
+    /// Marks `docs/AGENTS.md` bans from prose: the em dash and the semicolon.
+    const BANNED_MARKS: [char; 2] = ['\u{2014}', ';'];
+    const CONTRACTIONS: [&str; 6] = ["n't", "'re", "'ll", "'ve", "'m", "'d"];
+    const LONG_RELEASE_ERROR: &str = "release too long";
+    const MANY_HIGHLIGHTS_ERROR: &str = "too many highlights";
+    const LONG_HIGHLIGHT_ERROR: &str = "highlight too long";
+    const LONG_BULLET_ERROR: &str = "bullet too long";
+    const BANNED_MARK_ERROR: &str = "banned mark";
+    const CONTRACTION_ERROR: &str = "contraction";
 
     fn notes(versions: &[&str]) -> ReleaseNotes {
         ReleaseNotes::parse(versions.iter().map(|version| {
@@ -365,8 +379,8 @@ mod tests {
         title(&Version::parse(version).unwrap())
     }
 
-    /// Every file in `release-notes/`, read from disk.
-    fn checked_in_notes() -> ReleaseNotes {
+    /// Every file in `release-notes/`, read from disk, as its name and text.
+    fn checked_in_files() -> Vec<(&'static str, &'static str)> {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(NOTES_DIR);
         let files = fs::read_dir(&directory)
             .unwrap()
@@ -379,12 +393,139 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!files.is_empty(), "{}", directory.display());
-        ReleaseNotes::parse(files).unwrap()
+        files
+    }
+
+    fn checked_in_notes() -> ReleaseNotes {
+        ReleaseNotes::parse(checked_in_files()).unwrap()
+    }
+
+    /// A line as prose: what it says outside its code spans.
+    fn prose(line: &str) -> String {
+        let mut prose = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            prose.push_str(&rest[..start]);
+            rest = code_span(&rest[start..]).1;
+        }
+        prose.push_str(rest);
+        prose.replace('\u{2019}', "'")
+    }
+
+    fn word_count(text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+
+    /// What a release's notes break of the focus rules in CONTRIBUTING.md: a few one-line highlights, bullets
+    /// sized to their change, a release short enough to read, and the docs voice of `docs/AGENTS.md`.
+    fn focus_problems(text: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        let words = word_count(text);
+        if words > MAX_RELEASE_WORDS {
+            problems.push(format!(
+                "{LONG_RELEASE_ERROR}: {words} words, cut to {MAX_RELEASE_WORDS}"
+            ));
+        }
+        let highlights = text
+            .trim_start()
+            .lines()
+            .take_while(|line| line.starts_with(HIGHLIGHT_MARKER))
+            .collect::<Vec<_>>();
+        if highlights.len() > MAX_HIGHLIGHTS {
+            problems.push(format!(
+                "{MANY_HIGHLIGHTS_ERROR}: {}, merge them to {MAX_HIGHLIGHTS}",
+                highlights.len()
+            ));
+        }
+        for highlight in highlights {
+            let words = word_count(highlight);
+            if words > MAX_HIGHLIGHT_WORDS {
+                problems.push(format!(
+                    "{LONG_HIGHLIGHT_ERROR}: {words} words, cut to {MAX_HIGHLIGHT_WORDS}: {highlight}"
+                ));
+            }
+        }
+        let mut fences = Fences::default();
+        let mut bullet: Option<(&str, usize)> = None;
+        for line in text.lines().chain([""]) {
+            let continues = !line.trim().is_empty() && !line.starts_with(['-', '#', QUOTE]);
+            match bullet {
+                Some((start, words)) if continues => {
+                    bullet = Some((start, words + word_count(line)))
+                }
+                Some((start, words)) if words > MAX_BULLET_WORDS => {
+                    let lead = start.split(['.', ':']).next().unwrap_or(start);
+                    problems.push(format!(
+                        "{LONG_BULLET_ERROR}: {words} words, cut to {MAX_BULLET_WORDS}: {lead}"
+                    ));
+                    bullet = None;
+                }
+                _ => bullet = None,
+            }
+            if fences.step(line) {
+                continue;
+            }
+            if line.starts_with(HIGHLIGHT_MARKER) {
+                bullet = Some((line, word_count(line)));
+            }
+            let prose = prose(line);
+            for mark in BANNED_MARKS {
+                if prose.contains(mark) {
+                    problems.push(format!("{BANNED_MARK_ERROR} `{mark}`: {line}"));
+                }
+            }
+            for word in prose.split_whitespace() {
+                let word = word
+                    .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+                    .to_lowercase();
+                if CONTRACTIONS.iter().any(|ending| word.ends_with(ending)) {
+                    problems.push(format!("{CONTRACTION_ERROR} `{word}`: {line}"));
+                }
+            }
+        }
+        problems
     }
 
     #[test]
     fn checked_in_notes_follow_the_authoring_rules() {
         checked_in_notes();
+    }
+
+    #[test]
+    fn checked_in_notes_stay_focused() {
+        let problems = checked_in_files()
+            .into_iter()
+            .flat_map(|(path, text)| {
+                focus_problems(text)
+                    .into_iter()
+                    .map(move |problem| format!("{path}: {problem}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test_case(&"- A change.\n".repeat(MAX_HIGHLIGHTS + 1), MANY_HIGHLIGHTS_ERROR ; "too_many_highlights")]
+    #[test_case(&format!("- {}\n", "word ".repeat(MAX_HIGHLIGHT_WORDS)), LONG_HIGHLIGHT_ERROR ; "long_highlight")]
+    #[test_case(&format!("{LEAD}### Changes\n\n- **A.** {}\n", "word ".repeat(MAX_BULLET_WORDS)), LONG_BULLET_ERROR ; "long_bullet")]
+    #[test_case(&format!("{LEAD}### Changes\n\n- **A.** {}\n  {}\n", "word ".repeat(MAX_BULLET_WORDS / 2), "word ".repeat(MAX_BULLET_WORDS / 2)), LONG_BULLET_ERROR ; "long_wrapped_bullet")]
+    #[test_case(&format!("{LEAD}{}", "- **A.** Short.\n".repeat(MAX_RELEASE_WORDS / 3 + 1)), LONG_RELEASE_ERROR ; "long_release")]
+    #[test_case(&format!("{LEAD}- **A.** One \u{2014} two.\n"), BANNED_MARK_ERROR ; "em_dash")]
+    #[test_case(&format!("{LEAD}- **A.** One; two.\n"), BANNED_MARK_ERROR ; "semicolon")]
+    #[test_case(&format!("{LEAD}- **A.** It doesn't.\n"), CONTRACTION_ERROR ; "contraction")]
+    #[test_case(&format!("{LEAD}- **A.** You\u{2019}ll see.\n"), CONTRACTION_ERROR ; "curly_contraction")]
+    fn unfocused_notes_are_named(text: &str, expected: &str) {
+        let problems = focus_problems(text);
+        assert!(
+            problems.iter().any(|problem| problem.contains(expected)),
+            "{problems:?}"
+        );
+    }
+
+    #[test_case("- A change in Caudra's view.\n" ; "possessive")]
+    #[test_case("- Run `a; b` and `don't`.\n" ; "code_spans")]
+    #[test_case("- A change.\n\n```sh\na; b # don't\n```\n" ; "fenced_code")]
+    fn focused_notes_pass(text: &str) {
+        assert_eq!(focus_problems(text), Vec::<String>::new());
     }
 
     /// Changes land in the next release's draft, so a second file ahead of the workspace version is a draft
