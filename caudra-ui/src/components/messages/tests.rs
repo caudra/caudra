@@ -2911,21 +2911,98 @@ fn a_streamed_write_grows_in_the_card() {
     assert!(grown.contains("fn two() {}"), "{grown}");
 }
 
+#[test_case(false; "following")]
+#[test_case(true; "paused")]
+fn a_streamed_plan_keeps_its_body_when_execution_starts(paused: bool) {
+    const HEADER: &str = "write active plan";
+    const BODY: &str = "# Plan title\n\nFirst step\n\nSecond step";
+    const TITLE: &str = "Plan title";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Earlier context\n\n".repeat(30),
+    ));
+    panel.tool_pending(TOOL_ID.into(), plan::NAME);
+    panel.tool_input_preview(TOOL_ID, Some(HEADER.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(BODY.into()));
+    render(&mut panel, 80, 24);
+    if paused {
+        panel.set_scroll_top(panel.scroll_top().saturating_sub(2));
+    }
+    let before = buffer_text(&render(&mut panel, 80, 24));
+    assert!(before.contains(TITLE), "{before}");
+    assert!(panel.scroll_top() > 0);
+    assert_eq!(panel.auto_scroll(), !paused);
+    let heights = panel.segment_heights();
+    let scroll = panel.scroll_top();
+
+    panel.tool_start(ToolStartEvent {
+        summary: HEADER.into(),
+        effect: ToolEffect::Mutating,
+        ..start(TOOL_ID, plan::NAME)
+    });
+    let running = buffer_text(&render(&mut panel, 80, 24));
+    assert!(running.contains(TITLE), "{running}");
+    assert_eq!(panel.segment_heights(), heights);
+    assert_eq!(panel.scroll_top(), scroll);
+    assert_eq!(panel.auto_scroll(), !paused);
+
+    panel.tool_done(ToolDoneEvent {
+        tool: plan::NAME.into(),
+        output: ToolOutput::Markdown(BODY.into()),
+        ..done(TOOL_ID)
+    });
+    let finished = buffer_text(&render(&mut panel, 80, 24));
+    assert_eq!(finished.matches(TITLE).count(), 1, "{finished}");
+    assert!(panel.messages.last().unwrap().live_body.is_none());
+}
+
+#[test_case("cancel"; "cancelled")]
+#[test_case("reset"; "reset")]
+#[test_case("error"; "failed")]
+fn a_retained_preview_is_cleared_when_execution_ends(ending: &str) {
+    const BODY: &str = "Unfinished plan preview";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), plan::NAME);
+    panel.tool_input_body(TOOL_ID, Some(BODY.into()));
+    panel.tool_start(start(TOOL_ID, plan::NAME));
+    let running = buffer_text(&render(&mut panel, 80, 24));
+    assert!(running.contains(BODY), "{running}");
+
+    match ending {
+        "cancel" => panel.cancel_in_progress(),
+        "reset" => panel.stream_reset(),
+        "error" => panel.fail_in_progress_with_message(ERROR_TEXT.into()),
+        _ => unreachable!(),
+    }
+    let finished = buffer_text(&render(&mut panel, 80, 24));
+    assert!(!finished.contains(BODY), "{finished}");
+    assert!(panel.messages[0].live_body.is_none());
+}
+
 /// The streamed body is a stand-in for output the call has not produced yet,
 /// so the real one has to displace it rather than render underneath it.
-#[test]
-fn a_streamed_body_gives_way_to_the_real_output() {
+#[test_case(false; "output")]
+#[test_case(true; "input")]
+fn a_streamed_body_gives_way_to_the_real_output(input: bool) {
     const WRITTEN: &str = "fn done() {}";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     streaming_write(&mut panel, &["fn streaming() {}\n"]);
     rebuild(&mut panel);
 
     let mut event = start(TOOL_ID, FILE_WRITE_TOOL_NAME);
-    event.output = Some(ToolOutput::WriteCode {
-        path: "a.rs".into(),
-        byte_count: WRITTEN.len(),
-        lines: vec![WRITTEN.into()],
-    });
+    if input {
+        event.input = Some(ToolInput::Code {
+            language: "rust".into(),
+            code: WRITTEN.into(),
+        });
+    } else {
+        event.output = Some(ToolOutput::WriteCode {
+            path: "a.rs".into(),
+            byte_count: WRITTEN.len(),
+            lines: vec![WRITTEN.into()],
+        });
+    }
     panel.tool_start(event);
 
     assert_eq!(panel.messages[0].live_body, None);
@@ -12542,10 +12619,9 @@ fn tool_done_draws_its_own_card_and_evicts_the_owed_redraw() {
     );
 }
 
-/// The last thing the call was spelling out is not what it ran, so a start
-/// both redraws the card and drops what the previews were owed.
-#[test]
-fn tool_start_draws_its_own_card_and_evicts_the_owed_redraw() {
+#[test_case(false; "retained_preview")]
+#[test_case(true; "replacement_output")]
+fn tool_start_draws_its_own_card_and_evicts_the_owed_redraw(replacement: bool) {
     let mut panel = backgrounded_write();
     panel.tool_input_preview(TOOL_ID, Some(PREVIEW_PATH.into()), None);
     panel.tool_input_body(TOOL_ID, Some(PREVIEW_BODY.into()));
@@ -12553,14 +12629,24 @@ fn tool_start_draws_its_own_card_and_evicts_the_owed_redraw() {
 
     let mut event = start(TOOL_ID, FILE_WRITE_TOOL_NAME);
     event.summary = WRITTEN_FILE_PATH.into();
+    if replacement {
+        event.output = Some(ToolOutput::WriteCode {
+            path: WRITTEN_FILE_PATH.into(),
+            byte_count: DONE_TEXT.len(),
+            lines: vec![DONE_TEXT.into()],
+        });
+    }
     panel.tool_start(event);
 
     assert!(panel.dirty_cards.is_empty(), "{TERMINAL_EAGER_MSG}");
     let started = seg_text(&panel, TOOL_ID);
     assert!(started.contains(WRITTEN_FILE_PATH), "{TERMINAL_EAGER_MSG}");
-    for stale in [PREVIEW_PATH, PREVIEW_BODY] {
-        assert!(!started.contains(stale), "{PREVIEW_GONE_MSG}: {started:?}");
-    }
+    assert!(
+        !started.contains(PREVIEW_PATH),
+        "{PREVIEW_GONE_MSG}: {started:?}"
+    );
+    assert_eq!(started.contains(PREVIEW_BODY), !replacement, "{started:?}");
+    assert_eq!(started.contains(DONE_TEXT), replacement, "{started:?}");
 }
 
 const PREVIEW_PATH: &str = "src/spelled_out.rs";

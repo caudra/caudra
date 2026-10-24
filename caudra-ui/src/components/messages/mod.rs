@@ -2301,7 +2301,9 @@ impl MessagesPanel {
                 Some(output) => msg.tool_output = Some(Arc::new(output)),
                 None => {}
             }
-            msg.live_body = None;
+            if msg.tool_input.is_some() || msg.tool_output.is_some() {
+                msg.live_body = None;
+            }
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
             self.settle_batch_snapshot(&event.id);
