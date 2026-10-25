@@ -63,7 +63,7 @@ pub static DOC: ModuleDoc = ModuleDoc {
 const DECIDE_CALL: &str = "decisions.decide";
 const RERANK_CALL: &str = "decisions.rerank";
 const NO_ENGINE: &str =
-    "decisions is unavailable: no decision engine is set up; choose one with /decision-model";
+    "decisions is unavailable: no decision engine is set up; choose one with /decisions model";
 const DECIDE_PARAMS: &[&str] = &[INPUT_PARAM, QUESTIONS_PARAM, MODEL_PARAM, TIMEOUT_PARAM];
 const RERANK_PARAMS: &[&str] = &[
     QUERY_PARAM,

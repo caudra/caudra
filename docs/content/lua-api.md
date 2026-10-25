@@ -362,6 +362,19 @@ browsing memory files or toggling settings.
     with one opts table: `opts.args` is the raw
     argument string (whitespace kept, may be empty)
     and `opts.fargs` is the same split into words.
+  - `complete` (`table|string|function`) Optional. What the command palette
+    suggests while the user types an argument,
+    spelled like nvim's `complete`: a list of
+    strings, "dir" for directories, "file" for files
+    and directories, or a function called as
+    `complete(arglead, cmdline, cursorpos)` that
+    returns a list of strings. `arglead` is the word
+    before the caret, `cmdline` the whole line, and
+    `cursorpos` the caret's byte offset in it. The
+    palette filters what it returns against
+    `arglead`, and asks again as the user types, so
+    keep it quick. Suggestions never restrict what
+    the user may run.
 
 **Example:**
 
@@ -371,6 +384,26 @@ caudra.api.register_command({
   description = "Say hello",
   handler = function()
     caudra.ui.flash("Hello from my plugin!")
+  end,
+})
+
+-- Suggest a fixed set of greetings, or compute them as the user types:
+caudra.api.register_command({
+  name = "/greet",
+  nargs = 1,
+  complete = { "hello", "hi", "welcome" },
+  handler = function(opts)
+    caudra.ui.flash(opts.args .. " from my plugin!")
+  end,
+})
+caudra.api.register_command({
+  name = "/shout",
+  nargs = 1,
+  complete = function(arglead)
+    return { arglead:upper(), arglead:upper() .. "!" }
+  end,
+  handler = function(opts)
+    caudra.ui.flash(opts.args)
   end,
 })
 ```

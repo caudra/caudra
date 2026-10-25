@@ -65,7 +65,7 @@ pub(super) const NOT_CHECKED: &str = "not checked yet";
 pub(super) const ENGINE_CONFIGURED: &str = "configured";
 pub(super) const API_KEY_FIELD: &str = "API key";
 pub(super) const ENGINE_OFF: &str =
-    "No decision endpoint is active. Add one with /login or pick one with /decision-model.";
+    "No decision endpoint is active. Add one with /login or pick one with /decisions model.";
 pub(super) const CONTENT_FLAGGED: &str = "flagged";
 pub(super) const LOGGING_HINT: &str =
     "Logging is off: set log = true under [decisions] in the global caudra.toml";

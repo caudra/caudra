@@ -548,13 +548,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use test_case::test_case;
 
     use super::*;
     use crate::AppSession;
     use crate::app::Msg;
     use crate::app::mouse::SELECTION_COPIED;
     use crate::app::tests::{mouse_event, test_app};
-    use crate::components::command::{ParsedCommand, SEARCH_HISTORY_COMMAND};
+    use crate::components::command::{ParsedCommand, SEARCH_COMMAND};
     use crate::components::{DisplayMessage, DisplayRole, DisplaySource};
 
     const WORD: &str = "ledger";
@@ -612,22 +613,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn search_history_command_opens_the_project_tab_with_its_words() {
+    #[test_case("", SearchTab::Project ; "project_by_default")]
+    #[test_case("chat ", SearchTab::ThisChat ; "chat")]
+    #[test_case("Project ", SearchTab::Project ; "project_ignoring_case")]
+    #[test_case("all ", SearchTab::AllProjects ; "all")]
+    fn the_search_command_opens_the_named_tab_with_its_words(tab_word: &str, tab: SearchTab) {
         let mut app = test_app();
 
         app.execute_command(
             ParsedCommand {
-                name: SEARCH_HISTORY_COMMAND.into(),
-                args: format!(" {WORD} "),
+                name: SEARCH_COMMAND.into(),
+                args: format!(" {tab_word}{WORD} "),
             },
             0,
         );
 
         assert!(app.search_modal.is_open());
-        assert_eq!(app.search_modal.tab(), SearchTab::Project);
+        assert_eq!(app.search_modal.tab(), tab);
         assert_eq!(app.search_modal.query(), WORD);
-        assert_eq!(app.search_modal.history().status, HistoryStatus::Searching);
+        if tab != SearchTab::ThisChat {
+            assert_eq!(app.search_modal.history().status, HistoryStatus::Searching);
+        }
     }
 
     #[test]

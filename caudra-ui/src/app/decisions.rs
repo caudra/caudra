@@ -23,7 +23,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use tracing::warn;
 
-use super::{App, DECISIONS_USAGE};
+use super::App;
 use crate::components::Action;
 use crate::components::decisions_modal::{
     DecisionsAction, DecisionsFetchState, DecisionsModalContext, DecisionsScope, DecisionsSnapshot,
@@ -194,7 +194,7 @@ impl App {
         vec![Action::RefreshModels]
     }
 
-    /// `/decision-next`: the endpoint after the active one, in name order.
+    /// `/decisions next`: the endpoint after the active one, in name order.
     pub(super) fn cycle_decision_endpoint(
         &mut self,
         providers: impl FnOnce() -> ProvidersConfig,
@@ -233,11 +233,7 @@ impl App {
         }
     }
 
-    pub(super) fn execute_decisions(&mut self, args: &str) {
-        if !args.trim().is_empty() {
-            self.flash(DECISIONS_USAGE.into());
-            return;
-        }
+    pub(super) fn execute_decisions(&mut self) {
         self.decisions_modal.open();
         self.refresh_decisions();
     }
@@ -455,7 +451,7 @@ mod tests {
     use crate::components::now_secs;
     use crate::components::status_bar::StatusBarHitTarget;
 
-    const DECISION_MODEL_COMMAND: &str = "/decision-model";
+    const DECISION_MODEL_COMMAND: &str = "/decisions model";
     const OTHER_SESSION: &str = "other-session";
     const OTHER_PROJECT: &str = "/elsewhere";
     const QUESTION_SET: &str = "test-questions";
@@ -572,7 +568,7 @@ mod tests {
             ],
         );
 
-        app.execute_decisions("");
+        app.execute_decisions();
 
         assert!(app.decisions_modal.is_open());
         let state = settled(&app);
@@ -613,7 +609,7 @@ mod tests {
         let (_tmp, mut app) = isolated_app();
         let project = project(&app);
         log_rows(&app, &[(OTHER_SESSION, OTHER_PROJECT)]);
-        app.execute_decisions("");
+        app.execute_decisions();
         assert_eq!(scope_rows(&settled(&app)), [0, 0, 1]);
         log_rows(&app, &[(OTHER_SESSION, &project)]);
 
@@ -645,7 +641,7 @@ mod tests {
             &app,
             &[(&previous, &project), (&current.to_string(), &project)],
         );
-        app.execute_decisions("");
+        app.execute_decisions();
         let state = settled(&app);
         assert_eq!(scope_rows(&state), [1, 2, 2]);
         let session = &ready(&state).scopes[DecisionsScope::Session.index()].recent[0]

@@ -190,7 +190,7 @@ Writes an artifact and returns its absolute path as a string. `name` is a single
 
 ### `decide(input, questions)` and `decide(input, questions, options)`
 
-Calls the user's configured decision endpoint and returns `#{ model, answers, by_name }`. Available while a decision endpoint is active, even with passive decision features off. Do not assume one is. Catch failures or ask the user to add one with `/login` (or `caudra auth login --decision`) and select it with `/decision-model`. A call that already completed in a resumed run replays its recorded answer without the engine.
+Calls the user's configured decision endpoint and returns `#{ model, answers, by_name }`. Available while a decision endpoint is active, even with passive decision features off. Do not assume one is. Catch failures or ask the user to add one with `/login` (or `caudra auth login --decision`) and select it with `/decisions model`. A call that already completed in a resumed run replays its recorded answer without the engine.
 
 ```rhai
 let result = decide(#{ task: args.objective }, [

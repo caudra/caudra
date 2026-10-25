@@ -28,19 +28,30 @@ pub(crate) struct CompletionAsk {
     pub context: BTreeMap<String, String>,
 }
 
-#[derive(Default)]
-pub(crate) struct McpCompleter {
+/// A question answered off the event loop once typing has paused: a newer
+/// ask replaces one still waiting or running, so only the latest answers.
+pub(crate) struct AsyncAsk<A, V> {
     /// The ask waiting out the pause, and when the pause ends.
-    waiting: Option<(CompletionAsk, Instant)>,
-    running: Option<(CompletionAsk, Task<Result<Completion, McpError>>)>,
+    waiting: Option<(A, Instant)>,
+    running: Option<(A, Task<Option<V>>)>,
     /// The last ask sent, so asking it again changes nothing.
-    sent: Option<CompletionAsk>,
+    sent: Option<A>,
 }
 
-impl McpCompleter {
+impl<A, V> Default for AsyncAsk<A, V> {
+    fn default() -> Self {
+        Self {
+            waiting: None,
+            running: None,
+            sent: None,
+        }
+    }
+}
+
+impl<A: Clone + PartialEq, V: Send + 'static> AsyncAsk<A, V> {
     /// Asks once typing has paused. Asking what was already asked is a no-op,
     /// so a caller may ask on every frame.
-    pub fn ask(&mut self, ask: CompletionAsk, now: Instant) {
+    pub fn ask(&mut self, ask: A, now: Instant) {
         let current = self
             .waiting
             .as_ref()
@@ -63,58 +74,103 @@ impl McpCompleter {
         self.waiting.is_some() || self.running.is_some()
     }
 
-    /// Sends the ask whose pause has ended, and hands back the answer to one
-    /// that finished. A server that fails to answer offers nothing.
+    /// Starts the ask whose pause has ended with `start`, and hands back the
+    /// answer to one that finished. `None` from a task offers nothing.
     pub fn poll(
         &mut self,
-        reader: &McpSnapshotReader,
         now: Instant,
-    ) -> Option<(CompletionAsk, Vec<String>)> {
+        start: impl FnOnce(A) -> Task<Option<V>>,
+    ) -> Option<(A, V)> {
         if self.waiting.as_ref().is_some_and(|(_, due)| *due <= now)
             && let Some((ask, _)) = self.waiting.take()
         {
-            let reader = reader.clone();
-            let request = ask.clone();
-            let task = smol::spawn(async move {
-                reader
-                    .complete(
-                        &request.target,
-                        &request.argument,
-                        &request.value,
-                        &request.context,
-                    )
-                    .await
-            });
             self.sent = Some(ask.clone());
-            self.running = Some((ask, task));
+            self.running = Some((ask.clone(), start(ask)));
         }
         let (_, task) = self.running.as_mut()?;
         let result = future::block_on(future::poll_once(task))?;
         let (ask, _) = self.running.take()?;
-        match result {
-            Ok(completion) => Some((ask, completion.values)),
-            Err(error) => {
-                debug!(?ask.target, argument = ask.argument, %error, "MCP completion failed");
-                None
-            }
-        }
+        result.map(|values| (ask, values))
+    }
+
+    /// The ask waiting out its pause, or else the one last sent.
+    #[cfg(test)]
+    pub fn pending(&self) -> Option<&A> {
+        self.waiting
+            .as_ref()
+            .map(|(ask, _)| ask)
+            .or(self.sent.as_ref())
     }
 
     /// Waits for the running ask, for a test that must not race it.
     #[cfg(test)]
     pub fn settle(
         &mut self,
-        reader: &McpSnapshotReader,
         now: Instant,
-    ) -> Option<(CompletionAsk, Vec<String>)> {
-        let answer = self.poll(reader, now);
+        start: impl FnOnce(A) -> Task<Option<V>>,
+    ) -> Option<(A, V)> {
+        let answer = self.poll(now, start);
         if answer.is_some() {
             return answer;
         }
         let (ask, task) = self.running.take()?;
-        future::block_on(task)
+        future::block_on(task).map(|values| (ask, values))
+    }
+}
+
+/// The server's `complete` for `ask`. A server that fails to answer offers
+/// nothing.
+pub(crate) fn complete(
+    reader: &McpSnapshotReader,
+    ask: CompletionAsk,
+) -> Task<Option<Vec<String>>> {
+    let reader = reader.clone();
+    smol::spawn(async move {
+        let result: Result<Completion, McpError> = reader
+            .complete(&ask.target, &ask.argument, &ask.value, &ask.context)
+            .await;
+        result
+            .inspect_err(|error| {
+                debug!(?ask.target, argument = ask.argument, %error, "MCP completion failed");
+            })
             .ok()
-            .map(|completion| (ask, completion.values))
+            .map(|completion| completion.values)
+    })
+}
+
+/// Values an MCP server suggests, asked through an [`AsyncAsk`].
+#[derive(Default)]
+pub(crate) struct McpCompleter(AsyncAsk<CompletionAsk, Vec<String>>);
+
+impl McpCompleter {
+    pub fn ask(&mut self, ask: CompletionAsk, now: Instant) {
+        self.0.ask(ask, now);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    #[cfg(test)]
+    pub fn busy(&self) -> bool {
+        self.0.busy()
+    }
+
+    pub fn poll(
+        &mut self,
+        reader: &McpSnapshotReader,
+        now: Instant,
+    ) -> Option<(CompletionAsk, Vec<String>)> {
+        self.0.poll(now, |ask| complete(reader, ask))
+    }
+
+    #[cfg(test)]
+    pub fn settle(
+        &mut self,
+        reader: &McpSnapshotReader,
+        now: Instant,
+    ) -> Option<(CompletionAsk, Vec<String>)> {
+        self.0.settle(now, |ask| complete(reader, ask))
     }
 }
 
@@ -152,14 +208,14 @@ mod tests {
         completer.ask(ask("ma"), start);
         let almost = start + COMPLETION_DEBOUNCE - Duration::from_millis(1);
         completer.poll(&reader, almost);
-        assert!(completer.running.is_none());
+        assert!(completer.0.running.is_none());
 
         completer.ask(ask("mai"), almost);
         completer.poll(&reader, start + COMPLETION_DEBOUNCE);
-        assert!(completer.running.is_none());
+        assert!(completer.0.running.is_none());
 
         completer.poll(&reader, almost + COMPLETION_DEBOUNCE);
-        assert_eq!(completer.sent, Some(ask("mai")));
+        assert_eq!(completer.0.sent, Some(ask("mai")));
     }
 
     #[test]

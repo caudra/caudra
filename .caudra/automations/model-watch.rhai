@@ -51,7 +51,7 @@ switch event.trigger {
                 let started = state.step_at ?? t.unix;
                 if state.stuck_notice != started && t.unix - started > args.step_notice_hours * 3600 {
                     state.stuck_notice = started;
-                    notify("model-watch's " + step + " step of the " + state.run + " run has had its goal open for over " + args.step_notice_hours + " hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.");
+                    notify("model-watch's " + step + " step of the " + state.run + " run has had its goal open for over " + args.step_notice_hours + " hours, so it may be looping. Check the session: /goal clear stops the step, and arming model-watch again retries it.");
                     return;
                 }
                 skip("the " + step + " step is in progress");
@@ -80,7 +80,7 @@ switch event.trigger {
         if event.verdict == "stalled" {
             if state.step_at != () && state.stuck_notice == state.step_at { skip("already told that this step is stuck"); }
             state.stuck_notice = state.step_at;
-            notify("model-watch's " + step + " step of the " + state.run + " run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal-clear stops the step, and arming model-watch again retries it.");
+            notify("model-watch's " + step + " step of the " + state.run + " run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal clear stops the step, and arming model-watch again retries it.");
             return;
         }
         state.current = ();

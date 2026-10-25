@@ -3687,7 +3687,7 @@ fn a_favorite_the_policy_excludes_is_saved_but_never_offered() {
     );
     assert_eq!(app.model_picker.favorites(), [SECOND_FAVORITE]);
     assert_eq!(
-        asked_for(&app.execute_command(cmd("/favorite-next"), 0)),
+        asked_for(&app.execute_command(cmd("/model next"), 0)),
         Some(SECOND_FAVORITE)
     );
 }
@@ -3696,7 +3696,7 @@ fn a_favorite_the_policy_excludes_is_saved_but_never_offered() {
 fn cycling_without_favorites_says_how_to_add_one() {
     let mut app = test_app();
 
-    let actions = app.execute_command(cmd("/favorite-next"), 0);
+    let actions = app.execute_command(cmd("/model next"), 0);
 
     assert!(actions.is_empty());
     assert_eq!(
@@ -3720,7 +3720,7 @@ fn cycling_starts_at_the_first_favorite_and_wraps() {
 
     app.state.model = Model::from_spec(FIRST_FAVORITE).unwrap();
     assert_eq!(
-        asked_for(&app.execute_command(cmd("/favorite-next"), 0)),
+        asked_for(&app.execute_command(cmd("/model next"), 0)),
         Some(SECOND_FAVORITE)
     );
 
@@ -4637,11 +4637,8 @@ pub(crate) fn error_app(app: &mut App) {
     }));
 }
 
-pub(crate) fn cmd(name: &str) -> ParsedCommand {
-    ParsedCommand {
-        name: name.to_string(),
-        args: String::new(),
-    }
+pub(crate) fn cmd(line: &str) -> ParsedCommand {
+    ParsedCommand::from_line(line)
 }
 
 fn type_slash(app: &mut App) {
@@ -6835,6 +6832,7 @@ fn with_custom_command(app: &mut App, name: &str, content: &str) {
             content: content.to_string(),
             scope: caudra_agent::command::CommandScope::Project,
             accepts_args: false,
+            argument_hint: None,
             source: caudra_agent::command::CommandSource::Local(PathBuf::from(
                 "/project/.caudra/commands/custom.md",
             )),
@@ -9341,7 +9339,7 @@ fn rendered_wide(app: &mut App, width: u16) -> String {
 const UPDATE_VERSION: &str = "99.9.9";
 const UPDATE_HEADLINE: &str = "Update available: v99.9.9";
 const UPDATE_COMMAND: &str = "caudra update --channel preview";
-const DISMISS_UPDATE_COMMAND: &str = "/dismiss-update";
+const DISMISS_UPDATE_COMMAND: &str = "/update dismiss";
 const NARROW_SCREEN: u16 = 40;
 const BANNER_MISSING: &str = "an available release must be on screen";
 const BANNER_UNPOLLED: &str = "a release no poller has seen must not be on screen";
@@ -14476,11 +14474,11 @@ fn goal_clear_aliases_leave_no_active_goal(alias: &str) {
 }
 
 #[test]
-fn goal_clear_registered_command_stops_active_goal() {
+fn goal_clear_subcommand_stops_active_goal() {
     let mut app = test_app();
     app.state.goal.set("ship it").unwrap();
 
-    let actions = app.run_cmdline("/goal-clear", 0).unwrap();
+    let actions = app.run_cmdline("/goal clear", 0).unwrap();
 
     assert!(actions.is_empty());
     assert!(app.state.goal.snapshot().is_none());
@@ -14518,8 +14516,8 @@ fn goal_loop_cap_notice_separates_run_continuations_from_total_evaluations() {
     );
 }
 
-#[test_case("/goal-model"; "registered_command")]
-#[test_case("/goal MODEL"; "legacy_subcommand")]
+#[test_case("/goal model"; "subcommand")]
+#[test_case("/goal MODEL"; "ignoring_case")]
 fn goal_model_opens_dedicated_picker_without_starting_goal(command: &str) {
     let mut app = test_app();
 
@@ -15820,6 +15818,7 @@ fn typed_lua_command_with_args_executes() {
             description: "Deploy the project".into(),
             plugin: "deploy_plugin".into(),
             max_args: usize::MAX,
+            ..LuaCommandInfo::default()
         }]),
     );
     let (handle, probe) = caudra_lua::test_support::probed_event_handle();
@@ -15910,6 +15909,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             description: "Deploy the project".into(),
             plugin: "deploy_plugin".into(),
             max_args: 0,
+            ..LuaCommandInfo::default()
         }]),
     );
     let (handle, probe) = caudra_lua::test_support::probed_event_handle();
@@ -17388,11 +17388,11 @@ fn fork_fails_when_referenced_managed_output_is_missing() {
     assert!(error.contains(&source_session_id.to_string()));
 }
 
-#[test_case("/move-session", false, None; "move_picker")]
-#[test_case("/migrate-sessions", true, None; "migrate_picker")]
-#[test_case("/move-session destination with spaces", false, Some(RELOCATION_DESTINATION); "move_destination")]
-#[test_case("/migrate-sessions destination with spaces", true, Some(RELOCATION_DESTINATION); "migrate_destination")]
-#[test_case("  /MOVE-SESSION destination with spaces  ", false, Some(RELOCATION_DESTINATION); "normalized_command")]
+#[test_case("/sessions move", false, None; "move_picker")]
+#[test_case("/sessions migrate", true, None; "migrate_picker")]
+#[test_case("/sessions move destination with spaces", false, Some(RELOCATION_DESTINATION); "move_destination")]
+#[test_case("/sessions migrate destination with spaces", true, Some(RELOCATION_DESTINATION); "migrate_destination")]
+#[test_case("  /SESSIONS Move destination with spaces  ", false, Some(RELOCATION_DESTINATION); "normalized_command")]
 fn relocation_commands_request_runtime_preflight(
     command: &str,
     bulk: bool,
@@ -26907,7 +26907,7 @@ fn stash_pop_restores_paste_tokens_and_images() {
     app.update(Msg::Paste("a\nb\nc".into()));
     with_image(&mut app);
     app.execute_command(cmd("/stash"), 0);
-    app.execute_command(cmd("/stash-pop"), 0);
+    app.execute_command(cmd("/stash pop"), 0);
 
     assert_eq!(app.input_box.buffer.display_text(), "[Pasted 3 lines] ");
     assert_eq!(app.input_box.buffer.expanded_text(), "a\nb\nc ");
@@ -26922,7 +26922,7 @@ fn stash_pop_takes_the_newest_entry() {
         app.update(Msg::Paste(text.into()));
         app.execute_command(cmd("/stash"), 0);
     }
-    app.execute_command(cmd("/stash-pop"), 0);
+    app.execute_command(cmd("/stash pop"), 0);
 
     assert_eq!(app.input_box.buffer.value(), "newer");
     assert_eq!(stash_entries(&app)[0].text, "older");
@@ -26934,7 +26934,7 @@ fn stash_pop_refuses_to_overwrite_a_draft() {
     app.update(Msg::Paste("stashed".into()));
     app.execute_command(cmd("/stash"), 0);
     app.update(Msg::Paste("in progress".into()));
-    app.execute_command(cmd("/stash-pop"), 0);
+    app.execute_command(cmd("/stash pop"), 0);
 
     assert_eq!(app.input_box.buffer.value(), "in progress");
     assert_eq!(stash_entries(&app).len(), 1);
@@ -26943,7 +26943,7 @@ fn stash_pop_refuses_to_overwrite_a_draft() {
 #[test]
 fn stash_pop_on_an_empty_stash_leaves_the_composer_alone() {
     let (_tmp, mut app) = stash_app();
-    app.execute_command(cmd("/stash-pop"), 0);
+    app.execute_command(cmd("/stash pop"), 0);
     assert!(app.input_box.is_empty());
     assert!(!app.stash_picker.is_open());
 }
@@ -26955,7 +26955,7 @@ fn stash_list_restores_the_chosen_entry_and_drops_it() {
         app.update(Msg::Paste(text.into()));
         app.execute_command(cmd("/stash"), 0);
     }
-    app.execute_command(cmd("/stash-list"), 0);
+    app.execute_command(cmd("/stash list"), 0);
     assert!(app.stash_picker.is_open());
 
     app.update(Msg::Key(key(KeyCode::Down)));
@@ -26973,7 +26973,7 @@ fn stash_list_deletes_an_entry_after_two_presses() {
         app.update(Msg::Paste(text.into()));
         app.execute_command(cmd("/stash"), 0);
     }
-    app.execute_command(cmd("/stash-list"), 0);
+    app.execute_command(cmd("/stash list"), 0);
 
     let delete = KeyEvent::new(kb::DELETE.code, kb::DELETE.modifiers);
     app.update(Msg::Key(delete));
@@ -26998,7 +26998,7 @@ fn deleting_the_last_stash_entry_closes_the_picker() {
     let (_tmp, mut app) = stash_app();
     app.update(Msg::Paste("only".into()));
     app.execute_command(cmd("/stash"), 0);
-    app.execute_command(cmd("/stash-list"), 0);
+    app.execute_command(cmd("/stash list"), 0);
 
     let delete = KeyEvent::new(kb::DELETE.code, kb::DELETE.modifiers);
     app.update(Msg::Key(delete));
@@ -27011,7 +27011,7 @@ fn deleting_the_last_stash_entry_closes_the_picker() {
 #[test]
 fn stash_list_on_an_empty_stash_opens_nothing() {
     let (_tmp, mut app) = stash_app();
-    app.execute_command(cmd("/stash-list"), 0);
+    app.execute_command(cmd("/stash list"), 0);
     assert!(!app.stash_picker.is_open());
 }
 
@@ -27052,7 +27052,7 @@ fn restoring_is_refused_while_a_queued_prompt_is_being_edited() {
     app.queue.set_focus_at(0);
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    app.execute_command(cmd("/stash-pop"), 0);
+    app.execute_command(cmd("/stash pop"), 0);
 
     assert_eq!(app.input_box.buffer.value(), "queued");
     assert_eq!(stash_entries(&app).len(), 1);
@@ -27286,12 +27286,13 @@ pub(crate) mod automation_runtime {
         open_question, press_chord, rendered, rendered_wide, screen_hit, test_app, type_and_submit,
     };
     use crate::app::automation::{
-        ARM_WORD, ARMED_PREFIX, ARMS_ONCE_SAVED, AutomationLink, DISARM_WORD, DISARMED_PREFIX,
-        FAILED_AT_LINE, INSPECTOR_HINT, InputWait,
+        ARMED_PREFIX, ARMS_ONCE_SAVED, AutomationLink, DISARMED_PREFIX, FAILED_AT_LINE,
+        INSPECTOR_HINT, InputWait,
     };
     use crate::app::{Mode, PlanState, REVERT_BUSY_MSG};
     use crate::components::Action;
     use crate::components::automation_inspector::AutomationAction;
+    use crate::components::command::words::{ARM_ARG, DISARM_ARG};
     use crate::components::status_bar::{AutomationChip, StatusBarHitTarget};
 
     pub(crate) const COURIER_MESSAGE: &str = "check CI";
@@ -27723,10 +27724,10 @@ pub(crate) mod automation_runtime {
         }
     }
 
-    #[test_case(&format!("{DISARM_WORD} {COURIER}"), &format!("{DISARMED_PREFIX}{COURIER}") ; "disarm")]
-    #[test_case(&format!("{ARM_WORD} {COURIER}"), &format!("{ARMED_PREFIX}{COURIER}") ; "arm_again")]
+    #[test_case(&format!("{DISARM_ARG} {COURIER}"), &format!("{DISARMED_PREFIX}{COURIER}") ; "disarm")]
+    #[test_case(&format!("{ARM_ARG} {COURIER}"), &format!("{ARMED_PREFIX}{COURIER}") ; "arm_again")]
     #[test_case(
-        &format!("{ARM_WORD} {MISSING}"),
+        &format!("{ARM_ARG} {MISSING}"),
         &AutomationError::UnknownAutomation { name: MISSING.into() }.to_string();
         "refused"
     )]
@@ -27749,7 +27750,7 @@ pub(crate) mod automation_runtime {
         let mut app = test_app();
         let linked = LinkedAutomations::unsaved(&mut app);
 
-        automations_command(&mut app, &format!("{ARM_WORD} {COURIER}"));
+        automations_command(&mut app, &format!("{ARM_ARG} {COURIER}"));
         app.await_automation_reply();
 
         assert_eq!(
@@ -27763,7 +27764,7 @@ pub(crate) mod automation_runtime {
     fn an_answer_for_a_session_the_tab_has_left_is_dropped() {
         let mut app = test_app();
         let linked = LinkedAutomations::courier(&mut app);
-        automations_command(&mut app, &format!("{DISARM_WORD} {COURIER}"));
+        automations_command(&mut app, &format!("{DISARM_ARG} {COURIER}"));
         app.state.session_mut().id = CaudraId::generate();
 
         app.await_automation_reply();

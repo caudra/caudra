@@ -70,6 +70,8 @@ pub struct CustomCommand {
     pub content: String,
     pub scope: CommandScope,
     pub accepts_args: bool,
+    /// What the frontmatter says the arguments are, such as `<file>`.
+    pub argument_hint: Option<String>,
     /// The file this came from, so a shadowed or missing command can be traced
     /// to a directory rather than guessed at.
     pub source: CommandSource,
@@ -252,6 +254,7 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         content: body.to_string(),
         scope,
         accepts_args,
+        argument_hint: fm.argument_hint,
         source: CommandSource::Local(path.to_path_buf()),
     })
 }
@@ -271,6 +274,7 @@ pub(crate) fn parse_remote_command(
         content: body.to_owned(),
         scope: CommandScope::Project,
         accepts_args: frontmatter.argument_hint.is_some() || body.contains(ARGUMENTS_PLACEHOLDER),
+        argument_hint: frontmatter.argument_hint,
         source: CommandSource::Remote(Box::new(source)),
     })
 }
@@ -345,6 +349,7 @@ mod tests {
             content: "body".into(),
             scope,
             accepts_args: false,
+            argument_hint: None,
             source: CommandSource::Local(PathBuf::from("/fake/review.md")),
         };
         assert_eq!(cmd.display_name(), expected);

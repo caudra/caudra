@@ -48,7 +48,9 @@ use crate::api::tool::{
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
-use crate::api::util::command::{LuaCommandReader, LuaCommandWriter, UiAction};
+use crate::api::util::command::{
+    CompletionRequest, LuaCommandReader, LuaCommandWriter, LuaCompletion, UiAction,
+};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
@@ -231,6 +233,12 @@ pub enum Request {
         /// How many `caudra.api.run_command` hops led here; seeds the handler's
         /// [`TaskCell::command_depth`] so an alias cycle terminates.
         depth: u8,
+    },
+    /// Calls a command's `complete` function; an empty reply when it has
+    /// none or it fails.
+    CompleteCommand {
+        request: CompletionRequest,
+        reply: flume::Sender<Vec<String>>,
     },
     CollectPromptSlots {
         config: AgentConfig,
@@ -923,6 +931,32 @@ impl TaskScope {
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
+}
+
+/// What a command's `complete` function returns for `request`, called with
+/// nvim's `(arglead, cmdline, cursorpos)`. A failure suggests nothing.
+async fn complete_command(
+    lua: &Lua,
+    complete: Function,
+    request: CompletionRequest,
+) -> Vec<String> {
+    let CompletionRequest {
+        plugin,
+        command,
+        arglead,
+        cmdline,
+        cursorpos,
+    } = request;
+    let run = async {
+        let thread = lua.create_thread(complete)?;
+        thread
+            .into_async::<Vec<String>>((arglead, cmdline, cursorpos))?
+            .await
+    };
+    run_detached(lua, run).await.unwrap_or_else(|error| {
+        tracing::warn!(%plugin, %command, %error, "command completion failed");
+        Vec::new()
+    })
 }
 
 /// [`run_detached`] for a slash-command handler, seeding the hop count that
@@ -3017,6 +3051,29 @@ pub fn spawn(
                                     }
                                 })
                                 .detach();
+                            }
+                        }
+                        Request::CompleteCommand { request, reply } => {
+                            let completer =
+                                rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
+                                    let entry = m.get(&request.plugin)?.get(&request.command)?;
+                                    let LuaCompletion::Function(key) = &entry.complete else {
+                                        return None;
+                                    };
+                                    rt.lua.registry_value::<Function>(key).ok()
+                                });
+                            match completer {
+                                Some(func) => {
+                                    let lua = rt.lua.clone();
+                                    ex.spawn(async move {
+                                        let values = complete_command(&lua, func, request).await;
+                                        let _ = reply.send(values);
+                                    })
+                                    .detach();
+                                }
+                                None => {
+                                    let _ = reply.send(Vec::new());
+                                }
                             }
                         }
                         Request::ComputeHeader {

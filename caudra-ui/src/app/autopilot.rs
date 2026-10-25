@@ -35,8 +35,8 @@ use tracing::warn;
 use super::goal::LogPlace;
 use super::tasks::MAIN_TASK_ID;
 use super::{
-    App, CONFIRMATION_DURATION, FLASH_CANCEL, IMPLEMENT_CAPTURE_FAILED, LOG_ARG, MODEL_ARG,
-    Notification, Status, is_goal_clear,
+    App, CONFIRMATION_DURATION, FLASH_CANCEL, IMPLEMENT_CAPTURE_FAILED, Notification, Status,
+    is_goal_clear,
 };
 use crate::components::audit_log::{COPIED_ENTRY, PanelTab, ROW_NOT_LOADED};
 use crate::components::autopilot_panel::{
@@ -44,6 +44,7 @@ use crate::components::autopilot_panel::{
     budget_left, decision_details, decision_title, end_notice, end_reason, goal_line,
     spend_summary, state_label,
 };
+use crate::components::command::words::{LOG_ARG, MODEL_ARG, OFF_ARG, STOP_ARG};
 use crate::components::messages::markdown_code_span;
 use crate::components::status_bar::AutopilotChip;
 use crate::components::{Action, DisplayMessage, Overlay, format_elapsed};
@@ -51,7 +52,7 @@ use crate::storage_writer::AutopilotWrite;
 
 const GOAL_COMMAND: &str = "/goal";
 const AUTOPILOT_COMMAND: &str = "/autopilot";
-const STOP_ARGS: [&str; 2] = ["off", "stop"];
+const STOP_ARGS: [&str; 2] = [OFF_ARG, STOP_ARG];
 const MS_PER_MINUTE: u64 = 60_000;
 /// How far the stored engagement clock may trail the live one, so time
 /// passing alone does not rewrite an engaged session every frame.

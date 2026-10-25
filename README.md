@@ -307,7 +307,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Git worktrees you open and close](https://caudra.ai/docs/worktrees/#closing-a-worktree)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
-- [Search past sessions with `/search-history`](https://caudra.ai/docs/sessions/#search-past-sessions)
+- [Search past sessions with `/search`](https://caudra.ai/docs/sessions/#search-past-sessions)
 - [Search past conversations from Python](https://caudra.ai/docs/code/#search-past-conversations)
 - [Spend by model and purpose in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
 - [Opt-in cache warming for the Anthropic API](https://caudra.ai/docs/token-economy/#cache-warming)

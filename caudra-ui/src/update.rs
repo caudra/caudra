@@ -12,7 +12,7 @@ const SHORT_HEADLINE: &str = "Update: v";
 const SEPARATOR: &str = " \u{2014} ";
 pub(crate) const CLOSE: &str = " \u{d7} ";
 pub(crate) const CLOSE_TIP: &str =
-    "Hides this notice until Caudra restarts\nClick or run /dismiss-update";
+    "Hides this notice until Caudra restarts\nClick or run /update dismiss";
 pub(crate) const UPDATE_TIP: &str = "Installs this release after asking\nClick or run /update";
 
 static NOTICE: LazyLock<Arc<UpdateNotice>> = LazyLock::new(Arc::default);

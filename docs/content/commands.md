@@ -5,86 +5,84 @@ description: "The / palette, sessions, toggles, custom commands."
 
 Type `/` in the input box to open the command palette. `Tab` completes the command word, up to the cursor, and keeps the rest of the draft, so a `/` typed in front of a written prompt makes the prompt the command's arguments. `Ctrl+Z` takes a completion back.
 
+### Arguments
+
+Each row shows the arguments its command takes, dimmed, as in the Arguments column below: `<name>` must be given, `[name]` may be left out, and `a|b` lists the words a slot accepts. A verb such as `/goal clear` or `/stash pop` has a row of its own once you type a letter, and a dash finds it too, so `/goal-c` reaches `/goal clear`.
+
+After the command and a space, the palette lists what the slot under the cursor takes, with a description for each: subcommands, levels, task ids, workflow runs, automations, docs pages, and directories. The first row repeats the signature with the current slot in bold. A slot that takes free text shows its name as a dimmed placeholder, and the composer shows the rest of the highlighted value, or the slot name, after the cursor.
+
+`Tab` takes the highlighted value, `Up` and `Down` move, and `Esc` closes the list. `Enter` runs a word the slot accepts as typed. On a slot with a fixed set of words, `Enter` on any other word runs the highlighted one, so a typo such as `/thinking hg` runs `/thinking high`. When nothing matches, the draft stays and the usage line is shown. Free text always runs as typed. The `Ctrl+P` command modal shows the same rows and the same list under its argument field.
+
 ## Built-in commands
 
 Commands marked Main only act on the main session's turn or history. They stay listed while a task transcript is open, drawn dimmed, and report their scope rather than running. See [Tasks](#tasks).
 
 A command with an Experiment entry exists only while that switch is on under `[experimental]` in the global `caudra.toml`. Typing it while the switch is off names the switch instead. See [Experimental features](/docs/configuration/#experimental-features).
 
-| Command | Description | Scope | Experiment |
-|---------|-------------|-------|------------|
-| `/compact` | Summarize and compact conversation history | Main only |  |
-| `/continue` | Resume an interrupted turn without adding a message | Main only |  |
-| `/new` | Start a new session |  |  |
-| `/help` | Show keybindings |  |  |
-| `/usage` | Show token usage breakdown |  |  |
-| `/context` | Inspect active context window usage |  |  |
-| `/storage` | Inspect what the state directory holds |  |  |
-| `/logs` | Browse the structured log |  |  |
-| `/docs` | Read Caudra's documentation, or search it |  |  |
-| `/search-history` | Search past sessions of this project or every project |  |  |
-| `/changelog` | Show what's new in Caudra, or every release with `all` |  |  |
-| `/tools` | Show which tools the model can reach |  |  |
-| `/skills` | Show the skills the model can load and where they come from |  |  |
-| `/queue` | Inspect and edit queued prompts |  |  |
-| `/stash` | Park the current prompt draft for later |  |  |
-| `/stash-pop` | Restore the most recently stashed prompt |  |  |
-| `/stash-list` | Browse stashed prompts |  |  |
-| `/update` | Install the release the update banner names, then restart |  |  |
-| `/dismiss-update` | Hide the update banner until Caudra restarts |  |  |
-| `/memory` | Inspect project memory: the view, its summary tree, and the notes |  |  |
-| `/learn` | Review what continual learning changed, revert it, or pause it |  |  |
-| `/tasks` | Browse tasks and steer running subagents |  |  |
-| `/shells` | Browse shell commands and stop running ones |  |  |
-| `/peers` | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
-| `/messages` | Review held peer messages and manage this session's inbound policy | Main only | `cross_session_messaging` |
-| `/topics` | Browse peer topic messages, or change this session's topic subscriptions | Main only | `cross_session_messaging` |
-| `/groups` | List consumer groups and this session's work, join or leave a group, or retry, pause, or cancel a work item | Main only | `cross_session_messaging` |
-| `/workflows` | Browse, trust, and launch workflows | Main only | `workflows` |
-| `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only | `workflows` |
-| `/deep-research` | Research a question with the deep-research workflow | Main only | `workflows` |
-| `/review-changes` | Review a change from independent angles with the review-changes workflow | Main only | `workflows` |
-| `/root-cause` | Diagnose a failure with the root-cause workflow | Main only | `workflows` |
-| `/automations` | Inspect, trust, and pause automations (arm NAME [{json}] \| disarm NAME) | Main only | `automations` |
-| `/sessions` | Browse and switch sessions |  |  |
-| `/rename` | Rename the current session |  |  |
-| `/fork` | Fork the session into a new one at its latest message | Main only |  |
-| `/model` | Switch chat model or assign job models | Main only |  |
-| `/favorite-next` | Switch to the next favorite model | Main only |  |
-| `/accounts` | Choose which account of the model's provider requests go to | Main only |  |
-| `/decision-model` | Pick the decision endpoint that screens tool calls | Main only |  |
-| `/decision-next` | Switch to the next decision endpoint | Main only |  |
-| `/system-prompt` | Inspect the system prompt and switch profile | Main only |  |
-| `/projection` | Inspect the conversation as the provider receives it | Main only |  |
-| `/review` | Review the last reply passage by passage |  |  |
-| `/theme` | Switch color theme |  |  |
-| `/view` | Cycle transcript: auto / compact / expanded |  |  |
-| `/mcp` | Configure MCP servers |  |  |
-| `/env` | View environment variables and choose which reach shell commands |  |  |
-| `/settings` | Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml |  |  |
-| `/permissions` | Inspect active conversation permission rules |  |  |
-| `/login` | Authenticate with an LLM provider |  |  |
-| `/cd` | Change working directory |  |  |
-| `/move-session` | Move the current session; retain its counters and lifetime project attribution (optional directory) | Main only |  |
-| `/migrate-sessions` | Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory) | Main only |  |
-| `/worktree` | Open, create, close or remove git worktrees of this repository (new [branch] \| close \| remove) | Main only |  |
-| `/btw` | Ask a side question, with follow-ups (no tools, nothing enters history) | Main only |  |
-| `/catchup` | Bring yourself back up to speed on this session (optional focus; a /btw, nothing enters history) | Main only |  |
-| `/extract` | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |  |
-| `/goal` | Work until a completion condition is met (model, log) | Main only |  |
-| `/goal-clear` | Stop the active completion goal | Main only |  |
-| `/goal-model` | Assign the completion goal model | Main only |  |
-| `/autopilot` | Keep the session moving: answer prompts, questions, and plans for you (off, model, log) | Main only |  |
-| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |  |
-| `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  |  |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |
-| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |  |
-| `/fast` | Toggle fast mode (models that sell a fast tier) |  |  |
-| `/exit` | Exit the application |  |  |
-| `/reload` | Reload plugins and config |  |  |
-| `/workbench` | Open the file explorer, editor and source control view |  |  |
-| `/remote` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only | `remote_workcell` or `sandboxes` |
-| `/sandbox` | Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery |  | `sandboxes` |
+| Command | Arguments | Description | Scope | Experiment |
+|---------|-----------|-------------|-------|------------|
+| `/compact` |  | Summarize and compact conversation history | Main only |  |
+| `/continue` |  | Resume an interrupted turn without adding a message | Main only |  |
+| `/new` |  | Start a new session |  |  |
+| `/help` |  | Show keybindings |  |  |
+| `/usage` |  | Show token usage breakdown |  |  |
+| `/context` | `[all]` | Inspect active context window usage |  |  |
+| `/storage` | `[all]` | Inspect what the state directory holds |  |  |
+| `/logs` |  | Browse the structured log |  |  |
+| `/docs` | `[page]` | Read Caudra's documentation, or search it |  |  |
+| `/search` | `[chat\|project\|all\|<words>]` | Search this chat, this project's past sessions, or every project's |  |  |
+| `/changelog` | `[all]` | Show what's new in Caudra, or every release with `all` |  |  |
+| `/tools` |  | Show which tools the model can reach |  |  |
+| `/skills` |  | Show the skills the model can load and where they come from |  |  |
+| `/queue` |  | Inspect and edit queued prompts |  |  |
+| `/stash` | `[pop\|list]` | Park the current prompt draft for later, or restore or browse stashed ones |  |  |
+| `/update` | `[dismiss]` | Install the release the update banner names, then restart |  |  |
+| `/memory` |  | Inspect project memory: the view, its summary tree, and the notes |  |  |
+| `/learn` |  | Review what continual learning changed, revert it, or pause it |  |  |
+| `/tasks` | `[list\|status\|background\|cancel]` | Browse tasks and steer running subagents |  |  |
+| `/shells` |  | Browse shell commands and stop running ones |  |  |
+| `/peers` |  | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
+| `/messages` | `[help\|approve\|reject\|inbound]` | Review held peer messages and manage this session's inbound policy | Main only | `cross_session_messaging` |
+| `/topics` | `[help\|subscribe\|unsubscribe\|broadcast]` | Browse peer topic messages, or change this session's topic subscriptions | Main only | `cross_session_messaging` |
+| `/groups` | `[help\|join\|leave\|retry\|pause\|cancel]` | List consumer groups and this session's work, join or leave a group, or retry, pause, or cancel a work item | Main only | `cross_session_messaging` |
+| `/workflows` |  | Browse, trust, and launch workflows | Main only | `workflows` |
+| `/workflow` | `[runs\|pause\|resume\|stop\|<name>] [args]` | Start a workflow, or list, pause, resume, and stop runs | Main only | `workflows` |
+| `/deep-research` | `<query>` | Research a question with the deep-research workflow | Main only | `workflows` |
+| `/review-changes` | `<scope>` | Review a change from independent angles with the review-changes workflow | Main only | `workflows` |
+| `/root-cause` | `<failure>` | Diagnose a failure with the root-cause workflow | Main only | `workflows` |
+| `/automations` | `[arm\|disarm]` | Inspect, trust, and pause automations, or arm and disarm one | Main only | `automations` |
+| `/sessions` | `[move\|migrate]` | Browse and switch sessions, or move them to another directory |  |  |
+| `/rename` | `<title>` | Rename the current session |  |  |
+| `/fork` |  | Fork the session into a new one at its latest message | Main only |  |
+| `/model` | `[next]` | Switch chat model or assign job models | Main only |  |
+| `/accounts` |  | Choose which account of the model's provider requests go to | Main only |  |
+| `/system-prompt` |  | Inspect the system prompt and switch profile | Main only |  |
+| `/projection` |  | Inspect the conversation as the provider receives it | Main only |  |
+| `/review` |  | Review the last reply passage by passage |  |  |
+| `/theme` |  | Switch color theme |  |  |
+| `/view` |  | Cycle transcript: auto / compact / expanded |  |  |
+| `/mcp` |  | Configure MCP servers |  |  |
+| `/env` |  | View environment variables and choose which reach shell commands |  |  |
+| `/settings` |  | Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml |  |  |
+| `/permissions` | `[discover]` | Inspect active conversation permission rules |  |  |
+| `/login` |  | Authenticate with an LLM provider |  |  |
+| `/cd` | `[directory]` | Change working directory |  |  |
+| `/worktree` | `[new\|close\|remove]` | Open, create, close or remove git worktrees of this repository | Main only |  |
+| `/btw` | `<question>` | Ask a side question, with follow-ups (no tools, nothing enters history) | Main only |  |
+| `/catchup` | `[focus]` | Bring yourself back up to speed on this session (a /btw, nothing enters history) | Main only |  |
+| `/extract` |  | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |  |
+| `/goal` | `[clear\|model\|log\|<condition>]` | Work until a completion condition is met | Main only |  |
+| `/autopilot` | `[off\|model\|log\|<goal>]` | Keep the session moving: answer prompts, questions, and plans for you | Main only |  |
+| `/auto` |  | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |  |
+| `/decisions` | `[model\|next]` | Inspect decision engine status and recent decisions, or switch endpoints |  |  |
+| `/yolo` |  | Toggle YOLO mode (skip all permission prompts) |  |  |
+| `/thinking` | `[level]` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |  |
+| `/fast` |  | Toggle fast mode (models that sell a fast tier) |  |  |
+| `/exit` |  | Exit the application |  |  |
+| `/reload` |  | Reload plugins and config |  |  |
+| `/workbench` |  | Open the file explorer, editor and source control view |  |  |
+| `/remote` | `[status\|pending\|reconnect\|reconcile\|acknowledge]` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only | `remote_workcell` or `sandboxes` |
+| `/sandbox` | `[instances\|profiles\|images\|providers\|reconcile-network]` | Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery |  | `sandboxes` |
 
 ## Resuming after an interruption
 
@@ -98,7 +96,7 @@ Subagents resume the same way. A `task` call that passes a `task_id` may omit `p
 
 ## Model jobs
 
-`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal-model` opens the Goal assignment page directly.
+`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal model` opens the Goal assignment page directly.
 
 See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assignments, automatic resolution, and supply markers.
 
@@ -108,11 +106,11 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 ## Stash
 
-A prompt you are not ready to send does not have to block the composer. `/stash` (`Ctrl+X s`) moves the draft out of the way, `/stash-pop` (`Ctrl+X p`) brings the newest one back, and `/stash-list` opens the full list.
+A prompt you are not ready to send does not have to block the composer. `/stash` (`Ctrl+X s`) moves the draft out of the way, `/stash pop` (`Ctrl+X p`) brings the newest one back, and `/stash list` opens the full list.
 
 The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in the `input.stash` row of Caudra's SQLite state database, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
 
-`/stash-pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
+`/stash pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
 
 Stashing is for drafts you do not want to send yet. To line up prompts Caudra should send on its own, use the queue instead. See [Queue and Steering](/docs/queue/).
 
@@ -186,7 +184,7 @@ Closing Caudra interrupts every active run, and an interrupted run is over. Paus
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. Background tasks, shell commands, workflows, and their result delivery must settle first. The main agent processes their results before the turn is complete. Queued user input takes priority over a goal check. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
+Run `/goal model` to open the Goal assignment page directly. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 
 Run `/goal` without arguments to open the status panel. Its Status tab shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
@@ -212,7 +210,7 @@ Run `/goal` without arguments to open the status panel. Its Status tab shows the
 
 The detail shows the check's start and end times, the evaluator's own verdict, what became of it, the full reason or error, and its tokens and cost. The transcript rows for checks that were not met, failed checks, and a goal's end come back when you resume. A session keeps its last 200 goals and 2,000 checks. The log goes when the session is deleted, and a fork starts without one.
 
-Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
+Use `/goal clear` to stop early. `stop`, `off`, `reset`, `none`, and `cancel` are accepted in its place, without regard to case.
 
 Goal state belongs to the session. An active goal survives resume with its condition, evaluation count, spend, elapsed time, and latest reason, and completed status survives too, while `/new` clears them. A resumed goal is status rather than a trigger: it waits for your next message and is evaluated at the end of that turn. Normal permissions still apply, so unattended goals need rules or YOLO mode that already permit the required tools.
 

@@ -14,12 +14,53 @@ use crate::api::util::pair::{Pair, try_pair};
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
     pub max_args: usize,
+    /// `nargs` was 1 or "+", so an argument must be given.
+    pub required: bool,
+    pub complete: LuaCompletion,
+}
+
+/// What a plugin command suggests for its arguments, after nvim's
+/// `complete`. The registry holds the function itself; the published
+/// snapshot only says there is one, as `Function(())`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LuaCompletion<F = ()> {
+    #[default]
+    None,
+    Values(Arc<[String]>),
+    Directories,
+    Files,
+    /// Called on the Lua thread as `(arglead, cmdline, cursorpos)`.
+    Function(F),
+}
+
+impl<F> LuaCompletion<F> {
+    fn published(&self) -> LuaCompletion {
+        match self {
+            Self::None => LuaCompletion::None,
+            Self::Values(values) => LuaCompletion::Values(Arc::clone(values)),
+            Self::Directories => LuaCompletion::Directories,
+            Self::Files => LuaCompletion::Files,
+            Self::Function(_) => LuaCompletion::Function(()),
+        }
+    }
+}
+
+/// What the UI asks a `complete` function: nvim's three arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionRequest {
+    pub plugin: Arc<str>,
+    pub command: Arc<str>,
+    /// The word under the caret, up to the caret.
+    pub arglead: String,
+    pub cmdline: String,
+    /// The caret, in bytes into `cmdline`.
+    pub cursorpos: usize,
 }
 
 #[derive(Clone, Default)]
@@ -130,6 +171,8 @@ pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
     pub max_args: usize,
+    pub required: bool,
+    pub complete: LuaCompletion<RegistryKey>,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
@@ -143,6 +186,8 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
                 max_args: entry.max_args,
+                required: entry.required,
+                complete: entry.complete.published(),
             })
         })
         .collect();
@@ -577,6 +622,8 @@ mod tests {
             handler: key,
             description: Arc::from(desc),
             max_args: 0,
+            required: false,
+            complete: LuaCompletion::None,
         }
     }
 

@@ -1,5 +1,9 @@
 use super::App;
 use crate::AppSession;
+use crate::components::command::words::{
+    DOCTOR_ARG, IMAGES_ARG, INSTANCES_ARG, PROFILES_ARG, PROVIDERS_ARG, RECONCILE_NETWORK_ARG,
+    STATUS_ARG,
+};
 use crate::components::sandbox_manager::{SandboxAction, SandboxView};
 use crate::components::{DisplayMessage, DisplayRole, Overlay};
 use crate::repaint::Dirty;
@@ -21,6 +25,26 @@ const UNSAVED_DRAFT_ERR: &str =
     "Save or discard unsaved local editor/composer drafts before changing sandbox authority";
 pub(super) const WORKBENCH_BUSY: &str =
     "Wait for pending Workbench reads or writes before changing sandbox authority";
+const SANDBOX_USAGE: &str =
+    "Usage: /sandbox [instances|profiles|images|providers|reconcile-network]";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SandboxCommand {
+    Open(SandboxView),
+    ReconcileNetwork,
+}
+
+pub(super) fn parse_sandbox_command(args: &str) -> Option<SandboxCommand> {
+    let view = match args.trim().to_ascii_lowercase().as_str() {
+        "" | STATUS_ARG | INSTANCES_ARG => SandboxView::Instances,
+        PROFILES_ARG => SandboxView::Profiles,
+        IMAGES_ARG => SandboxView::Images,
+        PROVIDERS_ARG | DOCTOR_ARG => SandboxView::Providers,
+        RECONCILE_NETWORK_ARG => return Some(SandboxCommand::ReconcileNetwork),
+        _ => return None,
+    };
+    Some(SandboxCommand::Open(view))
+}
 
 /// The instance the footer names, or `None` when there is nothing to name.
 /// Readiness is the manager's own: the binding's sandbox record says which
@@ -54,7 +78,11 @@ impl App {
         if self.refuse_disabled(Feature::Sandboxes) {
             return;
         }
-        if args.trim() == "reconcile-network" {
+        let Some(command) = parse_sandbox_command(args) else {
+            self.flash(SANDBOX_USAGE.into());
+            return;
+        };
+        let SandboxCommand::Open(view) = command else {
             if self
                 .sandbox_live
                 .network_gate
@@ -75,16 +103,6 @@ impl App {
                 self.flash("Open /sandbox to load the committed configuration, then /sandbox reconcile-network.".into());
             }
             return;
-        }
-        let view = match args.trim() {
-            "" | "status" | "instances" => SandboxView::Instances,
-            "profiles" => SandboxView::Profiles,
-            "images" => SandboxView::Images,
-            "providers" | "doctor" => SandboxView::Providers,
-            _ => {
-                self.flash("Usage: /sandbox [instances|profiles|images|providers|status]".into());
-                return;
-            }
         };
         let action = self.sandbox_manager.open(self.state.session.id, view);
         self.handle_sandbox_action(action);

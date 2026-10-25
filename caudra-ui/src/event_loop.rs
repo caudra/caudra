@@ -6161,7 +6161,7 @@ mod tests {
         let destination = TempDir::new().unwrap();
         let writer = Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
         let mut app = relocation_app(storage.clone(), source.path(), Arc::clone(&writer));
-        let command = format!("/move-session {}", destination.path().display());
+        let command = format!("/sessions move {}", destination.path().display());
         app.update(Msg::Paste(command.clone()));
         app.checkpoint_now();
         writer.save_sync(Arc::clone(&app.state.session)).unwrap();

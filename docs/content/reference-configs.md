@@ -1900,7 +1900,7 @@ version = 1
 
 # [decisions.my-endpoint]
 # One decision endpoint, named my-endpoint here. Configuring it is the consent
-# to send decision context to it, and `/decision-model` or
+# to send decision context to it, and `/decisions model` or
 # `caudra decisions use` makes it the active one.
 
 # Decision wire protocol: `typesafe` or `openai`. Never inferred from the URL

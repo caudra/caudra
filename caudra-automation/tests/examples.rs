@@ -267,9 +267,9 @@ const MODEL_WATCH_WAITED: &str = "model-watch has waited 12 hours to land on mai
 const MODEL_WATCH_NO_AUTOPILOT: &str =
     "model-watch cannot start today's run: autopilot is not engaged, run /autopilot.";
 const MODEL_WATCH_IMPOSSIBLE: &str = "model-watch stopped at the survey step of the 2026-10-05 run: the goal was impossible. Fix what blocked it, then arm model-watch again in /automations.";
-const MODEL_WATCH_SYNC_OPEN: &str = "model-watch's sync step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.";
-const MODEL_WATCH_SURVEY_OPEN: &str = "model-watch's survey step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal-clear stops the step, and arming model-watch again retries it.";
-const MODEL_WATCH_SYNC_STALLED: &str = "model-watch's sync step of the 2026-10-05 run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal-clear stops the step, and arming model-watch again retries it.";
+const MODEL_WATCH_SYNC_OPEN: &str = "model-watch's sync step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal clear stops the step, and arming model-watch again retries it.";
+const MODEL_WATCH_SURVEY_OPEN: &str = "model-watch's survey step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal clear stops the step, and arming model-watch again retries it.";
+const MODEL_WATCH_SYNC_STALLED: &str = "model-watch's sync step of the 2026-10-05 run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal clear stops the step, and arming model-watch again retries it.";
 const ALREADY_TOLD_STUCK: &str = "already told that this step is stuck";
 const SYNC_IN_PROGRESS: &str = "the sync step is in progress";
 const RUN_DONE: &str = "today's run is done";

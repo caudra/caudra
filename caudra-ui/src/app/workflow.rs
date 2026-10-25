@@ -15,14 +15,16 @@ use caudra_providers::{Message, WorkflowEventOrigin};
 #[cfg(test)]
 use caudra_workflow::RunStatus;
 use caudra_workflow::{
-    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError,
-    WorkflowEvent, WorkflowRequest, WorkflowResponse,
+    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowCatalog,
+    WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::app::App;
 use crate::components::Action;
+use crate::components::command::SourceValue;
+use crate::components::command::words::RUNS_ARG;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::logs_modal::LogsAction;
 use crate::components::workflow_catalog_picker::WorkflowCatalogAction;
@@ -40,12 +42,17 @@ pub(crate) const TRUST_HINT: &str = "run /workflows to review and trust it";
 pub(crate) const DEEP_RESEARCH_WORKFLOW: &str = "deep-research";
 pub(crate) const REVIEW_CHANGES_WORKFLOW: &str = "review-changes";
 pub(crate) const ROOT_CAUSE_WORKFLOW: &str = "root-cause";
+const BUILTIN_WORKFLOWS: [&str; 3] = [
+    DEEP_RESEARCH_WORKFLOW,
+    REVIEW_CHANGES_WORKFLOW,
+    ROOT_CAUSE_WORKFLOW,
+];
+const BUILTIN_WORKFLOW: &str = "Built-in workflow";
 /// What a built-in workflow wants after its own slash command, as the word the
 /// usage line asks for.
 const DEEP_RESEARCH_SUBJECT: &str = "query";
 const REVIEW_CHANGES_SUBJECT: &str = "scope";
 const ROOT_CAUSE_SUBJECT: &str = "failure";
-const RUNS_SUBCOMMAND: &str = "runs";
 const RETURN_HINT: &str = "/workflow returns to this run";
 const HISTORY_LIMIT: Option<usize> = None;
 const BUDGET_FLAG: &str = "--agent-budget";
@@ -72,6 +79,9 @@ pub(crate) struct WorkflowUi {
     suppressed: HashSet<String>,
     reply_tx: flume::Sender<Reply>,
     reply_rx: flume::Receiver<Reply>,
+    /// What `/workflow` may start, as the catalog last listed it; `None`
+    /// until the palette first asks.
+    names: Option<Vec<SourceValue>>,
     /// Requests a test would have shipped, and the switch that lets it ship
     /// them without a runtime to answer.
     #[cfg(test)]
@@ -84,6 +94,8 @@ pub(crate) struct WorkflowUi {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Intent {
     Catalog,
+    /// The catalog asked for its names alone, for the slash palette.
+    Names,
     Launch,
     Trust,
     Control(RunControl),
@@ -122,6 +134,7 @@ impl WorkflowUi {
             suppressed: HashSet::new(),
             reply_tx,
             reply_rx,
+            names: None,
             #[cfg(test)]
             sent: Vec::new(),
             #[cfg(test)]
@@ -157,6 +170,7 @@ impl WorkflowUi {
             })
             .collect();
         self.handle = handle;
+        self.names = None;
     }
 
     pub(crate) fn available(&self) -> bool {
@@ -502,7 +516,7 @@ impl App {
             self.flash(UNAVAILABLE_MSG.into());
             return Vec::new();
         }
-        if args.is_empty() || args == RUNS_SUBCOMMAND {
+        if args.is_empty() || args.eq_ignore_ascii_case(RUNS_ARG) {
             self.open_workflow_inspector(None);
             return Vec::new();
         }
@@ -737,6 +751,22 @@ impl App {
         }
     }
 
+    /// What `/workflow` may start: the built-ins at once, then the catalog's
+    /// names once a listing lands.
+    pub(super) fn workflow_names(&mut self) -> Vec<SourceValue> {
+        if let Some(names) = &self.workflow.names {
+            return names.clone();
+        }
+        let builtins: Vec<SourceValue> = BUILTIN_WORKFLOWS
+            .iter()
+            .map(|name| SourceValue::new(*name, BUILTIN_WORKFLOW))
+            .collect();
+        if self.workflow.dispatch(Intent::Names, WorkflowRequest::List) {
+            self.workflow.names = Some(builtins.clone());
+        }
+        builtins
+    }
+
     pub(super) fn poll_workflow_replies(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         while let Some(reply) = self.workflow.poll() {
@@ -749,7 +779,12 @@ impl App {
     pub(super) fn on_workflow_reply(&mut self, reply: Reply) {
         match (reply.intent, reply.result) {
             (Intent::Catalog, Ok(WorkflowResponse::Catalog(catalog))) => {
+                self.workflow.names = Some(catalog_names(&catalog));
                 self.workflow_catalog_picker.fill(catalog);
+            }
+            (Intent::Names, Ok(WorkflowResponse::Catalog(catalog))) => {
+                self.workflow.names = Some(catalog_names(&catalog));
+                self.resync_command_palette();
             }
             (Intent::Catalog, Err(error)) => self.workflow_catalog_picker.fail(error.to_string()),
             (Intent::Launch, Ok(WorkflowResponse::Started(snapshot))) => {
@@ -833,10 +868,10 @@ impl App {
 }
 
 impl RunControl {
-    fn parse(word: &str) -> Option<Self> {
+    pub(super) fn parse(word: &str) -> Option<Self> {
         [Self::Pause, Self::Resume, Self::Stop]
             .into_iter()
-            .find(|control| control.verb() == word)
+            .find(|control| control.verb().eq_ignore_ascii_case(word))
     }
 
     fn past_tense(self) -> &'static str {
@@ -846,6 +881,14 @@ impl RunControl {
             Self::Stop => "Stopped",
         }
     }
+}
+
+fn catalog_names(catalog: &WorkflowCatalog) -> Vec<SourceValue> {
+    catalog
+        .entries
+        .iter()
+        .map(|entry| SourceValue::new(&entry.name, &entry.description))
+        .collect()
 }
 
 /// A run selector and the budget written after it, when the last word is a

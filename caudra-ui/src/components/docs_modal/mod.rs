@@ -414,7 +414,7 @@ impl DocsModal {
         popup
     }
 
-    fn library(&self) -> &'static Library {
+    pub(crate) fn library(&self) -> &'static Library {
         (self.library)()
     }
 

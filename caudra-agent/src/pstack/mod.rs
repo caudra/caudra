@@ -73,6 +73,7 @@ fn builtin_commands(library: &Library) -> Vec<CustomCommand> {
             ),
             scope: CommandScope::Builtin(NAME),
             accepts_args: true,
+            argument_hint: None,
             source: CommandSource::Builtin,
         })
         .collect()

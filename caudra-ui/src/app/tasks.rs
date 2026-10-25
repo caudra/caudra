@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::app::App;
 use crate::app::background_delivery::{DeliveryFailure, DeliveryJob, DeliveryKey};
 
+use crate::components::command::words::{BACKGROUND_ARG, CANCEL_ARG, LIST_ARG, STATUS_ARG};
 use crate::components::input::{InputState, Submission};
 use crate::components::shell_modal;
 use crate::components::task_picker::TaskPickerAction;
@@ -56,6 +57,32 @@ const CONTINUATION_UNAVAILABLE: &str =
     "This task cannot be continued right now; your draft is kept";
 const CONTINUATION_STALE: &str =
     "Task continuation was interrupted by a session change or stop; your draft is kept";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TaskCommand<'a> {
+    List,
+    Status(&'a str),
+    Background(&'a str),
+    Cancel(&'a str),
+}
+
+/// `/tasks` with no arguments lists, as `/tasks list` does.
+pub(super) fn parse_task_command(args: &str) -> Option<TaskCommand<'_>> {
+    let mut words = args.split_whitespace();
+    let operation = words.next().unwrap_or(LIST_ARG);
+    let target = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    let is = |word: &str| operation.eq_ignore_ascii_case(word);
+    match target {
+        None if is(LIST_ARG) => Some(TaskCommand::List),
+        Some(id) if is(STATUS_ARG) => Some(TaskCommand::Status(id)),
+        Some(id) if is(BACKGROUND_ARG) => Some(TaskCommand::Background(id)),
+        Some(id) if is(CANCEL_ARG) => Some(TaskCommand::Cancel(id)),
+        _ => None,
+    }
+}
 
 pub(super) struct TaskContinuation {
     session: CaudraId,
@@ -644,12 +671,9 @@ impl App {
     }
 
     pub(super) fn execute_task_control(&mut self, args: &str) -> Vec<Action> {
-        let mut words = args.split_whitespace();
-        let operation = words.next().unwrap_or("list");
-        let target = words.next();
-        match (operation, target, words.next()) {
-            ("list", None, None) => return self.tasks_browse(),
-            ("status", Some(id), None) => {
+        match parse_task_command(args) {
+            Some(TaskCommand::List) => return self.tasks_browse(),
+            Some(TaskCommand::Status(id)) => {
                 if !self.show_shell(id) {
                     self.tasks_browse();
                     if !self.task_picker.select(id) {
@@ -662,7 +686,7 @@ impl App {
                     let _ = self.refresh_task_picker();
                 }
             }
-            ("background" | "cancel", Some(id), None) => {
+            Some(command @ (TaskCommand::Background(id) | TaskCommand::Cancel(id))) => {
                 match self
                     .background
                     .as_ref()
@@ -674,13 +698,13 @@ impl App {
                     }) {
                     Ok(task) => self.start_task_control(
                         task,
-                        operation == "background",
+                        matches!(command, TaskCommand::Background(_)),
                         ControlModal::Tasks,
                     ),
                     Err(error) => self.flash(error),
                 }
             }
-            _ => self.flash(if self.background.is_some() {
+            None => self.flash(if self.background.is_some() {
                 AUTO_TASK_USAGE.into()
             } else {
                 TASK_USAGE.into()

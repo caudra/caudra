@@ -399,7 +399,7 @@ Enabled by default in the interactive UI. Caudra checks GitHub releases in the b
 
 Click the banner's text or run `/update` to install the release. Caudra asks first, then stops every session, runs the installer in the terminal, and restarts on the same tabs with the flags it was started with. Work that was running is interrupted, and `agent.resume_interrupted` decides whether it resumes. If nothing is installed, the sessions reopen with a warning. An `--ephemeral` run, and Windows, where the install finishes after Caudra exits, exit instead of restarting. A Homebrew, Nix, or Cargo installation is updated through its package manager instead.
 
-Click the banner's `×` or run `/dismiss-update` to hide it in every session until Caudra exits. The dismissal is not saved, so the next start shows the banner again while the release is still newer.
+Click the banner's `×` or run `/update dismiss` to hide it in every session until Caudra exits. The dismissal is not saved, so the next start shows the banner again while the release is still newer.
 
 GitHub receives your source IP address and normal request metadata, including a `caudra` user agent. The check sends no session data, machine identifier, or current version.
 

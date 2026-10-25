@@ -30,6 +30,7 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::components::command::words::{PAUSE_ARG, RESUME_ARG, STOP_ARG};
 use crate::components::docs_link::DocsTopic;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::json_tree::{self, JsonRow};
@@ -198,9 +199,9 @@ pub enum RunControl {
 impl RunControl {
     pub(crate) fn verb(self) -> &'static str {
         match self {
-            Self::Pause => "pause",
-            Self::Resume => "resume",
-            Self::Stop => "stop",
+            Self::Pause => PAUSE_ARG,
+            Self::Resume => RESUME_ARG,
+            Self::Stop => STOP_ARG,
         }
     }
 

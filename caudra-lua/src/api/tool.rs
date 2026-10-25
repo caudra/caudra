@@ -32,8 +32,8 @@ use serde_json::{Value, json};
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
+    CommandEntry, CommandHandlerMap, LuaCommandWriter, LuaCompletion, UiAction,
+    publish_command_snapshot, ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, ManagedToolOutputRef};
@@ -48,6 +48,10 @@ const TOOL_HANDLER_RETURN_ERR: &str =
 const LUA_THREAD_DISCONNECTED_ERR: &str = "lua thread disconnected";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
+pub(crate) const COMPLETE_ERR: &str =
+    r#"register_command: 'complete' must be a list of strings, "dir", "file", or a function"#;
+const COMPLETE_DIRECTORIES: &str = "dir";
+const COMPLETE_FILES: &str = "file";
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -826,6 +830,19 @@ fn register_permission_rule(
 ///                          with one opts table: `opts.args` is the raw
 ///                          argument string (whitespace kept, may be empty)
 ///                          and `opts.fargs` is the same split into words.
+///   complete    (table|string|function) Optional. What the command palette
+///                          suggests while the user types an argument,
+///                          spelled like nvim's `complete`: a list of
+///                          strings, "dir" for directories, "file" for files
+///                          and directories, or a function called as
+///                          `complete(arglead, cmdline, cursorpos)` that
+///                          returns a list of strings. `arglead` is the word
+///                          before the caret, `cmdline` the whole line, and
+///                          `cursorpos` the caret's byte offset in it. The
+///                          palette filters what it returns against
+///                          `arglead`, and asks again as the user types, so
+///                          keep it quick. Suggestions never restrict what
+///                          the user may run.
 /// @return
 /// @example
 /// caudra.api.register_command({
@@ -833,6 +850,26 @@ fn register_permission_rule(
 ///   description = "Say hello",
 ///   handler = function()
 ///     caudra.ui.flash("Hello from my plugin!")
+///   end,
+/// })
+///
+/// -- Suggest a fixed set of greetings, or compute them as the user types:
+/// caudra.api.register_command({
+///   name = "/greet",
+///   nargs = 1,
+///   complete = { "hello", "hi", "welcome" },
+///   handler = function(opts)
+///     caudra.ui.flash(opts.args .. " from my plugin!")
+///   end,
+/// })
+/// caudra.api.register_command({
+///   name = "/shout",
+///   nargs = 1,
+///   complete = function(arglead)
+///     return { arglead:upper(), arglead:upper() .. "!" }
+///   end,
+///   handler = function(opts)
+///     caudra.ui.flash(opts.args)
 ///   end,
 /// })
 #[lua_fn]
@@ -1486,19 +1523,43 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
-/// Matching only needs an upper bound, so "+" and "*" both become MAX;
-/// minimums ("+" vs "*") are left for handlers to enforce.
-fn parse_nargs(spec: &Table) -> LuaResult<usize> {
+/// The most arguments, and whether one is required. Matching only needs the
+/// upper bound, so "+" and "*" both become MAX; the minimum only marks the
+/// signature, and handlers still enforce it.
+fn parse_nargs(spec: &Table) -> LuaResult<(usize, bool)> {
     match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
+        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok((0, false)),
+        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok((1, true)),
         LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(1),
-            "*" | "+" => Ok(usize::MAX),
+            "?" => Ok((1, false)),
+            "*" => Ok((usize::MAX, false)),
+            "+" => Ok((usize::MAX, true)),
             _ => Err(mlua::Error::runtime(NARGS_ERR)),
         },
         _ => Err(mlua::Error::runtime(NARGS_ERR)),
     }
+}
+
+fn parse_complete(lua: &Lua, spec: &Table) -> LuaResult<LuaCompletion<RegistryKey>> {
+    let invalid = || mlua::Error::runtime(COMPLETE_ERR);
+    Ok(match spec.get::<LuaValue>("complete")? {
+        LuaValue::Nil => LuaCompletion::None,
+        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
+            COMPLETE_DIRECTORIES => LuaCompletion::Directories,
+            COMPLETE_FILES => LuaCompletion::Files,
+            _ => return Err(invalid()),
+        },
+        LuaValue::Table(list) => LuaCompletion::Values(
+            list.sequence_values::<String>()
+                .collect::<LuaResult<Vec<_>>>()
+                .map_err(|_| invalid())?
+                .into(),
+        ),
+        LuaValue::Function(complete) => {
+            LuaCompletion::Function(lua.create_registry_value(complete)?)
+        }
+        _ => return Err(invalid()),
+    })
 }
 
 fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
@@ -1514,7 +1575,8 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
-    let max_args = parse_nargs(spec)?;
+    let (max_args, required) = parse_nargs(spec)?;
+    let complete = parse_complete(lua, spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1533,6 +1595,8 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
                 handler: handler_key,
                 description,
                 max_args,
+                required,
+                complete,
             },
         );
     }

@@ -36,7 +36,7 @@ const UPSTREAM_ABOUT: &str = "Aperture routes the models of upstream providers a
      `aperture/UPSTREAM/MODEL`. Each [aperture.overrides.UPSTREAM] table overrides the models of \
      one upstream, such as llmserver here.";
 const DECISION_ENDPOINT_ABOUT: &str = "One decision endpoint, named my-endpoint here. Configuring \
-     it is the consent to send decision context to it, and `/decision-model` or `caudra decisions \
+     it is the consent to send decision context to it, and `/decisions model` or `caudra decisions \
      use` makes it the active one.";
 const PROVIDER_ORDER_ABOUT: &str = "Lets Auto move a conversation to another provider's \
      subscription when its own provider's subscriptions run low. It applies only to a provider \

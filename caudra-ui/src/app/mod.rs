@@ -9,6 +9,7 @@ pub(crate) mod automation;
 pub(crate) mod autopilot;
 pub(crate) mod background_delivery;
 mod btw;
+mod command_sources;
 pub(crate) mod decisions;
 mod delegation;
 mod env;
@@ -17,6 +18,8 @@ pub(crate) mod file_revert;
 mod goal;
 #[cfg(debug_assertions)]
 mod grab;
+#[cfg(test)]
+mod grammar_agreement;
 mod image_paste;
 mod learning;
 mod memory;
@@ -74,8 +77,12 @@ use crate::components::autopilot_panel::AutopilotPanel;
 use crate::components::changelog_modal::{
     self, ChangelogAction, ChangelogModal, View as ChangelogView,
 };
+use crate::components::command::words::{
+    ALL_ARG, CHAT_ARG, CLEAR_ARG, DISCOVER_ARG, DISMISS_ARG, GOAL_CLEAR_ALIASES, LIST_ARG, LOG_ARG,
+    MIGRATE_ARG, MODEL_ARG, MOVE_ARG, NEXT_ARG, POP_ARG, PROJECT_ARG, SUGGESTED_ARG,
+};
 use crate::components::command::{
-    CommandAction, CommandPalette, ParsedCommand, SEARCH_HISTORY_COMMAND, disabled_feature,
+    CommandAction, CommandPalette, ParsedCommand, SEARCH_COMMAND, disabled_feature,
 };
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
@@ -253,7 +260,12 @@ const CHANGELOG_USAGE: &str = "Usage: /changelog [all]";
 const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
-const DECISIONS_USAGE: &str = "Usage: /decisions";
+const DECISIONS_USAGE: &str = "Usage: /decisions [model|next]";
+const STASH_USAGE: &str = "Usage: /stash [pop|list]";
+const UPDATE_USAGE: &str = "Usage: /update [dismiss]";
+const MODEL_USAGE: &str = "Usage: /model [next]";
+const SESSIONS_USAGE: &str = "Usage: /sessions [move|migrate [directory]]";
+const PERMISSIONS_USAGE: &str = "Usage: /permissions [discover]";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const WORKFLOW_AUTH_REQUIRED: &str =
     "A workflow agent needs authentication. Run `caudra auth login` in another terminal.";
@@ -284,11 +296,6 @@ const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again 
 const IMPLEMENT_VERB: &str = "Implement";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_CAPTURE_FAILED: &str = "Cannot implement plan";
-/// The `/goal` arguments that clear the goal rather than name one.
-const GOAL_CLEAR_ARGS: [&str; 6] = ["clear", "stop", "off", "reset", "none", "cancel"];
-/// The argument `/goal` and `/autopilot` take to bind their model.
-const MODEL_ARG: &str = "model";
-const LOG_ARG: &str = "log";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
@@ -883,7 +890,8 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
                 features,
-            ),
+            )
+            .with_lua_handle(lua_event_handle.clone()),
             no_commands: false,
             command_modal: CommandModal::new(),
             theme_picker: ThemePicker::new(),
@@ -1417,15 +1425,6 @@ impl App {
         } else {
             &mut self.subagent_input_box
         }
-    }
-
-    /// The palette follows whichever composer is on screen, and learns from
-    /// the same call whether a task owns it, so the dropdown can never style
-    /// itself for a chat it is no longer attached to.
-    fn sync_command_palette(&mut self, text: &str) {
-        let task_focused = !self.is_main_chat();
-        let caret = self.active_input_box().buffer.palette_caret();
-        self.command_palette.sync(text, caret, task_focused);
     }
 
     /// The caret moved inside the composer, which changes the command word
@@ -2848,9 +2847,17 @@ impl App {
         }
 
         if self.command_modal.is_open() {
-            keyboard_text!(command_modal, true);
+            if let Some(text) = generated {
+                if !text.is_empty() {
+                    self.command_modal.handle_text(text, false);
+                    self.resync_command_palette();
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(true);
-            let action = self.command_modal.handle_key(key);
+            let action = self
+                .command_modal
+                .handle_key(key, &mut self.command_palette);
             return Some(self.handle_command_modal_action(action));
         }
 
@@ -3157,8 +3164,9 @@ impl App {
             CommandAction::Run(completion) => {
                 let input = self.active_input_box_mut();
                 input.complete(&completion);
-                let command = ParsedCommand::from_line(&input.buffer.value());
+                let line = input.buffer.value();
                 input.discard();
+                let command = self.command_palette.parse(&line);
                 Some(self.execute_command(command, 0))
             }
             CommandAction::Complete(completion) => {
@@ -3166,11 +3174,15 @@ impl App {
                 self.resync_dropdowns();
                 Some(Vec::new())
             }
+            CommandAction::Usage(usage) => Some(self.flash_usage(&usage)),
             CommandAction::Passthrough => None,
         }
     }
 
+    /// The palette follows the argument prompt while it is open, and the
+    /// composer again once it is gone.
     fn handle_command_modal_action(&mut self, action: CommandModalAction) -> Vec<Action> {
+        self.resync_command_palette();
         match action {
             CommandModalAction::Consumed | CommandModalAction::Closed => Vec::new(),
             CommandModalAction::Execute(cmd) => self.execute_command(cmd, 0),
@@ -3178,6 +3190,7 @@ impl App {
                 self.copy_to_clipboard(&text);
                 Vec::new()
             }
+            CommandModalAction::Usage(usage) => self.flash_usage(&usage),
         }
     }
 
@@ -4382,8 +4395,8 @@ impl App {
         if self.refuse_disabled_command(token) {
             return true;
         }
-        if token.eq_ignore_ascii_case("/decisions") {
-            self.execute_decisions(args);
+        if token.eq_ignore_ascii_case("/decisions") && args.trim().is_empty() {
+            self.execute_decisions();
             return true;
         }
         if token.eq_ignore_ascii_case("/context") {
@@ -4786,6 +4799,11 @@ impl App {
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    fn flash_usage(&mut self, usage: &str) -> Vec<Action> {
+        self.flash(usage.into());
+        vec![]
     }
 
     fn quit(&mut self) -> Vec<Action> {
@@ -6243,7 +6261,7 @@ impl App {
             .command_palette
             .resolve(&requested)
             .ok_or_else(|| format!("unknown command '{name}'"))?;
-        if self.command_is_out_of_scope(&resolved) {
+        if self.command_is_out_of_scope(&resolved, args) {
             return Err(MAIN_ONLY_CMD_MSG.to_string());
         }
         Ok(self.execute_command(
@@ -6258,8 +6276,8 @@ impl App {
     /// A command whose effect lands on the main session's turn or history has
     /// no meaning while a task owns the screen, so it says so instead of
     /// acting somewhere the user is not looking.
-    fn command_is_out_of_scope(&self, name: &str) -> bool {
-        !self.is_main_chat() && self.command_palette.is_main_only(name)
+    fn command_is_out_of_scope(&self, name: &str, args: &str) -> bool {
+        !self.is_main_chat() && self.command_palette.is_main_only(name, args)
     }
 
     /// A built-in whose experiment is off is hidden, but typing its exact
@@ -6282,7 +6300,7 @@ impl App {
     /// {depth} is the `caudra.api.run_command` hop count, forwarded to a Lua
     /// handler so an alias cycle keeps counting. 0 when the user typed it.
     fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
-        if self.command_is_out_of_scope(&cmd.name) {
+        if self.command_is_out_of_scope(&cmd.name, &cmd.args) {
             self.flash(MAIN_ONLY_CMD_MSG.into());
             return vec![];
         }
@@ -6316,8 +6334,9 @@ impl App {
                 self.docs_modal.open(&cmd.args);
                 vec![]
             }
-            SEARCH_HISTORY_COMMAND => {
-                self.open_search(SearchTab::Project, cmd.args.trim());
+            SEARCH_COMMAND => {
+                let (tab, words) = search_tab(&cmd.args);
+                self.open_search(tab, words);
                 vec![]
             }
             "/changelog" => {
@@ -6328,10 +6347,17 @@ impl App {
                 self.execute_tools();
                 vec![]
             }
-            "/decisions" => {
-                self.execute_decisions(&cmd.args);
-                vec![]
-            }
+            "/decisions" => match subcommand(&cmd.args) {
+                (word, _) if word.is_empty() => {
+                    self.execute_decisions();
+                    vec![]
+                }
+                (word, "") if word == MODEL_ARG => self.open_decision_model_picker(),
+                (word, "") if word == NEXT_ARG => {
+                    self.cycle_decision_endpoint(ProvidersConfig::load)
+                }
+                _ => self.flash_usage(DECISIONS_USAGE),
+            },
             "/skills" => {
                 self.execute_skills();
                 vec![]
@@ -6348,8 +6374,6 @@ impl App {
             "/catchup" => vec![Action::Catchup(cmd.args.trim().into())],
             "/extract" => vec![Action::Extract],
             "/goal" => self.execute_goal(&cmd.args),
-            "/goal-clear" => self.clear_goal(),
-            "/goal-model" => self.open_goal_model_picker(),
             "/autopilot" => self.execute_autopilot(&cmd.args),
             "/continue" => self.continue_run(),
             "/new" => vec![Action::RequestNewSession],
@@ -6357,14 +6381,20 @@ impl App {
                 self.focus_active_queue();
                 vec![]
             }
-            "/stash" => self.run_builtin(BuiltinAction::StashPush),
-            "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
-            "/stash-list" => self.run_builtin(BuiltinAction::StashList),
-            "/dismiss-update" => {
-                self.dismiss_update();
-                vec![]
-            }
-            "/update" => self.request_update(),
+            "/stash" => match subcommand(&cmd.args) {
+                (word, _) if word.is_empty() => self.run_builtin(BuiltinAction::StashPush),
+                (word, "") if word == POP_ARG => self.run_builtin(BuiltinAction::StashPop),
+                (word, "") if word == LIST_ARG => self.run_builtin(BuiltinAction::StashList),
+                _ => self.flash_usage(STASH_USAGE),
+            },
+            "/update" => match subcommand(&cmd.args) {
+                (word, _) if word.is_empty() => self.request_update(),
+                (word, "") if word == DISMISS_ARG => {
+                    self.dismiss_update();
+                    vec![]
+                }
+                _ => self.flash_usage(UPDATE_USAGE),
+            },
             "/memory" => self.open_memory_inspector(),
             "/learn" => self.open_learn_inspector(),
             "/tasks" => self.execute_task_control(&cmd.args),
@@ -6385,14 +6415,16 @@ impl App {
                 self.execute_builtin_workflow(workflow::ROOT_CAUSE_WORKFLOW, &cmd.args)
             }
             "/automations" => self.execute_automations(&cmd.args),
-            "/sessions" => self.sessions_browse(),
-            "/move-session" | "/migrate-sessions" => {
-                let destination = cmd.args.trim();
-                vec![Action::OpenSessionRelocation {
-                    bulk: cmd.name == "/migrate-sessions",
-                    destination: (!destination.is_empty()).then(|| destination.to_owned()),
-                }]
-            }
+            "/sessions" => match subcommand(&cmd.args) {
+                (word, _) if word.is_empty() => self.sessions_browse(),
+                (word, destination) if word == MOVE_ARG || word == MIGRATE_ARG => {
+                    vec![Action::OpenSessionRelocation {
+                        bulk: word == MIGRATE_ARG,
+                        destination: (!destination.is_empty()).then(|| destination.to_owned()),
+                    }]
+                }
+                _ => self.flash_usage(SESSIONS_USAGE),
+            },
             "/worktree" => match WorktreeView::parse(&cmd.args) {
                 Ok(view) => vec![Action::OpenWorktrees(view)],
                 Err(usage) => {
@@ -6402,21 +6434,22 @@ impl App {
             },
             "/rename" => self.rename_session(&cmd.args),
             "/fork" => self.fork_latest(),
-            "/model" => {
-                self.model_picker.open(
-                    &self.state.model,
-                    &self.model_policy,
-                    self.active_decision_endpoint(),
-                );
-                vec![Action::RefreshModels]
-            }
-            "/favorite-next" => self.cycle_favorite_model(),
+            "/model" => match subcommand(&cmd.args) {
+                (word, _) if word.is_empty() => {
+                    self.model_picker.open(
+                        &self.state.model,
+                        &self.model_policy,
+                        self.active_decision_endpoint(),
+                    );
+                    vec![Action::RefreshModels]
+                }
+                (word, "") if word == NEXT_ARG => self.cycle_favorite_model(),
+                _ => self.flash_usage(MODEL_USAGE),
+            },
             "/accounts" => {
                 self.open_accounts();
                 vec![]
             }
-            "/decision-model" => self.open_decision_model_picker(),
-            "/decision-next" => self.cycle_decision_endpoint(ProvidersConfig::load),
             "/system-prompt" => {
                 self.execute_system_prompt();
                 vec![]
@@ -6438,13 +6471,17 @@ impl App {
             "/env" => self.open_env(),
             "/settings" => self.open_settings(),
             "/permissions" => {
+                let discover = match subcommand(&cmd.args) {
+                    (word, _) if word.is_empty() => false,
+                    (word, "") if word == DISCOVER_ARG || word == SUGGESTED_ARG => true,
+                    _ => return self.flash_usage(PERMISSIONS_USAGE),
+                };
                 match self.open_permissions_picker() {
-                    Ok(()) => {
-                        if matches!(cmd.args.trim(), "discover" | "suggested") {
-                            self.permission_ui.show_discovery = true;
-                            self.permissions_picker.show_discovery();
-                        }
+                    Ok(()) if discover => {
+                        self.permission_ui.show_discovery = true;
+                        self.permissions_picker.show_discovery();
                     }
+                    Ok(()) => {}
                     Err(error) => self.flash(error.to_string()),
                 }
                 vec![]
@@ -7926,7 +7963,10 @@ impl App {
         try_picker!(self.message_actions);
         try_picker!(self.queue_actions);
         try_picker!(self.review);
-        try_picker!(self.command_modal);
+        if self.command_modal.handle_paste(text) {
+            self.resync_command_palette();
+            return;
+        }
         try_picker!(self.theme_picker);
         try_picker!(self.prompt_profile_picker);
         try_picker!(self.model_picker);
@@ -8162,9 +8202,29 @@ pub(crate) fn no_favorites_msg() -> String {
 }
 
 fn is_goal_clear(args: &str) -> bool {
-    GOAL_CLEAR_ARGS
-        .iter()
-        .any(|clear| args.eq_ignore_ascii_case(clear))
+    args.eq_ignore_ascii_case(CLEAR_ARG)
+        || GOAL_CLEAR_ALIASES
+            .iter()
+            .any(|clear| args.eq_ignore_ascii_case(clear))
+}
+
+/// The tab `/search` opens on, named by its first word, and the words to
+/// search for.
+fn search_tab(args: &str) -> (SearchTab, &str) {
+    let (word, rest) = subcommand(args);
+    match word.as_str() {
+        CHAT_ARG => (SearchTab::ThisChat, rest),
+        PROJECT_ARG => (SearchTab::Project, rest),
+        ALL_ARG => (SearchTab::AllProjects, rest),
+        _ => (SearchTab::Project, args.trim()),
+    }
+}
+
+/// A command's first argument word, lowercased for matching, and the rest.
+fn subcommand(args: &str) -> (String, &str) {
+    let args = args.trim();
+    let (word, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    (word.to_ascii_lowercase(), rest.trim())
 }
 
 /// Names a workflow agent the way the inspector does, by phase and label,

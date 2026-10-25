@@ -213,7 +213,7 @@ ranked = await decisions.rerank("crashes when saving a file", titles, threshold=
 
 `rerank()` judges up to 256 candidates, each a string or a small dict. `index` is a candidate's position in `candidates`, and `score` is the probability that it is relevant. `threshold` drops candidates below it, and `top_k` keeps at most that many. Candidates go out 64 to a request, with up to 4 requests at once. Each request waits up to one [`rerank_timeout_ms`](/docs/configuration/#decisions) for every 16 candidates it holds, like Caudra's own reranking, unless the call passes a shorter `timeout_ms`. A `decide()` call waits up to `timeout_ms` from the configuration. An empty list returns `[]` without a request.
 
-The model learns how to use both from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without an endpoint, a call raises `RuntimeError` that names `/decision-model`.
+The model learns how to use both from the `# MCP servers` reminder, which describes them while an endpoint is active, with or without servers. Without an endpoint, a call raises `RuntimeError` that names `/decisions model`.
 
 The reminder also tells the model how to get reliable answers, following the habits of Caudra's own question sets:
 

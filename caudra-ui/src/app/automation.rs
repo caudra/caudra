@@ -42,6 +42,7 @@ use tracing::{debug, warn};
 
 use super::{AUTOMATION_NOTICE_PREFIX, App, PendingInput};
 use crate::components::automation_inspector::AutomationAction;
+use crate::components::command::words::{ARM_ARG, DISARM_ARG};
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::status_bar::AutomationChip;
 use crate::components::{Action, Overlay, Status, escape_terminal_controls};
@@ -55,8 +56,6 @@ pub(super) const ARGS_NOT_JSON: &str = "Automation args are not valid JSON: ";
 pub(super) const ARMED_PREFIX: &str = "Armed ";
 pub(super) const DISARMED_PREFIX: &str = "Disarmed ";
 pub(super) const ARMS_ONCE_SAVED: &str = " arms once this session is saved";
-pub(super) const ARM_WORD: &str = "arm";
-pub(super) const DISARM_WORD: &str = "disarm";
 pub(super) const FAILED_AT_LINE: &str = " failed at line ";
 const FAILED: &str = " failed";
 pub(super) const INSPECTOR_HINT: &str = " (/automations)";
@@ -144,7 +143,7 @@ impl AutomationLink {
 
 impl App {
     /// The runtime serving this session, never one a session change left behind.
-    fn automation_handle(&self) -> Option<&AutomationHandle> {
+    pub(super) fn automation_handle(&self) -> Option<&AutomationHandle> {
         self.automation
             .handle
             .as_ref()
@@ -765,7 +764,7 @@ impl App {
 
 /// `/automations [arm NAME [{json}] | disarm NAME]`: `None` opens the inspector. The args are
 /// the rest of the line after the name, so their JSON may hold spaces.
-fn parse_automations_command(args: &str) -> Result<Option<AutomationRequest>, String> {
+pub(super) fn parse_automations_command(args: &str) -> Result<Option<AutomationRequest>, String> {
     let args = args.trim();
     if args.is_empty() {
         return Ok(None);
@@ -773,8 +772,8 @@ fn parse_automations_command(args: &str) -> Result<Option<AutomationRequest>, St
     let (word, rest) = split_word(args);
     let (name, rest) = split_word(rest.trim_start());
     let rest = rest.trim();
-    match word {
-        ARM_WORD if !name.is_empty() => {
+    match word.to_ascii_lowercase().as_str() {
+        ARM_ARG if !name.is_empty() => {
             let args = (!rest.is_empty())
                 .then(|| serde_json::from_str::<Value>(rest))
                 .transpose()
@@ -785,7 +784,7 @@ fn parse_automations_command(args: &str) -> Result<Option<AutomationRequest>, St
                 origin: ArmOrigin::Manual,
             }))
         }
-        DISARM_WORD if !name.is_empty() && rest.is_empty() => Ok(Some(AutomationRequest::Disarm {
+        DISARM_ARG if !name.is_empty() && rest.is_empty() => Ok(Some(AutomationRequest::Disarm {
             name: name.to_owned(),
         })),
         _ => Err(AUTOMATIONS_USAGE.to_owned()),
@@ -1050,15 +1049,15 @@ mod tests {
     }
 
     #[test_case("", None ; "bare")]
-    #[test_case(&format!("{ARM_WORD} {AUTOMATION}"), Some(arm(None)) ; "arm_without_args")]
-    #[test_case(&format!("{ARM_WORD} {AUTOMATION} {ARGS}"), Some(arm(Some(json!({ "every": 5 })))) ; "arm_with_json")]
+    #[test_case(&format!("{ARM_ARG} {AUTOMATION}"), Some(arm(None)) ; "arm_without_args")]
+    #[test_case(&format!("{ARM_ARG} {AUTOMATION} {ARGS}"), Some(arm(Some(json!({ "every": 5 })))) ; "arm_with_json")]
     #[test_case(
-        &format!(" {ARM_WORD}  {AUTOMATION}  {ARGS_WITH_SPACES} "),
+        &format!(" {ARM_ARG}  {AUTOMATION}  {ARGS_WITH_SPACES} "),
         Some(arm(Some(json!({ "repo": "my project", "every": 5 }))));
         "json_with_spaces"
     )]
     #[test_case(
-        &format!("{DISARM_WORD} {AUTOMATION}"),
+        &format!("{DISARM_ARG} {AUTOMATION}"),
         Some(AutomationRequest::Disarm { name: AUTOMATION.into() });
         "disarm"
     )]
@@ -1066,10 +1065,10 @@ mod tests {
         assert_eq!(parse_automations_command(line), Ok(expected));
     }
 
-    #[test_case(&format!("{ARM_WORD} {AUTOMATION} {BAD_JSON}"), ARGS_NOT_JSON ; "bad_json")]
+    #[test_case(&format!("{ARM_ARG} {AUTOMATION} {BAD_JSON}"), ARGS_NOT_JSON ; "bad_json")]
     #[test_case(&format!("{UNKNOWN_SUBCOMMAND} {AUTOMATION}"), AUTOMATIONS_USAGE ; "unknown_subcommand")]
-    #[test_case(ARM_WORD, AUTOMATIONS_USAGE ; "arm_without_a_name")]
-    #[test_case(&format!("{DISARM_WORD} {AUTOMATION} {ARGS}"), AUTOMATIONS_USAGE ; "disarm_with_args")]
+    #[test_case(ARM_ARG, AUTOMATIONS_USAGE ; "arm_without_a_name")]
+    #[test_case(&format!("{DISARM_ARG} {AUTOMATION} {ARGS}"), AUTOMATIONS_USAGE ; "disarm_with_args")]
     fn a_malformed_command_sends_nothing_and_says_why(line: &str, message: &str) {
         let error = parse_automations_command(line).expect_err(SENDS_NOTHING);
         assert!(error.starts_with(message), "{error}");
@@ -1078,8 +1077,8 @@ mod tests {
     /// Without a runtime a well-formed command says so, so a parse error flashing instead
     /// shows nothing was sent.
     #[test_case("", UNAVAILABLE_MSG ; "bare")]
-    #[test_case(&format!("{DISARM_WORD} {AUTOMATION}"), UNAVAILABLE_MSG ; "disarm")]
-    #[test_case(&format!("{ARM_WORD} {AUTOMATION} {BAD_JSON}"), ARGS_NOT_JSON ; "bad_json")]
+    #[test_case(&format!("{DISARM_ARG} {AUTOMATION}"), UNAVAILABLE_MSG ; "disarm")]
+    #[test_case(&format!("{ARM_ARG} {AUTOMATION} {BAD_JSON}"), ARGS_NOT_JSON ; "bad_json")]
     fn without_a_runtime_the_command_says_why_it_did_nothing(args: &str, message: &str) {
         let mut app = test_app();
 

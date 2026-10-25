@@ -17,8 +17,8 @@ use crate::components::modal::ESC_LABEL;
 use crate::components::{ascii_key, plain_char};
 use crate::theme;
 
-pub(crate) const GOAL_CLEAR: &str = "/goal-clear";
-pub(crate) const GOAL_MODEL: &str = "/goal-model";
+pub(crate) const GOAL_CLEAR: &str = "/goal clear";
+pub(crate) const GOAL_MODEL: &str = "/goal model";
 pub(crate) const LOWER_LABEL: &str = "-";
 pub(crate) const RAISE_LABEL: &str = "+";
 const LOWER_KEY: char = ascii_key(LOWER_LABEL);

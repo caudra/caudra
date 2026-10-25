@@ -1,8 +1,10 @@
 //! The centered command palette, opened by a keybinding rather than by
-//! typing `/`. Shares its command list with the inline dropdown in
-//! [`crate::components::command`]; only the surface differs.
+//! typing `/`. Shares its command list and its argument suggestions with the
+//! inline dropdown in [`crate::components::command`]; only the surface
+//! differs.
 
 use caudra_grab::grab_scope;
+use caudra_workbench::buffer::Cursor;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -10,7 +12,9 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::components::command::{CommandRow, ParsedCommand};
+use crate::components::command::{
+    CommandAction, CommandPalette, CommandRow, Completion, ParsedCommand,
+};
 use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction};
@@ -28,13 +32,16 @@ const TITLE: &str = " Commands ";
 const ARGS_WIDTH_PERCENT: u16 = 65;
 const PICK_WIDTH_PERCENT: u16 = 80;
 const FOOTER_ROWS: u16 = 1;
-const ARGS_MAX_HEIGHT_PERCENT: u16 = 40;
+const ARGS_MAX_HEIGHT_PERCENT: u16 = 60;
+const ARGUMENT_SEPARATOR: &str = " ";
 
 pub enum CommandModalAction {
     Consumed,
     Closed,
     Execute(ParsedCommand),
     Copy(String),
+    /// Nothing the slot takes was typed: the usage line to show.
+    Usage(String),
 }
 
 enum Stage {
@@ -56,6 +63,7 @@ enum StageAction {
     AskArgs { row: Box<CommandRow>, query: String },
     Run(ParsedCommand),
     Copy(String),
+    Usage(String),
 }
 
 pub struct CommandModal {
@@ -104,7 +112,13 @@ impl CommandModal {
         self.query.clear();
     }
 
-    pub fn handle_key(&mut self, key_event: KeyEvent) -> CommandModalAction {
+    /// `palette` follows [`Self::argument_line`]: the owner syncs it after
+    /// every change, so its suggestions are this prompt's.
+    pub fn handle_key(
+        &mut self,
+        key_event: KeyEvent,
+        palette: &mut CommandPalette,
+    ) -> CommandModalAction {
         let action = match &mut self.stage {
             Stage::Closed => return CommandModalAction::Consumed,
             Stage::Pick(picker) => {
@@ -112,11 +126,14 @@ impl CommandModal {
                 Self::map_pick_action(picker.handle_key(key_event), query)
             }
             Stage::Args { input, row, .. } => match key_event.code {
-                KeyCode::Enter => StageAction::Run(ParsedCommand {
-                    name: row.name.clone(),
-                    args: input.text().trim().to_string(),
-                }),
+                KeyCode::Enter => Self::enter(key_event, input, row, palette),
                 KeyCode::Esc => StageAction::Back,
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down if palette.is_active() => {
+                    if let CommandAction::Complete(completion) = palette.handle_key(key_event) {
+                        take(input, row, &completion);
+                    }
+                    StageAction::None
+                }
                 _ => match input.handle_key(key_event) {
                     TextKey::Copy(text) | TextKey::Cut(text) => StageAction::Copy(text),
                     TextKey::Ignored if key::QUIT.matches(key_event) => StageAction::Close,
@@ -128,20 +145,55 @@ impl CommandModal {
         self.transition(action)
     }
 
+    /// Enter as the composer's palette takes it, on the line the prompt
+    /// stands for: a word a closed slot does not list runs the highlighted
+    /// suggestion, and nothing it could mean keeps the prompt open.
+    fn enter(
+        key_event: KeyEvent,
+        input: &TextField,
+        row: &CommandRow,
+        palette: &mut CommandPalette,
+    ) -> StageAction {
+        let line = line_of(row, input);
+        match palette.handle_key(key_event) {
+            CommandAction::Run(completion) => {
+                StageAction::Run(palette.parse(&completion.applied_to(&line)))
+            }
+            CommandAction::Usage(usage) => StageAction::Usage(usage),
+            CommandAction::Consumed => StageAction::None,
+            CommandAction::Complete(_) | CommandAction::Passthrough => {
+                StageAction::Run(palette.parse(&line))
+            }
+        }
+    }
+
     /// A footer click in either stage is the key it names, so it takes the
-    /// key path and the two can never disagree.
-    pub fn handle_mouse(&mut self, event: MouseEvent) -> CommandModalAction {
+    /// key path and the two can never disagree. A click on a suggestion
+    /// takes it, as Tab does.
+    pub fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        palette: &mut CommandPalette,
+    ) -> CommandModalAction {
         let action = match &mut self.stage {
             Stage::Pick(picker) => {
                 let query = picker.search_text();
                 match picker.handle_mouse(event) {
-                    PickerAction::Key(key) => return self.handle_key(key),
+                    PickerAction::Key(key) => return self.handle_key(key, palette),
                     action => Self::map_pick_action(action, query),
                 }
             }
+            Stage::Args { input, row, .. }
+                if palette.contains(Position::new(event.column, event.row)) =>
+            {
+                if let CommandAction::Complete(completion) = palette.handle_mouse(event) {
+                    take(input, row, &completion);
+                }
+                StageAction::None
+            }
             Stage::Args { footer, .. } => {
                 return match footer.handle_mouse(event) {
-                    Some(key) => self.handle_key(key),
+                    Some(key) => self.handle_key(key, palette),
                     None => CommandModalAction::Consumed,
                 };
             }
@@ -149,6 +201,18 @@ impl CommandModal {
         };
 
         self.transition(action)
+    }
+
+    /// The command line the argument prompt stands for, and the caret in it
+    /// in chars, while the prompt is open.
+    pub fn argument_line(&self) -> Option<(String, usize)> {
+        let Stage::Args { input, row, .. } = &self.stage else {
+            return None;
+        };
+        Some((
+            line_of(row, input),
+            prefix_chars(row) + input.cursor_offset(),
+        ))
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -188,10 +252,7 @@ impl CommandModal {
                 row: Box::new(row),
                 query,
             },
-            PickerAction::Select(row) => StageAction::Run(ParsedCommand {
-                name: row.name,
-                args: String::new(),
-            }),
+            PickerAction::Select(row) => StageAction::Run(ParsedCommand::from_line(&row.name)),
             PickerAction::Close => StageAction::Close,
             PickerAction::Copy(text) => StageAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
@@ -204,6 +265,7 @@ impl CommandModal {
         match action {
             StageAction::None => CommandModalAction::Consumed,
             StageAction::Copy(text) => CommandModalAction::Copy(text),
+            StageAction::Usage(usage) => CommandModalAction::Usage(usage),
             StageAction::AskArgs { row, query } => {
                 self.query = query;
                 self.stage = Stage::Args {
@@ -230,7 +292,8 @@ impl CommandModal {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    /// The argument prompt draws `palette`'s suggestions under its field.
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, palette: &mut CommandPalette) -> Rect {
         grab_scope!("command_modal", area);
         let popup = match &mut self.stage {
             Stage::Closed => Rect::default(),
@@ -245,19 +308,26 @@ impl CommandModal {
                 };
                 // Both rows wrap, so the modal is sized from their wrapped
                 // heights; a fixed guess clips the input line out of view.
+                // The suggestions give way first when it is clamped.
                 let width = modal_inner_width(area, ARGS_WIDTH_PERCENT);
                 let hint_rows = wrapped_rows(&row.description, width);
                 let input_lines = prompt_lines(input, width);
                 let input_rows = input_lines.len() as u16;
+                let fixed_rows = hint_rows + input_rows + FOOTER_ROWS;
                 let (popup, inner) =
-                    modal.render(frame, area, hint_rows + input_rows + FOOTER_ROWS);
+                    modal.render(frame, area, fixed_rows + palette.argument_rows());
+                let list_rows = palette
+                    .argument_rows()
+                    .min(inner.height.saturating_sub(fixed_rows));
 
-                let [hint_area, input_area, footer_area] = Layout::vertical([
+                let [hint_area, input_area, list_area, footer_area] = Layout::vertical([
                     Constraint::Length(hint_rows),
                     Constraint::Min(1),
+                    Constraint::Length(list_rows),
                     Constraint::Length(FOOTER_ROWS),
                 ])
                 .areas(inner);
+                palette.view_arguments_in(frame, list_area);
                 let bg = t.surface_style();
                 frame.render_widget(
                     Paragraph::new(row.description.as_str())
@@ -342,17 +412,53 @@ fn footer() -> Vec<Hint> {
 }
 
 fn args_footer() -> Vec<Hint> {
-    vec![Hint::bind(key::ENTER, "Run"), Hint::bind(key::ESC, "Back")]
+    vec![
+        Hint::bind(key::ENTER, "Run"),
+        Hint::bind(key::TAB, "Complete"),
+        Hint::bind(key::ESC, "Back"),
+    ]
+}
+
+fn line_of(row: &CommandRow, input: &TextField) -> String {
+    format!("{}{ARGUMENT_SEPARATOR}{}", row.name, input.text())
+}
+
+/// Chars of the line before the field's text starts.
+fn prefix_chars(row: &CommandRow) -> usize {
+    row.name.chars().count() + ARGUMENT_SEPARATOR.len()
+}
+
+/// `completion`, made over the whole line, made in the field that holds the
+/// line's arguments, as one edit undo takes back.
+fn take(input: &mut TextField, row: &CommandRow, completion: &Completion) {
+    let prefix = prefix_chars(row);
+    let start = completion.range.start.saturating_sub(prefix);
+    let end = completion.range.end.saturating_sub(prefix);
+    input.set_cursor(Cursor::new(0, start), false);
+    input.set_cursor(Cursor::new(0, end), true);
+    input.insert_text(&completion.text);
+    input.set_cursor_offset(start + completion.caret);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Deref, DerefMut};
+    use std::sync::Arc;
+
     use super::*;
     use crate::components::command::SECTION_BUILTIN;
+    use crate::components::command::words::{LIST_ARG, POP_ARG};
     use crate::components::key;
+    use caudra_agent::McpSnapshotReader;
+    use caudra_config::FeatureFlags;
+    use caudra_lua::LuaCommandReader;
     use crossterm::event::KeyModifiers;
     use test_case::test_case;
 
+    const STASH: &str = "/stash";
+    const STASH_DESC: &str = "Park the current prompt draft";
+    const MISTYPED_LIST: &str = "lst";
+    const NOTHING_LISTED: &str = "zzz";
     const ZERO_ARG: &str = "/help";
     const WITH_ARGS: &str = "/btw";
     const WITH_ARGS_DESC: &str = "Ask a side question";
@@ -369,33 +475,108 @@ mod tests {
     fn row(name: &str, description: &str, max_args: usize) -> CommandRow {
         CommandRow {
             name: name.to_string(),
+            search: name.to_string(),
             description: description.to_string(),
             max_args,
+            signature: String::new(),
             section: SECTION_BUILTIN,
             disabled: false,
         }
     }
 
-    fn opened() -> CommandModal {
-        let mut modal = CommandModal::new();
+    /// The modal with the palette it shares, synced after every change as
+    /// the app does.
+    struct Rig {
+        modal: CommandModal,
+        palette: CommandPalette,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Self {
+                modal: CommandModal::new(),
+                palette: CommandPalette::new(
+                    Arc::from([]),
+                    McpSnapshotReader::empty(),
+                    LuaCommandReader::empty(),
+                    FeatureFlags::all(),
+                ),
+            }
+        }
+
+        fn handle_key(&mut self, key_event: KeyEvent) -> CommandModalAction {
+            let action = self.modal.handle_key(key_event, &mut self.palette);
+            self.follow();
+            action
+        }
+
+        fn handle_paste(&mut self, text: &str) -> bool {
+            let pasted = self.modal.handle_paste(text);
+            self.follow();
+            pasted
+        }
+
+        fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+            self.modal.view(frame, area, &mut self.palette)
+        }
+
+        fn follow(&mut self) {
+            if let Some((line, caret)) = self.modal.argument_line() {
+                self.palette.sync(&line, caret, false);
+            }
+        }
+
+        fn argument(&self) -> String {
+            let Stage::Args { input, .. } = &self.modal.stage else {
+                panic!("expected args stage, got {}", stage_name(self));
+            };
+            input.text()
+        }
+    }
+
+    impl Deref for Rig {
+        type Target = CommandModal;
+
+        fn deref(&self) -> &CommandModal {
+            &self.modal
+        }
+    }
+
+    impl DerefMut for Rig {
+        fn deref_mut(&mut self) -> &mut CommandModal {
+            &mut self.modal
+        }
+    }
+
+    fn opened() -> Rig {
+        let mut modal = Rig::new();
         modal.open(vec![
             row(ZERO_ARG, "Show keybindings", 0),
             row(WITH_ARGS, WITH_ARGS_DESC, usize::MAX),
+            row(STASH, STASH_DESC, 1),
         ]);
         modal
     }
 
-    fn type_text(modal: &mut CommandModal, text: &str) {
+    fn stash_prompt() -> Rig {
+        let mut modal = opened();
+        type_text(&mut modal, "stash");
+        modal.handle_key(key(KeyCode::Enter));
+        assert_eq!(stage_name(&modal), "args");
+        modal
+    }
+
+    fn type_text(modal: &mut Rig, text: &str) {
         for c in text.chars() {
             modal.handle_key(key(KeyCode::Char(c)));
         }
     }
 
-    fn render(modal: &mut CommandModal) -> (Rect, String) {
+    fn render(modal: &mut Rig) -> (Rect, String) {
         render_at(modal, TEST_HEIGHT)
     }
 
-    fn render_at(modal: &mut CommandModal, height: u16) -> (Rect, String) {
+    fn render_at(modal: &mut Rig, height: u16) -> (Rect, String) {
         let backend = ratatui::backend::TestBackend::new(TEST_WIDTH, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut popup = Rect::default();
@@ -428,11 +609,11 @@ mod tests {
             .map(|i| row(&format!("/cmd{i}"), "", 0))
             .collect();
 
-        let mut modal = CommandModal::new();
+        let mut modal = Rig::new();
         modal.open(rows.clone());
         let (short, _) = render_at(&mut modal, TEST_HEIGHT);
 
-        let mut modal = CommandModal::new();
+        let mut modal = Rig::new();
         modal.open(rows);
         let (tall, _) = render_at(&mut modal, TALL_HEIGHT);
 
@@ -453,7 +634,7 @@ mod tests {
     /// `BUILTIN_COMMANDS`. Source order must not beat the fuzzy score.
     #[test]
     fn a_better_match_outranks_an_earlier_one() {
-        let mut modal = CommandModal::new();
+        let mut modal = Rig::new();
         modal.open(vec![
             row(WORSE_MATCH, "Review the last reply", 0),
             row(BETTER_MATCH, "Cycle transcript view", 0),
@@ -642,5 +823,51 @@ mod tests {
             panic!("expected args stage, got {}", stage_name(&modal));
         };
         assert_eq!(input.text(), "h");
+    }
+
+    #[test]
+    fn the_prompt_lists_what_the_slot_takes() {
+        let mut modal = stash_prompt();
+        let (_, text) = render(&mut modal);
+        for choice in [POP_ARG, LIST_ARG] {
+            assert!(text.contains(choice), "{choice} missing from {text:?}");
+        }
+    }
+
+    #[test_case("po", 0, POP_ARG ; "the_word_typed_so_far")]
+    #[test_case("", 1, LIST_ARG ; "a_row_moved_to")]
+    fn tab_takes_the_highlighted_suggestion(typed: &str, downs: usize, expected: &str) {
+        let mut modal = stash_prompt();
+        type_text(&mut modal, typed);
+        for _ in 0..downs {
+            modal.handle_key(key(KeyCode::Down));
+        }
+        let action = modal.handle_key(key(KeyCode::Tab));
+        assert!(matches!(action, CommandModalAction::Consumed));
+        assert_eq!(modal.argument(), expected);
+    }
+
+    #[test_case(LIST_ARG ; "a_listed_word")]
+    #[test_case(MISTYPED_LIST ; "a_mistyped_word")]
+    fn enter_runs_what_the_slot_takes(typed: &str) {
+        let mut modal = stash_prompt();
+        type_text(&mut modal, typed);
+        let action = modal.handle_key(key(KeyCode::Enter));
+        let CommandModalAction::Execute(cmd) = action else {
+            panic!("expected execute, stage is {}", stage_name(&modal));
+        };
+        assert_eq!((cmd.name.as_str(), cmd.args.as_str()), (STASH, LIST_ARG));
+    }
+
+    #[test]
+    fn enter_on_a_word_nothing_matches_keeps_the_prompt() {
+        let mut modal = stash_prompt();
+        type_text(&mut modal, NOTHING_LISTED);
+        let action = modal.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, CommandModalAction::Usage(ref usage) if usage.contains(STASH)),
+            "expected the usage line"
+        );
+        assert_eq!(modal.argument(), NOTHING_LISTED);
     }
 }

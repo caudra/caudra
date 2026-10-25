@@ -452,6 +452,7 @@ impl App {
                 self.chord_hint(layout.input_area)
             };
             if self.active_subagent_has_composer() || self.queue_editor_active() {
+                let ghost = self.composer_palette_ghost();
                 self.subagent_input_box.view(
                     frame,
                     layout.input_area,
@@ -468,8 +469,9 @@ impl App {
                     self.separator_style(),
                     self.composer_holds_keys(),
                     panel_hint,
+                    ghost.as_deref(),
                 );
-                self.command_palette.view(frame, layout.input_area);
+                self.view_composer_palette(frame, layout.input_area);
                 self.mention_popup.view(frame, layout.input_area);
                 self.commit_popup.view(frame, layout.input_area);
             } else {
@@ -532,6 +534,7 @@ impl App {
                 self.chord_hint(layout.input_area)
                     .or_else(|| self.lua_hint_line())
             };
+            let ghost = self.composer_palette_ghost();
             self.input_box.view(
                 frame,
                 layout.input_area,
@@ -539,10 +542,26 @@ impl App {
                 self.separator_style(),
                 self.composer_holds_keys(),
                 panel_hint,
+                ghost.as_deref(),
             );
-            self.command_palette.view(frame, layout.input_area);
+            self.view_composer_palette(frame, layout.input_area);
             self.mention_popup.view(frame, layout.input_area);
             self.commit_popup.view(frame, layout.input_area);
+        }
+    }
+
+    /// The command modal draws the palette itself while it is open, since
+    /// its argument prompt is what the palette follows then.
+    fn composer_palette_ghost(&self) -> Option<String> {
+        match self.command_modal.is_open() {
+            true => None,
+            false => self.command_palette.ghost(),
+        }
+    }
+
+    fn view_composer_palette(&mut self, frame: &mut Frame, input_area: Rect) {
+        if !self.command_modal.is_open() {
+            self.command_palette.view(frame, input_area);
         }
     }
 
@@ -587,7 +606,12 @@ impl App {
             };
         }
 
-        render_if_open!(self.command_modal);
+        if self.command_modal.is_open() {
+            overlay_rect = self
+                .command_modal
+                .view(frame, full, &mut self.command_palette);
+            topic = self.command_modal.docs_topic();
+        }
         render_if_open!(self.rewind_picker);
         render_if_open!(self.message_actions);
         render_if_open!(self.queue_actions);

@@ -19,6 +19,13 @@ use crate::AppSession;
 use crate::app::App;
 use crate::app::background_delivery::DeliveryFailure;
 use crate::components::automation_inspector::REREAD_EVERY;
+use crate::components::command::SourceValue;
+use crate::components::command::grammar::Source;
+use crate::components::command::words::{
+    ACCEPT_ARG, APPROVE_ARG, AUTO_ARG, BROADCAST_ARG, CANCEL_ARG, HELP_ARG, HOLD_ARG, INBOUND_ARG,
+    JOIN_ARG, LEAVE_ARG, OFF_ARG, ON_ARG, PAUSE_ARG, REFUSE_ARG, REJECT_ARG, RETRY_ARG,
+    SUBSCRIBE_ARG, UNSUBSCRIBE_ARG,
+};
 use crate::components::peer_manager::{
     HISTORY_POLL, PageRequest, PeerManager, PeerView, SubscriptionChange,
 };
@@ -607,6 +614,27 @@ impl SessionRuntime {
         }
     }
 
+    /// Offers the slash palette what this session's registration holds for
+    /// a `/messages`, `/topics`, or `/groups` slot that asks.
+    fn offer_peer_completions(&mut self) -> Dirty {
+        let Some(source) = self.app.command_palette.wanted() else {
+            return Dirty::NO;
+        };
+        let words: Vec<String> = match (source, &self.peer) {
+            (_, None) => Vec::new(),
+            (Source::PeerReviewed, Some(peer)) => peer.reviewed.keys().cloned().collect(),
+            (Source::PeerTopics, Some(peer)) => peer.session.controls().topics,
+            (Source::PeerJoinedGroups, Some(peer)) => peer.session.controls().groups,
+            _ => return Dirty::NO,
+        };
+        let values = words
+            .into_iter()
+            .map(|word| SourceValue::new(word, ""))
+            .collect();
+        self.app.command_palette.provide(source, values);
+        Dirty::YES
+    }
+
     fn peer_notice(&mut self, text: String) {
         self.app
             .main_chat()
@@ -641,7 +669,7 @@ impl EventLoop<'_> {
                 .any(|runtime| !runtime.restore_transitions.is_empty());
         let mut dirty = Dirty::NO;
         for runtime in &mut self.sessions {
-            dirty |= runtime.sync_peer(transition);
+            dirty |= runtime.sync_peer(transition) | runtime.offer_peer_completions();
         }
         dirty
     }
@@ -859,7 +887,7 @@ impl EventLoop<'_> {
     }
 
     pub(super) fn peer_messages(&mut self, index: usize, args: &str) {
-        if args.trim() == "help" {
+        if args.trim() == HELP_ARG {
             let runtime = &mut self.sessions[index];
             if !runtime.app.refuse_disabled(Feature::CrossSessionMessaging) {
                 runtime.peer_notice(MESSAGES_HELP.into());
@@ -872,7 +900,7 @@ impl EventLoop<'_> {
         let args: Vec<_> = args.split_whitespace().collect();
         match args.as_slice() {
             [] => self.open_peers(index, PeerView::Held),
-            [action @ ("approve" | "reject"), id] => {
+            [action @ (APPROVE_ARG | REJECT_ARG), id] => {
                 let Some(token) = self.sessions[index]
                     .peer
                     .as_mut()
@@ -881,19 +909,19 @@ impl EventLoop<'_> {
                     self.sessions[index].app.flash(REVIEW_REQUIRED.into());
                     return;
                 };
-                let decision = if *action == "approve" {
+                let decision = if *action == APPROVE_ARG {
                     PeerDecision::Approve
                 } else {
                     PeerDecision::Reject
                 };
                 self.decide_peer_message(index, token, decision);
             }
-            ["inbound", policy] => {
+            [INBOUND_ARG, policy] => {
                 let policy = match *policy {
-                    "auto" => InboundPolicy::Auto,
-                    "accept" => InboundPolicy::Accept,
-                    "hold" => InboundPolicy::Hold,
-                    "refuse" => InboundPolicy::Refuse,
+                    AUTO_ARG => InboundPolicy::Auto,
+                    ACCEPT_ARG => InboundPolicy::Accept,
+                    HOLD_ARG => InboundPolicy::Hold,
+                    REFUSE_ARG => InboundPolicy::Refuse,
                     _ => {
                         self.sessions[index].app.flash(MESSAGES_HELP.into());
                         return;
@@ -906,7 +934,7 @@ impl EventLoop<'_> {
     }
 
     pub(super) fn peer_topics(&mut self, index: usize, args: &str) {
-        if args.trim() == "help" {
+        if args.trim() == HELP_ARG {
             let runtime = &mut self.sessions[index];
             if !runtime.app.refuse_disabled(Feature::CrossSessionMessaging) {
                 runtime.peer_notice(TOPICS_HELP.into());
@@ -964,7 +992,7 @@ impl EventLoop<'_> {
     }
 
     pub(super) fn peer_groups(&mut self, index: usize, args: &str) {
-        if args.trim() == "help" {
+        if args.trim() == HELP_ARG {
             let runtime = &mut self.sessions[index];
             if !runtime.app.refuse_disabled(Feature::CrossSessionMessaging) {
                 runtime.peer_notice(GROUPS_HELP.into());
@@ -986,10 +1014,10 @@ impl EventLoop<'_> {
         let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
         let action = match args.as_slice() {
             [] => None,
-            [action, _] if action == "retry" => Some(WorkAction::Retry),
-            [action, _] if action == "pause" => Some(WorkAction::Pause),
-            [action, _] if action == "cancel" => Some(WorkAction::Cancel),
-            [action, group] if action == "leave" => {
+            [action, _] if action == RETRY_ARG => Some(WorkAction::Retry),
+            [action, _] if action == PAUSE_ARG => Some(WorkAction::Pause),
+            [action, _] if action == CANCEL_ARG => Some(WorkAction::Cancel),
+            [action, group] if action == LEAVE_ARG => {
                 let result = session
                     .leave_group(group)
                     .map(|()| format!("{LEFT}{group}"));
@@ -999,7 +1027,7 @@ impl EventLoop<'_> {
                 }
                 return;
             }
-            [action, group] if action == "join" => {
+            [action, group] if action == JOIN_ARG => {
                 let group = group.clone();
                 peer.group_command = Some(Load::start((), async move {
                     session.join_group(&group).await?;
@@ -1166,14 +1194,16 @@ enum SubscriptionRequest {
 fn subscription_request(args: &[String]) -> SubscriptionRequest {
     match args.split_first() {
         None => SubscriptionRequest::Browse,
-        Some((action, patterns)) if action == "subscribe" && !patterns.is_empty() => {
+        Some((action, patterns)) if action == SUBSCRIBE_ARG && !patterns.is_empty() => {
             SubscriptionRequest::Change(SubscriptionChange::Subscribe(patterns.to_vec()))
         }
-        Some((action, patterns)) if action == "unsubscribe" && !patterns.is_empty() => {
+        Some((action, patterns)) if action == UNSUBSCRIBE_ARG && !patterns.is_empty() => {
             SubscriptionRequest::Change(SubscriptionChange::Unsubscribe(patterns.to_vec()))
         }
-        Some((action, [state])) if action == "broadcast" && (state == "on" || state == "off") => {
-            SubscriptionRequest::Change(SubscriptionChange::Broadcasts(state == "on"))
+        Some((action, [state]))
+            if action == BROADCAST_ARG && (state == ON_ARG || state == OFF_ARG) =>
+        {
+            SubscriptionRequest::Change(SubscriptionChange::Broadcasts(state == ON_ARG))
         }
         Some(_) => SubscriptionRequest::Usage,
     }

@@ -196,7 +196,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` calls the active [decision endpoint](/docs/providers/#decision-endpoints), which you add with `/login` or `caudra auth login --decision` and switch with `/decision-model` or `caudra decisions use`. The `typesafe` protocol calls System One. `openai` calls OpenAI Decisions or a compatible ninfer server. With an endpoint active, `decide()` is available even when passive decision features are configured off, and without one it fails with a catchable error. A run reads the endpoint that is active when its session starts. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. Calls go directly to that endpoint without ambient proxies or HTTP redirects. Both protocols send text only.
+`decide()` calls the active [decision endpoint](/docs/providers/#decision-endpoints), which you add with `/login` or `caudra auth login --decision` and switch with `/decisions model` or `caudra decisions use`. The `typesafe` protocol calls System One. `openai` calls OpenAI Decisions or a compatible ninfer server. With an endpoint active, `decide()` is available even when passive decision features are configured off, and without one it fails with a catchable error. A run reads the endpoint that is active when its session starts. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. Calls go directly to that endpoint without ambient proxies or HTTP redirects. Both protocols send text only.
 
 ```rhai
 let result = decide(

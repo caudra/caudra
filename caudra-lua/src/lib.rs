@@ -10,9 +10,10 @@ mod runtime;
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TaskRequest, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, CompletionRequest, Dimension, Edge, FloatConfig,
+    FloatConfigPatch, HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, LuaCompletion,
+    ModelRequest, SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiReply, WinCommand,
+    WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -86,6 +87,20 @@ pub mod test_support {
                 } = req
                 {
                     return Some((command.to_string(), args, depth));
+                }
+            }
+            None
+        }
+
+        /// Waits for the next `complete` request, skipping other requests,
+        /// answers it with `values`, and returns what it asked. `None` once
+        /// every handle is gone.
+        pub fn answer_completion(&self, values: Vec<String>) -> Option<crate::CompletionRequest> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.recv() {
+                if let Request::CompleteCommand { request, reply } = req {
+                    let _ = reply.send(values);
+                    return Some(request);
                 }
             }
             None

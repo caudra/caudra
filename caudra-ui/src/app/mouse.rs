@@ -493,7 +493,10 @@ impl App {
         } else if self.command_modal.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
-                |app, event| app.command_modal.handle_mouse(event),
+                |app, event| {
+                    app.command_modal
+                        .handle_mouse(event, &mut app.command_palette)
+                },
                 |app, action| app.handle_command_modal_action(action),
             ) {
                 return actions;
@@ -1430,7 +1433,7 @@ impl App {
             }
             StatusBarHitTarget::Decisions => {
                 self.clear_control_hovers();
-                self.execute_decisions("");
+                self.execute_decisions();
                 Vec::new()
             }
             StatusBarHitTarget::Account => {

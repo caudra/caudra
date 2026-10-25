@@ -6,9 +6,17 @@ use crate::page_header;
 
 const MAIN_ONLY_MARK: &str = "Main only";
 
+const ARGUMENT_COMPLETION: &str = r#"### Arguments
+
+Each row shows the arguments its command takes, dimmed, as in the Arguments column below: `<name>` must be given, `[name]` may be left out, and `a|b` lists the words a slot accepts. A verb such as `/goal clear` or `/stash pop` has a row of its own once you type a letter, and a dash finds it too, so `/goal-c` reaches `/goal clear`.
+
+After the command and a space, the palette lists what the slot under the cursor takes, with a description for each: subcommands, levels, task ids, workflow runs, automations, docs pages, and directories. The first row repeats the signature with the current slot in bold. A slot that takes free text shows its name as a dimmed placeholder, and the composer shows the rest of the highlighted value, or the slot name, after the cursor.
+
+`Tab` takes the highlighted value, `Up` and `Down` move, and `Esc` closes the list. `Enter` runs a word the slot accepts as typed. On a slot with a fixed set of words, `Enter` on any other word runs the highlighted one, so a typo such as `/thinking hg` runs `/thinking high`. When nothing matches, the draft stays and the usage line is shown. Free text always runs as typed. The `Ctrl+P` command modal shows the same rows and the same list under its argument field."#;
+
 const MODEL_JOBS: &str = r#"## Model jobs
 
-`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal-model` opens the Goal assignment page directly.
+`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal model` opens the Goal assignment page directly.
 
 See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assignments, automatic resolution, and supply markers."#;
 
@@ -101,7 +109,7 @@ const GOALS: &str = r#"## Completion goals
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. Background tasks, shell commands, workflows, and their result delivery must settle first. The main agent processes their results before the turn is complete. Queued user input takes priority over a goal check. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
+Run `/goal model` to open the Goal assignment page directly. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 
 Run `/goal` without arguments to open the status panel. Its Status tab shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
@@ -127,7 +135,7 @@ Run `/goal` without arguments to open the status panel. Its Status tab shows the
 
 The detail shows the check's start and end times, the evaluator's own verdict, what became of it, the full reason or error, and its tokens and cost. The transcript rows for checks that were not met, failed checks, and a goal's end come back when you resume. A session keeps its last 200 goals and 2,000 checks. The log goes when the session is deleted, and a fork starts without one.
 
-Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
+Use `/goal clear` to stop early. `stop`, `off`, `reset`, `none`, and `cancel` are accepted in its place, without regard to case.
 
 Goal state belongs to the session. An active goal survives resume with its condition, evaluation count, spend, elapsed time, and latest reason, and completed status survives too, while `/new` clears them. A resumed goal is status rather than a trigger: it waits for your next message and is evaluated at the end of that turn. Normal permissions still apply, so unattended goals need rules or YOLO mode that already permit the required tools.
 
@@ -163,11 +171,11 @@ Subagents resume the same way. A `task` call that passes a `task_id` may omit `p
 
 const STASH: &str = r#"## Stash
 
-A prompt you are not ready to send does not have to block the composer. `/stash` (`Ctrl+X s`) moves the draft out of the way, `/stash-pop` (`Ctrl+X p`) brings the newest one back, and `/stash-list` opens the full list.
+A prompt you are not ready to send does not have to block the composer. `/stash` (`Ctrl+X s`) moves the draft out of the way, `/stash pop` (`Ctrl+X p`) brings the newest one back, and `/stash list` opens the full list.
 
 The stash keeps the whole composer, so pasted text keeps its `[Pasted N lines]` pill and attached images come back with the draft. Entries are stored in the `input.stash` row of Caudra's SQLite state database, capped at 50, and shared across every session and project. That makes the stash a way to carry a prompt from one project to another. Each entry records the directory it came from, and the list shows that name next to its age.
 
-`/stash-pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
+`/stash pop` and the list both refuse to restore into a composer that already holds a draft. Stash the current one first, then restore. In the list, `Enter` restores an entry and removes it, and `Ctrl+D` twice deletes without restoring.
 
 Stashing is for drafts you do not want to send yet. To line up prompts Caudra should send on its own, use the queue instead. See [Queue and Steering](/docs/queue/)."#;
 
@@ -246,9 +254,13 @@ fn write_row(out: &mut String, command: &BuiltinCommand) {
         .map(|feature| format!("`{}`", feature.key()))
         .collect::<Vec<_>>()
         .join(" or ");
+    let arguments = match command.signature() {
+        signature if signature.is_empty() => String::new(),
+        signature => format!("`{}`", signature.replace('|', "\\|")),
+    };
     writeln!(
         out,
-        "| `{name}` | {description} | {scope} | {experiments} |",
+        "| `{name}` | {arguments} | {description} | {scope} | {experiments} |",
         name = command.name,
         description = command.description.replace('|', "\\|"),
     )
@@ -269,6 +281,8 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "{ARGUMENT_COMPLETION}").unwrap();
+    writeln!(out).unwrap();
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
@@ -284,8 +298,16 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Scope | Experiment |").unwrap();
-    writeln!(out, "|---------|-------------|-------|------------|").unwrap();
+    writeln!(
+        out,
+        "| Command | Arguments | Description | Scope | Experiment |"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "|---------|-----------|-------------|-------|------------|"
+    )
+    .unwrap();
     for cmd in BUILTIN_COMMANDS {
         write_row(&mut out, cmd);
     }

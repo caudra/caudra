@@ -425,7 +425,7 @@ fn write_update_check_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "Click the banner's `×` or run `/dismiss-update` to hide it in every \
+        "Click the banner's `×` or run `/update dismiss` to hide it in every \
          session until Caudra exits. The dismissal is not saved, so the next \
          start shows the banner again while the release is still newer.\n"
     )

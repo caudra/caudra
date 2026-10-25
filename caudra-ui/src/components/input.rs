@@ -40,6 +40,8 @@ const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
+/// The blank cell the caret occupies past the end of a line.
+const CARET_CELL: &str = " ";
 const IMAGE_CHIP_GAP: &str = " ";
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
@@ -661,6 +663,10 @@ impl InputBox {
         (rows_above + wrap_row) as u16
     }
 
+    /// `ghost` is dim text after the caret, such as the rest of a command the
+    /// palette suggests, drawn only while the caret ends a one-line draft
+    /// with nothing selected.
+    #[allow(clippy::too_many_arguments)]
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -669,6 +675,7 @@ impl InputBox {
         border_style: Style,
         focused: bool,
         top_right_hint: Option<Line<'_>>,
+        ghost: Option<&str>,
     ) {
         grab_scope!("input", area);
         let content_area = content_area(area);
@@ -777,6 +784,17 @@ impl InputBox {
                 .collect()
         };
 
+        if let Some(ghost) = ghost.filter(|_| cursor_visible && self.caret_ends_one_line())
+            && let Some(line) = styled_lines.last_mut()
+            && line
+                .spans
+                .pop_if(|span| span.content == CARET_CELL)
+                .is_some()
+        {
+            let base = theme::current().input_placeholder;
+            line.spans.extend(cursor_on_first_char(ghost, base, true));
+        }
+
         if !self.pending_images.is_empty() {
             styled_lines.push(self.image_chips_line());
         }
@@ -821,6 +839,13 @@ impl InputBox {
             ));
         }
         Line::from(spans)
+    }
+
+    fn caret_ends_one_line(&self) -> bool {
+        let [line] = self.buffer.lines() else {
+            return false;
+        };
+        self.buffer.x() == line.chars().count() && self.buffer.selection_on_line(0).is_none()
     }
 
     /// The attached picture whose chip sits under the pointer.
@@ -1037,13 +1062,16 @@ impl InputBox {
     }
 }
 
-fn cursor_on_first_char(text: &'static str, base: Style, focused: bool) -> [Span<'static>; 2] {
+fn cursor_on_first_char(text: &str, base: Style, focused: bool) -> [Span<'static>; 2] {
     let (first, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
     let cursor = match focused {
         true => base.patch(theme::current().cursor),
         false => base,
     };
-    [Span::styled(first, cursor), Span::styled(rest, base)]
+    [
+        Span::styled(first.to_owned(), cursor),
+        Span::styled(rest.to_owned(), base),
+    ]
 }
 
 fn random_placeholder_hint() -> &'static str {
@@ -1400,7 +1428,7 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
         pos += span_len;
     }
     if !cursor_placed {
-        result.push(Span::styled(" ", caret));
+        result.push(Span::styled(CARET_CELL, caret));
     }
     result
 }
@@ -1796,16 +1824,52 @@ mod tests {
         height: u16,
         placeholder: Placeholder,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        render_input_ghosted(input, width, height, placeholder, None)
+    }
+
+    fn render_input_ghosted(
+        input: &mut InputBox,
+        width: u16,
+        height: u16,
+        placeholder: Placeholder,
+        ghost: Option<&str>,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         let border_style = Style::new().fg(theme::current().mode_build);
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                input.view(frame, area, placeholder, border_style, true, None);
+                input.view(frame, area, placeholder, border_style, true, None, ghost);
             })
             .unwrap();
         terminal
+    }
+
+    const GHOST: &str = "nking";
+
+    #[test_case("/thi", true ; "after_the_caret_at_the_end")]
+    #[test_case("/thi\nmore", false ; "never_in_a_multi_line_draft")]
+    fn ghost_text_follows_the_caret(text: &str, shown: bool) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste(text);
+        let terminal = render_input_ghosted(&mut input, 40, 4, Placeholder::Blank, Some(GHOST));
+        let first_line = text.lines().next().unwrap_or_default();
+        let row = rendered_row(&terminal, 1);
+        assert_eq!(
+            row == format!("{CHEVRON}{first_line}{GHOST}"),
+            shown,
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn ghost_text_waits_for_the_caret_to_reach_the_end() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("/thi");
+        input.handle_key(KeyEvent::from(KeyCode::Left));
+        let terminal = render_input_ghosted(&mut input, 40, 4, Placeholder::Blank, Some(GHOST));
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}/thi"));
     }
 
     fn render_input(
@@ -1840,6 +1904,7 @@ mod tests {
                     Style::new(),
                     true,
                     Some(hint.clone()),
+                    None,
                 );
             })
             .unwrap();

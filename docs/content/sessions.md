@@ -157,7 +157,7 @@ ACP clients get the same task resume when they load a session. The main turn wai
 
 ## Moving sessions to another directory
 
-Use `/migrate-sessions` to move every saved local session with one exact stored working directory. The source directory may already be gone. Choose a destination directory and review the confirmation before applying the move.
+Use `/sessions migrate [dir]` to move every saved local session with one exact stored working directory. The source directory may already be gone. Choose a destination directory and review the confirmation before applying the move.
 
 The bulk confirmation checks **Include historical project usage** by default. Toggle it off to leave lifetime project attribution unchanged. When included, the move reattributes all usage recorded for that exact source directory, including deleted sessions and ephemeral runs. It covers every model, purpose, and payer category, but excludes child directories with a different recorded cwd. Overlapping destination buckets are added together without replacing existing destination spend. The completion message reports usage buckets moved and merged, or an empty source ledger, separately from sessions moved.
 
@@ -306,7 +306,7 @@ Retention never removes spending records. What a session cost is written to a se
 
 ## Search past sessions
 
-`Ctrl+F` opens the search on the current chat, and `/search-history [words]` opens it on this project's past sessions with the words already typed. One modal holds three tabs, and `Tab` or `Shift+Tab` moves between them while keeping what you typed. `Alt+1` to `Alt+3` jump straight to a tab.
+`Ctrl+F` opens the search on the current chat, and `/search [words]` opens it on this project's past sessions with the words already typed, and `/search chat` or `/search all` opens it on This chat or All projects instead. One modal holds three tabs, and `Tab` or `Shift+Tab` moves between them while keeping what you typed. `Alt+1` to `Alt+3` jump straight to a tab.
 
 | Tab | Searches | Matching |
 |-----|----------|----------|

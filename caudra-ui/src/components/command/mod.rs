@@ -1,30 +1,44 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::iter;
+use std::mem;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use caudra_agent::agent::COMPACT_DESCRIPTION;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::mcp::CompletionTarget;
 use caudra_agent::{McpPromptInfo, McpSnapshotReader};
-use caudra_config::{Feature, FeatureFlags};
+use caudra_config::FeatureFlags;
 use caudra_grab::grab_scope;
-use caudra_lua::{LuaCommandInfo, LuaCommandReader};
+use caudra_lua::{CompletionRequest, EventHandle, LuaCommandInfo, LuaCommandReader, LuaCompletion};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use smol::Task;
 
 use crate::components::list_picker::{DISABLED_DIM, PickerItem};
 use crate::components::match_spans;
-use crate::components::mcp_completion::{CompletionAsk, McpCompleter};
+use crate::components::mcp_completion::{AsyncAsk, CompletionAsk, complete};
 use crate::input_document::char_to_byte;
 use crate::repaint::Dirty;
 use crate::theme;
+
+mod builtins;
+pub(crate) mod grammar;
+pub(crate) mod suggest;
+pub(crate) mod words;
+
+pub(crate) use builtins::SEARCH_COMMAND;
+pub use builtins::{BUILTIN_COMMANDS, BuiltinCommand, disabled_feature};
+use grammar::{Arg, Node, SIGNATURE_WIDTH, Source, Subcommand, truncate};
+pub(crate) use suggest::SourceValue;
+use suggest::{Arguments, Suggestion, list_paths};
 
 const TICK_TIMEOUT_MS: u64 = 10;
 /// Abbreviations that keep opening the command they opened before a newer,
@@ -34,8 +48,20 @@ pub(crate) const SECTION_BUILTIN: &str = "Built-in";
 const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
 const SECTION_PLUGIN: &str = "Plugins";
-const VALUE_PAD: usize = 1;
-pub(crate) const SEARCH_HISTORY_COMMAND: &str = "/search-history";
+const PAD: usize = 1;
+const GAP: usize = 2;
+/// A subcommand row is matched as though a dash joined it to its command,
+/// since a space would end the command word: `/goal-c` reaches `/goal clear`.
+const SUBCOMMAND_DASH: &str = "-";
+const WORD_SEPARATOR: &str = " ";
+/// What a custom command's arguments are called when its frontmatter gives
+/// no hint, and what a plugin command's are.
+const CUSTOM_ARG: &str = "arguments";
+const LUA_ARG: &str = "args";
+const HINT_BRACKETS: [char; 4] = ['<', '>', '[', ']'];
+/// How long a plugin's `complete` function may take before the palette
+/// stops waiting for it.
+const LUA_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which chat a command can act on. [`ChatScope::MainOnly`] reaches the main
 /// session's turn or history, which a focused task has no equivalent of, so
@@ -53,7 +79,12 @@ pub enum ChatScope {
 #[derive(Clone)]
 pub struct CommandRow {
     pub name: String,
+    /// What a query is matched against: the name, a subcommand joined to
+    /// its command by a dash as the inline dropdown matches it.
+    pub search: String,
     pub description: String,
+    /// What follows the name, such as `[pop|list]`; empty for none.
+    pub signature: String,
     pub max_args: usize,
     pub section: &'static str,
     pub disabled: bool,
@@ -70,6 +101,14 @@ impl PickerItem for CommandRow {
         &self.name
     }
 
+    fn search_text(&self) -> &str {
+        &self.search
+    }
+
+    fn suffix(&self) -> Option<&str> {
+        (!self.signature.is_empty()).then_some(&self.signature)
+    }
+
     fn detail(&self) -> Option<&str> {
         (!self.description.is_empty()).then_some(&self.description)
     }
@@ -83,543 +122,6 @@ impl PickerItem for CommandRow {
     }
 }
 
-pub struct BuiltinCommand {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub max_args: usize,
-    pub scope: ChatScope,
-    /// Experiments any one of which makes the command available; empty for a
-    /// command that always is.
-    pub features: &'static [Feature],
-}
-
-impl BuiltinCommand {
-    pub fn available(&self, features: FeatureFlags) -> bool {
-        self.features.is_empty()
-            || self
-                .features
-                .iter()
-                .any(|&feature| features.enabled(feature))
-    }
-}
-
-/// The experiment that keeps the built-in command `name` out of this
-/// process, so an explicit request can say how to turn it on.
-pub fn disabled_feature(name: &str, features: FeatureFlags) -> Option<Feature> {
-    BUILTIN_COMMANDS
-        .iter()
-        .find(|command| command.name.eq_ignore_ascii_case(name))
-        .filter(|command| !command.available(features))
-        .and_then(|command| command.features.first().copied())
-}
-
-pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
-    BuiltinCommand {
-        name: "/compact",
-        description: COMPACT_DESCRIPTION,
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/continue",
-        description: "Resume an interrupted turn without adding a message",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/new",
-        description: "Start a new session",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/help",
-        description: "Show keybindings",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/usage",
-        description: "Show token usage breakdown",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/context",
-        description: "Inspect active context window usage",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/storage",
-        description: "Inspect what the state directory holds",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/logs",
-        description: "Browse the structured log",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/docs",
-        description: "Read Caudra's documentation, or search it",
-        max_args: usize::MAX,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: SEARCH_HISTORY_COMMAND,
-        description: "Search past sessions of this project or every project",
-        max_args: usize::MAX,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/changelog",
-        description: "Show what's new in Caudra, or every release with `all`",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/tools",
-        description: "Show which tools the model can reach",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/skills",
-        description: "Show the skills the model can load and where they come from",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/queue",
-        description: "Inspect and edit queued prompts",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/stash",
-        description: "Park the current prompt draft for later",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/stash-pop",
-        description: "Restore the most recently stashed prompt",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/stash-list",
-        description: "Browse stashed prompts",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/update",
-        description: "Install the release the update banner names, then restart",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/dismiss-update",
-        description: "Hide the update banner until Caudra restarts",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/memory",
-        description: "Inspect project memory: the view, its summary tree, and the notes",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/learn",
-        description: "Review what continual learning changed, revert it, or pause it",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/tasks",
-        description: "Browse tasks and steer running subagents",
-        max_args: usize::MAX,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/shells",
-        description: "Browse shell commands and stop running ones",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/peers",
-        description: "Browse live local messaging peers (experimental)",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::CrossSessionMessaging],
-    },
-    BuiltinCommand {
-        name: "/messages",
-        description: "Review held peer messages and manage this session's inbound policy",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::CrossSessionMessaging],
-    },
-    BuiltinCommand {
-        name: "/topics",
-        description: "Browse peer topic messages, or change this session's topic subscriptions",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::CrossSessionMessaging],
-    },
-    BuiltinCommand {
-        name: "/groups",
-        description: "List consumer groups and this session's work, join or leave a group, or retry, pause, or cancel a work item",
-        max_args: 2,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::CrossSessionMessaging],
-    },
-    BuiltinCommand {
-        name: "/workflows",
-        description: "Browse, trust, and launch workflows",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Workflows],
-    },
-    BuiltinCommand {
-        name: "/workflow",
-        description: "Start a workflow, or list, pause, resume, and stop runs",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Workflows],
-    },
-    BuiltinCommand {
-        name: "/deep-research",
-        description: "Research a question with the deep-research workflow",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Workflows],
-    },
-    BuiltinCommand {
-        name: "/review-changes",
-        description: "Review a change from independent angles with the review-changes workflow",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Workflows],
-    },
-    BuiltinCommand {
-        name: "/root-cause",
-        description: "Diagnose a failure with the root-cause workflow",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Workflows],
-    },
-    BuiltinCommand {
-        name: "/automations",
-        description: "Inspect, trust, and pause automations (arm NAME [{json}] | disarm NAME)",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::Automations],
-    },
-    BuiltinCommand {
-        name: "/sessions",
-        description: "Browse and switch sessions",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/rename",
-        description: "Rename the current session",
-        max_args: usize::MAX,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/fork",
-        description: "Fork the session into a new one at its latest message",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/model",
-        description: "Switch chat model or assign job models",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/favorite-next",
-        description: "Switch to the next favorite model",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/accounts",
-        description: "Choose which account of the model's provider requests go to",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/decision-model",
-        description: "Pick the decision endpoint that screens tool calls",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/decision-next",
-        description: "Switch to the next decision endpoint",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/system-prompt",
-        description: "Inspect the system prompt and switch profile",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/projection",
-        description: "Inspect the conversation as the provider receives it",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/review",
-        description: "Review the last reply passage by passage",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/theme",
-        description: "Switch color theme",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/view",
-        description: "Cycle transcript: auto / compact / expanded",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/mcp",
-        description: "Configure MCP servers",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/env",
-        description: "View environment variables and choose which reach shell commands",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/settings",
-        description: "Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/permissions",
-        description: "Inspect active conversation permission rules",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/login",
-        description: "Authenticate with an LLM provider",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/cd",
-        description: "Change working directory",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/move-session",
-        description: "Move the current session; retain its counters and lifetime project attribution (optional directory)",
-        max_args: 1,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/migrate-sessions",
-        description: "Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory)",
-        max_args: 1,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/worktree",
-        description: "Open, create, close or remove git worktrees of this repository (new [branch] | close | remove)",
-        max_args: 2,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/btw",
-        description: "Ask a side question, with follow-ups (no tools, nothing enters history)",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/catchup",
-        description: "Bring yourself back up to speed on this session (optional focus; a /btw, nothing enters history)",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/extract",
-        description: "List the requirements the session has gathered so far (Extract model, copyable, no history pollution)",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/goal",
-        description: "Work until a completion condition is met (model, log)",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/goal-clear",
-        description: "Stop the active completion goal",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/goal-model",
-        description: "Assign the completion goal model",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/autopilot",
-        description: "Keep the session moving: answer prompts, questions, and plans for you (off, model, log)",
-        max_args: usize::MAX,
-        scope: ChatScope::MainOnly,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/auto",
-        description: "Toggle Auto permissions (skip unmatched prompts, keep safeguards)",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/decisions",
-        description: "Inspect decision engine status, features, activity, and recent decisions",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/yolo",
-        description: "Toggle YOLO mode (skip all permission prompts)",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/thinking",
-        description: "Set reasoning (off, adaptive/provider default, effort, or token budget)",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/fast",
-        description: "Toggle fast mode (models that sell a fast tier)",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/exit",
-        description: "Exit the application",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/reload",
-        description: "Reload plugins and config",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/workbench",
-        description: "Open the file explorer, editor and source control view",
-        max_args: 0,
-        scope: ChatScope::Any,
-        features: &[],
-    },
-    BuiltinCommand {
-        name: "/remote",
-        description: "Remote status, pending operations, reconnect, reconcile or explicit acknowledgement",
-        max_args: 3,
-        scope: ChatScope::MainOnly,
-        features: &[Feature::RemoteWorkcell, Feature::Sandboxes],
-    },
-    BuiltinCommand {
-        name: "/sandbox",
-        description: "Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery",
-        max_args: 1,
-        scope: ChatScope::Any,
-        features: &[Feature::Sandboxes],
-    },
-];
-
 pub struct ParsedCommand {
     pub name: String,
     pub args: String,
@@ -629,6 +131,7 @@ impl ParsedCommand {
     /// The command a composer line runs: its first word, and the rest as
     /// arguments.
     pub fn from_line(line: &str) -> Self {
+        let line = line.trim_start();
         let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         Self {
             name: name.to_owned(),
@@ -647,17 +150,31 @@ pub struct Completion {
     pub caret: usize,
 }
 
+impl Completion {
+    /// `input`, the text it was synced with, with this edit made.
+    pub fn applied_to(&self, input: &str) -> String {
+        let start = char_to_byte(input, self.range.start);
+        let end = char_to_byte(input, self.range.end);
+        format!("{}{}{}", &input[..start], self.text, &input[end..])
+    }
+}
+
 pub enum CommandAction {
     Consumed,
     /// Complete the command, then run what the composer then holds.
     Run(Completion),
     Complete(Completion),
+    /// Nothing the slot under the caret accepts was typed: say how the
+    /// command is used, and keep the draft.
+    Usage(String),
     Passthrough,
 }
 
 #[derive(Clone)]
 enum CommandType {
     Builtin(&'static BuiltinCommand),
+    /// A subcommand indexed as its own row, such as `/goal clear`.
+    Subcommand(&'static BuiltinCommand, &'static Subcommand<'static>),
     Custom(usize),
     McpPrompt(usize),
     Lua(usize),
@@ -677,15 +194,18 @@ struct Match {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CommandRowKey {
     Builtin(&'static str),
+    Subcommand(&'static str, &'static str),
     Custom(usize),
     McpPrompt(usize),
     Lua(usize),
+    Suggestion(usize),
 }
 
 impl CommandType {
     fn row_key(&self) -> CommandRowKey {
         match self {
             Self::Builtin(command) => CommandRowKey::Builtin(command.name),
+            Self::Subcommand(command, sub) => CommandRowKey::Subcommand(command.name, sub.name),
             Self::Custom(index) => CommandRowKey::Custom(*index),
             Self::McpPrompt(index) => CommandRowKey::McpPrompt(*index),
             Self::Lua(index) => CommandRowKey::Lua(*index),
@@ -696,8 +216,99 @@ impl CommandType {
 #[derive(Clone, Copy)]
 struct CommandRowHit {
     area: Rect,
-    filtered_index: usize,
+    row_index: usize,
     key: CommandRowKey,
+}
+
+/// A question answered off the event loop for the slot under the caret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaletteAsk {
+    Prompt(CompletionAsk),
+    Paths {
+        base: PathBuf,
+        home: Option<PathBuf>,
+        token: String,
+        directories_only: bool,
+    },
+    Lua(CompletionRequest),
+}
+
+impl PaletteAsk {
+    /// Whether an answer to `self` still belongs to the slot `other` asks
+    /// about, though what is typed there has moved on.
+    fn same_slot(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Prompt(left), Self::Prompt(right)) => {
+                left.target == right.target && left.argument == right.argument
+            }
+            (Self::Lua(left), Self::Lua(right)) => {
+                left.plugin == right.plugin && left.command == right.command
+            }
+            (
+                Self::Paths {
+                    base: left_base,
+                    directories_only: left_only,
+                    ..
+                },
+                Self::Paths {
+                    base: right_base,
+                    directories_only: right_only,
+                    ..
+                },
+            ) => left_base == right_base && left_only == right_only,
+            _ => false,
+        }
+    }
+
+    fn start(
+        self,
+        reader: &McpSnapshotReader,
+        lua: &EventHandle,
+    ) -> Task<Option<Vec<SourceValue>>> {
+        match self {
+            Self::Lua(request) => {
+                let lua = lua.clone();
+                smol::spawn(async move {
+                    let answer = async { Some(lua.complete_command(request).await) };
+                    let lull = async {
+                        smol::Timer::after(LUA_COMPLETION_TIMEOUT).await;
+                        None
+                    };
+                    let values = smol::future::or(answer, lull).await?;
+                    Some(
+                        values
+                            .into_iter()
+                            .map(|value| SourceValue::new(value, ""))
+                            .collect(),
+                    )
+                })
+            }
+            Self::Prompt(ask) => {
+                let answer = complete(reader, ask);
+                smol::spawn(async move {
+                    answer.await.map(|values| {
+                        values
+                            .into_iter()
+                            .map(|value| SourceValue::new(value, ""))
+                            .collect()
+                    })
+                })
+            }
+            Self::Paths {
+                base,
+                home,
+                token,
+                directories_only,
+            } => smol::spawn(async move {
+                Some(
+                    smol::unblock(move || {
+                        list_paths(&base, home.as_deref(), &token, directories_only)
+                    })
+                    .await,
+                )
+            }),
+        }
+    }
 }
 
 pub struct CommandPalette {
@@ -710,11 +321,15 @@ pub struct CommandPalette {
     lua_reader: LuaCommandReader,
     lua_commands: Vec<LuaCommandInfo>,
     lua_generation: u64,
+    /// Where a plugin command's `complete` function is asked.
+    lua_handle: EventHandle,
     features: FeatureFlags,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     /// The palette text last synced, which every completion is measured in.
     input: String,
+    /// Where the caret was in [`Self::input`], in bytes.
+    caret: usize,
     /// Where the command word being typed ends in [`Self::input`], in bytes:
     /// at the first space, or at the caret when it sits inside the word.
     token_end: usize,
@@ -731,22 +346,19 @@ pub struct CommandPalette {
     /// Set by [`CommandPalette::sync`] so it cannot go stale behind the rows
     /// it styles.
     task_focused: bool,
-    completer: McpCompleter,
-    /// The MCP prompt argument the input is in the middle of.
-    argument: Option<PromptArgument>,
-    /// What the prompt's server suggested for it. While there are any, they
-    /// are the rows.
-    values: Vec<String>,
-    value_selected: usize,
-}
-
-/// The prompt argument at the end of the input, and where its value starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PromptArgument {
-    ask: CompletionAsk,
-    start: usize,
-    /// The last argument takes the rest of the input, spaces and all.
-    last: bool,
+    /// The slot under the caret, once the command word names a command and
+    /// the caret has moved past it. While there is one, its suggestions are
+    /// the rows.
+    arguments: Option<Arguments>,
+    /// What the app last offered for a source it answers itself.
+    supplied: Option<(Source, Vec<SourceValue>)>,
+    /// What the last asynchronous answer offered, and for which ask.
+    answered: Option<(PaletteAsk, Vec<SourceValue>)>,
+    asking: AsyncAsk<PaletteAsk, Vec<SourceValue>>,
+    /// Where relative paths are read from: `None` for a remote workspace,
+    /// whose directories this machine cannot list.
+    working_directory: Option<PathBuf>,
+    home: Option<PathBuf>,
 }
 
 impl CommandPalette {
@@ -775,10 +387,12 @@ impl CommandPalette {
             lua_reader,
             lua_commands,
             lua_generation,
+            lua_handle: EventHandle::inert(),
             features,
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             input: String::new(),
+            caret: 0,
             token_end: 0,
             current_arg_count: 0,
             scroll_offset: 0,
@@ -787,11 +401,18 @@ impl CommandPalette {
             row_hits: Vec::new(),
             mouse_down: None,
             task_focused: false,
-            completer: McpCompleter::default(),
-            argument: None,
-            values: Vec::new(),
-            value_selected: 0,
+            arguments: None,
+            supplied: None,
+            answered: None,
+            asking: AsyncAsk::default(),
+            working_directory: None,
+            home: caudra_storage::paths::home(),
         }
+    }
+
+    pub(crate) fn with_lua_handle(mut self, handle: EventHandle) -> Self {
+        self.lua_handle = handle;
+        self
     }
 
     pub(crate) fn set_custom_commands(&mut self, commands: Arc<[CustomCommand]>) {
@@ -808,6 +429,14 @@ impl CommandPalette {
         self.mcp_generation = snapshot.generation;
         self.mcp_prompts = snapshot.prompts.clone();
         self.reindex();
+    }
+
+    /// Where a typed relative path starts, or `None` when the session works
+    /// somewhere this machine cannot list.
+    pub(crate) fn set_working_directory(&mut self, directory: Option<&Path>) {
+        if self.working_directory.as_deref() != directory {
+            self.working_directory = directory.map(Path::to_path_buf);
+        }
     }
 
     fn reindex(&mut self) {
@@ -835,7 +464,7 @@ impl CommandPalette {
             .filter(move |cmd| cmd.available(features))
             .map(|cmd| CommandItem {
                 name: cmd.name.to_string(),
-                max_args: cmd.max_args,
+                max_args: cmd.max_args(),
                 command_type: CommandType::Builtin(cmd),
             });
         let custom = custom_commands
@@ -863,6 +492,35 @@ impl CommandPalette {
         builtins.chain(custom).chain(prompts).chain(lua)
     }
 
+    /// The command followed by its subcommands, each a row of its own.
+    fn with_subcommands(item: CommandItem) -> impl Iterator<Item = CommandItem> {
+        let subcommands = Self::subcommands_of(&item);
+        iter::once(item).chain(subcommands)
+    }
+
+    fn subcommands_of(item: &CommandItem) -> impl Iterator<Item = CommandItem> + use<> {
+        let command = match item.command_type {
+            CommandType::Builtin(command) => Some(command),
+            _ => None,
+        };
+        command.into_iter().flat_map(|command| {
+            command.args.subcommands.iter().map(move |sub| CommandItem {
+                name: format!("{}{WORD_SEPARATOR}{}", command.name, sub.name),
+                max_args: sub.node.max_args(),
+                command_type: CommandType::Subcommand(command, sub),
+            })
+        })
+    }
+
+    /// The name a query matches: a subcommand row joined by a dash, since a
+    /// space would end the command word.
+    fn search_name(item: &CommandItem) -> String {
+        match item.command_type {
+            CommandType::Subcommand(..) => item.name.replace(WORD_SEPARATOR, SUBCOMMAND_DASH),
+            _ => item.name.clone(),
+        }
+    }
+
     fn build_nucleo(
         features: FeatureFlags,
         custom_commands: &[CustomCommand],
@@ -872,9 +530,11 @@ impl CommandPalette {
         let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
 
-        for item in Self::items(features, custom_commands, mcp_prompts, lua_commands) {
+        for item in Self::items(features, custom_commands, mcp_prompts, lua_commands)
+            .flat_map(Self::with_subcommands)
+        {
             injector.push(item, |item, cols| {
-                cols[0] = Utf32String::from(item.name.as_str());
+                cols[0] = Utf32String::from(Self::search_name(item));
             });
         }
 
@@ -885,15 +545,13 @@ impl CommandPalette {
         if !self.is_active() {
             return CommandAction::Passthrough;
         }
-        if let Some(action) = self.handle_value_key(key) {
-            return action;
-        }
+        let rows = self.row_count();
         match key.code {
-            KeyCode::Up => {
+            KeyCode::Up if rows > 0 => {
                 self.move_up();
                 CommandAction::Consumed
             }
-            KeyCode::Down => {
+            KeyCode::Down if rows > 0 => {
                 self.move_down();
                 CommandAction::Consumed
             }
@@ -901,7 +559,7 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => self.activate_selected(),
+            KeyCode::Enter => self.activate(),
             KeyCode::Tab => self
                 .completion()
                 .map_or(CommandAction::Consumed, CommandAction::Complete),
@@ -909,24 +567,108 @@ impl CommandPalette {
         }
     }
 
+    /// What Tab takes: the selected suggestion over the word under the caret.
+    fn completion(&self) -> Option<Completion> {
+        match &self.arguments {
+            Some(arguments) => {
+                Some(self.take(arguments, arguments.suggestions.get(self.selected)?))
+            }
+            None => self.word_completion(),
+        }
+    }
+
     /// The selected command spliced over the word being typed. A space goes
     /// between it and whatever follows unless one is already there, so a
     /// command put in front of a written prompt takes the prompt as its
     /// arguments, and the caret lands where those arguments start.
-    fn completion(&self) -> Option<Completion> {
+    fn word_completion(&self) -> Option<Completion> {
         let item = self.filtered.get(self.selected)?;
         let name = self.item_name(item);
         let tail = &self.input[self.token_end..];
         let takes_rest = self.item_has_args(item) || !tail.is_empty();
-        let separator = match takes_rest && !tail.starts_with(char::is_whitespace) {
-            true => " ",
+        Some(self.splice(0..self.token_end, &name, takes_rest))
+    }
+
+    /// `suggestion` over the word under the caret, a space after it when it
+    /// leaves more to type.
+    fn take(&self, arguments: &Arguments, suggestion: &Suggestion) -> Completion {
+        self.splice(
+            arguments.token.clone(),
+            &suggestion.value,
+            suggestion.continues,
+        )
+    }
+
+    fn splice(&self, bytes: Range<usize>, text: &str, continues: bool) -> Completion {
+        let tail = &self.input[bytes.end..];
+        let separator = match continues && !tail.starts_with(char::is_whitespace) {
+            true => WORD_SEPARATOR,
             false => "",
         };
-        Some(Completion {
-            range: 0..self.input[..self.token_end].chars().count(),
-            caret: name.chars().count() + usize::from(takes_rest),
-            text: format!("{name}{separator}"),
-        })
+        let start = self.input[..bytes.start].chars().count();
+        Completion {
+            range: start..start + self.input[bytes].chars().count(),
+            caret: text.chars().count() + usize::from(continues),
+            text: format!("{text}{separator}"),
+        }
+    }
+
+    /// The line exactly as it is.
+    fn as_typed(&self) -> Completion {
+        let end = self.input.chars().count();
+        Completion {
+            range: end..end,
+            text: String::new(),
+            caret: 0,
+        }
+    }
+
+    /// What Enter does. A slot that takes only listed words runs what was
+    /// typed when it is one of them, the highlighted suggestion when it is
+    /// not, and nothing at all when nothing matches. Anything else runs as
+    /// typed.
+    fn enter(&self) -> CommandAction {
+        let Some(arguments) = &self.arguments else {
+            return self
+                .word_completion()
+                .map_or(CommandAction::Consumed, CommandAction::Run);
+        };
+        let token = self.input[arguments.token.clone()].trim();
+        if token.is_empty() || !arguments.closed {
+            return CommandAction::Run(self.as_typed());
+        }
+        if let Some(exact) = arguments.exact(token) {
+            return CommandAction::Run(match exact.value == token {
+                true => self.as_typed(),
+                false => self.take(arguments, exact),
+            });
+        }
+        if arguments.accepts_unlisted(token) {
+            return CommandAction::Run(self.as_typed());
+        }
+        match arguments.suggestions.get(self.selected) {
+            Some(suggestion) => CommandAction::Run(self.take(arguments, suggestion)),
+            None => CommandAction::Usage(arguments.usage()),
+        }
+    }
+
+    fn activate(&mut self) -> CommandAction {
+        let action = self.enter();
+        if matches!(action, CommandAction::Run(_)) {
+            self.close();
+        }
+        action
+    }
+
+    /// A click runs a command row, as Enter does, and takes a suggestion, as
+    /// Tab does.
+    fn click(&mut self) -> CommandAction {
+        match self.arguments {
+            Some(_) => self
+                .completion()
+                .map_or(CommandAction::Consumed, CommandAction::Complete),
+            None => self.activate(),
+        }
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> CommandAction {
@@ -949,13 +691,8 @@ impl CommandPalette {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down = None;
-                if let Some(hit) = self
-                    .row_hits
-                    .iter()
-                    .find(|hit| hit.area.contains(position))
-                    .copied()
-                {
-                    self.selected = hit.filtered_index;
+                if let Some(hit) = self.hit(position) {
+                    self.selected = hit.row_index;
                     self.mouse_down = Some(hit.key);
                 }
                 CommandAction::Consumed
@@ -965,8 +702,8 @@ impl CommandPalette {
                 CommandAction::Consumed
             }
             MouseEventKind::Moved => {
-                if let Some(hit) = self.row_hits.iter().find(|hit| hit.area.contains(position)) {
-                    self.selected = hit.filtered_index;
+                if let Some(hit) = self.hit(position) {
+                    self.selected = hit.row_index;
                 }
                 CommandAction::Consumed
             }
@@ -974,139 +711,93 @@ impl CommandPalette {
                 let Some(pressed_key) = self.mouse_down.take() else {
                     return CommandAction::Consumed;
                 };
-                let released = self
-                    .row_hits
-                    .iter()
-                    .find(|hit| hit.area.contains(position))
-                    .map(|hit| (hit.filtered_index, hit.key));
-                let Some((filtered_index, released_key)) = released else {
+                let Some(released) = self.hit(position) else {
                     return CommandAction::Consumed;
                 };
-                if released_key != pressed_key {
+                if released.key != pressed_key {
                     return CommandAction::Consumed;
                 }
-                self.selected = filtered_index;
-                self.activate_selected()
+                self.selected = released.row_index;
+                self.click()
             }
             _ => CommandAction::Consumed,
         }
     }
 
-    pub fn is_active(&self) -> bool {
-        !self.filtered.is_empty() || !self.values.is_empty()
+    fn hit(&self, position: Position) -> Option<CommandRowHit> {
+        self.row_hits
+            .iter()
+            .find(|hit| hit.area.contains(position))
+            .copied()
     }
 
-    /// Up and Down walk the suggested values and Tab takes one; Enter still
-    /// runs the command as typed.
-    fn handle_value_key(&mut self, key: KeyEvent) -> Option<CommandAction> {
-        if self.values.is_empty() {
+    /// While the line names a command, Enter goes through the palette even
+    /// when there is nothing to suggest, so the command runs.
+    pub fn is_active(&self) -> bool {
+        !self.filtered.is_empty() || self.arguments.is_some()
+    }
+
+    /// Rows the selection can move over.
+    fn row_count(&self) -> usize {
+        match &self.arguments {
+            Some(arguments) => arguments.suggestions.len(),
+            None => self.filtered.len(),
+        }
+    }
+
+    /// Dim text that would follow the caret: the rest of the selected
+    /// suggestion when the word typed is its start, or the name of an empty
+    /// slot. Only offered while the caret ends the line.
+    pub fn ghost(&self) -> Option<String> {
+        if !self.is_active() || self.caret != self.input.len() || self.input.contains('\n') {
             return None;
         }
-        let count = self.values.len();
-        match key.code {
-            KeyCode::Up => self.value_selected = (self.value_selected + count - 1) % count,
-            KeyCode::Down => self.value_selected = (self.value_selected + 1) % count,
-            KeyCode::Esc => self.clear_argument(),
-            KeyCode::Tab => {
-                let argument = self.argument.as_ref()?;
-                let value = self.values.get(self.value_selected)?;
-                let separator = if argument.last { "" } else { " " };
-                let text = format!("{value}{separator}");
-                let start = self.input.get(..argument.start)?.chars().count();
-                return Some(CommandAction::Complete(Completion {
-                    range: start..self.input.chars().count(),
-                    caret: text.chars().count(),
-                    text,
-                }));
-            }
-            _ => return None,
-        }
-        Some(CommandAction::Consumed)
-    }
-
-    /// The argument `input` is typing, when it calls an MCP prompt whose
-    /// server completes. Arguments are positional, split on whitespace, and
-    /// the last one takes the rest, as running the prompt reads them.
-    fn prompt_argument(&self, input: &str) -> Option<PromptArgument> {
-        let (command, mut rest) = input.strip_prefix('/')?.split_once(char::is_whitespace)?;
-        let prompt = self
-            .mcp_prompts
-            .iter()
-            .find(|prompt| prompt.completions && prompt.display_name == command)?;
-        let last = prompt.arguments.len().checked_sub(1)?;
-        let mut context = BTreeMap::new();
-        for (index, argument) in prompt.arguments.iter().enumerate() {
-            rest = rest.trim_start();
-            let start = input.len() - rest.len();
-            let value = match rest.split_once(char::is_whitespace) {
-                Some((word, tail)) if index < last => {
-                    context.insert(argument.name.clone(), word.to_owned());
-                    rest = tail;
-                    continue;
+        match &self.arguments {
+            Some(arguments) => {
+                let token = &self.input[arguments.token.clone()];
+                if token.is_empty() {
+                    return arguments.hint.clone();
                 }
-                _ => rest,
-            };
-            return Some(PromptArgument {
-                ask: CompletionAsk {
-                    target: CompletionTarget::Prompt {
-                        qualified_name: prompt.qualified_name.clone(),
-                    },
-                    argument: argument.name.clone(),
-                    value: value.to_owned(),
-                    context,
-                },
-                start,
-                last: index == last,
-            });
+                rest_of(&arguments.suggestions.get(self.selected)?.value, token)
+            }
+            None => rest_of(
+                &self.item_name(self.filtered.get(self.selected)?),
+                &self.input[..self.token_end],
+            ),
         }
-        None
     }
 
-    /// Follows the argument being typed. Values the server already gave stay
-    /// while they still fit what is typed, so a keystroke does not blank the
-    /// list while the next answer is on its way.
-    fn track_argument(&mut self, input: &str, now: Instant) {
-        let Some(argument) = self.prompt_argument(input) else {
-            self.clear_argument();
-            return;
-        };
-        if self.argument.as_ref() == Some(&argument) {
-            return;
-        }
-        let typed = &argument.ask.value;
-        self.values
-            .retain(|value| value.starts_with(typed.as_str()));
-        self.value_selected = 0;
-        self.completer.ask(argument.ask.clone(), now);
-        self.argument = Some(argument);
-    }
-
-    fn clear_argument(&mut self) {
-        self.completer.clear();
-        self.argument = None;
-        self.values.clear();
-        self.value_selected = 0;
-    }
-
-    /// Takes the server's answer for the argument still being typed.
+    /// Takes an answer for the slot still under the caret.
     pub(crate) fn poll_completion(&mut self) -> Dirty {
         self.poll_completion_at(Instant::now())
     }
 
     fn poll_completion_at(&mut self, now: Instant) -> Dirty {
-        let Some((ask, values)) = self.completer.poll(&self.mcp_reader, now) else {
+        let (reader, lua) = (&self.mcp_reader, &self.lua_handle);
+        let Some(answer) = self.asking.poll(now, |ask| ask.start(reader, lua)) else {
             return Dirty::NO;
         };
-        if self
-            .argument
-            .as_ref()
-            .is_none_or(|argument| argument.ask != ask)
-        {
-            return Dirty::NO;
-        }
-        self.values = values;
-        self.value_selected = 0;
+        self.answered = Some(answer);
+        self.refresh_arguments();
         Dirty::YES
+    }
+
+    /// Hands over what a source the app answers offers for the slot under
+    /// the caret, after [`Self::sync`] asked for it.
+    pub(crate) fn provide(&mut self, source: Source, values: Vec<SourceValue>) {
+        self.supplied = Some((source, values));
+        self.refresh_arguments();
+    }
+
+    /// The source the slot under the caret reads, while nobody has offered
+    /// its values yet.
+    pub(crate) fn wanted(&self) -> Option<Source> {
+        let source = self.arguments.as_ref()?.source?;
+        let offered = self
+            .supplied
+            .as_ref()
+            .is_some_and(|(supplied, _)| *supplied == source);
+        (!source.is_async() && !offered).then_some(source)
     }
 
     /// Pulls MCP prompts and Lua commands forward when either side has
@@ -1131,29 +822,45 @@ impl CommandPalette {
         );
     }
 
-    /// Every command as a modal picker row, grouped by source. {task_focused}
-    /// only decides styling: refusal stays with the one dispatcher.
+    /// Every command and subcommand as a modal picker row, grouped by
+    /// source. Subcommands follow every built-in, so a command wins a tie
+    /// with a verb that matches a query as well. {task_focused} only decides
+    /// styling: refusal stays with the one dispatcher.
     pub fn rows(&mut self, task_focused: bool) -> Vec<CommandRow> {
         self.refresh_sources();
-        Self::items(
+        let mut items: Vec<CommandItem> = Self::items(
             self.features,
             &self.custom,
             &self.mcp_prompts,
             &self.lua_commands,
         )
-        .map(|item| CommandRow {
-            description: self.describe(&item.command_type).to_string(),
-            section: Self::section_of(&item.command_type),
-            disabled: task_focused && Self::scope_of(&item.command_type) == ChatScope::MainOnly,
-            name: item.name,
-            max_args: item.max_args,
-        })
-        .collect()
+        .collect();
+        let builtins = items
+            .iter()
+            .take_while(|item| matches!(item.command_type, CommandType::Builtin(_)))
+            .count();
+        let subcommands: Vec<CommandItem> = items[..builtins]
+            .iter()
+            .flat_map(Self::subcommands_of)
+            .collect();
+        items.splice(builtins..builtins, subcommands);
+        items
+            .into_iter()
+            .map(|item| CommandRow {
+                search: Self::search_name(&item),
+                description: self.describe(&item.command_type).to_string(),
+                signature: truncate(&self.signature_of(&item.command_type), SIGNATURE_WIDTH),
+                section: Self::section_of(&item.command_type),
+                disabled: task_focused && Self::scope_of(&item.command_type) == ChatScope::MainOnly,
+                name: item.name,
+                max_args: item.max_args,
+            })
+            .collect()
     }
 
     fn section_of(command_type: &CommandType) -> &'static str {
         match command_type {
-            CommandType::Builtin(_) => SECTION_BUILTIN,
+            CommandType::Builtin(_) | CommandType::Subcommand(..) => SECTION_BUILTIN,
             CommandType::Custom(_) => SECTION_CUSTOM,
             CommandType::McpPrompt(_) => SECTION_MCP,
             CommandType::Lua(_) => SECTION_PLUGIN,
@@ -1166,37 +873,119 @@ impl CommandPalette {
     fn scope_of(command_type: &CommandType) -> ChatScope {
         match command_type {
             CommandType::Builtin(command) => command.scope,
+            CommandType::Subcommand(command, sub) => sub.scope.unwrap_or(command.scope),
             CommandType::McpPrompt(_) => ChatScope::MainOnly,
             CommandType::Custom(_) | CommandType::Lua(_) => ChatScope::Any,
         }
     }
 
     /// The styling question the palettes ask, and the refusal question
-    /// [`crate::app::App`] asks, answered from one table.
-    pub fn is_main_only(&self, name: &str) -> bool {
+    /// [`crate::app::App`] asks, answered from one table. A subcommand named
+    /// by the leading words of `args` overrides its command's scope.
+    pub fn is_main_only(&self, name: &str, args: &str) -> bool {
+        self.command_named(name).is_some_and(|command_type| {
+            let scope = match &command_type {
+                CommandType::Builtin(command) => grammar::scope_of(command.args, args),
+                _ => None,
+            };
+            scope.unwrap_or_else(|| Self::scope_of(&command_type)) == ChatScope::MainOnly
+        })
+    }
+
+    /// The command `name` names exactly, ignoring case.
+    fn command_named(&self, name: &str) -> Option<CommandType> {
         Self::items(
             self.features,
             &self.custom,
             &self.mcp_prompts,
             &self.lua_commands,
         )
-        .find(|item| item.name == name)
-        .is_some_and(|item| Self::scope_of(&item.command_type) == ChatScope::MainOnly)
+        .find(|item| item.name.eq_ignore_ascii_case(name))
+        .map(|item| item.command_type)
     }
 
     fn describe(&self, command_type: &CommandType) -> &str {
         match command_type {
             CommandType::Builtin(cmd) => cmd.description,
+            CommandType::Subcommand(_, sub) => sub.description,
             CommandType::Custom(i) => &self.custom[*i].description,
             CommandType::McpPrompt(i) => &self.mcp_prompts[*i].description,
             CommandType::Lua(i) => &self.lua_commands[*i].description,
         }
     }
 
-    /// Filters on the command word `input` starts with, `caret` chars in. A
-    /// caret inside the word cuts it there, so a command typed in front of a
-    /// written prompt matches on what was typed, not on the prompt it touches.
-    pub fn sync(&mut self, input: &str, caret: usize, task_focused: bool) {
+    fn signature_of(&self, command_type: &CommandType) -> String {
+        self.with_node(command_type, |node| node.signature())
+    }
+
+    /// The grammar of what follows a command's name. A built-in declares
+    /// its own; the rest are read off what their sources say they take.
+    fn with_node<R>(&self, command_type: &CommandType, read: impl FnOnce(Node<'_>) -> R) -> R {
+        match command_type {
+            CommandType::Builtin(command) => read(command.args),
+            CommandType::Subcommand(_, sub) => read(sub.node),
+            CommandType::Custom(index) => {
+                let command = &self.custom[*index];
+                let name = command
+                    .argument_hint
+                    .as_deref()
+                    .map_or(CUSTOM_ARG, hint_name);
+                let args = [Arg::text(name, "", None)];
+                read(Node::args(match command.has_args() {
+                    true => &args,
+                    false => &[],
+                }))
+            }
+            CommandType::McpPrompt(index) => {
+                let prompt = &self.mcp_prompts[*index];
+                let source = prompt.completions.then_some(Source::McpPrompt);
+                let last = prompt.arguments.len().saturating_sub(1);
+                let args: Vec<Arg> = prompt
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(position, argument)| {
+                        let arg = match position == last {
+                            true => Arg::text(&argument.name, &argument.description, source),
+                            false => Arg::value(&argument.name, &argument.description, source),
+                        };
+                        match argument.required {
+                            true => arg.required(),
+                            false => arg,
+                        }
+                    })
+                    .collect();
+                read(Node::args(&args))
+            }
+            CommandType::Lua(index) => {
+                let command = &self.lua_commands[*index];
+                let source = match command.complete {
+                    LuaCompletion::None => None,
+                    LuaCompletion::Values(_) | LuaCompletion::Function(()) => Some(Source::Lua),
+                    LuaCompletion::Directories => Some(Source::Directories),
+                    LuaCompletion::Files => Some(Source::Files),
+                };
+                let arg = match command.max_args {
+                    0 => None,
+                    1 => Some(Arg::value(LUA_ARG, "", source)),
+                    _ => Some(Arg::text(LUA_ARG, "", source)),
+                };
+                let arg = arg.map(|arg| match command.required {
+                    true => arg.required(),
+                    false => arg,
+                });
+                read(Node::args(arg.as_slice()))
+            }
+        }
+    }
+
+    /// Follows `input` with the caret `caret` chars in. While the caret is
+    /// in the command word, it filters commands on what is typed before the
+    /// caret, so a command typed in front of a written prompt matches on what
+    /// was typed, not on the prompt it touches. Once the word names a command
+    /// and the caret is past it, it follows the slot under the caret, and
+    /// returns the source the app is asked to [`Self::provide`] for it.
+    pub fn sync(&mut self, input: &str, caret: usize, task_focused: bool) -> Option<Source> {
         self.invalidate_mouse_geometry();
         self.refresh_sources();
         self.task_focused = task_focused;
@@ -1204,15 +993,21 @@ impl CommandPalette {
         if !input.starts_with('/') {
             self.filtered.clear();
             self.current_arg_count = 0;
-            self.clear_argument();
-            return;
+            self.clear_arguments();
+            return None;
         }
 
         let word_end = input.find(char::is_whitespace).unwrap_or(input.len());
-        self.token_end = match char_to_byte(input, caret) {
+        self.caret = char_to_byte(input, caret);
+        self.token_end = match self.caret {
             0 => word_end,
             caret => caret.min(word_end),
         };
+        if self.caret > word_end && self.command_named(&input[..word_end]).is_some() {
+            self.filtered.clear();
+            return self.refresh_arguments();
+        }
+        self.clear_arguments();
         let cmd_word = &input[1..self.token_end];
         let tail = &input[self.token_end..];
         self.current_arg_count =
@@ -1228,7 +1023,136 @@ impl CommandPalette {
 
         self.tick();
         self.hold_abbreviation(cmd_word);
-        self.track_argument(input, Instant::now());
+        None
+    }
+
+    /// Works out the slot under the caret from [`Self::input`], with what
+    /// its source offers so far, and asks an asynchronous source for more.
+    fn refresh_arguments(&mut self) -> Option<Source> {
+        let word_end = self.input.find(char::is_whitespace)?;
+        let command = self.command_named(&self.input[..word_end])?;
+        let name = self.item_name(&Match {
+            command_type: command.clone(),
+            indices: Vec::new(),
+        });
+        let args = &self.input[word_end..];
+        let caret = self.caret - word_end;
+        let mut matcher = mem::take(&mut self.matcher);
+        let mut read = |values: &[SourceValue]| {
+            self.with_node(&command, |node| {
+                suggest::arguments(&name, node, args, word_end, caret, values, &mut matcher)
+            })
+        };
+        let Some(mut arguments) = read(&[]) else {
+            self.matcher = matcher;
+            self.clear_arguments();
+            return None;
+        };
+        let ask = arguments
+            .source
+            .and_then(|source| self.async_ask(&command, &arguments, source));
+        let listed = self.listed_values(&command);
+        let values: Option<&[SourceValue]> = match (&ask, arguments.source) {
+            (Some(ask), _) => self
+                .answered
+                .as_ref()
+                .filter(|(answered, _)| answered.same_slot(ask))
+                .map(|(_, values)| values.as_slice()),
+            (None, Some(Source::Lua)) => listed.as_deref(),
+            (None, Some(source)) => self
+                .supplied
+                .as_ref()
+                .filter(|(supplied, _)| *supplied == source)
+                .map(|(_, values)| values.as_slice()),
+            (None, None) => None,
+        };
+        if let Some(read) = values.and_then(read) {
+            arguments = read;
+        }
+        self.matcher = matcher;
+        match ask {
+            Some(ask) => self.asking.ask(ask, Instant::now()),
+            None => self.asking.clear(),
+        }
+        if self
+            .arguments
+            .as_ref()
+            .is_none_or(|previous| previous.token != arguments.token)
+        {
+            self.selected = 0;
+            self.scroll_offset = 0;
+        }
+        self.selected = self
+            .selected
+            .min(arguments.suggestions.len().saturating_sub(1));
+        let wanted = arguments.source.filter(|source| !source.is_async());
+        self.arguments = Some(arguments);
+        wanted
+    }
+
+    fn async_ask(
+        &self,
+        command: &CommandType,
+        arguments: &Arguments,
+        source: Source,
+    ) -> Option<PaletteAsk> {
+        let token = self.input[arguments.token.clone()].to_owned();
+        match (source, command) {
+            (Source::McpPrompt, CommandType::McpPrompt(index)) => {
+                Some(PaletteAsk::Prompt(CompletionAsk {
+                    target: CompletionTarget::Prompt {
+                        qualified_name: self.mcp_prompts[*index].qualified_name.clone(),
+                    },
+                    argument: arguments.argument.clone()?,
+                    value: token,
+                    context: arguments.given.iter().cloned().collect(),
+                }))
+            }
+            (Source::Lua, CommandType::Lua(index)) => {
+                let command = &self.lua_commands[*index];
+                if command.complete != LuaCompletion::Function(()) {
+                    return None;
+                }
+                let lead = arguments.token.start.min(self.caret)..self.caret;
+                Some(PaletteAsk::Lua(CompletionRequest {
+                    plugin: Arc::clone(&command.plugin),
+                    command: Arc::clone(&command.name),
+                    arglead: self.input[lead].to_owned(),
+                    cmdline: self.input.clone(),
+                    cursorpos: self.caret,
+                }))
+            }
+            (Source::Directories | Source::Files, _) => Some(PaletteAsk::Paths {
+                base: self.working_directory.clone()?,
+                home: self.home.clone(),
+                token,
+                directories_only: source == Source::Directories,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The fixed list a plugin command offers, which needs no asking.
+    fn listed_values(&self, command: &CommandType) -> Option<Vec<SourceValue>> {
+        let CommandType::Lua(index) = command else {
+            return None;
+        };
+        let LuaCompletion::Values(values) = &self.lua_commands[*index].complete else {
+            return None;
+        };
+        Some(
+            values
+                .iter()
+                .map(|value| SourceValue::new(value, ""))
+                .collect(),
+        )
+    }
+
+    fn clear_arguments(&mut self) {
+        self.arguments = None;
+        self.supplied = None;
+        self.answered = None;
+        self.asking.clear();
     }
 
     fn hold_abbreviation(&mut self, typed: &str) {
@@ -1260,39 +1184,53 @@ impl CommandPalette {
         }
     }
 
+    /// Subcommand rows stay out of the bare `/` list, which would otherwise
+    /// bury the commands under their verbs, and join as soon as a letter is
+    /// typed, behind any command that matches as well.
     fn refresh_matches(&mut self) {
         self.invalidate_mouse_geometry();
         let snapshot = self.nucleo.snapshot();
         let pattern = snapshot.pattern();
         let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
 
-        self.filtered.clear();
         let count = snapshot.matched_item_count();
+        let mut ranked: Vec<(u32, Match)> = Vec::with_capacity(count as usize);
         for item in snapshot.matched_items(0..count) {
             let cmd_item = &item.data;
             let col = &item.matcher_columns[0];
 
-            if self.current_arg_count > cmd_item.max_args {
+            if self.current_arg_count > cmd_item.max_args
+                || (!has_pattern && matches!(cmd_item.command_type, CommandType::Subcommand(..)))
+            {
                 continue;
             }
 
-            let indices = if has_pattern {
-                let mut indices_buf = vec![];
-                pattern.column_pattern(0).indices(
-                    col.slice(..),
-                    &mut self.matcher,
-                    &mut indices_buf,
-                );
-                indices_buf
-            } else {
-                Vec::new()
+            let mut indices = Vec::new();
+            let score = match has_pattern {
+                true => pattern
+                    .column_pattern(0)
+                    .indices(col.slice(..), &mut self.matcher, &mut indices)
+                    .unwrap_or_default(),
+                false => 0,
             };
-
-            self.filtered.push(Match {
-                command_type: cmd_item.command_type.clone(),
-                indices,
-            });
+            indices.sort_unstable();
+            indices.dedup();
+            ranked.push((
+                score,
+                Match {
+                    command_type: cmd_item.command_type.clone(),
+                    indices,
+                },
+            ));
         }
+        ranked.sort_by_key(|(score, m)| {
+            (
+                Reverse(*score),
+                matches!(m.command_type, CommandType::Subcommand(..)),
+            )
+        });
+        self.filtered.clear();
+        self.filtered.extend(ranked.into_iter().map(|(_, m)| m));
 
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         self.ensure_visible();
@@ -1302,31 +1240,25 @@ impl CommandPalette {
         self.filtered.clear();
         self.current_arg_count = 0;
         self.scroll_offset = 0;
-        self.clear_argument();
+        self.clear_arguments();
         self.invalidate_mouse_geometry();
     }
 
     pub fn move_up(&mut self) {
-        if self.filtered.is_empty() {
+        let rows = self.row_count();
+        if rows == 0 {
             return;
         }
-        self.selected = if self.selected == 0 {
-            self.filtered.len() - 1
-        } else {
-            self.selected - 1
-        };
+        self.selected = (self.selected + rows - 1) % rows;
         self.ensure_visible();
     }
 
     pub fn move_down(&mut self) {
-        if self.filtered.is_empty() {
+        let rows = self.row_count();
+        if rows == 0 {
             return;
         }
-        self.selected = if self.selected == self.filtered.len() - 1 {
-            0
-        } else {
-            self.selected + 1
-        };
+        self.selected = (self.selected + 1) % rows;
         self.ensure_visible();
     }
 
@@ -1352,7 +1284,7 @@ impl CommandPalette {
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        let max_offset = self.filtered.len().saturating_sub(self.viewport_height);
+        let max_offset = self.row_count().saturating_sub(self.viewport_height);
         let offset = if delta > 0 {
             self.scroll_offset.saturating_sub(delta as usize)
         } else {
@@ -1369,6 +1301,9 @@ impl CommandPalette {
     fn item_name(&self, m: &Match) -> String {
         match &m.command_type {
             CommandType::Builtin(cmd) => cmd.name.to_string(),
+            CommandType::Subcommand(cmd, sub) => {
+                format!("{}{WORD_SEPARATOR}{}", cmd.name, sub.name)
+            }
             CommandType::Custom(i) => self.custom[*i].display_name(),
             CommandType::McpPrompt(i) => format!("/{}", self.mcp_prompts[*i].display_name),
             CommandType::Lua(i) => self.lua_commands[*i].name.to_string(),
@@ -1377,7 +1312,8 @@ impl CommandPalette {
 
     fn item_has_args(&self, m: &Match) -> bool {
         match &m.command_type {
-            CommandType::Builtin(cmd) => cmd.max_args > 0,
+            CommandType::Builtin(cmd) => cmd.max_args() > 0,
+            CommandType::Subcommand(_, sub) => sub.continues(),
             CommandType::Custom(i) => self.custom[*i].has_args(),
             CommandType::McpPrompt(i) => !self.mcp_prompts[*i].arguments.is_empty(),
             CommandType::Lua(i) => self.lua_commands[*i].max_args > 0,
@@ -1393,27 +1329,27 @@ impl CommandPalette {
     }
 
     #[cfg(test)]
-    pub fn sync_typed(&mut self, input: &str, task_focused: bool) {
-        self.sync(input, input.chars().count(), task_focused);
+    pub fn sync_typed(&mut self, input: &str, task_focused: bool) -> Option<Source> {
+        self.sync(input, input.chars().count(), task_focused)
     }
 
     /// What Enter would run on the synced text, which holds no paste chips.
     #[cfg(test)]
     pub fn confirm(&self) -> Option<ParsedCommand> {
-        let completion = self.completion()?;
-        let range = char_to_byte(&self.input, completion.range.end);
-        let line = format!("{}{}", completion.text, &self.input[range..]);
-        Some(ParsedCommand::from_line(&line))
+        let CommandAction::Run(completion) = self.enter() else {
+            return None;
+        };
+        Some(self.parse(&completion.applied_to(&self.input)))
     }
 
-    fn activate_selected(&mut self) -> CommandAction {
-        match self.completion() {
-            Some(completion) => {
-                self.close();
-                CommandAction::Run(completion)
-            }
-            None => CommandAction::Consumed,
+    /// The command `line` runs, its name spelled as registered, since the
+    /// dispatcher matches names exactly and typing ignores case.
+    pub fn parse(&self, line: &str) -> ParsedCommand {
+        let mut command = ParsedCommand::from_line(line);
+        if let Some(name) = self.resolve(&command.name) {
+            command.name = name;
         }
+        command
     }
 
     fn invalidate_mouse_geometry(&mut self) {
@@ -1452,9 +1388,36 @@ impl CommandPalette {
         self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
+    /// A row's name, a subcommand's parent drawn dimmed, matched chars lit.
+    fn name_spans(&self, m: &Match, base: Style, matched: Style) -> Vec<Span<'static>> {
+        let name = self.item_name(m);
+        let CommandType::Subcommand(parent, _) = m.command_type else {
+            return match_spans(&name, &m.indices, base, matched, None);
+        };
+        let split = parent.name.len() + WORD_SEPARATOR.len();
+        let (head, rest) = name.split_at(split);
+        let (head_indices, rest_indices): (Vec<u32>, Vec<u32>) = m
+            .indices
+            .iter()
+            .partition(|&&index| (index as usize) < split);
+        let rest_indices: Vec<u32> = rest_indices
+            .into_iter()
+            .map(|index| index - split as u32)
+            .collect();
+        let mut spans = match_spans(
+            head,
+            &head_indices,
+            theme::dim_style(base, DISABLED_DIM),
+            matched,
+            None,
+        );
+        spans.extend(match_spans(rest, &rest_indices, base, matched, None));
+        spans
+    }
+
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
-        if !self.values.is_empty() {
-            return self.view_values(frame, input_area);
+        if self.arguments.is_some() {
+            return self.view_arguments(frame, input_area);
         }
         let filtered = &self.filtered;
         if filtered.is_empty() {
@@ -1468,19 +1431,31 @@ impl CommandPalette {
             return None;
         }
 
-        const GAP: usize = 2;
-        let max_name = filtered
+        let names: Vec<String> = filtered.iter().map(|m| self.item_name(m)).collect();
+        let signatures: Vec<String> = filtered
             .iter()
-            .map(|item| self.item_name(item).len())
+            .map(|m| truncate(&self.signature_of(&m.command_type), SIGNATURE_WIDTH))
+            .collect();
+        let max_name = names
+            .iter()
+            .map(|name| name.chars().count())
             .max()
             .unwrap_or(0);
+        let max_signature = signatures
+            .iter()
+            .map(|signature| signature.chars().count())
+            .max()
+            .unwrap_or(0);
+        let signature_column = match max_signature {
+            0 => 0,
+            width => width + GAP,
+        };
         let max_desc = filtered
             .iter()
-            .map(|item| self.item_description(item).len())
+            .map(|item| self.item_description(item).chars().count())
             .max()
             .unwrap_or(0);
-        const PAD: usize = 1;
-        let popup_width = (PAD + max_name + GAP + max_desc + PAD) as u16;
+        let popup_width = (PAD + max_name + GAP + signature_column + max_desc + PAD) as u16;
 
         let popup = Rect {
             x: input_area.x,
@@ -1496,56 +1471,49 @@ impl CommandPalette {
             .scroll_offset
             .min(filtered.len().saturating_sub(viewport_height));
         let end = (scroll_offset + viewport_height).min(filtered.len());
-        let lines: Vec<Line> = filtered[scroll_offset..end]
-            .iter()
-            .enumerate()
-            .map(|(row, m)| {
-                let i = scroll_offset + row;
-                let name = self.item_name(m);
-                let desc = self.item_description(m);
+        let lines: Vec<Line> = (scroll_offset..end)
+            .map(|i| {
+                let m = &filtered[i];
                 let selected = i == self.selected;
-                let name_pad = max_name - name.len() + GAP;
-                let dim = |style: Style| {
-                    if self.is_disabled(m) {
-                        theme::dim_style(style, DISABLED_DIM)
-                    } else {
-                        style
-                    }
+                let dim = |style: Style| match self.is_disabled(m) {
+                    true => theme::dim_style(style, DISABLED_DIM),
+                    false => style,
                 };
-
-                if selected {
-                    let s = t.item_selected;
-                    let highlighted_name =
-                        match_spans(&name, &m.indices, dim(s), dim(t.item_match_selected), None);
-                    let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
-                    spans.extend(highlighted_name);
-                    spans.push(Span::styled(" ".repeat(name_pad), s));
-                    spans.push(Span::styled(desc, dim(s)));
-                    spans.push(Span::styled(" ".repeat(PAD), s));
-                    Line::from(spans)
-                } else {
-                    let highlighted_name =
-                        match_spans(&name, &m.indices, dim(t.item), dim(t.item_match), None);
-                    let mut spans = vec![Span::raw(" ".repeat(PAD))];
-                    spans.extend(highlighted_name);
-                    spans.push(Span::raw(" ".repeat(name_pad)));
-                    spans.push(Span::styled(desc, dim(t.item_desc)));
-                    spans.push(Span::raw(" ".repeat(PAD)));
-                    Line::from(spans)
+                let (base, matched, detail) = match selected {
+                    true => (t.item_selected, t.item_match_selected, t.item_selected),
+                    false => (t.item, t.item_match, t.item_desc),
+                };
+                let fill = |width: usize| Span::styled(" ".repeat(width), base);
+                let name_pad = max_name - names[i].chars().count() + GAP;
+                let mut spans = vec![fill(PAD)];
+                spans.extend(self.name_spans(m, dim(base), dim(matched)));
+                spans.push(fill(name_pad));
+                if signature_column > 0 {
+                    let signature = &signatures[i];
+                    spans.push(Span::styled(
+                        signature.clone(),
+                        theme::dim_style(dim(detail), DISABLED_DIM),
+                    ));
+                    spans.push(fill(signature_column - signature.chars().count()));
                 }
+                spans.push(Span::styled(
+                    self.item_description(m).to_owned(),
+                    dim(detail),
+                ));
+                spans.push(fill(PAD));
+                Line::from(spans)
             })
             .collect();
 
         frame.render_widget(Clear, popup);
         frame.render_widget(Paragraph::new(lines).style(t.surface_style()), popup);
 
-        self.row_hits = filtered[scroll_offset..end]
-            .iter()
+        self.row_hits = (scroll_offset..end)
             .enumerate()
-            .map(|(row, item)| CommandRowHit {
+            .map(|(row, index)| CommandRowHit {
                 area: Rect::new(popup.x, popup.y + row as u16, popup.width, 1),
-                filtered_index: scroll_offset + row,
-                key: item.command_type.row_key(),
+                row_index: index,
+                key: filtered[index].command_type.row_key(),
             })
             .collect();
         self.popup_area = Some(popup);
@@ -1555,52 +1523,188 @@ impl CommandPalette {
         Some(popup)
     }
 
-    /// The suggested values for the argument being typed, the selected one
-    /// highlighted. The selection is kept in view by drawing from it.
-    fn view_values(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+    /// The argument popup, standing on the composer.
+    fn view_arguments(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
         self.invalidate_mouse_geometry();
-        let height = (self.values.len() as u16).min(input_area.y);
+        let width = arguments_width(self.arguments.as_ref()?);
+        let height = self.argument_rows().min(input_area.y);
         if height == 0 {
             return None;
         }
-        let width = self
-            .values
-            .iter()
-            .map(|value| value.chars().count() + VALUE_PAD * 2)
-            .max()
-            .unwrap_or_default() as u16;
         let popup = Rect {
             x: input_area.x,
-            y: input_area.y.saturating_sub(height),
+            y: input_area.y - height,
             width: width.min(input_area.width),
             height,
         };
+        self.draw_arguments(frame, popup);
+        Some(popup)
+    }
+
+    /// Rows the argument list asks for: the signature, every suggestion,
+    /// and the placeholder. Zero while no command's arguments are followed.
+    pub fn argument_rows(&self) -> u16 {
+        self.arguments.as_ref().map_or(0, |arguments| {
+            let placeholder = usize::from(arguments.placeholder.is_some());
+            (1 + arguments.suggestions.len() + placeholder) as u16
+        })
+    }
+
+    /// The argument list over `area`, for a surface that places it itself.
+    pub fn view_arguments_in(&mut self, frame: &mut Frame, area: Rect) {
+        self.invalidate_mouse_geometry();
+        if area.height > 0 && self.arguments.is_some() {
+            self.draw_arguments(frame, area);
+        }
+    }
+
+    /// The signature with the caret's slot lit, the suggestions for that
+    /// slot, then the open slot's placeholder, which the selection never
+    /// lands on.
+    fn draw_arguments(&mut self, frame: &mut Frame, popup: Rect) {
+        let Some(arguments) = self.arguments.as_ref() else {
+            return;
+        };
         grab_scope!("command", popup);
+        let suggestions = &arguments.suggestions;
+        let placeholder = usize::from(arguments.placeholder.is_some());
+        let height = popup.height as usize;
+        let viewport = height
+            .saturating_sub(1 + placeholder)
+            .min(suggestions.len());
+        let shows_placeholder = height > 1 + viewport;
+        let scroll_offset = self
+            .scroll_offset
+            .min(suggestions.len().saturating_sub(viewport));
+        let max_value = value_width(arguments);
+
         let t = theme::current();
-        let first = (self.value_selected + 1).saturating_sub(height as usize);
-        let pad = " ".repeat(VALUE_PAD);
-        let lines: Vec<Line> = self
-            .values
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(height as usize)
-            .map(|(index, value)| {
-                let style = match index == self.value_selected {
-                    true => t.item_selected,
-                    false => t.item,
-                };
-                Line::from(Span::styled(format!("{pad}{value}{pad}"), style))
-            })
-            .collect();
+        let mut signature = vec![Span::raw(" ".repeat(PAD))];
+        for (index, part) in arguments.signature.iter().enumerate() {
+            if index > 0 {
+                signature.push(Span::raw(WORD_SEPARATOR));
+            }
+            let style = match part.current {
+                true => t.item.add_modifier(Modifier::BOLD),
+                false => t.item_desc,
+            };
+            signature.push(Span::styled(part.text.clone(), style));
+        }
+        let mut lines = vec![Line::from(signature)];
+        let end = scroll_offset + viewport;
+        for (index, suggestion) in suggestions[scroll_offset..end].iter().enumerate() {
+            let index = scroll_offset + index;
+            let (base, matched, detail) = match index == self.selected {
+                true => (t.item_selected, t.item_match_selected, t.item_selected),
+                false => (t.item, t.item_match, t.item_desc),
+            };
+            let fill = |width: usize| Span::styled(" ".repeat(width), base);
+            let mut spans = vec![fill(PAD)];
+            spans.extend(match_spans(
+                &suggestion.value,
+                &suggestion.indices,
+                base,
+                matched,
+                None,
+            ));
+            spans.push(fill(max_value - suggestion.value.chars().count() + GAP));
+            spans.push(Span::styled(suggestion.description.clone(), detail));
+            spans.push(fill(PAD));
+            lines.push(Line::from(spans));
+        }
+        if let Some(placeholder) = arguments.placeholder.as_ref().filter(|_| shows_placeholder) {
+            let label_pad = max_value - placeholder.label.chars().count() + GAP;
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{}{}{}{}",
+                    " ".repeat(PAD),
+                    placeholder.label,
+                    " ".repeat(label_pad),
+                    placeholder.description
+                ),
+                t.input_placeholder,
+            )));
+        }
+
         frame.render_widget(Clear, popup);
         frame.render_widget(Paragraph::new(lines).style(t.surface_style()), popup);
-        Some(popup)
+
+        self.row_hits = (scroll_offset..end)
+            .enumerate()
+            .map(|(row, index)| CommandRowHit {
+                area: Rect::new(popup.x, popup.y + 1 + row as u16, popup.width, 1),
+                row_index: index,
+                key: CommandRowKey::Suggestion(index),
+            })
+            .collect();
+        self.popup_area = Some(popup);
+        self.viewport_height = viewport;
+        self.scroll_offset = scroll_offset;
+    }
+}
+
+/// The widest value or placeholder label in the list.
+fn value_width(arguments: &Arguments) -> usize {
+    let values = arguments
+        .suggestions
+        .iter()
+        .map(|suggestion| &suggestion.value);
+    let label = arguments
+        .placeholder
+        .iter()
+        .map(|placeholder| &placeholder.label);
+    values
+        .chain(label)
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Columns the argument list needs, so neither a row nor the signature is cut.
+fn arguments_width(arguments: &Arguments) -> u16 {
+    let signature = arguments
+        .signature
+        .iter()
+        .map(|part| part.text.chars().count() + WORD_SEPARATOR.len())
+        .sum::<usize>();
+    let descriptions = arguments
+        .suggestions
+        .iter()
+        .map(|suggestion| &suggestion.description);
+    let placeholder = arguments
+        .placeholder
+        .iter()
+        .map(|placeholder| &placeholder.description);
+    let description = descriptions
+        .chain(placeholder)
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rows = PAD + value_width(arguments) + GAP + description + PAD;
+    rows.max(PAD + signature + PAD) as u16
+}
+
+/// What `value` adds past `typed`, when `typed` is how it starts.
+fn rest_of(value: &str, typed: &str) -> Option<String> {
+    let head = value.get(..typed.len())?;
+    (head.eq_ignore_ascii_case(typed) && value.len() > typed.len())
+        .then(|| value[typed.len()..].to_owned())
+}
+
+/// An argument hint such as `<file>` as a slot name. One with several parts
+/// stays as written.
+fn hint_name(hint: &str) -> &str {
+    let hint = hint.trim();
+    let inner = hint.trim_matches(HINT_BRACKETS);
+    match inner.contains(HINT_BRACKETS) {
+        true => hint,
+        false => inner,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -1608,6 +1712,7 @@ mod tests {
     use caudra_agent::mcp::completing_stub_session;
     use caudra_agent::mcp::resources::ResourceLists;
     use caudra_agent::{McpPromptArg, McpSnapshot};
+    use caudra_config::Feature;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use test_case::test_case;
 
@@ -1669,8 +1774,6 @@ mod tests {
     #[test_case("/learn"; "learn")]
     #[test_case("/auto"; "auto")]
     #[test_case("/decisions"; "decisions")]
-    #[test_case("/decision-model"; "decision_model")]
-    #[test_case("/decision-next"; "decision_next")]
     fn ordinary_commands_need_no_experiment(name: &str) {
         assert_eq!(disabled_feature(name, FeatureFlags::NONE), None);
         assert_eq!(
@@ -1681,21 +1784,25 @@ mod tests {
         );
     }
 
-    #[test_case("/move-session"; "current")]
-    #[test_case("/migrate-sessions"; "bulk")]
-    fn relocation_commands_are_main_only_and_preserve_directory_spaces(name: &str) {
+    #[test_case(words::MOVE_ARG; "current")]
+    #[test_case(words::MIGRATE_ARG; "bulk")]
+    fn relocation_subcommands_are_main_only_and_preserve_directory_spaces(subcommand: &str) {
+        const SESSIONS: &str = "/sessions";
         const DIRECTORY: &str = "../project with spaces";
-        let input = format!("{name} {DIRECTORY}");
-        let mut palette = synced(name);
-        assert_eq!(palette.confirm().unwrap().name, name);
-        let command = ParsedCommand::from_line(&input);
-        assert_eq!(command.name, name);
-        assert_eq!(command.args, DIRECTORY);
-        assert!(palette.is_main_only(name));
+        let args = format!("{subcommand} {DIRECTORY}");
+        let mut palette = synced(&format!("{SESSIONS} {args}"));
+        let command = palette.confirm().unwrap();
+        assert_eq!(
+            (command.name.as_str(), command.args.as_str()),
+            (SESSIONS, args.as_str())
+        );
+        assert!(palette.is_main_only(SESSIONS, &args));
+        assert!(!palette.is_main_only(SESSIONS, ""));
+        let row_name = format!("{SESSIONS} {subcommand}");
         let row = palette
             .rows(true)
             .into_iter()
-            .find(|row| row.name == name)
+            .find(|row| row.name == row_name)
             .unwrap();
         assert!(row.disabled);
         assert!(row.takes_args());
@@ -1706,7 +1813,7 @@ mod tests {
         const COMMAND: &str = "/fork";
         let mut palette = synced(COMMAND);
         assert_eq!(palette.confirm().unwrap().name, COMMAND);
-        assert!(palette.is_main_only(COMMAND));
+        assert!(palette.is_main_only(COMMAND, ""));
         let row = palette
             .rows(true)
             .into_iter()
@@ -1727,9 +1834,9 @@ mod tests {
             .find(|row| row.name == COMMAND)
             .unwrap();
         assert!(!row.disabled);
-        assert!(!row.takes_args());
         assert_eq!(palette.confirm().unwrap().name, COMMAND);
-        assert!(!palette.is_main_only(COMMAND));
+        assert!(!palette.is_main_only(COMMAND, ""));
+        assert!(palette.is_main_only(COMMAND, words::MODEL_ARG));
     }
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
@@ -1815,6 +1922,7 @@ mod tests {
                 content: "Review $ARGUMENTS".into(),
                 scope: caudra_agent::command::CommandScope::Project,
                 accepts_args: true,
+                argument_hint: None,
                 source: caudra_agent::command::CommandSource::Local(PathBuf::from(
                     ".caudra/commands/review.md",
                 )),
@@ -1825,6 +1933,7 @@ mod tests {
                 content: "Fix the code".into(),
                 scope: caudra_agent::command::CommandScope::User,
                 accepts_args: false,
+                argument_hint: None,
                 source: caudra_agent::command::CommandSource::Local(PathBuf::from(
                     "/config/caudra/commands/fix.md",
                 )),
@@ -1866,11 +1975,23 @@ mod tests {
         assert_eq!(p.is_active(), expect_active);
     }
 
-    #[test_case("/goal-c", "/goal-clear" ; "clear")]
-    #[test_case("/goal-m", "/goal-model" ; "model")]
-    fn goal_control_commands_are_discoverable(input: &str, expected: &str) {
+    #[test_case("/goal-c", "/goal clear" ; "clear")]
+    #[test_case("/goal-m", "/goal model" ; "model")]
+    #[test_case("/pop", "/stash pop" ; "a_verb_alone")]
+    #[test_case("/stash-l", "/stash list" ; "an_old_dashed_spelling")]
+    fn subcommands_are_found_by_their_verb(input: &str, expected: &str) {
         let p = synced(input);
-        assert!(p.filtered.iter().any(|item| p.item_name(item) == expected));
+        assert_eq!(p.item_name(&p.filtered[0]), expected);
+    }
+
+    #[test]
+    fn a_bare_slash_hides_subcommands() {
+        let p = synced("/");
+        assert!(
+            !p.filtered
+                .iter()
+                .any(|item| matches!(item.command_type, CommandType::Subcommand(..)))
+        );
     }
 
     #[test]
@@ -1903,7 +2024,7 @@ mod tests {
             palette.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
             CommandAction::Consumed
         ));
-        assert_eq!(palette.selected, hit.filtered_index);
+        assert_eq!(palette.selected, hit.row_index);
     }
 
     #[test]
@@ -1911,7 +2032,7 @@ mod tests {
         let mut palette = synced("/");
         render(&mut palette);
         let hit = palette.row_hits[1];
-        let expected_name = palette.item_name(&palette.filtered[hit.filtered_index]);
+        let expected_name = palette.item_name(&palette.filtered[hit.row_index]);
 
         palette.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
         let action = palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
@@ -2000,12 +2121,11 @@ mod tests {
     }
 
     #[test]
-    fn sync_filters_on_first_word_only() {
+    fn a_named_command_moves_on_to_its_arguments() {
         let p = synced("/cd ~/foo");
         assert!(p.is_active());
-        assert_eq!(p.filtered.len(), 1);
-        let name = p.item_name(&p.filtered[0]);
-        assert_eq!(name, "/cd");
+        assert!(p.filtered.is_empty());
+        assert!(p.arguments.is_some());
     }
 
     #[test_case("/compact ", false ; "zero_arg_cmd_with_space")]
@@ -2166,13 +2286,7 @@ mod tests {
 
     #[test]
     fn confirm_mcp_prompt_parses_args() {
-        let input = "/myserver:code-review my-diff-content";
-        let mut p = synced_with_prompts(input);
-        p.selected = p
-            .filtered
-            .iter()
-            .position(|f| matches!(f.command_type, CommandType::McpPrompt(0)))
-            .unwrap();
+        let p = synced_with_prompts("/myserver:code-review my-diff-content");
         let cmd = p.confirm().unwrap();
         assert_eq!(cmd.name, "/myserver:code-review");
         assert_eq!(cmd.args, "my-diff-content");
@@ -2291,12 +2405,14 @@ mod tests {
                 description: Arc::from("View memory files"),
                 plugin: Arc::from("memory"),
                 max_args: 0,
+                ..LuaCommandInfo::default()
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
                 description: Arc::from("Deploy the project"),
                 plugin: Arc::from("deploy_plugin"),
                 max_args: 0,
+                ..LuaCommandInfo::default()
             },
         ])
     }
@@ -2307,6 +2423,7 @@ mod tests {
             description: Arc::from("Deploy the project"),
             plugin: Arc::from("deploy_plugin"),
             max_args,
+            ..LuaCommandInfo::default()
         }]);
         let mut p =
             CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
@@ -2393,6 +2510,7 @@ mod tests {
             description: Arc::from("old command"),
             plugin: Arc::from("p"),
             max_args: 0,
+            ..LuaCommandInfo::default()
         }]);
         let mut p =
             CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
@@ -2410,12 +2528,14 @@ mod tests {
                 description: Arc::from("new"),
                 plugin: Arc::from("p"),
                 max_args: 0,
+                ..LuaCommandInfo::default()
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
                 description: Arc::from("new2"),
                 plugin: Arc::from("p"),
                 max_args: 0,
+                ..LuaCommandInfo::default()
             },
         ]);
         p.sync_typed("/", false);
@@ -2427,6 +2547,74 @@ mod tests {
         assert_eq!(updated_lua, 2);
         assert!(p.find_lua_command("/old").is_none());
         assert!(p.find_lua_command("/new1").is_some());
+    }
+
+    const LUA_PICK: &str = "/pick";
+    const LUA_PICK_PLUGIN: &str = "picker";
+    const LUA_LISTED: [&str; 2] = ["alpha", "beta"];
+    const LUA_REQUIRED_SIGNATURE: &str = "<args>";
+    const NOT_ASKED: &str = "the plugin's complete function was never asked";
+
+    fn lua_listed() -> Vec<String> {
+        LUA_LISTED.map(String::from).to_vec()
+    }
+
+    fn lua_palette(complete: LuaCompletion, handle: EventHandle) -> CommandPalette {
+        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: Arc::from(LUA_PICK),
+            plugin: Arc::from(LUA_PICK_PLUGIN),
+            max_args: 1,
+            required: true,
+            complete,
+            ..LuaCommandInfo::default()
+        }]);
+        CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all())
+            .with_lua_handle(handle)
+    }
+
+    #[test_case("/pick ", &LUA_LISTED ; "every_value_before_a_word")]
+    #[test_case("/pick al", &LUA_LISTED[..1] ; "the_values_the_word_matches")]
+    fn a_plugin_list_is_suggested(input: &str, expected: &[&str]) {
+        let mut palette = lua_palette(
+            LuaCompletion::Values(lua_listed().into()),
+            EventHandle::inert(),
+        );
+        palette.sync_typed(input, false);
+        assert_eq!(suggested(&palette), expected);
+    }
+
+    #[test]
+    fn a_plugin_function_is_asked_with_nvims_arguments() {
+        let (handle, probe) = caudra_lua::test_support::probed_event_handle();
+        let mut palette = lua_palette(LuaCompletion::Function(()), handle);
+        let input = "/pick al";
+        palette.sync_typed(input, false);
+        let answering = std::thread::spawn(move || probe.answer_completion(lua_listed()));
+
+        answered(&mut palette);
+
+        assert_eq!(suggested(&palette), &LUA_LISTED[..1]);
+        drop(palette);
+        let asked = answering.join().unwrap().expect(NOT_ASKED);
+        assert_eq!(
+            (
+                asked.arglead.as_str(),
+                asked.cmdline.as_str(),
+                asked.cursorpos
+            ),
+            ("al", input, input.len())
+        );
+    }
+
+    #[test]
+    fn a_required_plugin_argument_is_signed_as_one() {
+        let mut palette = lua_palette(LuaCompletion::None, EventHandle::inert());
+        let row = palette
+            .rows(false)
+            .into_iter()
+            .find(|row| row.name == LUA_PICK)
+            .unwrap();
+        assert_eq!(row.signature, LUA_REQUIRED_SIGNATURE);
     }
 
     /// Rows above the input are all the popup gets, so a list longer than that
@@ -2445,11 +2633,7 @@ mod tests {
     }
 
     fn visible(palette: &CommandPalette) -> Vec<usize> {
-        palette
-            .row_hits
-            .iter()
-            .map(|hit| hit.filtered_index)
-            .collect()
+        palette.row_hits.iter().map(|hit| hit.row_index).collect()
     }
 
     /// Walking off the bottom used to leave the selection drawn nowhere: the
@@ -2506,10 +2690,10 @@ mod tests {
         palette.scroll(-3);
         render_cramped(&mut palette);
         let hit = *palette.row_hits.first().expect("a row was drawn");
-        assert_eq!(hit.filtered_index, palette.scroll_offset);
+        assert_eq!(hit.row_index, palette.scroll_offset);
         assert_eq!(
             hit.key,
-            palette.filtered[hit.filtered_index].command_type.row_key()
+            palette.filtered[hit.row_index].command_type.row_key()
         );
     }
 
@@ -2543,12 +2727,26 @@ mod tests {
         )
     }
 
-    /// Spins until the server's answer lands, past the pause it waits out.
+    /// Waits for the server's answer, past the pause it waits out.
     fn answered(palette: &mut CommandPalette) {
         let due = Instant::now() + COMPLETION_DEBOUNCE;
-        while palette.completer.busy() {
-            let _ = palette.poll_completion_at(due);
+        let reader = palette.mcp_reader.clone();
+        let lua = palette.lua_handle.clone();
+        if let Some(answer) = palette.asking.settle(due, |ask| ask.start(&reader, &lua)) {
+            palette.answered = Some(answer);
+            palette.refresh_arguments();
         }
+    }
+
+    fn suggested(palette: &CommandPalette) -> Vec<&str> {
+        palette
+            .arguments
+            .as_ref()
+            .expect(NOT_TRACKED)
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.value.as_str())
+            .collect()
     }
 
     #[test_case("/stub:review ma", BRANCH, "ma", &[] ; "the_first_argument")]
@@ -2563,7 +2761,9 @@ mod tests {
     ) {
         let mut palette = completing_palette();
         palette.sync_typed(input, false);
-        let asked = &palette.argument.as_ref().expect(NOT_TRACKED).ask;
+        let Some(PaletteAsk::Prompt(asked)) = palette.asking.pending() else {
+            panic!("{NOT_TRACKED}");
+        };
         let context: BTreeMap<String, String> = context
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -2584,7 +2784,7 @@ mod tests {
         let input = "/stub:review ma";
         palette.sync_typed(input, false);
         answered(&mut palette);
-        assert_eq!(palette.values, SUGGESTED);
+        assert_eq!(suggested(&palette), SUGGESTED);
         palette.handle_key(KeyEvent::from(KeyCode::Down));
         let CommandAction::Complete(completion) = palette.handle_key(KeyEvent::from(KeyCode::Tab))
         else {
@@ -2617,7 +2817,7 @@ mod tests {
     }
 
     #[test_case("/fo", 3, "/fork", 5 ; "zero_arg_command_alone")]
-    #[test_case("/mov", 4, "/move-session ", 14 ; "command_with_arguments_alone")]
+    #[test_case("/ren", 4, "/rename ", 8 ; "command_with_arguments_alone")]
     #[test_case("/goFix the bug", 3, "/goal Fix the bug", 6 ; "caret_inside_glued_prose")]
     #[test_case("/go Fix the bug", 3, "/goal Fix the bug", 6 ; "prose_after_a_space")]
     #[test_case("/go Fix the bug", 0, "/goal Fix the bug", 6 ; "caret_at_the_start")]
@@ -2670,12 +2870,12 @@ mod tests {
         palette.sync_typed("/stub:review mai", false);
         palette.sync_typed("/stub:review main", false);
         palette.sync_typed("/stub:review maint", false);
-        assert_eq!(palette.values, [SUGGESTED[1]]);
+        assert_eq!(suggested(&palette), [SUGGESTED[1]]);
     }
 
     #[test]
     fn a_server_without_completions_is_never_asked() {
         let palette = synced_with_prompts("/myserver:code-review ma");
-        assert!(palette.argument.is_none());
+        assert!(palette.asking.pending().is_none());
     }
 }

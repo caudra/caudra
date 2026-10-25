@@ -16,6 +16,7 @@ use ratatui::layout::{Position, Rect};
 use super::status_bar::collapse_home;
 use super::tooltip::Tip;
 use super::{Hint, Overlay};
+use crate::components::command::words::{CLOSE_ARG, NEW_ARG, REMOVE_ARG};
 use crate::components::docs_link::DocsTopic;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -51,9 +52,6 @@ const BRANCH_HINT: &str =
 const BASE_HINT: &str = "A branch, tag or commit of this checkout.";
 const BRANCH_KEPT: &str = "Its branch is kept.";
 pub(crate) const USAGE: &str = "Usage: /worktree [new [branch] | close | remove]";
-const NEW_ARGUMENT: &str = "new";
-const REMOVE_ARGUMENT: &str = "remove";
-const CLOSE_ARGUMENT: &str = "close";
 
 /// Where `/worktree` opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,10 +66,10 @@ pub enum WorktreeView {
 impl WorktreeView {
     pub fn parse(args: &str) -> Result<Self, &'static str> {
         let mut words = args.split_whitespace();
-        let view = match words.next() {
+        let view = match words.next().map(str::to_ascii_lowercase).as_deref() {
             None => Self::List,
-            Some(NEW_ARGUMENT) => Self::Create(words.next().map(str::to_owned)),
-            Some(REMOVE_ARGUMENT | CLOSE_ARGUMENT) => Self::Remove,
+            Some(NEW_ARG) => Self::Create(words.next().map(str::to_owned)),
+            Some(REMOVE_ARG | CLOSE_ARG) => Self::Remove,
             Some(_) => return Err(USAGE),
         };
         match words.next() {

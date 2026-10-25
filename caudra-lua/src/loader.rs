@@ -17,7 +17,7 @@ use include_dir::{Dir, include_dir};
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::tool::PermissionRulePolicy;
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
+use crate::api::util::command::{CompletionRequest, HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions_with_trust};
 use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
@@ -713,6 +713,19 @@ impl EventHandle {
         });
     }
 
+    /// What a command's `complete` function suggests for `request`: nothing
+    /// when it has none, fails, or no runtime is there to ask.
+    pub async fn complete_command(&self, request: CompletionRequest) -> Vec<String> {
+        let (reply, rx) = flume::bounded(1);
+        match self
+            .prio_tx
+            .try_send(Request::CompleteCommand { request, reply })
+        {
+            Ok(()) => self.await_reply_async(&rx).await,
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Waits for a reply, and settles for the default if the runtime dies
     /// with the request still queued.
     ///
@@ -850,7 +863,8 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::api::tool::COMPLETE_ERR;
+    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter, LuaCompletion};
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use caudra_agent::tools::ToolRegistry;
@@ -1158,10 +1172,72 @@ mod tests {
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
             max_args: 0,
+            required: false,
+            complete: LuaCompletion::None,
         }]);
         let snap = reader.load();
         assert_eq!(snap.commands.len(), 1);
         assert!(snap.generation > 0);
+    }
+
+    const COMPLETING_PLUGIN: &str = "completing";
+    const COMPLETING_COMMAND: &str = "/pick";
+
+    fn host_with_complete(complete: &str) -> Result<PluginHost, PluginError> {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            COMPLETING_PLUGIN,
+            &format!(
+                r#"
+                caudra.api.register_command({{
+                    name = "{COMPLETING_COMMAND}",
+                    nargs = 1,
+                    complete = {complete},
+                    handler = function() end,
+                }})
+                "#
+            ),
+        )?;
+        Ok(host)
+    }
+
+    #[test_case(r#"{ "alpha", "beta" }"#, LuaCompletion::Values(Arc::from(["alpha".to_owned(), "beta".to_owned()])) ; "a_list")]
+    #[test_case(r#""dir""#, LuaCompletion::Directories ; "directories")]
+    #[test_case(r#""file""#, LuaCompletion::Files ; "files")]
+    #[test_case("function() return {} end", LuaCompletion::Function(()) ; "a_function")]
+    #[test_case("nil", LuaCompletion::None ; "nothing")]
+    fn register_command_publishes_what_it_completes(complete: &str, expected: LuaCompletion) {
+        let host = host_with_complete(complete).unwrap();
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands[0].complete, expected);
+        assert!(snap.commands[0].required);
+    }
+
+    #[test_case(r#""buffer""# ; "an_unknown_name")]
+    #[test_case("42" ; "a_number")]
+    #[test_case("{ 1, {} }" ; "a_list_of_non_strings")]
+    fn register_command_refuses_an_invalid_complete(complete: &str) {
+        let Err(error) = host_with_complete(complete) else {
+            panic!("an invalid complete was accepted");
+        };
+        assert!(error.to_string().contains(COMPLETE_ERR), "{error}");
+    }
+
+    #[test]
+    fn a_complete_function_answers_with_nvims_arguments() {
+        let host = host_with_complete(
+            "function(arglead, cmdline, cursorpos) return { arglead .. '|' .. cmdline .. '|' .. cursorpos } end",
+        )
+        .unwrap();
+        let cmdline = format!("{COMPLETING_COMMAND} al");
+        let values = smol::block_on(host.event_handle().complete_command(CompletionRequest {
+            plugin: Arc::from(COMPLETING_PLUGIN),
+            command: Arc::from(COMPLETING_COMMAND),
+            arglead: "al".into(),
+            cursorpos: cmdline.len(),
+            cmdline: cmdline.clone(),
+        }));
+        assert_eq!(values, vec![format!("al|{cmdline}|{}", cmdline.len())]);
     }
 
     #[test]

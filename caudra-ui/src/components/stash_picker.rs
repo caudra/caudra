@@ -65,7 +65,7 @@ impl StashPicker {
         }
     }
 
-    /// Newest first, so the entry `/stash-pop` would take sits at the top.
+    /// Newest first, so the entry `/stash pop` would take sits at the top.
     pub fn open(&mut self, entries: Vec<StashEntry>, now: u64) {
         let items = build_items(entries, now);
         self.pending_delete = None;
