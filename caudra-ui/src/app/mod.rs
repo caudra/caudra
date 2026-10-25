@@ -1422,7 +1422,15 @@ impl App {
     /// itself for a chat it is no longer attached to.
     fn sync_command_palette(&mut self, text: &str) {
         let task_focused = !self.is_main_chat();
-        self.command_palette.sync(text, task_focused);
+        let caret = self.active_input_box().buffer.palette_caret();
+        self.command_palette.sync(text, caret, task_focused);
+    }
+
+    /// The caret moved inside the composer, which changes the command word
+    /// the slash palette is completing.
+    fn resync_command_palette(&mut self) {
+        let text = self.active_input_box().palette_text();
+        self.sync_command_palette(&text);
     }
 
     /// Hands the log window to everything that has to agree about which `#`
@@ -2349,7 +2357,7 @@ impl App {
                 && self.active_subagent_has_composer()
                 && !self.subagent_input_box.is_empty()
             {
-                self.subagent_input_box.discard();
+                self.subagent_input_box.clear_undoably();
                 return Some(vec![]);
             }
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
@@ -2359,7 +2367,7 @@ impl App {
                 }
                 self.quit()
             } else {
-                self.input_box.discard();
+                self.input_box.clear_undoably();
                 vec![]
             });
         }
@@ -3144,15 +3152,16 @@ impl App {
     fn handle_command_action(&mut self, action: CommandAction) -> Option<Vec<Action>> {
         match action {
             CommandAction::Consumed => Some(Vec::new()),
-            CommandAction::Execute(cmd) => {
-                self.active_input_box_mut().discard();
-                Some(self.execute_command(cmd, 0))
-            }
-            CommandAction::Complete(text) => {
-                self.sync_command_palette(&text);
+            CommandAction::Run(completion) => {
                 let input = self.active_input_box_mut();
-                input.set_input(text);
-                input.buffer.move_to_end();
+                input.complete(&completion);
+                let command = ParsedCommand::from_line(&input.buffer.value());
+                input.discard();
+                Some(self.execute_command(command, 0))
+            }
+            CommandAction::Complete(completion) => {
+                self.active_input_box_mut().complete(&completion);
+                self.resync_dropdowns();
                 Some(Vec::new())
             }
             CommandAction::Passthrough => None,
@@ -4154,9 +4163,7 @@ impl App {
     }
 
     fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        let command_action = self
-            .command_palette
-            .handle_key(key, &self.subagent_input_box.buffer.value());
+        let command_action = self.command_palette.handle_key(key);
         if let Some(actions) = self.handle_command_action(command_action) {
             return actions;
         }
@@ -4169,6 +4176,10 @@ impl App {
             }
             InputAction::PaletteSync(val) => {
                 self.sync_dropdowns(&val);
+                vec![]
+            }
+            InputAction::CaretMoved => {
+                self.resync_command_palette();
                 vec![]
             }
             InputAction::Passthrough(key) => match key.code {
@@ -4209,8 +4220,12 @@ impl App {
         }
         if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
             self.start_image_paste();
-        } else if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_key(key) {
-            self.sync_dropdowns(&val);
+        } else {
+            match self.active_input_box_mut().handle_key(key) {
+                InputAction::PaletteSync(val) => self.sync_dropdowns(&val),
+                InputAction::CaretMoved => self.resync_command_palette(),
+                _ => {}
+            }
         }
         vec![]
     }
@@ -4694,9 +4709,7 @@ impl App {
             return actions;
         }
 
-        let command_action = self
-            .command_palette
-            .handle_key(key, &self.input_box.buffer.value());
+        let command_action = self.command_palette.handle_key(key);
         if let Some(actions) = self.handle_command_action(command_action) {
             return actions;
         }
@@ -4722,6 +4735,10 @@ impl App {
             }
             InputAction::PaletteSync(val) => {
                 self.sync_dropdowns(&val);
+                vec![]
+            }
+            InputAction::CaretMoved => {
+                self.resync_command_palette();
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -8000,7 +8017,7 @@ impl App {
             return;
         }
         let input = self.active_input_box_mut();
-        input.set_input(text);
+        input.buffer.replace_all(&text);
         input.move_to_end();
         self.resync_dropdowns();
     }

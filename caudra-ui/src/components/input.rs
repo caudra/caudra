@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::shell::parse_shell_prefix;
+use crate::components::command::Completion;
 use crate::components::keybindings::leader;
 use crate::highlight;
 use crate::input_document::{
@@ -178,6 +179,8 @@ pub enum InputAction {
     EditPaste(PasteId),
     ContinueLine,
     PaletteSync(String),
+    /// The caret moved without an edit, which only the slash palette reads.
+    CaretMoved,
     Passthrough(KeyEvent),
     None,
 }
@@ -238,7 +241,9 @@ pub struct InputBox {
     pub(crate) buffer: InputDocument,
     history: InputHistory,
     history_index: Option<usize>,
-    draft: InputDraft,
+    /// The draft set aside while history is browsed, kept whole so its undo
+    /// history is still there when the reader comes back to it.
+    parked: Option<InputDocument>,
     scroll_y: u16,
     follow_cursor: bool,
     placeholder_hint: &'static str,
@@ -307,9 +312,13 @@ impl InputBox {
             _ => {}
         }
 
-        match self.buffer.handle_key(key).changed() {
-            true => InputAction::PaletteSync(self.buffer.palette_text()),
-            false => InputAction::None,
+        let caret = self.buffer.cursor_offset();
+        if self.buffer.handle_key(key).changed() {
+            InputAction::PaletteSync(self.buffer.palette_text())
+        } else if self.buffer.cursor_offset() != caret {
+            InputAction::CaretMoved
+        } else {
+            InputAction::None
         }
     }
 
@@ -373,7 +382,7 @@ impl InputBox {
             buffer: InputDocument::new(),
             history,
             history_index: None,
-            draft: InputDraft::default(),
+            parked: None,
             scroll_y: 0,
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
@@ -512,10 +521,21 @@ impl InputBox {
     }
 
     pub fn discard(&mut self) {
+        self.buffer.clear();
+        self.forget_draft_state();
+    }
+
+    /// [`Self::discard`] as an edit the reader can undo. Attached images are
+    /// not text and stay gone.
+    pub fn clear_undoably(&mut self) {
+        self.buffer.replace_all("");
+        self.forget_draft_state();
+    }
+
+    fn forget_draft_state(&mut self) {
         self.pending_images.clear();
         self.history_index = None;
-        self.draft = InputDraft::default();
-        self.buffer.clear();
+        self.parked = None;
         self.scroll_y = 0;
     }
 
@@ -582,6 +602,12 @@ impl InputBox {
         self.buffer.move_to_end();
     }
 
+    pub(crate) fn complete(&mut self, completion: &Completion) {
+        self.follow_cursor = true;
+        self.buffer
+            .complete(completion.range.clone(), &completion.text, completion.caret);
+    }
+
     pub(crate) fn expand_pastes(&mut self) {
         self.buffer.expand_pastes();
     }
@@ -592,7 +618,7 @@ impl InputBox {
         }
         let new_index = match self.history_index {
             None => {
-                self.draft = self.buffer.draft();
+                self.parked = Some(mem::replace(&mut self.buffer, InputDocument::new()));
                 self.history.len() - 1
             }
             Some(0) => return,
@@ -614,8 +640,7 @@ impl InputBox {
             self.set_input(entry);
         } else {
             self.history_index = None;
-            let draft = mem::take(&mut self.draft);
-            self.set_draft(draft);
+            self.buffer = self.parked.take().unwrap_or_else(InputDocument::new);
         }
     }
 
@@ -1719,7 +1744,7 @@ mod tests {
         input.history_up();
         input.history_down();
         assert_eq!(input.buffer.value(), "line1\nline2");
-        assert!(input.is_at_first_line());
+        assert!(input.is_at_last_line());
 
         input.submit();
         input.history_up();
@@ -1935,6 +1960,45 @@ mod tests {
             "{EDIT_NOT_UNDONE}"
         );
         assert_eq!(input.buffer.display_text(), DRAFT, "{EDIT_NOT_UNDONE}");
+    }
+
+    #[test]
+    fn browsing_history_keeps_the_drafts_undo() {
+        const DRAFT: &str = "read src";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "earlier");
+        type_text(&mut input, DRAFT);
+        input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        input.history_up();
+        input.history_down();
+        input.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+
+        assert_eq!(input.buffer.display_text(), DRAFT, "{EDIT_NOT_UNDONE}");
+    }
+
+    #[test]
+    fn a_cleared_draft_comes_back_with_undo() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste("a\nb\nc");
+        type_text(&mut input, "explain");
+
+        input.clear_undoably();
+        assert!(input.is_empty());
+        input.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+
+        assert_eq!(input.buffer.value(), "a\nb\nc explain", "{EDIT_NOT_UNDONE}");
+        assert!(input.has_pastes(), "{EDIT_NOT_UNDONE}");
+    }
+
+    #[test]
+    fn a_caret_move_reports_itself() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "/go");
+        assert!(matches!(
+            input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            InputAction::CaretMoved
+        ));
     }
 
     fn reversed(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {

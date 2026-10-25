@@ -22,7 +22,6 @@ use tracing::{debug, warn};
 
 use crate::app::App;
 use crate::components::Action;
-use crate::components::command::CommandAction;
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::logs_modal::LogsAction;
 use crate::components::workflow_catalog_picker::WorkflowCatalogAction;
@@ -679,9 +678,13 @@ impl App {
                 self.copy_to_clipboard(&text);
                 Vec::new()
             }
-            WorkflowCatalogAction::Launch(name) => self
-                .handle_command_action(CommandAction::Complete(format!("/workflow {name} ")))
-                .unwrap_or_default(),
+            WorkflowCatalogAction::Launch(name) => {
+                let input = self.active_input_box_mut();
+                input.buffer.replace_all(&format!("/workflow {name} "));
+                input.move_to_end();
+                self.resync_dropdowns();
+                Vec::new()
+            }
             WorkflowCatalogAction::Trust { name, digest } => {
                 self.workflow
                     .dispatch(Intent::Trust, WorkflowRequest::Trust { name, digest });

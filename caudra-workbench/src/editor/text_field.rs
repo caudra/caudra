@@ -231,7 +231,17 @@ fn super_chord(code: KeyCode, extend: bool) -> Option<TextCommand> {
         KeyCode::Backspace => editing(EditCommand::KillToLineStart),
         KeyCode::Left => moving(Motion::Home, extend),
         KeyCode::Right => moving(Motion::End, extend),
+        KeyCode::Char('z' | 'Z') => Some(undo_or_redo(code, extend)),
         _ => None,
+    }
+}
+
+/// `Shift` turns undo into redo, the way every macOS editor and most Linux
+/// ones read it. A terminal may report the chord as an uppercase letter.
+fn undo_or_redo(code: KeyCode, extend: bool) -> TextCommand {
+    match extend || code == KeyCode::Char('Z') {
+        true => TextCommand::Redo,
+        false => TextCommand::Undo,
     }
 }
 
@@ -242,7 +252,7 @@ fn control_chord(code: KeyCode, kind: FieldKind, extend: bool) -> Option<TextCom
         KeyCode::Char('k') => editing(EditCommand::KillToLineEnd),
         KeyCode::Enter | KeyCode::Char('j') if kind != FieldKind::Line => newline(kind),
         KeyCode::Char('a') => Some(TextCommand::SelectAll),
-        KeyCode::Char('z') => Some(TextCommand::Undo),
+        KeyCode::Char('z' | 'Z') => Some(undo_or_redo(code, extend)),
         KeyCode::Char('y') => Some(TextCommand::Redo),
         KeyCode::Char('c') => Some(TextCommand::Copy),
         KeyCode::Char('e') => moving(Motion::End, extend),
@@ -833,6 +843,11 @@ mod tests {
     #[test_case(ctrl(KeyCode::Char('a')), LINE => Some(TextCommand::SelectAll); "ctrl a selects all")]
     #[test_case(ctrl(KeyCode::Char('z')), LINE => Some(TextCommand::Undo); "ctrl z undoes")]
     #[test_case(ctrl(KeyCode::Char('y')), LINE => Some(TextCommand::Redo); "ctrl y redoes")]
+    #[test_case(press(KeyCode::Char('z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), LINE => Some(TextCommand::Redo); "ctrl shift z redoes")]
+    #[test_case(press(KeyCode::Char('Z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), LINE => Some(TextCommand::Redo); "ctrl shift uppercase z redoes")]
+    #[test_case(ctrl(KeyCode::Char('Z')), LINE => Some(TextCommand::Redo); "ctrl uppercase z redoes")]
+    #[test_case(press(KeyCode::Char('z'), KeyModifiers::SUPER), LINE => Some(TextCommand::Undo); "super z undoes")]
+    #[test_case(press(KeyCode::Char('z'), KeyModifiers::SUPER | KeyModifiers::SHIFT), LINE => Some(TextCommand::Redo); "super shift z redoes")]
     #[test_case(ctrl(KeyCode::Char('c')), LINE => Some(TextCommand::Copy); "ctrl c copies")]
     #[test_case(plain(KeyCode::Left), LINE => to(Motion::Left); "left")]
     #[test_case(shift(KeyCode::Right), LINE => extending(Motion::Right); "shift right extends")]
@@ -876,6 +891,7 @@ mod tests {
     #[test_case(keys::SELECT_ALL, TextCommand::SelectAll; "select all")]
     #[test_case(keys::UNDO, TextCommand::Undo; "undo")]
     #[test_case(keys::REDO, TextCommand::Redo; "redo")]
+    #[test_case(keys::REDO_SHIFTED, TextCommand::Redo; "redo shifted")]
     #[test_case(keys::COPY, TextCommand::Copy; "copy")]
     #[test_case(keys::CUT, TextCommand::Cut; "cut")]
     #[test_case(keys::LINE_END, TextCommand::Move { motion: Motion::End, extend: false }; "line end")]

@@ -4609,6 +4609,62 @@ fn typing_filters_palette() {
     assert!(!app.command_palette.is_active());
 }
 
+const WRITTEN_PROMPT: &str = "Fix the login bug ";
+const DRAFT_LOST: &str = "Tab completion must keep the prompt written after the command";
+const COMPLETION_NOT_UNDONE: &str = "one Ctrl+Z must take a completion back";
+const CLEAR_NOT_UNDONE: &str = "Ctrl+Z must bring back a draft Ctrl+C cleared";
+
+fn ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
+#[test]
+fn tab_completion_keeps_the_prompt_after_the_command() {
+    let mut app = test_app();
+    app.input_box.set_input(WRITTEN_PROMPT.into());
+    app.input_box.move_to_end();
+    app.input_box.handle_paste("a\nb\nc");
+    app.input_box.buffer.set_cursor(0, 0);
+    for character in "/goal".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    assert!(app.command_palette.is_active());
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("/goal {WRITTEN_PROMPT}a\nb\nc "),
+        "{DRAFT_LOST}"
+    );
+    assert!(app.input_box.has_pastes(), "{DRAFT_LOST}");
+    assert_eq!(app.input_box.buffer.cursor_offset(), "/goal ".len());
+
+    app.update(Msg::Key(ctrl(KeyCode::Char('z'))));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("/goal{WRITTEN_PROMPT}a\nb\nc "),
+        "{COMPLETION_NOT_UNDONE}"
+    );
+    assert!(app.input_box.has_pastes(), "{COMPLETION_NOT_UNDONE}");
+}
+
+#[test]
+fn ctrl_c_clears_a_draft_undoably() {
+    let mut app = test_app();
+    app.input_box.set_input(WRITTEN_PROMPT.into());
+    app.input_box.move_to_end();
+
+    app.update(Msg::Key(ctrl(KeyCode::Char('c'))));
+    assert!(app.input_box.is_empty());
+    app.update(Msg::Key(ctrl(KeyCode::Char('z'))));
+
+    assert_eq!(
+        app.input_box.buffer.value(),
+        WRITTEN_PROMPT,
+        "{CLEAR_NOT_UNDONE}"
+    );
+}
+
 #[test]
 fn enter_executes_new_command() {
     let mut app = test_app();

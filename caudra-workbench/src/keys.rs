@@ -140,6 +140,11 @@ pub const SUPER_HOME: Bind = bind!(KeyCode::Left, SUPER, "Super+←");
 pub const SUPER_END: Bind = bind!(KeyCode::Right, SUPER, "Super+→");
 pub const TEXT_START: Bind = bind!(KeyCode::Home, CTRL, "Ctrl+Home");
 pub const TEXT_END: Bind = bind!(KeyCode::End, CTRL, "Ctrl+End");
+pub const REDO_SHIFTED: Bind = bind!(
+    KeyCode::Char('z'),
+    CTRL.union(KeyModifiers::SHIFT),
+    "Ctrl+Shift+Z"
+);
 /// A list under a one-line field takes the text-start chords for its own
 /// ends, which on one line would only repeat `Home` and `End` anyway. Bare
 /// `Home` and `End` reach the list too while the field is empty, since there

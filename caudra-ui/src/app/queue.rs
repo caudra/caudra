@@ -968,6 +968,7 @@ impl App {
             InputAction::Passthrough(_)
             | InputAction::ContinueLine
             | InputAction::PaletteSync(_)
+            | InputAction::CaretMoved
             | InputAction::None => Vec::new(),
         }
     }

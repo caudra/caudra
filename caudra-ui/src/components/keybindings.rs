@@ -1048,7 +1048,12 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
-        description: "Undo / redo",
+        description: "Undo / redo, paste chips included",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::REDO_SHIFTED.label),
+        description: "Redo",
         context: KeybindContext::TextFields,
     },
     Keybind {
@@ -1545,7 +1550,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
-        description: "Complete command",
+        description: "Complete the command word and keep the rest of the draft",
         context: KeybindContext::CommandPalette,
     },
     Keybind {
@@ -2623,6 +2628,7 @@ mod tests {
     #[test_case(wb::SELECT_ALL ; "select_all")]
     #[test_case(wb::UNDO ; "undo")]
     #[test_case(wb::REDO ; "redo")]
+    #[test_case(wb::REDO_SHIFTED ; "redo_shifted")]
     #[test_case(wb::COPY ; "copy")]
     #[test_case(wb::CUT ; "cut")]
     #[test_case(wb::WORD_LEFT ; "word_left")]

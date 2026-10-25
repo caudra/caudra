@@ -12,7 +12,11 @@ surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to cop
 the answer, and the permissions picker keeps `Ctrl+E` to edit, `Ctrl+K` to revoke, \
 and `Ctrl+Y` to copy a rule. In a list, `Home` and `End` move the cursor in its \
 filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.\n\n\
-`Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as \
+`Ctrl+Z` is undo everywhere, so it never suspends Caudra. `Ctrl+Shift+Z` and \
+`Super+Shift+Z` also redo, and `Super+Z` also undoes. In the composer, a command \
+completion and `Ctrl+C` clearing the draft each undo in one step, and undo brings a \
+deleted paste chip back with its content. Attached images are not part of undo. A \
+masked field, such as \
 an API key, refuses to select all, copy, or cut. A terminal paste goes to the field \
 that has focus. `Super` chords need a terminal that reports them, such as one with \
 the kitty keyboard protocol.\n\n";

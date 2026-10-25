@@ -34,11 +34,20 @@ struct PasteSpan {
     text: String,
 }
 
+/// The chips an edit took out and put in, with ranges relative to where the
+/// edit starts. The display buffer only knows a chip's label, so this is what
+/// lets undo bring back the paste a label stands for instead of the label.
+#[derive(Debug, Clone)]
+struct ChipChange {
+    removed: Vec<PasteSpan>,
+    inserted: Vec<PasteSpan>,
+}
+
 pub(crate) struct InputDocument {
     display: Buffer,
     /// Undo for the composer, coalesced into gestures by the same rules the
     /// workbench's editor uses.
-    history: History,
+    history: History<ChipChange>,
     pastes: Vec<PasteSpan>,
     next_paste_id: u64,
 }
@@ -197,26 +206,105 @@ impl InputDocument {
 
     /// Steps back through the undo history, reporting whether anything moved.
     pub fn undo(&mut self) -> bool {
-        self.replay(History::undo)
+        let Some((edit, chips)) = self.history.undo_tagged() else {
+            return false;
+        };
+        self.replay(&edit, chips.map(|chips| chips.removed));
+        true
     }
 
     pub fn redo(&mut self) -> bool {
-        self.replay(History::redo)
-    }
-
-    /// A replayed edit moves every offset after it, and a chip the edit covered
-    /// is gone for good: undo restores the text, not the summary it stood
-    /// behind, which is the same trade expanding a paste already makes.
-    fn replay(&mut self, step: impl Fn(&mut History) -> Option<Edit>) -> bool {
-        let Some(edit) = step(&mut self.history) else {
+        let Some((edit, chips)) = self.history.redo_tagged() else {
             return false;
         };
+        self.replay(&edit, chips.map(|chips| chips.inserted));
+        true
+    }
+
+    /// A replayed edit moves every offset after it and drops the chips its
+    /// range covers. The chips the step had taken out go back with their
+    /// content and their ids, which nothing else can hold: ids only grow.
+    fn replay(&mut self, edit: &Edit, restored: Option<Vec<PasteSpan>>) {
         let at = self.offset_of(edit.at);
         let removed = edit.removed.chars().count();
         let inserted = edit.inserted.chars().count();
-        self.display.replay(&edit);
+        self.display.replay(edit);
         self.apply_change(at..at + removed, inserted);
-        true
+        self.place_chips(at, restored.unwrap_or_default());
+        self.normalize_cursor(CursorDirection::Nearest);
+    }
+
+    /// Replaces the whole draft as one undo step, chips included, so a
+    /// completion or a clear can be taken back like any other edit.
+    pub fn replace_all(&mut self, text: &str) {
+        if self.pastes.is_empty() && self.display_text() == text {
+            return;
+        }
+        self.history.break_group();
+        self.splice(0..self.char_count(), text, Vec::new());
+        self.history.break_group();
+    }
+
+    /// Splices `text` over `palette_range`, offsets in [`Self::palette_text`],
+    /// and leaves the caret `caret` chars past where the splice starts. One
+    /// undo step, and nothing outside the range moves.
+    pub fn complete(&mut self, palette_range: Range<usize>, text: &str, caret: usize) {
+        let range = self.palette_to_display(palette_range.start)
+            ..self.palette_to_display(palette_range.end);
+        let display = self.display_text();
+        let start = if char_slice(&display, range.clone()) == text
+            && !self
+                .pastes
+                .iter()
+                .any(|paste| ranges_intersect(&range, &paste.range))
+        {
+            range.start
+        } else {
+            self.history.break_group();
+            let start = self.splice(range, text, Vec::new());
+            self.history.break_group();
+            start
+        };
+        let caret = self.cursor_of(start + caret);
+        self.set_caret(caret, false);
+    }
+
+    /// The caret as an offset into [`Self::palette_text`].
+    pub fn palette_caret(&self) -> usize {
+        let cursor = self.cursor_offset();
+        let folded: usize = self
+            .pastes
+            .iter()
+            .take_while(|paste| paste.range.end <= cursor)
+            .map(|paste| paste.range.len() - PALETTE_TOKEN.len())
+            .sum();
+        (cursor - folded).min(self.palette_text().chars().count())
+    }
+
+    /// Maps an offset in [`Self::palette_text`] onto the display text. An
+    /// offset inside a chip's token lands on the chip's start, and the end of
+    /// the palette text is the end of the draft, past the space it trims.
+    fn palette_to_display(&self, offset: usize) -> usize {
+        if offset >= self.palette_text().chars().count() {
+            return self.char_count();
+        }
+        let mut folded = 0;
+        for paste in &self.pastes {
+            let token_start = paste.range.start - folded;
+            if offset <= token_start {
+                break;
+            }
+            if offset < token_start + PALETTE_TOKEN.len() {
+                return paste.range.start;
+            }
+            folded += paste.range.len() - PALETTE_TOKEN.len();
+        }
+        offset + folded
+    }
+
+    fn char_count(&self) -> usize {
+        let last = self.display.line_count().saturating_sub(1);
+        self.offset_of(Cursor::new(last, self.display.line(last).chars().count()))
     }
 
     pub fn has_pastes(&self) -> bool {
@@ -253,24 +341,14 @@ impl InputDocument {
     pub fn insert_paste(&mut self, text: &str) -> PasteId {
         let text = sanitize_paste(text);
         let label = paste_summary_label(&text);
-        let start = self.cursor_offset();
-        let inserted = format!("{label} ");
-        self.insert_text(&inserted);
-
         let id = PasteId(self.next_paste_id);
         self.next_paste_id += 1;
-        let end = start + label.chars().count();
-        let index = self
-            .pastes
-            .partition_point(|paste| paste.range.start < start);
-        self.pastes.insert(
-            index,
-            PasteSpan {
-                id,
-                range: start..end,
-                text,
-            },
-        );
+        let chip = PasteSpan {
+            id,
+            range: 0..label.chars().count(),
+            text,
+        };
+        self.splice(self.edit_range(), &format!("{label} "), vec![chip]);
         id
     }
 
@@ -435,27 +513,22 @@ impl InputDocument {
     }
 
     pub fn update_paste(&mut self, id: PasteId, text: &str) -> bool {
-        let Some(index) = self.pastes.iter().position(|paste| paste.id == id) else {
+        let Some(paste) = self.pastes.iter().find(|paste| paste.id == id) else {
             return false;
         };
+        let old_range = paste.range.clone();
         let text = sanitize_paste(text);
         let label = paste_summary_label(&text);
-        let old_range = self.pastes[index].range.clone();
         let old_len = old_range.len();
         let new_len = label.chars().count();
         let cursor = self.cursor_offset();
 
-        let start = self.cursor_of(old_range.start);
-        let end = self.cursor_of(old_range.end);
-        self.display.set_cursor(start, false);
-        self.display.set_cursor(end, true);
-        if let Some(edit) = self.display.insert(&label) {
-            self.history.record(edit);
-        }
-
-        self.pastes[index].range = old_range.start..old_range.start + new_len;
-        self.pastes[index].text = text;
-        shift_spans(&mut self.pastes[index + 1..], old_len, new_len);
+        let chip = PasteSpan {
+            id,
+            range: 0..new_len,
+            text,
+        };
+        self.splice(old_range.clone(), &label, vec![chip]);
 
         let cursor = if cursor <= old_range.start {
             cursor
@@ -498,10 +571,11 @@ impl InputDocument {
     }
 
     pub fn expand_pastes(&mut self) {
-        self.display = buffer_of(&self.expanded_text());
+        if self.pastes.is_empty() {
+            return;
+        }
+        self.replace_all(&self.expanded_text());
         self.display.move_document_end(false);
-        self.history = History::default();
-        self.pastes.clear();
     }
 
     fn project<'a>(&'a self, replacement: impl Fn(&'a PasteSpan) -> &'a str) -> String {
@@ -534,7 +608,20 @@ impl InputDocument {
     /// Splices `inserted` over a char range. A range that reaches into a paste
     /// chip swallows the whole chip: half a summary stands for nothing, and a
     /// selection that straddles one is the ordinary way to reach that state.
-    fn replace(&mut self, mut removed: Range<usize>, inserted: &str) {
+    fn replace(&mut self, removed: Range<usize>, inserted: &str) {
+        self.splice(removed, inserted, Vec::new());
+    }
+
+    /// [`Self::replace`], putting `chips` (ranges relative to `inserted`) in
+    /// with the text, and recording every chip that goes or comes with the
+    /// edit so undo and redo can put them back. Returns where the splice
+    /// started once the range had swallowed the chips it reached into.
+    fn splice(
+        &mut self,
+        mut removed: Range<usize>,
+        inserted: &str,
+        chips: Vec<PasteSpan>,
+    ) -> usize {
         loop {
             let mut expanded = removed.clone();
             for paste in &self.pastes {
@@ -554,9 +641,35 @@ impl InputDocument {
         self.display.set_cursor(start, false);
         self.display.set_cursor(end, true);
         if let Some(edit) = self.display.insert(inserted) {
-            self.history.record(edit);
+            let swallowed: Vec<PasteSpan> = self
+                .pastes
+                .iter()
+                .filter(|paste| ranges_intersect(&removed, &paste.range))
+                .map(|paste| PasteSpan {
+                    range: paste.range.start - removed.start..paste.range.end - removed.start,
+                    ..paste.clone()
+                })
+                .collect();
+            let tag = (!swallowed.is_empty() || !chips.is_empty()).then(|| ChipChange {
+                removed: swallowed,
+                inserted: chips.clone(),
+            });
+            self.history.record_tagged(edit, tag);
         }
-        self.apply_change(removed, inserted.chars().count());
+        self.apply_change(removed.clone(), inserted.chars().count());
+        self.place_chips(removed.start, chips);
+        removed.start
+    }
+
+    /// Puts `chips`, ranges relative to `at`, back in order.
+    fn place_chips(&mut self, at: usize, chips: Vec<PasteSpan>) {
+        for mut chip in chips {
+            chip.range = at + chip.range.start..at + chip.range.end;
+            let index = self
+                .pastes
+                .partition_point(|paste| paste.range.start < chip.range.start);
+            self.pastes.insert(index, chip);
+        }
     }
 
     /// The range an edit acts on: the selection when there is one, otherwise
@@ -732,13 +845,6 @@ fn shift_offset(offset: usize, removed_len: usize, inserted_len: usize) -> usize
         offset + inserted_len - removed_len
     } else {
         offset - (removed_len - inserted_len)
-    }
-}
-
-fn shift_spans(spans: &mut [PasteSpan], removed_len: usize, inserted_len: usize) {
-    for span in spans {
-        span.range.start = shift_offset(span.range.start, removed_len, inserted_len);
-        span.range.end = shift_offset(span.range.end, removed_len, inserted_len);
     }
 }
 
@@ -1065,6 +1171,164 @@ mod tests {
         }
 
         assert_eq!(document.selected_text().as_deref(), Some("Review a\nb\nc "));
+    }
+
+    const CHIP_NOT_RESTORED: &str = "undo must bring a chip back with the paste it stands for";
+    const REDO_LOST: &str = "redo must reapply the edit undo took back";
+    const COMPLETION_SPREAD: &str = "a completion must leave everything outside its range alone";
+    const WITH_PASTE: &str = "Review a\nb\nc ";
+    const CHIP_DISPLAY: &str = "Review [Pasted 3 lines] ";
+
+    fn undo(document: &mut InputDocument) {
+        document.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    }
+
+    fn redo(document: &mut InputDocument) {
+        document.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    }
+
+    fn command_with_chip() -> InputDocument {
+        let mut document = InputDocument::from_plain("/cd ".into());
+        document.move_to_end();
+        document.insert_paste(PASTE_BODY);
+        document.insert_text("next");
+        document
+    }
+
+    #[test]
+    fn undoing_a_deleted_chip_brings_its_paste_back() {
+        let mut document = with_one_paste();
+        document.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        document.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(document.display_text(), "Review  ");
+
+        undo(&mut document);
+        assert_eq!(document.display_text(), CHIP_DISPLAY, "{CHIP_NOT_RESTORED}");
+        assert_eq!(document.value(), WITH_PASTE, "{CHIP_NOT_RESTORED}");
+
+        redo(&mut document);
+        assert_eq!(document.value(), "Review  ", "{REDO_LOST}");
+        assert!(!document.has_pastes(), "{REDO_LOST}");
+    }
+
+    #[test]
+    fn typing_over_a_selected_chip_undoes_and_redoes() {
+        let mut document = with_one_paste();
+        document.select_all();
+        document.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(document.value(), "x");
+
+        undo(&mut document);
+        assert_eq!(document.value(), WITH_PASTE, "{CHIP_NOT_RESTORED}");
+        assert!(document.has_pastes(), "{CHIP_NOT_RESTORED}");
+
+        redo(&mut document);
+        assert_eq!(document.value(), "x", "{REDO_LOST}");
+        assert!(!document.has_pastes(), "{REDO_LOST}");
+    }
+
+    #[test]
+    fn undoing_an_edited_paste_restores_its_old_content() {
+        let mut document = with_one_paste();
+        let id = document.insert_paste("d\ne\nf");
+        document.update_paste(id, "one line");
+
+        undo(&mut document);
+        assert_eq!(
+            document.paste_text(id),
+            Some("d\ne\nf"),
+            "{CHIP_NOT_RESTORED}"
+        );
+        assert_eq!(document.value(), "Review a\nb\nc d\ne\nf ");
+
+        redo(&mut document);
+        assert_eq!(document.paste_text(id), Some("one line"), "{REDO_LOST}");
+    }
+
+    #[test]
+    fn undoing_an_expansion_folds_the_chips_again() {
+        let mut document = with_one_paste();
+        document.expand_pastes();
+        assert!(!document.has_pastes());
+        assert_eq!(document.display_text(), WITH_PASTE);
+
+        undo(&mut document);
+        assert_eq!(document.display_text(), CHIP_DISPLAY, "{CHIP_NOT_RESTORED}");
+        assert_eq!(document.value(), WITH_PASTE, "{CHIP_NOT_RESTORED}");
+    }
+
+    #[test]
+    fn undoing_a_paste_removes_its_chip() {
+        let mut document = InputDocument::from_plain("Review ".into());
+        document.move_to_end();
+        document.insert_paste(PASTE_BODY);
+
+        undo(&mut document);
+        assert_eq!(document.display_text(), "Review ");
+        assert!(!document.has_pastes());
+
+        redo(&mut document);
+        assert_eq!(document.value(), WITH_PASTE, "{REDO_LOST}");
+    }
+
+    #[test]
+    fn replacing_everything_is_one_undo_step() {
+        let mut document = with_one_paste();
+        document.replace_all("");
+        assert_eq!(document.value(), "");
+
+        undo(&mut document);
+        assert_eq!(document.value(), WITH_PASTE, "{CHIP_NOT_RESTORED}");
+        assert_eq!(document.display_text(), CHIP_DISPLAY);
+    }
+
+    #[test_case(0, 0 ; "start")]
+    #[test_case(3, 3 ; "before_the_chip")]
+    #[test_case(4, 4 ; "chip_start")]
+    #[test_case(6, 4 ; "inside_the_token")]
+    #[test_case(9, 20 ; "chip_end")]
+    #[test_case(10, 21 ; "after_the_chip")]
+    #[test_case(14, 25 ; "end")]
+    fn a_palette_offset_maps_onto_the_display(palette: usize, display: usize) {
+        let document = command_with_chip();
+        assert_eq!(document.palette_text(), "/cd paste next");
+        assert_eq!(document.palette_to_display(palette), display);
+    }
+
+    #[test]
+    fn the_end_of_the_palette_is_the_end_of_the_draft() {
+        let document = with_one_paste();
+        let palette_end = document.palette_text().chars().count();
+        assert_eq!(
+            document.palette_to_display(palette_end),
+            CHIP_DISPLAY.chars().count()
+        );
+    }
+
+    #[test]
+    fn the_caret_reads_in_palette_offsets() {
+        let mut document = command_with_chip();
+        assert_eq!(document.palette_caret(), "/cd paste next".len());
+        document.set_cursor(0, 2);
+        assert_eq!(document.palette_caret(), 2);
+    }
+
+    #[test]
+    fn a_completion_keeps_the_chips_and_text_after_it() {
+        let mut document = InputDocument::from_plain("/c ".into());
+        document.move_to_end();
+        document.insert_paste(PASTE_BODY);
+        document.insert_text("next");
+        document.set_cursor(0, 2);
+
+        document.complete(0..2, "/cd", 4);
+        assert_eq!(document.value(), "/cd a\nb\nc next", "{COMPLETION_SPREAD}");
+        assert!(document.has_pastes(), "{COMPLETION_SPREAD}");
+        assert_eq!(document.cursor_offset(), 4);
+
+        undo(&mut document);
+        assert_eq!(document.value(), "/c a\nb\nc next", "{CHIP_NOT_RESTORED}");
+        assert!(document.has_pastes(), "{CHIP_NOT_RESTORED}");
     }
 
     /// The caret is kept off the middle of a chip, so this range is not one the

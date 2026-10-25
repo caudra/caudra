@@ -74,7 +74,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 
 These keys work the same in every text field: the composer, a picker's filter, forms and prompts, `/btw`, and the workbench editor with its fields. Where a surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy the answer, and the permissions picker keeps `Ctrl+E` to edit, `Ctrl+K` to revoke, and `Ctrl+Y` to copy a rule. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.
 
-`Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as an API key, refuses to select all, copy, or cut. A terminal paste goes to the field that has focus. `Super` chords need a terminal that reports them, such as one with the kitty keyboard protocol.
+`Ctrl+Z` is undo everywhere, so it never suspends Caudra. `Ctrl+Shift+Z` and `Super+Shift+Z` also redo, and `Super+Z` also undoes. In the composer, a command completion and `Ctrl+C` clearing the draft each undo in one step, and undo brings a deleted paste chip back with its content. Attached images are not part of undo. A masked field, such as an API key, refuses to select all, copy, or cut. A terminal paste goes to the field that has focus. `Super` chords need a terminal that reports them, such as one with the kitty keyboard protocol.
 
 | Key | Action |
 |-----|--------|
@@ -83,7 +83,8 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | `Ctrl+K` | Delete to the end of the line, or join the next line at its end |
 | `Super+Backspace` | Delete to the start of the line |
 | `Ctrl+A` | Select all |
-| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo, paste chips included |
+| `Ctrl+Shift+Z` | Redo |
 | `Ctrl+C` | Copy the selection, or run the surface's own action when nothing is selected |
 | `Shift+Delete` | Cut the selection |
 | `Ctrl+←` / `Ctrl+→` | Move by word |
@@ -260,7 +261,7 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `b` | Toggle send together |
 | Queue | `.` | Open item actions |
 | Queue | `r` | Replace current run |
-| Commands | `Tab` | Complete command |
+| Commands | `Tab` | Complete the command word and keep the rest of the draft |
 | Model Picker | `Ctrl+F` | Toggle favorite model |
 | Model Picker | `R` | Clear job binding |
 | Session Picker | `Ctrl+N` | New session |

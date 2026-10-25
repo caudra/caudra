@@ -3,7 +3,7 @@ title: "Commands"
 description: "The / palette, sessions, toggles, custom commands."
 ---
 
-Type `/` in the input box to open the command palette.
+Type `/` in the input box to open the command palette. `Tab` completes the command word, up to the cursor, and keeps the rest of the draft, so a `/` typed in front of a written prompt makes the prompt the command's arguments. `Ctrl+Z` takes a completion back.
 
 ## Built-in commands
 

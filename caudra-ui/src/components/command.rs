@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +22,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use crate::components::list_picker::{DISABLED_DIM, PickerItem};
 use crate::components::match_spans;
 use crate::components::mcp_completion::{CompletionAsk, McpCompleter};
+use crate::input_document::char_to_byte;
 use crate::repaint::Dirty;
 use crate::theme;
 
@@ -616,10 +618,33 @@ pub struct ParsedCommand {
     pub args: String,
 }
 
+impl ParsedCommand {
+    /// The command a composer line runs: its first word, and the rest as
+    /// arguments.
+    pub fn from_line(line: &str) -> Self {
+        let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        Self {
+            name: name.to_owned(),
+            args: args.trim().to_owned(),
+        }
+    }
+}
+
+/// An edit the palette asks of the composer: `text` over `range`, in chars of
+/// the palette text it was synced with, and the caret `caret` chars past the
+/// range's start. Everything outside the range stays as the reader left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub range: Range<usize>,
+    pub text: String,
+    pub caret: usize,
+}
+
 pub enum CommandAction {
     Consumed,
-    Execute(ParsedCommand),
-    Complete(String),
+    /// Complete the command, then run what the composer then holds.
+    Run(Completion),
+    Complete(Completion),
     Passthrough,
 }
 
@@ -681,6 +706,11 @@ pub struct CommandPalette {
     features: FeatureFlags,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
+    /// The palette text last synced, which every completion is measured in.
+    input: String,
+    /// Where the command word being typed ends in [`Self::input`], in bytes:
+    /// at the first space, or at the caret when it sits inside the word.
+    token_end: usize,
     current_arg_count: usize,
     /// First visible row. The popup is capped by the space above the input, so
     /// a long list has rows that only scrolling reaches.
@@ -741,6 +771,8 @@ impl CommandPalette {
             features,
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
+            input: String::new(),
+            token_end: 0,
             current_arg_count: 0,
             scroll_offset: 0,
             viewport_height: 0,
@@ -842,11 +874,11 @@ impl CommandPalette {
         nucleo
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, input: &str) -> CommandAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> CommandAction {
         if !self.is_active() {
             return CommandAction::Passthrough;
         }
-        if let Some(action) = self.handle_value_key(key, input) {
+        if let Some(action) = self.handle_value_key(key) {
             return action;
         }
         match key.code {
@@ -862,25 +894,35 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => self.activate_selected(input),
-            KeyCode::Tab => {
-                if let Some(item) = self.filtered.get(self.selected) {
-                    let name = self.item_name(item);
-                    let text = if self.item_has_args(item) {
-                        format!("{name} ")
-                    } else {
-                        name
-                    };
-                    CommandAction::Complete(text)
-                } else {
-                    CommandAction::Consumed
-                }
-            }
+            KeyCode::Enter => self.activate_selected(),
+            KeyCode::Tab => self
+                .completion()
+                .map_or(CommandAction::Consumed, CommandAction::Complete),
             _ => CommandAction::Passthrough,
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent, input: &str) -> CommandAction {
+    /// The selected command spliced over the word being typed. A space goes
+    /// between it and whatever follows unless one is already there, so a
+    /// command put in front of a written prompt takes the prompt as its
+    /// arguments, and the caret lands where those arguments start.
+    fn completion(&self) -> Option<Completion> {
+        let item = self.filtered.get(self.selected)?;
+        let name = self.item_name(item);
+        let tail = &self.input[self.token_end..];
+        let takes_rest = self.item_has_args(item) || !tail.is_empty();
+        let separator = match takes_rest && !tail.starts_with(char::is_whitespace) {
+            true => " ",
+            false => "",
+        };
+        Some(Completion {
+            range: 0..self.input[..self.token_end].chars().count(),
+            caret: name.chars().count() + usize::from(takes_rest),
+            text: format!("{name}{separator}"),
+        })
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> CommandAction {
         let position = Position::new(event.column, event.row);
         let over_popup = self.popup_area.is_some_and(|area| area.contains(position));
 
@@ -937,7 +979,7 @@ impl CommandPalette {
                     return CommandAction::Consumed;
                 }
                 self.selected = filtered_index;
-                self.activate_selected(input)
+                self.activate_selected()
             }
             _ => CommandAction::Consumed,
         }
@@ -949,7 +991,7 @@ impl CommandPalette {
 
     /// Up and Down walk the suggested values and Tab takes one; Enter still
     /// runs the command as typed.
-    fn handle_value_key(&mut self, key: KeyEvent, input: &str) -> Option<CommandAction> {
+    fn handle_value_key(&mut self, key: KeyEvent) -> Option<CommandAction> {
         if self.values.is_empty() {
             return None;
         }
@@ -962,8 +1004,13 @@ impl CommandPalette {
                 let argument = self.argument.as_ref()?;
                 let value = self.values.get(self.value_selected)?;
                 let separator = if argument.last { "" } else { " " };
-                let head = input.get(..argument.start)?;
-                return Some(CommandAction::Complete(format!("{head}{value}{separator}")));
+                let text = format!("{value}{separator}");
+                let start = self.input.get(..argument.start)?.chars().count();
+                return Some(CommandAction::Complete(Completion {
+                    range: start..self.input.chars().count(),
+                    caret: text.chars().count(),
+                    text,
+                }));
             }
             _ => return None,
         }
@@ -1139,26 +1186,30 @@ impl CommandPalette {
         }
     }
 
-    pub fn sync(&mut self, input: &str, task_focused: bool) {
+    /// Filters on the command word `input` starts with, `caret` chars in. A
+    /// caret inside the word cuts it there, so a command typed in front of a
+    /// written prompt matches on what was typed, not on the prompt it touches.
+    pub fn sync(&mut self, input: &str, caret: usize, task_focused: bool) {
         self.invalidate_mouse_geometry();
         self.refresh_sources();
         self.task_focused = task_focused;
-        let Some(stripped) = input.strip_prefix('/') else {
+        input.clone_into(&mut self.input);
+        if !input.starts_with('/') {
             self.filtered.clear();
             self.current_arg_count = 0;
             self.clear_argument();
             return;
-        };
+        }
 
-        let parts: Vec<&str> = stripped.split_whitespace().collect();
-        let cmd_word = parts.first().copied().unwrap_or(stripped);
-        let trailing_space = stripped.ends_with(char::is_whitespace);
-
-        self.current_arg_count = if trailing_space {
-            parts.len()
-        } else {
-            parts.len().saturating_sub(1)
+        let word_end = input.find(char::is_whitespace).unwrap_or(input.len());
+        self.token_end = match char_to_byte(input, caret) {
+            0 => word_end,
+            caret => caret.min(word_end),
         };
+        let cmd_word = &input[1..self.token_end];
+        let tail = &input[self.token_end..];
+        self.current_arg_count =
+            tail.split_whitespace().count() + usize::from(tail.ends_with(char::is_whitespace));
 
         self.nucleo.pattern.reparse(
             0,
@@ -1334,25 +1385,25 @@ impl CommandPalette {
         self.task_focused && Self::scope_of(&m.command_type) == ChatScope::MainOnly
     }
 
-    pub fn confirm(&self, input: &str) -> Option<ParsedCommand> {
-        let item = self.filtered.get(self.selected)?;
-        let name = self.item_name(item);
-        let args = input
-            .strip_prefix('/')
-            .and_then(|s| s.split_once(char::is_whitespace))
-            .map(|(_, a)| a.trim())
-            .unwrap_or("");
-        Some(ParsedCommand {
-            name,
-            args: args.to_string(),
-        })
+    #[cfg(test)]
+    pub fn sync_typed(&mut self, input: &str, task_focused: bool) {
+        self.sync(input, input.chars().count(), task_focused);
     }
 
-    fn activate_selected(&mut self, input: &str) -> CommandAction {
-        match self.confirm(input) {
-            Some(cmd) => {
+    /// What Enter would run on the synced text, which holds no paste chips.
+    #[cfg(test)]
+    pub fn confirm(&self) -> Option<ParsedCommand> {
+        let completion = self.completion()?;
+        let range = char_to_byte(&self.input, completion.range.end);
+        let line = format!("{}{}", completion.text, &self.input[range..]);
+        Some(ParsedCommand::from_line(&line))
+    }
+
+    fn activate_selected(&mut self) -> CommandAction {
+        match self.completion() {
+            Some(completion) => {
                 self.close();
-                CommandAction::Execute(cmd)
+                CommandAction::Run(completion)
             }
             None => CommandAction::Consumed,
         }
@@ -1568,7 +1619,7 @@ mod tests {
             LuaCommandReader::empty(),
             features,
         );
-        p.sync(input, false);
+        p.sync_typed(input, false);
         p
     }
 
@@ -1584,7 +1635,7 @@ mod tests {
         let mut off = synced_with(name, FeatureFlags::all().without(feature));
         assert!(off.rows(false).iter().all(|row| row.name != name));
         assert_eq!(off.resolve(name), None);
-        assert!(off.confirm(name).is_none_or(|command| command.name != name));
+        assert!(off.confirm().is_none_or(|command| command.name != name));
         assert_eq!(
             disabled_feature(name, FeatureFlags::all().without(feature)),
             Some(feature)
@@ -1629,7 +1680,8 @@ mod tests {
         const DIRECTORY: &str = "../project with spaces";
         let input = format!("{name} {DIRECTORY}");
         let mut palette = synced(name);
-        let command = palette.confirm(&input).unwrap();
+        assert_eq!(palette.confirm().unwrap().name, name);
+        let command = ParsedCommand::from_line(&input);
         assert_eq!(command.name, name);
         assert_eq!(command.args, DIRECTORY);
         assert!(palette.is_main_only(name));
@@ -1646,7 +1698,7 @@ mod tests {
     fn fork_is_main_only_and_takes_no_arguments() {
         const COMMAND: &str = "/fork";
         let mut palette = synced(COMMAND);
-        assert_eq!(palette.confirm(COMMAND).unwrap().name, COMMAND);
+        assert_eq!(palette.confirm().unwrap().name, COMMAND);
         assert!(palette.is_main_only(COMMAND));
         let row = palette
             .rows(true)
@@ -1669,7 +1721,7 @@ mod tests {
             .unwrap();
         assert!(!row.disabled);
         assert!(!row.takes_args());
-        assert_eq!(palette.confirm(COMMAND).unwrap().name, COMMAND);
+        assert_eq!(palette.confirm().unwrap().name, COMMAND);
         assert!(!palette.is_main_only(COMMAND));
     }
 
@@ -1721,7 +1773,7 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        palette.sync("/", task_focused);
+        palette.sync_typed("/", task_focused);
         // Off the first row, so both commands under test are styled as
         // ordinary rows rather than as the selection.
         palette.move_down();
@@ -1744,7 +1796,7 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        p.sync(input, false);
+        p.sync_typed(input, false);
         p
     }
 
@@ -1841,7 +1893,7 @@ mod tests {
         let hit = palette.row_hits[2];
 
         assert!(matches!(
-            palette.handle_mouse(mouse(MouseEventKind::Moved, hit.area), "/"),
+            palette.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
             CommandAction::Consumed
         ));
         assert_eq!(palette.selected, hit.filtered_index);
@@ -1854,17 +1906,12 @@ mod tests {
         let hit = palette.row_hits[1];
         let expected_name = palette.item_name(&palette.filtered[hit.filtered_index]);
 
-        palette.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), hit.area),
-            "/",
-        );
-        let action =
-            palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area), "/");
+        palette.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        let action = palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
 
         assert!(matches!(
             action,
-            CommandAction::Execute(ParsedCommand { name, args })
-                if name == expected_name && args.is_empty()
+            CommandAction::Run(Completion { text, .. }) if text == expected_name
         ));
         assert!(!palette.is_active());
     }
@@ -1876,14 +1923,9 @@ mod tests {
         let first = palette.row_hits[0];
         let second = palette.row_hits[1];
 
-        palette.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), first.area),
-            "/",
-        );
-        let action = palette.handle_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), second.area),
-            "/",
-        );
+        palette.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
+        let action =
+            palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
 
         assert!(matches!(action, CommandAction::Consumed));
         assert!(palette.is_active());
@@ -1895,16 +1937,9 @@ mod tests {
         render(&mut palette);
         let hit = palette.row_hits[0];
 
-        palette.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), hit.area),
-            "/",
-        );
-        palette.handle_mouse(
-            mouse(MouseEventKind::Drag(MouseButton::Left), hit.area),
-            "/",
-        );
-        let action =
-            palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area), "/");
+        palette.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
+        palette.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit.area));
+        let action = palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
 
         assert!(matches!(action, CommandAction::Consumed));
         assert!(palette.is_active());
@@ -1915,16 +1950,10 @@ mod tests {
         let mut palette = synced("/");
         render(&mut palette);
         let stale = palette.row_hits[0];
-        palette.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), stale.area),
-            "/",
-        );
+        palette.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
 
-        palette.sync("/goal", false);
-        let action = palette.handle_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), stale.area),
-            "/goal",
-        );
+        palette.sync_typed("/goal", false);
+        let action = palette.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area));
 
         assert!(matches!(action, CommandAction::Passthrough));
         assert!(palette.popup_area.is_none());
@@ -1939,7 +1968,7 @@ mod tests {
         let outside = Rect::new(popup.right(), popup.y, 1, 1);
 
         assert!(matches!(
-            palette.handle_mouse(mouse(MouseEventKind::Moved, outside), "/"),
+            palette.handle_mouse(mouse(MouseEventKind::Moved, outside)),
             CommandAction::Passthrough
         ));
     }
@@ -1952,14 +1981,14 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        assert!(p.confirm("").is_none());
+        assert!(p.confirm().is_none());
     }
 
     #[test]
     fn sync_clamps_selected() {
         let mut p = synced("/");
         p.selected = 100;
-        p.sync("/", false);
+        p.sync_typed("/", false);
         assert_eq!(p.selected, p.filtered.len() - 1);
     }
 
@@ -2015,8 +2044,8 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        p.sync(input, false);
-        let cmd = p.confirm(input).unwrap();
+        p.sync_typed(input, false);
+        let cmd = p.confirm().unwrap();
         assert_eq!(cmd.name, expected_name);
         assert_eq!(cmd.args, expected_args);
     }
@@ -2030,9 +2059,9 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        p.sync("/project:review", false);
+        p.sync_typed("/project:review some-file.rs", false);
         assert!(p.is_active());
-        let cmd = p.confirm("/project:review some-file.rs").unwrap();
+        let cmd = p.confirm().unwrap();
         assert_eq!(cmd.name, "/project:review");
         assert_eq!(cmd.args, "some-file.rs");
     }
@@ -2088,7 +2117,7 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        p.sync(input, false);
+        p.sync_typed(input, false);
         p
     }
 
@@ -2137,7 +2166,7 @@ mod tests {
             .iter()
             .position(|f| matches!(f.command_type, CommandType::McpPrompt(0)))
             .unwrap();
-        let cmd = p.confirm(input).unwrap();
+        let cmd = p.confirm().unwrap();
         assert_eq!(cmd.name, "/myserver:code-review");
         assert_eq!(cmd.args, "my-diff-content");
     }
@@ -2152,7 +2181,7 @@ mod tests {
             FeatureFlags::all(),
         );
 
-        p.sync("/", false);
+        p.sync_typed("/", false);
         let initial_count = p
             .filtered
             .iter()
@@ -2175,7 +2204,7 @@ mod tests {
         });
 
         p.mcp_reader = updated_reader;
-        p.sync("/", false);
+        p.sync_typed("/", false);
 
         let updated_count = p
             .filtered
@@ -2212,10 +2241,10 @@ mod tests {
             LuaCommandReader::empty(),
             FeatureFlags::all(),
         );
-        p.sync("/", false);
+        p.sync_typed("/", false);
 
         p.set_mcp_reader(sample_prompts());
-        p.sync("/", false);
+        p.sync_typed("/", false);
 
         let prompts = p
             .filtered
@@ -2274,7 +2303,7 @@ mod tests {
         }]);
         let mut p =
             CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
-        p.sync(input, false);
+        p.sync_typed(input, false);
         p
     }
 
@@ -2295,7 +2324,7 @@ mod tests {
     #[test]
     fn confirm_lua_command_keeps_multi_word_args() {
         let input = "/deploy my new target";
-        let cmd = synced_with_nargs(input, usize::MAX).confirm(input).unwrap();
+        let cmd = synced_with_nargs(input, usize::MAX).confirm().unwrap();
         assert_eq!(cmd.name, "/deploy");
         assert_eq!(cmd.args, "my new target");
     }
@@ -2307,7 +2336,7 @@ mod tests {
             sample_lua_commands(),
             FeatureFlags::all(),
         );
-        p.sync(input, false);
+        p.sync_typed(input, false);
         p
     }
 
@@ -2344,15 +2373,8 @@ mod tests {
 
     #[test]
     fn confirm_lua_command_parses_args() {
-        let mut p = CommandPalette::new(
-            Arc::from([]),
-            empty_snapshot(),
-            sample_lua_commands(),
-            FeatureFlags::all(),
-        );
-        p.sync("/memory", false);
-        let cmd = p.confirm("/memory some-arg").unwrap();
-        assert_eq!(cmd.name, "/memory");
+        let cmd = synced_with_nargs("/deploy some-arg", 1).confirm().unwrap();
+        assert_eq!(cmd.name, "/deploy");
         assert_eq!(cmd.args, "some-arg");
     }
 
@@ -2367,7 +2389,7 @@ mod tests {
         }]);
         let mut p =
             CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
-        p.sync("/", false);
+        p.sync_typed("/", false);
         let initial_lua = p
             .filtered
             .iter()
@@ -2389,7 +2411,7 @@ mod tests {
                 max_args: 0,
             },
         ]);
-        p.sync("/", false);
+        p.sync_typed("/", false);
         let updated_lua = p
             .filtered
             .iter()
@@ -2533,7 +2555,7 @@ mod tests {
         context: &[(&str, &str)],
     ) {
         let mut palette = completing_palette();
-        palette.sync(input, false);
+        palette.sync_typed(input, false);
         let asked = &palette.argument.as_ref().expect(NOT_TRACKED).ask;
         let context: BTreeMap<String, String> = context
             .iter()
@@ -2553,15 +2575,82 @@ mod tests {
     fn a_suggested_value_completes_the_argument() {
         let mut palette = completing_palette();
         let input = "/stub:review ma";
-        palette.sync(input, false);
+        palette.sync_typed(input, false);
         answered(&mut palette);
         assert_eq!(palette.values, SUGGESTED);
-        palette.handle_key(KeyEvent::from(KeyCode::Down), input);
-        let CommandAction::Complete(text) = palette.handle_key(KeyEvent::from(KeyCode::Tab), input)
+        palette.handle_key(KeyEvent::from(KeyCode::Down));
+        let CommandAction::Complete(completion) = palette.handle_key(KeyEvent::from(KeyCode::Tab))
         else {
             panic!("Tab did not take the suggestion");
         };
-        assert_eq!(text, format!("/stub:review {} ", SUGGESTED[1]));
+        let text = format!("{} ", SUGGESTED[1]);
+        assert_eq!(
+            completion,
+            Completion {
+                range: "/stub:review ".len()..input.len(),
+                caret: text.len(),
+                text,
+            }
+        );
+    }
+
+    const TAIL_LOST: &str = "Tab must splice the command over the word and keep what follows";
+
+    fn tab(palette: &mut CommandPalette) -> Completion {
+        match palette.handle_key(KeyEvent::from(KeyCode::Tab)) {
+            CommandAction::Complete(completion) => completion,
+            _ => panic!("Tab did not complete"),
+        }
+    }
+
+    fn spliced(input: &str, completion: &Completion) -> (String, usize) {
+        let end = char_to_byte(input, completion.range.end);
+        let text = format!("{}{}", completion.text, &input[end..]);
+        (text, completion.range.start + completion.caret)
+    }
+
+    #[test_case("/fo", 3, "/fork", 5 ; "zero_arg_command_alone")]
+    #[test_case("/mov", 4, "/move-session ", 14 ; "command_with_arguments_alone")]
+    #[test_case("/goFix the bug", 3, "/goal Fix the bug", 6 ; "caret_inside_glued_prose")]
+    #[test_case("/go Fix the bug", 3, "/goal Fix the bug", 6 ; "prose_after_a_space")]
+    #[test_case("/go Fix the bug", 0, "/goal Fix the bug", 6 ; "caret_at_the_start")]
+    #[test_case("/go Fix the bug", 9, "/goal Fix the bug", 6 ; "caret_in_the_prose")]
+    fn tab_completes_only_the_command_word(
+        input: &str,
+        caret: usize,
+        expected: &str,
+        expected_caret: usize,
+    ) {
+        let mut palette = synced("/");
+        palette.sync(input, caret, false);
+        let expected_name = expected.split_whitespace().next().unwrap();
+        palette.selected = palette
+            .filtered
+            .iter()
+            .position(|item| palette.item_name(item) == expected_name)
+            .unwrap();
+        let completion = tab(&mut palette);
+        assert_eq!(
+            spliced(input, &completion),
+            (expected.to_owned(), expected_caret),
+            "{TAIL_LOST}"
+        );
+    }
+
+    #[test]
+    fn enter_runs_the_command_with_the_prose_after_it() {
+        let mut palette = synced("/");
+        palette.sync("/goFix the bug", 3, false);
+        palette.selected = palette
+            .filtered
+            .iter()
+            .position(|item| palette.item_name(item) == "/goal")
+            .unwrap();
+        let command = palette.confirm().unwrap();
+        assert_eq!(
+            (command.name.as_str(), command.args.as_str()),
+            ("/goal", "Fix the bug")
+        );
     }
 
     /// Typing on keeps the suggestions that still fit, while the next answer
@@ -2569,11 +2658,11 @@ mod tests {
     #[test]
     fn typing_on_keeps_only_the_values_that_still_fit() {
         let mut palette = completing_palette();
-        palette.sync("/stub:review ma", false);
+        palette.sync_typed("/stub:review ma", false);
         answered(&mut palette);
-        palette.sync("/stub:review mai", false);
-        palette.sync("/stub:review main", false);
-        palette.sync("/stub:review maint", false);
+        palette.sync_typed("/stub:review mai", false);
+        palette.sync_typed("/stub:review main", false);
+        palette.sync_typed("/stub:review maint", false);
         assert_eq!(palette.values, [SUGGESTED[1]]);
     }
 
