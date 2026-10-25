@@ -507,6 +507,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/catchup",
+        description: "Bring yourself back up to speed on this session (optional focus; a /btw, nothing enters history)",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/extract",
         description: "List the requirements the session has gathered so far (Extract model, copyable, no history pollution)",
         max_args: 0,

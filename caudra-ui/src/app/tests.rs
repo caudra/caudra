@@ -1,3 +1,4 @@
+use super::btw::{CATCHUP_FOCUS_PREFIX, CATCHUP_HEADER, CATCHUP_PROMPT, NOTHING_TO_CATCH_UP};
 use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::agent::tools_preview_source;
@@ -19740,6 +19741,57 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
         before + 1,
         "only the marker left; the row appended after it stays"
     );
+}
+
+const CATCHUP_FOCUS: &str = "the migration";
+
+#[test_case("/catchup", "" ; "no_focus")]
+#[test_case("/catchup  the migration ", CATCHUP_FOCUS ; "with_focus")]
+fn catchup_returns_its_focus(cmdline: &str, expected: &str) {
+    let mut app = test_app();
+
+    let actions = app.run_cmdline(cmdline, 0).unwrap();
+
+    assert!(matches!(&actions[..], [Action::Catchup(focus)] if focus == expected));
+}
+
+#[test_case("", CATCHUP_HEADER.to_owned(), CATCHUP_PROMPT.to_owned() ; "no_focus")]
+#[test_case(
+    CATCHUP_FOCUS,
+    format!("{CATCHUP_HEADER}: {CATCHUP_FOCUS}"),
+    format!("{CATCHUP_PROMPT}{CATCHUP_FOCUS_PREFIX}{CATCHUP_FOCUS}")
+    ; "with_focus"
+)]
+fn catchup_asks_the_canned_question_under_a_short_header(
+    focus: &str,
+    header: String,
+    question: String,
+) {
+    let mut app = btw_ready_app();
+
+    app.start_catchup(focus);
+
+    assert!(app.stream_modal.is_open());
+    assert_eq!(app.stream_modal.headers(), [header.as_str()]);
+    assert_eq!(
+        app.btw_thread.as_ref().unwrap().pending(),
+        Some(question.as_str())
+    );
+    assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
+}
+
+#[test]
+fn catchup_on_an_empty_conversation_flashes_instead_of_asking() {
+    let mut app = btw_ready_app();
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::history_items(&[]),
+    ))));
+
+    app.start_catchup("");
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.btw_thread.is_none());
+    assert_eq!(app.status_bar.flash_text().unwrap(), NOTHING_TO_CATCH_UP);
 }
 
 const BTW_QUESTION: &str = "why sqlite?";

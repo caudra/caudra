@@ -1209,6 +1209,8 @@ pub enum Action {
     /// A local file for the system's own viewer.
     OpenFile(std::path::PathBuf),
     Btw(String),
+    /// A `/btw` that asks for a catch-up, with the optional focus typed after it.
+    Catchup(String),
     Extract,
     /// Asks whether to install the release the banner names, which needs
     /// every session's state.

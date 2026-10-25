@@ -6345,6 +6345,7 @@ impl App {
                     vec![Action::Btw(question)]
                 }
             }
+            "/catchup" => vec![Action::Catchup(cmd.args.trim().into())],
             "/extract" => vec![Action::Extract],
             "/goal" => self.execute_goal(&cmd.args),
             "/goal-clear" => self.clear_goal(),

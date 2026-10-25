@@ -187,7 +187,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/catchup`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
 ### Models and reasoning
 
@@ -368,6 +368,11 @@ pub fn generate() -> String {
     writeln!(
         out,
         "- **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal that reports elapsed time while it waits, and how much of the prompt has been prefilled when the provider says. Type under it and press `Enter` or click `Send a follow-up` to ask the next question, which is queued if the previous answer is still streaming. The follow-up field edits like the composer, with the keys under [Text Fields](/docs/keybindings/#text-fields). Drag over the thread to select a passage, and releasing the mouse button copies it as the transcript copies: one part as its text, with an answer's Markdown, and several parts as a Markdown document with a `## User`, `## Assistant`, `## Thinking`, or `## Error` section for each. `Ctrl+Y` copies the selection, or the whole answer when nothing is selected. `Ctrl+C` copies the selection, or the text selected in the field, and with nothing selected it stops the answer without losing the thread. `Esc` or `Close` closes. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends.\n\n  While a main-session question form is waiting, press `F2` or click `Ask /btw` to clarify its choices. `Esc` returns to the unchanged form and stops any streaming side response. Reopening restores the clarification thread until the form is submitted, dismissed, or cancelled. Task and subagent questions do not support this action yet."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **`/catchup`**: a `/btw` that brings you back up to speed when you have lost track of the session, after time away or while running several at once. The answer opens with the goal and where things stand, then lists what needs you, what the agent is doing now, what is done, what was decided, and what is still open, leaving out any that are empty. Add a few words after the command, such as `/catchup the migration`, to narrow it. Follow-ups and copying work as in `/btw`, and nothing enters history."
     )
     .unwrap();
     writeln!(

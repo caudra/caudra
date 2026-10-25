@@ -5109,6 +5109,9 @@ impl<'t> EventLoop<'t> {
             Action::Btw(question) => {
                 self.sessions[idx].app.start_btw(question);
             }
+            Action::Catchup(focus) => {
+                self.sessions[idx].app.start_catchup(&focus);
+            }
             Action::Extract => {
                 let chat = self.ctx.model_slot.load_full();
                 self.sessions[idx]

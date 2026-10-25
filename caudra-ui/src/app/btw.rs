@@ -38,6 +38,32 @@ not yours to start.\n- Never say \"Let me...\", \"I'll now...\", or promise any 
 you don't know, say so; do not offer to look it up.\n- Follow-up questions may arrive in this \
 thread. Answer each the same way.\n</system-reminder>";
 
+pub(super) const CATCHUP_HEADER: &str = "Catch me up";
+pub(super) const NOTHING_TO_CATCH_UP: &str = "Nothing to catch up on yet";
+pub(super) const CATCHUP_FOCUS_PREFIX: &str = "\n\nFocus on: ";
+pub(super) const CATCHUP_PROMPT: &str = "I've lost track of this session. I've been away, or busy \
+with other sessions. Bring me up to speed from the conversation so far, so I can carry on without \
+rereading it.
+
+Open with one or two sentences: what we are trying to achieve, and where things stand right now.
+
+Then use these short sections, in this order, and leave out any that would be empty:
+- **Needs you**: anything waiting on me, such as an unanswered question, a decision, an approval, \
+a plan to review, or a failure only I can unblock. Say exactly what I have to decide and what the \
+options are.
+- **Now**: what the agent was doing where the conversation ends, and what it was about to do next.
+- **Done**: what is finished, stated concretely (files, commands, commits, test results). Mark \
+anything that was claimed but not verified.
+- **Decided**: choices already settled and the reason for each, so I don't reopen them. Quote my \
+own words where I made the call.
+- **Open**: failures, risks, and loose ends that are still unresolved.
+
+Give more weight to what happened since my last message than to early turns, and drop anything \
+that no longer matters. Don't retell the session turn by turn. Name things exactly (files, \
+branches, commands, errors) rather than describing them. Keep it to about 200 words unless the \
+session really needs more. If the conversation doesn't make something clear, say so instead of \
+guessing.";
+
 const TOOL_CALL_STOPPED: &str = "\n\n_Stopped: the model kept trying to call tools. `/btw` cannot \
 run tools, so ask in the main session instead._";
 
@@ -283,23 +309,47 @@ impl App {
     }
 
     pub(crate) fn start_btw(&mut self, question: String) {
-        let Some(mut thread) = self.capture_btw_thread() else {
+        let Some(thread) = self.capture_btw_thread() else {
             return;
         };
+        self.open_btw(thread, format!("{QUESTION_PREFIX}{question}"), question);
+    }
+
+    /// A `/btw` with a canned question, headed by a short label rather than
+    /// the prompt, so copying the thread does not repeat the whole prompt.
+    pub(crate) fn start_catchup(&mut self, focus: &str) {
+        let Some(thread) = self.capture_btw_thread() else {
+            return;
+        };
+        if !thread
+            .base
+            .iter()
+            .any(|message| matches!(message.role, Role::User))
+        {
+            self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
+            return;
+        }
+        let (header, question) = if focus.is_empty() {
+            (CATCHUP_HEADER.to_owned(), CATCHUP_PROMPT.to_owned())
+        } else {
+            (
+                format!("{CATCHUP_HEADER}: {focus}"),
+                format!("{CATCHUP_PROMPT}{CATCHUP_FOCUS_PREFIX}{focus}"),
+            )
+        };
+        self.open_btw(thread, header, question);
+    }
+
+    fn open_btw(&mut self, mut thread: BtwThread, header: String, question: String) {
         self.renew_question_wait();
         self.close_stream_modal();
-        thread.ask(question.clone());
+        thread.ask(question);
         self.install_btw_thread(thread);
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
-        self.stream_modal.open(
-            TITLE,
-            format!("{QUESTION_PREFIX}{question}"),
-            StreamFooter::FollowUp,
-            rx,
-            trigger,
-        );
+        self.stream_modal
+            .open(TITLE, header, StreamFooter::FollowUp, rx, trigger);
         self.spawn_btw(tx, cancel);
     }
 
