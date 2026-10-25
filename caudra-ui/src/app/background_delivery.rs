@@ -13,7 +13,9 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use super::App;
-use super::tasks::{WAKES_SUPPRESSED_STOP_FAILED, WAKES_SUPPRESSED_STOP_REQUESTED};
+use super::tasks::{
+    WAKES_SUPPRESSED_RUNTIME_FAILED, WAKES_SUPPRESSED_STOP_FAILED, WAKES_SUPPRESSED_STOP_REQUESTED,
+};
 use super::workflow::{WorkflowDelivery, WorkflowDeliveryResult};
 use crate::components::{DisplayMessage, DisplayRole};
 
@@ -26,16 +28,21 @@ pub(crate) const DELIVERY_RETRY_FLASH: &str = "Background results could not be s
 pub(crate) const DELIVERY_RETRY_NOTICE: &str = "Background results could not be saved; retrying. Automatic continuation resumes when a save succeeds.";
 pub(crate) const DELIVERY_RECOVERED_NOTICE: &str =
     "Saving background results recovered; automatic continuation resumes.";
+pub(crate) const DELIVERY_HALTED_NOTICE: &str = "Background tasks stopped";
+pub(crate) const DELIVERY_HALTED_RECOVERY: &str = "Restart Caudra to recover.";
 
 /// Why background results did not reach the session. A failed stop leaves
 /// work whose state is unknown, so it stays fail-closed until the user acts;
-/// a failed save is retried with backoff.
+/// a failed save is retried with backoff; a halted runtime cannot recover in
+/// this process, so it is reported once and never retried.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum DeliveryFailure {
     #[error("{0}")]
     Stop(String),
     #[error("{0}")]
     Save(String),
+    #[error("{0}")]
+    Halted(String),
 }
 
 struct DeliveryRetry {
@@ -140,6 +147,8 @@ pub(crate) struct BackgroundDelivery {
     completed: Option<DeliveryKey>,
     sequence: u64,
     retry: Option<DeliveryRetry>,
+    /// The background generation whose halt was already reported.
+    halted_generation: Option<u64>,
 }
 
 impl Default for BackgroundDelivery {
@@ -158,6 +167,7 @@ impl Default for BackgroundDelivery {
             stop_id: None,
             rearm_after_stop: false,
             retry: None,
+            halted_generation: None,
         }
     }
 }
@@ -483,6 +493,10 @@ impl App {
                 self.flash(error);
                 return;
             }
+            DeliveryFailure::Halted(error) => {
+                self.delivery_halted(site, error);
+                return;
+            }
             DeliveryFailure::Save(error) => error,
         };
         let retry = self.background_delivery.record_failure(now);
@@ -503,6 +517,28 @@ impl App {
                 DELIVERY_RETRY_NOTICE.into(),
             ));
         }
+    }
+
+    /// A background runtime that stopped for good is reported once per
+    /// generation and holds automatic wakes, since no retry can recover it.
+    fn delivery_halted(&mut self, site: &'static str, error: String) {
+        self.background_delivery.retry = None;
+        self.suppress_background_wakes(WAKES_SUPPRESSED_RUNTIME_FAILED);
+        let generation = self.background.as_ref().map(BackgroundTasks::generation);
+        if self.background_delivery.halted_generation == generation {
+            return;
+        }
+        self.background_delivery.halted_generation = generation;
+        warn!(
+            session = %self.state.session.id,
+            site,
+            %error,
+            "background runtime halted; delivery stopped"
+        );
+        self.main_chat().push(DisplayMessage::new(
+            DisplayRole::Notice,
+            format!("{DELIVERY_HALTED_NOTICE}: {error}. {DELIVERY_HALTED_RECOVERY}"),
+        ));
     }
 
     pub(super) fn delivery_recovered(&mut self) {
@@ -553,9 +589,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        App, BackgroundDelivery, DELIVERY_NOTICE_AFTER, DELIVERY_RECOVERED_NOTICE,
-        DELIVERY_RETRY_FLASH, DELIVERY_RETRY_MAX, DELIVERY_RETRY_NOTICE, DeliveryFailure,
-        DeliveryKey, DeliveryReply, STOP_FAILED_ERR, WorkflowDeliveryResult,
+        App, BackgroundDelivery, BackgroundTasks, DELIVERY_HALTED_NOTICE, DELIVERY_HALTED_RECOVERY,
+        DELIVERY_NOTICE_AFTER, DELIVERY_RECOVERED_NOTICE, DELIVERY_RETRY_FLASH, DELIVERY_RETRY_MAX,
+        DELIVERY_RETRY_NOTICE, DeliveryFailure, DeliveryKey, DeliveryReply, STOP_FAILED_ERR,
+        WorkflowDeliveryResult,
     };
     use crate::agent::QueuedMessage;
     use crate::agent::shared_queue::{self, QueueItem};
@@ -974,6 +1011,33 @@ mod tests {
         assert!(app.automatic_wakes_suppressed);
         assert!(!app.background_delivery.retry_pending(now));
         assert_eq!(app.status_bar.flash_text(), Some(STOP_ERROR));
+    }
+
+    #[test]
+    fn halted_runtime_holds_wakes_without_retrying_and_notices_once() {
+        let mut app = test_app();
+        app.background = Some(
+            smol::block_on(BackgroundTasks::spawn(
+                app.storage.clone(),
+                app.state.session.id,
+            ))
+            .unwrap(),
+        );
+        let now = Instant::now();
+        app.delivery_failed(SAVE_SITE, DeliveryFailure::Save(SAVE_ERROR.into()), now);
+        for _ in 0..DELIVERY_NOTICE_AFTER + 1 {
+            app.delivery_failed(SAVE_SITE, DeliveryFailure::Halted(SAVE_ERROR.into()), now);
+        }
+        assert!(app.automatic_wakes_suppressed);
+        assert!(!app.background_delivery.retry_pending(now));
+        assert_eq!(
+            notices(
+                &mut app,
+                &format!("{DELIVERY_HALTED_NOTICE}: {SAVE_ERROR}. {DELIVERY_HALTED_RECOVERY}")
+            ),
+            1
+        );
+        assert_eq!(notices(&mut app, DELIVERY_RETRY_NOTICE), 0);
     }
 
     #[test]

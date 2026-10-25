@@ -17,9 +17,11 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - Every 30 minutes a background shell runs, Caudra asks the agent waiting on it whether to keep waiting or check whether the command hangs.
 - Clicking the update banner, or running `/update`, installs the new release and restarts Caudra on the same sessions.
 
-> **Note**
+> **Important**
 >
-> On its first start, Preview 14 upgrades `caudra.toml` to format 5 and saves a copy under `backups/config/global/` in the state directory. Preview 13 and earlier cannot read the upgraded file. See [Config file versions](/docs/configuration/#config-file-versions).
+> **Close every other Caudra session before you start Preview 14.** On its first start, Preview 14 upgrades the session database in your [state directory](/docs/configuration/#directory-layout) to keep each background task's transcript beside its record. While another terminal, editor session over ACP, or `caudra storage` command still has the database open, Preview 14 lists those sessions and does not start. It also moves the global `caudra.toml` to format version 5.
+>
+> Both upgrades save a copy first: the database as `backups/caudra.db.v38.bak` and `caudra.toml` under `backups/config/global/`, both in the state directory. Preview 13 and earlier cannot open the upgraded database or read the upgraded `caudra.toml`, and `caudra rollback` restores only the previous binary. See [Config file versions](/docs/configuration/#config-file-versions).
 
 ### Changes
 
@@ -40,6 +42,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **Tab completion keeps the rest of the draft**: Pressing `Tab` on a command replaced the whole composer with the command name, so typing `/` in front of a written prompt and completing the command deleted the prompt and its paste chips. `Tab` and `Enter` now replace only the command word, up to the cursor when the cursor is inside it, and the rest of the draft becomes the command's arguments. `/goFix the bug` completes to `/goal Fix the bug`. Completing a prompt argument from an MCP server replaces only that argument. See [Commands](/docs/commands/).
 - **A goal set during a turn no longer waits in the queue**: `/goal` or `/autopilot <goal>` sent while Caudra worked became an ordinary queued prompt, and a reopen could later send it as bare text that confused the model. The goal now takes effect at once, and its first turn starts after the current work and any queued prompts are done. See [Send next](/docs/queue/#send-next).
 - **Reopened sessions hold their queued prompts**: Reopening, resuming, or rewinding a session sent its saved queue at once, so prompts written for a turn that never finished could run without you. Saved prompts now wait under **Held until sent**. Choose **Send now** from a prompt's menu to deliver it, or edit or delete it. A turn started from the queue now also resumes after a crash, like any other turn. See [Recovery](/docs/queue/#recovery).
+- **Long subagent runs no longer block background results**: A subagent whose transcript grew past 8 MiB could not be saved when it finished. Caudra then showed `Background results could not be saved, retrying` and never delivered that task's result or any later one. A task's transcript is now saved beside its record in the session database, however long it grows, so the result arrives and the task can still be continued. If background tasks ever stop for good, Caudra says so once and asks you to restart, instead of retrying forever. See [Background tasks](/docs/sessions/#background-tasks).
 
 ## Caudra 0.2 Preview 13 {#v0-2-0-preview-13}
 

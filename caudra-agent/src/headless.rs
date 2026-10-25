@@ -5193,14 +5193,14 @@ mod tests {
         StopReason, StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
-    use caudra_storage::background::TaskRecord;
+    use caudra_storage::background::{TaskRecord, TranscriptWrite};
     use caudra_storage::engine_decisions::StoredDecisionAnchor;
     use caudra_storage::goal_log::{GoalEnd, GoalEvaluationOutcome};
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
     };
-    use caudra_storage::sessions::{RecordCoverage, generate_title};
+    use caudra_storage::sessions::{RecordCoverage, RuntimeRetry, generate_title};
     use caudra_storage::workflow::WorkflowRunStatus;
     use caudra_workflow::{RunStatus, WorkflowError, WorkflowEvent};
     use caudra_workspace::PlanRef;
@@ -6043,7 +6043,7 @@ mod tests {
             }
             if durable || call == CONTINUATION {
                 database
-                    .save_background_task(
+                    .save_background_task_runtime(
                         session_id(),
                         &TaskRecord {
                             payload: Default::default(),
@@ -6062,11 +6062,13 @@ mod tests {
                             request: serde_json::json!({"call_id": version, "label": TASK}),
                             outcome: None,
                             output_ref: None,
-                            history: serde_json::to_value(vec![Message::user(call.into())])
-                                .unwrap(),
                             spec: serde_json::to_value(crate::SubagentTaskSpec::default()).unwrap(),
                             events: Vec::new(),
                         },
+                        &TranscriptWrite::Save(
+                            serde_json::to_string(&[Message::user(call.into())]).unwrap(),
+                        ),
+                        &RuntimeRetry::new(None, &|| false),
                     )
                     .unwrap();
             }

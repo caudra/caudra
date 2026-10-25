@@ -93,7 +93,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_VERSION: i64 = 39;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -925,6 +925,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 38,
         sql: crate::shell_runs::DROP_V1,
     },
+    Migration {
+        from: 38,
+        to: 39,
+        sql: crate::background::TRANSCRIPTS,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1203,7 +1208,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1222,7 +1227,8 @@ fn full_schema() -> String {
         crate::token_calibration::TABLE,
         crate::learning::TABLES,
         crate::learning::TRANSCRIPTS,
-        crate::shell_runs::TABLE
+        crate::shell_runs::TABLE,
+        crate::background::TRANSCRIPTS
     )
 }
 
@@ -2241,7 +2247,7 @@ impl SessionDatabase {
         let workflow = workflow_totals(&self.connection)?;
         let automation = automation_totals(&self.connection)?;
         let (background_invocation_count, background_bytes) = self.connection.query_row(
-            "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) + (SELECT coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints) FROM background_tasks",
+            "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) + (SELECT coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints) + (SELECT coalesce(sum(byte_count), 0) FROM background_transcripts) FROM background_tasks",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
@@ -3630,6 +3636,7 @@ impl SessionDatabase {
             "SELECT payload FROM tool_outputs WHERE session_id = ?1",
             "SELECT payload FROM subagent_history_items WHERE session_id = ?1",
             "SELECT payload FROM job_owner_checkpoints WHERE session_id = ?1",
+            "SELECT payload FROM background_transcripts WHERE session_id = ?1",
         ] {
             let mut statement = transaction.prepare(sql)?;
             let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
@@ -5561,6 +5568,9 @@ fn migrate_to_current(
         if step.to == 38 {
             crate::shell_runs::migrate(&transaction)?;
         }
+        if step.to == 39 {
+            crate::background::move_transcripts(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", step.to)?;
         transaction.commit()?;
         current = step.to;
@@ -7121,11 +7131,22 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    /// Drops what schema 39 added. Every downgrade below 39 runs it first.
+    macro_rules! background_transcripts_downgrade {
+        () => {
+            "DROP TABLE background_transcripts;"
+        };
+    }
+    const BACKGROUND_TRANSCRIPTS_DOWNGRADE: &str = background_transcripts_downgrade!();
+    const BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA: i64 = 38;
     /// Puts the bindings back as schema 36 had them, before bundled scripts.
     /// Every downgrade below 37 runs it first.
     macro_rules! bundled_scope_downgrade {
         () => {
-            crate::automation::rebuild_bindings!(v36, "automation_bindings_v37")
+            concat!(
+                background_transcripts_downgrade!(),
+                crate::automation::rebuild_bindings!(v36, "automation_bindings_v37")
+            )
         };
     }
     const BUNDLED_SCOPE_DOWNGRADE: &str = bundled_scope_downgrade!();
@@ -7988,7 +8009,6 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             request: json!({}),
             outcome: Some(json!({"success": true})),
             output_ref: None,
-            history: Value::Null,
             spec: Value::Null,
             events: vec![TaskEvent {
                 sequence: 2,
@@ -12902,6 +12922,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(LEARNING_DOWNGRADE, LEARNING_PREVIOUS_SCHEMA; "learning_from_thirty_three")]
     #[test_case(LEARNING_TRANSCRIPTS_DOWNGRADE, LEARNING_TRANSCRIPTS_PREVIOUS_SCHEMA; "learning_transcripts_from_thirty_four")]
     #[test_case(SHELL_RUNS_DOWNGRADE, SHELL_RUNS_PREVIOUS_SCHEMA; "shell_runs_from_thirty_five")]
+    #[test_case(BACKGROUND_TRANSCRIPTS_DOWNGRADE, BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA; "background_transcripts_from_thirty_eight")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -12966,6 +12987,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     fn shell_readings_step_replaces_feature_rows() {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .execute_batch(BACKGROUND_TRANSCRIPTS_DOWNGRADE)
+            .unwrap();
         database
             .connection
             .execute_batch(crate::shell_runs::DROP_V1)
@@ -13202,6 +13227,48 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert!(!archived);
         assert_eq!(sequence, 9);
         assert_eq!(database.background_watermarks(session.id).unwrap(), (3, 9));
+    }
+
+    #[test_case(json!([{"role": "user", "content": "x"}]), true; "transcript")]
+    #[test_case(Value::Null, false; "null_history")]
+    fn schema_thirty_eight_moves_inline_history_beside_its_record(history: Value, moved: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(BACKGROUND_TRANSCRIPTS_DOWNGRADE)
+            .unwrap();
+        let record = checkpoint_shell_record(JobOwner::Main);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["history"] = history.clone();
+        let legacy = legacy.to_string();
+        database.connection.execute("INSERT INTO background_tasks(session_id, invocation_id, payload, bytes) VALUES (?1, ?2, ?3, ?4)", params![session.id.as_bytes().as_slice(), record.invocation_id, legacy, legacy.len() as i64]).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let database = SessionDatabase::open(&state).unwrap();
+
+        let (stored, bytes): (String, i64) = database
+            .connection
+            .query_row(
+                "SELECT payload, bytes FROM background_tasks WHERE invocation_id = ?1",
+                [&record.invocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, serde_json::to_string(&record).unwrap());
+        assert_eq!(bytes, stored.len() as i64);
+        assert_eq!(
+            database
+                .background_transcript(session.id, &record.invocation_id)
+                .unwrap(),
+            moved.then(|| history.to_string())
+        );
     }
 
     #[test]
@@ -13804,6 +13871,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")
@@ -13919,6 +13987,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")

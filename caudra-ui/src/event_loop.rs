@@ -3335,9 +3335,14 @@ impl<'t> EventLoop<'t> {
                         }
                         Err(error) => {
                             runtime.app.release_background_claims();
+                            let failure = if background.failure().is_some() {
+                                DeliveryFailure::Halted(error)
+                            } else {
+                                DeliveryFailure::Save(error)
+                            };
                             runtime.app.delivery_failed(
                                 DELIVERY_SITE_BACKGROUND_CLAIM,
-                                DeliveryFailure::Save(error),
+                                failure,
                                 now,
                             );
                             return None;

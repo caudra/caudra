@@ -2428,7 +2428,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, SessionDatabase, persisted_session_ids};
+    use crate::background::{TaskRecord, TranscriptWrite};
+    use crate::sessions::{RuntimeRetry, Session, SessionDatabase, persisted_session_ids};
     use serde_json::Value;
 
     const TEST_MAX_BYTES: usize = 1024 * 1024;
@@ -3286,6 +3287,58 @@ mod tests {
         assert!(!store.output_path(live, unreferenced_output.id).exists());
         assert!(!store.session_dir(orphan).exists());
         assert!(!temp_path.exists());
+    }
+
+    #[test_case(false; "outcome")]
+    #[test_case(true; "transcript")]
+    fn cleanup_keeps_outputs_referenced_only_by_a_background_task(in_transcript: bool) {
+        let (temp, mut store) = test_store();
+        store.orphan_grace = Duration::ZERO;
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session: Session<Value, Value, Value> = Session::new("model", "/project");
+        session.save(&state_dir).unwrap();
+        let referenced = store.put(session.id, EXACT_TEXT).unwrap();
+        let unreferenced = store.put(session.id, MISSING_TEXT).unwrap();
+        let mut record = serde_json::json!({
+            "created_at": 0,
+            "updated_at": 0,
+            "sequence": 1,
+            "task_id": "task-1",
+            "invocation_id": "invocation-1",
+            "root_call_id": "call-1",
+            "generation": 1,
+            "state": "succeeded",
+            "background": true,
+            "receipt_accepted": true,
+            "mode": "build",
+            "request": {},
+            "outcome": {"success": true},
+            "events": [],
+        });
+        let transcript =
+            serde_json::json!([{"role": "user", "output_ref": referenced.clone()}]).to_string();
+        let transcript = if in_transcript {
+            TranscriptWrite::Save(transcript)
+        } else {
+            record["output_ref"] = serde_json::json!(referenced);
+            TranscriptWrite::Keep
+        };
+        let record: TaskRecord = serde_json::from_value(record).unwrap();
+        SessionDatabase::open(&state_dir)
+            .unwrap()
+            .save_background_task_runtime(
+                session.id,
+                &record,
+                &transcript,
+                &RuntimeRetry::new(None, &|| false),
+            )
+            .unwrap();
+
+        let removed = store.cleanup_orphans(&[session.id]).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(store.output_path(session.id, referenced.id).exists());
+        assert!(!store.output_path(session.id, unreferenced.id).exists());
     }
 
     #[test]

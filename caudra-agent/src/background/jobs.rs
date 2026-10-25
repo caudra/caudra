@@ -11,7 +11,7 @@ use caudra_storage::{
     StateDir,
     background::{
         BackgroundCursor, JobKind, JobOwner, JobPayload, MAX_INVOCATIONS, QuestionJobMetadata,
-        ShellJobMetadata, TaskEvent, TaskRecord,
+        ShellJobMetadata, TaskEvent, TaskRecord, TranscriptWrite,
     },
     id::CaudraId,
     now_epoch,
@@ -697,7 +697,6 @@ impl JobScope {
             request,
             outcome: None,
             output_ref: None,
-            history: Value::Null,
             spec: Value::Null,
             events: Vec::new(),
         };
@@ -726,7 +725,7 @@ impl JobScope {
                 };
                 let admitted = scope
                     .tasks
-                    .persist_record(record, Some(admission.clone()))
+                    .persist_record(record, Some(admission.clone()), TranscriptWrite::Keep)
                     .await;
                 scope.tasks.lock().admitting.remove(&driver_id);
                 if let Err(error) = admitted {
@@ -2293,7 +2292,6 @@ mod tests {
                             .find(|record| record.invocation_id == provenance.invocation_id)
                             .unwrap();
                         assert_eq!(record.kind(), JobKind::Shell);
-                        assert!(record.history.is_null());
                         assert!(record.spec.is_null());
                         done()
                     },

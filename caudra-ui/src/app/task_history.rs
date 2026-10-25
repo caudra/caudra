@@ -4,7 +4,6 @@ use caudra_agent::{
     TaskCard,
     background::{BackgroundTasks, TaskHistoryPage},
 };
-use caudra_providers::Message;
 use caudra_storage::{
     background::{BackgroundCursor, JobKind, MAX_HISTORY_PAGE},
     id::CaudraId,
@@ -116,13 +115,9 @@ impl App {
             id.to_owned(),
             focus,
             smol::spawn(async move {
-                let record = runtime.record_invocation(&invocation).await?;
+                runtime.record_invocation(&invocation).await?;
+                let history = runtime.transcript(&invocation).await?.unwrap_or_default();
                 smol::unblock(move || {
-                    let history: Vec<Message> = if record.history.is_null() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_value(record.history).map_err(|error| error.to_string())?
-                    };
                     let items = crate::history_items(&history);
                     let rows = decisions
                         .map(|(storage, session_id)| load_engine_decisions(&storage, session_id))
@@ -391,8 +386,8 @@ mod tests {
     use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus, ToolOutput};
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::{
-        background::{MAX_HISTORY_PAGE, TaskRecord},
-        sessions::SessionDatabase,
+        background::{MAX_HISTORY_PAGE, TaskRecord, TranscriptWrite},
+        sessions::{RuntimeRetry, SessionDatabase},
     };
     use futures_lite::future::yield_now;
     use serde_json::json;
@@ -468,12 +463,16 @@ mod tests {
                 request: json!({"call_id": id, "label": id}),
                 outcome: Some(json!({"success": true})),
                 output_ref: None,
-                history: json!(history),
                 spec: json!({}),
                 events: Vec::new(),
             };
             database
-                .save_background_task(app.state.session.id, &record)
+                .save_background_task_runtime(
+                    app.state.session.id,
+                    &record,
+                    &TranscriptWrite::Save(json!(history).to_string()),
+                    &RuntimeRetry::new(None, &|| false),
+                )
                 .unwrap();
         }
         app.background = Some(

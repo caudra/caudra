@@ -38,6 +38,7 @@ pub(crate) const WAKES_SUPPRESSED_RUN_MAX_TOKENS: &str = "run_max_tokens";
 pub(crate) const WAKES_SUPPRESSED_RUN_ERROR: &str = "run_error";
 pub(crate) const WAKES_SUPPRESSED_STOP_REQUESTED: &str = "stop_requested";
 pub(crate) const WAKES_SUPPRESSED_STOP_FAILED: &str = "stop_failed";
+pub(crate) const WAKES_SUPPRESSED_RUNTIME_FAILED: &str = "runtime_failed";
 const MILLIS_PER_SECOND: u64 = 1_000;
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const TASK_NOUN: &str = "task";

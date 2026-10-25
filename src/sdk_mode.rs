@@ -4024,7 +4024,6 @@ mod tests {
                 "output": output, "error": null, "tokens_used": 0, "duration_ms": 0
             })),
             output_ref: None,
-            history: serde_json::json!([]),
             spec: Value::Null,
             events: Vec::new(),
         }

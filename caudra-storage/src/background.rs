@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::{
     StorageError,
     id::CaudraId,
-    sessions::{RuntimeRetry, SessionDatabase, SessionError},
+    sessions::{RuntimeRetry, SessionDatabase, SessionError, compress_payload, decompress_payload},
     tool_outputs::ToolOutputRef,
 };
 
@@ -17,6 +17,11 @@ pub const MAX_HISTORY_PAGE: usize = 32;
 pub const MAX_REPORTS: usize = 32;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
+/// One task's transcript, kept beside its record so it never counts against
+/// the record's size or the session's resident budget.
+pub const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
+const TRANSCRIPT_FIELD: &str = "background transcript";
+const RUNTIME_TRANSCRIPT_LOAD: &str = "background transcript load";
 const JOB_EVENT_FIELD: &str = "job event provenance";
 const INVALID_JOB_EVENT: &str =
     "job event does not match its recorded task, event, or owning invocation";
@@ -50,6 +55,20 @@ CREATE INDEX background_history ON background_tasks(session_id, archived, json_e
 CREATE INDEX background_task_version ON background_tasks(session_id, json_extract(payload, '$.task_id'), json_extract(payload, '$.request.call_id'), json_extract(payload, '$.sequence') DESC);
 CREATE INDEX background_call_owner ON background_tasks(session_id, coalesce(json_extract(payload, '$.owner.kind'), 'main'), json_extract(payload, '$.owner.invocation_id'), json_extract(payload, '$.request.call_id'), json_extract(payload, '$.sequence') DESC);
 "#;
+/// Each agent task's latest transcript, a zstd-compressed JSON array of its
+/// messages: the running checkpoint, then the settled run.
+pub(crate) const TRANSCRIPTS: &str = r#"
+CREATE TABLE background_transcripts (
+    session_id    BLOB NOT NULL,
+    invocation_id TEXT NOT NULL,
+    payload       BLOB NOT NULL,
+    byte_count    INTEGER NOT NULL,
+    PRIMARY KEY(session_id, invocation_id),
+    FOREIGN KEY(session_id, invocation_id)
+        REFERENCES background_tasks(session_id, invocation_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +96,16 @@ pub enum BackgroundLookup<'a> {
     },
 }
 
-pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0)";
+pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(byte_count) FROM background_transcripts WHERE session_id = sessions.id), 0)";
+
+/// What a record's save does to its transcript.
+#[derive(Debug)]
+pub enum TranscriptWrite {
+    Keep,
+    /// Replaces it with this JSON array of messages.
+    Save(String),
+    Remove,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,8 +193,6 @@ pub struct TaskRecord {
     pub outcome: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_ref: Option<ToolOutputRef>,
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub history: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub spec: Value,
     pub events: Vec<TaskEvent>,
@@ -303,9 +329,44 @@ impl SessionDatabase {
         &self,
         session: CaudraId,
         record: &TaskRecord,
+        transcript: &TranscriptWrite,
         retry: &RuntimeRetry<'_>,
     ) -> Result<(), SessionError> {
-        self.save_background_task_inner(session, record, Some(retry))
+        self.save_background_task_inner(session, record, transcript, Some(retry))
+    }
+
+    pub fn background_transcript_runtime(
+        &self,
+        session: CaudraId,
+        invocation_id: &str,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<Option<String>, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run(RUNTIME_TRANSCRIPT_LOAD, || {
+            self.background_transcript(session, invocation_id)
+        })
+    }
+
+    /// The JSON array of messages an agent task last saved, archived or not.
+    pub fn background_transcript(
+        &self,
+        session: CaudraId,
+        invocation_id: &str,
+    ) -> Result<Option<String>, SessionError> {
+        let stored: Option<Vec<u8>> = self
+            .connection()
+            .query_row(
+                "SELECT payload FROM background_transcripts WHERE session_id = ?1 AND invocation_id = ?2",
+                params![session.as_bytes().as_slice(), invocation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let transcript = decompress_payload(&stored, TRANSCRIPT_FIELD)?;
+        Self::validate_len(TRANSCRIPT_FIELD, transcript.len(), MAX_TRANSCRIPT_BYTES)?;
+        Ok(Some(transcript))
     }
 
     pub fn task_identity_exists(
@@ -490,7 +551,7 @@ impl SessionDatabase {
             }
         };
         let mut statement = self.connection().prepare(
-            "SELECT json_set(json_remove(payload, '$.history', '$.spec'), '$.outcome', NULL, '$.events', json('[]'), '$.request', json_object('call_id', json_extract(payload, '$.request.call_id'), 'label', substr(json_extract(payload, '$.request.label'), 1, 4096), 'owner_call_id', json_extract(payload, '$.request.owner_call_id'), 'owner_task_id', json_extract(payload, '$.request.owner_task_id'), 'duration_ms', json_extract(payload, '$.outcome.duration_ms'))) FROM background_tasks WHERE session_id = ?1 AND archived = 1 AND (?2 IS NULL OR (json_extract(payload, '$.sequence'), invocation_id) < (?2, ?3)) AND (?4 IS NULL OR (coalesce(json_extract(payload, '$.owner.kind'), 'main') = ?4 AND json_extract(payload, '$.owner.invocation_id') IS ?5)) AND (?6 IS NULL OR json_extract(payload, '$.generation') = ?6) ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT ?7",
+            "SELECT json_set(json_remove(payload, '$.spec'), '$.outcome', NULL, '$.events', json('[]'), '$.request', json_object('call_id', json_extract(payload, '$.request.call_id'), 'label', substr(json_extract(payload, '$.request.label'), 1, 4096), 'owner_call_id', json_extract(payload, '$.request.owner_call_id'), 'owner_task_id', json_extract(payload, '$.request.owner_task_id'), 'duration_ms', json_extract(payload, '$.outcome.duration_ms'))) FROM background_tasks WHERE session_id = ?1 AND archived = 1 AND (?2 IS NULL OR (json_extract(payload, '$.sequence'), invocation_id) < (?2, ?3)) AND (?4 IS NULL OR (coalesce(json_extract(payload, '$.owner.kind'), 'main') = ?4 AND json_extract(payload, '$.owner.invocation_id') IS ?5)) AND (?6 IS NULL OR json_extract(payload, '$.generation') = ?6) ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT ?7",
         )?;
         let mut rows = statement.query(params![
             session.as_bytes().as_slice(),
@@ -544,22 +605,32 @@ impl SessionDatabase {
         })
     }
 
+    /// Saves `record`, keeping whatever transcript it already has.
     pub fn save_background_task(
         &self,
         session: CaudraId,
         record: &TaskRecord,
     ) -> Result<(), SessionError> {
-        self.save_background_task_inner(session, record, None)
+        self.save_background_task_inner(session, record, &TranscriptWrite::Keep, None)
     }
 
     fn save_background_task_inner(
         &self,
         session: CaudraId,
         record: &TaskRecord,
+        transcript: &TranscriptWrite,
         retry: Option<&RuntimeRetry<'_>>,
     ) -> Result<(), SessionError> {
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
         Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
+        let transcript = match transcript {
+            TranscriptWrite::Keep => None,
+            TranscriptWrite::Save(text) => {
+                Self::validate_len(TRANSCRIPT_FIELD, text.len(), MAX_TRANSCRIPT_BYTES)?;
+                Some(Some((compress_payload(text)?, text.len())))
+            }
+            TranscriptWrite::Remove => Some(None),
+        };
         let last_sequence = sql_integer(
             record
                 .events
@@ -595,6 +666,21 @@ impl SessionDatabase {
                     field: "background archive",
                     reason: "archived invocations are read-only".into(),
                 });
+            }
+            match &transcript {
+                None => {}
+                Some(Some((stored, bytes))) => {
+                    transaction.execute(
+                        "INSERT INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, byte_count = excluded.byte_count",
+                        params![session.as_bytes().as_slice(), record.invocation_id, stored, *bytes as i64],
+                    )?;
+                }
+                Some(None) => {
+                    transaction.execute(
+                        "DELETE FROM background_transcripts WHERE session_id = ?1 AND invocation_id = ?2",
+                        params![session.as_bytes().as_slice(), record.invocation_id],
+                    )?;
+                }
             }
             Ok(())
         };
@@ -670,6 +756,48 @@ fn unsigned_integer(value: i64) -> Result<u64, SessionError> {
     })
 }
 
+/// Moves every record's inline `history` into [`TRANSCRIPTS`]. Each record is
+/// re-encoded as the runtime writes it, so an archive's compare-and-set still
+/// matches, and rows move one at a time so memory stays flat.
+pub(crate) fn move_transcripts(transaction: &Transaction<'_>) -> Result<(), SessionError> {
+    let keys = transaction
+        .prepare("SELECT session_id, invocation_id FROM background_tasks WHERE json_type(payload, '$.history') IS NOT NULL")?
+        .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut select = transaction.prepare(
+        "SELECT payload FROM background_tasks WHERE session_id = ?1 AND invocation_id = ?2",
+    )?;
+    let mut update = transaction.prepare(
+        "UPDATE background_tasks SET payload = ?3, bytes = ?4 WHERE session_id = ?1 AND invocation_id = ?2",
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (session, invocation) in keys {
+        let payload: String = select.query_row(params![session, invocation], |row| row.get(0))?;
+        let mut value: Value = serde_json::from_str(&payload).map_err(StorageError::from)?;
+        let history = value
+            .as_object_mut()
+            .and_then(|fields| fields.remove("history"))
+            .unwrap_or_default();
+        let payload = match serde_json::from_value::<TaskRecord>(value.clone()) {
+            Ok(record) => serde_json::to_string(&record).map_err(StorageError::from)?,
+            Err(_) => value.to_string(),
+        };
+        update.execute(params![session, invocation, payload, payload.len() as i64])?;
+        if history.is_array() {
+            let transcript = history.to_string();
+            insert.execute(params![
+                session,
+                invocation,
+                compress_payload(&transcript)?,
+                transcript.len() as i64
+            ])?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn protects_session(
     connection: &Connection,
     session: CaudraId,
@@ -692,7 +820,7 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        JobKind, JobOwner, JobPayload, ShellJobMetadata, TaskEvent, TaskRecord,
+        JobKind, JobOwner, JobPayload, ShellJobMetadata, TaskEvent, TaskRecord, TranscriptWrite,
         accept_owned_job_event,
     };
     use crate::{
@@ -743,7 +871,6 @@ mod tests {
             request: json!({}),
             outcome: Some(json!({"success":true})),
             output_ref: None,
-            history: json!([]),
             spec: json!({}),
             events: vec![TaskEvent {
                 sequence: 2,
@@ -756,6 +883,46 @@ mod tests {
                 wait_nudge: false,
             }],
         }
+    }
+
+    #[test]
+    fn a_transcript_larger_than_any_record_is_kept_beside_it_and_goes_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        let transcript = json!(["x".repeat(super::MAX_RECORD_BYTES)]).to_string();
+        let saved = |write| {
+            database
+                .save_background_task_runtime(session.id, &record(), &write, &retry)
+                .unwrap();
+            database
+                .background_transcript(session.id, INVOCATION)
+                .unwrap()
+        };
+
+        assert_eq!(
+            saved(TranscriptWrite::Save(transcript.clone())).as_ref(),
+            Some(&transcript)
+        );
+        assert_eq!(saved(TranscriptWrite::Keep).as_ref(), Some(&transcript));
+        assert_eq!(saved(TranscriptWrite::Remove), None);
+        saved(TranscriptWrite::Save(transcript.clone()));
+        database
+            .connection()
+            .execute(
+                "DELETE FROM background_tasks WHERE invocation_id = ?1",
+                [INVOCATION],
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .background_transcript(session.id, INVOCATION)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -772,10 +939,14 @@ mod tests {
             task.invocation_id = format!("{INVOCATION}-{index}");
             task.sequence = index as u64 + 1;
             task.request = json!({"call_id": format!("{TASK}-{index}"), "label": TASK});
-            task.history = json!([index]);
             task.events[0].suppressed = true;
             database
-                .save_background_task_runtime(session.id, &task, &retry)
+                .save_background_task_runtime(
+                    session.id,
+                    &task,
+                    &TranscriptWrite::Save(json!([index]).to_string()),
+                    &retry,
+                )
                 .unwrap();
             database
                 .checkpoint_job_owner(session.id, &task.invocation_id, TASK, &[json!(index)])
@@ -792,7 +963,7 @@ mod tests {
             );
             assert!(
                 database
-                    .save_background_task_runtime(session.id, &task, &retry)
+                    .save_background_task_runtime(session.id, &task, &TranscriptWrite::Keep, &retry)
                     .is_err()
             );
         }
@@ -818,7 +989,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(first.history, json!([0]));
+        assert_eq!(
+            database
+                .background_transcript(session.id, &first.invocation_id)
+                .unwrap(),
+            Some(json!([0]).to_string())
+        );
         let retried = database
             .background_lookup_runtime(
                 session.id,
@@ -846,7 +1022,6 @@ mod tests {
                 .unwrap();
             assert!(page.records.len() <= super::MAX_HISTORY_PAGE);
             for task in page.records {
-                assert!(task.history.is_null());
                 assert!(task.outcome.is_none());
                 sequences.push(task.sequence);
             }
@@ -982,7 +1157,7 @@ mod tests {
         let retry = RuntimeRetry::new(None, &cancelled);
         let task = record();
         runtime
-            .save_background_task_runtime(session.id, &task, &retry)
+            .save_background_task_runtime(session.id, &task, &TranscriptWrite::Keep, &retry)
             .unwrap();
         assert!(writer.borrow().is_none());
         let records = runtime.background_tasks(session.id).unwrap();
@@ -1010,7 +1185,12 @@ mod tests {
         };
         let retry = RuntimeRetry::new(None, &cancelled);
         let missing_session = CaudraId::generate();
-        let result = runtime.save_background_task_runtime(missing_session, &record(), &retry);
+        let result = runtime.save_background_task_runtime(
+            missing_session,
+            &record(),
+            &TranscriptWrite::Keep,
+            &retry,
+        );
         assert!(
             matches!(result, Err(SessionError::Sqlite(error)) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation))
         );
@@ -1052,7 +1232,6 @@ mod tests {
             task.owner = JobOwner::Child {
                 invocation_id: CHILD.into(),
             };
-            task.history = Value::Null;
             task.spec = Value::Null;
         }
         let mut value = serde_json::to_value(&task).unwrap();
@@ -1060,7 +1239,6 @@ mod tests {
             value.as_object_mut().unwrap().remove("payload");
             value.as_object_mut().unwrap().remove("owner");
         } else {
-            assert!(value.get("history").is_none());
             assert!(value.get("spec").is_none());
         }
         let restored: TaskRecord = serde_json::from_value(value).unwrap();
