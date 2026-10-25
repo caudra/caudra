@@ -152,6 +152,7 @@ impl QueueItem {
                 can_move_up: false,
                 can_move_down: false,
                 admission: Some(*admission),
+                held: false,
             },
             Self::Compact { .. } => QueueEntry {
                 id,
@@ -165,6 +166,7 @@ impl QueueItem {
                 can_move_up: false,
                 can_move_down: false,
                 admission: None,
+                held: false,
             },
         }
     }

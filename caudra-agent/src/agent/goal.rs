@@ -88,6 +88,9 @@ pub struct GoalSnapshot {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
     pub subscription_cost: Option<f64>,
+    /// The goal was set while the session was busy, and its first run waits
+    /// for the session to settle instead of riding the message queue.
+    pub kickoff_pending: bool,
     pub(crate) generation: u64,
 }
 
@@ -314,6 +317,7 @@ impl GoalHandle {
                 usage: stored.usage.into(),
                 cost: stored.usage.cost,
                 subscription_cost: stored.usage.subscription_cost,
+                kickoff_pending: stored.kickoff_pending,
                 generation: state.generation,
             };
             if legacy {
@@ -366,6 +370,7 @@ impl GoalHandle {
                         attempt: wait.attempt,
                         until_ms: wait.until_ms,
                     }),
+                    kickoff_pending: goal.kickoff_pending,
                 })
             }),
             result: state
@@ -394,11 +399,11 @@ impl GoalHandle {
 
     pub fn set(&self, condition: &str) -> Result<GoalSnapshot, GoalError> {
         let condition = Goal::validate(condition)?;
-        Ok(self.set_validated(condition))
+        Ok(self.set_validated(condition, false))
     }
 
     /// Starts the next goal, ending an active one as replaced.
-    fn set_validated(&self, condition: Arc<str>) -> GoalSnapshot {
+    fn set_validated(&self, condition: Arc<str>, kickoff_pending: bool) -> GoalSnapshot {
         let now_ms = self.now_ms();
         let mut state = self.lock();
         state.end_active(GoalEnd::Replaced, now_ms);
@@ -416,12 +421,36 @@ impl GoalHandle {
             usage: TokenUsage::default(),
             cost: None,
             subscription_cost: None,
+            kickoff_pending,
             generation: state.generation,
         };
         state.journal(GoalLogWrite::Begun(begun_record(&snapshot)));
         state.finished = None;
         state.active = Some(snapshot.clone());
         snapshot
+    }
+
+    /// Sets the goal for a session that is busy: it is active at once, and its
+    /// first run is owed until [`Self::take_kickoff`] claims it.
+    pub fn set_pending_kickoff(&self, condition: &str) -> Result<GoalSnapshot, GoalError> {
+        let condition = Goal::validate(condition)?;
+        Ok(self.set_validated(condition, true))
+    }
+
+    /// Whether the active goal still owes its first run.
+    pub fn kickoff_pending(&self) -> bool {
+        self.lock()
+            .active
+            .as_ref()
+            .is_some_and(|goal| goal.kickoff_pending)
+    }
+
+    /// Claims the active goal's owed first run, true when one was owed.
+    pub fn take_kickoff(&self) -> bool {
+        self.lock()
+            .active
+            .as_mut()
+            .is_some_and(|goal| mem::take(&mut goal.kickoff_pending))
     }
 
     pub fn clear(&self) -> Option<GoalSnapshot> {
@@ -1289,6 +1318,9 @@ mod tests {
         "a restored goal must keep its number, or take and journal the next one";
     const CAP_DROPS_OLDEST: &str = "a full backlog must drop its oldest write";
     const ADOPT_LOGS_NOTHING: &str = "adopting a goal must journal nothing of its own";
+    const KICKOFF_SURVIVES: &str = "a goal's owed kickoff must survive a resume";
+    const KICKOFF_CLAIMED_ONCE: &str = "an owed kickoff must be claimed exactly once";
+    const KICKOFF_ENDS_WITH_GOAL: &str = "a replaced or ended goal must owe no kickoff";
 
     struct NullProvider;
 
@@ -1516,6 +1548,7 @@ mod tests {
             last_verdict: None,
             last_reason: None,
             wait: None,
+            kickoff_pending: false,
         }
     }
 
@@ -1679,6 +1712,54 @@ mod tests {
         );
         resumed.end_wait();
         assert_eq!(resumed.wait(), None);
+    }
+
+    #[test]
+    fn an_owed_kickoff_survives_a_resume_until_claimed() {
+        let (clock, handle) = clocked();
+        handle.set_pending_kickoff(PROMPT).unwrap();
+
+        let resumed = GoalHandle::from_meta_with_clock(
+            &SessionMeta {
+                active_goal: handle.stored().active,
+                ..SessionMeta::default()
+            },
+            clock as Arc<dyn Clock>,
+        );
+
+        assert!(resumed.kickoff_pending(), "{KICKOFF_SURVIVES}");
+        assert!(resumed.take_kickoff(), "{KICKOFF_CLAIMED_ONCE}");
+        assert!(!resumed.take_kickoff(), "{KICKOFF_CLAIMED_ONCE}");
+        assert!(!resumed.kickoff_pending(), "{KICKOFF_CLAIMED_ONCE}");
+        assert!(
+            resumed
+                .stored()
+                .active
+                .is_some_and(|goal| !goal.kickoff_pending),
+            "{KICKOFF_CLAIMED_ONCE}"
+        );
+    }
+
+    #[test_case(Transition::Replace ; "replaced_by_an_idle_goal")]
+    #[test_case(Transition::Clear ; "cleared")]
+    #[test_case(Transition::Reset ; "reset")]
+    fn a_new_or_ended_goal_owes_no_kickoff(transition: Transition) {
+        let (_clock, handle) = clocked();
+        handle.set_pending_kickoff(PROMPT).unwrap();
+
+        match transition {
+            Transition::Replace => {
+                handle.set(OTHER_PROMPT).unwrap();
+            }
+            Transition::Clear => {
+                handle.clear();
+            }
+            Transition::Reset => handle.reset(),
+            _ => unreachable!(),
+        }
+
+        assert!(!handle.kickoff_pending(), "{KICKOFF_ENDS_WITH_GOAL}");
+        assert!(!handle.take_kickoff(), "{KICKOFF_ENDS_WITH_GOAL}");
     }
 
     #[test_case(0, NUMBERED_GOAL + 1, true ; "legacy_goal_takes_the_next_number")]

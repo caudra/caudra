@@ -11,15 +11,17 @@ use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_m
 use caudra_automation::event::StartedBy;
 use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
 use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::{StoredPromptAdmission, StoredQueuedPrompt};
 
 use super::{Action, App, Status};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::agent::shared_queue::{PendingPrompt, QueueItem, QueueSender};
 use crate::chat::format_with_images;
 use crate::components::input::{InputAction, InputState, Submission};
 use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
 use crate::components::queue_actions::QueueLanes;
 use crate::components::queue_panel::{QueueEntry, set_movement_flags};
+use crate::components::{DisplayMessage, DisplayRole};
 use crate::input_document::InputDraft;
 use crate::theme;
 
@@ -39,6 +41,8 @@ const MODE_DECISION_STALE: &str = "Session work changed; submit again to choose 
 const PLAN_TARGET_ERR: &str = "Plan target is unavailable; select Plan again before submitting";
 const GOAL_SUBMISSION_ERR: &str = "Could not set the submitted goal";
 pub(crate) const GOAL_SET: &str = "Goal set";
+pub(crate) const GOAL_KICKOFF_NOTICE: &str =
+    "Goal set. Work on it starts once the current turn and queued messages settle.";
 const MODE_DECISION_PENDING: &str = "Finish the pending Plan submission choice first";
 
 pub(crate) enum SubmitOutcome {
@@ -92,14 +96,87 @@ enum QueueTarget {
     Task(String),
 }
 
+/// A prompt a reopened session brought back from its saved queue. The run it
+/// waited behind is gone, so it waits for the user to send it.
+struct HeldPrompt {
+    id: QueueItemId,
+    prompt: PendingPrompt,
+}
+
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
+    /// Shown after the live lanes and never dispatched on their own, so the
+    /// live queue's emptiness, which gates every automatic run, ignores them.
+    held: Vec<HeldPrompt>,
+    /// Set by a restore from the stored session, so the next flush holds what
+    /// it brings back instead of dispatching it.
+    hold_next_restore: bool,
     selected: Option<QueueItemId>,
     viewport: usize,
 }
 
 impl MessageQueue {
+    pub(super) fn hold_next_restore(&mut self) {
+        self.hold_next_restore = true;
+    }
+
+    fn hold(&mut self, prompts: Vec<PendingPrompt>) {
+        self.held = prompts
+            .into_iter()
+            .map(|prompt| HeldPrompt {
+                id: QueueItemId::new(),
+                prompt,
+            })
+            .collect();
+        self.clamp_focus();
+    }
+
+    pub(super) fn discard_held(&mut self) {
+        self.held.clear();
+        self.hold_next_restore = false;
+    }
+
+    pub(crate) fn held_prompts(&self) -> impl Iterator<Item = &PendingPrompt> {
+        self.held.iter().map(|held| &held.prompt)
+    }
+
+    fn held_prompt(&self, id: QueueItemId) -> Option<&PendingPrompt> {
+        self.held
+            .iter()
+            .find(|held| held.id == id)
+            .map(|held| &held.prompt)
+    }
+
+    fn take_held(&mut self, id: QueueItemId) -> Option<PendingPrompt> {
+        let index = self.held.iter().position(|held| held.id == id)?;
+        let prompt = self.held.remove(index).prompt;
+        self.clamp_focus();
+        Some(prompt)
+    }
+
+    fn held_entries(&self) -> impl Iterator<Item = QueueEntry<'static>> + '_ {
+        self.held.iter().map(|held| QueueEntry {
+            id: held.id,
+            text: Cow::Owned(held.prompt.text.clone()),
+            color: theme::current()
+                .tool_dim
+                .fg
+                .unwrap_or(theme::current().foreground),
+            editable: true,
+            movable: false,
+            can_move_up: false,
+            can_move_down: false,
+            admission: None,
+            held: true,
+        })
+    }
+
+    /// What will run without the user sending it: every lane but the held one.
+    pub(crate) fn live_entries(&self) -> Vec<QueueEntry<'static>> {
+        self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
+    }
+
     pub(super) fn wake_dispatch(&self) {
         if let Some(shared) = &self.shared {
             shared.wake_dispatch();
@@ -127,7 +204,7 @@ impl MessageQueue {
     }
 
     pub(crate) fn remove_id(&mut self, id: QueueItemId) -> bool {
-        self.take_id(id).is_some()
+        self.take_id(id).is_some() || self.take_held(id).is_some()
     }
 
     pub(crate) fn take_id(&mut self, id: QueueItemId) -> Option<QueueItem> {
@@ -169,7 +246,9 @@ impl MessageQueue {
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
+        let mut entries = self.live_entries();
+        entries.extend(self.held_entries());
+        entries
     }
 
     #[cfg(test)]
@@ -184,10 +263,25 @@ impl MessageQueue {
     }
 
     pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<InputState> {
+        if let Some(held) = self.held.iter().find(|held| held.id == id) {
+            return Some(InputState::new(
+                InputDraft {
+                    text: held.prompt.text.clone(),
+                    paste_ranges: held.prompt.paste_ranges.clone(),
+                },
+                held.prompt.images.clone(),
+            ));
+        }
         self.shared.as_ref()?.begin_edit(id)
     }
 
-    pub(crate) fn finish_edit(&self, id: QueueItemId, message: QueuedMessage) -> bool {
+    pub(crate) fn finish_edit(&mut self, id: QueueItemId, message: QueuedMessage) -> bool {
+        if let Some(held) = self.held.iter_mut().find(|held| held.id == id) {
+            held.prompt.text = message.text;
+            held.prompt.images = message.images;
+            held.prompt.paste_ranges = message.paste_ranges;
+            return true;
+        }
         self.shared
             .as_ref()
             .is_some_and(|shared| shared.finish_edit(id, message))
@@ -334,6 +428,7 @@ impl App {
                 } else {
                     PromptAdmission::Steer
                 }),
+                held: false,
             })
             .collect::<Vec<_>>();
         if self.subagent_steers.contains_key(task_id) {
@@ -353,6 +448,7 @@ impl App {
                 can_move_up: false,
                 can_move_down: false,
                 admission: Some(PromptAdmission::Steer),
+                held: false,
             })
             .collect::<Vec<_>>();
         set_movement_flags(&mut unsent);
@@ -625,7 +721,7 @@ impl App {
             if self.replacement_item == Some(id) {
                 self.replacement_item = None;
                 self.status =
-                    if self.cancelling_run.is_some() || !self.queue.panel_entries().is_empty() {
+                    if self.cancelling_run.is_some() || !self.queue.live_entries().is_empty() {
                         Status::Streaming
                     } else {
                         Status::Idle
@@ -1121,7 +1217,12 @@ impl App {
             return SubmitOutcome::Rejected(PERMISSION_PUBLISH_ERR);
         }
         if let Some(goal) = &submission.goal {
-            if self.state.goal.set(goal).is_err() {
+            let set = if deferred {
+                self.state.goal.set_pending_kickoff(goal)
+            } else {
+                self.state.goal.set(goal)
+            };
+            if set.is_err() {
                 return SubmitOutcome::Rejected(GOAL_SUBMISSION_ERR);
             }
             self.state.autopilot.drop_goal_ownership();
@@ -1130,6 +1231,16 @@ impl App {
         }
         if submission.input.mode.is_planning() && self.state.plan.is_ready() {
             self.answer_plan_escalation(ActionName::Revise);
+        }
+        if deferred && submission.goal.is_some() {
+            self.main_chat().push(DisplayMessage::new(
+                DisplayRole::Notice,
+                GOAL_KICKOFF_NOTICE.into(),
+            ));
+            if admission == PromptAdmission::Interrupt {
+                return SubmitOutcome::Replacing(self.replace_run_with_goal_kickoff());
+            }
+            return SubmitOutcome::Queued;
         }
         if deferred {
             if admission == PromptAdmission::Interrupt {
@@ -1351,14 +1462,62 @@ impl App {
         }])
     }
 
+    /// Stops the current run for a goal that replaces it. The goal's first run
+    /// is owed, not queued, so it starts once the stop has settled.
+    fn replace_run_with_goal_kickoff(&mut self) -> Vec<Action> {
+        let shared = self.queue.shared.clone();
+        let _dispatch = shared.as_ref().map(QueueSender::lock_dispatch);
+        self.stop_background_work();
+        let await_terminal = self.status == Status::Streaming && self.queue.is_processing();
+        let cancelled_run = self.begin_main_cancel(true, await_terminal);
+        if await_terminal {
+            self.goal_replaces_run = true;
+        } else {
+            self.status = Status::Idle;
+            self.rearm_background();
+        }
+        vec![Action::CancelAgent {
+            run_id: cancelled_run,
+        }]
+    }
+
     /// Push restored queue items only here, never in `restore_display`: on
     /// load/rewind the display is restored before `respawn` swaps the shared
     /// queue, so pushing earlier would fill a queue that is about to die.
+    ///
+    /// A restore from the stored session holds every saved prompt: the run it
+    /// was queued behind is gone, so only the user decides when it is sent. A
+    /// live respawn keeps its queue live and its held prompts held.
     pub(crate) fn flush_restored_queue(&mut self) {
         // The live queue owns the prompts from here on, so the recovery
         // snapshot must stop overriding it on save.
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
+        let meta = &self.state.session.meta;
+        // Read, not taken: the live queue is what the next checkpoint mirrors
+        // back into the session, so emptying it here changes nothing on disk.
+        let mut queued: Vec<PendingPrompt> = meta
+            .queued_messages
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let admission = meta
+                    .queued_message_admissions
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default();
+                stored_pending_prompt(prompt, admission)
+            })
+            .collect();
+        if mem::take(&mut self.queue.hold_next_restore) {
+            let held = meta
+                .held_queued_messages
+                .iter()
+                .map(|prompt| stored_pending_prompt(prompt, StoredPromptAdmission::Queue))
+                .chain(queued.drain(..))
+                .collect();
+            self.queue.hold(held);
+        }
         let Some(shared) = self.queue.shared.clone() else {
             return;
         };
@@ -1367,68 +1526,14 @@ impl App {
         } else {
             QueueDelivery::Separate
         };
-        let mut entries = Vec::with_capacity(self.state.session.meta.queued_messages.len());
-        // Read, not taken: the live queue is what the next checkpoint mirrors
-        // back into the session, so emptying it here changes nothing on disk.
-        for (index, prompt) in self
-            .state
-            .session
-            .meta
-            .queued_messages
-            .clone()
+        let entries: Vec<_> = queued
             .into_iter()
-            .enumerate()
-        {
-            let admission = match self
-                .state
-                .session
-                .meta
-                .queued_message_admissions
-                .get(index)
-                .copied()
-                .unwrap_or_default()
-            {
-                caudra_storage::sessions::StoredPromptAdmission::Queue => PromptAdmission::Queue,
-                caudra_storage::sessions::StoredPromptAdmission::Steer => PromptAdmission::Steer,
-                caudra_storage::sessions::StoredPromptAdmission::Interrupt => {
-                    PromptAdmission::Interrupt
-                }
-            };
-            let images = prompt
-                .images
-                .into_iter()
-                .filter_map(|image| {
-                    let Some(media_type) = ImageMediaType::from_mime(&image.media_type) else {
-                        tracing::warn!(
-                            media_type = %image.media_type,
-                            "skipping stored queued image"
-                        );
-                        return None;
-                    };
-                    Some(ImageSource::new(media_type, image.data.into()))
-                })
-                .collect();
-            let mode = prompt.mode.map_or(self.state.mode, Into::into);
-            if mode == super::Mode::Plan && matches!(self.state.plan, super::mode::PlanState::None)
-            {
-                let selected = self.state.mode;
-                self.enter_plan();
-                self.state.mode = selected;
-            }
-            let mut submission = self.prepare_submission(QueuedMessage {
-                mentions: self.scan_mentions(&prompt.text),
-                commits: self.scan_commits(&prompt.text),
-                text: prompt.text,
-                images,
-                paste_ranges: prompt
-                    .paste_ranges
-                    .into_iter()
-                    .map(|range| range.start..range.end)
-                    .collect(),
-            });
-            submission.input.mode = self.agent_mode_for(mode);
-            entries.push(submission.into_queue_item(self.run_id, admission));
-        }
+            .map(|prompt| {
+                let admission = prompt.admission;
+                self.restored_submission(prompt)
+                    .into_queue_item(self.run_id, admission)
+            })
+            .collect();
         if !entries.is_empty() && self.automatic_wakes_suppressed {
             self.rearm_background();
         }
@@ -1441,6 +1546,41 @@ impl App {
             self.status = Status::Streaming;
         }
         shared.restore_pending(entries, delivery, ready);
+    }
+
+    /// A saved prompt as a submission against the session as it is now, in
+    /// the mode it was queued in.
+    fn restored_submission(&mut self, prompt: PendingPrompt) -> PromptSubmission {
+        let mode = prompt.mode.map_or(self.state.mode, Into::into);
+        if mode == super::Mode::Plan && matches!(self.state.plan, super::mode::PlanState::None) {
+            let selected = self.state.mode;
+            self.enter_plan();
+            self.state.mode = selected;
+        }
+        let mut submission = self.prepare_submission(QueuedMessage {
+            mentions: self.scan_mentions(&prompt.text),
+            commits: self.scan_commits(&prompt.text),
+            text: prompt.text,
+            images: prompt.images,
+            paste_ranges: prompt.paste_ranges,
+        });
+        submission.input.mode = self.agent_mode_for(mode);
+        submission
+    }
+
+    /// Sends a held prompt as though it had just been typed: it starts a run
+    /// when the session is idle and waits in the queue when it is not.
+    pub(super) fn send_held_queue_item(&mut self, id: QueueItemId) -> Vec<Action> {
+        let Some(prompt) = self.queue.held_prompt(id).cloned() else {
+            self.flash(ALREADY_SENT_ERR.into());
+            return Vec::new();
+        };
+        let submission = self.restored_submission(prompt);
+        let outcome = self.admit_submission(submission, PromptAdmission::Queue);
+        if !matches!(outcome, SubmitOutcome::Rejected(_)) {
+            self.queue.take_held(id);
+        }
+        self.handle_submit_outcome(outcome)
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -1468,6 +1608,7 @@ impl App {
             self.rearm_background();
         }
         self.automation_queue_consumed();
+        self.open_queued_run();
         self.goal_deferred = false;
         self.autopilot_checkin_due = false;
         self.state.goal.end_wait();
@@ -1486,6 +1627,7 @@ impl App {
             self.rearm_background();
         }
         self.automation_queue_consumed();
+        self.open_queued_run();
         self.goal_deferred = false;
         self.autopilot_checkin_due = false;
         self.state.goal.end_wait();
@@ -1570,6 +1712,9 @@ impl App {
             self.autopilot_checkin_due = false;
             return vec![];
         };
+        if goal.kickoff_pending {
+            return self.start_goal_kickoff(&goal.condition);
+        }
         let resumed = mem::take(&mut self.autopilot_checkin_due);
         let checkin = if self.state.goal.wait().is_some() && !self.goal_deferred {
             caudra_agent::goal_wait_message(&goal.condition)
@@ -1586,6 +1731,26 @@ impl App {
         let actions = self.start_run(input, String::new(), StartedBy::Autopilot);
         if !actions.is_empty() {
             self.count_autopilot_continuation();
+        }
+        actions
+    }
+
+    /// The first run of a goal set while the session was busy, shown as the
+    /// prompt it would have been had the session been idle.
+    fn start_goal_kickoff(&mut self, condition: &str) -> Vec<Action> {
+        let mut input = self.build_agent_input(&QueuedMessage {
+            text: condition.to_owned(),
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            paste_ranges: Vec::new(),
+        });
+        input.preamble.push(caudra_providers::Message::synthetic(
+            caudra_agent::goal_kickoff_message(condition),
+        ));
+        let actions = self.start_run(input, condition.to_owned(), StartedBy::User);
+        if !actions.is_empty() {
+            self.state.goal.take_kickoff();
         }
         actions
     }
@@ -1660,6 +1825,40 @@ impl App {
             self.main_chat().show_user_prompt(display, images);
         }
         vec![Action::SendMessage(Box::new(input))]
+    }
+}
+
+fn stored_pending_prompt(
+    prompt: &StoredQueuedPrompt,
+    admission: StoredPromptAdmission,
+) -> PendingPrompt {
+    PendingPrompt {
+        text: prompt.text.clone(),
+        images: prompt
+            .images
+            .iter()
+            .filter_map(|image| {
+                let Some(media_type) = ImageMediaType::from_mime(&image.media_type) else {
+                    tracing::warn!(
+                        media_type = %image.media_type,
+                        "skipping stored queued image"
+                    );
+                    return None;
+                };
+                Some(ImageSource::new(media_type, image.data.clone().into()))
+            })
+            .collect(),
+        paste_ranges: prompt
+            .paste_ranges
+            .iter()
+            .map(|range| range.start..range.end)
+            .collect(),
+        admission: match admission {
+            StoredPromptAdmission::Queue => PromptAdmission::Queue,
+            StoredPromptAdmission::Steer => PromptAdmission::Steer,
+            StoredPromptAdmission::Interrupt => PromptAdmission::Interrupt,
+        },
+        mode: prompt.mode,
     }
 }
 

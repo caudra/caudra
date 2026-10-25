@@ -389,6 +389,13 @@ const MEASURED_CONTEXT: u32 = 100_000;
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
 const GOAL_CONDITION: &str = "all focused tests pass";
+const HELD_PROMPT: &str = "queued before the reopen";
+const QUEUED_PROMPT: &str = "queued after the reopen";
+const EDITED_PROMPT: &str = "edited while held";
+const RESTORE_HOLDS: &str = "a restore from the stored session must hold its queued prompts";
+const SEND_NOW_DELIVERS: &str = "Send now must deliver a held prompt as though it were typed";
+const GOAL_NOT_QUEUED: &str = "a goal set while busy must owe its kickoff, not queue it";
+const GOAL_KICKS_OFF_ONCE: &str = "an owed goal must kick off once, as its condition";
 const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 const CONTEXT_COMMAND: &str = "/context";
 const LOGS_COMMAND: &str = "/logs";
@@ -13534,7 +13541,7 @@ fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
 }
 
 #[test]
-fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
+fn restore_resumed_session_holds_complete_queued_prompts_and_round_trips() {
     let mut app = test_app();
     let stored_prompts = vec![
         StoredQueuedPrompt {
@@ -13553,8 +13560,9 @@ fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
         vec![StoredPromptAdmission::Steer, StoredPromptAdmission::Queue];
 
     app.restore_resumed_session();
+    assert!(app.queue.pending_prompts().is_empty());
     assert_eq!(
-        app.queue.pending_prompts(),
+        app.queue.held_prompts().cloned().collect::<Vec<_>>(),
         [
             shared_queue::PendingPrompt {
                 mode: Some(StoredMode::Plan),
@@ -13572,14 +13580,241 @@ fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
             },
         ]
     );
-    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status, Status::Idle);
 
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, stored_prompts);
+    assert!(app.state.session.meta.queued_messages.is_empty());
+    assert_eq!(app.state.session.meta.held_queued_messages, stored_prompts);
+
+    app.restore_resumed_session();
+    assert!(app.queue.pending_prompts().is_empty());
     assert_eq!(
-        app.state.session.meta.queued_message_admissions,
-        [StoredPromptAdmission::Steer, StoredPromptAdmission::Queue]
+        app.queue
+            .held_prompts()
+            .map(|prompt| prompt.text.as_str())
+            .collect::<Vec<_>>(),
+        ["q1", "q2"]
     );
+}
+
+#[derive(Clone, Copy)]
+enum StoredRestore {
+    Load,
+    Startup,
+    Rewind,
+}
+
+#[test_case(StoredRestore::Load ; "load")]
+#[test_case(StoredRestore::Startup ; "startup")]
+#[test_case(StoredRestore::Rewind ; "rewind")]
+fn every_restore_from_the_stored_session_holds_queued_prompts(restore: StoredRestore) {
+    let mut app = build_rewind_app();
+    let queued = vec![stored_queued_prompt(HELD_PROMPT)];
+    match restore {
+        StoredRestore::Load => {
+            let mut session = AppSession::new("test-model", &app.state.session.cwd);
+            session.meta.queued_messages = queued;
+            crate::push_history_message(&mut session, Message::user("hello".into()));
+            let model = app.state.model.clone();
+            app.apply_loaded_session(session, &model).unwrap();
+            app.flush_restored_queue();
+        }
+        StoredRestore::Startup => {
+            app.state.session_mut().meta.queued_messages = queued;
+            app.restore_resumed_session();
+        }
+        StoredRestore::Rewind => {
+            assert!(!app.rewind_to(rewind_to_second_turn()).is_empty());
+            app.state.session_mut().meta.queued_messages = queued;
+            app.flush_restored_queue();
+        }
+    }
+
+    assert!(app.queue.is_empty(), "{RESTORE_HOLDS}");
+    assert!(app.queue.live_entries().is_empty(), "{RESTORE_HOLDS}");
+    assert_eq!(
+        app.queue
+            .held_prompts()
+            .map(|prompt| prompt.text.as_str())
+            .collect::<Vec<_>>(),
+        [HELD_PROMPT],
+        "{RESTORE_HOLDS}"
+    );
+    assert_eq!(app.status, Status::Idle, "{RESTORE_HOLDS}");
+    assert!(
+        app.queue.panel_entries().iter().all(|entry| entry.held),
+        "{RESTORE_HOLDS}"
+    );
+}
+
+#[test]
+fn a_live_respawn_keeps_held_prompts_held_and_sends_the_live_queue() {
+    let mut app = held_app();
+    app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt(QUEUED_PROMPT)];
+
+    app.flush_restored_queue();
+
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .iter()
+            .map(|prompt| prompt.text.as_str())
+            .collect::<Vec<_>>(),
+        [QUEUED_PROMPT]
+    );
+    assert_eq!(app.queue.held_prompts().count(), 1);
+}
+
+fn held_app() -> App {
+    let mut app = test_app();
+    app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt(HELD_PROMPT)];
+    app.restore_resumed_session();
+    assert_eq!(app.queue.held_prompts().count(), 1);
+    app
+}
+
+#[test_case(false ; "idle_starts_a_run")]
+#[test_case(true ; "busy_queues_it")]
+fn send_now_delivers_a_held_prompt_as_though_typed(busy: bool) {
+    let mut app = held_app();
+    if busy {
+        app.status = Status::Streaming;
+        app.run_id = 1;
+    }
+
+    let actions = queue_menu_action(&mut app, QueueActionKind::Send);
+
+    assert_eq!(app.queue.held_prompts().count(), 0, "{SEND_NOW_DELIVERS}");
+    let sent: Vec<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SendMessage(input) => Some(input.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    let queued: Vec<_> = app
+        .queue
+        .pending_prompts()
+        .into_iter()
+        .map(|prompt| prompt.text)
+        .collect();
+    if busy {
+        assert!(sent.is_empty(), "{SEND_NOW_DELIVERS}");
+        assert_eq!(queued, [HELD_PROMPT], "{SEND_NOW_DELIVERS}");
+    } else {
+        assert_eq!(sent, [HELD_PROMPT], "{SEND_NOW_DELIVERS}");
+        assert!(queued.is_empty(), "{SEND_NOW_DELIVERS}");
+        assert!(app.state.session.meta.open_run.is_some());
+    }
+}
+
+#[test]
+fn deleting_a_held_prompt_drops_it_from_the_session() {
+    let mut app = held_app();
+
+    queue_menu_action(&mut app, QueueActionKind::Delete);
+    app.checkpoint();
+
+    assert_eq!(app.queue.held_prompts().count(), 0);
+    assert!(app.queue.panel_entries().is_empty());
+    assert!(app.state.session.meta.held_queued_messages.is_empty());
+    assert!(app.state.session.meta.queued_messages.is_empty());
+}
+
+#[test]
+fn editing_a_held_prompt_keeps_it_held() {
+    let mut app = held_app();
+
+    queue_menu_action(&mut app, QueueActionKind::Edit);
+    assert!(app.queue_editor_active());
+    assert_eq!(app.input_box.buffer.value(), HELD_PROMPT);
+    app.input_box.set_input(EDITED_PROMPT.into());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(actions.is_empty());
+    assert!(app.queue.is_empty());
+    assert_eq!(
+        app.queue
+            .held_prompts()
+            .map(|prompt| prompt.text.as_str())
+            .collect::<Vec<_>>(),
+        [EDITED_PROMPT]
+    );
+}
+
+#[test_case("/goal" ; "goal")]
+#[test_case("/autopilot" ; "autopilot")]
+fn a_goal_set_while_busy_kicks_off_after_the_turn_without_queueing(command: &str) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let actions = app
+        .run_cmdline(&format!("{command} {GOAL_CONDITION}"), 0)
+        .unwrap();
+
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SendMessage(_))),
+        "{GOAL_NOT_QUEUED}"
+    );
+    assert!(!app.mode_submission.is_open());
+    assert!(app.queue.is_empty(), "{GOAL_NOT_QUEUED}");
+    assert!(app.queue.panel_entries().is_empty(), "{GOAL_NOT_QUEUED}");
+    assert!(app.state.goal.kickoff_pending(), "{GOAL_NOT_QUEUED}");
+    assert_eq!(
+        app.state.goal.active_condition().as_deref(),
+        Some(GOAL_CONDITION)
+    );
+    assert!(
+        (0..app.main_chat().message_count()).any(|index| app
+            .main_chat()
+            .message_at(index)
+            .is_some_and(|message| message.text == crate::app::queue::GOAL_KICKOFF_NOTICE)),
+        "{GOAL_NOT_QUEUED}"
+    );
+
+    end_turn(&mut app);
+    assert!(app.goal_checkin_due());
+    let actions = app.start_goal_checkin();
+
+    let inputs: Vec<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::SendMessage(input) => Some(input),
+            _ => None,
+        })
+        .collect();
+    let [input] = inputs.as_slice() else {
+        panic!("{GOAL_KICKS_OFF_ONCE}: {} runs", inputs.len());
+    };
+    let kickoff = caudra_agent::goal_kickoff_message(GOAL_CONDITION);
+    assert_eq!(input.message, GOAL_CONDITION, "{GOAL_KICKS_OFF_ONCE}");
+    assert!(
+        input
+            .preamble
+            .iter()
+            .any(|message| message.first_text_content() == Some(kickoff.as_str())),
+        "{GOAL_KICKS_OFF_ONCE}"
+    );
+    assert!(!app.state.goal.kickoff_pending(), "{GOAL_KICKS_OFF_ONCE}");
+    assert!(!app.goal_checkin_due(), "{GOAL_KICKS_OFF_ONCE}");
+}
+
+#[test]
+fn an_idle_goal_starts_at_once() {
+    let mut app = test_app();
+
+    let actions = app
+        .run_cmdline(&format!("/goal {GOAL_CONDITION}"), 0)
+        .unwrap();
+
+    assert!(actions.iter().any(
+        |action| matches!(action, Action::SendMessage(input) if input.message == GOAL_CONDITION)
+    ));
+    assert!(!app.state.goal.kickoff_pending());
+    assert!(app.queue.is_empty());
 }
 
 #[test]
@@ -14536,6 +14771,7 @@ fn a_resumed_waiting_goal_checks_in_once_its_wait_is_over(until_ms: u64, due: bo
             attempt: 1,
             until_ms,
         }),
+        kickoff_pending: false,
     }));
     let model = app.state.model.clone();
     let mut resumed = test_app();
@@ -14626,6 +14862,7 @@ fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
         last_verdict: Some(StoredGoalVerdict::NotMet),
         last_reason: Some(GOAL_REASON.into()),
         wait: None,
+        kickoff_pending: false,
     }));
 
     let model = app.state.model.clone();
@@ -17357,6 +17594,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
         last_verdict: None,
         last_reason: None,
         wait: None,
+        kickoff_pending: false,
     }));
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);

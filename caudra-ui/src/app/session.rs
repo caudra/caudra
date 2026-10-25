@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crate::agent::shared_queue::PendingPrompt;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{
     CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, attach_card_decisions, decision_inserts,
@@ -80,6 +81,29 @@ fn plan_target(plan: &PlanState) -> Option<StoredPlanTarget> {
             })
         },
     )
+}
+
+fn stored_queued_prompt(prompt: &PendingPrompt) -> StoredQueuedPrompt {
+    StoredQueuedPrompt {
+        mode: prompt.mode,
+        text: prompt.text.clone(),
+        images: prompt
+            .images
+            .iter()
+            .map(|image| StoredImage {
+                media_type: image.media_type.mime().into(),
+                data: image.data.to_string(),
+            })
+            .collect(),
+        paste_ranges: prompt
+            .paste_ranges
+            .iter()
+            .map(|range| StoredPasteRange {
+                start: range.start,
+                end: range.end,
+            })
+            .collect(),
+    }
 }
 
 fn stored_subagent_outcome(outcome: Option<TaskOutcome>) -> StoredSubagentOutcome {
@@ -174,6 +198,7 @@ pub(crate) fn session_has_content(session: &AppSession, default_mode: StoredMode
         || session.meta.input_draft.is_some()
         || !session.meta.input_draft_images.is_empty()
         || !session.meta.queued_messages.is_empty()
+        || !session.meta.held_queued_messages.is_empty()
         || !session.meta.unsent_subagent_messages.is_empty()
         || session.meta.active_goal.is_some()
         || session.meta.goal_result.is_some()
@@ -484,29 +509,7 @@ impl App {
                     end: range.end,
                 })
                 .collect(),
-            queued_messages: queued_prompts
-                .iter()
-                .map(|prompt| StoredQueuedPrompt {
-                    mode: prompt.mode,
-                    text: prompt.text.clone(),
-                    images: prompt
-                        .images
-                        .iter()
-                        .map(|image| StoredImage {
-                            media_type: image.media_type.mime().into(),
-                            data: image.data.to_string(),
-                        })
-                        .collect(),
-                    paste_ranges: prompt
-                        .paste_ranges
-                        .iter()
-                        .map(|range| StoredPasteRange {
-                            start: range.start,
-                            end: range.end,
-                        })
-                        .collect(),
-                })
-                .collect(),
+            queued_messages: queued_prompts.iter().map(stored_queued_prompt).collect(),
             queued_message_admissions: queued_prompts
                 .iter()
                 .map(|prompt| match prompt.admission {
@@ -520,6 +523,11 @@ impl App {
             } else {
                 self.recoverable_queue_together
             },
+            held_queued_messages: self
+                .queue
+                .held_prompts()
+                .map(stored_queued_prompt)
+                .collect(),
             unsent_subagent_messages: self
                 .unsent_subagent_steers
                 .iter()
@@ -687,6 +695,7 @@ impl App {
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
+        self.queue.discard_held();
         self.task_queue_selection = None;
         self.task_queue_viewport = 0;
         self.queue_hits.clear();
@@ -708,6 +717,7 @@ impl App {
         self.pending_input = PendingInput::None;
         self.cancelling_run = None;
         self.replacement_item = None;
+        self.goal_replaces_run = false;
         self.status_bar.clear_flash();
         self.last_esc = None;
         self.last_exit = None;
@@ -717,6 +727,7 @@ impl App {
     }
 
     pub(crate) fn restore_display(&mut self) {
+        self.queue.hold_next_restore();
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 

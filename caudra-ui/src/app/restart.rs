@@ -138,6 +138,15 @@ impl App {
         }
     }
 
+    /// A queued prompt the agent loop picked up starts its run without
+    /// `start_run`, so it opens the run here. One it guided into a run already
+    /// open changes nothing.
+    pub(super) fn open_queued_run(&mut self) {
+        if self.state.session.meta.open_run.is_none() {
+            self.open_run(false);
+        }
+    }
+
     /// A run that ended on its own leaves nothing to resume. One a shutdown
     /// cut off stays open for the next start.
     pub(super) fn settle_open_run(&mut self) {
@@ -255,12 +264,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use caudra_agent::restart::{InterruptedJob, RestoredWork, StopCause};
-    use caudra_agent::{AgentEvent, DoneReason};
+    use caudra_agent::{AgentEvent, DoneReason, QueueConsumedItem, QueueItemId};
     use caudra_config::ResumeInterrupted;
     use caudra_providers::TokenUsage;
     use caudra_storage::background::{JobKind, JobOwner};
     use caudra_storage::now_epoch;
-    use caudra_storage::sessions::StoredOpenRun;
+    use caudra_storage::sessions::{StoredOpenRun, StoredQueuedPrompt};
     use test_case::test_case;
 
     use super::super::App;
@@ -270,6 +279,9 @@ mod tests {
     const MAX_AGE_HOURS: u64 = 24;
     const RESUME_HEADING: &str = "Resumed after interruption";
     const SHELL_TASK: &str = "shell-1";
+    const QUEUED_PROMPT: &str = "queued before the restart";
+    const QUEUED_RUN_OPENS: &str = "a run the queue starts must be open, so a crash resumes it";
+    const HELD_LEAVES_RESUME: &str = "held prompts must not hold back the resume";
 
     fn reopened(open_run: Option<u32>, work: RestoredWork, configured: ResumeInterrupted) -> App {
         let mut app = test_app();
@@ -374,5 +386,64 @@ mod tests {
             reason: DoneReason::Cancelled,
         }));
         app.automatic_wakes_suppressed
+    }
+
+    #[test_case(false; "one_item")]
+    #[test_case(true; "a_batch")]
+    fn a_run_the_queue_starts_is_open(batch: bool) {
+        let mut app = test_app();
+        app.run_id = 1;
+        let id = QueueItemId::new();
+        let event = if batch {
+            AgentEvent::QueueBatchConsumed {
+                items: vec![QueueConsumedItem {
+                    id,
+                    text: QUEUED_PROMPT.into(),
+                    images: Vec::new(),
+                }],
+            }
+        } else {
+            AgentEvent::QueueItemConsumed {
+                id,
+                text: QUEUED_PROMPT.into(),
+                images: Vec::new(),
+            }
+        };
+
+        app.update(agent_msg(event));
+
+        assert!(
+            app.state.session.meta.open_run.is_some(),
+            "{QUEUED_RUN_OPENS}"
+        );
+    }
+
+    #[test]
+    fn held_prompts_leave_the_resume_due() {
+        let mut app = test_app();
+        app.state.session_mut().meta.queued_messages = vec![StoredQueuedPrompt {
+            text: QUEUED_PROMPT.into(),
+            mode: None,
+            images: Vec::new(),
+            paste_ranges: Vec::new(),
+        }];
+        app.restore_resumed_session();
+        let session = app.state.session_mut();
+        session.updated_at = now_epoch();
+        session.meta.open_run = Some(StoredOpenRun {
+            started_at: 0,
+            resume_attempts: 0,
+            shut_down_at: None,
+        });
+        app.restore_interruption(
+            RestoredWork::default(),
+            Vec::new(),
+            ResumeInterrupted::Auto,
+            MAX_AGE_HOURS,
+        );
+
+        assert_eq!(app.queue.held_prompts().count(), 1);
+        assert!(app.queue.is_empty());
+        assert!(app.interrupted_resume_due(), "{HELD_LEAVES_RESUME}");
     }
 }

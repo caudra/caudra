@@ -46,6 +46,7 @@ pub(crate) mod workflow;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -703,6 +704,9 @@ pub struct App {
     pub(crate) run_id: u64,
     pub(crate) cancelling_run: Option<u64>,
     replacement_item: Option<QueueItemId>,
+    /// A goal set with "stop work" waits for the stopped run to end before
+    /// its first run may start.
+    goal_replaces_run: bool,
     goal_deferred: bool,
     /// A resumed engaged session owes its goal one check-in once it settles.
     autopilot_checkin_due: bool,
@@ -1038,6 +1042,7 @@ impl App {
             run_id: 0,
             cancelling_run: None,
             replacement_item: None,
+            goal_replaces_run: false,
             goal_deferred: false,
             autopilot_checkin_due: false,
             autopilot_check_due: false,
@@ -3293,6 +3298,7 @@ impl App {
             return Vec::new();
         };
         match kind {
+            QueueActionKind::Send => return self.send_held_queue_item(id),
             QueueActionKind::Edit => {
                 self.select_active_queue_item(id);
                 self.begin_queue_edit(id);
@@ -4914,6 +4920,7 @@ impl App {
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         if !preserve_queue {
             self.queue.clear();
+            self.state.goal.take_kickoff();
             self.replacement_item = None;
             if !await_terminal {
                 self.status = Status::Idle;
@@ -5366,7 +5373,7 @@ impl App {
                 let cancelled_error = matches!(&envelope.event, AgentEvent::Error { .. });
                 self.cancelling_run = None;
                 self.status =
-                    if self.replacement_item.is_some() || !self.queue.panel_entries().is_empty() {
+                    if self.replacement_item.is_some() || !self.queue.live_entries().is_empty() {
                         Status::Streaming
                     } else {
                         Status::Idle
@@ -5374,6 +5381,9 @@ impl App {
                 self.refresh_record_index();
                 if cancelled_error {
                     self.queue.resume();
+                }
+                if mem::take(&mut self.goal_replaces_run) {
+                    self.rearm_background();
                 }
                 self.automation_run_ended(TurnOutcome::Cancelled, None);
             }
@@ -7122,7 +7132,10 @@ impl App {
     }
 
     pub(crate) fn goal_checkin_due(&self) -> bool {
-        (self.goal_deferred || self.autopilot_checkin_due || self.state.goal.wait_over())
+        (self.goal_deferred
+            || self.autopilot_checkin_due
+            || self.state.goal.wait_over()
+            || self.state.goal.kickoff_pending())
             && self.state.goal.snapshot().is_some()
     }
 

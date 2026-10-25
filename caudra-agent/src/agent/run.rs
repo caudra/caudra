@@ -2987,7 +2987,7 @@ impl<'h> Agent<'h> {
         &mut self,
         done_reason: DoneReason,
     ) -> Result<TurnOutcome, AgentError> {
-        let Some(goal) = self.goal.snapshot() else {
+        let Some(goal) = self.goal.snapshot().filter(|goal| !goal.kickoff_pending) else {
             return Ok(TurnOutcome::Done(done_reason));
         };
         if !self.goal_completion_ready() {
@@ -5119,6 +5119,8 @@ mod tests {
     const TOKENS_PER_MILLION: f64 = 1_000_000.0;
     const COST_TOLERANCE: f64 = 1e-12;
     const LOGS_EVERY_CHECK: &str = "each goal check must log one evaluation and report its fields";
+    const KICKOFF_UNJUDGED: &str =
+        "the run that was busy when a goal arrived must end without judging it";
     const DECISION_VERDICT: &str = "not yet verified";
     const DECISION_SKILL: &str = "test-helper";
     const DECISION_SKILL_TASK: &str = "effect-suggestion-regression";
@@ -6843,6 +6845,35 @@ mod tests {
                 agent.goal_completion(DoneReason::EndTurn).await.unwrap();
                 assert_eq!(requests.lock().unwrap().len(), 1);
             }
+        });
+    }
+
+    #[test_case(true; "with_queued_input")]
+    #[test_case(false; "idle")]
+    fn a_goal_owing_its_kickoff_ends_the_turn_unjudged(pending: bool) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![goal_response(true, false, DECISION_VERDICT)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.goal.set_pending_kickoff(DECISION_GOAL).unwrap();
+            agent.interrupt_source = Some(Arc::new(PendingInput(AtomicBool::new(pending))));
+
+            assert!(matches!(
+                agent.goal_completion(DoneReason::EndTurn).await.unwrap(),
+                TurnOutcome::Done(DoneReason::EndTurn)
+            ));
+
+            assert!(requests.lock().unwrap().is_empty(), "{KICKOFF_UNJUDGED}");
+            assert_eq!(agent.goal.snapshot().unwrap().evaluations, 0);
+            assert!(agent.goal.kickoff_pending(), "{KICKOFF_UNJUDGED}");
+            assert!(
+                !events.try_iter().any(|event| matches!(
+                    event.event,
+                    AgentEvent::GoalDeferred { .. } | AgentEvent::GoalEvaluating { .. }
+                )),
+                "{KICKOFF_UNJUDGED}"
+            );
         });
     }
 

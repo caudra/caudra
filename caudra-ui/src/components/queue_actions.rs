@@ -17,6 +17,7 @@ const WIDTH_PERCENT: u16 = 38;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueActionKind {
+    Send,
     Edit,
     MoveUp,
     MoveDown,
@@ -30,6 +31,7 @@ pub enum QueueActionKind {
 impl PickerItem for QueueActionKind {
     fn label(&self) -> &str {
         match self {
+            Self::Send => "Send now",
             Self::Edit => "Edit",
             Self::MoveUp => "Move up",
             Self::MoveDown => "Move down",
@@ -85,6 +87,9 @@ impl QueueActions {
         let guided = entry.admission == Some(PromptAdmission::Steer);
         let queued = entry.admission == Some(PromptAdmission::Queue);
         let mut actions = Vec::new();
+        if entry.held {
+            actions.push(QueueActionKind::Send);
+        }
         if entry.editable {
             actions.push(QueueActionKind::Edit);
         }
@@ -217,6 +222,7 @@ mod tests {
             can_move_up: false,
             can_move_down: false,
             admission,
+            held: false,
         }
     }
 
@@ -288,6 +294,12 @@ mod tests {
             QueueActionKind::Delete,
         ]
         ; "reorderable_item_offers_both_moves"
+    )]
+    #[test_case(
+        QueueEntry { held: true, editable: true, ..entry(None) },
+        QueueLanes::Main,
+        &[QueueActionKind::Send, QueueActionKind::Edit, QueueActionKind::Delete]
+        ; "held_item_can_be_sent_edited_or_dropped"
     )]
     fn menu_matches_item_capabilities(
         entry: QueueEntry<'static>,

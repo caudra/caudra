@@ -352,6 +352,10 @@ pub struct StoredActiveGoal {
     /// not waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<StoredGoalWait>,
+    /// Set while the busy session it arrived in still owes the goal its first
+    /// run, which starts once the session is quiet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kickoff_pending: bool,
 }
 
 /// A goal's wait on a change outside the session: its `attempt`th in a row,
@@ -528,6 +532,10 @@ pub struct SessionMeta {
     pub queued_message_admissions: Vec<StoredPromptAdmission>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub queued_messages_together: bool,
+    /// Queued prompts a reopen brought back, waiting for the user to send them
+    /// rather than for the run they were queued behind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_queued_messages: Vec<StoredQueuedPrompt>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub unsent_subagent_messages: HashMap<String, Vec<StoredQueuedDraft>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

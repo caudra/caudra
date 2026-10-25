@@ -596,6 +596,7 @@ mod tests {
     const EXPECTED_SEND: &str = "expected one automatic continuation";
     const EXPECTED_COMPOSED_SEND: &str = "expected the composed prompt to start a run";
     const EXPECTED_QUEUED_INPUT: &str = "expected the submitted Plan input in the queue";
+    const GOAL_NOT_QUEUED: &str = "a goal that stops work must owe its kickoff, not queue it";
 
     fn app_in_mode(mode: Mode) -> App {
         let mut app = test_app();
@@ -1302,6 +1303,44 @@ mod tests {
             app.input_box.expanded_text(),
             format!("/goal {PROPOSED_GOAL}")
         );
+    }
+
+    #[test_case(true; "active_agent")]
+    #[test_case(false; "startup_not_claimed")]
+    fn stopping_work_for_a_goal_cancels_the_run_and_queues_nothing(active: bool) {
+        let mut app = app_in_mode(Mode::Build);
+        let (sender, receiver) = shared_queue::queue();
+        app.queue.set_shared(sender);
+        if active {
+            receiver.set_active_run(RUN_ID);
+        }
+        app.toggle_mode();
+        app.submit_goal(PROPOSED_GOAL);
+        assert!(app.mode_submission.is_open());
+
+        let actions =
+            app.handle_mode_submission(ModeSubmissionAction::Select(ModeSubmissionChoice::Stop));
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::CancelAgent { run_id: RUN_ID }]
+        ));
+        assert!(app.queue.is_empty(), "{GOAL_NOT_QUEUED}");
+        assert!(app.queue.panel_entries().is_empty(), "{GOAL_NOT_QUEUED}");
+        assert!(app.replacement_item.is_none(), "{GOAL_NOT_QUEUED}");
+        assert!(app.state.goal.kickoff_pending());
+        assert_eq!(
+            app.state.goal.active_condition().as_deref(),
+            Some(PROPOSED_GOAL)
+        );
+        assert_eq!(app.cancelling_run, active.then_some(RUN_ID));
+        assert_eq!(app.automatic_wakes_suppressed, active);
+
+        crate::app::tests::end_turn(&mut app);
+
+        assert_eq!(app.status, Status::Idle);
+        assert!(!app.automatic_wakes_suppressed);
+        assert!(app.goal_checkin_due());
     }
 
     #[test_case(ModeSubmissionAction::Select(ModeSubmissionChoice::KeepEditing); "keep_goal")]

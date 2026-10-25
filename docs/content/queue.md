@@ -11,9 +11,11 @@ Press `Enter` or click `next` while Caudra is working. The prompt waits until th
 
 Queued user input takes priority over automatic `/goal` checks. If no input is waiting, the goal can be checked after the current work and result delivery settle. An [open todo reminder](/docs/context/#open-todo-items) comes before both, as part of the run that is ending.
 
+A `/goal` or `/autopilot <goal>` sent while Caudra works takes effect at once and does not enter the queue. Its first turn starts once the current work and every queued prompt are done.
+
 Queued prompts appear above the input. A section header names each group and counts what is waiting in it, and the sections appear in the order Caudra claims them. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click.
 
-Every row opens with a `⋯` handle. Click it, or press `.` on the focused row, to open the item menu. The menu carries Edit, Move up, Move down, Move to Guide, Move to Up next, Replace current run, Move to Main, and Delete, filtered to what that item allows right now. `Shift+Up` and `Shift+Down` also reorder the focused item. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. In a running [task chat](#task-chats), guidance rows also offer Replace current run. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
+Every row opens with a `⋯` handle. Click it, or press `.` on the focused row, to open the item menu. The menu carries Send now, Edit, Move up, Move down, Move to Guide, Move to Up next, Replace current run, Move to Main, and Delete, filtered to what that item allows right now. `Shift+Up` and `Shift+Down` also reorder the focused item. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. In a running [task chat](#task-chats), guidance rows also offer Replace current run. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
 
 Press `b` while the queue is focused or click its mode control to toggle Together. Together sends compatible pending next-run prompts as separate user messages in one model turn. Prompts with different execution modes run in separate turns. The setting resets after those batches are claimed.
 
@@ -59,4 +61,6 @@ Waiting guidance can take over too. Press `r` on its row or choose Replace curre
 
 ## Recovery
 
-Unclaimed prompts, their delivery modes, and their captured Build or Plan modes are saved with the session. Editing or reordering a prompt keeps its captured mode. A provider or tool error pauses delivery so the next prompt cannot race error recovery. Resume the session to retry or edit the preserved queue.
+Unclaimed prompts, their delivery modes, and their captured Build or Plan modes are saved with the session. Editing or reordering a prompt keeps its captured mode. A provider or tool error pauses delivery so the next prompt cannot race error recovery.
+
+Saved prompts are held when the session opens again, whether you reopen it, resume it at startup, pick it in `/resume`, or rewind it. The turn they were waiting behind is gone, so they never run on their own. Held prompts appear under Held until sent. Choose Send now from a prompt's menu to deliver it as though you had just typed it, or edit or delete it. Held prompts stay held across later reopens until you act on them.

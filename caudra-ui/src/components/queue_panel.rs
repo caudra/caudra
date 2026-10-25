@@ -15,6 +15,8 @@ use crate::theme;
 
 const ELLIPSIS: &str = "...";
 const GUIDE_SECTION: &str = "Guide";
+const HELD_GROUP: u8 = 3;
+const HELD_SECTION: &str = "Held until sent";
 const MAX_VISIBLE_ENTRIES: usize = 4;
 const MAX_VISIBLE_ROWS: usize = 6;
 const MENU_GAP: &str = " ";
@@ -39,6 +41,8 @@ pub struct QueueEntry<'a> {
     pub can_move_up: bool,
     pub can_move_down: bool,
     pub admission: Option<PromptAdmission>,
+    /// Brought back by a reopen, and sent only when the user says so.
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,14 +301,14 @@ fn panel_rows(entries: &[QueueEntry<'_>]) -> Vec<PanelRow> {
     let mut rows = Vec::with_capacity(entries.len() + 1);
     let mut lane = None;
     for (index, entry) in entries.iter().enumerate() {
-        let group = admission_group(entry.admission);
+        let group = entry_group(entry);
         if lane != Some(group) {
             lane = Some(group);
             rows.push(PanelRow::Section {
                 label: section_label(group),
                 count: entries[index..]
                     .iter()
-                    .take_while(|entry| admission_group(entry.admission) == group)
+                    .take_while(|entry| entry_group(entry) == group)
                     .count(),
             });
         }
@@ -359,7 +363,16 @@ fn section_label(group: u8) -> &'static str {
     match group {
         0 => REPLACING_SECTION,
         1 => GUIDE_SECTION,
+        HELD_GROUP => HELD_SECTION,
         _ => UP_NEXT_SECTION,
+    }
+}
+
+fn entry_group(entry: &QueueEntry<'_>) -> u8 {
+    if entry.held {
+        HELD_GROUP
+    } else {
+        admission_group(entry.admission)
     }
 }
 
@@ -420,6 +433,7 @@ mod tests {
             can_move_up: false,
             can_move_down: false,
             admission,
+            held: false,
         }
     }
 
