@@ -593,6 +593,7 @@ pub struct App {
     /// Set by the event loop: `builtin_skills.pstack`, for the commands a remote `cd` rediscovers.
     pub(crate) pstack: bool,
     pub(super) task_picker: TaskPicker,
+    task_picker_inputs: Option<tasks::PickerInputs>,
     pub(super) shell_modal: ShellModal,
     pub(crate) peer_manager: PeerManager,
     pub(super) workflow_inspector: WorkflowInspector,
@@ -962,6 +963,7 @@ impl App {
             summarize_memory: true,
             pstack: false,
             task_picker: TaskPicker::new(),
+            task_picker_inputs: None,
             shell_modal: ShellModal::new(),
             peer_manager: PeerManager::new(),
             workflow_inspector: WorkflowInspector::new(),

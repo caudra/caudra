@@ -68,7 +68,7 @@ use jiff::Timestamp;
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
 use super::tooltip::{Anchor, Tip, TipKey};
-use caudra_agent::background::BackgroundTasks;
+use caudra_agent::background::TaskSnapshot;
 use caudra_agent::code::output::{CodeCall, CodeOutput};
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::decisions::{DecisionFeature, NoteOutcome};
@@ -77,7 +77,7 @@ use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, CallStage, EventSender, InstructionBlock,
     NO_FILES_FOUND, ReasoningSummary, SharedBuf, SubagentProgress, TaskCard, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent, format_live_duration, format_settled_duration,
+    ToolInput, ToolOutput, ToolStartEvent, Tracked, format_live_duration, format_settled_duration,
     reasoning_summary, streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
@@ -251,26 +251,6 @@ fn review_label(source: DisplaySource) -> &'static str {
         DisplaySource::Reasoning(_) => "thinking",
         DisplaySource::ToolCall { .. } => "tool call",
         DisplaySource::ToolResult(_) => "tool result",
-    }
-}
-
-fn collect_task_identities(output: &ToolOutput, identities: &mut HashMap<String, String>) {
-    match output {
-        ToolOutput::Tasks(tasks) => {
-            identities.extend(
-                tasks
-                    .iter()
-                    .map(|task| (task.invocation_id.clone(), task.task_id.clone())),
-            );
-        }
-        ToolOutput::Batch { entries, .. } => {
-            for entry in entries {
-                if let Some(output) = &entry.output {
-                    collect_task_identities(output, identities);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1006,7 +986,7 @@ impl DroppedSnapshots {
 }
 
 pub struct MessagesPanel {
-    messages: Vec<DisplayMessage>,
+    messages: Tracked<Vec<DisplayMessage>>,
     streaming_thinking: StreamingContent,
     streaming_text: StreamingContent,
     /// Whose words `streaming_text` currently holds. A delegated task's chat
@@ -1045,7 +1025,10 @@ pub struct MessagesPanel {
     /// index. Live chrome rather than part of the roster: `BatchToolEntry` is
     /// persisted, and what a subagent was doing is stale the moment it stops.
     batch_child_progress: BatchProgressMap,
-    task_cards: HashMap<String, TaskCard>,
+    task_cards: Tracked<HashMap<String, TaskCard>>,
+    /// The runtime revision and the transcript and card stamps the task cards
+    /// were last reconciled at. While all three hold, reconciling is a no-op.
+    task_sync: Option<[u64; 3]>,
     /// What each dispatched batch child has streamed so far, by parent tool id
     /// and child index. A batch keeps the live row for itself, so a child's
     /// output arrives addressed to an id no header has and is kept here until
@@ -1171,7 +1154,7 @@ impl MessagesPanel {
         let assistant = assistant_style();
         let ms = ui_config.typewriter_ms_per_char;
         Self {
-            messages: Vec::new(),
+            messages: Tracked::default(),
             streaming_thinking: StreamingContent::new(
                 "",
                 thinking.text_style,
@@ -1206,7 +1189,8 @@ impl MessagesPanel {
             raw_views: HashSet::new(),
             batch_views: BatchViewMap::new(),
             batch_child_progress: BatchProgressMap::new(),
-            task_cards: HashMap::new(),
+            task_cards: Tracked::default(),
+            task_sync: None,
             batch_child_output: BatchLiveMap::new(),
             batch_child_started: BatchStartedMap::new(),
             subagent_models: SubagentModels::default(),
@@ -1274,7 +1258,7 @@ impl MessagesPanel {
         self.disclosure.clear();
         self.streaming_reasoning_open = None;
         self.auto_open = None;
-        for msg in &mut self.messages {
+        for msg in self.messages.iter_mut() {
             msg.body_open = None;
         }
         // Anchor before the cache goes: the modes have wildly different
@@ -2033,7 +2017,7 @@ impl MessagesPanel {
             msg.body_open = None;
         }
         self.dropped_snapshots.clear();
-        self.messages = msgs;
+        *self.messages = msgs;
         self.cache.clear();
         self.auto_open = None;
         self.held_anchor = None;
@@ -2487,23 +2471,51 @@ impl MessagesPanel {
         true
     }
 
-    pub(crate) fn reconcile_task_cards(&mut self, runtime: &BackgroundTasks) -> bool {
-        let mut identities: HashMap<String, String> = self
-            .task_cards
-            .values()
-            .map(|task| (task.invocation_id.clone(), task.task_id.clone()))
-            .collect();
-        for message in &self.messages {
-            if let Some(output) = message.tool_output.as_deref() {
-                collect_task_identities(output, &mut identities);
+    /// Whether `card`, a summary, is what this transcript already shows.
+    pub(crate) fn has_task_card(&self, card: &TaskCard) -> bool {
+        self.task_cards.get(&card.call_id) == Some(card)
+    }
+
+    fn task_sync_key(&self, runtime: &TaskSnapshot) -> [u64; 3] {
+        [
+            runtime.revision(),
+            self.messages.stamp(),
+            self.task_cards.stamp(),
+        ]
+    }
+
+    /// Brings every card this transcript holds, or any of its task outputs
+    /// names, up to the runtime's resident record. Free while neither the
+    /// runtime nor the transcript moved since the last call.
+    pub(crate) fn reconcile_task_cards(&mut self, runtime: &TaskSnapshot) -> bool {
+        if self.task_sync == Some(self.task_sync_key(runtime)) {
+            return false;
+        }
+        let mut updates = Vec::new();
+        if runtime.has_resident() {
+            let mut seen = HashSet::new();
+            let mut consider = |task: &TaskCard| {
+                if let Some(card) = runtime.resident(&task.task_id, &task.invocation_id)
+                    && seen.insert(card.invocation_id.as_str())
+                    && !self.has_task_card(card)
+                {
+                    updates.push(card.clone());
+                }
+            };
+            for task in self.task_cards.values() {
+                consider(task);
+            }
+            for message in self.messages.iter() {
+                if let Some(output) = message.tool_output.as_deref() {
+                    task_card::for_each_card(output, &mut consider);
+                }
             }
         }
         let mut changed = false;
-        for (invocation, task_id) in identities {
-            if let Some(card) = runtime.resident_invocation_status(&task_id, &invocation) {
-                changed |= self.task_card_update(card);
-            }
+        for card in updates {
+            changed |= self.task_card_update(card);
         }
+        self.task_sync = Some(self.task_sync_key(runtime));
         changed
     }
 
@@ -5581,7 +5593,7 @@ impl MessagesPanel {
             batch_live: &self.batch_child_output,
             batch_started: &self.batch_child_started,
             subagent_models: &self.subagent_models,
-            task_cards: Some(&self.task_cards),
+            task_cards: Some(&*self.task_cards),
             cwd: self.cwd.clone(),
             show_decisions: self.show_decisions,
             decisions_open: self.card_decisions_open.contains(tool_id),

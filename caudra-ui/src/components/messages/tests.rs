@@ -735,7 +735,7 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
         ..done(TOOL_ID)
     });
     if restored {
-        panel.load_messages(panel.messages.clone());
+        panel.load_messages(panel.messages.to_vec());
     }
     if depth > 1 {
         panel.toggle_batch_child(TOOL_ID, 0);
@@ -11923,7 +11923,7 @@ fn shell_rows(count: usize, resumed: bool) -> MessagesPanel {
         panel.tool_done(done(&id));
     }
     if resumed {
-        let messages = mem::take(&mut panel.messages);
+        let messages = mem::take(&mut *panel.messages);
         panel.load_messages(messages);
     }
     panel

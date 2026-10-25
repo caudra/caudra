@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use caudra_agent::{
-    TaskCard,
+    TaskCard, Tracked,
     background::{BackgroundTasks, TaskHistoryPage},
 };
 use caudra_storage::{
@@ -28,10 +29,12 @@ struct ArchivedChat {
 #[derive(Default)]
 pub(super) struct TaskHistory {
     owner: Option<(CaudraId, u64)>,
-    cards: Vec<TaskCard>,
+    cards: Tracked<Vec<TaskCard>>,
     next: Option<BackgroundCursor>,
     page: Option<HistoryLoad<TaskHistoryPage>>,
-    detail: Option<TaskCard>,
+    detail: Tracked<Option<TaskCard>>,
+    /// The runtime revision a resident `detail` was read at.
+    detail_revision: Option<u64>,
     detail_request: Option<(String, HistoryLoad<TaskCard>)>,
     detail_requested: Option<String>,
     lookup: Option<(Option<String>, HistoryLoad<TaskCard>)>,
@@ -59,23 +62,31 @@ impl TaskHistory {
         }
     }
 
+    fn bound_to(&self, runtime: &BackgroundTasks) -> bool {
+        self.owner == Some((runtime.session_id(), runtime.generation()))
+    }
+
+    /// Moves whenever anything [`Self::cards`] merges in does.
+    pub(super) fn stamps(&self) -> [u64; 2] {
+        [self.cards.stamp(), self.detail.stamp()]
+    }
+
     pub(super) fn cards(&self, runtime: &BackgroundTasks) -> Vec<TaskCard> {
         let mut cards = runtime.list();
-        if self.owner != Some((runtime.session_id(), runtime.generation())) {
+        if !self.bound_to(runtime) {
             return cards;
         }
-        for card in &self.cards {
-            if !cards.iter().any(|current| current.task_id == card.task_id) {
-                cards.push(card.clone());
-            }
-        }
-        if let Some(detail) = &self.detail {
+        let listed: HashSet<String> = cards.iter().map(|card| card.task_id.clone()).collect();
+        cards.extend(
+            self.cards
+                .iter()
+                .filter(|card| !listed.contains(&card.task_id))
+                .cloned(),
+        );
+        if let Some(detail) = self.detail.as_ref() {
             if let Some(card) = cards.iter_mut().find(|card| card.task_id == detail.task_id) {
-                if card.invocation_id == detail.invocation_id
-                    && card.state == detail.state
-                    && card.updated_at <= detail.updated_at
-                {
-                    *card = detail.clone();
+                if refined_by(card, detail) {
+                    card.clone_from(detail);
                 }
             } else {
                 cards.push(detail.clone());
@@ -83,6 +94,33 @@ impl TaskHistory {
         }
         cards
     }
+
+    /// The card [`Self::cards`] lists first for `task_id`, without copying the
+    /// rest.
+    fn card(&self, runtime: &BackgroundTasks, task_id: &str) -> Option<TaskCard> {
+        let snapshot = runtime.snapshot();
+        let listed = snapshot.card(task_id);
+        if !self.bound_to(runtime) {
+            return listed.cloned();
+        }
+        let card = listed.or_else(|| self.cards.iter().find(|card| card.task_id == task_id));
+        let detail = self
+            .detail
+            .as_ref()
+            .filter(|detail| detail.task_id == task_id);
+        match (card, detail) {
+            (Some(card), Some(detail)) if refined_by(card, detail) => Some(detail.clone()),
+            (None, Some(detail)) => Some(detail.clone()),
+            (card, _) => card.cloned(),
+        }
+    }
+}
+
+/// Whether `detail` is the full read of the same run `card` summarizes.
+fn refined_by(card: &TaskCard, detail: &TaskCard) -> bool {
+    card.invocation_id == detail.invocation_id
+        && card.state == detail.state
+        && card.updated_at <= detail.updated_at
 }
 
 impl App {
@@ -91,9 +129,9 @@ impl App {
             return false;
         };
         let Some(card) = self
-            .task_history_cards()
-            .into_iter()
-            .find(|card| card.task_id == id && card.kind == JobKind::Agent && !card.active())
+            .task_history
+            .card(&runtime, id)
+            .filter(|card| card.kind == JobKind::Agent && !card.active())
         else {
             return false;
         };
@@ -259,7 +297,7 @@ impl App {
                         };
                         self.land_archived_jump(&id);
                         self.task_history.cached_chat = Some(id);
-                        self.task_history.detail = Some(loaded.card);
+                        *self.task_history.detail = Some(loaded.card);
                         self.sync_todo_panel();
                         self.fire_restore_items(loaded.restore);
                     }
@@ -284,7 +322,7 @@ impl App {
                     Ok(card) => {
                         let id = card.task_id.clone();
                         let shell = card.kind == JobKind::Shell;
-                        self.task_history.detail = Some(card);
+                        *self.task_history.detail = Some(card);
                         if shell {
                             self.show_shell(&id);
                         } else {
@@ -308,7 +346,7 @@ impl App {
             };
             match smol::block_on(page) {
                 Ok(page) => {
-                    self.task_history.cards = page.tasks;
+                    *self.task_history.cards = page.tasks;
                     self.task_history.next = page.next;
                 }
                 Err(error) => self.flash(error),
@@ -337,41 +375,48 @@ impl App {
             let result = smol::block_on(task);
             if selected.as_ref() == Some(&id) {
                 match result {
-                    Ok(card) => self.task_history.detail = Some(card),
+                    Ok(card) => *self.task_history.detail = Some(card),
                     Err(error) => self.flash(error),
                 }
                 dirty = Dirty::YES;
             }
         }
-        if let Some(id) = selected {
-            let card = self
-                .task_history_cards()
-                .into_iter()
-                .find(|card| card.task_id == id);
-            if let Some(card) = card {
-                if let Some(detail) = runtime.resident_invocation_status(&id, &card.invocation_id) {
-                    self.task_history.detail = Some(detail);
-                    return dirty | self.refresh_task_picker();
-                }
-                let loaded = self.task_history.detail.as_ref().is_some_and(|detail| {
-                    detail.task_id == id
-                        && detail.invocation_id == card.invocation_id
-                        && detail.state == card.state
-                        && detail.updated_at >= card.updated_at
+        if let Some(id) = selected
+            && let Some(card) = self.task_history.card(&runtime, &id)
+        {
+            let revision = runtime.snapshot().revision();
+            let read = self.task_history.detail_revision == Some(revision)
+                && self.task_history.detail.as_ref().is_some_and(|detail| {
+                    detail.task_id == id && detail.invocation_id == card.invocation_id
                 });
-                let loading = self
-                    .task_history
-                    .detail_request
-                    .as_ref()
-                    .is_some_and(|(pending, _)| pending == &id);
-                if !loaded && !loading && self.task_history.detail_requested.as_ref() != Some(&id) {
-                    let requested = id.clone();
-                    self.task_history.detail_requested = Some(id.clone());
-                    self.task_history.detail_request = Some((
-                        id,
-                        smol::spawn(async move { runtime.status_async(&requested).await }),
-                    ));
+            if read {
+                return dirty | self.refresh_task_picker();
+            }
+            if let Some(detail) = runtime.resident_invocation_status(&id, &card.invocation_id) {
+                if self.task_history.detail.as_ref() != Some(&detail) {
+                    *self.task_history.detail = Some(detail);
                 }
+                self.task_history.detail_revision = Some(revision);
+                return dirty | self.refresh_task_picker();
+            }
+            let loaded = self.task_history.detail.as_ref().is_some_and(|detail| {
+                detail.task_id == id
+                    && detail.invocation_id == card.invocation_id
+                    && detail.state == card.state
+                    && detail.updated_at >= card.updated_at
+            });
+            let loading = self
+                .task_history
+                .detail_request
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == &id);
+            if !loaded && !loading && self.task_history.detail_requested.as_ref() != Some(&id) {
+                let requested = id.clone();
+                self.task_history.detail_requested = Some(id.clone());
+                self.task_history.detail_request = Some((
+                    id,
+                    smol::spawn(async move { runtime.status_async(&requested).await }),
+                ));
             }
         }
         dirty | self.refresh_task_picker()

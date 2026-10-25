@@ -24,7 +24,7 @@ use crate::inline_image::ImageRef;
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use caudra_agent::background::BackgroundTasks;
+use caudra_agent::background::TaskSnapshot;
 use caudra_agent::decisions::{DecisionFeature, DecisionNote, PendingDecision};
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
@@ -1073,7 +1073,11 @@ impl Chat {
         self.messages_panel.task_card_update(card)
     }
 
-    pub(crate) fn reconcile_task_cards(&mut self, runtime: &BackgroundTasks) -> bool {
+    pub(crate) fn has_task_card(&self, card: &TaskCard) -> bool {
+        self.messages_panel.has_task_card(card)
+    }
+
+    pub(crate) fn reconcile_task_cards(&mut self, runtime: &TaskSnapshot) -> bool {
         self.messages_panel.reconcile_task_cards(runtime)
     }
 

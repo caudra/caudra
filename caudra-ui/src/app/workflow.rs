@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use caudra_agent::Tracked;
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_config::Feature;
 use caudra_providers::{Message, WorkflowEventOrigin};
@@ -65,7 +66,7 @@ const INVALID_ACK: &str = "Workflow completion acknowledgment returned an unexpe
 
 pub(crate) struct WorkflowUi {
     handle: Option<WorkflowHandle>,
-    runs: Vec<RunSnapshot>,
+    runs: Tracked<Vec<RunSnapshot>>,
     claimed: Vec<WorkflowEventOrigin>,
     ready: Vec<Message>,
     suppressed: HashSet<String>,
@@ -115,7 +116,7 @@ impl WorkflowUi {
         let (reply_tx, reply_rx) = flume::unbounded();
         Self {
             handle: None,
-            runs: Vec::new(),
+            runs: Tracked::default(),
             claimed: Vec::new(),
             ready: Vec::new(),
             suppressed: HashSet::new(),
@@ -142,8 +143,8 @@ impl WorkflowUi {
             .as_ref()
             .map(|handle| handle.state().runs.clone())
             .unwrap_or_default();
-        let previous = std::mem::take(&mut self.runs);
-        self.runs = published
+        let previous = std::mem::take(&mut *self.runs);
+        *self.runs = published
             .into_iter()
             .map(|mut run| {
                 if let Some(known) = previous
@@ -172,6 +173,10 @@ impl WorkflowUi {
 
     pub(crate) fn runs(&self) -> &[RunSnapshot] {
         &self.runs
+    }
+
+    pub(crate) fn runs_stamp(&self) -> u64 {
+        self.runs.stamp()
     }
 
     #[cfg(test)]

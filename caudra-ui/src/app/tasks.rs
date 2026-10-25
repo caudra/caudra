@@ -6,7 +6,7 @@
 //! Both `caudra.task.list()` and the `TaskStatusChanged` autocmd serialize the
 //! types below, so the two can never spell a status differently.
 
-use caudra_agent::background::{BackgroundTasks, SessionWork, ShellSnapshot};
+use caudra_agent::background::{BackgroundTasks, SessionWork, ShellSnapshot, TaskSnapshot};
 use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
 use caudra_agent::{AgentEvent, CancelToken, Envelope, SubagentInfo, TaskCard, TaskProvenance};
 use std::collections::{HashMap, HashSet};
@@ -724,19 +724,20 @@ impl App {
     }
 
     /// Subagent chats only, in chat order.
+    pub(crate) fn task_snapshot(&self) -> Option<Arc<TaskSnapshot>> {
+        self.background.as_ref().map(BackgroundTasks::snapshot)
+    }
+
     pub(crate) fn task_states(&self) -> impl Iterator<Item = TaskState<'_>> {
-        let runtime = self
-            .background
-            .as_ref()
-            .map(BackgroundTasks::list)
-            .unwrap_or_default();
+        let runtime = self.task_snapshot();
         self.chats.iter().filter_map(move |chat| {
+            let id = chat.task_id()?;
             Some(TaskState {
-                id: chat.task_id()?,
+                id,
                 name: &chat.name,
                 status: runtime
-                    .iter()
-                    .find(|task| chat.task_id().is_some_and(|id| id.as_ref() == task.task_id))
+                    .as_ref()
+                    .and_then(|runtime| runtime.card(id))
                     .map_or_else(|| chat.task_status(), runtime_status),
             })
         })
@@ -754,15 +755,11 @@ impl App {
         if unfinished.peek().is_none() {
             return Vec::new();
         }
-        let runtime = self
-            .background
-            .as_ref()
-            .map(BackgroundTasks::list)
-            .unwrap_or_default();
+        let runtime = self.task_snapshot();
         unfinished
             .filter_map(|chat| {
                 let id = chat.task_id()?;
-                let card = runtime.iter().find(|task| task.task_id == id.as_ref());
+                let card = runtime.as_ref().and_then(|runtime| runtime.card(id));
                 card.is_none_or(TaskCard::active).then(|| PaneSubagent {
                     id: id.to_string(),
                     name: chat.name.clone(),
@@ -774,13 +771,9 @@ impl App {
     }
 
     pub(super) fn task_activity(&self) -> TaskActivity {
-        let runtime = self
-            .background
-            .as_ref()
-            .map(BackgroundTasks::list)
-            .unwrap_or_default();
+        let runtime = self.task_snapshot();
         TaskActivity::new(
-            &runtime,
+            runtime.as_ref().map_or(&[], |runtime| runtime.cards()),
             self.shell_snapshot.get(),
             self.workflow.runs(),
             self.chats.iter().filter_map(|chat| {
@@ -800,13 +793,16 @@ impl App {
 
     /// Every chat, the main one first, with its runtime card if it has one.
     fn chat_tasks(&self, runtime: &[TaskCard]) -> Vec<TaskInfo> {
+        let mut cards = HashMap::with_capacity(runtime.len());
+        for card in runtime {
+            cards.entry(card.task_id.as_str()).or_insert(card);
+        }
         self.chats
             .iter()
             .enumerate()
             .map(|(idx, chat)| {
                 let task_id = chat.task_id();
-                let card =
-                    task_id.and_then(|id| runtime.iter().find(|task| task.task_id == id.as_ref()));
+                let card = task_id.and_then(|id| cards.get(id.as_ref()).copied());
                 TaskInfo {
                     id: task_id.map_or_else(|| Arc::from(MAIN_TASK_ID), Arc::clone),
                     name: chat.name.clone(),
@@ -847,6 +843,10 @@ impl App {
     pub(crate) fn picker_tasks(&self) -> Vec<TaskInfo> {
         let runtime = self.runtime_tasks();
         let mut tasks = self.chat_tasks(&runtime);
+        let mut rows: HashMap<Arc<str>, usize> = HashMap::with_capacity(tasks.len());
+        for (index, task) in tasks.iter().enumerate() {
+            rows.entry(Arc::clone(&task.id)).or_insert(index);
+        }
         let mut seen = HashSet::new();
         let listed = |card: &&TaskCard| match card.kind {
             JobKind::Agent => true,
@@ -854,7 +854,8 @@ impl App {
             JobKind::Shell => false,
         };
         for card in runtime.iter().filter(listed) {
-            if !tasks.iter().any(|task| task.id.as_ref() == card.task_id) {
+            if !rows.contains_key(card.task_id.as_str()) {
+                rows.insert(Arc::from(card.task_id.as_str()), tasks.len());
                 tasks.push(TaskInfo {
                     id: Arc::from(card.task_id.as_str()),
                     name: card.label.clone(),
@@ -870,7 +871,7 @@ impl App {
                 continue;
             }
             let status = roster_status(run, agent);
-            match tasks.iter_mut().find(|task| &*task.id == id) {
+            match rows.get(id).map(|&index| &mut tasks[index]) {
                 Some(task) if task.runtime.is_none() => task.status = Some(status),
                 Some(_) => {}
                 None => tasks.push(TaskInfo {
@@ -936,6 +937,69 @@ impl App {
     }
 }
 
+/// What the open `/tasks` rows were last built from. A pass that moved none
+/// of it leaves them as they are, so an open picker costs a comparison rather
+/// than a rebuild of every chat's row.
+pub(super) struct PickerInputs {
+    runtime: Option<(CaudraId, u64, u64)>,
+    stamps: [u64; 3],
+    focused: usize,
+    selected: Option<String>,
+    chats: Vec<(Option<Arc<str>>, String, TaskStatus)>,
+}
+
+impl PickerInputs {
+    fn scalars(app: &App) -> (Option<(CaudraId, u64, u64)>, [u64; 3]) {
+        let runtime = app.background.as_ref().map(|runtime| {
+            (
+                runtime.session_id(),
+                runtime.generation(),
+                runtime.snapshot().revision(),
+            )
+        });
+        let [cards, detail] = app.task_history.stamps();
+        (runtime, [cards, detail, app.workflow.runs_stamp()])
+    }
+
+    fn capture(app: &App) -> Self {
+        let (runtime, stamps) = Self::scalars(app);
+        Self {
+            runtime,
+            stamps,
+            focused: app.active_chat,
+            selected: app.task_picker.selected_id(),
+            chats: app
+                .chats
+                .iter()
+                .map(|chat| {
+                    (
+                        chat.task_id().cloned(),
+                        chat.name.clone(),
+                        chat.task_status(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Compared in place, so an unchanged picker allocates nothing.
+    fn current(&self, app: &App) -> bool {
+        (self.runtime, self.stamps) == Self::scalars(app)
+            && self.focused == app.active_chat
+            && self.selected.as_deref() == app.task_picker.selected()
+            && self.chats.len() == app.chats.len()
+            && self
+                .chats
+                .iter()
+                .zip(&app.chats)
+                .all(|((id, name, status), chat)| {
+                    id.as_ref() == chat.task_id()
+                        && *name == chat.name
+                        && *status == chat.task_status()
+                })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TaskInteractions {
     pub(super) question: Option<Arc<TaskProvenance>>,
@@ -979,6 +1043,20 @@ impl Default for TaskControls {
     }
 }
 
+/// The chat a job's card belongs in: the main one, or the chat of the agent
+/// whose run started it.
+fn owner_chat(runtime: &TaskSnapshot, chats: &[Option<usize>], task: &TaskCard) -> Option<usize> {
+    match &task.owner {
+        JobOwner::Main => Some(0),
+        JobOwner::Child { invocation_id } => {
+            let owner = runtime
+                .latest_invocation(invocation_id)
+                .filter(|owner| owner.kind == JobKind::Agent)?;
+            chats[runtime.position(&owner.task_id)?]
+        }
+    }
+}
+
 pub(crate) fn runtime_status(task: &TaskCard) -> TaskStatus {
     if task.active() {
         TaskStatus::Working
@@ -1018,54 +1096,67 @@ impl App {
             let _ = self.refresh_task_picker();
         } else {
             self.task_picker.open(self.picker_tasks());
+            self.task_picker_inputs = Some(PickerInputs::capture(self));
         }
         Vec::new()
     }
 
-    /// Keeps an open picker in step with the chats behind it.
+    /// Keeps an open picker in step with the chats behind it, rebuilding its
+    /// rows only once something they are built from moved.
     pub(crate) fn refresh_task_picker(&mut self) -> Dirty {
         if !self.task_picker.is_open() {
+            return Dirty::NO;
+        }
+        if self
+            .task_picker_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.current(self))
+        {
             return Dirty::NO;
         }
         self.task_picker
             .set_promotion_enabled(self.background.is_some());
         let tasks = self.picker_tasks();
-        Dirty::from(self.task_picker.refresh(tasks))
+        let dirty = Dirty::from(self.task_picker.refresh(tasks));
+        self.task_picker_inputs = Some(PickerInputs::capture(self));
+        dirty
     }
 
     pub(crate) fn reconcile_tasks(&mut self) -> Dirty {
-        let Some(runtime) = self.background.clone() else {
+        let Some(runtime) = self.task_snapshot() else {
             return Dirty::NO;
         };
         let mut changed = false;
-        for task in runtime.list() {
+        let mut chats = self.chats_by_card(&runtime);
+        for (position, task) in runtime.cards().iter().enumerate() {
             if task.kind != JobKind::Agent {
-                if let Some(index) = self.job_owner_chat(&task) {
-                    changed |= self.chats[index].task_card_update(task);
+                if let Some(index) = owner_chat(&runtime, &chats, task) {
+                    changed |= self.update_task_card(index, task);
                 }
                 continue;
             }
-            let index = self
-                .chats
-                .iter()
-                .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task.task_id));
-            if index.is_none() && !task.active() {
-                changed |= self.chats[0].task_card_update(task);
-                continue;
-            }
-            let index = index.unwrap_or_else(|| {
-                self.resolve_or_create_chat(&SubagentInfo {
-                    parent_tool_use_id: task.call_id.clone(),
-                    task_id: task.task_id.clone(),
-                    name: task.label.clone(),
-                    prompt: None,
-                    model: None,
-                    thinking: None,
-                    fast: false,
-                    answer_tx: None,
-                    steer_tx: None,
-                })
-            });
+            let index = match chats[position] {
+                Some(index) => index,
+                None if !task.active() => {
+                    changed |= self.update_task_card(0, task);
+                    continue;
+                }
+                None => {
+                    let index = self.resolve_or_create_chat(&SubagentInfo {
+                        parent_tool_use_id: task.call_id.clone(),
+                        task_id: task.task_id.clone(),
+                        name: task.label.clone(),
+                        prompt: None,
+                        model: None,
+                        thinking: None,
+                        fast: false,
+                        answer_tx: None,
+                        steer_tx: None,
+                    });
+                    chats = self.chats_by_card(&runtime);
+                    index
+                }
+            };
             if !task.active() {
                 let outcome = match task.state.as_str() {
                     "succeeded" => TaskOutcome::Done,
@@ -1083,7 +1174,7 @@ impl App {
                     self.sync_todo_panel();
                 }
             }
-            changed |= self.chats[0].task_card_update(task);
+            changed |= self.update_task_card(0, task);
         }
         for chat in &mut self.chats {
             changed |= chat.reconcile_task_cards(&runtime);
@@ -1094,19 +1185,26 @@ impl App {
         Dirty::from(changed)
     }
 
-    pub(super) fn job_owner_chat(&self, task: &TaskCard) -> Option<usize> {
-        match &task.owner {
-            JobOwner::Main => Some(0),
-            JobOwner::Child { invocation_id } => {
-                let owner = self.background.as_ref()?.list().into_iter().find(|owner| {
-                    owner.invocation_id == *invocation_id && owner.kind == JobKind::Agent
-                })?;
-                self.chats.iter().position(|chat| {
-                    chat.task_id()
-                        .is_some_and(|id| id.as_ref() == owner.task_id)
-                })
+    /// The first chat standing for each of the runtime's cards, by position.
+    fn chats_by_card(&self, runtime: &TaskSnapshot) -> Vec<Option<usize>> {
+        let mut chats = vec![None; runtime.cards().len()];
+        for (index, chat) in self.chats.iter().enumerate() {
+            if let Some(position) = chat.task_id().and_then(|id| runtime.position(id)) {
+                chats[position].get_or_insert(index);
             }
         }
+        chats
+    }
+
+    /// Clones the card only when the chat does not show it yet.
+    fn update_task_card(&mut self, index: usize, task: &TaskCard) -> bool {
+        let chat = &mut self.chats[index];
+        !chat.has_task_card(task) && chat.task_card_update(task.clone())
+    }
+
+    pub(super) fn job_owner_chat(&self, task: &TaskCard) -> Option<usize> {
+        let runtime = self.task_snapshot()?;
+        owner_chat(&runtime, &self.chats_by_card(&runtime), task)
     }
 
     pub(super) fn handle_task_picker_action(&mut self, action: TaskPickerAction) -> Vec<Action> {
@@ -1190,16 +1288,31 @@ impl App {
 /// A task first seen already finished is recorded quietly, so a restored
 /// session does not replay yesterday's tasks.
 ///
-/// `previous` is keyed by id, because a session reset reuses positions.
+/// `previous` is keyed by id, because a session reset reuses positions. The
+/// chats rarely move, so a task is looked for at its own position first.
 pub(crate) fn diff_task_states<'a>(
     previous: &mut Vec<(Arc<str>, TaskStatus)>,
     current: impl Iterator<Item = TaskState<'a>>,
     mut emit: impl FnMut(TaskState<'a>),
 ) {
     let mut next = Vec::with_capacity(previous.len());
-    for task in current {
-        let announce = match previous.iter().find(|(id, _)| id == task.id) {
-            Some((_, status)) => *status != task.status,
+    let mut known: Option<HashMap<&str, TaskStatus>> = None;
+    for (position, task) in current.enumerate() {
+        let prior = match previous.get(position) {
+            Some((id, status)) if id == task.id => Some(*status),
+            _ => known
+                .get_or_insert_with(|| {
+                    let mut known = HashMap::with_capacity(previous.len());
+                    for (id, status) in previous.iter() {
+                        known.entry(id.as_ref()).or_insert(*status);
+                    }
+                    known
+                })
+                .get(task.id.as_ref())
+                .copied(),
+        };
+        let announce = match prior {
+            Some(status) => status != task.status,
             None => task.status == TaskStatus::Working,
         };
         if announce {
@@ -1215,9 +1328,10 @@ mod tests {
     use super::*;
     use crate::app::tests::{
         RESEARCH_NAME, app_with_subagent_id, cancel_app, close_subagent_transcript, end_turn,
-        error_app, finish_subagent, start_subagent,
+        error_app, finish_subagent, rendered, start_subagent,
     };
     use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+    use crate::repaint::expect::{OWED, QUIET};
     use caudra_storage::sessions::StoredSubagentOutcome;
     use test_case::test_case;
 
@@ -1631,5 +1745,51 @@ mod tests {
             vec![(OTHER_ID.to_owned(), TaskStatus::Working)]
         );
         assert_eq!(previous, vec![(two, TaskStatus::Working)]);
+    }
+
+    /// Tasks are looked for at their old position first. One that moved is
+    /// still found by id, so a chat closing ahead of it announces nothing.
+    #[test_case(TaskStatus::Done, false; "moved_unchanged")]
+    #[test_case(TaskStatus::Error, true; "moved_and_changed")]
+    fn a_moved_task_is_found_by_id(status: TaskStatus, announced: bool) {
+        let one: Arc<str> = Arc::from(TASK_ID);
+        let two: Arc<str> = Arc::from(OTHER_ID);
+        let mut previous = Vec::new();
+        collect(
+            &mut previous,
+            &[
+                (Arc::clone(&one), TaskStatus::Working),
+                (Arc::clone(&two), TaskStatus::Done),
+            ],
+        );
+
+        assert_eq!(
+            collect(&mut previous, &[(two, status)]),
+            announced
+                .then(|| (OTHER_ID.to_owned(), status))
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An open picker only rebuilds once a row it shows could have moved, and
+    /// then always: a rename and a new chat each reach it.
+    #[test]
+    fn an_open_picker_rebuilds_only_when_a_row_moved() {
+        const RENAMED: &str = "renamed";
+        const DEPLOY_NAME: &str = "deploy";
+        let mut app = app_with_two_subagents();
+        let _ = app.tasks_browse();
+        assert_eq!(app.refresh_task_picker(), Dirty::NO, "{QUIET}");
+
+        app.chats[1].name = RENAMED.into();
+        assert_eq!(app.refresh_task_picker(), Dirty::YES, "{OWED}");
+        assert_eq!(app.refresh_task_picker(), Dirty::NO, "{QUIET}");
+        assert!(rendered(&mut app).contains(RENAMED));
+
+        start_subagent(&mut app, ERROR_ID, DEPLOY_NAME);
+        let _ = app.refresh_task_picker();
+        assert_eq!(app.refresh_task_picker(), Dirty::NO, "{QUIET}");
+        assert!(rendered(&mut app).contains(DEPLOY_NAME));
     }
 }

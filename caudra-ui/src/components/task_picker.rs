@@ -346,7 +346,11 @@ impl TaskPicker {
     }
 
     pub(crate) fn selected_id(&self) -> Option<String> {
-        self.picker.selected_item().map(|item| item.id.clone())
+        self.selected().map(str::to_owned)
+    }
+
+    pub(crate) fn selected(&self) -> Option<&str> {
+        self.picker.selected_item().map(|item| item.id.as_str())
     }
 
     /// Emitted whenever the cursor lands somewhere new, which is what makes

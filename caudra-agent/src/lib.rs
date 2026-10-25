@@ -67,6 +67,8 @@ mod stored_session;
 mod subagent_history;
 pub mod template;
 mod tool_output;
+pub mod tracked;
+pub use tracked::Tracked;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod automation;

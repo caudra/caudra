@@ -35,7 +35,7 @@ use tracing::{info, warn};
 
 use crate::{
     AgentEvent, CancelToken, CancelTrigger, Envelope, EventSender, SharedHistory, SubagentTaskSpec,
-    TaskCard, TaskProvenance,
+    TaskCard, TaskProvenance, Tracked,
     agent::{
         steering::SharedSteering,
         subagent::TaskIdentity,
@@ -106,6 +106,7 @@ pub struct TaskHistoryPage {
 }
 mod jobs;
 mod shells;
+mod snapshot;
 mod wait_nudge;
 mod work;
 
@@ -113,6 +114,7 @@ pub use caudra_storage::background::{QuestionJobMetadata, ShellJobMetadata};
 pub(crate) use jobs::RunningShell;
 pub use jobs::{JobScope, MAX_DEFERRED_QUESTIONS};
 pub use shells::{ShellExecutions, ShellLive, ShellOutputView, ShellSnapshot, ShellView};
+pub use snapshot::TaskSnapshot;
 pub use wait_nudge::WaitNudge;
 pub use work::SessionWork;
 
@@ -221,8 +223,9 @@ struct State {
     closed_owners: HashSet<JobOwner>,
     revisions: HashMap<JobOwner, u64>,
     drivers: HashMap<String, (JobOwner, u64)>,
-    records: BTreeMap<String, TaskRecord>,
-    recent: Vec<TaskRecord>,
+    records: Tracked<BTreeMap<String, TaskRecord>>,
+    recent: Tracked<Vec<TaskRecord>>,
+    snapshot: Option<Arc<TaskSnapshot>>,
     sequence: u64,
     jobs: BTreeMap<String, smol::Task<()>>,
     admitting: HashSet<String>,
@@ -577,12 +580,15 @@ impl BackgroundTasks {
                 closed_owners: HashSet::new(),
                 revisions: HashMap::new(),
                 drivers: HashMap::new(),
-                recent,
+                recent: Tracked::new(recent),
+                snapshot: None,
                 sequence,
-                records: records
-                    .into_iter()
-                    .map(|record| (record.invocation_id.clone(), record))
-                    .collect(),
+                records: Tracked::new(
+                    records
+                        .into_iter()
+                        .map(|record| (record.invocation_id.clone(), record))
+                        .collect(),
+                ),
                 jobs: BTreeMap::new(),
                 admitting: HashSet::new(),
                 stop_jobs: HashMap::new(),
@@ -1477,29 +1483,7 @@ impl BackgroundTasks {
 
     /// Resident work and a bounded recent archive window; never performs storage I/O.
     pub fn list(&self) -> Vec<TaskStatus> {
-        let state = self.lock();
-        let mut latest = BTreeMap::new();
-        for record in &state.recent {
-            latest
-                .entry(record.task_id.clone())
-                .or_insert_with(|| (record.sequence, TaskCard::summary(record)));
-        }
-        for record in state.records.values() {
-            let entry = latest
-                .entry(record.task_id.clone())
-                .or_insert_with(|| (record.sequence, TaskCard::summary(record)));
-            if record.sequence >= entry.0 {
-                *entry = (record.sequence, TaskCard::summary(record));
-            }
-        }
-        let mut cards = latest.into_values().collect::<Vec<_>>();
-        cards.sort_by_key(|(sequence, card)| {
-            (
-                !matches!(card.state.as_str(), "queued" | "running" | "cancelling"),
-                Reverse(*sequence),
-            )
-        });
-        cards.into_iter().map(|(_, card)| card).collect()
+        self.snapshot().cards().to_vec()
     }
 
     pub fn status(&self, task_id: &str) -> Result<TaskStatus, String> {

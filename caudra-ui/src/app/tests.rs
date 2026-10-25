@@ -1278,7 +1278,10 @@ mod background_runtime {
     use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
     use crate::components::status_bar::StatusBarHitTarget;
     use crate::components::{Action, DisplayRole, key};
-    use crate::repaint::{Dirty, expect::OWED};
+    use crate::repaint::{
+        Dirty,
+        expect::{OWED, QUIET},
+    };
 
     const PARENT: &str = "Implement the change and launch the independent audit.";
     const CHILD: &str = "Audit the implementation independently.";
@@ -2205,6 +2208,52 @@ mod background_runtime {
                 fixture.app.chats[task_chat(&fixture.app)].in_progress_count(),
                 0
             );
+            fixture.close().await;
+        }));
+    }
+
+    /// Reconciling is skipped while neither the runtime nor a transcript
+    /// moved, so a task output that lands while the runtime stands still
+    /// must still be brought up to the resident run it names.
+    #[test]
+    fn a_task_output_landing_while_the_runtime_stands_still_is_reconciled() {
+        const RELAYED_CALL: &str = "relayed-task";
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let _ = fixture.app.reconcile_tasks();
+            assert_eq!(fixture.app.reconcile_tasks(), Dirty::NO, "{QUIET}");
+            let snapshot = background.snapshot();
+            let task = snapshot.cards()[0].clone();
+            let resident = snapshot
+                .resident(&task.task_id, &task.invocation_id)
+                .unwrap()
+                .clone();
+            let index = fixture
+                .app
+                .chats
+                .iter()
+                .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task.task_id))
+                .unwrap();
+            assert!(!fixture.app.chats[index].has_task_card(&resident));
+            let stale = TaskCard {
+                state: "queued".into(),
+                ..task.clone()
+            };
+            fixture.app.chats[index].handle_event(tool_start(RELAYED_CALL, "task"), None);
+            fixture.app.chats[index].handle_event(
+                AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+                    is_error: false,
+                    output: ToolOutput::Tasks(vec![stale]),
+                    ..ToolDoneEvent::error(RELAYED_CALL.into(), String::new())
+                })),
+                None,
+            );
+
+            assert_eq!(fixture.app.reconcile_tasks(), Dirty::YES, "{OWED}");
+            assert_eq!(background.snapshot().revision(), snapshot.revision());
+            assert!(fixture.app.chats[index].has_task_card(&resident));
+            assert_eq!(fixture.app.reconcile_tasks(), Dirty::NO, "{QUIET}");
             fixture.close().await;
         }));
     }

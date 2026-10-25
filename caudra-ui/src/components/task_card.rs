@@ -456,6 +456,19 @@ pub(crate) fn task_at(output: &ToolOutput, mut index: usize) -> Option<&TaskCard
     }
 }
 
+/// Every task card `output` holds, a batch's children included.
+pub(crate) fn for_each_card(output: &ToolOutput, visit: &mut impl FnMut(&TaskCard)) {
+    match output {
+        ToolOutput::Tasks(tasks) => tasks.iter().for_each(&mut *visit),
+        ToolOutput::Batch { entries, .. } => {
+            for output in entries.iter().filter_map(|entry| entry.output.as_ref()) {
+                for_each_card(output, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn contains_invocation(output: &ToolOutput, invocation: &str) -> bool {
     match output {
         ToolOutput::Tasks(tasks) => tasks.iter().any(|task| task.invocation_id == invocation),
