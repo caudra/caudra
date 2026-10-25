@@ -8,7 +8,10 @@ use serde_json::Value;
 use crate::{
     StorageError,
     id::CaudraId,
-    sessions::{RuntimeRetry, SessionDatabase, SessionError, compress_payload, decompress_payload},
+    sessions::{
+        RuntimeRetry, SessionDatabase, SessionError, compress_payload, decompress_payload,
+        progress::{MIGRATION, MigrationEvent},
+    },
     tool_outputs::ToolOutputRef,
 };
 
@@ -20,6 +23,7 @@ pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
 /// One task's transcript, kept beside its record so it never counts against
 /// the record's size or the session's resident budget.
 pub const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
+const TRANSCRIPTS_TABLE: &str = "background_transcripts";
 const TRANSCRIPT_FIELD: &str = "background transcript";
 const RUNTIME_TRANSCRIPT_LOAD: &str = "background transcript load";
 const JOB_EVENT_FIELD: &str = "job event provenance";
@@ -773,7 +777,16 @@ pub(crate) fn move_transcripts(transaction: &Transaction<'_>) -> Result<(), Sess
     let mut insert = transaction.prepare(
         "INSERT INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (session, invocation) in keys {
+    let total = keys.len() as u64;
+    let report = |done| {
+        MIGRATION.report(MigrationEvent::Rewrite {
+            table: TRANSCRIPTS_TABLE,
+            done,
+            total,
+        })
+    };
+    report(0);
+    for (done, (session, invocation)) in (1..).zip(keys) {
         let payload: String = select.query_row(params![session, invocation], |row| row.get(0))?;
         let mut value: Value = serde_json::from_str(&payload).map_err(StorageError::from)?;
         let history = value
@@ -794,6 +807,7 @@ pub(crate) fn move_transcripts(transaction: &Transaction<'_>) -> Result<(), Sess
                 transcript.len() as i64
             ])?;
         }
+        report(done);
     }
     Ok(())
 }
@@ -816,6 +830,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs::{self, File, FileTimes};
     use std::slice::from_ref;
+    use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
     use test_case::test_case;
 
@@ -828,6 +843,7 @@ mod tests {
         id::CaudraId,
         sessions::{
             RuntimeRetry, Session, SessionDatabase, SessionError, SessionLease, TitleSource,
+            progress::{MIGRATION, MigrationEvent},
         },
         tool_outputs::{TOOL_OUTPUT_DIR, ToolOutputStore},
     };
@@ -839,6 +855,8 @@ mod tests {
     const CWD: &str = "/project";
     const CHILD: &str = "exact-child-invocation";
     const OTHER_CHILD: &str = "other-child-invocation";
+    const LEGACY_HISTORY: &str = r#"["legacy"]"#;
+    const EVERY_TASK_COUNTED: &str = "the transcript move must count every task it moves";
 
     #[derive(Clone, Serialize, Deserialize)]
     struct TestMessage {
@@ -922,6 +940,52 @@ mod tests {
                 .background_transcript(session.id, INVOCATION)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn moving_transcripts_counts_each_task_it_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        database
+            .save_background_task(session.id, &record())
+            .unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE background_tasks SET payload = json_set(payload, '$.history', json(?1))",
+                [LEGACY_HISTORY],
+            )
+            .unwrap();
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&reported);
+        MIGRATION.set(move |event| {
+            if let MigrationEvent::Rewrite { table, done, total } = event
+                && table == super::TRANSCRIPTS_TABLE
+            {
+                sink.lock().unwrap().push((done, total));
+            }
+        });
+
+        let transaction = database.connection().unchecked_transaction().unwrap();
+        super::move_transcripts(&transaction).unwrap();
+        transaction.commit().unwrap();
+        MIGRATION.clear();
+
+        assert_eq!(
+            reported.lock().unwrap().as_slice(),
+            &[(0, 1), (1, 1)],
+            "{EVERY_TASK_COUNTED}"
+        );
+        assert_eq!(
+            database
+                .background_transcript(session.id, INVOCATION)
+                .unwrap()
+                .as_deref(),
+            Some(LEGACY_HISTORY)
         );
     }
 

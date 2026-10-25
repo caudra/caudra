@@ -58,7 +58,7 @@ pub use source_code_rename::SOURCE_CODE_TOOL_RENAMES;
 
 use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
 use super::lease::{SessionLease, held_sessions};
-use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
+use super::progress::{CHECKPOINT_PHASE, MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionListing,
     SessionLocation, SessionMeta, SessionRelocation, SessionRelocationResult, SessionSummary,
@@ -149,6 +149,7 @@ const PAYLOAD_DECOMPRESSION_FAILED: &str = "payload could not be decompressed";
 const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
 /// Pages between progress reports while a freelist is being reclaimed.
 const RECLAIM_PROGRESS_INTERVAL: u64 = 1024;
+const COMMIT_PHASE: &str = "committing";
 const WAL_JOURNAL_MODE: &str = "wal";
 /// What `wal_checkpoint` reports for both frame counts when it could not read
 /// the WAL, as when another connection holds the checkpoint lock.
@@ -5508,6 +5509,9 @@ fn reclaim_migration_freelist(connection: &Connection) -> Result<u64, SessionErr
     // not in WAL mode wal_checkpoint reports -1 frames rather than failing.
     let journal: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     if journal.eq_ignore_ascii_case(WAL_JOURNAL_MODE) {
+        MIGRATION.report(MigrationEvent::Phase {
+            label: CHECKPOINT_PHASE,
+        });
         checkpoint_on(connection, true)?;
     }
     let freelist = pragma_u64(connection, "freelist_count")?;
@@ -5572,6 +5576,9 @@ fn migrate_to_current(
             crate::background::move_transcripts(&transaction)?;
         }
         transaction.pragma_update(None, "user_version", step.to)?;
+        MIGRATION.report(MigrationEvent::Phase {
+            label: COMMIT_PHASE,
+        });
         transaction.commit()?;
         current = step.to;
     }

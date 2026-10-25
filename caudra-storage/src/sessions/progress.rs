@@ -8,6 +8,8 @@
 
 use std::sync::{Arc, RwLock};
 
+pub const CHECKPOINT_PHASE: &str = "checkpointing the WAL";
+
 /// What a migration is doing right now.
 ///
 /// `Backup` and `Rewrite` carry their own totals because the two phases count
@@ -21,6 +23,8 @@ pub enum MigrationEvent {
     Backup { done: u64, total: u64 },
     /// One step of the chain began.
     Step { from: i64, to: i64 },
+    /// A stage began that has no total to count against.
+    Phase { label: &'static str },
     /// A step is moving rows between tables.
     Rewrite {
         table: &'static str,

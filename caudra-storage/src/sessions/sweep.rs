@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use super::change_stores::ChangeStores;
 use super::database::{WORKSPACE_CHANGES_DIR, directory_bytes};
 use super::lease::SessionLease;
-use super::progress::{PRUNE, PruneEvent};
+use super::progress::{CHECKPOINT_PHASE, PRUNE, PruneEvent};
 use super::{
     ARCHIVE_DIR, CheckpointResult, SESSIONS_DIR, SessionDatabase, SessionError, TrimReport,
 };
@@ -32,7 +32,6 @@ const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
 const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";
 const CHANGE_STORES_PHASE: &str = "cleaning change stores";
 const TOOL_OUTPUT_PHASE: &str = "cleaning orphaned tool output";
-const CHECKPOINT_PHASE: &str = "checkpointing the WAL";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.

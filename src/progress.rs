@@ -17,14 +17,16 @@ use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget, Prog
 use crate::cli::Cli;
 
 /// Wide enough for `rewriting subagent_history_items`, the longest label, so the
-/// bar does not jump sideways when that phase starts.
-const BAR_TEMPLATE: &str = "  {msg:<32} [{bar:20}] {pos}/{len} {elapsed_precise}";
+/// bar does not jump sideways when that phase starts. The spinner keeps turning
+/// through a stage with nothing to count, so a long one never looks frozen.
+const MEASURED_TEMPLATE: &str = "  {spinner} {msg:<32} [{bar:20}] {pos}/{len} {elapsed_precise}";
+const UNMEASURED_TEMPLATE: &str = "  {spinner} {msg:<32} {elapsed_precise}";
 pub(crate) const BAR_CHARS: &str = "=> ";
 pub(crate) const BAR_REFRESH: Duration = Duration::from_millis(100);
 const BACKUP_MESSAGE: &str = "backing up (pages)";
 const RECLAIM_MESSAGE: &str = "reclaiming (pages)";
 const SANDBOX_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";
-const SANDBOX_TICKS: &str = "|/-\\ ";
+const SPINNER_TICKS: &str = "|/-\\ ";
 
 pub struct SandboxProgress(ProgressBar);
 
@@ -48,7 +50,7 @@ impl SandboxProgress {
             .with_style(
                 ProgressStyle::with_template(SANDBOX_TEMPLATE)
                     .expect("static template")
-                    .tick_chars(SANDBOX_TICKS),
+                    .tick_chars(SPINNER_TICKS),
             )
             .with_message(message);
         bar.set_draw_target(target);
@@ -105,16 +107,15 @@ fn render_migration(bar: &mut Option<ProgressBar>, event: MigrationEvent) {
         MigrationEvent::Started { from, to } => {
             eprintln!("Upgrading session database from schema {from} to {to}.");
             eprintln!("Leave caudra running until it finishes; the original is kept alongside.");
-            *bar = Some(new_bar());
+            *bar = Some(new_bar(ProgressDrawTarget::stderr()));
         }
         MigrationEvent::Backup { done, total } => {
             advance(bar.as_ref(), BACKUP_MESSAGE, done, total);
         }
         MigrationEvent::Step { from, to } => {
-            if let Some(bar) = bar.as_ref() {
-                bar.set_message(format!("schema {from} to {to}"));
-            }
+            enter_phase(bar.as_ref(), format!("schema {from} to {to}"));
         }
+        MigrationEvent::Phase { label } => enter_phase(bar.as_ref(), label.to_owned()),
         MigrationEvent::Rewrite { table, done, total } => {
             advance(bar.as_ref(), &format!("rewriting {table}"), done, total);
         }
@@ -139,7 +140,7 @@ fn render_prune(bar: &mut Option<ProgressBar>, event: PruneEvent) {
     match event {
         PruneEvent::Phase { label } => eprintln!("  {label}"),
         PruneEvent::Reclaiming { done, total } => {
-            let bar = bar.get_or_insert_with(new_bar);
+            let bar = bar.get_or_insert_with(|| new_bar(ProgressDrawTarget::stderr()));
             advance(Some(bar), RECLAIM_MESSAGE, done, total);
         }
         PruneEvent::Reclaimed { pages } => {
@@ -153,23 +154,42 @@ fn render_prune(bar: &mut Option<ProgressBar>, event: PruneEvent) {
     }
 }
 
-fn new_bar() -> ProgressBar {
-    let bar = ProgressBar::new(0).with_style(
-        ProgressStyle::with_template(BAR_TEMPLATE)
-            .expect("static template")
-            .progress_chars(BAR_CHARS),
-    );
-    bar.set_draw_target(ProgressDrawTarget::stderr());
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template)
+        .expect("static template")
+        .progress_chars(BAR_CHARS)
+        .tick_chars(SPINNER_TICKS)
+}
+
+fn new_bar(target: ProgressDrawTarget) -> ProgressBar {
+    let bar = ProgressBar::with_draw_target(None, target).with_style(style(UNMEASURED_TEMPLATE));
     bar.enable_steady_tick(BAR_REFRESH);
     bar
+}
+
+/// A stage without a total drops the bar, so the previous stage's full one
+/// does not sit on screen claiming work that is already over.
+fn enter_phase(bar: Option<&ProgressBar>, message: String) {
+    let Some(bar) = bar else {
+        return;
+    };
+    bar.unset_length();
+    bar.set_position(0);
+    bar.set_style(style(UNMEASURED_TEMPLATE));
+    bar.set_message(message);
 }
 
 fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
     let Some(bar) = bar else {
         return;
     };
-    if bar.length() != Some(total) {
-        bar.set_length(total);
+    match bar.length() {
+        Some(length) if length == total => {}
+        Some(_) => bar.set_length(total),
+        None => {
+            bar.set_length(total);
+            bar.set_style(style(MEASURED_TEMPLATE));
+        }
     }
     if bar.message() != message {
         bar.set_message(message.to_owned());
@@ -179,7 +199,7 @@ fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxProgress, sandbox_message, uninstall};
+    use super::{SandboxProgress, advance, enter_phase, new_bar, sandbox_message, uninstall};
     use crate::cli::Cli;
     use caudra_config::StorageConfig;
     use caudra_storage::StateDir;
@@ -204,6 +224,29 @@ mod tests {
     const MIGRATION_DETACHED: &str = "uninstall must release the migration sink";
     const PRUNE_DETACHED: &str = "uninstall must release the prune sink";
     const PRUNE_QUIET: &str = "pruning after uninstall must not report console progress";
+    const MEASURED_STAGE: &str = "rewriting background_transcripts";
+    const UNMEASURED_STAGE: &str = "committing";
+    const PHASE_DROPS_BAR: &str = "a stage without a total must not keep the previous bar";
+
+    #[test_case(None; "fresh")]
+    #[test_case(Some((7, 7)); "after_a_full_bar")]
+    #[test_case(Some((3, 9)); "after_a_partial_bar")]
+    fn stages_switch_between_bar_and_spinner(earlier: Option<(u64, u64)>) {
+        let bar = new_bar(ProgressDrawTarget::hidden());
+        if let Some((done, total)) = earlier {
+            advance(Some(&bar), MEASURED_STAGE, done, total);
+        }
+
+        enter_phase(Some(&bar), UNMEASURED_STAGE.to_owned());
+        assert_eq!(bar.length(), None, "{PHASE_DROPS_BAR}");
+        assert_eq!(bar.position(), 0, "{PHASE_DROPS_BAR}");
+        assert_eq!(bar.message(), UNMEASURED_STAGE);
+
+        advance(Some(&bar), MEASURED_STAGE, 1, 2);
+        assert_eq!(bar.length(), Some(2));
+        assert_eq!(bar.position(), 1);
+        assert_eq!(bar.message(), MEASURED_STAGE);
+    }
 
     #[test]
     fn uninstall_detaches_storage_progress() {
