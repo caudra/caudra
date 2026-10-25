@@ -964,6 +964,17 @@ impl JobScope {
         self.tasks.persist(record).await
     }
 
+    /// Lets a child that [`Self::cancel_and_drain`] closed admit work again,
+    /// for a replacement turn that carries on the same invocation. A stop,
+    /// shutdown or failure of the whole runtime still refuses it.
+    pub(crate) fn reopen(&self) {
+        debug_assert!(matches!(self.owner, JobOwner::Child { .. }));
+        let mut state = self.tasks.lock();
+        if state.generation == self.generation {
+            state.closed_owners.remove(&self.owner);
+        }
+    }
+
     pub async fn cancel_and_drain(&self) -> Result<(), String> {
         let (tx, rx) = flume::bounded(1);
         let scope = self.clone();
@@ -2704,6 +2715,52 @@ mod tests {
                     .unwrap_err(),
                 CLOSED
             );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum AfterDrain {
+        Reopen,
+        StayClosed,
+        ReopenFromOldGeneration,
+    }
+
+    #[test_case(AfterDrain::Reopen, None; "reopened_owner_admits_and_delivers")]
+    #[test_case(AfterDrain::StayClosed, Some(CLOSED); "drained_owner_stays_closed")]
+    #[test_case(AfterDrain::ReopenFromOldGeneration, Some(CLOSED); "old_generation_cannot_reopen")]
+    fn reopening_a_drained_child_owner(after: AfterDrain, refusal: Option<&str>) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let old = fixture.tasks.child_scope(CHILD);
+            if matches!(after, AfterDrain::ReopenFromOldGeneration) {
+                fixture.tasks.stop().await.unwrap();
+                fixture.tasks.rearm();
+            }
+            let scope = fixture.tasks.child_scope(CHILD);
+            scope
+                .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
+                .await
+                .unwrap();
+            scope.cancel_and_drain().await.unwrap();
+            match after {
+                AfterDrain::Reopen => scope.reopen(),
+                AfterDrain::StayClosed => {}
+                AfterDrain::ReopenFromOldGeneration => old.reopen(),
+            }
+            let next = ShellJobMetadata {
+                call_id: OTHER.into(),
+                ..metadata()
+            };
+            let admitted = scope
+                .admit_shell(next, &fixture.history, |_, _| async { done() })
+                .await;
+            assert_eq!(admitted.as_ref().err().map(String::as_str), refusal);
+            if admitted.is_ok() {
+                fixture.tasks.join_jobs().await.unwrap();
+                scope.settle_launches(&[receipt()]).await.unwrap();
+                assert!(!scope.claim_messages().unwrap().is_empty());
+            }
             fixture.tasks.shutdown().await.unwrap();
         });
     }

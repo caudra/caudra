@@ -961,6 +961,7 @@ mod tests {
 
     use super::*;
     use crate::agent::history::is_run_failure_marker;
+    use crate::background::{BackgroundTasks, CLOSED, ShellJobMetadata};
     use crate::cancel::CancelTrigger;
     use crate::permissions::PermissionMode;
     use crate::tools::DescriptionContext;
@@ -970,7 +971,9 @@ mod tests {
     };
     use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
     use crate::workflow::{RuntimeDeps, WorkflowRuntime, WorkspaceRebind};
-    use crate::{AgentEvent, AgentInput, SubagentEnd, ThinkingConfig};
+    use crate::{
+        AgentEvent, AgentInput, StoredSession, SubagentEnd, ThinkingConfig, ToolDoneEvent,
+    };
     use caudra_storage::{StateDir, id::CaudraId};
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
@@ -2682,6 +2685,8 @@ mod tests {
     }
 
     const REPLACEMENT: &str = "stop that and list the routes instead";
+    const REPLACEMENT_SHELL: &str = "replacement-shell";
+    const REPLACEMENT_SHELL_TIMEOUT_MS: u64 = 1_000;
 
     fn replacement_input() -> AgentInput {
         AgentInput {
@@ -2714,6 +2719,13 @@ mod tests {
             let mut ctx = ctx_with(AgentMode::Build, provider);
             let (events_tx, events_rx) = flume::unbounded();
             ctx.event_tx = EventSender::new(events_tx, 0);
+            let state = tempfile::tempdir().unwrap();
+            let dir = StateDir::from_path(state.path().to_owned());
+            let mut stored = StoredSession::new(LABEL, state.path().to_str().unwrap());
+            stored.save(&dir).unwrap();
+            let tasks = BackgroundTasks::spawn(dir, stored.id).await.unwrap();
+            ctx.audience = ToolAudience::MAIN;
+            ctx.jobs = Some(tasks.child_scope(CALL_ID));
             let mut session = OpenSession(
                 subagent::open_task(
                     &ctx,
@@ -2758,7 +2770,7 @@ mod tests {
                     _ => {}
                 }
             };
-            let requests = requests.lock().unwrap();
+            let requests = requests.lock().unwrap().clone();
             match after {
                 AfterReplacing::Keep => {
                     assert_eq!(result.map_err(failure_message).unwrap().text, SUMMARY);
@@ -2783,6 +2795,28 @@ mod tests {
                     assert_eq!(requests.len(), 1);
                 }
             }
+            let admitted = tasks
+                .child_scope(CALL_ID)
+                .admit_shell(
+                    ShellJobMetadata {
+                        call_id: REPLACEMENT_SHELL.into(),
+                        root_call_id: REPLACEMENT_SHELL.into(),
+                        command: REPLACEMENT_SHELL.into(),
+                        workdir: ".".into(),
+                        timeout_ms: REPLACEMENT_SHELL_TIMEOUT_MS,
+                        mode: "build".into(),
+                        eta: None,
+                    },
+                    &ctx.subagent_history,
+                    |_, _| async { ToolDoneEvent::error(REPLACEMENT_SHELL.into(), REPLACEMENT) },
+                )
+                .await;
+            let refusal = match after {
+                AfterReplacing::Keep => None,
+                AfterReplacing::Delete | AfterReplacing::CancelTask => Some(CLOSED),
+            };
+            assert_eq!(admitted.as_ref().err().map(String::as_str), refusal);
+            tasks.shutdown().await.unwrap();
         });
     }
 

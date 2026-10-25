@@ -797,6 +797,7 @@ impl Subagent {
                 warn!(name = %self.name, task_id = %card.task_id, %error, "replacement could not stop a job");
             }
         }
+        jobs.reopen();
     }
 
     async fn run_turn(

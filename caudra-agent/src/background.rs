@@ -59,7 +59,8 @@ const MIN_SHELL_COMMAND_FENCE_LENGTH: usize = 3;
 const TASK_OUTPUT_LABEL: &str = "output-task";
 const STALE_INVOCATION: &str =
     "task invocation or session generation changed; refresh before controlling it";
-const CLOSED: &str = "background task admission is closed; an explicit user turn must rearm it";
+pub(crate) const CLOSED: &str =
+    "background task admission is closed; an explicit user turn must rearm it";
 const ADMISSION_CANCELLED: &str = "background task admission cancelled";
 const TRANSITION: &str = "background task admission is reserved for a workspace transition";
 const FOREIGN_SESSION: &str = "task context belongs to a different session";
