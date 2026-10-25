@@ -98,6 +98,7 @@ impl App {
             .or_else(|| self.queue_tip())
             .or_else(|| self.todo_panel.hover_tip(self.tooltip.pointer()))
             .or_else(|| self.update_close_tip())
+            .or_else(|| self.update_text_tip())
             .or_else(|| self.status_bar_tip())
             .or_else(|| self.chats[self.active_chat].hover_tip())
     }
@@ -162,6 +163,12 @@ impl App {
         close
             .contains(self.tooltip.pointer()?)
             .then(|| Tip::at(TipKey::UpdateClose, close, update::CLOSE_TIP.to_owned()))
+    }
+
+    fn update_text_tip(&self) -> Option<Tip> {
+        let text = self.update_text?;
+        text.contains(self.tooltip.pointer()?)
+            .then(|| Tip::at(TipKey::UpdateText, text, update::UPDATE_TIP.to_owned()))
     }
 }
 
@@ -546,16 +553,20 @@ mod tests {
         assert_eq!(tip_text(&app).as_deref(), expected, "{SPURIOUS}");
     }
 
-    #[test]
-    fn the_update_close_explains_itself_until_dismissed() {
+    #[test_case(|app: &App| app.update_close, TipKey::UpdateClose; "close")]
+    #[test_case(|app: &App| app.update_text, TipKey::UpdateText; "text")]
+    fn the_update_banner_explains_itself_until_dismissed(
+        control: fn(&App) -> Option<Rect>,
+        expected: TipKey,
+    ) {
         let (mut app, _notice) = announced(app_without_splash);
         let _ = screen(&mut app, WIDE);
-        let close = app.update_close.expect(CONTROL_MISSING);
+        let area = control(&app).expect(CONTROL_MISSING);
 
-        let _ = rest_at(&mut app, WIDE, close);
+        let _ = rest_at(&mut app, WIDE, area);
         assert_eq!(
             app.tooltip_candidate().map(|tip| tip.key),
-            Some(TipKey::UpdateClose),
+            Some(expected),
             "{WRONG_TIP}"
         );
 

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use caudra_config::config_file;
 use caudra_storage::version::{self, Release, UpdateChannel, VersionError};
 use caudra_storage::{StateDir, StorageError};
+use caudra_ui::update::UpdateFlow;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::Uri;
 use isahc::{Body, HttpClient, Request, Response};
@@ -40,6 +41,8 @@ const CHECKSUM_MISMATCH: &str = "release installer checksum mismatch";
 const WINDOWS_ROLLBACK: &str = "in-process rollback is not supported on Windows; close all Caudra processes and run the versioned PowerShell installer for the previous release";
 const BACKUP_FILENAME: &str = "caudra_backup";
 const INSTALL_DIR_ENV: &str = "CAUDRA_INSTALL_DIR";
+#[cfg(not(windows))]
+const BINARY: &str = "caudra";
 const BACKUP_BINARY: &str = "binary";
 const BACKUP_LICENSES: &str = "licenses";
 const LEGACY_MARKER: &str = "no-license-bundle";
@@ -186,6 +189,36 @@ pub enum UpdateError {
 
     #[error("failed to check latest version: {0}")]
     VersionCheck(#[from] VersionError),
+}
+
+/// What a call to [`update`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Updated {
+    /// The release is installed as this binary.
+    Installed(PathBuf),
+    /// The install waits for the command printed for the user to run.
+    #[cfg(windows)]
+    Prepared,
+    /// Nothing was installed: no newer release, or the script was declined.
+    Current,
+}
+
+/// What updating from the interactive UI's banner does for this binary.
+pub fn flow(ephemeral: bool) -> UpdateFlow {
+    match current_exe_resolved() {
+        Ok(exe) => flow_for(&exe, ephemeral),
+        Err(error) => UpdateFlow::Unavailable(error.to_string()),
+    }
+}
+
+/// An ephemeral run keeps no sessions to reopen, and Windows installs only
+/// once every Caudra has exited.
+fn flow_for(exe: &Path, ephemeral: bool) -> UpdateFlow {
+    match package_manager(exe) {
+        Some(manager) => UpdateFlow::Unavailable(UpdateError::Managed(manager).to_string()),
+        None if cfg!(windows) || ephemeral => UpdateFlow::Exit,
+        None => UpdateFlow::Restart,
+    }
 }
 
 fn asset_url(release: &Release, name: &str) -> String {
@@ -872,7 +905,7 @@ pub fn update(
     channel: Option<UpdateChannel>,
     show_script: bool,
     skip_confirm: bool,
-) -> Result<(), UpdateError> {
+) -> Result<Updated, UpdateError> {
     let exe_path = current_exe_resolved()?;
     if let Some(manager) = package_manager(&exe_path) {
         return Err(UpdateError::Managed(manager));
@@ -885,7 +918,7 @@ pub fn update(
             version::CURRENT,
             release.tag
         );
-        return Ok(());
+        return Ok(Updated::Current);
     }
 
     let action = if cfg!(windows) {
@@ -915,7 +948,7 @@ pub fn update(
         println!("{script}");
         if !skip_confirm && !prompt_yes(&install_dir) {
             println!("Aborted.");
-            return Ok(());
+            return Ok(Updated::Current);
         }
     }
 
@@ -924,6 +957,7 @@ pub fn update(
         let backup_path = backup_binary(&exe_path, &storage)?;
         prepare_windows_update(&script, &install_dir, &release.tag, &backup_path)?;
         println!("Previous version saved to: {}", backup_path.display());
+        Ok(Updated::Prepared)
     }
 
     #[cfg(not(windows))]
@@ -942,9 +976,10 @@ pub fn update(
             release.tag,
             version::CURRENT
         );
+        Ok(Updated::Installed(
+            install_dir.join(format!("{BINARY}{}", std::env::consts::EXE_SUFFIX)),
+        ))
     }
-
-    Ok(())
 }
 
 pub fn rollback() -> Result<(), UpdateError> {
@@ -987,11 +1022,12 @@ mod tests {
     use super::{
         BACKUP_BINARY, BACKUP_FILENAME, BACKUP_LICENSES, CHECKSUM_INVALID, CHECKSUM_MISMATCH,
         CHECKSUM_MISSING, INSTALL_DIR_ENV, LEGACY_CONTENT, LEGACY_MARKER, LICENSE_ATTRIBUTION,
-        LICENSE_MANIFEST, LICENSE_NOTICE, RESTORE_PREFIX, asset_url_allowed, installer_command,
-        license_path, needs_sudo, package_manager, replace_installation, restore_backup,
-        save_snapshot, snapshot_licenses, verify_checksum, windows_update_command,
+        LICENSE_MANIFEST, LICENSE_NOTICE, RESTORE_PREFIX, UpdateError, asset_url_allowed, flow_for,
+        installer_command, license_path, needs_sudo, package_manager, replace_installation,
+        restore_backup, save_snapshot, snapshot_licenses, verify_checksum, windows_update_command,
     };
     use super::{COMPACT_FILES, COMPACT_MARKER, check_bundle, is_complete_compact_bundle};
+    use caudra_ui::update::UpdateFlow;
 
     const OLD_BINARY: &str = "previous executable";
     const NEW_BINARY: &str = "current executable";
@@ -1117,6 +1153,21 @@ mv() {
     #[test_case("/usr/local/bin/caudra", None; "unmanaged")]
     fn managed_installations_are_not_overwritten(exe: &str, expected: Option<&str>) {
         assert_eq!(package_manager(Path::new(exe)), expected);
+    }
+
+    #[test]
+    fn a_managed_installation_says_where_to_update() {
+        assert_eq!(
+            flow_for(Path::new("/nix/store/hash-caudra/bin/caudra"), false),
+            UpdateFlow::Unavailable(UpdateError::Managed("Nix").to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(false => UpdateFlow::Restart; "restarts_onto_saved_sessions")]
+    #[test_case(true => UpdateFlow::Exit; "an_ephemeral_run_has_nothing_to_reopen")]
+    fn an_installer_build_updates_in_place(ephemeral: bool) -> UpdateFlow {
+        flow_for(Path::new("/usr/local/bin/caudra"), ephemeral)
     }
 
     #[test_case(true; "cargo_owned")]

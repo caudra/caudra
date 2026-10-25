@@ -407,7 +407,20 @@ fn write_update_check_section(out: &mut String) {
          installs it, in every session of that process. A shared on-disk cache \
          reuses successful checks for 24 hours across processes, with backoff \
          after failures. Headless and ACP runs do not start an update check. \
-         Nothing is installed automatically.\n"
+         Nothing is installed without asking.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Click the banner's text or run `/update` to install the release. \
+         Caudra asks first, then stops every session, runs the installer in \
+         the terminal, and restarts on the same tabs with the flags it was \
+         started with. Work that was running is interrupted, and \
+         `agent.resume_interrupted` decides whether it resumes. If nothing is \
+         installed, the sessions reopen with a warning. An `--ephemeral` run, \
+         and Windows, where the install finishes after Caudra exits, exit \
+         instead of restarting. A Homebrew, Nix, or Cargo installation is \
+         updated through its package manager instead.\n"
     )
     .unwrap();
     writeln!(

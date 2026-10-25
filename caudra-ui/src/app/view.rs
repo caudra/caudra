@@ -83,6 +83,7 @@ impl App {
         self.admission_hits.clear();
         self.chord_hint_hit = None;
         self.update_close = None;
+        self.update_text = None;
         if self.workbench.is_open() {
             self.render_workbench(frame);
             return;
@@ -402,6 +403,7 @@ impl App {
             close,
         );
         self.update_close = Some(close);
+        self.update_text = Some(text);
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -623,6 +625,7 @@ impl App {
         render_if_open!(self.sandbox_manager);
         if !self.question_form.is_open() {
             render_if_open!(self.mode_submission);
+            render_if_open!(self.update_prompt);
         }
 
         Topmost {

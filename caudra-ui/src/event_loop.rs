@@ -136,7 +136,7 @@ use crate::inline_image;
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
-use crate::update::{self, UpdateNotice};
+use crate::update::{self, UpdateFlow, UpdateNotice};
 use crate::{
     AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
     SessionRelocationHandoff, SessionTab,
@@ -384,6 +384,8 @@ pub struct EventLoopParams {
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub prompt_profile_override: Option<String>,
+    /// What choosing to update from the banner does in this process.
+    pub update_flow: UpdateFlow,
     /// Reports to the terminal host Caudra runs in, which outlives this
     /// loop.
     pub host_reporter: Option<ReporterHandle>,
@@ -1243,6 +1245,7 @@ struct SpawnCtx {
     /// session, so the loop publishes the rest here for the picker to read.
     live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
     update_notice: Arc<UpdateNotice>,
+    update_flow: UpdateFlow,
     config_problems: Arc<ConfigProblems>,
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
     websearch: Option<WebsearchControl>,
@@ -1944,6 +1947,7 @@ impl<'t> EventLoop<'t> {
             prompt_profiles,
             default_prompt_profile,
             prompt_profile_override,
+            update_flow,
             host_reporter,
             worktrees,
             host_workspaces,
@@ -1968,7 +1972,7 @@ impl<'t> EventLoop<'t> {
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
             std::thread::spawn(crate::highlight::warmup);
-            crate::update::spawn_check(ui_config.update_check, ui_config.update_channel.clone());
+            crate::update::spawn_check(ui_config.update_check, ui_config.update_channel);
         });
 
         let cwd =
@@ -2054,6 +2058,7 @@ impl<'t> EventLoop<'t> {
             prompt_profile_override,
             live_sessions: Arc::default(),
             update_notice: crate::update::notice(),
+            update_flow,
             config_problems: Arc::default(),
             host_cwd: workspace_session.as_ref().map(|_| cwd.clone()),
             workspace_session,
@@ -5110,6 +5115,16 @@ impl<'t> EventLoop<'t> {
             Action::ForceRefreshUsage => self.force_refresh_usage(),
             Action::RefreshStorage => self.refresh_storage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
+            Action::OpenUpdatePrompt => {
+                let working = self
+                    .sessions
+                    .iter()
+                    .filter(|runtime| !runtime.quiescent())
+                    .count();
+                self.sessions[idx]
+                    .app
+                    .open_update_prompt(&self.ctx.update_flow, working);
+            }
         }
     }
 
@@ -5865,6 +5880,7 @@ mod tests {
             prompt_profile_override: None,
             live_sessions: Arc::default(),
             update_notice: Arc::default(),
+            update_flow: UpdateFlow::default(),
             config_problems: Arc::default(),
             workspace_session: None,
             websearch: None,

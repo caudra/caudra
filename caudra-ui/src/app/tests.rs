@@ -9233,7 +9233,12 @@ const NARROW_SCREEN: u16 = 40;
 const BANNER_MISSING: &str = "an available release must be on screen";
 const BANNER_UNPOLLED: &str = "a release no poller has seen must not be on screen";
 const BANNER_RETURNED: &str = "a dismissed release must stay hidden for the rest of the process";
-const BANNER_TEXT_INERT: &str = "the banner's text is no control";
+const BANNER_TEXT_INERT: &str = "a press on the banner's text must not dismiss it";
+const UPDATE_PROMPT_COMMAND: &str = "/update";
+const UPDATE_NOT_ASKED: &str = "the banner's text must ask whether to update";
+const UPDATE_NOT_STOPPED: &str = "choosing to update must stop every session for the install";
+const UPDATE_UNWANTED: &str = "declining must leave the sessions and the banner alone";
+const UNAVAILABLE_REASON: &str = "installed by Nix";
 const BANNER_OVER_INPUT: &str = "the banner must sit above the composer, never on it";
 const BANNER_UNDER_MODAL: &str = "a press meant for a modal must not reach the banner";
 
@@ -9347,6 +9352,79 @@ fn only_the_close_control_dismisses_the_banner() {
         !rendered(&mut app).contains(UPDATE_HEADLINE),
         "{BANNER_RETURNED}"
     );
+}
+
+#[test]
+fn a_press_on_the_banner_text_asks_whether_to_update() {
+    let (mut app, _notice) = announced(app_without_splash);
+    let _ = rendered(&mut app);
+    let text = app.update_text.expect(BANNER_MISSING);
+    let actions = app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        text.x,
+        text.y,
+    ));
+    assert!(
+        matches!(actions.as_slice(), [Action::OpenUpdatePrompt]),
+        "{UPDATE_NOT_ASKED}"
+    );
+}
+
+#[test_case(true; "with_a_banner")]
+#[test_case(false; "without_one")]
+fn the_update_command_asks_only_with_a_release(announce: bool) {
+    let mut app = if announce {
+        announced(app_without_splash).0
+    } else {
+        app_without_splash()
+    };
+    let asked = app
+        .execute_command(cmd(UPDATE_PROMPT_COMMAND), 0)
+        .iter()
+        .any(|action| matches!(action, Action::OpenUpdatePrompt));
+    assert_eq!(asked, announce, "{UPDATE_NOT_ASKED}");
+    if !announce {
+        assert_eq!(app.status_bar.flash_text(), Some(NO_UPDATE_AVAILABLE_MSG));
+    }
+}
+
+#[test_case(UpdateFlow::Restart; "restart")]
+#[test_case(UpdateFlow::Exit; "exit")]
+fn choosing_to_update_stops_for_the_banners_channel(flow: UpdateFlow) {
+    let (mut app, _notice) = announced(app_without_splash);
+    app.open_update_prompt(&flow, 0);
+    assert!(app.update_prompt.is_open(), "{UPDATE_NOT_ASKED}");
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.exit_request,
+        ExitRequest::Update(UpdateChannel::Preview),
+        "{UPDATE_NOT_STOPPED}"
+    );
+    assert!(
+        matches!(actions.as_slice(), [Action::ManualExit]),
+        "{UPDATE_NOT_STOPPED}"
+    );
+}
+
+#[test_case(&[KeyCode::Down, KeyCode::Enter]; "not_now")]
+#[test_case(&[KeyCode::Esc]; "escape")]
+fn declining_the_update_keeps_everything(keys: &[KeyCode]) {
+    let (mut app, notice) = announced(app_without_splash);
+    app.open_update_prompt(&UpdateFlow::Restart, 1);
+    for &code in keys {
+        app.update(Msg::Key(key(code)));
+    }
+    assert!(!app.update_prompt.is_open(), "{UPDATE_UNWANTED}");
+    assert_eq!(app.exit_request, ExitRequest::None, "{UPDATE_UNWANTED}");
+    assert!(notice.latest().is_some(), "{UPDATE_UNWANTED}");
+}
+
+#[test]
+fn an_installation_that_cannot_update_itself_says_why() {
+    let (mut app, _notice) = announced(app_without_splash);
+    app.open_update_prompt(&UpdateFlow::Unavailable(UNAVAILABLE_REASON.into()), 0);
+    assert!(!app.update_prompt.is_open());
+    assert_eq!(app.status_bar.flash_text(), Some(UNAVAILABLE_REASON));
 }
 
 #[test]
@@ -29806,6 +29884,11 @@ mod theme_colours {
             name: "mode_submission",
             open: |app, _| app.mode_submission.open(),
             shown: |app| app.mode_submission.is_open(),
+        },
+        Surface {
+            name: "update_prompt",
+            open: |app, _| app.update_prompt.open(&super::preview_release(), true, 1),
+            shown: |app| app.update_prompt.is_open(),
         },
         Surface {
             name: "review",

@@ -13,6 +13,7 @@ const SEPARATOR: &str = " \u{2014} ";
 pub(crate) const CLOSE: &str = " \u{d7} ";
 pub(crate) const CLOSE_TIP: &str =
     "Hides this notice until Caudra restarts\nClick or run /dismiss-update";
+pub(crate) const UPDATE_TIP: &str = "Installs this release after asking\nClick or run /update";
 
 static NOTICE: LazyLock<Arc<UpdateNotice>> = LazyLock::new(Arc::default);
 
@@ -24,6 +25,19 @@ pub use version::{CURRENT, is_newer};
 pub struct Available {
     pub version: String,
     pub channel: UpdateChannel,
+}
+
+/// What updating from the banner does in this process, which only the binary
+/// that installs it can tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpdateFlow {
+    /// Installs, then starts the new version on the same sessions.
+    #[default]
+    Restart,
+    /// Installs, or prepares the install, then exits.
+    Exit,
+    /// This installation cannot update itself; the text says how to.
+    Unavailable(String),
 }
 
 /// What every session in the process shows about a newer release. Dismissing
@@ -80,8 +94,7 @@ pub fn spawn_check(configured: bool, channel: UpdateChannel) {
 
 fn check(channel: UpdateChannel, lookup: Lookup) -> Result<Option<Available>, VersionError> {
     let channel = channel.resolve()?;
-    let release =
-        version::fetch_release_cached(channel.clone(), lookup, &caudra_config::proxy_env())?;
+    let release = version::fetch_release_cached(channel, lookup, &caudra_config::proxy_env())?;
     Ok(release
         .filter(|release| is_newer(&release.version, CURRENT))
         .map(|release| Available {

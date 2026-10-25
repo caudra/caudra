@@ -54,6 +54,7 @@ pub(crate) enum TipKey {
     Queue(QueueHitTarget),
     TodoHeader,
     UpdateClose,
+    UpdateText,
     DocsBadge,
     /// A control on the top border of the one modal that is open.
     TitleHint(usize),

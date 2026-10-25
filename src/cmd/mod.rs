@@ -5,6 +5,7 @@ mod decisions;
 mod logs;
 mod message;
 mod permissions;
+mod restart;
 mod sandbox;
 mod sandbox_transfer;
 mod storage;
@@ -39,6 +40,8 @@ use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normal
 use crate::docs;
 use crate::startup::Startup;
 use crate::update;
+
+pub use restart::{Finish, restart};
 
 /// The three names Workcell's shell forwards from this process into every
 /// command it runs. Windows reads the last two, Unix the first.
@@ -496,7 +499,7 @@ fn report_upgrade_notices(cli: &Cli) {
     }
 }
 
-pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Result<ExitCode> {
+pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Result<Finish> {
     caudra_storage::paths::check_namespace_override()?;
     cli.startup = match startup {
         Ok(startup) => startup,
@@ -544,7 +547,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         Some(Command::Decisions { action }) => {
             decisions::run(action, &cli)?;
         }
-        Some(Command::Message { action }) => return message::run(action, &cli),
+        Some(Command::Message { action }) => return message::run(action, &cli).map(Finish::Exit),
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
@@ -658,7 +661,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         }) => {
             subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
         }
-        Some(Command::Config { action }) => return config::run(action),
+        Some(Command::Config { action }) => return config::run(action).map(Finish::Exit),
         Some(Command::Logs {
             follow,
             level,
@@ -696,7 +699,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         }
         None => return tui::run(cli, tightened),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(ExitCode::SUCCESS.into())
 }
 
 #[cfg(test)]

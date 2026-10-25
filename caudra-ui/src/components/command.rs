@@ -232,6 +232,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/update",
+        description: "Install the release the update banner names, then restart",
+        max_args: 0,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/dismiss-update",
         description: "Hide the update banner until Caudra restarts",
         max_args: 0,

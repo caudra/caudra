@@ -65,6 +65,7 @@ use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::{
     HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
 };
+use caudra_storage::version::UpdateChannel;
 use caudra_workspace::{WorkspaceChangeService, WorkspaceSession};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
@@ -278,6 +279,13 @@ pub enum RunOutcome {
         tabs: Vec<SessionTab>,
         focused: usize,
     },
+    /// Every session is saved and stopped so the caller can install the
+    /// release from `channel`, then start it on the same sessions.
+    Update {
+        tabs: Vec<SessionTab>,
+        focused: usize,
+        channel: UpdateChannel,
+    },
     Relocate {
         tabs: Vec<SessionTab>,
         focused: usize,
@@ -408,6 +416,11 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         components::ExitRequest::Reload => RunOutcome::Reload {
             tabs: report.tabs,
             focused: report.focused,
+        },
+        components::ExitRequest::Update(channel) => RunOutcome::Update {
+            tabs: report.tabs,
+            focused: report.focused,
+            channel,
         },
         exit => {
             let summary = report

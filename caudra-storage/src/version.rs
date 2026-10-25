@@ -45,7 +45,7 @@ const UPLOADED: &str = "uploaded";
 const TOKEN_VARIABLES: [&str; 2] = ["GITHUB_TOKEN", "GH_TOKEN"];
 const CURL_HEADERS_FROM_STDIN: &str = "@-";
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateChannel {
     #[default]
@@ -527,7 +527,7 @@ pub fn fetch_release_cached(
         .as_secs();
     cached_at(
         &paths::cache_dir()?.join(CACHE_DIRECTORY),
-        channel.clone(),
+        channel,
         target,
         now,
         lookup,
@@ -775,7 +775,7 @@ mod tests {
     fn channel_roundtrip(text: &str, expected: UpdateChannel) {
         assert_eq!(text.parse::<UpdateChannel>().unwrap(), expected);
         assert_eq!(expected.to_string(), text);
-        assert_eq!(serde_json::to_value(&expected).unwrap(), json!(text));
+        assert_eq!(serde_json::to_value(expected).unwrap(), json!(text));
         assert_eq!(
             serde_json::from_value::<UpdateChannel>(json!(text)).unwrap(),
             expected
@@ -815,10 +815,7 @@ mod tests {
             .iter()
             .map(|tag| fixture(tag, LINUX))
             .collect();
-        assert_eq!(
-            select(channel.clone(), LINUX, &releases).unwrap().tag,
-            expected
-        );
+        assert_eq!(select(channel, LINUX, &releases).unwrap().tag, expected);
         releases.reverse();
         assert_eq!(select(channel, LINUX, &releases).unwrap().tag, expected);
     }
@@ -830,10 +827,7 @@ mod tests {
             .iter()
             .map(|tag| fixture(tag, LINUX))
             .collect();
-        assert_eq!(
-            select(channel.clone(), LINUX, &releases).unwrap(),
-            release()
-        );
+        assert_eq!(select(channel, LINUX, &releases).unwrap(), release());
         releases.reverse();
         assert_eq!(select(channel, LINUX, &releases).unwrap(), release());
     }
@@ -967,7 +961,7 @@ mod tests {
         incomplete["assets"] = json!([]);
         let mut releases = [fixture(TAG, LINUX), incomplete];
         for _ in 0..2 {
-            let result = discover(channel.clone(), LINUX, |page| {
+            let result = discover(channel, LINUX, |page| {
                 let release = releases.get(page as usize - 1);
                 Ok(serde_json::to_vec(&release.into_iter().collect::<Vec<_>>()).unwrap())
             });

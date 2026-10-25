@@ -56,7 +56,8 @@ fn main() -> ExitCode {
     caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     caudra_storage::log::flush_blocking(LOG_FLUSH_TIMEOUT);
     match result {
-        Ok(code) => code,
+        Ok(cmd::Finish::Exit(code)) => code,
+        Ok(cmd::Finish::Restart(command)) => cmd::restart(command),
         Err(e) => {
             print_error(&e);
             ExitCode::FAILURE

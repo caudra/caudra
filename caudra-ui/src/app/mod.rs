@@ -141,6 +141,7 @@ use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tools_modal::{ToolsModal, ToolsScope};
 use crate::components::tooltip::{TipArea, Tooltip};
+use crate::components::update_prompt::{UpdateChoice, UpdatePrompt, UpdatePromptAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::{paint_image, paint_markdown, styles as workbench_styles};
@@ -217,7 +218,7 @@ use serde_json::Value;
 use smol::Task;
 
 use crate::storage_writer::{StorageWriter, WarmingWrite};
-use crate::update::{self, Available, UpdateNotice};
+use crate::update::{self, Available, UpdateFlow, UpdateNotice};
 use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
@@ -270,6 +271,7 @@ const YOLO_OFF_MSG: &str = "YOLO mode disabled";
 const AUTO_ON_MSG: &str = "Auto permission mode enabled";
 const AUTO_OFF_MSG: &str = "Auto permission mode disabled";
 const NO_UPDATE_MSG: &str = "No update notice to dismiss";
+const NO_UPDATE_AVAILABLE_MSG: &str = "No update is available";
 const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
@@ -521,6 +523,7 @@ pub struct App {
     pub(super) message_actions: MessageActions,
     pub(super) queue_actions: QueueActions,
     pub(super) mode_submission: ModeSubmission,
+    pub(super) update_prompt: UpdatePrompt,
     pending_plan_submission: Option<queue::PendingPlanSubmission>,
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
@@ -619,6 +622,8 @@ pub struct App {
     pub(crate) config_problems: Arc<ConfigProblems>,
     /// The banner's close control as last drawn, `None` while it is not.
     pub(super) update_close: Option<Rect>,
+    /// The banner's text as last drawn, which opens the update prompt.
+    pub(super) update_text: Option<Rect>,
     /// The picker's other half comes from a disk query, which no publisher
     /// covers; see [`StorageWriter::generation`].
     stored_session_generation: u64,
@@ -897,6 +902,7 @@ impl App {
             message_actions: MessageActions::new(),
             queue_actions: QueueActions::new(),
             mode_submission: ModeSubmission::new(),
+            update_prompt: UpdatePrompt::new(),
             pending_plan_submission: None,
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
@@ -971,6 +977,7 @@ impl App {
             update_banner: Watch::default(),
             config_problems: Arc::default(),
             update_close: None,
+            update_text: None,
             stored_session_generation: 0,
             question_subagent: None,
             stash_picker: StashPicker::new(),
@@ -1863,7 +1870,7 @@ impl App {
                     self.docs_modal.handle_paste(&text);
                     return vec![];
                 }
-                if self.mode_submission.is_open()
+                if (self.mode_submission.is_open() || self.update_prompt.is_open())
                     && !self.permission_prompt_holds_input()
                     && !self.question_form.is_open()
                 {
@@ -2511,6 +2518,16 @@ impl App {
             }
             let action = self.mode_submission.handle_key(key);
             return Some(self.handle_mode_submission(action));
+        }
+        if self.update_prompt.is_open()
+            && !self.permission_prompt_holds_input()
+            && !self.question_form.is_open()
+        {
+            if command_key.is_none() {
+                return Some(vec![]);
+            }
+            let action = self.update_prompt.handle_key(key);
+            return Some(self.handle_update_prompt(action));
         }
         if self.sandbox_manager.is_open() {
             keyboard_text!(sandbox_manager, self.sandbox_manager.text_input_active());
@@ -6317,6 +6334,7 @@ impl App {
                 self.dismiss_update();
                 vec![]
             }
+            "/update" => self.request_update(),
             "/memory" => self.open_memory_inspector(),
             "/learn" => self.open_learn_inspector(),
             "/tasks" => self.execute_task_control(&cmd.args),
@@ -6812,7 +6830,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 53] {
+    fn overlays(&self) -> [&dyn Overlay; 54] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -6841,6 +6859,7 @@ impl App {
             &self.message_actions,
             &self.queue_actions,
             &self.mode_submission,
+            &self.update_prompt,
             &self.review,
             &self.command_modal,
             &self.theme_picker,
@@ -6870,7 +6889,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 53] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 54] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -6899,6 +6918,7 @@ impl App {
             &mut self.message_actions,
             &mut self.queue_actions,
             &mut self.mode_submission,
+            &mut self.update_prompt,
             &mut self.review,
             &mut self.command_modal,
             &mut self.theme_picker,
@@ -7166,6 +7186,52 @@ impl App {
         self.update_notice.dismiss();
         self.update_banner = Watch::default();
         self.update_close = None;
+        self.update_text = None;
+    }
+
+    /// The prompt needs every session's state, which only the event loop
+    /// holds, so it opens from there.
+    pub(super) fn request_update(&mut self) -> Vec<Action> {
+        if self.update_banner.get().is_none() {
+            self.flash(NO_UPDATE_AVAILABLE_MSG.into());
+            return Vec::new();
+        }
+        vec![Action::OpenUpdatePrompt]
+    }
+
+    /// `working` counts the sessions the update would stop mid-work.
+    pub(crate) fn open_update_prompt(&mut self, flow: &UpdateFlow, working: usize) {
+        let Some(available) = self.update_banner.get() else {
+            self.flash(NO_UPDATE_AVAILABLE_MSG.into());
+            return;
+        };
+        match flow {
+            UpdateFlow::Unavailable(reason) => self.flash(reason.clone()),
+            flow => {
+                self.update_prompt
+                    .open(available, *flow == UpdateFlow::Restart, working);
+            }
+        }
+    }
+
+    pub(super) fn handle_update_prompt(&mut self, action: UpdatePromptAction) -> Vec<Action> {
+        let choice = match action {
+            UpdatePromptAction::Consumed => return Vec::new(),
+            UpdatePromptAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                return Vec::new();
+            }
+            UpdatePromptAction::Close => UpdateChoice::NotNow,
+            UpdatePromptAction::Select(choice) => choice,
+        };
+        self.update_prompt.close();
+        match (choice, self.update_banner.get()) {
+            (UpdateChoice::Restart | UpdateChoice::Exit, Some(available)) => {
+                let channel = available.channel;
+                self.quit_with(ExitRequest::Update(channel))
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;
@@ -7781,7 +7847,7 @@ impl App {
             self.docs_modal.handle_paste(text);
             return;
         }
-        if self.mode_submission.is_open()
+        if (self.mode_submission.is_open() || self.update_prompt.is_open())
             && !self.permission_prompt_holds_input()
             && !self.question_form.is_open()
         {

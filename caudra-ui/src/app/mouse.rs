@@ -102,6 +102,16 @@ impl App {
             let action = self.mode_submission.handle_mouse(event);
             return self.handle_mode_submission(action);
         }
+        if self.update_prompt.is_open()
+            && !self.permission_prompt_holds_input()
+            && !self.question_form.is_open()
+        {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            let action = self.update_prompt.handle_mouse(event);
+            return self.handle_update_prompt(action);
+        }
         if self.sandbox_manager.is_open() {
             self.clear_control_hovers();
             self.autoscroll = None;
@@ -624,6 +634,13 @@ impl App {
             self.clear_control_hovers();
             self.dismiss_update();
             return Vec::new();
+        }
+        if !self.has_modal_overlay()
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.update_text.is_some_and(|text| text.contains(at))
+        {
+            self.clear_control_hovers();
+            return self.request_update();
         }
         // Ahead of the selection below, which would otherwise read a press on
         // a bar as the start of a sweep down the surface behind it. Both

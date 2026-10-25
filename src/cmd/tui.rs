@@ -36,6 +36,7 @@ use caudra_storage::sessions::{
     SessionRelocationResult,
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
+use caudra_storage::version::{self, UpdateChannel};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateClass, StateDir, hold_instance};
 use caudra_terminal_host::reporter::Reporter;
@@ -51,6 +52,7 @@ use caudra_workcell::{PatternObligationKind, RemoteConnectionStatus};
 
 use super::worktree::{self, Executed, Handled};
 use super::{ConfigFlags, LuaLayers, load_recorded_settings, resolve_config, settings_reloader};
+use super::{Finish, restart};
 use crate::cli::Cli;
 use crate::cmd::permissions::discover::{
     DiscoveryLimits, DiscoveryReport, RECOGNIZER_CAPACITY, RECOGNIZER_ORDER_BIAS,
@@ -61,6 +63,7 @@ use crate::progress::SandboxProgress;
 use crate::release_notes;
 use crate::setup;
 use crate::startup::project_notices;
+use crate::update::{self, Updated};
 
 const LOGIN_PLACEHOLDER_PROVIDER: &str = "anthropic";
 const LOGIN_PLACEHOLDER_UNAVAILABLE: &str = "built-in login placeholder provider is not registered";
@@ -97,6 +100,10 @@ const RELOCATION_ENV_RESTART: &str =
 const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
 const RELOCATION_USAGE_EMPTY: &str =
     "No historical project usage was recorded for the source directory";
+const UPDATE_FAILED: &str = "Update not installed";
+const UPDATE_NOT_NEWER: &str = "GitHub lists no newer release for this channel";
+const UPDATE_NO_RESTART: &str =
+    "Updated, but could not restart Caudra; run `caudra --continue` to reopen your sessions";
 const RELOCATION_PLANS_DETACHED: &str = "Active source plans and approvals were detached";
 const RELOCATION_APPROVALS_DETACHED: &str =
     "Approvals were detached; plans stay attached, since both directories share project state";
@@ -1424,7 +1431,7 @@ fn after_runtime_release<T, U>(
     operation()
 }
 
-pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
     let permission_mode_override = cli.permission_mode_override();
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
@@ -1572,7 +1579,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             workcell_runtime.stored_binding(),
             features,
         )?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(ExitCode::SUCCESS.into());
     }
 
     // Past the SDK branch stdin is no longer a protocol channel, so both
@@ -1621,6 +1628,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             workcell_runtime.local_documents().cloned(),
             cli.autopilot.then_some(stack.config.autopilot),
         )
+        .map(Finish::Exit)
         .context("run print mode");
     }
 
@@ -1892,6 +1900,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 prompt_profiles: Arc::clone(&stack.prompt_profiles),
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
+                update_flow: update::flow(storage.is_ephemeral()),
                 host_reporter: host_reporter.as_ref().map(Reporter::handle),
                 peer_host: peer_host.clone(),
                 worktrees: worktrees.clone(),
@@ -1944,7 +1953,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     eprintln!(
                         "Sandbox '{name}': {action} completed. Active TUI ended; conversations saved and detached. Inspect the sandbox and explicitly resume/attach when ready. No local fallback."
                     );
-                    return Ok(ExitCode::SUCCESS);
+                    return Ok(ExitCode::SUCCESS.into());
                 }
                 let registry = ToolRegistry::default();
                 let runtime = sandbox_phase(
@@ -2066,12 +2075,40 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 // Returning the code instead of exiting here keeps every guard
                 // alive to its scope end, including the ephemeral state root
                 // whose `Drop` erases the volatile directory.
-                return Ok(code);
+                return Ok(code.into());
             }
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
             } => (reloaded, f, None, None),
+            RunOutcome::Update {
+                tabs: stopped,
+                focused: stopped_focus,
+                channel,
+            } => match install_update(channel, &mut warnings) {
+                Updated::Current => (stopped, stopped_focus, None, None),
+                finished => {
+                    drop(stopped);
+                    drop(sweeper);
+                    drop(stack);
+                    teardown.join();
+                    if let Some(reporter) = host_reporter.take() {
+                        reporter.release();
+                    }
+                    return Ok(match finished {
+                        Updated::Installed(binary) if !storage.is_ephemeral() => {
+                            match restart::restart_command(&binary, env::args_os()) {
+                                Ok(command) => Finish::Restart(command),
+                                Err(error) => {
+                                    eprintln!("{UPDATE_NO_RESTART}: {error}");
+                                    ExitCode::SUCCESS.into()
+                                }
+                            }
+                        }
+                        _ => ExitCode::SUCCESS.into(),
+                    });
+                }
+            },
             RunOutcome::Relocate {
                 tabs: reloaded,
                 focused: f,
@@ -2118,7 +2155,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                         if let Some(reporter) = host_reporter.take() {
                             reporter.release();
                         }
-                        return Ok(ExitCode::SUCCESS);
+                        return Ok(ExitCode::SUCCESS.into());
                     }
                 }
             }
@@ -2210,7 +2247,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     }
                 }
                 eprintln!("{committed}. {RELOCATION_ENV_RESTART}.");
-                return Ok(ExitCode::SUCCESS);
+                return Ok(ExitCode::SUCCESS.into());
             }
         } else {
             teardown.defer(move || drop(stack));
@@ -2255,6 +2292,22 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             "rebuilt plugins and config"
         );
     }
+}
+
+/// Installs from the restored terminal, where the installer's output and a
+/// sudo prompt can reach the user. Nothing installed reopens the sessions
+/// with a warning saying so.
+fn install_update(channel: UpdateChannel, warnings: &mut Vec<String>) -> Updated {
+    let reason = match update::update(Some(channel), false, false) {
+        Ok(Updated::Current) => UPDATE_NOT_NEWER.to_owned(),
+        Ok(updated) => return updated,
+        Err(error) => error.to_string(),
+    };
+    warnings.push(format!(
+        "{UPDATE_FAILED}: {reason}. Still on v{}",
+        version::CURRENT
+    ));
+    Updated::Current
 }
 
 /// A redirected stderr and `--exit-on-done` both belong to a script, which

@@ -93,6 +93,7 @@ pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod tools_modal;
 pub(crate) mod tooltip;
+pub(crate) mod update_prompt;
 pub(crate) mod usage_modal;
 pub(crate) mod which_key;
 pub(crate) mod workbench;
@@ -127,6 +128,7 @@ use caudra_providers::{
 };
 use caudra_storage::accounts::AccountName;
 use caudra_storage::sessions::SessionRelocation;
+use caudra_storage::version::UpdateChannel;
 use caudra_workbench::keys::{ListEnd, list_end};
 use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -1208,6 +1210,9 @@ pub enum Action {
     OpenFile(std::path::PathBuf),
     Btw(String),
     Extract,
+    /// Asks whether to install the release the banner names, which needs
+    /// every session's state.
+    OpenUpdatePrompt,
 }
 
 pub struct ForkedSession {
@@ -1248,12 +1253,15 @@ pub enum ExitRequest {
     Success,
     Error,
     Reload,
+    /// Stops every session so the release the banner names can be installed
+    /// from this channel.
+    Update(UpdateChannel),
 }
 
 impl ExitRequest {
     pub fn code(&self) -> ExitCode {
         match self {
-            Self::None | Self::Success | Self::Reload => ExitCode::SUCCESS,
+            Self::None | Self::Success | Self::Reload | Self::Update(_) => ExitCode::SUCCESS,
             Self::Error => ExitCode::FAILURE,
         }
     }

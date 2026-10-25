@@ -15,6 +15,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - Tasks and shell commands have one way to run in the background, and `agent.task_execution` and `agent.shell_execution` are gone.
 - A shell command still running after 10 minutes moves to the background instead of holding up the turn.
 - Every 30 minutes a background shell runs, Caudra asks the agent waiting on it whether to keep waiting or check whether the command hangs.
+- Clicking the update banner, or running `/update`, installs the new release and restarts Caudra on the same sessions.
 
 > **Note**
 >
@@ -31,6 +32,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **A cancelled shell command says how far it got**: Cancelling a running `shell` command, with `Esc`, `Ctrl+K` in `/shells`, or `/tasks cancel`, told the agent only `Shell execution cancelled`. The result now also carries the last of the command's output so far, filtered like a final result, so the agent can tell where the command stopped. See [Inspect and control tasks](/docs/sessions/#inspect-and-control-tasks).
 - **Shell results say how long a command took**: A shell result told the agent the exit code but not how long the command ran, so the agent had no basis for the next run's `timeoutSec` or for starting a long command in the background. A command that ran a second or more now ends with, for example, `[shell status: exit code 0; took 3m12s]`, and a timeout with `timed out after 2m`. See [shell](/docs/tools/#shell).
 - **A long background shell asks whether to keep waiting**: An agent that started a shell in the background waited for its result, however long it took, so a command that hung on a prompt or a lock held the agent until its `timeoutSec` deadline. Every 30 minutes the command runs, Caudra now sends the agent waiting on it a reminder with the last of its output, filtered like a final result, and asks whether waiting is still necessary or the command should be cancelled. An idle session wakes for it the way it does for a result, and subagents get it too. Foreground commands are never asked about. Change the interval with `agent.shell_wait_nudge_minutes`, or set it to `0` to turn the reminder off. See [Long-running background shells](/docs/context/#long-running-background-shells).
+- **Update from the banner**: The update banner only named the command to run in another terminal. Clicking its text, or running `/update`, now asks whether to update. Choosing to update stops every session, installs the release in the terminal, where a sudo prompt can reach you, and restarts Caudra on the same tabs with the flags it was started with. Work that was running is interrupted, and `agent.resume_interrupted` decides whether it resumes. If nothing is installed, the sessions reopen with a warning. An `--ephemeral` run, and Windows, where the install finishes after Caudra exits, exit instead of restarting. A Homebrew, Nix or Cargo installation says to update through its package manager. See [ui.update_check](/docs/configuration/#ui-update-check).
 
 ## Caudra 0.2 Preview 13 {#v0-2-0-preview-13}
 
