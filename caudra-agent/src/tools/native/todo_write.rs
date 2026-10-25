@@ -95,9 +95,15 @@ impl Tool for TodoWrite {
     }
 }
 
+/// What a call's header says about the list it carries, the same whether the
+/// list is still streaming or the call has started.
+pub(crate) fn header(count: usize) -> String {
+    format!("{count} todos")
+}
+
 /// `validate` has already checked the shape, so a failure here means a status
 /// or priority the enum does not cover.
-fn parse_item(raw: &Value) -> Result<TodoItem, ParseError> {
+pub(crate) fn parse_item(raw: &Value) -> Result<TodoItem, ParseError> {
     let field = |name: &str| raw.get(name).and_then(Value::as_str);
     let status = field("status").ok_or_else(|| ParseError::custom("status is required"))?;
     Ok(TodoItem {
@@ -116,7 +122,7 @@ fn parse_item(raw: &Value) -> Result<TodoItem, ParseError> {
     })
 }
 
-fn parse_status(raw: &str) -> Option<TodoStatus> {
+pub(crate) fn parse_status(raw: &str) -> Option<TodoStatus> {
     match raw {
         "pending" => Some(TodoStatus::Pending),
         "in_progress" => Some(TodoStatus::InProgress),
@@ -126,7 +132,7 @@ fn parse_status(raw: &str) -> Option<TodoStatus> {
     }
 }
 
-fn parse_priority(raw: &str) -> Option<TodoPriority> {
+pub(crate) fn parse_priority(raw: &str) -> Option<TodoPriority> {
     match raw {
         "high" => Some(TodoPriority::High),
         "medium" => Some(TodoPriority::Medium),
@@ -141,7 +147,7 @@ struct TodoCall {
 
 impl ToolInvocation for TodoCall {
     fn start_header(&self) -> HeaderFuture {
-        HeaderFuture::Ready(HeaderResult::plain(format!("{} todos", self.todos.len())))
+        HeaderFuture::Ready(HeaderResult::plain(header(self.todos.len())))
     }
 
     fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {

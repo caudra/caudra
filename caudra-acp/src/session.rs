@@ -44,6 +44,7 @@ use crate::errors::{
 };
 use crate::methods::SessionSettings;
 use crate::outbound::{Outbound, PendingState, Written};
+use crate::plan_drafts::PlanDrafts;
 use crate::server::Incoming;
 use crate::translate::{MessageCursor, OpenCalls};
 use crate::turn::{DRAIN_TIMEOUT, Leftover, OwedPrompt, PromptDirective, Steer, TurnEnd, resubmit};
@@ -523,6 +524,8 @@ impl EventPump {
         // Tool calls whose `tool_call` creation has been sent. An id leaves the
         // set when the call finishes, so this tracks only calls in flight.
         let mut announced = OpenCalls::new();
+        // The plan a streaming `todo_write` is writing, and the last one stored.
+        let mut plans = PlanDrafts::default();
         // The assistant message being streamed, which names its chunks.
         let mut reply: Option<MessageCursor> = None;
         // The run serving the owed prompt, once its start or one of its
@@ -588,7 +591,7 @@ impl EventPump {
                         "cancelled turn did not end in time; answering its prompt cancelled"
                     );
                     answerless.extend(turn_run.take());
-                    turn.settle_open_calls(&mut announced, true);
+                    turn.settle_open_calls(&mut announced, &mut plans, true);
                     let spend = mem::take(&mut turn_spend);
                     turn.answer(TurnEnd::Stopped {
                         stop: StopReason::Cancelled,
@@ -597,7 +600,7 @@ impl EventPump {
                     continue;
                 }
                 Err(Wake::Ended) => {
-                    turn.settle_open_calls(&mut announced, true);
+                    turn.settle_open_calls(&mut announced, &mut plans, true);
                     let mut owed = locked(&pending);
                     owed.agent_gone = true;
                     if let Some(prompt) = owed.prompt.take() {
@@ -651,16 +654,32 @@ impl EventPump {
                 AgentEvent::ToolInputDelta {
                     id,
                     name,
-                    preview: Some(preview),
+                    preview,
+                    todos,
+                    complete,
                     ..
                 } => {
+                    let plan = plans.advance(&id, todos, complete);
+                    if plan.is_none() && preview.is_none() {
+                        continue;
+                    }
                     interrupt(&mut reply);
+                    if let Some(plan) = plan {
+                        turn.update(plan, answers);
+                    }
+                    let Some(preview) = preview else {
+                        continue;
+                    };
                     let first = announced
                         .insert(id.clone(), Arc::from(name.as_str()))
                         .is_none();
                     translate::tool_preview(&registry, &id, &name, preview, first)
                 }
-                AgentEvent::ToolInputDelta { .. } => continue,
+                // A retried stream writes its calls again from the start.
+                AgentEvent::StreamReset => match plans.abandon() {
+                    Some(plan) => plan,
+                    None => continue,
+                },
                 AgentEvent::ToolStart(event) => {
                     interrupt(&mut reply);
                     let first = announced
@@ -676,7 +695,7 @@ impl EventPump {
                     announced.remove(&event.id);
                     // A finished todo_write is the agent's plan changing, which
                     // ACP reports separately from the call that caused it.
-                    if let Some(plan) = translate::plan_update(&event.output) {
+                    if let Some(plan) = plans.finished(&event.id, &event.output) {
                         turn.update(plan, answers);
                     }
                     translate::tool_done(&event, &cwd, home.as_deref())
@@ -724,7 +743,7 @@ impl EventPump {
                         turn.update(translate::compaction_update(&id, status, None), answers);
                     }
                     let spend = mem::take(&mut turn_spend);
-                    turn.settle_open_calls(&mut announced, answers);
+                    turn.settle_open_calls(&mut announced, &mut plans, answers);
                     if answers {
                         drain_deadline = None;
                         turn_run = None;
@@ -750,7 +769,7 @@ impl EventPump {
                         );
                         turn.update(failed, answers);
                     }
-                    turn.settle_open_calls(&mut announced, answers);
+                    turn.settle_open_calls(&mut announced, &mut plans, answers);
                     if answers {
                         drain_deadline = None;
                         turn_run = None;
@@ -764,7 +783,7 @@ impl EventPump {
                 // answers nothing.
                 AgentEvent::AuthRequired => {
                     if turn.owed() {
-                        turn.settle_open_calls(&mut announced, true);
+                        turn.settle_open_calls(&mut announced, &mut plans, true);
                         drain_deadline = None;
                         answerless.extend(turn_run.take());
                         turn.answer(TurnEnd::Failed(auth_required(AUTH_REQUIRED_DETAILS)));
@@ -824,10 +843,14 @@ impl TurnOutput<'_> {
     }
 
     /// Calls still open when their turn ends never finish, so the client is
-    /// told they failed before it reads the turn's answer.
-    fn settle_open_calls(&self, open: &mut OpenCalls, owned: bool) {
+    /// told they failed before it reads the turn's answer. A plan one of them
+    /// was still writing is withdrawn with it.
+    fn settle_open_calls(&self, open: &mut OpenCalls, plans: &mut PlanDrafts, owned: bool) {
         for update in translate::cancel_open_calls(open) {
             self.update(update, owned);
+        }
+        if let Some(plan) = plans.abandon() {
+            self.update(plan, owned);
         }
     }
 

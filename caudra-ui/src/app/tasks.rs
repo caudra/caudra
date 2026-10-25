@@ -1079,6 +1079,7 @@ impl App {
                     chat.cancel_in_progress();
                     chat.mark_finished(outcome, &task.state);
                     changed = true;
+                    self.sync_todo_panel();
                 }
             }
             changed |= self.chats[0].task_card_update(task);

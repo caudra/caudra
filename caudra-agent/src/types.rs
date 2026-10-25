@@ -3104,6 +3104,12 @@ pub enum AgentEvent {
         /// the roster the batch actually dispatched.
         #[serde(skip_serializing_if = "Option::is_none")]
         roster: Option<Vec<BatchToolEntry>>,
+        /// The whole list a `todo_write` has written so far. An item joins
+        /// once its content begins and reads as pending until its status
+        /// arrives. `Some` only when an item was added or one changed;
+        /// `ToolDone` replaces it with the list the call stored.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        todos: Option<Vec<TodoItem>>,
         /// The briefs the delegating calls in this fragment are writing: the
         /// call itself, or the `batch` children that moved. Empty for every
         /// fragment that delegates nothing, which is nearly all of them.
@@ -6513,6 +6519,7 @@ mod tests {
             size: None,
             body: None,
             roster: None,
+            todos: None,
             delegations: Vec::new(),
             complete,
         }

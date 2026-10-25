@@ -46,7 +46,7 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
-use caudra_agent::types::WorkflowRunCard;
+use caudra_agent::types::{TodoItem, WorkflowRunCard};
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
@@ -2229,6 +2229,22 @@ impl MessagesPanel {
             return;
         }
         merge_batch_snapshot(msg, entries, String::new());
+        self.mark_card_dirty(tool_id);
+    }
+
+    /// The list a still-streaming `todo_write` has written so far, drawn the
+    /// way its result is. `ToolDone` replaces it with the list it stored.
+    pub fn tool_input_todos(&mut self, tool_id: &str, items: Option<Vec<TodoItem>>) {
+        let Some(items) = items else {
+            return;
+        };
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        if !msg.tool_preview_pending || !Self::is_running(msg) {
+            return;
+        }
+        msg.tool_output = Some(Arc::new(ToolOutput::TodoList(items)));
         self.mark_card_dirty(tool_id);
     }
 

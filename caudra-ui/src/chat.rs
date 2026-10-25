@@ -110,6 +110,10 @@ pub struct Chat {
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     todos: Vec<TodoItem>,
+    /// The list a still-streaming `todo_write` has written so far, under its
+    /// call id. It stands in for [`Self::todos`] until that call finishes,
+    /// and is dropped unread when it fails or its run ends without it.
+    live_todos: Option<(String, Vec<TodoItem>)>,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
@@ -160,6 +164,7 @@ impl Chat {
             stall_pending: false,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             todos: Vec::new(),
+            live_todos: None,
             finish: None,
             task_id: None,
             parent_tool_use_id: None,
@@ -274,9 +279,14 @@ impl Chat {
                 size,
                 body,
                 roster,
+                todos,
                 complete,
                 ..
             } => {
+                if let Some(items) = &todos {
+                    self.live_todos = Some((id.clone(), items.clone()));
+                }
+                self.messages_panel.tool_input_todos(&id, todos);
                 self.messages_panel.tool_input_roster(&id, roster);
                 self.messages_panel.tool_input_preview(&id, preview, size);
                 self.messages_panel.tool_input_body(&id, body);
@@ -299,6 +309,9 @@ impl Chat {
                 self.messages_panel.code_progress(&e.id, e.index, e.call);
             }
             AgentEvent::ToolDone(mut e) => {
+                if self.live_todos.as_ref().is_some_and(|(id, _)| *id == e.id) {
+                    self.live_todos = None;
+                }
                 if let ToolOutput::TodoList(items) = &e.output {
                     self.todos.clone_from(items);
                 }
@@ -411,10 +424,12 @@ impl Chat {
                 unreachable!("handled before handle_event")
             }
             AgentEvent::Done { .. } => {
+                self.live_todos = None;
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
             }
             AgentEvent::Error { message } => {
+                self.live_todos = None;
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
@@ -929,6 +944,7 @@ impl Chat {
 
     pub fn stream_reset(&mut self) {
         self.retry = None;
+        self.live_todos = None;
         self.messages_panel.stream_reset();
     }
 
@@ -937,14 +953,23 @@ impl Chat {
     }
 
     pub fn cancel_in_progress(&mut self) {
+        self.live_todos = None;
         self.messages_panel.cancel_in_progress();
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
+        self.live_todos = None;
         self.messages_panel.fail_in_progress_with_message(message);
     }
 
     pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
+        if self
+            .live_todos
+            .as_ref()
+            .is_some_and(|(id, _)| !excluded.contains(id))
+        {
+            self.live_todos = None;
+        }
         self.messages_panel
             .fail_in_progress_except(message, excluded);
     }
@@ -1080,6 +1105,7 @@ impl Chat {
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.live_todos = None;
         self.todos = msgs
             .iter()
             .rev()
@@ -1091,8 +1117,23 @@ impl Chat {
         self.messages_panel.load_messages(msgs);
     }
 
+    /// The list the todo panel shows: the one being written while a call
+    /// streams it, the last one a call stored otherwise.
     pub(crate) fn todos(&self) -> &[TodoItem] {
-        &self.todos
+        self.live_todos
+            .as_ref()
+            .map_or(&self.todos, |(_, items)| items)
+    }
+
+    /// Whether `event` can change what [`Self::todos`] returns.
+    pub(crate) fn touches_todos(event: &AgentEvent) -> bool {
+        matches!(
+            event,
+            AgentEvent::ToolInputDelta { todos: Some(_), .. }
+                | AgentEvent::ToolDone(_)
+                | AgentEvent::Done { .. }
+                | AgentEvent::Error { .. }
+        )
     }
 
     pub fn bind_sources(&mut self, messages: &[DisplayMessage]) {

@@ -43,12 +43,12 @@ const OBJECT_OPEN: char = '{';
 /// Tracks where a string ends without decoding it: only the quote that closes
 /// it and the backslash that hides one are structural.
 #[derive(Clone, Copy, Default)]
-struct StringScan {
+pub(super) struct StringScan {
     escaped: bool,
 }
 
 impl StringScan {
-    fn ends(&mut self, c: char) -> bool {
+    pub(super) fn ends(&mut self, c: char) -> bool {
         if self.escaped {
             self.escaped = false;
             return false;

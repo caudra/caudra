@@ -15,8 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use caudra_agent::AgentConfig;
-use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock, NamedMock};
+use caudra_agent::tools::{TODOWRITE_TOOL_NAME, ToolRegistry};
 use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
 use caudra_providers::provider::{BoxFuture, Provider};
@@ -110,6 +110,12 @@ enum Reply {
     StreamingTool {
         id: &'static str,
     },
+    /// Starts a `todo_write`, writes `fragments` of its list, and never
+    /// finishes it.
+    StreamingTodos {
+        id: &'static str,
+        fragments: &'static [&'static str],
+    },
     /// Never answers, as a model still thinking when the turn is cancelled.
     Hang,
 }
@@ -173,6 +179,20 @@ impl Provider for ScriptedModel {
                         id: id.into(),
                         delta: PARTIAL_INPUT.into(),
                     });
+                    smol::future::pending().await
+                }
+                Reply::StreamingTodos { id, fragments } => {
+                    let _ = event_tx.send(ProviderEvent::ToolUseStart {
+                        id: id.into(),
+                        name: TODOWRITE_TOOL_NAME.into(),
+                        source_ordinal: None,
+                    });
+                    for fragment in fragments {
+                        let _ = event_tx.send(ProviderEvent::ToolInputDelta {
+                            id: id.into(),
+                            delta: (*fragment).into(),
+                        });
+                    }
                     smol::future::pending().await
                 }
                 Reply::Hang => smol::future::pending().await,
@@ -479,6 +499,7 @@ mod updates {
     pub(super) const AVAILABLE_COMMANDS: &str = "available_commands_update";
     pub(super) const CONFIG_OPTION: &str = "config_option_update";
     pub(super) const CURRENT_MODE: &str = "current_mode_update";
+    pub(super) const PLAN: &str = "plan";
 }
 
 fn is_response(frame: &Value, id: i64) -> bool {
@@ -720,6 +741,48 @@ mod tests {
             script.reply(Reply::Text(REPLY));
             let next = client.prompt(&sid, PROMPT);
             assert_eq!(client.response(next)["result"]["stopReason"], END_TURN);
+        });
+    }
+
+    /// A todo list streams into the plan an item at a time, and a list the
+    /// call never stored is withdrawn when its turn ends.
+    #[test]
+    fn a_streaming_todo_list_updates_the_plan_and_a_cancel_withdraws_it() {
+        const TODO_ID: &str = "toolu_todos";
+        const FIRST: &str = "Read the parser";
+        const FRAGMENTS: &[&str] = &[
+            r#"{"todos": [{"content": "Read the parser", "status": "completed"}"#,
+            r#", {"content": "Write the rea"#,
+        ];
+        let entries = |frame: &Value| -> Vec<String> {
+            frame["params"]["update"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["content"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        isolated(|| {
+            let mut client = Client::start();
+            client.initialize();
+            let (cwd, script) = client.project(PROJECT);
+            let (sid, _) = client.open(&cwd);
+            script.reply(Reply::StreamingTodos {
+                id: TODO_ID,
+                fragments: FRAGMENTS,
+            });
+            let id = client.prompt(&sid, PROMPT);
+            let drafted = client
+                .until(|frame| update_kind(frame) == Some(updates::PLAN))
+                .pop()
+                .unwrap();
+            assert_eq!(entries(&drafted), [FIRST], "only closed items are sent");
+
+            client.cancel(&sid);
+            let frames = client.until_response(id);
+            let withdrawn = position(&frames, |frame| update_kind(frame) == Some(updates::PLAN));
+            assert!(entries(&frames[withdrawn]).is_empty(), "{frames:#?}");
+            assert_eq!(frames.last().unwrap()["result"]["stopReason"], CANCELLED);
         });
     }
 

@@ -4180,6 +4180,7 @@ mod tests {
             size: None,
             body: None,
             roster: None,
+            todos: None,
             delegations: Vec::new(),
             complete: false,
         }

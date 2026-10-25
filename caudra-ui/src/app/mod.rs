@@ -4892,6 +4892,7 @@ impl App {
             chat.cancel_in_progress();
             chat.clear_retry();
         }
+        self.sync_todo_panel();
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         if !preserve_queue {
@@ -4929,6 +4930,7 @@ impl App {
         self.chats[index].cancel_in_progress();
         self.chats[index].mark_finished(TaskOutcome::Killed, CANCELLED_TEXT);
         self.sync_subagents();
+        self.sync_todo_panel();
         self.subagent_answers.remove(&task_id);
         self.clear_auth_waiter(Some(&task_id));
         self.preserve_unconsumed_steers(&task_id);
@@ -5524,6 +5526,7 @@ impl App {
         if matches!(envelope.event, AgentEvent::StreamReset) {
             self.chats[chat_idx].stream_reset();
             self.discard_stream_delegations(chat_idx);
+            self.sync_todo_panel();
             return vec![];
         }
 
@@ -5822,7 +5825,7 @@ impl App {
         } else {
             None
         };
-        let todo_changed = matches!(&event, AgentEvent::ToolDone(e) if matches!(&e.output, ToolOutput::TodoList(_)));
+        let todo_changed = Chat::touches_todos(&event);
         if matches!(event, AgentEvent::ToolDone(_))
             && let Some(scale) = self
                 .route_model(self.state.applied_mode)
@@ -5875,6 +5878,7 @@ impl App {
                     chat.flush();
                     chat.cancel_in_progress();
                     chat.push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
+                    self.sync_todo_panel();
                 }
                 self.chats[chat_idx].show_user_prompt(display, images);
                 if let Some(pending) = self.pending_subagent_steers.get_mut(&task_id) {
@@ -6044,6 +6048,7 @@ impl App {
     ) {
         self.chats[chat_idx].stream_reset();
         self.discard_stream_delegations(chat_idx);
+        self.sync_todo_panel();
         let Some(deadline) = Instant::now().checked_add(Duration::from_millis(delay_ms)) else {
             self.chats[chat_idx].clear_retry();
             tracing::warn!(
@@ -7735,6 +7740,7 @@ impl App {
             }
             chat.fail_in_progress_with_message(message.into());
         }
+        self.sync_todo_panel();
     }
 
     /// Marks unfinished subagent chats as ended and drops them from

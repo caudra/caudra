@@ -16,6 +16,7 @@ mod mcp_servers;
 pub mod methods;
 mod outbound;
 pub mod permissions;
+mod plan_drafts;
 mod restore;
 mod server;
 mod session;

@@ -18,10 +18,11 @@ use super::tool_body::BodyStream;
 use super::tool_delegation::{Delegated, DelegationStream};
 use super::tool_preview;
 use super::tool_roster::RosterStream;
+use super::tool_todos::TodoStream;
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
-use crate::tools::native::batch;
-use crate::types::{BatchToolEntry, Delegation};
+use crate::tools::native::{batch, todo_write};
+use crate::types::{BatchToolEntry, Delegation, TodoItem};
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -66,6 +67,7 @@ struct Changed {
     size: Option<String>,
     body: Option<String>,
     roster: Option<Vec<BatchToolEntry>>,
+    todos: Option<Vec<TodoItem>>,
     /// One per delegating call the fragment moved: the call itself, or the
     /// `batch` children writing their briefs.
     delegations: Vec<Delegation>,
@@ -92,6 +94,8 @@ struct PendingInput {
     size: Option<String>,
     /// Present only for `batch`, whose whole argument is a list of other calls.
     roster: Option<RosterStream>,
+    /// Present only for `todo_write`, whose whole argument is the list.
+    todos: Option<TodoStream>,
     /// Present only for `task`, whose brief opens a chat before it runs.
     delegation: Option<DelegationStream>,
     /// The call's own id, so a delegation can name the chat its subagent will
@@ -105,6 +109,7 @@ impl PendingInput {
             execution: InputFrame::default(),
             body: BodyStream::new(&name),
             roster: RosterStream::new(&name, dispatching),
+            todos: TodoStream::new(&name),
             delegation: DelegationStream::new(&name),
             name,
             id,
@@ -118,6 +123,18 @@ impl PendingInput {
     /// The headline settles long before a file body finishes arriving, so the
     /// body reader keeps taking fragments the preview has stopped caring about.
     fn absorb(&mut self, delta: &str) -> Changed {
+        // A todo list is its own headline, counted the way the started call
+        // counts it, so the header does not move when the call runs.
+        if let Some(stream) = self.todos.as_mut() {
+            let Some(items) = stream.absorb(delta) else {
+                return Changed::default();
+            };
+            return Changed {
+                preview: self.published(todo_write::header(items.len())),
+                todos: Some(items),
+                ..Changed::default()
+            };
+        }
         // A batch has no headline of its own to scan for: its children are the
         // headline, and the count they add up to is what the row says.
         if self.roster.is_some() {
@@ -178,6 +195,7 @@ impl PendingInput {
             size,
             body,
             roster: None,
+            todos: None,
             delegations,
             ready: Vec::new(),
         }
@@ -381,6 +399,7 @@ async fn forward_provider_events(
                                 size: changed.size,
                                 body: changed.body,
                                 roster: changed.roster,
+                                todos: changed.todos,
                                 delegations: changed.delegations,
                                 complete: true,
                             })
@@ -448,6 +467,7 @@ async fn forward_provider_events(
                     size: changed.size,
                     body: changed.body,
                     roster: changed.roster,
+                    todos: changed.todos,
                     delegations: changed.delegations,
                     complete: top_ready.is_some(),
                 }
@@ -1030,6 +1050,7 @@ fn error_description(error: &AgentError) -> String {
 mod tests {
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
     use crate::tools::{ToolLive, ToolSource};
+    use crate::types::TodoStatus;
     use caudra_providers::Role;
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{InvalidToolInput, ModelInfo, invalid_tool_input};
@@ -2075,6 +2096,45 @@ mod tests {
         assert_eq!(
             published,
             [batch::roster_header(1), batch::roster_header(2)]
+        );
+    }
+
+    /// A todo list streams as the list itself, under the header the started
+    /// call keeps, so neither the card nor its header moves when it runs.
+    #[test]
+    fn a_todo_write_publishes_its_list_under_the_header_it_will_keep() {
+        const TODO_WRITE: &str = "todo_write";
+        let fragments = [
+            r#"{"todos": [{"content": "Read", "status": "completed"}"#,
+            r#", {"content": "Write"#,
+            r#"", "status": "in_progress"}]}"#,
+        ];
+        let lists: Vec<Vec<(String, TodoStatus)>> = deltas(TODO_WRITE, &fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { todos, .. } => todos,
+                _ => None,
+            })
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| (item.content, item.status))
+                    .collect()
+            })
+            .collect();
+        let read = ("Read".to_owned(), TodoStatus::Completed);
+        let write = |status| ("Write".to_owned(), status);
+        assert_eq!(
+            lists,
+            [
+                vec![read.clone()],
+                vec![read.clone(), write(TodoStatus::Pending)],
+                vec![read, write(TodoStatus::InProgress)],
+            ]
+        );
+        assert_eq!(
+            previews(TODO_WRITE, &fragments),
+            [todo_write::header(1), todo_write::header(2)]
         );
     }
 

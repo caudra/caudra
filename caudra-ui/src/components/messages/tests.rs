@@ -27,6 +27,7 @@ use caudra_agent::tools::{
     QUESTION_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
+use caudra_agent::types::{TodoPriority, TodoStatus};
 use caudra_agent::{
     ActivityChild, DecisionHelper, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput,
     McpServerKind, MemoryNote, MemoryOrigin, MemoryOutput, NO_FILES_FOUND, SearchCap,
@@ -2978,6 +2979,41 @@ fn a_retained_preview_is_cleared_when_execution_ends(ending: &str) {
     let finished = buffer_text(&render(&mut panel, 80, 24));
     assert!(!finished.contains(BODY), "{finished}");
     assert!(panel.messages[0].live_body.is_none());
+}
+
+/// A todo list draws while it is written, keeps its place when the call
+/// starts, and gives way to the list the call stored.
+#[test]
+fn a_streaming_todo_list_draws_until_the_stored_list_replaces_it() {
+    const DRAFTED: &str = "Draft the reader";
+    const STORED: &str = "Ship the reader";
+    let items = |content: &str| {
+        vec![TodoItem {
+            content: content.into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::default(),
+        }]
+    };
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), TODOWRITE_TOOL_NAME);
+    panel.tool_input_todos(TOOL_ID, Some(items(DRAFTED)));
+    let streaming = buffer_text(&render(&mut panel, 80, 24));
+    assert!(streaming.contains(DRAFTED), "{streaming}");
+    let heights = panel.segment_heights();
+
+    panel.tool_start(start(TOOL_ID, TODOWRITE_TOOL_NAME));
+    let started = buffer_text(&render(&mut panel, 80, 24));
+    assert!(started.contains(DRAFTED), "{started}");
+    assert_eq!(panel.segment_heights(), heights);
+
+    panel.tool_done(ToolDoneEvent {
+        tool: TODOWRITE_TOOL_NAME.into(),
+        output: ToolOutput::TodoList(items(STORED)),
+        ..done(TOOL_ID)
+    });
+    let finished = buffer_text(&render(&mut panel, 80, 24));
+    assert!(finished.contains(STORED), "{finished}");
+    assert!(!finished.contains(DRAFTED), "{finished}");
 }
 
 /// The streamed body is a stand-in for output the call has not produced yet,

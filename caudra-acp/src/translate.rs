@@ -11,7 +11,8 @@ use agent_client_protocol_schema::v1::{
 };
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::types::{
-    TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 use caudra_agent::{DoneReason, History};
 use caudra_providers::{
@@ -482,6 +483,11 @@ pub fn plan_update(output: &ToolOutput) -> Option<SessionUpdate> {
     let ToolOutput::TodoList(items) = output else {
         return None;
     };
+    Some(plan(items))
+}
+
+/// The plan `items` spell, by the rules of [`plan_update`].
+pub(crate) fn plan(items: &[TodoItem]) -> SessionUpdate {
     let entries = items
         .iter()
         .filter_map(|item| {
@@ -499,7 +505,7 @@ pub fn plan_update(output: &ToolOutput) -> Option<SessionUpdate> {
             Some(PlanEntry::new(item.content.clone(), priority, status))
         })
         .collect();
-    Some(SessionUpdate::Plan(Plan::new(entries)))
+    SessionUpdate::Plan(Plan::new(entries))
 }
 
 /// Per ACP "Session Usage Updates": the current context gauge plus the

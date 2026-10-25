@@ -4861,6 +4861,7 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
         size: None,
         body: None,
         roster: None,
+        todos: None,
         delegations,
         complete: false,
     })
@@ -9576,28 +9577,47 @@ fn publish_sticky_todos(app: &mut App, task: Option<(&str, &str)>, items: Vec<To
     );
     for event in [
         tool_start(&id, TODOWRITE_TOOL_NAME),
-        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-            id,
-            tool: TODOWRITE_TOOL_NAME.into(),
-            output: ToolOutput::TodoList(items),
-            is_error: false,
-            annotation: None,
-            written_path: None,
-            written_paths: Vec::new(),
-            remote_written_paths: false,
-            output_ref: None,
-            output_limits: None,
-            model_suffix: None,
-            model_output: None,
-            model_output_from_ref: false,
-            documents: Vec::new(),
-            accounting: ToolAccounting::default(),
-        })),
+        todo_done(&id, ToolOutput::TodoList(items), false),
     ] {
         app.update(match task {
             Some((id, name)) => subagent_msg(event, id, Some(name)),
             None => agent_msg(event),
         });
+    }
+}
+
+fn todo_done(id: &str, output: ToolOutput, is_error: bool) -> AgentEvent {
+    AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: id.into(),
+        tool: TODOWRITE_TOOL_NAME.into(),
+        output,
+        is_error,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        remote_written_paths: false,
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+        documents: Vec::new(),
+        accounting: ToolAccounting::default(),
+    }))
+}
+
+fn drafted_todos(id: &str, items: Vec<TodoItem>) -> AgentEvent {
+    AgentEvent::ToolInputDelta {
+        id: id.into(),
+        name: TODOWRITE_TOOL_NAME.into(),
+        delta: String::new(),
+        preview: None,
+        size: None,
+        body: None,
+        roster: None,
+        todos: Some(items),
+        delegations: Vec::new(),
+        complete: false,
     }
 }
 
@@ -9712,6 +9732,70 @@ fn sticky_todos_live_updates_are_local_to_main_and_each_task() {
     app.focus_task(TODO_SECOND_ID).unwrap();
     assert_sticky_todo_source(&mut app, Some((TODO_SECOND_ID, TODO_SECOND_NAME)), &second);
     app.focus_task(MAIN_TASK_ID).unwrap();
+    assert_sticky_todo_source(&mut app, None, &main);
+}
+
+const DRAFTED_TODO_CALL: &str = "sticky-todo-drafted";
+const DRAFTED_TODO_TEXT: &str = "Stream the list as it is written";
+
+/// The panel shows the list a call is still writing, and the list it stored
+/// once it finishes.
+#[test]
+fn sticky_todos_follow_a_streaming_call_until_it_stores_its_list() {
+    let mut app = sticky_todo_app();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    let draft = sticky_todo(DRAFTED_TODO_TEXT, TodoStatus::Pending);
+    app.update(agent_msg(AgentEvent::ToolPending {
+        id: DRAFTED_TODO_CALL.into(),
+        name: TODOWRITE_TOOL_NAME.into(),
+    }));
+    app.update(agent_msg(drafted_todos(DRAFTED_TODO_CALL, draft.clone())));
+    assert_sticky_todo_source(&mut app, None, &draft);
+
+    let stored = sticky_todo(DRAFTED_TODO_TEXT, TodoStatus::InProgress);
+    app.update(agent_msg(tool_start(
+        DRAFTED_TODO_CALL,
+        TODOWRITE_TOOL_NAME,
+    )));
+    app.update(agent_msg(todo_done(
+        DRAFTED_TODO_CALL,
+        ToolOutput::TodoList(stored.clone()),
+        false,
+    )));
+    assert_sticky_todo_source(&mut app, None, &stored);
+}
+
+/// A list that never got stored was never the plan, so the panel goes back
+/// to the last one that was.
+#[test_case(todo_done(DRAFTED_TODO_CALL, ToolOutput::Plain("invalid todos".into()), true) ; "the_call_failed")]
+#[test_case(AgentEvent::StreamReset ; "the_stream_reset")]
+#[test_case(done() ; "the_run_ended_without_it")]
+fn sticky_todos_drop_a_draft_that_was_never_stored(end: AgentEvent) {
+    let mut app = sticky_todo_app();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed);
+    app.update(agent_msg(AgentEvent::ToolPending {
+        id: DRAFTED_TODO_CALL.into(),
+        name: TODOWRITE_TOOL_NAME.into(),
+    }));
+    app.update(agent_msg(drafted_todos(
+        DRAFTED_TODO_CALL,
+        sticky_todo(DRAFTED_TODO_TEXT, TodoStatus::Pending),
+    )));
+    app.update(agent_msg(end));
+    assert_sticky_todo_source(&mut app, None, &main);
+}
+
+#[test]
+fn cancelling_drops_a_streaming_todo_draft() {
+    let mut app = sticky_todo_app();
+    press_chord(&mut app, chord::PLAN_TOGGLE);
+    let main = sticky_todo(TODO_MAIN_TEXT, TodoStatus::Completed);
+    app.update(agent_msg(drafted_todos(
+        DRAFTED_TODO_CALL,
+        sticky_todo(DRAFTED_TODO_TEXT, TodoStatus::Pending),
+    )));
+    app.handle_cancel();
     assert_sticky_todo_source(&mut app, None, &main);
 }
 
@@ -14200,7 +14284,13 @@ fn decision_spend_counts_for_the_session_without_a_second_ledger_row() {
         Some(GOAL_COST)
     );
     drain_writer(app, writer);
-    assert!(UsageLedger::open(&dir).unwrap().buckets(None).unwrap().is_empty());
+    assert!(
+        UsageLedger::open(&dir)
+            .unwrap()
+            .buckets(None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 const GAP_CALL: &str = "unrecorded-call";
