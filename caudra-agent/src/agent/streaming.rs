@@ -22,7 +22,7 @@ use super::tool_todos::TodoStream;
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
 use crate::tools::native::{batch, todo_write};
-use crate::types::{BatchToolEntry, Delegation, TodoItem};
+use crate::types::{BatchToolEntry, Delegation, PatchedFile, TodoItem};
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -68,6 +68,7 @@ struct Changed {
     body: Option<String>,
     roster: Option<Vec<BatchToolEntry>>,
     todos: Option<Vec<TodoItem>>,
+    patch: Option<Vec<PatchedFile>>,
     /// One per delegating call the fragment moved: the call itself, or the
     /// `batch` children writing their briefs.
     delegations: Vec<Delegation>,
@@ -186,6 +187,7 @@ impl PendingInput {
         // the envelope its body reader decodes, everything else by the prefix
         // of its arguments.
         let named = stream.header();
+        let patch = stream.files();
         let size = label.filter(|label| self.size.as_ref() != Some(label));
         if let Some(size) = &size {
             self.size = Some(size.clone());
@@ -194,10 +196,9 @@ impl PendingInput {
             preview: named.and_then(|header| self.published(header)).or(preview),
             size,
             body,
-            roster: None,
-            todos: None,
+            patch,
             delegations,
-            ready: Vec::new(),
+            ..Changed::default()
         }
     }
 
@@ -400,6 +401,7 @@ async fn forward_provider_events(
                                 body: changed.body,
                                 roster: changed.roster,
                                 todos: changed.todos,
+                                patch: changed.patch,
                                 delegations: changed.delegations,
                                 complete: true,
                             })
@@ -468,6 +470,7 @@ async fn forward_provider_events(
                     body: changed.body,
                     roster: changed.roster,
                     todos: changed.todos,
+                    patch: changed.patch,
                     delegations: changed.delegations,
                     complete: top_ready.is_some(),
                 }
@@ -2287,6 +2290,26 @@ mod tests {
             r#"*** Delete File: b.rs\n*** End Patch"}"#,
         ];
         assert_eq!(previews(PATCH, &fragments), ["a.rs", "a.rs, b.rs"]);
+    }
+
+    /// A section is a whole diff once the next one begins, so the card can
+    /// draw it while the rest of the patch is still being written.
+    #[test]
+    fn a_patch_publishes_each_file_once_it_is_finished() {
+        let fragments = [
+            r#"{"patchText": "*** Begin Patch\n*** Update File: a.rs\n"#,
+            r"-one\n+two\n*** Add File: b.rs\n+new\n",
+            r#"*** End Patch"}"#,
+        ];
+        let published: Vec<Vec<String>> = deltas(PATCH, &fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { patch, .. } => patch,
+                _ => None,
+            })
+            .map(|files| files.into_iter().map(|file| file.path).collect())
+            .collect();
+        assert_eq!(published, [vec!["a.rs"], vec!["a.rs", "b.rs"]]);
     }
 
     #[test]

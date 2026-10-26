@@ -280,6 +280,7 @@ impl Chat {
                 body,
                 roster,
                 todos,
+                patch,
                 complete,
                 ..
             } => {
@@ -287,6 +288,7 @@ impl Chat {
                     self.live_todos = Some((id.clone(), items.clone()));
                 }
                 self.messages_panel.tool_input_todos(&id, todos);
+                self.messages_panel.tool_input_patch(&id, patch);
                 self.messages_panel.tool_input_roster(&id, roster);
                 self.messages_panel.tool_input_preview(&id, preview, size);
                 self.messages_panel.tool_input_body(&id, body);

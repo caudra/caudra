@@ -3060,6 +3060,84 @@ fn a_change_that_is_only_a_diff_streams_its_size_and_no_body(tool: &'static str)
     assert!(buffer_text(&render(&mut panel, 80, 24)).contains(STREAMED_SIZE));
 }
 
+const STREAMED_PATCH_LINE: &str = "streamed_change";
+const APPLIED_PATCH_LINE: &str = "applied_change";
+const STREAMED_PATCH_MSG: &str =
+    "a finished file of a streaming patch is drawn before the call runs";
+const APPLIED_PATCH_MSG: &str = "the applied diff replaces the one read from the patch text";
+
+fn patched_file(patch: &str) -> PatchedFile {
+    PatchedFile {
+        path: "a.rs".into(),
+        patch: patch.into(),
+        additions: 1,
+        deletions: 1,
+        truncated: false,
+    }
+}
+
+fn streaming_patch(panel: &mut MessagesPanel) {
+    panel.tool_pending(TOOL_ID.into(), FILE_APPLY_PATCH_TOOL_NAME);
+    panel.tool_input_patch(
+        TOOL_ID,
+        Some(vec![patched_file(&format!(
+            "@@\n-old\n+{STREAMED_PATCH_LINE}\n"
+        ))]),
+    );
+}
+
+/// A section of a patch is a whole diff once the next one begins, so the card
+/// draws it while the rest is written, keeps it through the wait for approval,
+/// and swaps it for what was applied.
+#[test]
+fn a_streamed_patch_draws_its_finished_files_until_the_applied_diff_replaces_them() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    streaming_patch(&mut panel);
+    let streaming = buffer_text(&render(&mut panel, 80, 24));
+    assert!(
+        streaming.contains(STREAMED_PATCH_LINE),
+        "{STREAMED_PATCH_MSG}: {streaming}"
+    );
+
+    panel.tool_start(start(TOOL_ID, FILE_APPLY_PATCH_TOOL_NAME));
+    let started = buffer_text(&render(&mut panel, 80, 24));
+    assert!(
+        started.contains(STREAMED_PATCH_LINE),
+        "{STREAMED_PATCH_MSG}: {started}"
+    );
+
+    panel.tool_done(ToolDoneEvent {
+        tool: FILE_APPLY_PATCH_TOOL_NAME.into(),
+        output: ToolOutput::Patch {
+            files: vec![patched_file(&format!(
+                "@@ -1,1 +1,1 @@\n-old\n+{APPLIED_PATCH_LINE}\n"
+            ))],
+        },
+        ..done(TOOL_ID)
+    });
+    let finished = buffer_text(&render(&mut panel, 80, 24));
+    assert!(
+        finished.contains(APPLIED_PATCH_LINE),
+        "{APPLIED_PATCH_MSG}: {finished}"
+    );
+    assert!(
+        !finished.contains(STREAMED_PATCH_LINE),
+        "{APPLIED_PATCH_MSG}: {finished}"
+    );
+}
+
+/// Nothing a cancelled patch streamed was applied, so none of it may stay on
+/// the card looking like a change that landed.
+#[test]
+fn a_cancelled_patch_drops_the_diff_it_streamed() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    streaming_patch(&mut panel);
+    panel.cancel_in_progress();
+    assert!(panel.messages[0].tool_output.is_none());
+    let shown = buffer_text(&render(&mut panel, 80, 24));
+    assert!(!shown.contains(STREAMED_PATCH_LINE), "{shown}");
+}
+
 #[test]
 fn a_body_for_an_unknown_call_is_ignored() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

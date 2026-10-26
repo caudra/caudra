@@ -8,9 +8,10 @@
 //!
 //! Only a whole file is worth drawing half-arrived. A replacement and a patch
 //! are legible as diffs and as nothing else, so their body is counted and
-//! dropped rather than published. A patch keeps one thing on its way past: the
-//! `*** Verb: path` lines of its envelope, which name the files it touches
-//! long before it has finished describing what it does to them.
+//! dropped rather than published. A patch keeps two things on its way past:
+//! the `*** Verb: path` lines of its envelope, which name the files it touches
+//! long before it has finished describing what it does to them, and each
+//! file's section once the next one begins, which is a whole diff by then.
 //!
 //! The decode is resumable rather than a scan per fragment, which
 //! [`super::tool_preview`] can afford only because it gives up after a few
@@ -19,8 +20,10 @@
 //! would have anyway, which is that a `\` escape or a `\uXXXX` sequence can
 //! straddle two fragments.
 
+use super::tool_patch::PatchStream;
 use super::tool_preview::{candidates, same_key};
 use crate::patch;
+use crate::types::PatchedFile;
 
 /// Stops carrying a runaway body once no reader could follow it. Matches the
 /// cap on live shell output. The line count keeps going, so a huge write still
@@ -42,7 +45,7 @@ enum Body {
     /// Counted and dropped: a diff is legible as a diff and as nothing else.
     Counted,
     /// Counted, and read for the envelope lines that name the files it
-    /// touches.
+    /// touches and for the sections it has finished writing.
     Named,
 }
 
@@ -256,6 +259,7 @@ pub(super) struct BodyStream {
     /// Decoded bytes handed out so far, against [`LIVE_BODY_MAX_BYTES`].
     emitted: usize,
     envelope: Envelope,
+    patch: PatchStream,
 }
 
 impl BodyStream {
@@ -271,6 +275,7 @@ impl BodyStream {
             newlines: 0,
             emitted: 0,
             envelope: Envelope::default(),
+            patch: PatchStream::default(),
         })
     }
 
@@ -297,6 +302,12 @@ impl BodyStream {
     /// call. Always `None` for a body nothing reads an envelope out of.
     pub(super) fn header(&mut self) -> Option<String> {
         self.envelope.header()
+    }
+
+    /// Every file a patch has finished describing, when one more finished
+    /// since the last call. Always `None` for any other body.
+    pub(super) fn files(&mut self) -> Option<Vec<PatchedFile>> {
+        self.patch.files()
     }
 
     fn push(&mut self, c: char, decoded: &mut String) {
@@ -347,13 +358,21 @@ impl BodyStream {
                             self.emitted += c.len_utf8();
                             decoded.push(c);
                         }
-                        Body::Named => self.envelope.push(c),
+                        Body::Named => {
+                            self.envelope.push(c);
+                            self.patch.push(c);
+                        }
                         Body::Drawn | Body::Counted => {}
                     }
                     State::Body
                 }
                 Piece::Pending => State::Body,
-                Piece::End => State::Skip(0),
+                Piece::End => {
+                    if self.body == Body::Named {
+                        self.patch.finish();
+                    }
+                    State::Skip(0)
+                }
             },
             State::SkipString(depth) => match self.string.push(c) {
                 Piece::End => State::Skip(depth),
@@ -667,6 +686,37 @@ mod tests {
     fn an_envelope_line_split_across_fragments_is_still_named() {
         let fragments = [r#"{"patchText": "*** Upda"#, r"te File: a.rs\n"];
         assert_eq!(headers(PATCH, &fragments), ["a.rs"]);
+    }
+
+    /// A newline escape split between fragments still ends the line, and the
+    /// closing quote ends the last section the envelope never closed.
+    #[test]
+    fn a_patch_publishes_its_files_across_split_escapes() {
+        let mut stream = BodyStream::new(PATCH).unwrap();
+        let mut published = Vec::new();
+        for fragment in [
+            r#"{"patchText": "*** Update File: a.rs\n-one\"#,
+            r"n+two\n*** Upd",
+            r"ate File: b.rs\n+three",
+            r#""}"#,
+        ] {
+            stream.absorb(fragment);
+            published.extend(stream.files());
+        }
+        let paths: Vec<Vec<&str>> = published
+            .iter()
+            .map(|files| files.iter().map(|file| file.path.as_str()).collect())
+            .collect();
+        assert_eq!(paths, [vec!["a.rs"], vec!["a.rs", "b.rs"]]);
+        assert_eq!(published[1][0].patch, "@@\n-one\n+two\n");
+    }
+
+    #[test_case(WRITE, r#"{"content": "*** Update File: a.rs\n+x\n*** End Patch"}"# ; "a_write")]
+    #[test_case(EDIT, r#"{"newString": "*** Update File: a.rs\n+x\n*** End Patch"}"# ; "an_edit")]
+    fn only_a_patch_publishes_files(tool: &str, json: &str) {
+        let mut stream = BodyStream::new(tool).unwrap();
+        stream.absorb(json);
+        assert!(stream.files().is_none());
     }
 
     /// A patch body can quote the envelope it lives in, so the line has to

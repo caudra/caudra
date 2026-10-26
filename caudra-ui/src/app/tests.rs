@@ -4972,6 +4972,7 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
         body: None,
         roster: None,
         todos: None,
+        patch: None,
         delegations,
         complete: false,
     })
@@ -9951,6 +9952,7 @@ fn drafted_todos(id: &str, items: Vec<TodoItem>) -> AgentEvent {
         body: None,
         roster: None,
         todos: Some(items),
+        patch: None,
         delegations: Vec::new(),
         complete: false,
     }

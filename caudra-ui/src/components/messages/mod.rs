@@ -46,7 +46,7 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
-use caudra_agent::types::{TodoItem, WorkflowRunCard};
+use caudra_agent::types::{PatchedFile, TodoItem, WorkflowRunCard};
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
@@ -2232,6 +2232,23 @@ impl MessagesPanel {
         self.mark_card_dirty(tool_id);
     }
 
+    /// The files a still-streaming patch has finished describing, drawn the
+    /// way its result is but without line numbers. `ToolDone` replaces them
+    /// with the diff the call applied.
+    pub fn tool_input_patch(&mut self, tool_id: &str, files: Option<Vec<PatchedFile>>) {
+        let Some(files) = files else {
+            return;
+        };
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        if !msg.tool_preview_pending || !Self::is_running(msg) {
+            return;
+        }
+        msg.tool_output = Some(Arc::new(ToolOutput::Patch { files }));
+        self.mark_card_dirty(tool_id);
+    }
+
     /// The file a still-streaming write is spelling out. `ToolStart` drops it
     /// for the call's real output, so it only ever fills the wait.
     ///
@@ -3301,6 +3318,11 @@ impl MessagesPanel {
                 msg.tool_preview_pending = false;
                 msg.tool_stage = None;
                 msg.live_body = None;
+                // A running patch has no output but the diff it streamed,
+                // which was never applied.
+                if matches!(msg.tool_output.as_deref(), Some(ToolOutput::Patch { .. })) {
+                    msg.tool_output = None;
+                }
                 if let Some(output) = &mut msg.tool_output
                     && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
                 {

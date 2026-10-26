@@ -3110,6 +3110,12 @@ pub enum AgentEvent {
         /// `ToolDone` replaces it with the list the call stored.
         #[serde(skip_serializing_if = "Option::is_none")]
         todos: Option<Vec<TodoItem>>,
+        /// Every file a `file_apply_patch` has finished describing, read from
+        /// its own text and drawn without line numbers, since nothing has
+        /// read a file yet. `Some` only when one more file finished;
+        /// `ToolDone` replaces it with the diff the call applied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch: Option<Vec<PatchedFile>>,
         /// The briefs the delegating calls in this fragment are writing: the
         /// call itself, or the `batch` children that moved. Empty for every
         /// fragment that delegates nothing, which is nearly all of them.
@@ -6530,6 +6536,7 @@ mod tests {
             body: None,
             roster: None,
             todos: None,
+            patch: None,
             delegations: Vec::new(),
             complete,
         }

@@ -95,6 +95,9 @@ const GREP_SUMMARY_INDENT: &str = "  ";
 /// is rebuilt on every resize and theme change, so that cost is paid again
 /// each time.
 const MAX_REDIFF_LINES: usize = 4096;
+/// Opens a hunk, numbered or not: a patch streamed before it ran marks its
+/// chunks without saying where in the file they land.
+const HUNK_MARKER: &str = "@@";
 /// The columns a diff body needs before a second gutter of line numbers is
 /// worth what it takes away from the code.
 const MIN_CODE_COLUMNS: usize = 60;
@@ -549,6 +552,12 @@ struct DiffGutter {
 }
 
 impl DiffGutter {
+    /// The marks alone, for a patch none of whose hunks says where it sits.
+    const UNNUMBERED: Self = Self {
+        before_width: 0,
+        after_width: None,
+    };
+
     fn new(before_max: usize, after_max: usize, width: u16) -> Self {
         let (before, after) = (nr_width(before_max), nr_width(after_max));
         let two_columns = before + after + 4;
@@ -583,6 +592,7 @@ impl DiffGutter {
                 number(before, self.before_width),
                 number(after, after_width)
             ),
+            None if self.before_width == 0 => format!("{mark} "),
             None => format!("{} {mark} ", number(before.or(after), self.before_width)),
         };
         Span::styled(text, base.patch(theme::current().diff_line_nr))
@@ -634,7 +644,7 @@ fn render_diff(
             lines.push(render_hunk_line(
                 dl,
                 walkers.as_mut(),
-                &mut cursor,
+                Some(&mut cursor),
                 gutter,
                 width,
             ));
@@ -645,20 +655,23 @@ fn render_diff(
 }
 
 /// Unchanged and re-indented lines step both walkers but take spans from
-/// `after`. Removed and added lines only step their own side.
+/// `after`. Removed and added lines only step their own side. A hunk with no
+/// `cursor` does not know where it sits in its file, and numbers nothing.
 fn render_hunk_line(
     dl: &DiffLine,
     walkers: Option<&mut (FileWalker<'_>, FileWalker<'_>)>,
-    cursor: &mut (usize, usize),
+    cursor: Option<&mut (usize, usize)>,
     gutter: DiffGutter,
     width: u16,
 ) -> Line<'static> {
     let theme = theme::current();
-    let (before_nr, after_nr) = *cursor;
     let (on_before, on_after) = dl.sides();
-    cursor.0 += usize::from(on_before);
-    cursor.1 += usize::from(on_after);
-    let numbers = (on_before.then_some(before_nr), on_after.then_some(after_nr));
+    let numbers = cursor.map_or((None, None), |cursor| {
+        let (before_nr, after_nr) = *cursor;
+        cursor.0 += usize::from(on_before);
+        cursor.1 += usize::from(on_after);
+        (on_before.then_some(before_nr), on_after.then_some(after_nr))
+    });
 
     let (mark, base, spans) = match dl {
         DiffLine::Unchanged(text) => {
@@ -778,18 +791,18 @@ fn side(raw: &str) -> Side<'_> {
     }
 }
 
-/// One hunk of a unified patch: where its numbering restarts, and the body
-/// lines it describes.
+/// One hunk of a unified patch: where its numbering restarts on each side,
+/// `None` for a hunk that does not say, and the body lines it describes.
 struct PatchHunk<'a> {
-    before_start: usize,
-    after_start: usize,
+    start: Option<(usize, usize)>,
     body: Vec<&'a str>,
 }
 
 impl PatchHunk<'_> {
     /// The last line number the hunk prints on each side, which is what the
-    /// gutter is sized against.
-    fn ends(&self) -> (usize, usize) {
+    /// gutter is sized against. `None` for a hunk that numbers nothing.
+    fn ends(&self) -> Option<(usize, usize)> {
+        let (before_start, after_start) = self.start?;
         let (before, after) = self
             .body
             .iter()
@@ -799,10 +812,10 @@ impl PatchHunk<'_> {
                 Side::Both(_) => (before + 1, after + 1),
                 Side::Neither => (before, after),
             });
-        (
-            self.before_start + before.saturating_sub(1),
-            self.after_start + after.saturating_sub(1),
-        )
+        Some((
+            before_start + before.saturating_sub(1),
+            after_start + after.saturating_sub(1),
+        ))
     }
 
     /// The two file states the hunk describes, for the diff the card computes
@@ -849,28 +862,27 @@ impl PatchHunk<'_> {
 }
 
 /// The `---`/`+++` preamble precedes the first header, so a line that starts
-/// the same way inside a hunk is content.
+/// the same way inside a hunk is content. A body line always leads with its
+/// side's mark, so a line that leads with the hunk marker opens one.
 fn patch_hunks(patch: &str) -> Vec<PatchHunk<'_>> {
     let mut hunks: Vec<PatchHunk> = Vec::new();
     for raw in patch.lines() {
-        match hunk_start(raw) {
-            Some((before_start, after_start)) => hunks.push(PatchHunk {
-                before_start,
-                after_start,
+        if raw.starts_with(HUNK_MARKER) {
+            hunks.push(PatchHunk {
+                start: hunk_start(raw),
                 body: Vec::new(),
-            }),
-            None => {
-                if let Some(hunk) = hunks.last_mut() {
-                    hunk.body.push(raw);
-                }
-            }
+            });
+        } else if let Some(hunk) = hunks.last_mut() {
+            hunk.body.push(raw);
         }
     }
     hunks
 }
 
 /// A unified diff drawn the way an edit's diff is drawn: real line numbers
-/// down the left, removed and added lines in the diff colours.
+/// down the left, removed and added lines in the diff colours. A patch none
+/// of whose hunks says where it lands, which is one streamed before it ran,
+/// is drawn with the marks alone.
 ///
 /// The wire's grouping is not trusted. A patch reports what was applied, and an
 /// applied chunk arrives as the whole region it matched followed by the whole
@@ -887,13 +899,15 @@ fn render_unified_patch(
     width: u16,
 ) -> Vec<Line<'static>> {
     let hunks = patch_hunks(patch);
-    let (before_max, after_max) = hunks.iter().map(PatchHunk::ends).fold(
-        (1, 1),
-        |(before, after), (hunk_before, hunk_after)| {
+    let gutter = hunks
+        .iter()
+        .filter_map(PatchHunk::ends)
+        .reduce(|(before, after), (hunk_before, hunk_after)| {
             (before.max(hunk_before), after.max(hunk_after))
-        },
-    );
-    let gutter = DiffGutter::new(before_max, after_max, width);
+        })
+        .map_or(DiffGutter::UNNUMBERED, |(before_max, after_max)| {
+            DiffGutter::new(before_max.max(1), after_max.max(1), width)
+        });
     let mut lines = Vec::new();
     for hunk in &hunks {
         // The wire order and the re-diffed order walk the same body, drop the
@@ -920,15 +934,17 @@ fn render_unified_patch(
                 before.skip_to(group.before_start);
                 after.skip_to(group.after_start);
             }
-            let mut cursor = (
-                hunk.before_start + group.before_start - 1,
-                hunk.after_start + group.after_start - 1,
-            );
+            let mut cursor = hunk.start.map(|(before, after)| {
+                (
+                    before + group.before_start - 1,
+                    after + group.after_start - 1,
+                )
+            });
             for dl in &group.lines {
                 lines.push(render_hunk_line(
                     dl,
                     walkers.as_mut(),
-                    &mut cursor,
+                    cursor.as_mut(),
                     gutter,
                     width,
                 ));
@@ -5275,6 +5291,19 @@ mod tests {
     #[test]
     fn a_block_shaped_hunk_is_diffed_again() {
         assert_eq!(patch_rows(BLOCK_PATCH), INTERLEAVED, "{INTERLEAVED_MSG}");
+    }
+
+    /// A patch streamed before it ran has chunks that never say where they
+    /// land, and a made-up number would be worse than none.
+    #[test]
+    fn an_unnumbered_hunk_is_drawn_with_its_marks_alone() {
+        const UNNUMBERED_PATCH: &str = "@@ fn main\n keep\n-gone\n+added\n";
+        const UNNUMBERED_MSG: &str = "a hunk with no position is drawn without line numbers";
+        assert_eq!(
+            patch_rows(UNNUMBERED_PATCH),
+            ["  keep", "- gone", "+ added"],
+            "{UNNUMBERED_MSG}"
+        );
     }
 
     #[test]

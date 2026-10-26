@@ -8,7 +8,13 @@
 
 /// What every envelope line leads with.
 pub const MARKER: &str = "*** ";
-const VERBS: &[&str] = &["Add File:", "Update File:", "Delete File:", "Move to:"];
+pub const ADD_FILE: &str = "Add File:";
+pub const UPDATE_FILE: &str = "Update File:";
+pub const DELETE_FILE: &str = "Delete File:";
+pub const MOVE_TO: &str = "Move to:";
+/// The line closing the envelope, matched trimmed as Workcell matches it.
+pub const END_PATCH: &str = "*** End Patch";
+const VERBS: &[&str] = &[ADD_FILE, UPDATE_FILE, DELETE_FILE, MOVE_TO];
 const WITHOUT_FILES: &str = "file patch";
 /// Room a header spends naming files before it reports a count instead.
 const HEADER_BUDGET: usize = 60;

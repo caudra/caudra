@@ -26,6 +26,7 @@ pub mod title;
 mod tool_body;
 mod tool_delegation;
 pub mod tool_dispatch;
+mod tool_patch;
 mod tool_preview;
 mod tool_roster;
 mod tool_todos;
