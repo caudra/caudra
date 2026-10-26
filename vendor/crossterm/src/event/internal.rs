@@ -13,7 +13,7 @@ use crate::event::{Event, filter::Filter, read::InternalEventReader, timeout::Po
 
 /// Static instance of `InternalEventReader`.
 /// This needs to be static because there can be one event reader.
-static EVENT_READER: Mutex<Option<InternalEventReader>> = parking_lot::const_mutex(None);
+static EVENT_READER: Mutex<Option<InternalEventReader>> = Mutex::new(None);
 #[cfg(unix)]
 static GRAPHICS_QUERY_ID: AtomicU32 = AtomicU32::new(0xca00_0001);
 

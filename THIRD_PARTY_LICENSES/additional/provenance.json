@@ -1932,6 +1932,146 @@
       ],
       "notice_files": [],
       "status": "collected"
+    },
+    {
+      "name": "jsonschema-regex",
+      "version": "0.60.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6f8a848331614144c03e815fb931f238c9e342bd7ab501b29e35d647e7cd5688",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4eb7a64d9cf45bcbf38c7a69e544477294460751"
+        },
+        "path_in_vcs": "crates/jsonschema-regex"
+      },
+      "revision": "4eb7a64d9cf45bcbf38c7a69e544477294460751",
+      "path_in_vcs": "crates/jsonschema-regex",
+      "manifest_git_blob_sha1": "cd5d9277667b62c861bb53c8d74b4c22ad5c8f5d",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Prepared core-migrations/Cargo.lock and exact crates.io sparse-index entry",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "upstream_legal_blobs": {
+        "LICENSE": "20c070f6401feda6f47be1b158f4f5a4a9d14062"
+      },
+      "workspace_license_manifest_git_blob_sha1": "97e57b8a4663ec929a7cebcb80650d954033b6e6",
+      "notes": [
+        "The exact registry archive checksum matches Cargo.lock, and every extracted package file matches the archive. The original manifest and packaged source were compared with the recorded Git tree. Existing license evidence is reused only after byte-identical verification at that exact revision.",
+        "Every packaged source file, excluding Cargo-generated metadata, matches its package-relative path in the pinned Git tree."
+      ],
+      "lockfile": "Cargo.lock",
+      "verified_ancestor_legal_files": [
+        {
+          "path": "LICENSE",
+          "git_blob_sha1": "20c070f6401feda6f47be1b158f4f5a4a9d14062",
+          "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+          "preserved_path": "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+        }
+      ]
+    },
+    {
+      "name": "jsonschema-value",
+      "version": "0.60.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5a5a947ef798eeacacb43edf29b1d0ab64bdf5e2c9fbcaad10ee8663d922b544",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4eb7a64d9cf45bcbf38c7a69e544477294460751"
+        },
+        "path_in_vcs": "crates/jsonschema-value"
+      },
+      "revision": "4eb7a64d9cf45bcbf38c7a69e544477294460751",
+      "path_in_vcs": "crates/jsonschema-value",
+      "manifest_git_blob_sha1": "60a8eef3977b416b408e757db22395b02cb4e55a",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Prepared core-migrations/Cargo.lock and exact crates.io sparse-index entry",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "upstream_legal_blobs": {
+        "LICENSE": "20c070f6401feda6f47be1b158f4f5a4a9d14062"
+      },
+      "workspace_license_manifest_git_blob_sha1": "97e57b8a4663ec929a7cebcb80650d954033b6e6",
+      "notes": [
+        "The exact registry archive checksum matches Cargo.lock, and every extracted package file matches the archive. The original manifest and packaged source were compared with the recorded Git tree. Existing license evidence is reused only after byte-identical verification at that exact revision.",
+        "Every packaged source file, excluding Cargo-generated metadata, matches its package-relative path in the pinned Git tree."
+      ],
+      "lockfile": "Cargo.lock",
+      "verified_ancestor_legal_files": [
+        {
+          "path": "LICENSE",
+          "git_blob_sha1": "20c070f6401feda6f47be1b158f4f5a4a9d14062",
+          "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+          "preserved_path": "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+        }
+      ]
+    },
+    {
+      "name": "tree-sitter-md",
+      "version": "0.5.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8ed661bfe3c264961425f77cd89ad2998bf5d629e71ce8bab1e5d7e940d6246e",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-markdown",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "41ff24a6c775492c543b09228aeb98d1cd2b3a0f"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "41ff24a6c775492c543b09228aeb98d1cd2b3a0f",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "9b3fa51872884ef52302f38ba637bcb2b3680736",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-md-0.5.3/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile": "Cargo.lock",
+      "verified_ancestor_legal_files": [
+        {
+          "path": "LICENSE",
+          "git_blob_sha1": "c125939af9e397f845811e9d8f31e07dc69170db",
+          "sha256": "52ec8a1bf8256511e2a92613e0bb41ffefba3897f16fa958d7bb28c466dd4804",
+          "preserved_path": "THIRD_PARTY_LICENSES/additional/tree-sitter-md-0.5.3/LICENSE"
+        }
+      ],
+      "notes": [
+        "The exact registry archive checksum matches Cargo.lock, and every extracted package file matches the archive. The original manifest and packaged source were compared with the recorded Git tree. Existing license evidence is reused only after byte-identical verification at that exact revision.",
+        "Every packaged source file, excluding Cargo-generated metadata, matches its package-relative path in the pinned Git tree."
+      ]
     }
   ]
 }

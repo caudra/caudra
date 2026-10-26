@@ -1,10 +1,10 @@
-; Workcell Dart tags — authored against tree-sitter-dart 0.2.0 (node kinds and field names verified
+; Workcell Dart tags — authored against tree-sitter-dart 0.3.0 (node kinds and field names verified
 ; with `examples/dump` against tests/fixtures/sample.dart, cross-checked in the grammar's
-; node-types.json). Upstream ships no tags.scm, so every pattern here is original.
+; node-types.json). These patterns are authored locally, not copied from upstream tags.scm.
 ;
 ; The shape that drives this file: this grammar splits a member into a SIGNATURE node and a
 ; `function_body` sibling, joined by `method_declaration` / `function_declaration`. Only the joining
-; node owns `body:`, so every definition capture sits there and never on `class_member`, whose span
+; node owns `body:`, so every definition capture sits there and never on `member_declaration`, whose span
 ; would be the same but which is a list wrapper the grammar also uses for annotations and multi-name
 ; field declarations. An abstract member is the one case with no body at all, and there the
 ; signature IS the whole declaration.
@@ -40,7 +40,7 @@
 (type_alias
     (type_identifier) @name) @definition.class
 
-(enum_constant
+(enum_entry
     name: (identifier) @name) @definition.constant
 
 ; Top-level functions. `function_declaration` owns `body:`; the `function_signature` inside it is

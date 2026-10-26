@@ -12,7 +12,7 @@ readme = false
 edition = "2024"
 # The MSRV covers the library with no default features and with all public features enabled.
 # Development tools and examples do not independently define the crate's MSRV.
-rust-version = "1.85.0"
+rust-version = "1.95.0"
 categories = ["command-line-interface", "command-line-utilities"]
 
 [lib]
@@ -65,7 +65,7 @@ bitflags = { version = "2.9" }
 derive_more = { version = "2.0.0", features = ["is_variant"], optional = true }
 document-features = { version = "0.2.11", optional = true }
 futures-core = { version = "0.3.31", optional = true, default-features = false }
-parking_lot = "0.12.1"
+parking_lot = "0.13.0"
 serde = { version = "1.0.103", features = ["derive"], optional = true }
 
 # Windows dependencies

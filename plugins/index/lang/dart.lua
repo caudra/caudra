@@ -143,8 +143,8 @@ return function(U)
     end
   end
 
-  local function unwrap_class_member(member)
-    if member:type() ~= "class_member" then
+  local function unwrap_member_declaration(member)
+    if member:type() ~= "member_declaration" then
       return member
     end
     for _, child in ipairs(member:children()) do
@@ -157,7 +157,7 @@ return function(U)
   end
 
   local function extract_member(member, source)
-    local actual = unwrap_class_member(member)
+    local actual = unwrap_member_declaration(member)
     if not actual then
       return {}
     end

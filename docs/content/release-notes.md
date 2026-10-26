@@ -7,6 +7,21 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
+
+[v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)
+
+- Source analysis attributes Go and Rust initializer calls more accurately.
+- File watching on macOS no longer hangs when folders are watched and unwatched in quick succession.
+
+### Source analysis
+
+- **More accurate references.** Go grouped package declarations keep separate spans, so an initializer call belongs to the variable or constant that contains it. Calls in local Go and Rust initializers stay attached to the enclosing function or method.
+
+### Fixes
+
+- **Steadier file watching on macOS.** Watching and unwatching folders in quick succession no longer hangs the watcher.
+
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 
 [v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)
