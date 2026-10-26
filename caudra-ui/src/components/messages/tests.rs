@@ -3126,6 +3126,56 @@ fn a_streamed_patch_draws_its_finished_files_until_the_applied_diff_replaces_the
     );
 }
 
+const LONG_PATCH_LINES: usize = 120;
+const NEWEST_PATCH_LINE: &str = "newest_streamed_line";
+const TALL_SCREEN: u16 = 400;
+const NEWEST_SHOWN_MSG: &str = "a streaming patch is drawn whole, like a write's body, so the line being written stays on the card";
+const SETTLED_CAPPED_MSG: &str = "a settled patch rests at its budget";
+
+fn long_patch(header: &str, last: &str) -> PatchedFile {
+    let mut patch = format!("{header}\n");
+    for line in 0..LONG_PATCH_LINES {
+        patch.push_str(&format!("+line_{line}\n"));
+    }
+    patch.push_str(&format!("+{last}\n"));
+    PatchedFile {
+        additions: LONG_PATCH_LINES + 1,
+        deletions: 0,
+        ..patched_file(&patch)
+    }
+}
+
+/// The file a patch is writing is its newest part, so a card that held the
+/// preview to the settled budget would hide exactly the line arriving.
+#[test]
+fn a_streaming_patch_is_drawn_whole_and_settles_to_its_budget() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), FILE_APPLY_PATCH_TOOL_NAME);
+    panel.tool_input_patch(TOOL_ID, Some(vec![long_patch("@@", "first_half")]));
+    let first = buffer_text(&render(&mut panel, 80, TALL_SCREEN));
+    assert!(first.contains("first_half"), "{NEWEST_SHOWN_MSG}: {first}");
+
+    panel.tool_input_patch(TOOL_ID, Some(vec![long_patch("@@", NEWEST_PATCH_LINE)]));
+    let grown = buffer_text(&render(&mut panel, 80, TALL_SCREEN));
+    assert!(
+        grown.contains(NEWEST_PATCH_LINE),
+        "{NEWEST_SHOWN_MSG}: {grown}"
+    );
+
+    panel.tool_done(ToolDoneEvent {
+        tool: FILE_APPLY_PATCH_TOOL_NAME.into(),
+        output: ToolOutput::Patch {
+            files: vec![long_patch("@@ -0,0 +1,121 @@", NEWEST_PATCH_LINE)],
+        },
+        ..done(TOOL_ID)
+    });
+    let settled = buffer_text(&render(&mut panel, 80, TALL_SCREEN));
+    assert!(
+        !settled.contains(NEWEST_PATCH_LINE),
+        "{SETTLED_CAPPED_MSG}: {settled}"
+    );
+}
+
 /// Nothing a cancelled patch streamed was applied, so none of it may stay on
 /// the card looking like a change that landed.
 #[test]

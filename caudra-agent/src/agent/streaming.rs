@@ -2292,24 +2292,39 @@ mod tests {
         assert_eq!(previews(PATCH, &fragments), ["a.rs", "a.rs, b.rs"]);
     }
 
-    /// A section is a whole diff once the next one begins, so the card can
-    /// draw it while the rest of the patch is still being written.
+    /// The card draws the file a patch is writing as it grows, the way a
+    /// write's body is drawn, and the files before it stay whole.
     #[test]
-    fn a_patch_publishes_each_file_once_it_is_finished() {
+    fn a_patch_publishes_the_file_it_is_writing_as_it_grows() {
         let fragments = [
-            r#"{"patchText": "*** Begin Patch\n*** Update File: a.rs\n"#,
-            r"-one\n+two\n*** Add File: b.rs\n+new\n",
-            r#"*** End Patch"}"#,
+            r#"{"patchText": "*** Begin Patch\n*** Update File: a.rs\n-on"#,
+            r"e\n+two\n",
+            r"*** Add File: b.rs\n+ne",
+            r#"w\n*** End Patch"}"#,
         ];
-        let published: Vec<Vec<String>> = deltas(PATCH, &fragments)
+        let published: Vec<Vec<(String, String)>> = deltas(PATCH, &fragments)
             .into_iter()
             .filter_map(|event| match event {
                 AgentEvent::ToolInputDelta { patch, .. } => patch,
                 _ => None,
             })
-            .map(|files| files.into_iter().map(|file| file.path).collect())
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| (file.path, file.patch))
+                    .collect()
+            })
             .collect();
-        assert_eq!(published, [vec!["a.rs"], vec!["a.rs", "b.rs"]]);
+        let file = |path: &str, patch: &str| (path.to_owned(), patch.to_owned());
+        assert_eq!(
+            published,
+            [
+                vec![file("a.rs", "@@\n-on\n")],
+                vec![file("a.rs", "@@\n-one\n+two\n")],
+                vec![file("a.rs", "@@\n-one\n+two\n"), file("b.rs", "@@\n+ne\n")],
+                vec![file("a.rs", "@@\n-one\n+two\n"), file("b.rs", "@@\n+new\n")],
+            ]
+        );
     }
 
     #[test]

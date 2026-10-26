@@ -6,12 +6,12 @@
 //! is what lets the header say how much has arrived, and what lets a write show
 //! the file being written instead of a spinner and a line count.
 //!
-//! Only a whole file is worth drawing half-arrived. A replacement and a patch
-//! are legible as diffs and as nothing else, so their body is counted and
-//! dropped rather than published. A patch keeps two things on its way past:
-//! the `*** Verb: path` lines of its envelope, which name the files it touches
-//! long before it has finished describing what it does to them, and each
-//! file's section once the next one begins, which is a whole diff by then.
+//! Only a whole file is worth drawing half-arrived as text. A replacement and
+//! a patch are legible as diffs and as nothing else, so their body is counted
+//! and dropped rather than published. A patch keeps two things on its way
+//! past: the `*** Verb: path` lines of its envelope, which name the files it
+//! touches long before it has finished describing what it does to them, and
+//! each file's section read as a diff, the one still being written included.
 //!
 //! The decode is resumable rather than a scan per fragment, which
 //! [`super::tool_preview`] can afford only because it gives up after a few
@@ -45,7 +45,7 @@ enum Body {
     /// Counted and dropped: a diff is legible as a diff and as nothing else.
     Counted,
     /// Counted, and read for the envelope lines that name the files it
-    /// touches and for the sections it has finished writing.
+    /// touches and for its sections, drawn as diffs as far as they have arrived.
     Named,
 }
 
@@ -304,8 +304,9 @@ impl BodyStream {
         self.envelope.header()
     }
 
-    /// Every file a patch has finished describing, when one more finished
-    /// since the last call. Always `None` for any other body.
+    /// Every file a patch has described so far, the last possibly still being
+    /// written, when that changed since the last call. Always `None` for any
+    /// other body.
     pub(super) fn files(&mut self) -> Option<Vec<PatchedFile>> {
         self.patch.files()
     }
@@ -688,8 +689,9 @@ mod tests {
         assert_eq!(headers(PATCH, &fragments), ["a.rs"]);
     }
 
-    /// A newline escape split between fragments still ends the line, and the
-    /// closing quote ends the last section the envelope never closed.
+    /// A newline escape split between fragments still ends the line rather
+    /// than drawing a stray backslash, and the file being written is drawn
+    /// after the ones the patch has finished.
     #[test]
     fn a_patch_publishes_its_files_across_split_escapes() {
         let mut stream = BodyStream::new(PATCH).unwrap();
@@ -707,8 +709,18 @@ mod tests {
             .iter()
             .map(|files| files.iter().map(|file| file.path.as_str()).collect())
             .collect();
-        assert_eq!(paths, [vec!["a.rs"], vec!["a.rs", "b.rs"]]);
+        assert_eq!(
+            paths,
+            [
+                vec!["a.rs"],
+                vec!["a.rs"],
+                vec!["a.rs", "b.rs"],
+                vec!["a.rs", "b.rs"]
+            ]
+        );
+        assert_eq!(published[0][0].patch, "@@\n-one\n");
         assert_eq!(published[1][0].patch, "@@\n-one\n+two\n");
+        assert_eq!(published[2][1].patch, "@@\n+three\n");
     }
 
     #[test_case(WRITE, r#"{"content": "*** Update File: a.rs\n+x\n*** End Patch"}"# ; "a_write")]

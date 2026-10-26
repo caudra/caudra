@@ -2404,8 +2404,16 @@ impl ToolLineBuilder {
         }
     }
 
+    /// A patch still streaming is drawn whole, as `push_live_body` draws a
+    /// write: the file being written is the newest part of it, and the budget
+    /// would hide exactly that once the patch outgrew it. The card settles to
+    /// its budget with the call's own output.
     fn push_rendered_code(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
-        let content = code_view::render_tool_content(input, output, false, self.limits.clone());
+        let mut limits = self.limits.clone();
+        if self.is_in_progress() && matches!(output, Some(ToolOutput::Patch { .. })) {
+            limits.budget = usize::MAX;
+        }
+        let content = code_view::render_tool_content(input, output, false, limits);
         self.push_content(content);
     }
 

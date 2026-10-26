@@ -3110,10 +3110,11 @@ pub enum AgentEvent {
         /// `ToolDone` replaces it with the list the call stored.
         #[serde(skip_serializing_if = "Option::is_none")]
         todos: Option<Vec<TodoItem>>,
-        /// Every file a `file_apply_patch` has finished describing, read from
-        /// its own text and drawn without line numbers, since nothing has
-        /// read a file yet. `Some` only when one more file finished;
-        /// `ToolDone` replaces it with the diff the call applied.
+        /// Every file a `file_apply_patch` has described so far, the last
+        /// possibly still being written, read from its own text and drawn
+        /// without line numbers, since nothing has read a file yet. `Some`
+        /// only when what it draws changed; `ToolDone` replaces it with the
+        /// diff the call applied.
         #[serde(skip_serializing_if = "Option::is_none")]
         patch: Option<Vec<PatchedFile>>,
         /// The briefs the delegating calls in this fragment are writing: the
