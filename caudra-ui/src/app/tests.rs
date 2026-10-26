@@ -5683,11 +5683,17 @@ const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to
 fn reset_session_clears_the_bill_and_the_model_breakdown() {
     let mut app = streaming_app();
     app.update(main_turn());
+    app.update(billed_turn(SUBSCRIPTION_TURN_COST, Billing::Subscription));
     assert_eq!(app.state.cost, MAIN_COST, "{COST_WAS_NOT_BILLED}");
+    assert_eq!(
+        app.state.subscription_cost,
+        Some(SUBSCRIPTION_TURN_COST),
+        "{COST_WAS_NOT_BILLED}"
+    );
 
     app.reset_session();
 
-    assert_eq!(app.state.cost, None);
+    assert_eq!(spend_shown(&app), [None; 4]);
     assert!(app.state.session.usage_by_model().is_empty());
 }
 
@@ -5729,6 +5735,147 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     app.update(main_turn());
 
     assert_eq!(app.state.cost, Some(RESTORED_COST + MAIN_COST.unwrap()));
+}
+
+const SUBSCRIPTION_TURN_COST: f64 = 0.125;
+const API_TURN_COST: f64 = 0.5;
+const FREE_API_COST: f64 = 0.0;
+const SUBSCRIPTION_ON_BAR: &str = "~$0.125";
+const API_ON_BAR: &str = "$0.5";
+const SUBSCRIPTION_IN_USAGE: &str = "subscription (not billed): $0.125";
+const API_IN_USAGE: &str = "$0.500";
+const SPEND_LOST_ON_RESTART: &str = "reopening a session must keep what it recorded spending";
+const SPEND_NOT_ON_SCREEN: &str = "the restored spend must be drawn where it was before";
+const SPEND_NOT_ADDED_ONCE: &str = "a turn after reopening must add to the restored spend once";
+/// Wide enough that `/usage` fits its session total without panning.
+const USAGE_SCREEN_WIDTH: u16 = 200;
+
+fn billed_turn(cost: f64, billing: Billing) -> Msg {
+    agent_msg(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: Default::default(),
+        usage: MAIN_TOKENS,
+        model: MAIN_MODEL.into(),
+        provider: TEST_PROVIDER.into(),
+        purpose: LedgerPurpose::Chat,
+        cost: Some(cost),
+        billing,
+        account: None,
+        context_size: None,
+        context_window: 0,
+    })))
+}
+
+/// Billed and subscription totals, for the session and for the main chat the
+/// status bar draws.
+fn spend_shown(app: &App) -> [Option<f64>; 4] {
+    [
+        app.state.cost,
+        app.state.subscription_cost,
+        app.chats[0].cost,
+        app.chats[0].subscription_cost,
+    ]
+}
+
+fn usage_screen(app: &mut App) -> String {
+    app.execute_command(cmd("/usage"), 0);
+    let screen = rendered_wide(app, USAGE_SCREEN_WIDTH);
+    app.execute_command(cmd("/usage"), 0);
+    screen
+}
+
+/// Saves the session through the writer, then opens it in a new app the way a
+/// restart (`startup`) or `/sessions` does.
+fn reopen(
+    mut app: App,
+    writer: Arc<StorageWriter>,
+    dir: &StateDir,
+    startup: bool,
+) -> (Arc<StorageWriter>, App) {
+    app.checkpoint_now();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, dir).unwrap();
+    let writer = Arc::new(test_writer(dir.clone()));
+    let mut reopened = build_app(dir.clone(), Arc::clone(&writer));
+    if startup {
+        reopened.state = SessionState::from_session(
+            loaded,
+            &test_model(),
+            &reopened.storage,
+            &reopened.model_policy,
+            Mode::Plan,
+        );
+        reopened.restore_resumed_session();
+    } else {
+        reopened
+            .apply_loaded_session(loaded, &test_model())
+            .unwrap();
+    }
+    reopened.status = Status::Streaming;
+    reopened.run_id = 1;
+    (writer, reopened)
+}
+
+#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription)], Some(SUBSCRIPTION_ON_BAR), SUBSCRIPTION_IN_USAGE, true ; "subscription_at_startup")]
+#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription)], Some(SUBSCRIPTION_ON_BAR), SUBSCRIPTION_IN_USAGE, false ; "subscription_loaded")]
+#[test_case(&[(API_TURN_COST, Billing::Api)], Some(API_ON_BAR), API_IN_USAGE, true ; "api_at_startup")]
+#[test_case(&[(FREE_API_COST, Billing::Api), (SUBSCRIPTION_TURN_COST, Billing::Subscription)], None, SUBSCRIPTION_IN_USAGE, true ; "free_api_and_subscription_on_one_model")]
+#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription), (FREE_API_COST, Billing::Api)], None, SUBSCRIPTION_IN_USAGE, false ; "subscription_then_free_api_on_one_model")]
+fn restart_keeps_the_recorded_spend(
+    turns: &[(f64, Billing)],
+    on_bar: Option<&str>,
+    in_usage: &str,
+    startup: bool,
+) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(app.state.session_mut(), Message::user("spend".into()));
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for &(cost, billing) in turns {
+        app.update(billed_turn(cost, billing));
+    }
+    let before = spend_shown(&app);
+    let by_purpose = app.state.session.usage_by_purpose().clone();
+
+    let (writer, mut app) = reopen(app, writer, &dir, startup);
+
+    assert_eq!(spend_shown(&app), before, "{SPEND_LOST_ON_RESTART}");
+    assert_eq!(
+        app.state.session.usage_by_purpose(),
+        &by_purpose,
+        "{SPEND_LOST_ON_RESTART}"
+    );
+    if let Some(on_bar) = on_bar {
+        let screen = rendered_wide(&mut app, SIGMA_BAR_WIDTH);
+        assert!(
+            screen.contains(on_bar),
+            "{SPEND_NOT_ON_SCREEN}: {on_bar}\n{screen}"
+        );
+    }
+    let screen = usage_screen(&mut app);
+    assert!(
+        screen.contains(in_usage),
+        "{SPEND_NOT_ON_SCREEN}: {in_usage}\n{screen}"
+    );
+
+    app.update(billed_turn(SUBSCRIPTION_TURN_COST, Billing::Subscription));
+    let grown = before[1].unwrap_or_default() + SUBSCRIPTION_TURN_COST;
+    assert_eq!(
+        app.state.subscription_cost,
+        Some(grown),
+        "{SPEND_NOT_ADDED_ONCE}"
+    );
+    assert_eq!(
+        app.chats[0].subscription_cost,
+        Some(grown),
+        "{SPEND_NOT_ADDED_ONCE}"
+    );
+    let after = spend_shown(&app);
+
+    let (writer, app) = reopen(app, writer, &dir, startup);
+
+    assert_eq!(spend_shown(&app), after, "{SPEND_LOST_ON_RESTART}");
+    drain_writer(app, writer);
 }
 
 /// The sigma the status bar draws once subagents split the bill is the session

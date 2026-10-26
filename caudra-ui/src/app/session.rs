@@ -843,9 +843,11 @@ impl App {
         self.main_chat().load_messages(display_msgs);
         self.sync_todo_panel();
         let cost = self.state.cost;
+        let subscription_cost = self.state.subscription_cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
         main.cost = cost;
+        main.subscription_cost = subscription_cost;
         main.context_size = context_size;
         let draft = InputDraft {
             text: self
@@ -1100,6 +1102,7 @@ impl App {
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
+        self.state.subscription_cost = None;
         self.state.context_size = 0;
         self.state.goal = GoalHandle::default();
         self.goal_deferred = false;

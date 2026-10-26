@@ -692,14 +692,15 @@ fn provider_rows(models: &[BreakdownRow], fallback: &str) -> Vec<BreakdownRow> {
 }
 
 /// The session's spend by why each model was called, dearest first, then by
-/// tokens, ties by name so the order holds still between frames.
+/// tokens, ties by name so the order holds still between frames. Only what was
+/// recorded: no model names a purpose, so an unpriced row is never estimated.
 fn purpose_rows(by_purpose: &HashMap<String, StoredTokenUsage>) -> Vec<BreakdownRow> {
     let mut rows: Vec<BreakdownRow> = by_purpose
         .iter()
         .map(|(purpose, usage)| BreakdownRow {
             label: purpose.clone(),
             usage: *usage,
-            spend: recorded_spend(usage),
+            spend: ModelSpend::recorded(usage).unwrap_or_default(),
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -711,19 +712,6 @@ fn purpose_rows(by_purpose: &HashMap<String, StoredTokenUsage>) -> Vec<Breakdown
             .then_with(|| a.label.cmp(&b.label))
     });
     rows
-}
-
-/// What a purpose's turns recorded paying. No model names a purpose, so an
-/// unpriced row stays unpriced rather than being estimated, and both payers
-/// add up the way a provider fold does: any invoice makes the figure a bill.
-fn recorded_spend(usage: &StoredTokenUsage) -> ModelSpend {
-    let mut usd = usage.cost;
-    add_cost(&mut usd, usage.subscription_cost);
-    let billing = match (usage.cost, usage.subscription_cost) {
-        (None, Some(_)) => Billing::Subscription,
-        _ => Billing::Api,
-    };
-    ModelSpend { usd, billing }
 }
 
 fn breakdown_table(
@@ -2227,24 +2215,6 @@ mod tests {
             "{PURPOSE_ORDER}: {rows:?}"
         );
         assert!(rows[heading + 3].ends_with(RECORDED_TEXT), "{rows:?}");
-    }
-
-    #[test_case(Some(RECORDED_COST), None, Some(RECORDED_COST), Billing::Api ; "billed")]
-    #[test_case(None, Some(SUBSCRIPTION_COST), Some(SUBSCRIPTION_COST), Billing::Subscription ; "covered")]
-    #[test_case(Some(RECORDED_COST), Some(SUBSCRIPTION_COST), Some(RECORDED_COST + SUBSCRIPTION_COST), Billing::Api ; "mixed_is_a_bill")]
-    #[test_case(None, None, None, Billing::Api ; "unpriced_stays_unpriced")]
-    fn recorded_spend_adds_both_payers(
-        cost: Option<f64>,
-        subscription_cost: Option<f64>,
-        usd: Option<f64>,
-        billing: Billing,
-    ) {
-        let spend = recorded_spend(&StoredTokenUsage {
-            cost,
-            subscription_cost,
-            ..StoredTokenUsage::default()
-        });
-        assert_eq!((spend.usd, spend.billing), (usd, billing));
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

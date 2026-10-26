@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use caudra_storage::sessions::StoredTokenUsage;
+use caudra_storage::sessions::{StoredTokenUsage, add_cost};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -161,8 +161,24 @@ pub struct ModelSpend {
 }
 
 impl ModelSpend {
-    /// Where this belongs in a [`StoredTokenUsage`]: the two columns are the
-    /// same number under different payers, so only one is ever filled.
+    /// What a row's turns recorded paying, `None` while nothing on it was
+    /// priced. A row can hold both payers when one model served under an API key
+    /// and a subscription, and the figure then folds them the way a provider
+    /// row does: any charge makes it a bill, and a `$0` one does not.
+    pub fn recorded(usage: &StoredTokenUsage) -> Option<Self> {
+        let billing = match (usage.cost, usage.subscription_cost) {
+            (None, None) => return None,
+            (Some(cost), _) if cost > 0.0 => Billing::Api,
+            (_, Some(_)) => Billing::Subscription,
+            (Some(_), None) => Billing::Api,
+        };
+        let mut usd = usage.cost;
+        add_cost(&mut usd, usage.subscription_cost);
+        Some(Self { usd, billing })
+    }
+
+    /// Where an estimate belongs in a [`StoredTokenUsage`]: it is priced under
+    /// one payer, so only one column is filled.
     fn columns(self) -> (Option<f64>, Option<f64>) {
         match self.billing {
             Billing::Api => (self.usd, None),
@@ -174,10 +190,11 @@ impl ModelSpend {
 /// The bill a stored session ran up. Status bar, `/usage`, ACP and headless all
 /// come here, so they cannot disagree about the same session.
 ///
-/// Turns record what they paid, so summing those is the truth. What was written
-/// before that kept counters only, and its estimate against today's table is
-/// settled into the entry here, once: after a later turn merges its own cost in,
-/// the counters no longer say which of them was already paid for, so estimating
+/// Turns record what they paid, in one column per payer, so summing each
+/// column is the truth and both are kept as they are. What was written before
+/// that kept counters only, and its estimate against today's table is settled
+/// into the entry here, once: after a later turn merges its own cost in, the
+/// counters no longer say which of them was already paid for, so estimating
 /// again would drop everything the entry had before. Counters with no breakdown
 /// get one seeded, so there is always somewhere to settle into.
 pub fn settle_session(
@@ -191,9 +208,9 @@ pub fn settle_session(
         by_model.insert(current.spec(), total.billed(None, current.billing));
     }
     for (id, usage) in by_model.iter_mut() {
-        let (billed, subscription) = model_cost(id, usage, current, fast).columns();
-        usage.cost = billed;
-        usage.subscription_cost = subscription;
+        if ModelSpend::recorded(usage).is_none() {
+            (usage.cost, usage.subscription_cost) = model_cost(id, usage, current, fast).columns();
+        }
     }
     SessionSpend {
         billed: sum(by_model.values().filter_map(|usage| usage.cost)),
@@ -231,23 +248,15 @@ fn qualify_keys(by_model: &mut HashMap<String, StoredTokenUsage>, provider: &str
 /// from a caller that skipped settling still resolves, under the session's
 /// provider.
 ///
-/// A row written before Caudra recorded its payer is re-priced under `current`'s
+/// A row that recorded a price reports that, as [`ModelSpend::recorded`]. A row
+/// written before Caudra recorded its payer is re-priced under `current`'s
 /// billing mode, the same borrowing that already lets today's rates stand in for
 /// the rates a historical turn actually paid.
 pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: bool) -> ModelSpend {
+    if let Some(spend) = ModelSpend::recorded(usage) {
+        return spend;
+    }
     let billing = current.billing;
-    if let Some(usd) = usage.cost {
-        return ModelSpend {
-            usd: Some(usd),
-            billing: Billing::Api,
-        };
-    }
-    if let Some(usd) = usage.subscription_cost {
-        return ModelSpend {
-            usd: Some(usd),
-            billing: Billing::Subscription,
-        };
-    }
     if id == current.id || id == current.spec() {
         return ModelSpend {
             usd: current.list_cost(&(*usage).into(), fast),
@@ -310,6 +319,9 @@ mod tests {
     const NESTED_SPEC: &str = "openrouter/vendor/model";
     const LEGACY_KEYS_QUALIFY: &str =
         "a breakdown must settle into one row per provider and model, whenever it was written";
+    const SUBSCRIPTION: f64 = 0.25;
+    const FREE: f64 = 0.0;
+    const PAYERS_KEPT: &str = "settling must keep what each payer recorded, however often it runs";
 
     fn utc(day: i64, hour: i64, minute: i64, second: i64) -> Timestamp {
         Timestamp::from_second(
@@ -539,6 +551,58 @@ mod tests {
             settle_session(&total, &mut by_model, &current, false).billed,
             Some(LIST_PRICE + RECORDED)
         );
+    }
+
+    /// One model can serve under an API key and a subscription both, so a row
+    /// can carry both columns. Settling used to keep only the API one, even at
+    /// `$0`, and a reopened session lost its subscription spend. Both rows are
+    /// already qualified, and one of them no table can price, so neither can be
+    /// re-priced or renamed.
+    #[test_case(None, Some(SUBSCRIPTION)        ; "subscription_only")]
+    #[test_case(Some(RECORDED), Some(SUBSCRIPTION) ; "both_payers")]
+    #[test_case(Some(FREE), Some(SUBSCRIPTION)  ; "free_api_beside_a_subscription")]
+    fn settling_keeps_both_recorded_columns(cost: Option<f64>, subscription_cost: Option<f64>) {
+        let current = model(CURRENT, INPUT_RATE);
+        let row = StoredTokenUsage {
+            cost,
+            subscription_cost,
+            ..stored(None)
+        };
+        let mut by_model = HashMap::from([
+            (current.spec(), row),
+            (format!("{}/{UNRESOLVABLE}", current.provider), row),
+        ]);
+        let recorded = by_model.clone();
+        let mut settle = || settle_session(&TokenUsage::default(), &mut by_model, &current, false);
+
+        let first = settle();
+        let second = settle();
+
+        let expected = SessionSpend {
+            billed: cost.map(|cost| 2.0 * cost),
+            subscription: subscription_cost.map(|cost| 2.0 * cost),
+        };
+        assert_eq!(first, expected, "{PAYERS_KEPT}");
+        assert_eq!(second, expected, "{PAYERS_KEPT}");
+        assert_eq!(by_model, recorded, "{PAYERS_KEPT}");
+    }
+
+    #[test_case(Some(RECORDED), None         => Some((Some(RECORDED), Billing::Api))                    ; "billed")]
+    #[test_case(None, Some(SUBSCRIPTION)     => Some((Some(SUBSCRIPTION), Billing::Subscription))       ; "covered")]
+    #[test_case(Some(RECORDED), Some(SUBSCRIPTION) => Some((Some(RECORDED + SUBSCRIPTION), Billing::Api)) ; "mixed_is_a_bill")]
+    #[test_case(Some(FREE), Some(SUBSCRIPTION) => Some((Some(SUBSCRIPTION), Billing::Subscription))     ; "free_api_charges_nothing")]
+    #[test_case(Some(FREE), None             => Some((Some(FREE), Billing::Api))                        ; "free_api_alone")]
+    #[test_case(None, None                   => None                                                    ; "unpriced_stays_unpriced")]
+    fn recorded_spend_adds_both_payers(
+        cost: Option<f64>,
+        subscription_cost: Option<f64>,
+    ) -> Option<(Option<f64>, Billing)> {
+        ModelSpend::recorded(&StoredTokenUsage {
+            cost,
+            subscription_cost,
+            ..StoredTokenUsage::default()
+        })
+        .map(|spend| (spend.usd, spend.billing))
     }
 
     /// Rows written before the breakdown named a provider are bare. Loading one
