@@ -80,11 +80,13 @@ members = [
   "caudra-interpreter",
   "caudra-lua",
   "caudra-markdown",
+  "caudra-mattpocock",
   "caudra-otel",
   "caudra-providers",
   "caudra-proxy",
   "caudra-pstack",
   "caudra-script",
+  "caudra-skillpack",
   "caudra-storage",
   "caudra-config-macro",
   "caudra-lua-macro",
@@ -142,6 +144,7 @@ caudra-providers = { path = "caudra-providers" }
 caudra-proxy = { path = "caudra-proxy" }
 caudra-pstack = { path = "caudra-pstack" }
 caudra-script = { path = "caudra-script", default-features = false }
+caudra-skillpack = { path = "caudra-skillpack" }
 caudra-automation = { path = "caudra-automation" }
 caudra-storage = { path = "caudra-storage" }
 caudra-terminal-host = { path = "caudra-terminal-host" }
@@ -152,6 +155,7 @@ caudra-lua-macro = { path = "caudra-lua-macro" }
 caudra-grab = { path = "caudra-grab" }
 caudra-highlight = { path = "caudra-highlight" }
 caudra-markdown = { path = "caudra-markdown" }
+caudra-mattpocock = { path = "caudra-mattpocock" }
 caudra-otel = { path = "caudra-otel" }
 caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }

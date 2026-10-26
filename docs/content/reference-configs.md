@@ -1370,6 +1370,12 @@ version = 5
 # Type: boolean.
 # pstack = false
 
+# Offer Matt Pocock's bundled skills (grilling, TDD, diagnosing bugs, code
+# review, specs, tickets): the `mattpocock` skill and the `/mattpocock:`
+# commands.
+# Type: boolean.
+# mattpocock = false
+
 [plugins.task]
 
 # Max concurrently running subagents.

@@ -1,0 +1,17 @@
+[package]
+name = "caudra-mattpocock"
+description = "Matt Pocock's bundled skills: grilling, TDD, diagnosing bugs, code review, specs and tickets, translated for Caudra as addressable pages."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-skillpack = { workspace = true }
+include_dir = { workspace = true }
+
+[dev-dependencies]
+caudra-skillpack = { workspace = true, features = ["checks"] }
+regex = { workspace = true }

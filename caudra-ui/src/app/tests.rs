@@ -86,7 +86,7 @@ use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol, DecisionsConf
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     Effect, FeatureFlags, InboundPolicy, PermissionReviewCandidate, PermissionReviewKind,
-    PermissionRule, PermissionSource, PermissionsConfig, ToolKey, UiConfig,
+    PermissionRule, PermissionSource, PermissionsConfig, SkillPacks, ToolKey, UiConfig,
 };
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{
@@ -15367,11 +15367,13 @@ fn remote_cd_persistence_failure_preserves_live_state() {
     );
 }
 
-/// The live `builtin_skills.pstack` flip reaches a remote tab, whose commands come from its
-/// own project rather than the ones the event loop rediscovers locally.
-#[test_case(false ; "off")]
-#[test_case(true ; "on")]
-fn a_remote_tab_follows_the_pstack_switch(on: bool) {
+/// A live skill-pack flip reaches a remote tab, whose commands come from its own project
+/// rather than the ones the event loop rediscovers locally.
+#[test_case(false, false ; "both_off")]
+#[test_case(true, false ; "pstack_on")]
+#[test_case(false, true ; "mattpocock_on")]
+#[test_case(true, true ; "both_on")]
+fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) {
     let mut app = test_app();
     let original = remote_workspace_session();
     let workspace = WorkspaceSession::new(
@@ -15399,14 +15401,19 @@ fn a_remote_tab_follows_the_pstack_switch(on: bool) {
     );
     app.workspace_session = Some(workspace);
     let poteto = caudra_agent::pstack::commands(true)[0].display_name();
+    let grill = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::MATTPOCOCK, true)
+        [0]
+    .display_name();
+    let packs = SkillPacks { pstack, mattpocock };
 
-    app.set_pstack(!on);
-    app.set_pstack(on);
+    app.set_skill_packs(SkillPacks {
+        pstack: !pstack,
+        mattpocock: !mattpocock,
+    });
+    app.set_skill_packs(packs);
 
-    assert_eq!(
-        app.command_palette.find_custom_command(&poteto).is_some(),
-        on
-    );
+    let listed = |name: &str| app.command_palette.find_custom_command(name).is_some();
+    assert_eq!((listed(&poteto), listed(&grill)), (pstack, mattpocock));
 }
 
 #[test]

@@ -1,43 +1,8 @@
----
-name: pstack-translate
-description: Translate the vendored pstack skills from Cursor's vocabulary into Caudra's, so agents follow the pages Caudra serves as written. Use for the pstack-sync run, after `make sync-pstack` reports TRANSLATE, NEW, or ORPHAN, and for any edit under caudra-pstack/translated/.
----
+# pstack: from Cursor to Caudra
 
-# Translating pstack into Caudra
+pstack (cursor/plugins) is written for Cursor. The crate is `caudra-pstack`, synced with `make sync-pstack ARGS='--source <cursor/plugins checkout>'`. Its overlay keeps upstream's roots: `pstack/...` and `cursor-team-kit/...`, so a path to `--mark` reads `pstack/skills/how/SKILL.md`. The term list is `CURSOR_TERMS` in `caudra-pstack/src/library.rs`.
 
-pstack (cursor/plugins) is written for Cursor. Caudra bundles it as the `pstack` skill and serves every file as a page. The agent that reads a page must be able to follow it as written, with no mapping table. So every Cursor tool, field, path, model slug, command, and feature is rewritten here, once, by us.
-
-## Layout
-
-- `caudra-pstack/upstream/` is the verbatim copy `make sync-pstack` writes. Never edit it by hand. It is the base for the next translation and the license record.
-- `caudra-pstack/translated/` has the same layout (`pstack/...`, `cursor-team-kit/...`). A file there replaces its upstream page. Copy a file here only when it needs a change.
-- `caudra-pstack/translated/translations.json` records, for each translated file, the hash of the upstream file it was translated from. `python3 scripts/sync-pstack.py --mark <path>...` writes it, with paths as in the overlay, such as `pstack/skills/how/SKILL.md`.
-- `caudra-pstack/automations/*.rhai` are Caudra's own ports of pstack's automations, served as `pstack/caudra/automations/<file>` and bundled as `/automations` entries while pstack is on, so users arm them without writing a file.
-
-## The check
-
-`cargo test -p caudra-pstack --lib -- library::` fails when:
-
-- a served page still names a Cursor term (the list is `CURSOR_TERMS` in `caudra-pstack/src/library.rs`; its allowlist names each exception and why),
-- a translation's recorded upstream hash differs from the upstream file (the upstream file changed: retranslate),
-- a translation has no upstream file (upstream deleted or moved it: delete or move the translation),
-- a relative link leads nowhere.
-
-## How to translate a file
-
-1. Copy `caudra-pstack/upstream/<path>` to `caudra-pstack/translated/<path>`.
-2. Rewrite only what the tables below cover, plus the sentences whose reasoning depends on Cursor. Keep upstream's structure, headings, voice, and every rule that still holds. Do not reword text that is already right, and do not add commentary about the translation.
-3. Read the result as a Caudra agent would: every tool, field, value, path, and command must exist in Caudra and be spelled as its schema spells it.
-4. Run `python3 scripts/sync-pstack.py --mark <path>` and the check.
-
-## How to retranslate after a sync
-
-`make sync-pstack` prints one line per file that needs work:
-
-- `TRANSLATE <path>`: upstream changed a translated file. Diff the old and new upstream text (the command is printed with it, `git diff HEAD -- caudra-pstack/upstream/<path>` before you commit), apply the same change to the translation, translating any new Cursor text, then `--mark` it.
-- `NEW <path>`: upstream added or changed a file that has no translation. Translate it when the check names it.
-- `ORPHAN <path>`: the translation's upstream file is gone. Delete the translation, or move it with the upstream file and retranslate.
-- `PORT <script>`: a ported script changed. Update its Rust port in `caudra-pstack/src/scripts/` to match, with tests.
+`caudra-pstack/automations/*.rhai` are Caudra's own ports of pstack's automations, served as `pstack/caudra/automations/<file>` and bundled as `/automations` entries while pstack is on, so users arm them without writing a file.
 
 ## Tools
 

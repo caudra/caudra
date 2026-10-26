@@ -76,7 +76,7 @@ impl App {
 
     /// pstack's roles as stored now, `None` while pstack is off.
     pub(super) fn pstack_roles(&self) -> Option<PstackRoles> {
-        self.pstack.then(|| {
+        self.skill_packs.pstack.then(|| {
             PstackRoles::new(
                 roles::table(&self.model_policy, self.settings.task_model_choice),
                 roles::load(),

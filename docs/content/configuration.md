@@ -119,7 +119,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, and [`plugins.skill.pstack`](/docs/skills/#pstack) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, [`plugins.skill.pstack`](/docs/skills/#pstack), and [`plugins.skill.mattpocock`](/docs/skills/#mattpocock) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -929,6 +929,7 @@ enabled = false
 | `automation_dev` | boolean | `true` | Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`. |
 | `docs` | boolean | `true` | Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time. |
 | `pstack` | boolean | `false` | Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`. |
+| `mattpocock` | boolean | `false` | Offer Matt Pocock's bundled skills (grilling, TDD, diagnosing bugs, code review, specs, tickets): the `mattpocock` skill and the `/mattpocock:` commands. |
 
 ### `plugins.task`
 

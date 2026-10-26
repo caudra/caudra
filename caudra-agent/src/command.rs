@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use caudra_config::SkillPacks;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -118,28 +119,28 @@ impl CustomCommand {
 }
 
 /// Builtin commands follow the discovered ones: their own prefix keeps them
-/// apart, so a user command of the same name never shadows one. `pstack` is
-/// `builtin_skills.pstack` from the caller's config.
-pub fn discover_commands(cwd: &Path, pstack: bool) -> Vec<CustomCommand> {
+/// apart, so a user command of the same name never shadows one. `packs` is
+/// `builtin_skills.packs()` from the caller's config.
+pub fn discover_commands(cwd: &Path, packs: &SkillPacks) -> Vec<CustomCommand> {
     let mut commands = discover_commands_inner(
         cwd,
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
     );
-    commands.extend(crate::pstack::commands(pstack));
+    commands.extend(crate::skill_pack::all_commands(packs));
     commands
 }
 
 pub fn discover_remote_commands(
     context: &crate::remote_project_context::RemoteProjectContext,
-    pstack: bool,
+    packs: &SkillPacks,
 ) -> Vec<CustomCommand> {
     let mut commands = discover_remote_commands_in(
         context.commands(),
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
     );
-    commands.extend(crate::pstack::commands(pstack));
+    commands.extend(crate::skill_pack::all_commands(packs));
     commands
 }
 

@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
+
+[v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)
+
+- Matt Pocock's engineering skills ship as an opt-in pack beside pstack.
+
+### Changes
+
+- **mattpocock skills**: `[plugins.skill] mattpocock = true` adds 16 of [Matt Pocock's skills](https://github.com/mattpocock/skills), translated for Caudra, as the `mattpocock` skill and a `/mattpocock:<name>` command for each. They cover grilling a plan, domain modeling, test-first building, diagnosing bugs, code review, specs and tickets, and handoffs. Grilling asks through the `question` tool, and switching the pack applies at once in the terminal UI. Both packs can be on together. See [mattpocock](/docs/skills/#mattpocock).
+
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 
 [v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)

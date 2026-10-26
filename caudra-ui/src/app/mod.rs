@@ -193,8 +193,8 @@ use caudra_agent::{
 use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
-    Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
-    UiConfig,
+    Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SkillPacks,
+    SnapshotsConfig, UiConfig,
 };
 use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
@@ -597,8 +597,8 @@ pub struct App {
     /// Set by the event loop after construction: whether a summarizer writes
     /// the memory's lines, which the inspector says when it does not.
     pub(crate) summarize_memory: bool,
-    /// Set by the event loop: `builtin_skills.pstack`, for the commands a remote `cd` rediscovers.
-    pub(crate) pstack: bool,
+    /// Set by the event loop: `builtin_skills.packs()`, for the commands a remote `cd` rediscovers.
+    pub(crate) skill_packs: SkillPacks,
     pub(super) task_picker: TaskPicker,
     task_picker_inputs: Option<tasks::PickerInputs>,
     pub(super) shell_modal: ShellModal,
@@ -972,7 +972,7 @@ impl App {
             learn_reads: learning::LearnReads::default(),
             learner: None,
             summarize_memory: true,
-            pstack: false,
+            skill_packs: SkillPacks::default(),
             task_picker: TaskPicker::new(),
             task_picker_inputs: None,
             shell_modal: ShellModal::new(),
@@ -6777,10 +6777,10 @@ impl App {
         }
     }
 
-    /// `builtin_skills.pstack` as saved now. A remote tab reads its commands from its own
+    /// `builtin_skills.packs()` as saved now. A remote tab reads its commands from its own
     /// project, so it rediscovers them here; a local one takes them from [`Self::reload_commands`].
-    pub(crate) fn set_pstack(&mut self, on: bool) {
-        self.pstack = on;
+    pub(crate) fn set_skill_packs(&mut self, packs: SkillPacks) {
+        self.skill_packs = packs;
         if self.settings_modal.is_open() {
             self.settings_modal.set_pstack(self.pstack_roles());
         }
@@ -6788,7 +6788,7 @@ impl App {
             && let Some(context) = &self.remote_project_context
         {
             self.command_palette.set_custom_commands(Arc::from(
-                caudra_agent::command::discover_remote_commands(context, on),
+                caudra_agent::command::discover_remote_commands(context, &self.skill_packs),
             ));
         }
     }
@@ -6839,7 +6839,7 @@ impl App {
             } else {
                 Arc::from(caudra_agent::command::discover_remote_commands(
                     &change.context,
-                    self.pstack,
+                    &self.skill_packs,
                 ))
             });
         self.workspace_session = Some(change.workspace);

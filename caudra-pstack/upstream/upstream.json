@@ -149,6 +149,17 @@
     "cursor-team-kit/skills/control-cli/SKILL.md": "13ac93e595bbda2000849bdb815d5f2ca03f7c2ca63788c8335f9212b9b422a2",
     "cursor-team-kit/skills/control-ui/SKILL.md": "410cae25bdb1e5d2323b126abc5047b0213be7fdb0195710213fa8de8a751871"
   },
+  "sources": {
+    "pstack/README.md": "095b3c4d9e4ceb11e01293d9bde7b0346a7a1262ad1f12b3394d3a0d1bef689b",
+    "pstack/skills/poteto-help/SKILL.md": "7022e2cd0d65d5964151444c4efa82a34792a6644210a0ba60d7d6cfa69c72b8",
+    "pstack/docs/guide/01-setup.md": "384655bdecc713122ca69a485723c58462002a1d512415e94e48597d0dce2fa5",
+    "pstack/docs/guide/02-poteto-mode.md": "d168829def6c410b1afd87d1a6eb297df385f89faa9b31260684074e9e4eb52a",
+    "pstack/docs/guide/03-understand.md": "1ac97cbad51c15c18b3aade8634d81c8bbe50d2b3135c75c113ddb2a6dcb7af0",
+    "pstack/docs/guide/04-design.md": "cff616278303b533e617c5c4408af6d28895edbb8687d6ce99bb5dd1f6644a6c",
+    "pstack/docs/guide/06-verify-and-ship.md": "9276f7a20f72c115536e0a12f08aa2e9699fcd7498c217d9a02a7149c7d3a4a8",
+    "pstack/docs/guide/07-overnight.md": "b767a5dc5d7257efdb5cc8cfac92acfbb18fe8e023a3438339f4b45ce4a9264a",
+    "pstack/docs/guide/10-recipes-and-pitfalls.md": "006d8282db567aeae57398d5de1f3a802af2e3ac1a1f564198c384183fca3f92"
+  },
   "ported_scripts": {
     "skills/poteto-mode/scripts/check-plan.mjs": "e58c3d871b09d477be00628d69dd23ffa6c2e3a1728f5b867a841baa8e90278b",
     "skills/poteto-mode/scripts/worktree-audit.sh": "e0a94e5e5b1ff60638916e440600e15851f7b79bc1a1d1f602fde05d465e2ec0",

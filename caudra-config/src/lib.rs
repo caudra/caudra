@@ -232,17 +232,22 @@ pub const DEFAULT_SKILL_DOCS: bool = true;
 /// Off for now: pstack is an opinionated third-party workflow, and turning it
 /// on also adds its `/pstack:` commands, task profiles and `code` calls.
 pub const DEFAULT_SKILL_PSTACK: bool = false;
+/// Off, like pstack: Matt Pocock's skills are another opinionated third-party
+/// workflow, and turning them on also adds their `/mattpocock:` commands.
+pub const DEFAULT_SKILL_MATTPOCOCK: bool = false;
 const SKILL_PLUGIN_DEV_FIELD: &str = "plugin_dev";
 const SKILL_WORKFLOW_DEV_FIELD: &str = "workflow_dev";
 const SKILL_AUTOMATION_DEV_FIELD: &str = "automation_dev";
 const SKILL_DOCS_FIELD: &str = "docs";
 const SKILL_PSTACK_FIELD: &str = "pstack";
-const SKILL_FIELDS: [&str; 5] = [
+const SKILL_MATTPOCOCK_FIELD: &str = "mattpocock";
+const SKILL_FIELDS: [&str; 6] = [
     SKILL_PLUGIN_DEV_FIELD,
     SKILL_WORKFLOW_DEV_FIELD,
     SKILL_AUTOMATION_DEV_FIELD,
     SKILL_DOCS_FIELD,
     SKILL_PSTACK_FIELD,
+    SKILL_MATTPOCOCK_FIELD,
 ];
 const TASK_MAX_CONCURRENT_FIELD: &str = "max_concurrent";
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
@@ -369,6 +374,16 @@ pub const SKILL_OPTIONS: &[ConfigField] = &[
         env: None,
         choices: &[],
         description: "Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`.",
+    },
+    ConfigField {
+        name: SKILL_MATTPOCOCK_FIELD,
+        ty: "boolean",
+        default: ConfigValue::Bool(DEFAULT_SKILL_MATTPOCOCK),
+        min: None,
+        max: None,
+        env: None,
+        choices: &[],
+        description: "Offer Matt Pocock's bundled skills (grilling, TDD, diagnosing bugs, code review, specs, tickets): the `mattpocock` skill and the `/mattpocock:` commands.",
     },
 ];
 
@@ -1170,6 +1185,7 @@ impl RawConfig {
                 .skill_flag(SKILL_AUTOMATION_DEV_FIELD, DEFAULT_SKILL_AUTOMATION_DEV)?,
             docs: self.skill_flag(SKILL_DOCS_FIELD, DEFAULT_SKILL_DOCS)?,
             pstack: self.skill_flag(SKILL_PSTACK_FIELD, DEFAULT_SKILL_PSTACK)?,
+            mattpocock: self.skill_flag(SKILL_MATTPOCOCK_FIELD, DEFAULT_SKILL_MATTPOCOCK)?,
         })
     }
 
@@ -3169,6 +3185,7 @@ pub struct BuiltinSkills {
     pub automation_dev: bool,
     pub docs: bool,
     pub pstack: bool,
+    pub mattpocock: bool,
 }
 
 impl Default for BuiltinSkills {
@@ -3179,8 +3196,26 @@ impl Default for BuiltinSkills {
             automation_dev: DEFAULT_SKILL_AUTOMATION_DEV,
             docs: DEFAULT_SKILL_DOCS,
             pstack: DEFAULT_SKILL_PSTACK,
+            mattpocock: DEFAULT_SKILL_MATTPOCOCK,
         }
     }
+}
+
+impl BuiltinSkills {
+    pub fn packs(&self) -> SkillPacks {
+        SkillPacks {
+            pstack: self.pstack,
+            mattpocock: self.mattpocock,
+        }
+    }
+}
+
+/// The vendored skill packs `[plugins.skill]` turns on, each with its
+/// `/<pack>:` commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillPacks {
+    pub pstack: bool,
+    pub mattpocock: bool,
 }
 
 #[derive(Debug, Clone, ConfigSection)]
@@ -8085,13 +8120,14 @@ allow = [\"list_issues\"]
         assert!(error.to_string().contains(expected), "{error}");
     }
 
-    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK ; "defaults")]
-    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK ; "plugin_dev_alone")]
-    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK ; "workflow_dev_alone")]
-    #[test_case("automation_dev = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, false, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK ; "automation_dev_alone")]
-    #[test_case("docs = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, false, DEFAULT_SKILL_PSTACK ; "docs_alone")]
-    #[test_case("pstack = true", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, true ; "pstack_alone")]
-    #[test_case("plugin_dev = true\nworkflow_dev = false\nautomation_dev = false\ndocs = false\npstack = true", true, false, false, false, true ; "all")]
+    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK, DEFAULT_SKILL_MATTPOCOCK ; "defaults")]
+    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK, DEFAULT_SKILL_MATTPOCOCK ; "plugin_dev_alone")]
+    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK, DEFAULT_SKILL_MATTPOCOCK ; "workflow_dev_alone")]
+    #[test_case("automation_dev = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, false, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK, DEFAULT_SKILL_MATTPOCOCK ; "automation_dev_alone")]
+    #[test_case("docs = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, false, DEFAULT_SKILL_PSTACK, DEFAULT_SKILL_MATTPOCOCK ; "docs_alone")]
+    #[test_case("pstack = true", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, true, DEFAULT_SKILL_MATTPOCOCK ; "pstack_alone")]
+    #[test_case("mattpocock = true", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS, DEFAULT_SKILL_PSTACK, true ; "mattpocock_alone")]
+    #[test_case("plugin_dev = true\nworkflow_dev = false\nautomation_dev = false\ndocs = false\npstack = true\nmattpocock = true", true, false, false, false, true, true ; "all")]
     fn skill_flags_are_read_independently(
         options: &str,
         plugin_dev: bool,
@@ -8099,6 +8135,7 @@ allow = [\"list_issues\"]
         automation_dev: bool,
         docs: bool,
         pstack: bool,
+        mattpocock: bool,
     ) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.skill]\n{options}\n")).unwrap();
         let config = raw.into_config(false).unwrap();
@@ -8110,14 +8147,15 @@ allow = [\"list_issues\"]
                 automation_dev,
                 docs,
                 pstack,
+                mattpocock,
             }
         );
     }
 
     #[test]
-    fn pstack_is_off_by_default() {
+    fn skill_packs_are_off_by_default() {
         let config = RawConfig::default().into_config(false).unwrap();
-        assert!(!config.agent.builtin_skills.pstack);
+        assert_eq!(config.agent.builtin_skills.packs(), SkillPacks::default());
     }
 
     #[test]

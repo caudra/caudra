@@ -63,6 +63,7 @@ pub mod scratch;
 pub mod session_fork;
 pub mod shell_environment;
 pub mod shell_eta;
+pub mod skill_pack;
 mod stored_session;
 mod subagent_history;
 pub mod template;

@@ -1,12 +1,13 @@
 //! The vendored pstack as pages: every file by its path in the plugin, the shorthands the skills'
 //! own routing uses, an index the `pstack` skill opens with, and a word search.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{LazyLock, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
-use caudra_docs::{SearchIndex, SearchReport};
-use include_dir::{Dir, File, include_dir};
-use serde::Deserialize;
+use caudra_skillpack::{
+    MARKDOWN, SKILLS_DIR, Skill, Upstream, body, files, first_sentence, frontmatter, text_file,
+};
+use include_dir::{Dir, include_dir};
 
 use crate::roles::{MODEL_ROLES_REF, RoleTable};
 
@@ -22,22 +23,9 @@ pub const SKILL_DESCRIPTION: &str = "poteto's pstack: rigorous engineering skill
      or one of its skills, or sends a `/pstack:<skill>` command; the index lists every skill.";
 const PSTACK_ROOT: &str = "pstack";
 const TEAM_KIT_ROOT: &str = "cursor-team-kit";
-const MANIFEST: &str = "upstream.json";
-const SKILLS_DIR: &str = "skills";
 const AGENTS_DIR: &str = "agents";
-const SKILL_FILE: &str = "SKILL.md";
-const README_FILE: &str = "README.md";
-const MARKDOWN: &str = ".md";
-const PRINCIPLE_PREFIX: &str = "principle-";
-const SEARCH_SEPARATOR: char = '?';
 const PATH_SEPARATOR: char = '/';
-const PARENT: &str = "..";
-const CURRENT: &str = ".";
-const SEARCH_LIMIT: usize = 8;
-const SEARCH_UNIT: &str = "page";
-/// The heading the search index puts above each page: its path.
-const PATH_HEADING: usize = 0;
-const SUGGESTION_LIMIT: usize = 5;
+const PRINCIPLE_PREFIX: &str = "principle-";
 /// Entry points the index lists first, in this order.
 const START_HERE: &[&str] = &["poteto-mode", "poteto-help"];
 /// Upstream files Caudra replaces with a feature of its own, by their path in the vendored tree:
@@ -49,29 +37,9 @@ const BENNY: &str = "automations/benny/README.md";
 const CAUDRA_AUTOMATIONS_DIR: &str = "caudra/automations";
 const AUTOMATION_EXTENSION: &str = "rhai";
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Upstream {
-    pub repository: String,
-    pub commit: String,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    /// One of the `cursor-team-kit` skills pstack routes to, bundled beside it.
-    pub team_kit: bool,
-}
-
-impl Skill {
-    pub fn is_principle(&self) -> bool {
-        self.name.starts_with(PRINCIPLE_PREFIX)
-    }
-
-    pub fn summary(&self) -> &str {
-        first_sentence(&self.description)
-    }
+/// A `principle-*` leaf, read from within other skills rather than run on its own.
+pub fn is_principle(skill: &Skill) -> bool {
+    skill.name.starts_with(PRINCIPLE_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,19 +49,10 @@ pub struct Agent {
     pub body: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Frontmatter {
-    name: Option<String>,
-    description: Option<String>,
-}
-
 pub struct Library {
     /// Every page by its path in the plugin, the team-kit skills under `skills/` beside pstack's.
-    pages: BTreeMap<String, &'static str>,
-    upstream: Upstream,
-    skills: Vec<Skill>,
+    pages: caudra_skillpack::Library,
     agents: Vec<Agent>,
-    search: OnceLock<SearchIndex>,
 }
 
 pub fn library() -> &'static Library {
@@ -124,39 +83,10 @@ impl Library {
         for (path, text) in files(&AUTOMATIONS).into_iter().filter_map(text_file) {
             pages.insert(format!("{CAUDRA_AUTOMATIONS_DIR}/{path}"), text);
         }
-        let manifest = UPSTREAM
-            .get_file(MANIFEST)
-            .and_then(File::contents_utf8)
-            .unwrap_or_default();
-        let upstream = serde_json::from_str(manifest).unwrap_or_else(|_| Upstream {
-            repository: String::new(),
-            commit: String::new(),
-            version: String::new(),
-        });
-        Self::new(pages, upstream)
+        Self::new(pages, Upstream::read(&UPSTREAM))
     }
 
     fn new(pages: BTreeMap<String, &'static str>, upstream: Upstream) -> Self {
-        let team_kit: Vec<String> = UPSTREAM
-            .get_dir(TEAM_KIT_ROOT)
-            .into_iter()
-            .flat_map(files)
-            .filter_map(|file| file.path().to_str())
-            .filter_map(skill_of)
-            .map(str::to_owned)
-            .collect();
-        let skills = pages
-            .iter()
-            .filter_map(|(path, text)| {
-                let name = skill_of(path)?;
-                let front = frontmatter(text);
-                Some(Skill {
-                    name: front.name.unwrap_or_else(|| name.to_owned()),
-                    description: front.description.unwrap_or_default().trim().to_owned(),
-                    team_kit: team_kit.iter().any(|kit| kit == name),
-                })
-            })
-            .collect();
         let agents = pages
             .iter()
             .filter_map(|(path, text)| {
@@ -173,20 +103,21 @@ impl Library {
             })
             .collect();
         Self {
-            pages,
-            upstream,
-            skills,
+            pages: caudra_skillpack::Library::new(NAME, pages, upstream),
             agents,
-            search: OnceLock::new(),
         }
     }
 
+    pub fn pages(&self) -> &caudra_skillpack::Library {
+        &self.pages
+    }
+
     pub fn upstream(&self) -> &Upstream {
-        &self.upstream
+        self.pages.upstream()
     }
 
     pub fn skills(&self) -> &[Skill] {
-        &self.skills
+        self.pages.skills()
     }
 
     pub fn agents(&self) -> &[Agent] {
@@ -196,10 +127,8 @@ impl Library {
     /// What loading `pstack` itself returns: how to read the rest, the entry points, every
     /// skill, and the user's model roles.
     pub fn index(&self, roles: &RoleTable) -> String {
-        let Upstream {
-            version, commit, ..
-        } = &self.upstream;
-        let short: String = commit.chars().take(9).collect();
+        let version = &self.upstream().version;
+        let short = self.upstream().short_commit();
         let mut index = format!(
             "# pstack {version}\n\n\
              poteto's skills for rigorous engineering, bundled from cursor/plugins at `{short}`. \
@@ -210,24 +139,24 @@ impl Library {
              `/{NAME}:<skill>` command.\n\n## Start here\n\n"
         );
         for name in START_HERE {
-            if let Some(skill) = self.skill(name) {
-                index.push_str(&entry(skill));
+            if let Some(skill) = self.pages.skill(name) {
+                index.push_str(&self.pages.entry(skill));
             }
         }
         index.push_str(&format!(
             "- `{NAME}/{GUIDE}`: the pstack guide, a first real task from setup to overnight runs.\n\n## Skills\n\n"
         ));
         let listed = self
-            .skills
+            .skills()
             .iter()
-            .filter(|skill| !skill.is_principle() && !START_HERE.contains(&skill.name.as_str()));
+            .filter(|skill| !is_principle(skill) && !START_HERE.contains(&skill.name.as_str()));
         for skill in listed {
-            index.push_str(&entry(skill));
+            index.push_str(&self.pages.entry(skill));
         }
         let principles: Vec<String> = self
-            .skills
+            .skills()
             .iter()
-            .filter(|skill| skill.is_principle())
+            .filter(|skill| is_principle(skill))
             .map(|skill| format!("`{NAME}/{}`", skill.name))
             .collect();
         index.push_str(&format!(
@@ -256,143 +185,17 @@ impl Library {
     /// One page by the address that follows `pstack`: `/path`, or `?words` to search. A page that
     /// points at the model roles ends with `roles`.
     pub fn load(&self, address: &str, roles: &RoleTable) -> Result<String, String> {
-        if let Some(words) = address.strip_prefix(SEARCH_SEPARATOR) {
-            return Ok(self.search(words));
+        let loaded = self.pages.load(address)?;
+        let mut text = loaded.text;
+        if loaded
+            .page
+            .is_some_and(|page| page.contains(MODEL_ROLES_REF))
+        {
+            text.push_str("\n\n");
+            text.push_str(&roles.render());
         }
-        let requested = address.trim_start_matches(PATH_SEPARATOR);
-        let path = normalize(requested).ok_or_else(|| {
-            format!("`{NAME}/{requested}` leaves pstack; addresses stay inside the plugin")
-        })?;
-        if let Some((found, text)) = self.page(&path) {
-            let mut page = headed(&found, text);
-            if text.contains(MODEL_ROLES_REF) {
-                page.push_str("\n\n");
-                page.push_str(&roles.render());
-            }
-            return Ok(page);
-        }
-        if let Some(listing) = self.listing(&path) {
-            return Ok(listing);
-        }
-        Err(self.not_found(&path))
+        Ok(text)
     }
-
-    /// The page an address names: the exact file, a directory's `SKILL.md` or `README.md`, or the
-    /// same under `skills/`.
-    fn page(&self, path: &str) -> Option<(String, &'static str)> {
-        let under_skills = format!("{SKILLS_DIR}/{path}");
-        [path, under_skills.as_str()]
-            .into_iter()
-            .flat_map(|base| {
-                [
-                    base.to_owned(),
-                    format!("{base}/{SKILL_FILE}"),
-                    format!("{base}/{README_FILE}"),
-                ]
-            })
-            .find_map(|candidate| {
-                let text = self.pages.get(&candidate)?;
-                Some((candidate, *text))
-            })
-    }
-
-    fn listing(&self, path: &str) -> Option<String> {
-        let prefixes = match path.is_empty() {
-            true => vec![String::new()],
-            false => vec![format!("{path}/"), format!("{SKILLS_DIR}/{path}/")],
-        };
-        prefixes.into_iter().find_map(|prefix| {
-            let entries: Vec<String> = self
-                .pages
-                .keys()
-                .filter(|key| key.starts_with(&prefix))
-                .map(|key| format!("- `{NAME}/{key}`"))
-                .collect();
-            (!entries.is_empty())
-                .then(|| format!("`{NAME}/{prefix}` holds:\n\n{}", entries.join("\n")))
-        })
-    }
-
-    /// The pages that contain every word, ranked as `caudra-docs?<words>` ranks sections, each by
-    /// its best section.
-    fn search(&self, words: &str) -> String {
-        let query = words.trim();
-        if query.is_empty() {
-            return format!("Search with `{NAME}?<words>`, such as `{NAME}?flaky test`.");
-        }
-        let mut search = self.search_index().search(query, usize::MAX);
-        let mut pages = HashSet::new();
-        search.hits.retain(|hit| pages.insert(hit.page));
-        search.matched = search.hits.len();
-        search.hits.truncate(SEARCH_LIMIT);
-        let no_match = format!("No pstack page contains every word of `{query}`.");
-        let mut report = SearchReport::new(&search, query, NAME, SEARCH_UNIT, &no_match);
-        for hit in &search.hits {
-            let Some((path, text)) = self.pages.iter().nth(hit.page) else {
-                continue;
-            };
-            let place = (hit.heading != PATH_HEADING).then_some(hit.title.as_str());
-            report.entry(&format!("{NAME}/{path}"), place, text.len(), &hit.snippet);
-        }
-        report.finish()
-    }
-
-    /// Every page in path order under a heading naming its path, so a page without headings of
-    /// its own, such as a script, is searched too.
-    fn search_index(&self) -> &SearchIndex {
-        self.search.get_or_init(|| {
-            let bodies: Vec<String> = self
-                .pages
-                .iter()
-                .map(|(path, text)| format!("# {path}\n\n{}", body(text)))
-                .collect();
-            SearchIndex::from_markdown(bodies.iter().map(String::as_str))
-        })
-    }
-
-    fn not_found(&self, path: &str) -> String {
-        let last = path.rsplit(PATH_SEPARATOR).next().unwrap_or(path);
-        let mut near: Vec<&String> = self
-            .pages
-            .keys()
-            .filter(|key| !last.is_empty() && key.contains(last))
-            .take(SUGGESTION_LIMIT)
-            .collect();
-        if near.is_empty() {
-            let mut ranked: Vec<(usize, &String)> = self
-                .pages
-                .keys()
-                .map(|key| (distance(last, key_stem(key)), key))
-                .collect();
-            ranked.sort();
-            near = ranked
-                .into_iter()
-                .take(SUGGESTION_LIMIT)
-                .map(|(_, key)| key)
-                .collect();
-        }
-        let near: Vec<String> = near.iter().map(|key| format!("`{NAME}/{key}`")).collect();
-        format!(
-            "pstack has no page `{NAME}/{path}`. Closest: {}. Load `{NAME}` for the index.",
-            near.join(", ")
-        )
-    }
-
-    fn skill(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|skill| skill.name == name)
-    }
-}
-
-fn files(dir: &'static Dir<'static>) -> Vec<&'static File<'static>> {
-    let mut found: Vec<&'static File<'static>> = dir.files().collect();
-    for child in dir.dirs() {
-        found.extend(files(child));
-    }
-    found
-}
-
-fn text_file(file: &'static File<'static>) -> Option<(&'static str, &'static str)> {
-    Some((file.path().to_str()?, file.contents_utf8()?))
 }
 
 /// Every text file under the pstack and team-kit roots of a vendored tree, by its path in that
@@ -423,102 +226,10 @@ fn page_key(path: &str) -> String {
     }
 }
 
-/// `skills/<name>/SKILL.md`'s name, under either root.
-fn skill_of(path: &str) -> Option<&str> {
-    let path = path.strip_prefix(TEAM_KIT_ROOT).unwrap_or(path);
-    let rest = path
-        .trim_start_matches(PATH_SEPARATOR)
-        .strip_prefix(SKILLS_DIR)?
-        .strip_prefix(PATH_SEPARATOR)?;
-    let (name, file) = rest.split_once(PATH_SEPARATOR)?;
-    (file == SKILL_FILE).then_some(name)
-}
-
-fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
-    let Some(rest) = text.strip_prefix("---\n") else {
-        return (None, text);
-    };
-    match rest.find("\n---") {
-        Some(end) => {
-            let after = &rest[end + 4..];
-            (Some(&rest[..end]), after.trim_start_matches('\n'))
-        }
-        None => (None, text),
-    }
-}
-
-fn frontmatter(text: &str) -> Frontmatter {
-    split_frontmatter(text)
-        .0
-        .and_then(|yaml| serde_yaml::from_str(yaml).ok())
-        .unwrap_or_default()
-}
-
-fn body(text: &str) -> &str {
-    split_frontmatter(text).1
-}
-
-/// Resolves `.` and `..` and drops empty segments; `None` when the path climbs out of the plugin.
-fn normalize(path: &str) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split(PATH_SEPARATOR) {
-        match part {
-            "" | CURRENT => {}
-            PARENT => {
-                parts.pop()?;
-            }
-            part => parts.push(part),
-        }
-    }
-    Some(parts.join("/"))
-}
-
-fn headed(path: &str, text: &str) -> String {
-    let dir = path.rsplit_once(PATH_SEPARATOR).map_or("", |(dir, _)| dir);
-    format!(
-        "Page `{NAME}/{path}`. A relative path in it resolves against `{NAME}/{dir}/`.\n\n{text}"
-    )
-}
-
-fn entry(skill: &Skill) -> String {
-    format!("- `{NAME}/{}`: {}\n", skill.name, skill.summary())
-}
-
-fn first_sentence(text: &str) -> &str {
-    text.find(". ").map_or(text, |end| &text[..=end])
-}
-
-fn key_stem(key: &str) -> &str {
-    let key = key
-        .strip_suffix(SKILL_FILE)
-        .unwrap_or(key)
-        .trim_end_matches(PATH_SEPARATOR);
-    key.rsplit(PATH_SEPARATOR).next().unwrap_or(key)
-}
-
-fn distance(left: &str, right: &str) -> usize {
-    let right: Vec<char> = right.chars().collect();
-    let mut row: Vec<usize> = (0..=right.len()).collect();
-    for (i, a) in left.chars().enumerate() {
-        let mut previous = row[0];
-        row[0] = i + 1;
-        for (j, b) in right.iter().enumerate() {
-            let current = row[j + 1];
-            row[j + 1] = (previous + usize::from(a != *b))
-                .min(row[j] + 1)
-                .min(current + 1);
-            previous = current;
-        }
-    }
-    row[right.len()]
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
+    use caudra_skillpack::{SEARCH_LIMIT, checks, skill_of};
     use regex::Regex;
-    use sha2::{Digest, Sha256};
     use test_case::test_case;
 
     use super::*;
@@ -529,17 +240,6 @@ mod tests {
     const BUGBOT_CORRECTION: &str =
         "No word in pstack starts with \"bugbto\", so it also matched \"bugbot\".";
     const MISSING_SKILL_MSG: &str = "the index must list every skill that is not a principle";
-    const DANGLING_MSG: &str = "a relative link must resolve to a page";
-    const NAME_MISMATCH_MSG: &str = "a skill's frontmatter name must be its directory";
-    const DRIFT_MSG: &str = "upstream.json must hash every vendored file; run `make sync-pstack`";
-    const UNTRANSLATED_MSG: &str =
-        "these lines still name Cursor; translate them with the pstack-translate skill";
-    const BARE_COMMAND_MSG: &str = "a command the user types is `/pstack:<name>`";
-    const ORPHAN_MSG: &str = "a translation's upstream file is gone; delete or move it";
-    const STALE_MSG: &str = "upstream changed since this translation; retranslate it, then \
-         `scripts/sync-pstack.py --mark` it";
-    const TRANSLATIONS: &str = "translations.json";
-    const UNLISTED_MSG: &str = "translations.json must list exactly the translated files";
     /// Links upstream writes as templates for the model to fill in.
     const PLACEHOLDER_LINKS: &[&str] = &["url"];
 
@@ -565,6 +265,10 @@ mod tests {
         )
     }
 
+    fn pages() -> &'static BTreeMap<String, &'static str> {
+        library().pages().pages()
+    }
+
     fn pointing_library() -> Library {
         let upstream = library().upstream().clone();
         Library::new(
@@ -588,7 +292,7 @@ mod tests {
         let page = library().load("/skills/how/SKILL.md", &roles()).unwrap();
         assert_eq!(
             page.contains(ROLES_HEADING),
-            library().pages["skills/how/SKILL.md"].contains(MODEL_ROLES_REF)
+            pages()["skills/how/SKILL.md"].contains(MODEL_ROLES_REF)
         );
     }
 
@@ -606,9 +310,12 @@ mod tests {
                 "{VANISHED_MSG}: {retired}"
             );
             let key = page_key(retired);
-            assert!(!library().pages.contains_key(&key), "{UNSERVED_MSG}: {key}");
+            assert!(!pages().contains_key(&key), "{UNSERVED_MSG}: {key}");
             if let Some(name) = skill_of(&key) {
-                assert!(library().skill(name).is_none(), "{UNSERVED_MSG}: {name}");
+                assert!(
+                    library().pages().skill(name).is_none(),
+                    "{UNSERVED_MSG}: {name}"
+                );
                 let found = library().load(&format!("?{name}"), &roles()).unwrap();
                 assert!(!found.contains(&key), "{UNSERVED_MSG}: {found}");
             }
@@ -618,8 +325,7 @@ mod tests {
     #[test]
     fn a_page_naming_a_kinds_rows_points_at_the_roles_table() {
         let kind_rows = Regex::new(KIND_ROWS).unwrap();
-        let unpointed: Vec<&String> = library()
-            .pages
+        let unpointed: Vec<&String> = pages()
             .iter()
             .filter(|(_, text)| kind_rows.is_match(text) && !text.contains(MODEL_ROLES_REF))
             .map(|(page, _)| page)
@@ -628,9 +334,7 @@ mod tests {
     }
 
     #[test_case("/poteto-mode", "skills/poteto-mode/SKILL.md" ; "skill_shorthand")]
-    #[test_case("/skills/how/SKILL.md", "skills/how/SKILL.md" ; "full_path")]
     #[test_case("/poteto-mode/playbooks/bug-fix.md", "skills/poteto-mode/playbooks/bug-fix.md" ; "skill_relative_file")]
-    #[test_case("/skills/poteto-mode/../how/SKILL.md", "skills/how/SKILL.md" ; "parent_segment")]
     #[test_case("/docs/guide", "docs/guide/README.md" ; "directory_readme")]
     #[test_case("/deslop", "skills/deslop/SKILL.md" ; "team_kit_skill")]
     #[test_case("/agents/poteto-agent.md", "agents/poteto-agent.md" ; "agent")]
@@ -643,7 +347,7 @@ mod tests {
     #[test]
     fn a_translation_replaces_its_upstream_page() {
         for (path, text) in vendored(&TRANSLATED) {
-            assert_eq!(library().pages[&page_key(path)], text, "{path}");
+            assert_eq!(pages()[&page_key(path)], text, "{path}");
         }
     }
 
@@ -654,24 +358,18 @@ mod tests {
         let stems: Vec<&str> = automations().map(|(stem, _)| stem).collect();
         assert_eq!(
             stems.len(),
-            library()
-                .pages
+            pages()
                 .keys()
                 .filter(|path| path.starts_with(CAUDRA_AUTOMATIONS_DIR))
                 .count()
         );
         for stem in stems {
             let arm = format!("{ARM_COMMAND} {stem}");
-            let named = library().pages.iter().any(|(page, text)| {
+            let named = pages().iter().any(|(page, text)| {
                 !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && text.contains(&arm)
             });
             assert!(named, "{UNNAMED_MSG}: {arm}");
         }
-    }
-
-    #[test]
-    fn an_address_cannot_climb_out_of_the_plugin() {
-        assert!(library().load("/../../etc/passwd", &roles()).is_err());
     }
 
     #[test]
@@ -681,12 +379,6 @@ mod tests {
             error.contains("`pstack/skills/poteto-mode/SKILL.md`"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn a_directory_without_an_index_lists_its_pages() {
-        let listing = library().load("/poteto-mode/playbooks", &roles()).unwrap();
-        assert!(listing.contains("`pstack/skills/poteto-mode/playbooks/feature.md`"));
     }
 
     #[test_case("bugbot triage", "skills/poteto-mode/references/bugbot-triage.md" ; "terms_in_the_path_heading")]
@@ -710,7 +402,7 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with(SEARCH_ENTRY))
             .collect();
-        let distinct: BTreeSet<&str> = addresses.iter().copied().collect();
+        let distinct: std::collections::BTreeSet<&str> = addresses.iter().copied().collect();
         assert_eq!(addresses.len(), SEARCH_LIMIT, "{found}");
         assert_eq!(distinct.len(), addresses.len(), "{found}");
     }
@@ -735,101 +427,36 @@ mod tests {
                 skill.name
             );
         }
-        assert!(library().skill(POTETO_MODE).is_some());
+        assert!(library().pages().skill(POTETO_MODE).is_some());
     }
 
     #[test]
     fn every_skill_is_named_by_its_directory() {
-        for (path, text) in &library().pages {
-            if let Some(directory) = skill_of(path) {
-                assert_eq!(
-                    frontmatter(text).name.as_deref(),
-                    Some(directory),
-                    "{NAME_MISMATCH_MSG}"
-                );
-            }
-        }
+        checks::every_skill_is_named_by_its_directory(library().pages());
     }
 
     #[test]
     fn every_relative_link_resolves_to_a_page() {
-        let link = Regex::new(r"\]\(([^)\s]+)\)").unwrap();
-        for (path, text) in &library().pages {
-            if !path.ends_with(MARKDOWN) {
-                continue;
-            }
-            let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            for capture in link.captures_iter(text) {
-                let href = capture[1].split(['#', '?']).next().unwrap_or_default();
-                if href.is_empty() || href.contains(':') || PLACEHOLDER_LINKS.contains(&href) {
-                    continue;
-                }
-                let target = normalize(&format!("{dir}/{href}")).unwrap();
-                let found =
-                    library().page(&target).is_some() || library().listing(&target).is_some();
-                assert!(found, "{DANGLING_MSG}: {path} -> {href}");
-            }
-        }
+        checks::every_relative_link_resolves(library().pages(), PLACEHOLDER_LINKS);
     }
 
     #[test]
     fn the_manifest_hashes_every_vendored_file() {
-        let manifest: serde_json::Value = serde_json::from_str(
-            UPSTREAM
-                .get_file(MANIFEST)
-                .unwrap()
-                .contents_utf8()
-                .unwrap(),
-        )
-        .unwrap();
-        let listed: BTreeSet<String> = manifest["files"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        let mut vendored = BTreeSet::new();
-        for file in files(&UPSTREAM) {
-            let path = file.path().to_str().unwrap();
-            if path == MANIFEST {
-                continue;
-            }
-            let digest: String = Sha256::digest(file.contents())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            assert_eq!(manifest["files"][path], digest, "{DRIFT_MSG}: {path}");
-            vendored.insert(path.to_owned());
-        }
-        assert_eq!(vendored, listed, "{DRIFT_MSG}");
+        checks::the_manifest_hashes_every_vendored_file(library().pages(), &UPSTREAM);
     }
 
-    /// The upstream hash each translation was made from must still be upstream's, so a sync that
-    /// changes a translated file fails here until the translation follows it.
     #[test]
     fn every_translation_follows_its_upstream_file() {
-        let read = |dir: &Dir<'static>, file: &str| -> serde_json::Value {
-            serde_json::from_str(dir.get_file(file).unwrap().contents_utf8().unwrap()).unwrap()
-        };
-        let upstream = read(&UPSTREAM, MANIFEST);
-        let recorded = read(&TRANSLATED, TRANSLATIONS);
-        let recorded = recorded["files"].as_object().unwrap();
-        let translated: BTreeSet<&str> = vendored(&TRANSLATED)
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect();
-        for path in &translated {
-            let base = &upstream["files"][*path];
-            assert!(!base.is_null(), "{ORPHAN_MSG}: {path}");
-            assert_eq!(recorded.get(*path), Some(base), "{STALE_MSG}: {path}");
-        }
-        let listed: BTreeSet<&str> = recorded.keys().map(String::as_str).collect();
-        assert_eq!(listed, translated, "{UNLISTED_MSG}");
+        checks::every_translation_follows_its_upstream_file(
+            library().pages(),
+            &UPSTREAM,
+            &TRANSLATED,
+        );
     }
 
     /// Every served page reads as Caudra's: a page that still names one of these was not
-    /// translated. `.caudra/skills/pstack-translate` says what each becomes. A hard-coded `/tmp`
-    /// counts: Caudra gives each project a scratch directory, and writes outside it prompt.
+    /// translated. `.caudra/skills/skillpack-translate` says what each becomes. A hard-coded
+    /// `/tmp` counts: Caudra gives each project a scratch directory, and writes outside it prompt.
     const CURSOR_TERMS: &[&str] = &[
         r"`Task`|\bTask (tool|subagent|call)s?\b",
         r"AskQuestion",
@@ -869,57 +496,22 @@ mod tests {
     ];
     const LICENSE_FILE: &str = "LICENSE";
 
-    fn untranslated(term: &Regex) -> Vec<String> {
-        library()
-            .pages
-            .iter()
-            .filter(|(page, _)| {
-                !page.starts_with(CAUDRA_AUTOMATIONS_DIR) && !page.ends_with(LICENSE_FILE)
-            })
-            .filter(|(page, _)| {
-                !CURSOR_TERMS_ALLOWED
-                    .iter()
-                    .any(|(allowed, pattern)| allowed == page && *pattern == term.as_str())
-            })
-            .flat_map(|(page, text)| {
-                text.lines()
-                    .enumerate()
-                    .filter(|(_, line)| term.is_match(line))
-                    .map(move |(number, line)| format!("{page}:{}: {}", number + 1, line.trim()))
-            })
-            .collect()
+    fn unread(page: &str) -> bool {
+        page.starts_with(CAUDRA_AUTOMATIONS_DIR) || page.ends_with(LICENSE_FILE)
     }
 
     #[test]
     fn no_page_names_a_cursor_term() {
-        let found: Vec<String> = CURSOR_TERMS
-            .iter()
-            .flat_map(|pattern| untranslated(&Regex::new(pattern).unwrap()))
-            .collect();
-        assert!(
-            found.is_empty(),
-            "{UNTRANSLATED_MSG}:\n{}",
-            found.join("\n")
+        checks::no_page_names_a_foreign_term(
+            library().pages(),
+            CURSOR_TERMS,
+            CURSOR_TERMS_ALLOWED,
+            unread,
         );
     }
 
     #[test]
     fn a_skill_command_carries_the_pstack_scope() {
-        let names: Vec<String> = library()
-            .skills()
-            .iter()
-            .map(|skill| regex::escape(&skill.name))
-            .collect();
-        let bare = Regex::new(&format!(
-            r"(?m)(^|[\s`(\[*'])/({})($|[^\w-])",
-            names.join("|")
-        ))
-        .unwrap();
-        let found = untranslated(&bare);
-        assert!(
-            found.is_empty(),
-            "{BARE_COMMAND_MSG}:\n{}",
-            found.join("\n")
-        );
+        checks::every_skill_command_carries_the_scope(library().pages(), unread);
     }
 }

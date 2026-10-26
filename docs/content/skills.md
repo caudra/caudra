@@ -146,6 +146,44 @@ The lane is the one `caudra models` and the `# Model favorites` reminder show. A
 
 Open `/settings` and its **pstack** tab, the last one, shown while pstack is on, to choose a kind's model. `Enter` opens the model list with `inherit` and your favorites first, `t` changes a row's thinking level, and `R` returns the kind to automatic. On the Effort row, `Enter` steps the default effort and `R` restores `xhigh`. A Panel or Cross-judge pool has a line per seat, `+ add seat` adds one, and `d` removes one. The choices are saved globally with your model jobs and apply the next time a page loads, in every session, including `--print` and ACP. A saved model you can no longer use, because it is unstarred and Caudra cannot resolve it or `allowed_models` rules it out, is replaced by the automatic choice, and the table says so. With `agent.task_model_choice = false`, `task` has no `model` or `thinking`, so every kind runs as `inherit`.
 
+### mattpocock
+
+It is off by default. [mattpocock](https://github.com/mattpocock/skills) is Matt Pocock's set of small engineering disciplines, bundled under its MIT license. Caudra ships 16 of them, the ones that work in any repository. `mattpocock = true` adds two things:
+
+- The `mattpocock` skill, one line in the `skill` tool's list. Its description names the work that makes the agent reach for it, such as test-first building or a hard bug.
+- A `/mattpocock:<name>` command for every skill. `/mattpocock:grill-me the cache rewrite` tells the agent to load `mattpocock/grill-me` and follow it for that request.
+
+| Who starts it | Skills |
+|---|---|
+| The agent, when the work calls for it, or you | `grilling`, `domain-modeling`, `codebase-design`, `tdd`, `diagnosing-bugs`, `code-review`, `pr`, `writing-for-agents` |
+| Only you, with its command | `grill-me`, `grill-with-docs`, `improve-codebase-architecture`, `to-spec`, `to-tickets`, `to-questionnaire`, `handoff`, `retro` |
+
+The index splits the skills the same way, and the agent loads a skill from the second row only when you send its command. Addresses work as they do for pstack: `mattpocock`, `mattpocock/tdd`, `mattpocock/tdd/mocking.md` and `mattpocock?seam`.
+
+Upstream wrote the skills for Claude Code. Caudra translates them and adapts a few to how it works:
+
+- Grilling asks each round through the `question` tool, with the recommended answer first and room to type your own. In a run without the `question` tool, the agent asks in numbered plain text instead.
+- `tdd` adds a refactor step after each test turns green.
+- `improve-codebase-architecture` writes its report as Markdown with Mermaid diagrams, and as HTML only when you ask.
+- No skill commits or pushes on its own, and in Plan mode the documents a skill writes go to the plan.
+- Upstream's setup skill is replaced by one page that finds your issue tracker: the project's `AGENTS.md`, then the git remote, then local Markdown files under `.scratch/`.
+
+#### mattpocock and pstack
+
+Both packs can be on at once, and each keeps its own commands, so `/pstack:tdd` and `/mattpocock:tdd` sit side by side. pstack is one opinionated way of working, with orchestration, playbooks and model roles. mattpocock is a set of disciplines you pick one at a time.
+
+| Work | pstack | mattpocock |
+|---|---|---|
+| Tests | `tdd` writes tests first only when you ask, and may skip tests that are impractical | `tdd` agrees the seams up front and builds in vertical slices |
+| Bugs | the bug-fix playbook, alongside Caudra's `/root-cause` | `diagnosing-bugs`: a feedback loop first, then minimise, hypothesise and instrument |
+| Review | `interrogate` reviews adversarially across several models | `code-review` checks the change against standards and against the spec in parallel |
+| Architecture | `architect` designs and builds alternatives, and `how` explains existing code | `improve-codebase-architecture` surveys where modules could be deeper |
+| Interviews and specs | `in-your-own-words` restates what you asked for | grilling, domain modeling with a glossary and ADRs, specs, tickets and questionnaires |
+| Handing over | `ketchup` summarises live state, beside Caudra's `/btw`, `/catchup` and `/fork` | `handoff` writes a document another session or person can pick up |
+| Retrospective | `reflect` turns lessons into skill edits, beside Caudra's `/learn` | `retro` improves the agent's environment |
+
+The `pr` skill's Summary section comes from [Dex Horthy](https://github.com/dexhorthy)'s `show-me` skill, credited in `mattpocock/pr/CREDITS.md`.
+
 Each builtin has a switch under `plugins.skill`:
 
 ```toml
@@ -153,9 +191,10 @@ Each builtin has a switch under `plugins.skill`:
 [plugins.skill]
 automation_dev = true
 docs = false
+mattpocock = true
 plugin_dev = true
 pstack = true
 workflow_dev = false
 ```
 
-`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working. `pstack = false` removes the skill, its commands, its profiles and its `code` calls. While the terminal UI runs, switching `pstack` applies as soon as you save the file.
+`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working. `pstack = false` removes the skill, its commands, its profiles and its `code` calls, and `mattpocock = false` removes its skill and commands. While the terminal UI runs, switching `pstack` or `mattpocock` applies as soon as you save the file.
