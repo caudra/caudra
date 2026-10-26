@@ -17,6 +17,7 @@
 //! transaction as the structured delete because SQLite cannot atomically remove
 //! those files.
 
+use std::array;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_int};
@@ -86,7 +87,7 @@ use crate::workflow_scratch::{remove_session as remove_scratch_session, session_
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
     StateClass, StateDir, StorageError, existing_state_lock, lock_session_artifacts,
-    lock_session_artifacts_within, shared_existing_state_lock, shared_state_lock,
+    lock_session_artifacts_within, paths, shared_existing_state_lock, shared_state_lock,
     sync_parent_dir_durable, try_exclusive_existing_state_lock,
 };
 
@@ -194,8 +195,11 @@ const NO_NAMED_HOLDERS: &str =
     "another Caudra process, a storage command, or a reader has it open; close it and start again";
 const NAMED_HOLDERS: &str = "close these open sessions and start again:";
 const UNKNOWN_SESSION_TITLE: &str = "<untitled>";
+const UNKNOWN_PROJECT: &str = "-";
+const HOME_TILDE: &str = "~";
 const PID_HEADER: &str = "PID";
 const SESSION_HEADER: &str = "SESSION";
+const PROJECT_HEADER: &str = "PROJECT";
 const TITLE_HEADER: &str = "TITLE";
 const UNKNOWN_PID: &str = "-";
 const COLUMN_GAP: &str = "  ";
@@ -5321,47 +5325,62 @@ fn describe_migration_holders(state_dir: &StateDir, path: &Path) -> String {
     if held.is_empty() {
         return NO_NAMED_HOLDERS.to_owned();
     }
-    let titles = session_titles(path);
-    let rows: Vec<[String; 3]> = held
+    let mut names = session_names(path);
+    let home = paths::home();
+    let rows: Vec<[String; 4]> = held
         .into_iter()
         .map(|session| {
-            [
-                session
-                    .pid
-                    .map_or_else(|| UNKNOWN_PID.to_owned(), |pid| pid.to_string()),
-                session.id.to_string(),
-                titles
-                    .get(&session.id)
-                    .map_or(UNKNOWN_SESSION_TITLE, String::as_str)
-                    .to_owned(),
-            ]
+            let pid = session
+                .pid
+                .map_or_else(|| UNKNOWN_PID.to_owned(), |pid| pid.to_string());
+            let (project, title) = match names.remove(&session.id) {
+                Some(SessionNames { title, cwd }) => (home_relative(cwd, home.as_deref()), title),
+                None => (UNKNOWN_PROJECT.to_owned(), UNKNOWN_SESSION_TITLE.to_owned()),
+            };
+            [pid, session.id.to_string(), project, title]
         })
         .collect();
     holder_table(&rows)
 }
 
-/// [`NAMED_HOLDERS`] over a table of PID, session and title, one row per
-/// held session. The title comes last and unpadded, so no line ends in
+/// [`NAMED_HOLDERS`] over a table of PID, session, project and title, one row
+/// per held session. The title comes last and unpadded, so no line ends in
 /// spaces.
-fn holder_table(rows: &[[String; 3]]) -> String {
-    let width = |column: usize, header: &str| {
+fn holder_table(rows: &[[String; 4]]) -> String {
+    let headers = [PID_HEADER, SESSION_HEADER, PROJECT_HEADER, TITLE_HEADER];
+    let widths: [usize; 3] = array::from_fn(|column| {
         rows.iter()
             .map(|row| row[column].len())
-            .fold(header.len(), usize::max)
-    };
-    let (pid_width, session_width) = (width(0, PID_HEADER), width(1, SESSION_HEADER));
-    let line = |pid: &str, session: &str, title: &str| {
-        let line = format!(
-            "\n{TABLE_INDENT}{pid:<pid_width$}{COLUMN_GAP}{session:<session_width$}{COLUMN_GAP}{title}"
-        );
+            .fold(headers[column].len(), usize::max)
+    });
+    let line = |cells: [&str; 4]| {
+        let mut line = String::from("\n");
+        line.push_str(TABLE_INDENT);
+        for (cell, width) in cells.iter().zip(widths) {
+            line.push_str(&format!("{cell:<width$}{COLUMN_GAP}"));
+        }
+        line.push_str(cells[3]);
         line.trim_end().to_owned()
     };
     let mut table = String::from(NAMED_HOLDERS);
-    table.push_str(&line(PID_HEADER, SESSION_HEADER, TITLE_HEADER));
-    for [pid, session, title] in rows {
-        table.push_str(&line(pid, session, title));
+    table.push_str(&line(headers));
+    for row in rows {
+        table.push_str(&line(row.each_ref().map(String::as_str)));
     }
     table
+}
+
+/// `cwd` with the home directory spelled `~`, the way a user names a project
+/// they have open in a terminal.
+fn home_relative(cwd: String, home: Option<&Path>) -> String {
+    let Some(rest) = home.and_then(|home| Path::new(&cwd).strip_prefix(home).ok()) else {
+        return cwd;
+    };
+    if rest.as_os_str().is_empty() {
+        HOME_TILDE.to_owned()
+    } else {
+        format!("{HOME_TILDE}{MAIN_SEPARATOR}{}", rest.display())
+    }
 }
 
 /// [`describe_migration_holders`] for whatever holds the instance lock on the
@@ -5376,13 +5395,21 @@ pub fn describe_open_sessions(state_dir: &StateDir) -> String {
 /// The title of every session in the persistent database of `state_dir`,
 /// read-only and best effort, for naming the sessions that hold a lock.
 pub fn persistent_session_titles(state_dir: &StateDir) -> HashMap<CaudraId, String> {
-    session_titles(&state_dir.persistent_path().join(SESSIONS_DB_FILE))
+    session_names(&state_dir.persistent_path().join(SESSIONS_DB_FILE))
+        .into_iter()
+        .map(|(id, names)| (id, names.title))
+        .collect()
 }
 
-/// Reads titles straight from the old schema. Every version of `sessions` has
-/// carried `id` and `title`, so this works without the migration that is being
-/// blocked, and a failure to read simply leaves the ids unadorned.
-fn session_titles(path: &Path) -> HashMap<CaudraId, String> {
+struct SessionNames {
+    title: String,
+    cwd: String,
+}
+
+/// Reads names straight from the old schema. Every version of `sessions` has
+/// carried `id`, `title` and `cwd`, so this works without the migration that is
+/// being blocked, and a failure to read simply leaves the ids unadorned.
+fn session_names(path: &Path) -> HashMap<CaudraId, SessionNames> {
     let Ok(connection) = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -5391,18 +5418,23 @@ fn session_titles(path: &Path) -> HashMap<CaudraId, String> {
     ) else {
         return HashMap::new();
     };
-    let Ok(mut statement) = connection.prepare("SELECT id, title FROM sessions") else {
+    let Ok(mut statement) = connection.prepare("SELECT id, title, cwd FROM sessions") else {
         return HashMap::new();
     };
     let Ok(rows) = statement.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     }) else {
         return HashMap::new();
     };
     rows.flatten()
-        .filter_map(|(id, title)| {
+        .filter_map(|(id, title, cwd)| {
             let id = id_from_bytes(&id, "session id").ok()?;
-            Some((id, truncate_title(title)))
+            let title = truncate_title(title);
+            Some((id, SessionNames { title, cwd }))
         })
         .collect()
 }
@@ -14470,7 +14502,7 @@ CREATE TABLE subagents (
         let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
         assert_eq!(
             header,
-            [PID_HEADER, SESSION_HEADER, TITLE_HEADER],
+            [PID_HEADER, SESSION_HEADER, PROJECT_HEADER, TITLE_HEADER],
             "{holders}"
         );
         #[cfg(unix)]
@@ -14479,41 +14511,57 @@ CREATE TABLE subagents (
                 .next()
                 .unwrap()
                 .split_whitespace()
-                .take(2)
+                .take(3)
                 .collect::<Vec<_>>(),
-            [process::id().to_string(), id.to_string()],
+            [process::id().to_string(), id.to_string(), CWD.to_owned()],
             "{BLOCKED_NAMES_SESSIONS}: {holders}"
         );
     }
 
     const HOLDER_TABLE_MIXED: &str = "close these open sessions and start again:\n  \
-        PID    SESSION                 TITLE\n  \
-        48213  CgBUSiTqJofeMJp54oyev   Tango reply request\n  \
-        -      3vQp9uWmXkT7cZbN1aLdFe  <untitled>";
+        PID    SESSION                 PROJECT             TITLE\n  \
+        48213  CgBUSiTqJofeMJp54oyev   ~/workspace/caudra  Tango reply request\n  \
+        -      3vQp9uWmXkT7cZbN1aLdFe  -                   <untitled>";
     const HOLDER_TABLE_EMPTY_TITLE: &str = "close these open sessions and start again:\n  \
-        PID  SESSION                TITLE\n  \
-        7    CgBUSiTqJofeMJp54oyev";
+        PID  SESSION                PROJECT                  TITLE\n  \
+        7    CgBUSiTqJofeMJp54oyev  /srv/a-much-longer-path";
 
     #[test_case(
         &[
-            ["48213", "CgBUSiTqJofeMJp54oyev", "Tango reply request"],
-            [UNKNOWN_PID, "3vQp9uWmXkT7cZbN1aLdFe", UNKNOWN_SESSION_TITLE],
+            ["48213", "CgBUSiTqJofeMJp54oyev", "~/workspace/caudra", "Tango reply request"],
+            [UNKNOWN_PID, "3vQp9uWmXkT7cZbN1aLdFe", UNKNOWN_PROJECT, UNKNOWN_SESSION_TITLE],
         ],
         HOLDER_TABLE_MIXED ;
         "known_and_unknown_pids"
     )]
     #[test_case(
-        &[["7", "CgBUSiTqJofeMJp54oyev", ""]],
+        &[["7", "CgBUSiTqJofeMJp54oyev", "/srv/a-much-longer-path", ""]],
         HOLDER_TABLE_EMPTY_TITLE ;
         "empty_title_leaves_no_trailing_space"
     )]
-    fn holder_table_aligns_pid_and_session_columns(rows: &[[&str; 3]], expected: &str) {
-        let rows: Vec<[String; 3]> = rows.iter().map(|row| row.map(str::to_owned)).collect();
+    fn holder_table_aligns_every_column_but_the_title(rows: &[[&str; 4]], expected: &str) {
+        let rows: Vec<[String; 4]> = rows.iter().map(|row| row.map(str::to_owned)).collect();
 
         let table = holder_table(&rows);
 
         assert_eq!(table, expected);
         assert!(table.lines().all(|line| line == line.trim_end()), "{table}");
+    }
+
+    const HOME: &str = "/home/someone";
+
+    #[test_case("/home/someone/workspace/caudra", Some(HOME), "~/workspace/caudra" ; "inside_home")]
+    #[test_case("/home/someone", Some(HOME), "~" ; "home_itself")]
+    #[test_case("/home/someone-else/caudra", Some(HOME), "/home/someone-else/caudra" ; "sibling_sharing_a_prefix")]
+    #[test_case("/srv/caudra", Some(HOME), "/srv/caudra" ; "outside_home")]
+    #[test_case("/home/someone/caudra", None, "/home/someone/caudra" ; "no_home")]
+    #[cfg(unix)]
+    fn home_relative_spells_the_home_directory_as_a_tilde(
+        cwd: &str,
+        home: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(home_relative(cwd.to_owned(), home.map(Path::new)), expected);
     }
 
     fn schema_objects(database: &SessionDatabase) -> Vec<(String, String, Option<String>)> {
