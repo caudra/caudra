@@ -42,6 +42,7 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-5.6",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -96,9 +97,10 @@ fn apply_fast_mode(body: &mut Value, model: &Model, opts: &RequestOptions) {
 }
 
 fn supports_explicit_cache(model_id: &str) -> bool {
-    EXPLICIT_CACHE_FAMILIES
-        .iter()
-        .any(|family| model_id.starts_with(family))
+    model_id == "gpt-5.6"
+        || EXPLICIT_CACHE_FAMILIES
+            .iter()
+            .any(|family| model_id.starts_with(family))
 }
 
 // Codex models match by substring so future releases route without a registry
@@ -111,9 +113,10 @@ fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     if !PLAN_MODELS.contains(&model_id) {
         return None;
     }
-    let wide = WIDE_PLAN_FAMILIES
-        .iter()
-        .any(|family| model_id.starts_with(family));
+    let wide = model_id == "gpt-5.6"
+        || WIDE_PLAN_FAMILIES
+            .iter()
+            .any(|family| model_id.starts_with(family));
     Some(if wide {
         WIDE_PLAN_CONTEXT_WINDOW
     } else {
@@ -833,6 +836,7 @@ mod tests {
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
+    #[test_case("gpt-5.6")]
     fn named_plan_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
     }
@@ -841,6 +845,7 @@ mod tests {
     #[test_case("gpt-6.1-sol", true)]
     #[test_case("gpt-5.6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]
+    #[test_case("gpt-5.6", true)]
     #[test_case("gpt-5.5", false ; "gpt_5_5_is_implicit_only")]
     #[test_case("gpt-5.3-codex", false ; "codex_before_5_6_is_implicit_only")]
     #[test_case("gpt-5.4-nano", false)]
@@ -853,6 +858,8 @@ mod tests {
     /// developer message.
     #[test_case("openai/gpt-5.6-sol", false, true ; "api_key_marks_a_5_6_model")]
     #[test_case("openai/gpt-5.6-sol", true, false ; "login_keeps_instructions_on_a_5_6_model")]
+    #[test_case("openai/gpt-5.6", false, true ; "api_key_marks_the_5_6_alias")]
+    #[test_case("openai/gpt-5.6", true, false ; "login_keeps_instructions_on_the_5_6_alias")]
     #[test_case("openai/gpt-5.5", false, false ; "api_key_keeps_instructions_before_5_6")]
     fn responses_body_marks_the_system_prompt_only_for_the_metered_api(
         spec: &str,
@@ -902,6 +909,8 @@ mod tests {
     #[test_case(CODEX_MODEL, false, TEST_BASE_URL, RESPONSES_PATH ; "a_key_posts_codex_models_to_the_platform")]
     #[test_case(CODEX_MODEL, true, auth::CODING_PLAN_BASE_URL, RESPONSES_PATH ; "a_login_posts_codex_models_to_the_codex_backend")]
     #[test_case(CHAT_MODEL, false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "other_models_post_chat_completions")]
+    #[test_case("openai/gpt-5.6", false, TEST_BASE_URL, RESPONSES_PATH ; "alias_uses_responses_with_a_key")]
+    #[test_case("openai/gpt-5.6", true, auth::CODING_PLAN_BASE_URL, RESPONSES_PATH ; "alias_uses_responses_with_a_login")]
     fn wire_request_posts_where_the_send_does(spec: &str, oauth: bool, base: &str, path: &str) {
         let wire = provider_with_login(oauth)
             .wire_request(
@@ -925,6 +934,7 @@ mod tests {
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
+    #[test_case("gpt-5.6", Some(372_000))]
     #[test_case("gpt-5.5", Some(272_000))]
     #[test_case("gpt-5.3-codex", Some(272_000))]
     #[test_case("gpt-5.7-codex", Some(272_000) ; "unlisted codex model still routes")]
@@ -1034,6 +1044,7 @@ mod tests {
     #[test_case("gpt-5.5", effort("max"), Some("xhigh") ; "max_snaps_to_xhigh_on_5_5")]
     #[test_case("gpt-5.6-sol", ThinkingConfig::Off, Some("none") ; "off_is_explicit_on_5_6_sol")]
     #[test_case("gpt-5.6-sol", effort("max"), Some("max") ; "max_passes_through_on_5_6_sol")]
+    #[test_case("gpt-5.6", effort("max"), Some("max") ; "max_passes_through_on_5_6_alias")]
     #[test_case("gpt-5.6-terra", effort("max"), Some("max") ; "max_passes_through_on_5_6_terra")]
     #[test_case("gpt-5.6-luna", effort("max"), Some("max") ; "max_passes_through_on_5_6_luna")]
     #[test_case("gpt-6.1-sol", ThinkingConfig::Off, Some("low") ; "off_is_the_shallowest_level_on_6_1_sol")]

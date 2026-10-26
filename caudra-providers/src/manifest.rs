@@ -619,7 +619,7 @@ mod tests {
             Some("openai"),
         )
         .unwrap();
-        let facts = ManifestRegistry::facts_from_manifest(manifest, "gpt-4.1-nano");
+        let facts = ManifestRegistry::facts_from_manifest(manifest, "gpt-5.4-nano");
         let candidates =
             ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
 

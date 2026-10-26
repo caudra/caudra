@@ -1302,7 +1302,7 @@ mod tests {
     #[test_case("anthropic", "claude-haiku-4-5", Some(ModelPurpose::Fast) ; "curated_table")]
     #[test_case("anthropic", "claude-opus-4-6", Some(ModelPurpose::Best) ; "curated_best")]
     #[test_case("anthropic", "claude-sonnet-4-6", Some(ModelPurpose::Best) ; "known_non_small")]
-    #[test_case("openai", "gpt-4.1-nano", Some(ModelPurpose::Fast) ; "longest_prefix_wins")]
+    #[test_case("openai", "gpt-5.4-nano", Some(ModelPurpose::Fast) ; "longest_prefix_wins")]
     #[test_case(UNCLASSIFIABLE, "llama3", None ; "no_table_means_no_class")]
     fn class_of_reads_the_providers_own_answer(
         provider: &str,

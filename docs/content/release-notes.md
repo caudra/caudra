@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
+
+[v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)
+
+- Model catalog updates.
+
+### Models
+
+- **OpenAI model list updated.** Retired GPT-4.1 Nano and o4-mini entries are removed. The `gpt-5.6` alias uses GPT-5.6 Sol metadata.
+
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 
 [v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)

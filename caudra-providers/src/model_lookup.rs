@@ -480,16 +480,15 @@ mod tests {
         "openai/gpt-5.5",
         "openai/gpt-5.6-luna",
         "openai/gpt-5.6-sol",
+        "openai/gpt-5.6",
         "openai/gpt-5.6-terra",
         "openai/gpt-6-astra",
         "openai/gpt-6-luna",
         "openai/gpt-6-sol",
         "openai/gpt-6.1-sol",
         "openai/gpt-5.4-nano",
-        "openai/gpt-4.1-nano",
         "openai/gpt-4.1-mini",
         "openai/gpt-4.1",
-        "openai/o4-mini",
         "openai/o3",
         "ninfer-4090/qwen3.8-27b",
         "ninfer-4090/qwen3.8-27b-caveman7",
@@ -514,24 +513,19 @@ mod tests {
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5-1",
         "anthropic/claude-fable-5",
-        "copilot/gpt-5-mini",
-        "copilot/gpt-5.4-mini",
         "copilot/gpt-5.4-nano",
         "copilot/claude-haiku-4.5",
         "copilot/claude-haiku-5.5",
-        "copilot/gemini-3.7-flash",
         "copilot/gemini-3.8-flash",
         "copilot/claude-sonnet-4.6",
         "copilot/claude-sonnet-5.5",
         "copilot/claude-sonnet-5",
-        "copilot/gpt-5.5",
         "copilot/kimi-k3",
         "copilot/gemini-4-argon",
         "copilot/gpt-6-luna",
         "copilot/gpt-6.1-sol",
         "copilot/gpt-6-sol",
         "copilot/gpt-5.6-luna",
-        "copilot/gpt-5.4",
         "copilot/gpt-5.6-sol",
         "copilot/gpt-5.6-terra",
         "copilot/gpt-5.3-codex",
@@ -566,7 +560,6 @@ mod tests {
     #[test_case("codex", &[OPENAI], "openai/gpt-5.3-codex" ; "codex")]
     #[test_case("mini", &[OPENAI], "openai/gpt-5.4-mini" ; "mini_newest")]
     #[test_case("o3", &[], "openai/o3" ; "o3")]
-    #[test_case("o4 mini", &[], "openai/o4-mini" ; "o4_mini")]
     #[test_case("qwen", &[ANTHROPIC], "ninfer-4090/qwen3.8-27b" ; "qwen_base_beats_numbered_variants")]
     #[test_case("caveman", &[], "ninfer-4090/qwen3.8-27b-caveman7" ; "stem_of_a_trailing_numbered_word")]
     #[test_case("distill", &[], "ninfer-4090/qwen3.8-27b-distill-1" ; "variant_numbers_add_words")]
@@ -586,11 +579,11 @@ mod tests {
     #[test_case("gemini flash", &[], "copilot/gemini-3.8-flash" ; "gemini_flash_newest")]
     #[test_case("argon", &[], "copilot/gemini-4-argon" ; "argon")]
     #[test_case("grok", &[], "copilot/grok-4.7" ; "grok")]
+    #[test_case("gpt-5.6", &[OPENAI], "openai/gpt-5.6" ; "exact_alias_beats_siblings")]
     fn a_listed_model_resolves(query: &str, preferred: &[&str], expected: &str) {
         assert_eq!(find_model(query, &listed(), preferred).unwrap(), expected);
     }
 
-    #[test_case("gpt-5.6", &[OPENAI], &["openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-5.6-terra"] ; "three_5_6_models")]
     #[test_case("claude", &[ANTHROPIC], &["anthropic/claude-haiku-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] ; "claude_names_a_vendor")]
     #[test_case("sonnet", &[OPENAI, LOCAL], &["anthropic/claude-sonnet-5-5", "copilot/claude-sonnet-5.5"] ; "two_providers_serve_sonnet")]
     #[test_case("sonnet 4.6", &[], &["anthropic/claude-sonnet-4-6", "copilot/claude-sonnet-4.6"] ; "spellings_differ_by_provider")]

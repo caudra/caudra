@@ -68,7 +68,7 @@ pub(crate) const fn generations() -> &'static [ModelGeneration] {
         },
         ModelGeneration {
             label: "gpt-5.6",
-            members: &["gpt-5.6-"],
+            members: &["gpt-5.6"],
         },
     ];
     GENERATIONS
@@ -287,7 +287,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_WITH_MAX),
         },
         ModelEntry {
-            prefixes: &["gpt-5.6-sol"],
+            prefixes: &["gpt-5.6-sol", "gpt-5.6"],
             small: false,
             family: ModelFamily::Gpt,
             vision: true,
@@ -359,24 +359,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
-            prefixes: &["gpt-4.1-nano"],
-            small: true,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.40,
-                cache_write: 0.00,
-                cache_read: 0.025,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(32_768),
-            context_window: 1_047_576,
-            reasoning_options: None,
-        },
-        ModelEntry {
             prefixes: &["gpt-4.1-mini"],
             small: false,
             family: ModelFamily::Gpt,
@@ -411,24 +393,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(32_768),
             context_window: 1_047_576,
             reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["o4-mini"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.10,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.275,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
@@ -541,6 +505,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 #[cfg(test)]
 mod tests {
     use caudra_config::providers::{ProviderDef, resolve_default_model};
+    use std::ptr;
     use test_case::test_case;
 
     use super::*;
@@ -554,6 +519,36 @@ mod tests {
     const LONG_CONTEXT_RULE: &str =
         "past 272K OpenAI bills twice the input and cache rates and 1.5x the output rate";
     const FAST_RULE: &str = "OpenAI's fast mode costs twice whichever rate applies";
+
+    #[test_case("gpt-4.1-nano")]
+    #[test_case("gpt-4.1-nano-2025-04-14")]
+    #[test_case("o4-mini")]
+    #[test_case("o4-mini-2025-04-16")]
+    fn retired_models_are_not_listed(model_id: &str) {
+        assert!(
+            !models()
+                .iter()
+                .any(|entry| entry.prefixes.contains(&model_id))
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_alias_shares_sol_metadata_and_generation() {
+        let entries = models();
+        let alias = lookup_entry(entries, "gpt-5.6").unwrap();
+        let sol = lookup_entry(entries, "gpt-5.6-sol").unwrap();
+        assert!(ptr::eq(alias, sol));
+        let generation = generations()
+            .iter()
+            .find(|generation| generation.label == "gpt-5.6")
+            .unwrap();
+        assert!(
+            generation
+                .members
+                .iter()
+                .any(|prefix| "gpt-5.6".starts_with(prefix))
+        );
+    }
 
     #[test_case(None, "openai/gpt-6.1-sol" ; "builtin_setup_default")]
     #[test_case(Some(ProviderDef::default()), "openai/gpt-6.1-sol" ; "unconfigured_model_uses_builtin")]
@@ -639,6 +634,7 @@ mod tests {
     #[test_case("gpt-6-sol", true)]
     #[test_case("gpt-6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]
+    #[test_case("gpt-5.6", true)]
     #[test_case("gpt-5.6-terra", true)]
     #[test_case("gpt-5.6-luna", true)]
     #[test_case("gpt-5.5", true)]
@@ -658,6 +654,7 @@ mod tests {
     #[test_case("gpt-5.6-luna", true, 0.2, 0.02, 0.25, 1.2)]
     #[test_case("gpt-5.6-terra", false, 2.0, 0.2, 2.5, 12.0)]
     #[test_case("gpt-5.6-sol", false, 4.0, 0.4, 5.0, 20.0)]
+    #[test_case("gpt-5.6", false, 4.0, 0.4, 5.0, 20.0)]
     fn gpt_5_6_models_have_expected_tier_and_short_context_pricing(
         model_id: &str,
         small: bool,
