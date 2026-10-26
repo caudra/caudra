@@ -490,6 +490,33 @@ mod tests {
         MontyException::new(exc_type, Some(message.to_owned()))
     }
 
+    #[test_case(Surface::Isolated ; "isolated")]
+    #[test_case(Surface::Hosted ; "hosted")]
+    fn decimal_is_available_but_requires_an_import(surface: Surface) {
+        const MISSING: &str = "name 'decimal' is not defined";
+        const DIAGNOSTIC: &str =
+            "snippet.py:1:1: error[unresolved-reference] Name `decimal` used when not defined";
+        const GUIDANCE: &str = "add `import decimal`";
+        let raised = diagnose_for(&exception(ExcType::NameError, MISSING), surface)
+            .diagnostic
+            .expect("guidance");
+        let checked = diagnose_type_errors_for(DIAGNOSTIC, surface);
+        for text in [raised, checked] {
+            assert!(text.contains(GUIDANCE), "{text}");
+            assert!(!text.contains("are not implemented"), "{text}");
+        }
+    }
+
+    #[test_case(ExcType::DecimalDivisionByZero ; "division_by_zero")]
+    #[test_case(ExcType::DecimalInvalidOperation ; "invalid_operation")]
+    fn decimal_arithmetic_errors_are_not_capability_refusals(kind: ExcType) {
+        for surface in [Surface::Isolated, Surface::Hosted] {
+            let diagnosis = diagnose_for(&MontyException::new(kind, None), surface);
+            assert_eq!(diagnosis.outcome, Outcome::Exception);
+            assert!(diagnosis.diagnostic.is_none());
+        }
+    }
+
     #[test]
     fn unsupported_syntax_is_rejected_not_raised() {
         let diagnosis = diagnose(&exception(

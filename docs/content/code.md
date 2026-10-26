@@ -58,7 +58,7 @@ Variables that a run defines are still there in the next run of the same agent. 
 
 ## The Python subset
 
-Snippets run in a Python subset on the bundled Monty worker. There is no filesystem, network, subprocess, class inheritance, or third-party package, and unseeded randomness is refused. The standard modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, and `unicodedata`.
+Snippets run in a Python subset on the bundled Monty worker. There is no filesystem, network, subprocess, class inheritance, or third-party package, and unseeded randomness is refused. The standard modules are `asyncio`, `base64`, `binascii`, `bisect`, `collections`, `copy`, `csv`, `dataclasses`, `datetime`, `decimal`, `functools`, `hashlib`, `itertools`, `json`, `math`, `os`, `pathlib`, `posixpath`, `random`, `re`, `sys`, `time`, `tomllib`, `typing`, and `unicodedata`.
 
 Clocks read the host clock: `time.time()`, `time.monotonic()`, `time.perf_counter()`, and `datetime.now()` answer, and the time zone is UTC. `time.sleep()` and `await asyncio.sleep()` wait for real, up to the run's `timeoutSec`. `asyncio.sleep()` runs beside calls gathered with it, so a snippet can poll:
 

@@ -368,6 +368,91 @@ async fn complex_values_keep_their_type_through_session_dump_and_restore() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn decimal_is_auto_imported_and_preserves_precision() {
+    const EXPECTED: &str = "Decimal('0.3')";
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(
+        &group,
+        &host,
+        "decimal.Decimal('0.1') + decimal.Decimal('0.2')",
+        None,
+    )
+    .await;
+    assert_eq!(
+        outcome(&executed),
+        Outcome::Completed,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(result(&executed), &json!(EXPECTED));
+    assert_eq!(output(&executed).result_repr.as_deref(), Some(EXPECTED));
+    assert_eq!(executed.repairs, [Repair::Imported("decimal")]);
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decimal_values_and_context_survive_session_dump_and_restore() {
+    const EXPECTED: &str = "Decimal('12345678901234567890.123456790')";
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let first = run(
+        &group,
+        &host,
+        "from decimal import Decimal, getcontext\ngetcontext().prec = 40\nkept = {'values': [Decimal('12345678901234567890.123456789')]}\nkept",
+        None,
+    )
+    .await;
+    assert_eq!(outcome(&first), Outcome::Completed, "{:?}", output(&first));
+    assert_eq!(first.state_note, None);
+    let state = first.state.expect("saved decimal session");
+    let second = run(
+        &group,
+        &host,
+        "[getcontext().prec, kept['values'][0] + Decimal('0.000000001')]",
+        Some(state),
+    )
+    .await;
+    assert_eq!(
+        outcome(&second),
+        Outcome::Completed,
+        "{:?}",
+        output(&second)
+    );
+    assert_eq!(result(&second), &json!([40, EXPECTED]));
+    assert_eq!(second.state_note, None);
+    assert!(second.state.is_some());
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decimal_host_arguments_preserve_precision_including_nested_values() {
+    const EXPECTED: &str = "Decimal('12345678901234567890.123456789')";
+    let Some(group) = group().await else { return };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(
+        &group,
+        &host,
+        "from decimal import Decimal\nvalue = Decimal('12345678901234567890.123456789')\nawait gh.echo(value, nested={'values': [value]})",
+        None,
+    )
+    .await;
+    assert_eq!(
+        outcome(&executed),
+        Outcome::Completed,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(
+        result(&executed),
+        &json!({"args": [EXPECTED], "kwargs": {"nested": {"values": [EXPECTED]}}})
+    );
+    assert_eq!(output(&executed).result_repr, None);
+    assert_eq!(host.calls(), ["echo"]);
+    group.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn complex_host_arguments_cross_as_json_strings_including_nested_values() {
     let Some(group) = group().await else { return };
     let host = Arc::new(FakeHost::default());

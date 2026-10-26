@@ -381,6 +381,19 @@ async fn supports_the_advertised_stdlib_modules() {
     group.shutdown().await;
 }
 
+#[test_case("from decimal import Decimal\nDecimal('0.1') + Decimal('0.2')" ; "explicit_import")]
+#[test_case("import json\nfrom decimal import Decimal\nvalues = json.loads('[0.1, 0.2]', parse_float=Decimal)\nvalues[0] + values[1]" ; "json_decimal_callback")]
+#[tokio::test]
+async fn decimal_arithmetic_preserves_precision_with_type_checking(code: &str) {
+    const EXPECTED: &str = "Decimal('0.3')";
+    let group = group_or_skip!(true);
+    let output = run(&group, code).await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], EXPECTED, "{output}");
+    assert_eq!(output["resultRepr"], EXPECTED, "{output}");
+    group.shutdown().await;
+}
+
 /// The description and the import diagnostic both enumerate the modules, and for three of them —
 /// `base64`, `binascii`, and `functools` — the enumeration was wrong for as long as it existed.
 /// Spot-checking a handful of real modules could never catch that, so every advertised name is
