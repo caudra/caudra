@@ -18,7 +18,7 @@
     "THIRD_PARTY_LICENSES/additional/provenance.json"
   ],
   "packages": {
-    "caudra-highlight@0.2.0-preview.14": {
+    "caudra-highlight@0.2.0-preview.15": {
       "expression": "Apache-2.0 AND MIT AND MPL-2.0",
       "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. The TLA+, PlusCal and TLC config grammars converted from vscode-tlaplus remain MIT; preserve its upstream license. This aggregate expression does not relicense individual files.",
       "files": [
@@ -36,7 +36,7 @@
         "supplements/THIRD_PARTY_LICENSES/VscodeTlaplus.txt"
       ]
     },
-    "caudra-pstack@0.2.0-preview.14": {
+    "caudra-pstack@0.2.0-preview.15": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The Caudra glue and library remain Apache-2.0. The embedded pstack (Lauren Tan) and cursor-team-kit skills (Cursor) copied from cursor/plugins, their Caudra translations, and the Rust ports of pstack's scripts, remain MIT. Preserve both upstream licenses. This aggregate expression does not relicense individual files.",
       "files": [
@@ -54,7 +54,7 @@
         "supplements/THIRD_PARTY_LICENSES/CursorTeamKit.txt"
       ]
     },
-    "caudra-mattpocock@0.2.0-preview.14": {
+    "caudra-mattpocock@0.2.0-preview.15": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The Caudra glue and the page served in place of upstream's setup skill remain Apache-2.0. The embedded skills copied from mattpocock/skills (Matt Pocock) and their Caudra translations remain MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
       "files": [

@@ -119,7 +119,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0-preview.14"
+version = "0.2.0-preview.15"
 edition = "2024"
 authors = [
   "Thorsten Born <tensorninja@caudra.ai>",
