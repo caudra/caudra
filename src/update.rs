@@ -195,6 +195,10 @@ pub enum UpdateError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Updated {
     /// The release is installed as this binary.
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "Windows installs after Caudra exits")
+    )]
     Installed(PathBuf),
     /// The install waits for the command printed for the user to run.
     #[cfg(windows)]

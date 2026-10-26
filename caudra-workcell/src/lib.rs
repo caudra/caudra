@@ -4963,10 +4963,12 @@ mod tests {
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
     use caudra_agent::template::Vars;
+    #[cfg(target_os = "linux")]
+    use caudra_agent::tools::OUTPUT_SO_FAR_HEADING;
     use caudra_agent::tools::execution::configure_declared;
     use caudra_agent::tools::{
-        Deadline, FileReadTracker, OUTPUT_SO_FAR_HEADING, PLAN_WRITE_RESTRICTED,
-        READ_ONLY_TOOL_RESTRICTED, STALE_READ_MSG, interpreter_ctx,
+        Deadline, FileReadTracker, PLAN_WRITE_RESTRICTED, READ_ONLY_TOOL_RESTRICTED,
+        STALE_READ_MSG, interpreter_ctx,
     };
     use caudra_agent::{
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
