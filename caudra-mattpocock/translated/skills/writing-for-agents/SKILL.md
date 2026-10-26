@@ -7,6 +7,17 @@ Reference for writing any document an agent consumes: a skill, an `AGENTS.md` / 
 
 When the document you're writing is a skill or a command, read [`SKILL-MECHANICS.md`](SKILL-MECHANICS.md) for frontmatter, invocation choice, and router commands.
 
+## Knowledge destinations
+
+Choose the narrowest durable home before writing:
+
+- **Native memory**: project-specific gotchas, decisions and their reasons that help later sessions. Search existing notes with `memory`, then read or zoom the matches; update the existing note rather than add a duplicate. Inspect relevant learned instruction blocks and available learning output too.
+- **Session plan**: current goals, proposed steps, and unfinished work, not lasting project policy. Read it before replacing its contents and preserve unrelated sections. Only the main agent writes with `plan`; a task returns a draft for the main agent to merge. Saving a draft neither approves nor executes it.
+- **Shared `AGENTS.md` / `CLAUDE.md`**: small, stable rules and navigation pointers useful to everyone on the project. Keep personal preferences and machine-specific facts in their appropriate user/local scope, not shared instructions.
+- **Skills**: reusable procedures the agent should discover by a clear trigger. **Docs**: maintained reference material, reached through a pointer when needed. Prefer existing homes over new files; keep repository documentation in its established structure.
+
+Use visible context first. When the reason for a rule is missing, recover only relevant history in `code`: read `help("history")`, search with `await history.search(query, scope="session")` or `scope="project"`, then read returned item references with `await history.read(hit["ref"], around=2)`. Verify present-day claims against current files, not old tool output. Redact secrets and unnecessary personal information before persisting anything. A recommend-only request authorizes proposals, not writes to these destinations.
+
 ## Context pointers
 
 A **context pointer** is a reference held in the agent's context that names some out-of-context material and encodes the condition for reaching it. A skill's description is one; a line in `AGENTS.md` naming a doc is the same object. The pointer's _wording_, not its target, decides when the agent reaches the material, and how reliably. A must-have target behind a weakly worded pointer is a variance bug: sharpen the wording first, and inline the material only if sharpening fails.

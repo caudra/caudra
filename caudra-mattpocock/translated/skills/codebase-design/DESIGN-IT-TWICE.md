@@ -18,7 +18,7 @@ Show this to the user, then immediately proceed to Step 2. The user reads and th
 
 ### 2. Start the tasks
 
-Start 3+ tasks in parallel: one `task` call each, all in one turn, with `mode: "plan"` so none edits the code. Each must produce a **radically different** interface for the deepened module.
+Start 3+ independent foreground tasks in parallel through `batch`: one `task` call each, with `mode: "plan"` so none edits the code. Each must produce a **radically different** interface for the deepened module.
 
 Give each task a separate technical brief (file paths, coupling details, dependency category from [DEEPENING.md](DEEPENING.md), what sits behind the seam). The brief is independent of the user-facing problem-space explanation in Step 1. Give each task a different design constraint:
 

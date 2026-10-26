@@ -13,6 +13,10 @@ This command is _informed_ by the project's domain model and built on a shared d
 - Load `mattpocock/codebase-design` with the `skill` tool for the architecture vocabulary (**module**, **interface**, **depth**, **seam**, **adapter**, **leverage**, **locality**) and its principles (the deletion test, "the interface is the test surface", "one adapter = hypothetical seam, two = real"). Use these terms exactly in every suggestion, and don't drift into "component," "service," "API," or "boundary."
 - The domain language in `GLOSSARY.md` gives names to good seams; ADRs in `docs/adr/` record decisions this command should not re-litigate.
 
+Explore and report read-only in either mode. In Plan mode, read the existing session `plan` first. Only the main agent merges proposed glossary/ADR changes and implementation decisions into it, preserving existing scope and decisions; tasks return drafts. Writing files or implementing a refactor requires Build mode (the user switches with Tab). Once authorized, carry out agreed changes without re-asking each slice.
+
+If `question` or its answer channel is unavailable, present the question in plain text and say which decision is needed to continue. Unanswered, deferred, skipped, or dismissed questions do not authorize dependent work.
+
 ## Process
 
 ### 1. Explore
@@ -24,7 +28,11 @@ This command is _informed_ by the project's domain model and built on a shared d
 
 Read the project's domain glossary (`GLOSSARY.md`) and any ADRs in the area you're touching first.
 
-Then start a `task` with `mode: "plan"` to walk the codebase. Don't follow rigid heuristics; explore organically and note where you experience friction:
+Then start a `task` with `mode: "plan"` to walk the codebase.
+
+Give it the selected scope and ask it to use `source_code_context` to locate relevant modules, `file_index` before focused reads, and `source_code_refs` to examine callers, coupling, and tests at candidate seams when available; otherwise use `file_glob`, `file_grep`, and `file_read`. Counts are lower bounds, not proof that unlisted dynamic callers or tests do not exist.
+
+Don't follow rigid heuristics; explore organically and note where you experience friction:
 
 - Where does understanding one concept require bouncing between many small modules?
 - Where are modules **shallow**, with an interface nearly as complex as the implementation?
@@ -36,7 +44,7 @@ Apply the **deletion test** to anything you suspect is shallow: would deleting i
 
 ### 2. Present candidates as a report
 
-Present the candidates in your reply, in Markdown: one `###` section per candidate, with a ```` ```mermaid ```` block wherever a graph, flow, or sequence reliably communicates the structure. Each candidate gets a **before/after visualisation**. Be visual.
+Present the candidates in your reply, in Markdown: one `###` section per candidate, with terminal-supported Mermaid `graph`, `flowchart`, or `stateDiagram-v2` blocks wherever they communicate the structure; not sequence diagrams. Each candidate gets a **before/after visualisation**. Be visual.
 
 When the user asks for a richer, shareable report, also write a self-contained HTML file to the scratch directory as `architecture-review-<timestamp>.html`, following [HTML-REPORT.md](HTML-REPORT.md), and tell them its absolute path. Writing it needs Build mode.
 

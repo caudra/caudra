@@ -4,19 +4,19 @@ description: "Turn the current conversation into a spec and publish it to the pr
 disable-model-invocation: true
 ---
 
-This skill takes the current conversation context and codebase understanding and produces a spec. Do NOT interview the user; just synthesize what you already know.
+This skill takes the current conversation context, the relevant current session plan where available, and codebase understanding and produces a spec. Do NOT interview the user; just synthesize what you already know. Read the current plan with `plan` before using it; recovered history is not its current contents.
 
 [the issue tracker](../../caudra/issue-tracker.md) page says where to publish, and how in Plan mode.
 
 ## Process
 
-1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the spec, and respect any ADRs in the area you're touching.
+1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the spec, and respect any ADRs in the area you're touching. If prior decisions are missing from context, recover them with targeted history queries in `code`: read `help("history")`, use `await history.search(query, scope="session")` (or `scope="project"` for related sessions), then `await history.read(hit["ref"], around=2)` on relevant returned hits. Verify current behavior against files; history is not current file truth. Mark unresolved assumptions rather than inventing decisions.
 
 2. Sketch out the seams at which you're going to test the feature. Existing seams should be preferred to new ones. Use the highest seam possible. If new seams are needed, propose them at the highest point you can. The fewer seams across the codebase, the better - the ideal number is one.
 
-Check with the user, through the `question` tool, that these seams match their expectations.
+Check with the user that these seams match their expectations, using `question` when available with an answer channel; otherwise present the question in plain text. Deferred, skipped, dismissed, or unanswered questions remain unresolved and do not authorize dependent work or publication.
 
-3. Write the spec using the template below, then publish it to the project issue tracker. Apply the project's label for agent-ready work if it names one - no need for additional triage.
+3. Write the spec using the template below, then follow the tracker page's draft and publication gates. In Plan mode, the main agent reads the session plan and merges the draft without replacing unrelated sections; a task returns its draft instead. Before authorized Build-mode publication, reread the latest draft and destination. Apply the project's label for agent-ready work if it names one - no need for additional triage. Report a saved draft separately from a successfully published spec, with its path or confirmed issue identifier. Publication does not authorize implementation, commits, or pushes.
 
 <spec-template>
 

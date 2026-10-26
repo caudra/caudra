@@ -158,15 +158,17 @@ It is off by default. [mattpocock](https://github.com/mattpocock/skills) is Matt
 | The agent, when the work calls for it, or you | `grilling`, `domain-modeling`, `codebase-design`, `tdd`, `diagnosing-bugs`, `code-review`, `pr`, `writing-for-agents` |
 | Only you, with its command | `grill-me`, `grill-with-docs`, `improve-codebase-architecture`, `to-spec`, `to-tickets`, `to-questionnaire`, `handoff`, `retro` |
 
-The index splits the skills the same way, and the agent loads a skill from the second row only when you send its command. Addresses work as they do for pstack: `mattpocock`, `mattpocock/tdd`, `mattpocock/tdd/mocking.md` and `mattpocock?seam`.
+The index splits the skills the same way, and the agent runs a skill from the second row only when you send its command or ask for it by name. Addresses work as they do for pstack: `mattpocock`, `mattpocock/tdd`, `mattpocock/tdd/mocking.md` and `mattpocock?seam`.
 
 Upstream wrote the skills for Claude Code. Caudra translates them and adapts a few to how it works:
 
-- Grilling asks each round through the `question` tool, with the recommended answer first and room to type your own. In a run without the `question` tool, the agent asks in numbered plain text instead.
+- Grilling asks each round through the `question` tool, with the recommended answer first and room to type your own. If the tool or its answer channel is unavailable, the agent asks in numbered plain text instead. Deferred or skipped questions stay unresolved while independent investigation can continue.
 - `tdd` adds a refactor step after each test turns green.
 - `improve-codebase-architecture` writes its report as Markdown with Mermaid diagrams, and as HTML only when you ask.
-- No skill commits or pushes on its own, and in Plan mode the documents a skill writes go to the plan.
-- Upstream's setup skill is replaced by one page that finds your issue tracker: the project's `AGENTS.md`, then the git remote, then local Markdown files under `.scratch/`.
+- In Plan mode, document drafts preserve the existing session plan. A handoff stays in the reply by default. Writing files or publishing issues needs authorized Build-mode work, and no skill commits or pushes on its own.
+- `code-review` distinguishes committed changes from staged, unstaged and untracked work, and can use the session plan as its spec. Its Standards and Spec reviews stay separate.
+- Handoffs, retrospectives, specs and tickets recover missing decisions from session history when needed. A handoff distinguishes running work from verified results, and a retrospective recommends where reusable knowledge belongs without writing it automatically.
+- Upstream's setup skill is replaced by one page that follows your chosen tracker and available MCP or CLI connection. A git remote is only a hint to confirm. Local Markdown under `.scratch/` is an alternative, not a silent substitute for publishing to a tracker.
 
 #### mattpocock and pstack
 

@@ -7,6 +7,10 @@ description: Shared vocabulary for designing deep modules. Use when the user wan
 
 Design **deep modules**: a lot of behaviour behind a small interface, placed at a clean seam, testable through that interface. Use this language and these principles wherever code is being designed or restructured. The aim is leverage for callers, locality for maintainers, and testability for everyone.
 
+Design and explore read-only in either mode. In Plan mode, read the existing session `plan` first. Only the main agent merges design decisions into it, preserving existing scope and decisions; tasks return drafts. File edits and implementation require Build mode. Continue within the agreed scope without asking for approval each slice.
+
+When a decision needs the user, use `question` when available with an answer channel; otherwise present the question in plain text and say which decision is needed to continue. Unanswered, deferred, skipped, or dismissed questions do not authorize dependent work.
+
 ## Glossary
 
 Use these terms exactly: don't substitute "component," "service," "API," or "boundary." Consistent language is the whole point.
@@ -56,6 +60,8 @@ When designing an interface, ask:
 - Can I reduce the number of methods?
 - Can I simplify the parameters?
 - Can I hide more complexity inside?
+
+Ground the answers in real usage: when available, use `source_code_context` to find the relevant modules, `file_index` before focused reads, and `source_code_refs` to inspect callers and tests at the proposed seam; otherwise use `file_glob`, `file_grep`, and `file_read`. Counts are lower bounds, not proof of absent dynamic callers, adapters, or tests.
 
 ## Principles
 
