@@ -89,7 +89,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 input: 1.5,
                 output: 7.5,
                 cache_write: 0.00,
-                cache_read: 0.00,
+                cache_read: 0.15,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -108,6 +108,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 2.09,
                 cache_write: 0.00,
                 cache_read: 0.07,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["zai-glm-5-3-flash"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.15,
+                output: 0.50,
+                cache_write: 0.00,
+                cache_read: 0.03,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -161,7 +179,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 input: 0.15,
                 output: 0.60,
                 cache_write: 0.00,
-                cache_read: 0.00,
+                cache_read: 0.015,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -179,7 +197,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 input: 0.20,
                 output: 0.20,
                 cache_write: 0.00,
-                cache_read: 0.00,
+                cache_read: 0.02,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -379,6 +397,7 @@ pub(crate) fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::lookup_entry;
     use crate::providers::Timeouts;
     use crate::{ContentBlock, Role};
     use serde_json::{Value, json};
@@ -389,6 +408,36 @@ mod tests {
     const SYSTEM_PROMPT: &str = "sys";
     const REASONING: &str = "thinking";
     const REPLY: &str = "text";
+
+    #[test_case("mistral-medium-latest", 0.15 ; "medium")]
+    #[test_case("mistral-small-latest", 0.015 ; "small")]
+    #[test_case("ministral-14b-2512", 0.02 ; "ministral")]
+    fn cached_input_pricing(id: &str, expected: f64) {
+        assert_eq!(
+            lookup_entry(models(), id).unwrap().pricing.cache_read,
+            expected
+        );
+    }
+
+    #[test_case("zai-glm-5-3-flash", 0.15, 0.03, 0.50, true ; "flash")]
+    #[test_case("zai-glm-5-3", 1.40, 0.14, 4.40, false ; "full")]
+    fn glm_flash_has_distinct_metadata(
+        id: &str,
+        input: f64,
+        cache_read: f64,
+        output: f64,
+        vision: bool,
+    ) {
+        let entry = lookup_entry(models(), id).unwrap();
+        assert!(entry.prefixes.contains(&id));
+        assert_eq!(entry.pricing.input, input);
+        assert_eq!(entry.pricing.cache_read, cache_read);
+        assert_eq!(entry.pricing.output, output);
+        assert_eq!(entry.vision, vision);
+        assert_eq!(entry.context_window, 1_000_000);
+        assert_eq!(entry.max_output_tokens, None);
+        assert!(!entry.default);
+    }
 
     fn thinking_part() -> Value {
         json!({"type": "thinking", "thinking": [{"type": "text", "text": REASONING}]})
