@@ -112,10 +112,10 @@ mkdir -p composedemo
 cat > composedemo/compose.yaml <<'EOF'
 services:
   one:
-    image: alpine:3.24.2
+    image: alpine:3.24.3
     command: echo "service one"
   two:
-    image: alpine:3.24.2
+    image: alpine:3.24.3
     command: echo "service two"
 EOF
 
