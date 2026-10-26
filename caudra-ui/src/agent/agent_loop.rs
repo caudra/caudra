@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Instant;
 use std::{env, sync::Arc};
 
@@ -8,7 +10,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::agent;
 use caudra_agent::agent::cache_warming::{CacheWarmer, WarmStop, WarmerContext, WarmerRef};
 use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
-use caudra_agent::agent::{PrefixKey, Surface, SurfaceBaseline};
+use caudra_agent::agent::{
+    ActiveContext, ContextRefresh, PrefixKey, RefreshedContext, StandingState, Surface,
+    SurfaceBaseline,
+};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::code::CodeSession;
 use caudra_agent::context::{
@@ -27,13 +32,14 @@ use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
+use caudra_agent::remote_project_context::RemoteProjectContext;
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::execution::{configure_declared, execution_slots};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{
-    DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolDefinitions, ToolFilter,
-    ToolRegistry,
+    DescriptionContext, FileReadTracker, PathLocks, TASK_TOOL_NAME, ToolAudience, ToolDefinitions,
+    ToolFilter, ToolRegistry,
 };
 use caudra_agent::types::{LEARNING_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem};
 use caudra_agent::workflow::WorkflowHandle;
@@ -46,7 +52,8 @@ use caudra_agent::{
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{
-    AgentError, Billing, CacheKey, HistoryItem, Model, ModelPurpose, RequestOptions, ThinkingConfig,
+    AgentError, Billing, CacheKey, HistoryItem, Model, ModelPurpose, RequestOptions,
+    ThinkingConfig, Timeouts,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -62,6 +69,199 @@ use super::workflow::SharedMode;
 use super::{BtwPrompt, ModelSlot, SharedBtwPrompt, refresh_remote_context};
 
 const TASK_CONTEXT_UNAVAILABLE: &str = "Remote project context unavailable for task continuation";
+
+struct CompactionRefresh<'a> {
+    vars: &'a mut Vars,
+    instructions: &'a mut InstructionBaseline,
+    memory: &'a mut MemoryBaseline,
+    surface: &'a mut SurfaceBaseline,
+    tools: &'a mut Value,
+    hosted: &'a mut Vec<String>,
+    bound_profile: &'a mut Option<Arc<SystemPromptProfile>>,
+    remote_project_context: &'a mut Option<Arc<RemoteProjectContext>>,
+    context_system: &'a mut String,
+    context_options: &'a mut RequestOptions,
+    source: ToolsPreviewSource,
+    profile: Option<Arc<SystemPromptProfile>>,
+    workspace: Option<&'a WorkspaceSession>,
+    host_cwd: Option<&'a Path>,
+    permissions: &'a PermissionManager,
+    workflow: Option<&'a WorkflowHandle>,
+    subagent_cancels: &'a CancelMap<String>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
+    tool_output_store: Option<&'a ToolOutputStore>,
+    session_id: Option<&'a SessionRef>,
+    lua_handle: &'a EventHandle,
+    timeouts: Timeouts,
+    chat_model: Model,
+    btw_prompt: &'a SharedBtwPrompt,
+}
+
+impl ContextRefresh for CompactionRefresh<'_> {
+    fn refresh<'a>(
+        &'a mut self,
+        history: &'a History,
+        active: ActiveContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshedContext, AgentError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut vars =
+                refreshed_vars(self.vars, template::env_vars(), self.workspace.is_some());
+            let (current, remote) = if let Some(workspace) = self.workspace {
+                let (context, cwd) = refresh_remote_context(
+                    workspace,
+                    self.remote_project_context.as_deref(),
+                    self.permissions,
+                    self.workflow,
+                    self.subagent_cancels,
+                    self.source.config.features,
+                )
+                .await?;
+                vars = vars.set("{cwd}", cwd);
+                (
+                    agent::load_remote_instructions(&context, self.host_cwd),
+                    Some(context),
+                )
+            } else {
+                let cwd = vars.apply("{cwd}").into_owned();
+                (
+                    smol::unblock(move || agent::load_instructions(&cwd)).await,
+                    None,
+                )
+            };
+            let instructions = InstructionBaseline::adopt(current, history.epoch());
+            let instructions_notice = restored_notice(
+                history,
+                caudra_agent::prompt::INSTRUCTIONS_CHANGED_MARKER,
+                caudra_agent::prompt::INSTRUCTIONS_RESTORED_PROMPT,
+            );
+            let relocated = vars.apply("{cwd}") != self.vars.apply("{cwd}");
+            let mut memory = if relocated {
+                MemoryBaseline::open(
+                    self.local_documents.clone(),
+                    self.tool_output_store
+                        .map(ToolOutputStore::state_dir)
+                        .cloned(),
+                    PathBuf::from(vars.apply("{cwd}").as_ref()),
+                    history,
+                )
+                .await
+            } else {
+                self.memory.clone()
+            };
+            let memory_notice = memory
+                .refresh(history, self.session_id.map(SessionRef::as_str), true)
+                .await
+                .or_else(|| {
+                    restored_notice(
+                        history,
+                        caudra_agent::prompt::MEMORY_UPDATED_MARKER,
+                        if memory.view().is_some() {
+                            caudra_agent::prompt::MEMORY_REFRESHED_PROMPT
+                        } else {
+                            caudra_agent::prompt::MEMORY_UNAVAILABLE_PROMPT
+                        },
+                    )
+                });
+            let bindings = self.source.profiles.bind_for_tasks(
+                active.model,
+                &self.chat_model,
+                &active.options.thinking,
+                &self.source.model_policy,
+                self.timeouts,
+            );
+            let definitions = self.source.definitions(
+                active.model,
+                &vars,
+                active.mode,
+                active.mode.has_session_plan(active.plan),
+                &bindings,
+            );
+            let tool_filter =
+                session_tool_filter(&definitions.declared, &definitions.hosted, active.mode);
+            let slots = self
+                .lua_handle
+                .collect_prompt_slots_async(&self.source.config)
+                .await;
+            let slots = execution_slots(
+                &slots,
+                &self.source.config,
+                self.source.background_available,
+                self.source.background_available,
+                &definitions.declared,
+            );
+            let system = agent::build_system_prompt(
+                instructions.text(),
+                &slots,
+                &tool_filter,
+                self.profile.as_deref(),
+                memory.view(),
+            );
+            let mut surface = self.surface.clone();
+            let settled = surface.settle(
+                Surface::new(system.clone(), definitions.declared.clone()),
+                true,
+                PrefixKey {
+                    model: active.model.spec(),
+                    chat_model: self.chat_model.spec(),
+                    thinking: active.options.thinking.clone(),
+                    mode: active.mode.clone(),
+                    plan: active.plan.cloned(),
+                    cwd: vars.apply("{cwd}").into_owned(),
+                },
+                history.epoch(),
+                history.as_slice(),
+            );
+            let refreshed = RefreshedContext {
+                system: system.clone(),
+                environment: Some(agent::environment_block(&vars, active.model)),
+                instructions: instructions_notice,
+                memory: memory_notice,
+                configuration: settled.notice,
+                tools: definitions.declared.clone(),
+                tool_filter,
+                loaded_instructions: instructions.loaded().clone(),
+                remote_project_context: remote.clone(),
+                task_environment: vars.clone(),
+                memory_store: memory.store().cloned(),
+            };
+            *self.vars = vars;
+            *self.instructions = instructions;
+            *self.memory = memory;
+            *self.surface = surface;
+            *self.tools = definitions.declared;
+            *self.hosted = definitions.hosted;
+            self.bound_profile.clone_from(&self.profile);
+            *self.remote_project_context = remote;
+            *self.context_system = system.clone();
+            *self.context_options = active.options.clone();
+            self.btw_prompt.store(Arc::new(BtwPrompt {
+                provider: Arc::clone(active.provider),
+                model: active.model.clone(),
+                system,
+                tools: self.tools.clone(),
+                opts: active.options.clone(),
+                profile: self.profile.clone(),
+            }));
+            Ok(refreshed)
+        })
+    }
+}
+
+fn refreshed_vars(previous: &Vars, current: Vars, remote: bool) -> Vars {
+    if remote {
+        previous
+            .clone()
+            .set("{date}", current.apply("{date}").into_owned())
+    } else {
+        current
+    }
+}
+
+fn restored_notice(history: &History, marker: &str, restored: &str) -> Option<String> {
+    agent::last_announced(history.as_slice(), &[marker])
+        .is_some_and(|text| text != restored)
+        .then(|| restored.to_owned())
+}
 
 pub(crate) struct ToolsPreviewSource {
     pub(crate) registry: Arc<ToolRegistry>,
@@ -587,7 +787,9 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         self.cache_warmer.stop(WarmStop::PrefixChanged);
+        self.adopt_settings();
         let slot = self.model_slot.load_full();
+        let effective_slot = self.effective_model_slot.load_full();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
             &slot.model,
@@ -603,21 +805,20 @@ impl AgentLoop {
         )
         .await;
         let retention = agent::Retention::new(&self.permissions, &self.goal, &self.history);
-        let spend = agent::compact_with_session(
+        event_tx.send(AgentEvent::Compacting)?;
+        let mut prepared = agent::prepare_compaction(
             &*provider,
             &model,
-            &mut self.history,
+            &self.history,
             event_tx,
             &self.config,
             extractor.as_ref(),
-            BackgroundReminderContext {
-                background: self.background.as_ref(),
-                jobs: None,
-                workflow: self.workflow.as_ref(),
-            },
             retention,
+            &CancelToken::none(),
+            &self.retry_now,
         )
         .await?;
+        let spend = prepared.spend;
         let cost = model.billed_cost(&spend.usage, false);
         self.goal
             .record_external_usage(spend.usage, cost, model.billing);
@@ -627,9 +828,123 @@ impl AgentLoop {
                 .record_external_usage(extraction.usage, extraction.cost, extraction.billing);
             self.record_autopilot_spend(event_tx, extraction.cost, extraction.billing);
         }
-        let effective_slot = self.effective_model_slot.load();
+        prepared.validate()?;
+        self.adopt_settings();
+        let listed = if self.config.task_model_choice {
+            agent::favorite_models(&self.model_policy).await
+        } else {
+            None
+        };
+        let system = self.context_system.clone();
+        let tools = self.tools.clone();
+        let tool_filter = self.effective_tool_filter();
+        let mode = self.mode.load_full();
+        let plan = self.plan.clone();
+        let options = self.context_options.clone();
+        let (_, mut refresh) = self.compaction_parts(slot.model.clone());
+        let refreshed = refresh
+            .refresh(
+                &prepared.history,
+                ActiveContext {
+                    provider: &effective_slot.provider,
+                    model: &effective_slot.model,
+                    system: &system,
+                    tools: &tools,
+                    tool_filter: &tool_filter,
+                    mode: &mode,
+                    plan: plan.as_ref(),
+                    options: &options,
+                },
+            )
+            .await?;
+        drop(refresh);
+        self.mcp = self.mcp.take().map(|mcp| {
+            mcp.with_profile_policy(Arc::new(self.profile_tool_policy()), ToolFilter::All)
+        });
+        let mcp = self.mcp.clone().map(|mcp| {
+            if refreshed.tool_filter.is_read_only() {
+                mcp.narrowed(&ToolFilter::ReadOnly(Box::new(ToolFilter::All)))
+            } else {
+                mcp
+            }
+        });
+        let reminders = StandingState {
+            environment: refreshed.environment.as_deref(),
+            instructions: refreshed.instructions.as_deref(),
+            memory: refreshed.memory.as_deref(),
+            configuration: refreshed.configuration.as_deref(),
+            mode_notice: None,
+            mode: &mode,
+            autopilot: self
+                .permissions
+                .autopilot()
+                .map(|handle| handle.is_engaged()),
+            favorites: self.config.task_model_choice
+                && refreshed.tool_filter.matches(TASK_TOOL_NAME),
+            model_policy: &self.model_policy,
+            mcp: mcp.as_ref(),
+            decisions: self.permissions.decisions().is_some(),
+            tools: &refreshed.tool_filter,
+        }
+        .collect_with_favorites(prepared.history.as_slice(), listed);
+        prepared.refresh_reminders(reminders);
+        prepared.finish(
+            &mut self.history,
+            event_tx,
+            &self.config,
+            BackgroundReminderContext {
+                background: self.background.as_ref(),
+                jobs: None,
+                workflow: self.workflow.as_ref(),
+            },
+        )?;
+        agent::append_post_compaction_instructions(&mut self.history, event_tx, &self.config)?;
+        self.restart_memory_pump();
+        self.publish_btw_prompt(
+            &effective_slot,
+            &self.context_system,
+            self.context_options.clone(),
+        );
         self.publish_prepared_context(&effective_slot);
+        event_tx.send(AgentEvent::Done {
+            usage: spend.usage,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        })?;
         Ok(())
+    }
+
+    fn compaction_parts(&mut self, chat_model: Model) -> (&mut History, CompactionRefresh<'_>) {
+        let source = self.tools_preview_source();
+        (
+            &mut self.history,
+            CompactionRefresh {
+                vars: &mut self.vars,
+                instructions: &mut self.instructions,
+                memory: &mut self.memory,
+                surface: &mut self.surface,
+                tools: &mut self.tools,
+                hosted: &mut self.hosted,
+                bound_profile: &mut self.bound_profile,
+                remote_project_context: &mut self.remote_project_context,
+                context_system: &mut self.context_system,
+                context_options: &mut self.context_options,
+                source,
+                profile: self.system_prompt_profile.clone(),
+                workspace: self.workspace_session.as_ref(),
+                host_cwd: self.host_cwd.as_deref(),
+                permissions: &self.permissions,
+                workflow: self.workflow.as_ref(),
+                subagent_cancels: &self.subagent_cancels,
+                local_documents: self.local_documents.clone(),
+                tool_output_store: self.tool_output_store.as_deref(),
+                session_id: self.session_id.as_ref(),
+                lua_handle: &self.lua_handle,
+                timeouts: self.timeouts,
+                chat_model,
+                btw_prompt: &self.btw_prompt,
+            },
+        )
     }
 
     /// Spend outside the agent's own turns, which an engaged autopilot counts
@@ -776,34 +1091,49 @@ impl AgentLoop {
         if let Some(learner) = &self.learner {
             learner.hold();
         }
+        let params = self.agent_params(&effective_slot, &selected_slot, prompt_slots, tool_filter);
+        let environment = Some(agent::environment_block(&self.vars, &effective_slot.model));
+        let tools = self.tools.clone();
+        let memory_store = self.memory.store().cloned();
+        let loaded_instructions = self.instructions.loaded().clone();
+        let answer_rx = Arc::clone(&self.answer_rx);
+        let queue = Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>;
+        let retry_now = self.retry_now.clone();
+        let goal = self.goal.clone();
+        let mcp = self.mcp.clone();
+        let code = self.code.clone();
+        let cache_warmer = self.cache_warmer.clone();
+        let autopilot = self.permissions.autopilot();
+        let (history, mut refresh) = self.compaction_parts(selected_slot.model.clone());
         let mut agent = Agent::new(
-            self.agent_params(&effective_slot, &selected_slot, prompt_slots, tool_filter),
+            params,
             AgentRunParams {
-                history: &mut self.history,
+                history,
                 system,
-                environment: Some(agent::environment_block(&self.vars, &effective_slot.model)),
+                environment,
                 instructions,
                 memory,
                 configuration,
                 mode_notice: None,
                 event_tx,
-                tools: self.tools.clone(),
+                tools,
                 tools_fixed: true,
-                memory_store: self.memory.store().cloned(),
+                memory_store,
             },
         )
         .with_peer_checkpoint()
-        .with_loaded_instructions(self.instructions.loaded().clone())
-        .with_user_response_rx(Arc::clone(&self.answer_rx))
-        .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>)
+        .with_compaction_refresh(&mut refresh)
+        .with_loaded_instructions(loaded_instructions)
+        .with_user_response_rx(answer_rx)
+        .with_interrupt_source(queue)
         .with_cancel(cancel)
-        .with_retry_now(self.retry_now.clone())
-        .with_goal(self.goal.clone())
-        .with_mcp(self.mcp.clone())
-        .with_code(self.code.clone())
+        .with_retry_now(retry_now)
+        .with_goal(goal)
+        .with_mcp(mcp)
+        .with_code(code)
         .with_home_model(selected_slot.home.clone())
-        .with_cache_warmer(self.cache_warmer.clone());
-        if let Some(autopilot) = self.permissions.autopilot() {
+        .with_cache_warmer(cache_warmer);
+        if let Some(autopilot) = autopilot {
             agent = agent.with_autopilot(autopilot);
         }
 
@@ -825,7 +1155,9 @@ impl AgentLoop {
             agent.run_batch(first, inputs).await
         };
         drop(agent);
+        drop(refresh);
         self.surface.touch(Instant::now());
+        self.restart_memory_pump();
         if let Some(pump) = &self.memory_pump {
             pump.nudge();
         }
@@ -1508,6 +1840,32 @@ pub(super) mod tests {
     const PREVIEW_MCP_TOOL: &str = "preview.lookup";
     const PREVIEW_MCP_DESCRIPTION: &str = "Look up preview data";
     const PREVIEW_PLAN_REF: &str = "plan-preview";
+    const OLD_DATE: &str = "2025-01-01";
+    const CURRENT_DATE: &str = "2026-10-26";
+    const REMOTE_PLATFORM: &str = "remote-platform";
+    const LOCAL_PLATFORM: &str = "local-platform";
+    const LOCAL_CWD: &str = "/host-project";
+
+    #[test_case(false, LOCAL_CWD, LOCAL_PLATFORM; "local_environment")]
+    #[test_case(true, PREVIEW_CWD, REMOTE_PLATFORM; "remote_identity_is_preserved")]
+    fn compaction_refreshes_date_without_replacing_remote_identity(
+        remote: bool,
+        cwd: &str,
+        platform: &str,
+    ) {
+        let previous = Vars::new()
+            .set("{cwd}", PREVIEW_CWD)
+            .set("{platform}", REMOTE_PLATFORM)
+            .set("{date}", OLD_DATE);
+        let current = Vars::new()
+            .set("{cwd}", LOCAL_CWD)
+            .set("{platform}", LOCAL_PLATFORM)
+            .set("{date}", CURRENT_DATE);
+        let refreshed = refreshed_vars(&previous, current, remote);
+        assert_eq!(refreshed.apply("{cwd}"), cwd);
+        assert_eq!(refreshed.apply("{platform}"), platform);
+        assert_eq!(refreshed.apply("{date}"), CURRENT_DATE);
+    }
 
     pub(crate) fn tools_preview_source(
         config: AgentConfig,

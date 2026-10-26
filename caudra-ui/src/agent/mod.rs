@@ -1170,7 +1170,10 @@ mod tests {
     use caudra_agent::automation::testing::AutomationFixture;
     use caudra_agent::automation::workflows::NO_WORKFLOWS;
     use caudra_agent::prompt::profile::{PROFILE_DIR, PROFILE_EXTENSION};
-    use caudra_agent::prompt::{CONFIGURATION_CHANGED_MARKER, CONFIGURATION_RESTORED_PROMPT};
+    use caudra_agent::prompt::{
+        CONFIGURATION_CHANGED_MARKER, CONFIGURATION_RESTORED_PROMPT, ENVIRONMENT_MARKER,
+        INSTRUCTIONS_CHANGED_MARKER, INSTRUCTIONS_RESTORED_PROMPT, MEMORY_UPDATED_MARKER,
+    };
     use caudra_agent::tools::TODOWRITE_TOOL_NAME;
     use caudra_agent::{AgentEvent, AgentInput, PromptAdmission};
     use caudra_automation::host::{Failure, FailureKind};
@@ -1234,6 +1237,8 @@ mod tests {
     const PROFILE_DROPPED: &str = "a session must keep the profile it loaded once the file is lost";
     const FROZEN_PROMPT: &str = "an edited profile must leave the cached prompt as it was";
     const EDIT_UNNOTED: &str = "the bound prompt must say which profile built it";
+    const STALE_COMPACTION_CONTEXT: &str = "stale-compaction-context";
+    const COMPACTION_FINISHED: &str = "manual compaction must finish before the next turn";
 
     struct StubProvider(Option<flume::Sender<String>>);
 
@@ -1451,6 +1456,103 @@ mod tests {
             .collect()
     }
 
+    fn finished_events(handles: &AgentHandles) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = handles
+                .agent_rx
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(COMPACTION_FINISHED)
+                .event;
+            assert!(!matches!(&event, AgentEvent::Error { .. }), "{event:?}");
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                return events;
+            }
+        }
+    }
+
+    #[test_case(false; "summarized_reminders")]
+    #[test_case(true; "retained_reminders")]
+    fn manual_compaction_refreshes_standing_context_without_an_extra_turn(retained: bool) {
+        crate::components::register_native_tools();
+        let stale: Vec<_> = [
+            ENVIRONMENT_MARKER,
+            INSTRUCTIONS_CHANGED_MARKER,
+            MEMORY_UPDATED_MARKER,
+            CONFIGURATION_CHANGED_MARKER,
+        ]
+        .into_iter()
+        .map(|marker| Message::observation(format!("{marker}\n{STALE_COMPACTION_CONTEXT}")))
+        .collect();
+        let mut initial = vec![Message::user(RESUMED_HISTORY_TEXT.into())];
+        if retained {
+            initial.push(Message::user(PROBE_TEXT.into()));
+        }
+        initial.extend(stale);
+        let (requests, received) = flume::unbounded();
+        let (mut handles, _, _) = spawn_with_provider(
+            Arc::new(PrefixRecorder(requests)),
+            initial,
+            None,
+            None,
+            None,
+        );
+        handles.publish_settings(Settings {
+            config: AgentConfig {
+                disabled_tools: [TODOWRITE_TOOL_NAME.to_owned()].into_iter().collect(),
+                ..turns_only()
+            },
+            prompt_profiles: Arc::default(),
+            mcp: None,
+        });
+        handles.queue.push(QueueItem::Compact { run_id: FIRST_RUN });
+        let events = finished_events(&handles);
+        received.recv_timeout(LONG_TIMEOUT).expect(NO_REQUEST);
+        assert!(received.is_empty());
+        let injected: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Injected { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            injected
+                .iter()
+                .all(|text| !text.contains(STALE_COMPACTION_CONTEXT))
+        );
+        for notice in [
+            INSTRUCTIONS_RESTORED_PROMPT,
+            caudra_agent::prompt::MEMORY_UNAVAILABLE_PROMPT,
+            CONFIGURATION_RESTORED_PROMPT,
+        ] {
+            assert!(injected.contains(&notice));
+        }
+        let environment = injected
+            .iter()
+            .find(|text| text.contains(ENVIRONMENT_MARKER))
+            .unwrap();
+        assert!(environment.contains(&crate::components::test_model().spec()));
+        assert!(environment.contains(caudra_agent::template::env_vars().apply("{date}").as_ref()));
+        let before = handles.btw_prompt.load_full();
+        assert!(!tool_names(&before.tools.to_string()).contains(&TODOWRITE_TOOL_NAME.to_owned()));
+        assert!(handles.context_store.latest(&ContextKey::Main).is_some());
+
+        let next = ask(&handles, &received, FIRST_RUN);
+        let next_events = finished_events(&handles);
+        assert_eq!(next.system, before.system);
+        assert_eq!(next.tools, before.tools.to_string());
+        assert!(next_events.iter().all(|event| !matches!(event,
+            AgentEvent::Injected { text, .. }
+                if [ENVIRONMENT_MARKER, INSTRUCTIONS_CHANGED_MARKER, MEMORY_UPDATED_MARKER, CONFIGURATION_CHANGED_MARKER]
+                    .iter().any(|marker| text.contains(marker))
+        )));
+        assert!(received.is_empty());
+        smol::block_on(handles.into_task().cancel());
+    }
+
     #[test]
     fn a_configuration_change_keeps_the_cached_prefix_until_a_rebuild() {
         crate::components::register_native_tools();
@@ -1552,6 +1654,48 @@ mod tests {
         reload_profiles(&mut handles, &mut app, loaded);
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         (handles, model_slot, permissions, app, received)
+    }
+
+    #[test]
+    fn manual_compaction_rebuilds_the_profile_for_the_effective_conversation_model() {
+        let dir = TempDir::new().unwrap();
+        let (mut handles, model_slot, _, mut app, received) = running_loaded_profile(&dir);
+        let first = ask(&handles, &received, app.run_id);
+        finished_events(&handles);
+        assert!(first.system.contains(LOADED_PROFILE));
+        reload_profiles(
+            &mut handles,
+            &mut app,
+            reread_profiles(&dir, Some(EDITED_PROFILE)),
+        );
+        let selected = model_slot.load_full();
+        let mut summary_model = selected.model.clone();
+        summary_model.id = SELECTED_MODEL.into();
+        model_slot.store(Arc::new(ModelSlot {
+            model: summary_model,
+            provider: Arc::clone(&selected.provider),
+            home: None,
+        }));
+        handles
+            .queue
+            .push(QueueItem::Compact { run_id: app.run_id });
+        let events = finished_events(&handles);
+        received.recv_timeout(LONG_TIMEOUT).expect(NO_REQUEST);
+        let prompt = handles.btw_prompt.load_full();
+        assert!(prompt.system.contains(EDITED_PROFILE));
+        assert!(!prompt.system.contains(LOADED_PROFILE));
+        assert!(!prompt.outdated_by(app.state.system_prompt_profile.as_deref()));
+        assert_eq!(prompt.model.spec(), selected.model.spec());
+        assert!(events.iter().all(|event| !matches!(event,
+            AgentEvent::Injected { text, .. }
+                if text.contains(ENVIRONMENT_MARKER) && text.contains(SELECTED_MODEL)
+        )));
+        model_slot.store(selected);
+        let next = ask(&handles, &received, app.run_id);
+        finished_events(&handles);
+        assert_eq!(next.system, prompt.system);
+        assert_eq!(next.tools, prompt.tools.to_string());
+        smol::block_on(handles.into_task().cancel());
     }
 
     /// `/new` and `/cd` respawn the agent from the profile the tab holds, and a
@@ -1674,6 +1818,7 @@ mod tests {
         AgentConfig {
             features: FeatureFlags::NONE,
             summarize_memory: false,
+            compaction_requirements: false,
             generate_titles: false,
             ..Default::default()
         }

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -28,7 +29,7 @@ use caudra_providers::pricing::settle_session;
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, CacheKey, HistoryItem, Message,
-    TokenUsage, WorkflowEventOrigin, active_history_items, merge_history_items,
+    RequestOptions, TokenUsage, WorkflowEventOrigin, active_history_items, merge_history_items,
     resolve_history_head, transcript_history_items,
 };
 #[cfg(test)]
@@ -61,6 +62,7 @@ use caudra_workspace::{
 };
 use event_listener::Event;
 use flume::Receiver;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
@@ -69,7 +71,7 @@ use crate::agent::change_recording::{ChangeRecorder, ChangeSource, cover_records
 use crate::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
-use crate::agent::{self, History};
+use crate::agent::{self, ActiveContext, ContextRefresh, History, RefreshedContext, StandingState};
 use crate::automation::catalog::Frontend;
 use crate::automation::clock::{Clock, SystemClock};
 use crate::automation::frontend::{
@@ -94,18 +96,20 @@ use crate::mcp::prompt_preamble;
 use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
 use crate::memory::compactor::{Ledger, Pump};
 use crate::mentions;
+use crate::nudge::Nudge;
 use crate::peers::{PeerDescriptor, PeerHost};
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
+use crate::remote_project_context::RemoteProjectContext;
 use crate::restart::{self, InterruptedJob, InterruptedNotice, Interruption, MainState};
 use crate::session_fork::ReachableTasks;
 use crate::template;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolDefinitions,
-    ToolFilter, ToolRegistry,
+    DescriptionContext, FileReadTracker, LocalTools, PathLocks, TASK_TOOL_NAME, ToolAudience,
+    ToolDefinitions, ToolFilter, ToolRegistry,
 };
 use crate::types::{
     AUTOPILOT_EVENT_RUN_ID, AutopilotEvent, BACKGROUND_EVENT_RUN_ID, BatchToolEntry,
@@ -1333,6 +1337,268 @@ struct AgentSetup {
     tool_filter: ToolFilter,
 }
 
+struct HeadlessRefresh<'a> {
+    base: &'a AgentParams,
+    remote_context: &'a mut Option<Arc<RemoteProjectContext>>,
+    vars: &'a mut template::Vars,
+    baseline: &'a mut agent::InstructionBaseline,
+    surface: &'a mut agent::SurfaceBaseline,
+    memory: &'a mut MemoryBaseline,
+    profile: Option<&'a SystemPromptProfile>,
+    system_override: Option<&'a str>,
+    append_system: Option<&'a str>,
+    excluded_tools: &'a [&'static str],
+    chat_model: &'a Model,
+    memory_origin: Option<&'a str>,
+    workflows_available: bool,
+}
+
+fn refresh_environment(vars: &template::Vars, remote: bool) -> template::Vars {
+    let refreshed = vars
+        .clone()
+        .set("{date}", Timestamp::now().strftime("%Y-%m-%d").to_string());
+    if remote {
+        refreshed
+    } else {
+        refreshed.set(
+            crate::prompt::CHECKOUT_SLOT,
+            template::checkout_section(Path::new(vars.apply("{cwd}").as_ref())),
+        )
+    }
+}
+
+fn restored_notice(history: &History, marker: &str, restored: &str) -> Option<String> {
+    agent::last_announced(history.as_slice(), &[marker])
+        .is_some_and(|text| text != restored)
+        .then(|| restored.to_owned())
+}
+
+async fn refresh_remote_context(
+    base: &AgentParams,
+    workspace: &WorkspaceSession,
+    previous: Option<&RemoteProjectContext>,
+    cwd: &str,
+) -> Result<Arc<RemoteProjectContext>, AgentError> {
+    let result = async {
+        let context = crate::remote_project_context::load_remote_project_context(
+            workspace,
+            base.config.features,
+        )
+        .await
+        .map_err(|error| AgentError::Config {
+            message: format!("Remote project context unavailable: {error}"),
+        })?;
+        let changed =
+            previous.is_none_or(|old| old.manifest_revision() != context.manifest_revision());
+        let _background_transition = if changed {
+            prepare_background_transition(base.background.as_ref())
+                .await
+                .map_err(|message| AgentError::Config { message })?
+        } else {
+            None
+        };
+        let transition = if changed {
+            crate::workflow::prepare_workspace_transition(
+                base.workflow.as_ref(),
+                base.subagent_cancels.active_count(),
+                WorkspaceRebind {
+                    workspace: workspace.clone(),
+                    context: Arc::clone(&context),
+                    cwd: cwd.to_owned(),
+                },
+            )
+            .await
+            .map_err(|message| AgentError::Config { message })?
+        } else {
+            None
+        };
+        base.permissions
+            .replace_remote_permission_asset(context.permissions())
+            .map_err(|error| AgentError::Config {
+                message: format!("Remote permission policy unavailable: {error}"),
+            })?;
+        if let Some(transition) = transition {
+            transition
+                .commit()
+                .await
+                .map_err(|error| AgentError::Config {
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(context)
+    }
+    .await;
+    if result.is_err() {
+        base.permissions.invalidate_remote_permission_asset();
+        base.subagent_cancels.cancel_all();
+        stop_session_work(base.background.as_ref(), base.workflow.as_ref()).await;
+    }
+    result
+}
+
+fn headless_system(
+    system_override: Option<&str>,
+    append: Option<&str>,
+    build: impl FnOnce() -> String,
+) -> String {
+    let mut system = system_override.map(str::to_owned).unwrap_or_else(build);
+    if let Some(append) = append {
+        system.push('\n');
+        system.push_str(append);
+    }
+    system
+}
+
+impl ContextRefresh for HeadlessRefresh<'_> {
+    fn refresh<'a>(
+        &'a mut self,
+        history: &'a History,
+        active: ActiveContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshedContext, AgentError>> + Send + 'a>> {
+        Box::pin(async move {
+            let vars = refresh_environment(self.vars, self.base.workspace_session.is_some());
+            let context = if let Some(workspace) = &self.base.workspace_session {
+                let context = refresh_remote_context(
+                    self.base,
+                    workspace,
+                    self.remote_context.as_deref(),
+                    vars.apply("{cwd}").as_ref(),
+                )
+                .await?;
+                Some(context)
+            } else {
+                self.remote_context.clone()
+            };
+            let current = match &context {
+                Some(context) => {
+                    agent::load_remote_instructions(context, self.base.host_cwd.as_deref())
+                }
+                None if self.base.workspace_session.is_none() => {
+                    let cwd = vars.apply("{cwd}").into_owned();
+                    smol::unblock(move || agent::load_instructions(&cwd)).await
+                }
+                None => agent::Instructions::default(),
+            };
+            let mut baseline = self.baseline.clone();
+            let mut memory = self.memory.clone();
+            let instructions = baseline.rebase(current, history.epoch()).or_else(|| {
+                restored_notice(
+                    history,
+                    crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
+                    crate::prompt::INSTRUCTIONS_RESTORED_PROMPT,
+                )
+            });
+            let memory_notice = memory.refresh(history, self.memory_origin, true).await;
+            let memory_notice = if memory.view().is_none() {
+                restored_notice(
+                    history,
+                    crate::prompt::MEMORY_UPDATED_MARKER,
+                    crate::prompt::MEMORY_UNAVAILABLE_PROMPT,
+                )
+            } else {
+                memory_notice.or_else(|| {
+                    restored_notice(
+                        history,
+                        crate::prompt::MEMORY_UPDATED_MARKER,
+                        crate::prompt::MEMORY_REFRESHED_PROMPT,
+                    )
+                })
+            };
+            let background = self.base.background.is_some();
+            let mut definitions = tool_definitions(
+                &vars,
+                active.model,
+                &self.base.config,
+                self.excluded_tools,
+                &self.base.registry,
+                self.workflows_available,
+                TaskDescriptionContext {
+                    profile: self.profile,
+                    session_plan: active.mode.has_session_plan(active.plan),
+                    prompt_profiles: &self.base.prompt_profiles,
+                    chat_model: self.chat_model,
+                    thinking: &active.options.thinking,
+                    model_policy: &self.base.model_policy,
+                    timeouts: self.base.timeouts,
+                    remote_project_context: context.as_ref(),
+                    host_cwd: self.base.host_cwd.as_deref(),
+                },
+            );
+            crate::tools::execution::configure_declared(
+                &mut definitions.declared,
+                &self.base.config,
+                background,
+                background,
+            );
+            let tool_filter = definitions.available_filter().for_mode(active.mode);
+            let slots = crate::tools::execution::execution_slots(
+                &self.base.prompt_slots,
+                &self.base.config,
+                background,
+                background,
+                &definitions.declared,
+            );
+            let system = headless_system(self.system_override, self.append_system, || {
+                agent::build_system_prompt(
+                    baseline.text(),
+                    &slots,
+                    &tool_filter,
+                    self.profile,
+                    memory.view(),
+                )
+            });
+            let settled = self.surface.settle(
+                agent::Surface::new(system, definitions.declared),
+                true,
+                agent::PrefixKey {
+                    model: active.model.spec(),
+                    chat_model: self.chat_model.spec(),
+                    thinking: active.options.thinking.clone(),
+                    mode: active.mode.clone(),
+                    plan: active.plan.cloned(),
+                    cwd: vars.apply("{cwd}").into_owned(),
+                },
+                history.epoch(),
+                history.as_slice(),
+            );
+            let refreshed = RefreshedContext {
+                system: settled.surface.system.clone(),
+                environment: Some(agent::environment_block(&vars, active.model)),
+                instructions: if self.system_override.is_some() {
+                    restored_notice(
+                        history,
+                        crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
+                        crate::prompt::INSTRUCTIONS_CUSTOM_PROMPT,
+                    )
+                } else {
+                    instructions
+                },
+                memory: if self.system_override.is_some() {
+                    restored_notice(
+                        history,
+                        crate::prompt::MEMORY_UPDATED_MARKER,
+                        crate::prompt::MEMORY_UNAVAILABLE_PROMPT,
+                    )
+                } else {
+                    memory_notice
+                },
+                configuration: settled.notice,
+                tools: settled.surface.tools.clone(),
+                tool_filter,
+                loaded_instructions: baseline.loaded().clone(),
+                remote_project_context: context.clone(),
+                task_environment: vars.clone(),
+                memory_store: memory.store().cloned(),
+            };
+            *self.remote_context = context;
+            *self.vars = vars;
+            *self.baseline = baseline;
+            *self.memory = memory;
+            Ok(refreshed)
+        })
+    }
+}
+
 struct TaskDescriptionContext<'a> {
     profile: Option<&'a SystemPromptProfile>,
     session_plan: bool,
@@ -1352,7 +1618,7 @@ fn setup(
     registry: &ToolRegistry,
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
-    remote_environment: Option<&RemoteEnvironment>,
+    (working_dir, remote_environment): (&Path, Option<&RemoteEnvironment>),
 ) -> AgentSetup {
     let vars = if let Some(environment) = remote_environment {
         template::env_vars()
@@ -1360,6 +1626,11 @@ fn setup(
             .set("{platform}", environment.platform.clone())
     } else {
         template::env_vars()
+            .set("{cwd}", working_dir.to_string_lossy().into_owned())
+            .set(
+                crate::prompt::CHECKOUT_SLOT,
+                template::checkout_section(working_dir),
+            )
     };
     let instructions = match task.remote_project_context {
         Some(context) => agent::load_remote_instructions(context, task.host_cwd),
@@ -1497,7 +1768,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = AgentMode::Build;
     let AgentSetup {
-        vars,
+        mut vars,
         instructions,
         mut tools,
         tool_filter,
@@ -1518,7 +1789,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             remote_project_context: params.remote_project_context.as_ref(),
             host_cwd: params.host_cwd.as_deref(),
         },
-        params.remote_environment.as_ref(),
+        (&params.initial_wd, params.remote_environment.as_ref()),
     );
 
     crate::tools::execution::configure_declared(&mut tools, &params.config, false, false);
@@ -1529,7 +1800,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         false,
         &tools,
     );
-    let memory = MemoryBaseline::adopt(
+    let mut memory = MemoryBaseline::adopt(
         open_memory_store(
             params.local_documents.as_ref(),
             Some(&state_dir),
@@ -1659,51 +1930,71 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     cwd: vars.apply("{cwd}").into_owned(),
                 },
             );
+            let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
+            let mut surface = agent::SurfaceBaseline::default();
+            let base = AgentParams {
+                provider: Arc::clone(&provider),
+                model: model.clone(),
+                chat_provider: provider,
+                chat_model: model,
+                config: params.config,
+                tool_output_lines: ToolOutputLines::default(),
+                tool_output_store: crate::tool_output::default_store(),
+                permissions,
+                session_id: Some(session_ref_clone.clone()),
+                cache_key: Some(CacheKey::session(&session_ref_clone)),
+                workspace_session: params.workspace_session.clone(),
+                remote_project_context: params.remote_project_context.clone(),
+                host_cwd: params.host_cwd.clone(),
+                local_documents: params.local_documents.clone(),
+                task_environment: vars.clone(),
+                root_tool_use_id: None,
+                mailbox: Some(mailbox.clone()),
+                context_publisher: None,
+                timeouts: params.timeouts,
+                file_tracker: FileReadTracker::fresh(),
+                path_locks: PathLocks::fresh(),
+                changes,
+                prompt_slots: Arc::new(params.prompt_slots),
+                prompt_profiles: Arc::clone(&params.prompt_profiles),
+                default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+                active_prompt_profile_name: Some(active_prompt_profile_name),
+                subagent_cancels: Arc::new(CancelMap::new()),
+                subagent_history: SubagentHistoryStore::default(),
+                registry: Arc::clone(registry),
+                audience: ToolAudience::MAIN,
+                tool_filter,
+                tool_ceiling,
+                profile_tool_policy,
+                model_policy: Arc::clone(&params.model_policy),
+                workflow: None,
+                background: None,
+                jobs: None,
+                task_id: None,
+            };
+            let environment = Some(agent::environment_block(&vars, &params.model));
+            let loaded_instructions = baseline.loaded().clone();
+            let mut refresh = HeadlessRefresh {
+                base: &base,
+                remote_context: &mut params.remote_project_context,
+                vars: &mut vars,
+                baseline: &mut baseline,
+                surface: &mut surface,
+                memory: &mut memory,
+                profile: params.system_prompt_profile.as_deref(),
+                system_override: None,
+                append_system: None,
+                excluded_tools: &params.excluded_tools,
+                chat_model: &base.chat_model,
+                memory_origin: Some(session_ref_clone.as_str()),
+                workflows_available: false,
+            };
             let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::clone(&provider),
-                    model: model.clone(),
-                    chat_provider: provider,
-                    chat_model: model,
-                    config: params.config,
-                    tool_output_lines: ToolOutputLines::default(),
-                    tool_output_store: crate::tool_output::default_store(),
-                    permissions,
-                    session_id: Some(session_ref_clone.clone()),
-                    cache_key: Some(CacheKey::session(&session_ref_clone)),
-                    workspace_session: params.workspace_session.clone(),
-                    remote_project_context: params.remote_project_context.clone(),
-                    host_cwd: params.host_cwd.clone(),
-                    local_documents: params.local_documents.clone(),
-                    task_environment: vars.clone(),
-                    root_tool_use_id: None,
-                    mailbox: Some(mailbox.clone()),
-                    context_publisher: None,
-                    timeouts: params.timeouts,
-                    file_tracker: FileReadTracker::fresh(),
-                    path_locks: PathLocks::fresh(),
-                    changes,
-                    prompt_slots: Arc::new(params.prompt_slots),
-                    prompt_profiles: Arc::clone(&params.prompt_profiles),
-                    default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
-                    active_prompt_profile_name: Some(active_prompt_profile_name),
-                    subagent_cancels: Arc::new(CancelMap::new()),
-                    subagent_history: SubagentHistoryStore::default(),
-                    registry: Arc::clone(registry),
-                    audience: ToolAudience::MAIN,
-                    tool_filter,
-                    tool_ceiling,
-                    profile_tool_policy,
-                    model_policy: Arc::clone(&params.model_policy),
-                    workflow: None,
-                    background: None,
-                    jobs: None,
-                    task_id: None,
-                },
+                base.clone(),
                 AgentRunParams {
                     history: &mut history,
                     system,
-                    environment: Some(agent::environment_block(&vars, &params.model)),
+                    environment,
                     instructions: None,
                     memory: None,
                     configuration: None,
@@ -1714,7 +2005,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     memory_store,
                 },
             )
-            .with_loaded_instructions(instructions.loaded)
+            .with_loaded_instructions(loaded_instructions)
+            .with_compaction_refresh(&mut refresh)
             .with_goal(params.goal)
             .with_background_wait()
             .with_peer_exit()
@@ -3148,7 +3440,7 @@ impl PreparedInteractive {
 }
 
 /// The TUI's `/compact` between runs: the conversation's summary replaces its
-/// history, and the goal pays for it. Reports `Compacting`, then `Done`.
+/// history, and the goal pays for it. The caller persists before reporting `Done`.
 #[allow(clippy::too_many_arguments)]
 async fn compact_conversation(
     (provider, model): (&Arc<dyn Provider>, &Model),
@@ -3159,28 +3451,67 @@ async fn compact_conversation(
     permissions: &Arc<PermissionManager>,
     goal: &GoalHandle,
     session: BackgroundReminderContext<'_>,
-) -> Result<(), AgentError> {
+    refresh: &mut HeadlessRefresh<'_>,
+    active: ActiveContext<'_>,
+    mcp: Option<&McpSession>,
+    autopilot: Option<&AutopilotHandle>,
+) -> Result<TokenUsage, AgentError> {
     let (compact_provider, compact_model) =
         agent::resolve_compaction_model(provider, model, timeouts, model_policy)?;
     let extractor = agent::resolve_extractor(config, provider, model, timeouts, model_policy).await;
     let retention = agent::Retention::new(permissions, goal, history);
-    let spend = agent::compact_with_session(
+    event_tx.send(AgentEvent::Compacting)?;
+    let mut prepared = agent::prepare_compaction(
         &*compact_provider,
         &compact_model,
         history,
         event_tx,
         config,
         extractor.as_ref(),
-        session,
         retention,
+        &CancelToken::none(),
+        &Nudge::default(),
     )
     .await?;
-    let cost = compact_model.billed_cost(&spend.usage, false);
-    goal.record_external_usage(spend.usage, cost, compact_model.billing);
-    if let Some(extraction) = spend.extraction {
+    let cost = compact_model.billed_cost(&prepared.spend.usage, false);
+    goal.record_external_usage(prepared.spend.usage, cost, compact_model.billing);
+    if let Some(extraction) = &prepared.spend.extraction {
         goal.record_external_usage(extraction.usage, extraction.cost, extraction.billing);
     }
-    Ok(())
+    prepared.validate()?;
+    let mode = active.mode;
+    let listed = if config.task_model_choice {
+        agent::favorite_models(model_policy).await
+    } else {
+        None
+    };
+    let refreshed = refresh.refresh(&prepared.history, active).await?;
+    let mcp = mcp.cloned().map(|mcp| {
+        if refreshed.tool_filter.is_read_only() {
+            mcp.narrowed(&ToolFilter::ReadOnly(Box::new(ToolFilter::All)))
+        } else {
+            mcp
+        }
+    });
+    let reminders = StandingState {
+        environment: refreshed.environment.as_deref(),
+        instructions: refreshed.instructions.as_deref(),
+        memory: refreshed.memory.as_deref(),
+        configuration: refreshed.configuration.as_deref(),
+        mode_notice: None,
+        mode,
+        autopilot: autopilot.map(AutopilotHandle::is_engaged),
+        favorites: config.task_model_choice && refreshed.tool_filter.matches(TASK_TOOL_NAME),
+        model_policy,
+        mcp: mcp.as_ref(),
+        decisions: permissions.decisions().is_some(),
+        tools: &refreshed.tool_filter,
+    }
+    .collect_with_favorites(prepared.history.as_slice(), listed);
+    prepared.refresh_reminders(reminders);
+    let spend = prepared.finish(history, event_tx, config, session)?;
+    agent::append_post_compaction_instructions(history, event_tx, config)?;
+    Ok(spend.usage)
 }
 
 pub async fn prepare_interactive(
@@ -3378,7 +3709,7 @@ async fn spawn_prepared_session(
             remote_project_context: params.remote_project_context.as_ref(),
             host_cwd: params.host_cwd.as_deref(),
         },
-        params.remote_environment.as_ref(),
+        (&params.initial_wd, params.remote_environment.as_ref()),
     );
 
     crate::tools::execution::configure_declared(
@@ -4137,8 +4468,115 @@ async fn spawn_prepared_session(
                     NextInput::Compact => {
                         let event_tx = EventSender::new(agent_tx.clone(), run_id);
                         run_id += 1;
+                        if let Some(mut selected) = model_rx
+                            .try_iter()
+                            .last()
+                            .filter(|candidate| params.model_policy.allows(&candidate.spec()))
+                            && selected.spec() != model.spec()
+                        {
+                            let routed = live_model.load_full();
+                            if routed.1.spec() == selected.spec() {
+                                provider = Arc::clone(&routed.0);
+                                model = Model::clone(&routed.1);
+                            } else {
+                                match provider::from_model_async(&mut selected, params.timeouts)
+                                    .await
+                                {
+                                    Ok(resolved) => {
+                                        provider = Arc::from(resolved);
+                                        model = selected;
+                                        live_model.store(Arc::new((
+                                            Arc::clone(&provider),
+                                            Arc::new(model.clone()),
+                                        )));
+                                    }
+                                    Err(error) => {
+                                        let _ = event_tx.send(AgentEvent::Error {
+                                            message: error.user_message(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            home_model = None;
+                        }
+                        let (stored_mode, stored_plan) = {
+                            let store = store.lock().await;
+                            let meta = store.as_ref().map(|store| &store.session.meta);
+                            let plan = meta.and_then(|meta| match &meta.plan_target {
+                                Some(StoredPlanTarget::LocalPath { path }) => {
+                                    Some(PlanTarget::Local(path.into()))
+                                }
+                                Some(StoredPlanTarget::PlanRef { reference }) => {
+                                    Some(PlanTarget::Remote(reference.clone()))
+                                }
+                                None => meta
+                                    .plan_path
+                                    .as_ref()
+                                    .map(|path| PlanTarget::Local(path.into())),
+                            });
+                            let mode = meta.and_then(|meta| match (&meta.mode, &plan) {
+                                (Some(StoredMode::Plan), Some(PlanTarget::Local(path))) => {
+                                    Some(AgentMode::Plan(path.clone()))
+                                }
+                                (Some(StoredMode::Plan), Some(PlanTarget::Remote(reference))) => {
+                                    Some(AgentMode::RemotePlan(reference.clone()))
+                                }
+                                _ => None,
+                            });
+                            (mode, plan)
+                        };
+                        let mode = mode_route
+                            .mode
+                            .load_full()
+                            .map(|mode| (*mode).clone())
+                            .or_else(|| continuation.as_ref().map(|(mode, _, _)| mode.clone()))
+                            .or_else(|| wait_fallback.as_ref().map(|(mode, _)| mode()))
+                            .or(stored_mode)
+                            .unwrap_or(AgentMode::Build);
+                        let options = RequestOptions {
+                            thinking: continuation.as_ref().map_or_else(
+                                || params.thinking.clone(),
+                                |(_, thinking, _)| thinking.clone(),
+                            ),
+                            fast: continuation.as_ref().is_some_and(|(_, _, fast)| *fast),
+                            ..Default::default()
+                        };
+                        let plan = mode.plan_target().or(stored_plan);
+                        let (turn_provider, turn_model) = match resolve_main_turn_model(
+                            &mode,
+                            &provider,
+                            &model,
+                            params.timeouts,
+                            &params.model_policy,
+                        )
+                        .await
+                        {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                let _ = event_tx.send(AgentEvent::Error {
+                                    message: error.user_message(),
+                                });
+                                continue;
+                            }
+                        };
+                        let mut refresh = HeadlessRefresh {
+                            base: &base,
+                            remote_context: &mut params.remote_project_context,
+                            vars: &mut vars,
+                            baseline: &mut baseline,
+                            surface: &mut surface,
+                            memory: &mut memory,
+                            profile: params.system_prompt_profile.as_deref(),
+                            system_override: params.system_prompt_override.as_deref(),
+                            append_system: params.append_system_prompt.as_deref(),
+                            excluded_tools: &params.excluded_tools,
+                            chat_model: &model,
+                            memory_origin: Some(&memory_origin),
+                            workflows_available,
+                        };
                         let compacted = compact_conversation(
-                            (&provider, &model),
+                            (&turn_provider, &turn_model),
                             &mut history,
                             &event_tx,
                             &params.config,
@@ -4150,15 +4588,35 @@ async fn spawn_prepared_session(
                                 jobs: None,
                                 workflow: workflow.as_ref(),
                             },
+                            &mut refresh,
+                            ActiveContext {
+                                provider: &turn_provider,
+                                model: &turn_model,
+                                system: "",
+                                tools: &tools,
+                                tool_filter: &base.tool_filter,
+                                mode: &mode,
+                                plan: plan.as_ref(),
+                                options: &options,
+                            },
+                            mcp.as_ref(),
+                            autopilot.as_ref(),
                         )
                         .await;
-                        if let Err(error) = compacted {
-                            error!(%error, "compaction failed");
-                            let _ = event_tx.send(AgentEvent::Error {
-                                message: error.user_message(),
-                            });
-                            continue;
-                        }
+                        base.remote_project_context
+                            .clone_from(&params.remote_project_context);
+                        base.task_environment = vars.clone();
+                        let usage = match compacted {
+                            Ok(usage) => usage,
+                            Err(error) => {
+                                error!(%error, "compaction failed");
+                                let _ = event_tx.send(AgentEvent::Error {
+                                    message: error.user_message(),
+                                });
+                                stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                                continue;
+                            }
+                        };
                         if let Some(store) = &mut *store.lock().await
                             && let Err(error) =
                                 store.record_turn(&history, model.spec(), &permissions)
@@ -4166,7 +4624,13 @@ async fn spawn_prepared_session(
                             let _ = event_tx.send(AgentEvent::Error {
                                 message: format!("{PERSIST_FAILED}: {error}"),
                             });
+                            continue;
                         }
+                        let _ = event_tx.send(AgentEvent::Done {
+                            usage,
+                            num_turns: 1,
+                            reason: DoneReason::EndTurn,
+                        });
                         continue;
                     }
                     NextInput::Background | NextInput::Workflow => {
@@ -4751,19 +5215,19 @@ async fn spawn_prepared_session(
                     .refresh(&history, Some(&memory_origin), rebuild)
                     .await;
 
-                let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                    agent::build_system_prompt(
-                        baseline.text(),
-                        &execution_slots,
-                        &live_tool_filter,
-                        params.system_prompt_profile.as_deref(),
-                        memory.view(),
-                    )
-                });
-                if let Some(append) = &params.append_system_prompt {
-                    system.push('\n');
-                    system.push_str(append);
-                }
+                let system = headless_system(
+                    params.system_prompt_override.as_deref(),
+                    params.append_system_prompt.as_deref(),
+                    || {
+                        agent::build_system_prompt(
+                            baseline.text(),
+                            &execution_slots,
+                            &live_tool_filter,
+                            params.system_prompt_profile.as_deref(),
+                            memory.view(),
+                        )
+                    },
+                );
                 let settled = surface.settle(
                     agent::Surface::new(system, definitions.declared),
                     rebuild,
@@ -4783,6 +5247,24 @@ async fn spawn_prepared_session(
                     .excluding(&retired)
                     .for_mode(&input.mode);
                 let configuration = settled.notice;
+                let environment = Some(agent::environment_block(&vars, &turn_model));
+                let loaded_instructions = baseline.loaded().clone();
+                let memory_store = memory.store().cloned();
+                let mut refresh = HeadlessRefresh {
+                    base: &base,
+                    remote_context: &mut params.remote_project_context,
+                    vars: &mut vars,
+                    baseline: &mut baseline,
+                    surface: &mut surface,
+                    memory: &mut memory,
+                    profile: params.system_prompt_profile.as_deref(),
+                    system_override: params.system_prompt_override.as_deref(),
+                    append_system: params.append_system_prompt.as_deref(),
+                    excluded_tools: &params.excluded_tools,
+                    chat_model: &model,
+                    memory_origin: Some(&memory_origin),
+                    workflows_available,
+                };
 
                 let mut agent = Agent::new(
                     AgentParams {
@@ -4796,18 +5278,20 @@ async fn spawn_prepared_session(
                     AgentRunParams {
                         history: &mut history,
                         system,
-                        environment: Some(agent::environment_block(&vars, &turn_model)),
-                        instructions,
+                        environment,
+                        instructions: instructions
+                            .filter(|_| params.system_prompt_override.is_none()),
                         memory: memory_notice.filter(|_| params.system_prompt_override.is_none()),
                         configuration,
                         mode_notice: None,
                         event_tx,
                         tools: definitions.declared,
                         tools_fixed: true,
-                        memory_store: memory.store().cloned(),
+                        memory_store,
                     },
                 )
-                .with_loaded_instructions(baseline.loaded().clone())
+                .with_loaded_instructions(loaded_instructions)
+                .with_compaction_refresh(&mut refresh)
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel.clone())
                 .with_local_tools(Arc::clone(&params.local_tools))
@@ -4830,6 +5314,9 @@ async fn spawn_prepared_session(
                 let result = agent.run(input).await;
                 let route = agent.conversation_route();
                 drop(agent);
+                base.remote_project_context
+                    .clone_from(&params.remote_project_context);
+                base.task_environment = vars.clone();
                 if route.model.spec() != model.spec() {
                     provider = route.provider;
                     model = route.model;
@@ -5230,6 +5717,7 @@ mod tests {
     use crate::types::ToolDoneEvent;
     use crate::types::{SubagentInfo, TodoPriority, TodoStatus};
     use crate::workflow::store::WorkflowStore;
+    use crate::worktree::git::fixture::{Repository, git};
     use crate::{GoalResult, GoalVerdict, TurnCompleteEvent};
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
@@ -5247,6 +5735,92 @@ mod tests {
     const FIRST_TODO: &str = "draft the schema";
     const REVISED_TODO: &str = "backfill the rows";
     const CHANGE_PROMPT: &str = "change the files";
+
+    #[test_case(None, None, "built"; "built_prompt")]
+    #[test_case(Some("override"), None, "override"; "override_is_exact")]
+    #[test_case(Some("override\n"), Some("append"), "override\n\nappend"; "append_preserves_newlines")]
+    #[test_case(None, Some(""), "built\n"; "empty_append_still_adds_newline")]
+    fn refreshed_system_preserves_override_and_append(
+        system_override: Option<&str>,
+        append: Option<&str>,
+        expected: &str,
+    ) {
+        let system = headless_system(system_override, append, || {
+            assert!(system_override.is_none());
+            "built".to_owned()
+        });
+        assert_eq!(system, expected);
+    }
+
+    #[test]
+    fn refreshed_environment_keeps_remote_identity_and_scratch() {
+        const STALE_DATE: &str = "stale date";
+        const REMOTE_CWD: &str = "remote/project";
+        const REMOTE_PLATFORM: &str = "remote-os";
+        const SCRATCH: &str = "session-specific scratch";
+        let vars = template::Vars::new()
+            .set("{date}", STALE_DATE)
+            .set("{cwd}", REMOTE_CWD)
+            .set("{platform}", REMOTE_PLATFORM)
+            .set("{scratch}", SCRATCH);
+        let refreshed = refresh_environment(&vars, true);
+        assert_ne!(refreshed.apply("{date}"), STALE_DATE);
+        assert_eq!(vars.apply("{date}"), STALE_DATE);
+        assert_eq!(refreshed.apply("{cwd}"), REMOTE_CWD);
+        assert_eq!(refreshed.apply("{platform}"), REMOTE_PLATFORM);
+        assert_eq!(refreshed.apply("{scratch}"), SCRATCH);
+    }
+
+    #[test]
+    fn refreshed_checkout_follows_the_session_directory_and_current_branch() {
+        const WORKTREE: &str = "headless-checkout";
+        const FIRST_BRANCH: &str = "before-refresh";
+        const SECOND_BRANCH: &str = "after-refresh";
+        let repository = Repository::new();
+        let worktree = repository.sibling(WORKTREE);
+        git(
+            &repository.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                FIRST_BRANCH,
+                &worktree.to_string_lossy(),
+            ],
+        );
+        let vars = template::Vars::new().set("{cwd}", worktree.to_string_lossy().into_owned());
+        let vars = refresh_environment(&vars, false);
+        assert!(
+            vars.apply(crate::prompt::CHECKOUT_SLOT)
+                .contains(FIRST_BRANCH)
+        );
+        git(&worktree, &["checkout", "--quiet", "-b", SECOND_BRANCH]);
+        let refreshed = refresh_environment(&vars, false);
+        assert!(
+            refreshed
+                .apply(crate::prompt::CHECKOUT_SLOT)
+                .contains(SECOND_BRANCH)
+        );
+        assert!(
+            !refreshed
+                .apply(crate::prompt::CHECKOUT_SLOT)
+                .contains(FIRST_BRANCH)
+        );
+        assert_eq!(refreshed.apply("{cwd}"), worktree.to_string_lossy());
+    }
+
+    #[test_case(crate::prompt::INSTRUCTIONS_CHANGED_MARKER, crate::prompt::INSTRUCTIONS_RESTORED_PROMPT; "restored_instruction_drift")]
+    #[test_case(crate::prompt::MEMORY_UPDATED_MARKER, crate::prompt::MEMORY_UNAVAILABLE_PROMPT; "missing_memory_withdraws_without_claiming_a_refreshed_view")]
+    fn refresh_withdraws_resumed_notices_once(marker: &str, restored: &str) {
+        let mut history = History::new(vec![Message::observation(marker.to_owned())]);
+        assert_eq!(
+            restored_notice(&history, marker, restored).as_deref(),
+            Some(restored)
+        );
+        history.push(Message::observation(restored.to_owned()));
+        assert!(restored_notice(&history, marker, restored).is_none());
+    }
 
     #[test_case(true ; "a_remote_run_records_on_its_host")]
     #[test_case(false ; "a_local_run_records_nothing")]
@@ -6768,6 +7342,7 @@ complete(#{ report: first.output });
                 config: AgentConfig {
                     generate_titles: false,
                     summarize_memory: false,
+                    compaction_requirements: false,
                     features: self.features,
                     ..AgentConfig::default()
                 },
@@ -8124,6 +8699,102 @@ complete(#{ report: first.output });
             let InteractiveHandle { input_tx, task, .. } = handle;
             drop(input_tx);
             task.await;
+        });
+    }
+
+    #[test_case(false, false; "refreshes_and_persists_while_idle")]
+    #[test_case(true, false; "bad_remote_policy_keeps_original_history")]
+    #[test_case(false, true; "active_children_block_remote_transition_and_are_cancelled")]
+    fn manual_compaction_refreshes_remote_policy_without_another_prompt(corrupt: bool, busy: bool) {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (workspace, service) = AssetService::permission_fixture();
+            let handle = session.spawn_in(false, Some(workspace)).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let before = {
+                let _turn = handle.mode_route.turn.lock().await;
+                crate::load_stored_session(session_id(), &session.state_dir).unwrap()
+            };
+            if corrupt {
+                service.corrupt_permissions();
+            } else {
+                service.remove_permissions();
+            }
+            let (trigger, cancelled) = CancelToken::new();
+            let child = busy.then(|| {
+                handle
+                    .subagent_cancels
+                    .insert(PERMISSION_REQUEST_ID.to_owned(), trigger)
+            });
+            let failed = corrupt || busy;
+            handle.compact_tx.send(()).unwrap();
+            if failed {
+                loop {
+                    match handle.event_rx.recv_async().await.unwrap().event {
+                        AgentEvent::Error { .. } => break,
+                        AgentEvent::Done { .. } => {
+                            panic!("unsafe remote refresh completed compaction")
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                wait_for_turn(&handle.event_rx).await;
+            }
+            let _turn = handle.mode_route.turn.lock().await;
+            let saved = crate::load_stored_session(session_id(), &session.state_dir).unwrap();
+            let restore = |session: &StoredSession| {
+                let head = resolve_history_head(
+                    session.messages(),
+                    session.meta.history_head,
+                    session.meta.pending_revert.is_some(),
+                );
+                History::restored(active_history_items(session.messages(), head).unwrap()).unwrap()
+            };
+            let saved = restore(&saved);
+            let before = restore(&before);
+            if failed {
+                assert_eq!(
+                    serde_json::to_value(saved.as_slice()).unwrap(),
+                    serde_json::to_value(before.as_slice()).unwrap(),
+                );
+            } else {
+                assert!(
+                    saved
+                        .active_items()
+                        .iter()
+                        .any(|item| item.supersedes.is_some())
+                );
+                assert!(saved.as_slice().iter().any(|message| {
+                    message.user_text().is_some_and(|text| {
+                        text.contains(crate::prompt::ENVIRONMENT_MARKER) && text.contains("remote")
+                    })
+                }));
+            }
+            let (events, _) = flume::unbounded();
+            let allowed = handle
+                .permissions
+                .enforce(
+                    &ToolKey::native("file_read"),
+                    &PermissionScopes::single("opaque-file".into()),
+                    &serde_json::json!({}),
+                    &EventSender::new(events, 0),
+                    None,
+                    PERMISSION_REQUEST_ID,
+                    &CancelToken::none(),
+                    None,
+                )
+                .await;
+            assert_eq!(allowed.is_err(), failed);
+            if let Some(slot) = child {
+                assert!(cancelled.is_cancelled());
+                handle
+                    .subagent_cancels
+                    .retire(&PERMISSION_REQUEST_ID.to_owned(), slot);
+            }
+            drop(_turn);
+            shutdown_interactive(handle).await;
         });
     }
 

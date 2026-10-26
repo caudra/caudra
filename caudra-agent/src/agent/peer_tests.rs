@@ -25,8 +25,9 @@ mod peer_tests {
     use super::{
         Agent, AnnouncedMode, ENVIRONMENT, History, MockProvider, PendingInput,
         RequestCapturingProvider, TurnOutcome, answer, default_input, environment_announcement,
-        last_announced, last_announced_mode, make_agent, mode_switch_notice, plan_announcement,
-        standing_notice, text_response, tool_use_response,
+        last_announced, last_announced_mode, make_agent, mode_switch_notice,
+        mode_switch_notice_with_tools, plan_mode, standing_notice, text_response,
+        tool_use_response,
     };
     use crate::autopilot::AutopilotHandle;
     use crate::peers::{PeerDescriptor, PeerHost, PeerSession, SendReceipt};
@@ -852,7 +853,7 @@ mod peer_tests {
         smol::block_on(async {
             let fixture = PeerFixture::new().await;
             let origin = fixture.queue(PEER_ATTACK).await;
-            let plan = plan_announcement();
+            let plan = mode_switch_notice_with_tools(&[], &plan_mode(), |_| false).unwrap();
             let mut history = History::new(vec![
                 Message::user(PEER_FIRST_TURN.into()),
                 environment_announcement(ENVIRONMENT),
@@ -867,6 +868,7 @@ mod peer_tests {
                 &mut history,
             );
             fixture.bind(&mut agent);
+            agent.mode = plan_mode();
             assert!(agent.inject_peer_messages());
             for compacted in [false, true] {
                 if compacted {

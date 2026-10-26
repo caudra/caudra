@@ -49,6 +49,31 @@ pub struct History {
 }
 
 impl History {
+    pub(super) fn staged(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            messages: self.messages.clone(),
+            mirror: None,
+            archived: self.archived.clone(),
+            todos: self.todos.clone(),
+            todos_call: self.todos_call.clone(),
+            plan_written: self.plan_written,
+        }
+    }
+
+    pub(super) fn install(&mut self, mut staged: Self) {
+        staged.mirror = self.mirror.take();
+        *self = staged;
+        self.publish();
+    }
+
+    pub(super) fn replace_staged_tail(&mut self, from: usize, messages: Vec<Message>) {
+        let item_len = item_len_for_message_count(self.active_items(), from);
+        Arc::make_mut(&mut self.snapshot.messages).truncate(item_len);
+        self.messages.truncate(from);
+        self.extend(messages);
+    }
+
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
             snapshot: HistorySnapshot::new(expand_messages(&messages)),

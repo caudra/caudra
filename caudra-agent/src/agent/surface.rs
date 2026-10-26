@@ -45,6 +45,7 @@ pub struct PrefixKey {
 }
 
 /// One request prefix, and every definition it could declare.
+#[derive(Clone)]
 pub struct Surface {
     pub system: String,
     pub tools: Value,
@@ -82,6 +83,7 @@ pub struct Settled<'a> {
 }
 
 /// `K` is what the prefix is keyed on, a [`PrefixKey`] outside tests.
+#[derive(Clone)]
 pub struct SurfaceBaseline<K = PrefixKey> {
     fixed: Option<Fixed<K>>,
     /// When the last request on the fixed prefix finished, which is when the
@@ -89,6 +91,7 @@ pub struct SurfaceBaseline<K = PrefixKey> {
     used: Option<Instant>,
 }
 
+#[derive(Clone)]
 struct Fixed<K> {
     surface: Surface,
     key: K,
