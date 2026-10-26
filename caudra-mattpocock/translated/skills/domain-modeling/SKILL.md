@@ -39,7 +39,7 @@ If a `GLOSSARY-MAP.md` exists at the root, the repo has multiple contexts. The m
 
 Create files lazily: only when you have something to write. If no `GLOSSARY.md` exists, create one when the first term is resolved. If no `docs/adr/` exists, create it when the first ADR is needed.
 
-Writing these files needs Build mode. In Plan mode, keep each resolved term and ADR draft in the session plan with the `plan` tool as it crystallises, and write the files once the user switches to Build mode.
+Writing these files needs Build mode. In Plan mode, the main agent reads the existing session plan with `plan` and preserves its other sections when adding resolved terms and ADR drafts. A delegated task returns drafts to its parent instead of replacing the plan. Saving a draft does not approve it or authorize publication. Re-read the current drafts before writing the authorized files in Build mode.
 
 ## During the session
 
@@ -57,7 +57,9 @@ When domain relationships are being discussed, stress-test them with specific sc
 
 ### Cross-reference with code
 
-When the user states how something works, check whether the code agrees. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible. Which is right?"
+When the user states how something works, check whether the code agrees. Use `source_code_context` to locate the relevant symbols, `file_index` for structure, and `source_code_refs` for callers when available; otherwise use file search and reading. Follow the evidence into the source: graph counts are lower bounds, not proof that a path cannot exist. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible. Which is right?"
+
+Ask decisions with `question` when it is available and has an answer channel, otherwise in plain text. A deferred or skipped answer leaves the term unresolved; do not record your preferred wording as agreed.
 
 ### Update GLOSSARY.md inline
 

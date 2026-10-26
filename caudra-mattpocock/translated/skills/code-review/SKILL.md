@@ -3,32 +3,36 @@ name: code-review
 description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Runs both reviews in parallel tasks and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
 ---
 
-Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
+Two-axis review of a committed range and/or working-tree changes, with the scope pinned before review:
 
 - **Standards**: does the code conform to this repo's documented coding standards?
 - **Spec**: does the code faithfully implement the originating issue / spec?
 
 Both axes run as **parallel tasks** so they don't pollute each other's context, then this skill aggregates their findings.
 
+Review is read-only in Plan or Build mode; do not change the session plan unless requested. Applying fixes requires Build mode and is separate from this review. If `question` or its answer channel is unavailable, present the question in plain text and say which decision is needed to continue. Unanswered, deferred, skipped, or dismissed questions do not authorize dependent work.
+
 When the spec lives on [the issue tracker](../../caudra/issue-tracker.md), that page says how to find and read it.
 
 ## Process
 
-### 1. Pin the fixed point
+### 1. Pin the scope and fixed point
 
-Whatever the user said is the fixed point (a commit SHA, branch name, tag, `main`, `HEAD~5`, etc.). If they didn't specify one, ask for it with the `question` tool, the merge-base with the default branch as the recommended option.
+Distinguish a **committed branch range** from **staged, unstaged, and untracked WIP**; do not silently include or omit either. Honor the supplied scope. If unclear, ask with `question`, recommending the merge-base with the default branch for a branch review, or all WIP for a work-in-progress review.
 
-Capture the diff command once: `git diff <fixed-point>...HEAD` (three-dot, so the comparison is against the merge-base). Also note the list of commits via `git log <fixed-point>..HEAD --oneline`.
+For a committed range, resolve the supplied ref and `HEAD` to commit SHAs (`git rev-parse --verify '<ref>^{commit}'`). An **exact commit/tag fixed point** means `git diff <base-sha> <head-sha>`; use `git merge-base <ref-sha> <head-sha>` as the base only when branch/merge-base semantics are intended. Three-dot diff chooses a merge-base; it does not mean "since this exact commit." Record the selected base, head, diff command, and `git log <base-sha>..<head-sha> --oneline`.
 
-Before going further, confirm the fixed point resolves (`git rev-parse <fixed-point>`) and the diff is non-empty. A bad ref or empty diff should fail here, not inside two parallel tasks.
+For WIP, record `git status --short --untracked-files=all`, `git diff --cached` (staged), and `git diff` (unstaged); read the selected untracked files explicitly, since neither diff includes them. Select only the requested categories and paths. For combined branch-plus-WIP review, retain both evidence sets rather than treating `...HEAD` as the whole change.
+
+Give both tasks the same scope record: resolved commits, commands, path filters, WIP categories, and untracked-file list. Validate refs and check all selected evidence for a non-empty change before launching. Avoid concurrent edits; if the worktree changes during review, refresh both tasks' affected evidence. Shell admission is not completion; wait for terminal results. Recover truncated diffs or logs with `tool_output` only when a retained output handle is provided; otherwise report the missing evidence, never invent a handle.
 
 ### 2. Identify the spec source
 
 Look for the originating spec, in this order:
 
-1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched as the issue tracker page says.
-2. A path the user passed as an argument.
-3. A spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name or feature.
+1. The spec or path explicitly supplied by the user.
+2. The relevant session plan (`plan` with `action: "read"`), linked issues (fetched as the issue tracker page says), and matching spec files in the repo. Use only requirements relevant to the selected scope; ask about conflicts rather than silently choosing.
+3. Only if context is still missing, targeted `history.search` / `history.read` through `code` after reading `help("history")`; do not trawl unrelated sessions.
 4. If nothing is found, ask the user where the spec is. If they say there isn't one, the **Spec** task will skip and report "no spec available".
 
 ### 3. Identify the standards sources
@@ -57,17 +61,17 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 
 ### 4. Start both tasks in parallel
 
-Issue both `task` calls in one turn, in the foreground, each with `mode: "plan"` so neither edits the code, and aggregate the reports they return.
+Use `batch` for both independent foreground `task` calls, each with `mode: "plan"` so neither edits the code, and aggregate the reports they return. Tell both to use `source_code_context` for relevant implementation paths, `file_index` before focused reads, and `source_code_refs` for affected callers/tests when available; otherwise use `file_glob`, `file_grep`, and `file_read`. Graph counts are lower bounds, not proof that unlisted callers or coverage do not exist.
 
 **Standards task brief** should include:
 
-- The full diff command and commit list.
+- The shared scope record and commit list from step 1.
 - The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the task has no other access to it).
 - The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."
 
 **Spec task brief** should include:
 
-- The diff command and commit list.
+- The same scope record and commit list from step 1.
 - The path or fetched contents of the spec.
 - The brief: "Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."
 
@@ -75,7 +79,7 @@ If the spec is missing, skip the Spec task and note this in the final report.
 
 ### 5. Aggregate
 
-Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
+Validate child findings against the scoped diff, surrounding code, and cited standard or spec. Remove unsupported claims and duplicates within each axis; mark unresolved uncertainty and checks not run. Present the validated reports under `## Standards` and `## Spec` headings. Do **not** merge or rerank findings across axes, because the two axes are deliberately separate (see _Why two axes_).
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes: that's the reranking the separation exists to prevent.
 

@@ -7,7 +7,13 @@ description: Diagnosis loop for hard bugs and performance regressions. Use when 
 
 A discipline for hard bugs. Skip phases only when explicitly justified.
 
+Follow the scope of the request. For an assessment or hypothetical scenario, explain which evidence qualifies and what would come next, then stop; describing a next step does not authorize executing it, inspecting unrelated files, or creating a plan.
+
 When exploring the codebase, read `GLOSSARY.md` (if it exists) to get a clear mental model of the relevant modules, and check ADRs in the area you're touching.
+
+In Plan mode, read the existing session `plan` first. Only the main agent merges the proposed loop and diagnosis into it, preserving existing scope and decisions; tasks return drafts. Creating harnesses, adding instrumentation, and fixing code require Build mode (the user switches with Tab). Once authorized, continue the loop without asking for approval each iteration.
+
+Use `question` for human observations when available with an answer channel; otherwise present the questions in plain text and say which observations are needed to continue. Unanswered, deferred, skipped, or dismissed questions do not supply evidence or authorize dependent work.
 
 ## Redact
 
@@ -32,7 +38,7 @@ Spend disproportionate effort here. **Be aggressive. Be creative. Refuse to give
 7. **Property / fuzz loop.** If the bug is "sometimes wrong output", run 1000 random inputs and look for the failure mode.
 8. **Bisection harness.** If the bug appeared between two known states (commit, dataset, version), automate "boot at state X, check, repeat" so you can `git bisect run` it.
 9. **Differential loop.** Run the same input through old-version vs new-version (or two configs) and diff outputs.
-10. **Human in the loop.** Last resort. If a human must click, drive _them_ so the loop is still structured: put each step and each observation to them with the `question` tool, one round per run of the loop, and read their answers as its output. When the steps must run in their own terminal (a sign-in, a device), copy [`scripts/hitl-loop.template.sh`](scripts/hitl-loop.template.sh) to the scratch directory, edit its steps, ask the user to run it with `bash`, and parse the `KEY=VALUE` lines they paste back.
+10. **Human in the loop.** Last resort. If a human must click, drive _them_ so the loop is still structured: put each step and each observation to them with the `question` tool, one round per run of the loop, and read their answers as its output. When the steps must run in their own terminal (a sign-in, a device), load the embedded [`scripts/hitl-loop.template.sh`](scripts/hitl-loop.template.sh) page with `skill` (`mattpocock/skills/diagnosing-bugs/scripts/hitl-loop.template.sh`). In Build mode, materialize its contents in the scratch directory (the `Scratch directory` path in the Environment block, `$TMPDIR` in shell commands), edit its steps, ask the user to run it with `bash`, and parse the redacted `KEY=VALUE` lines they paste back. The embedded page is not a project file to copy. Never run this interactive script through Caudra's shell or wait for shell stdin.
 
 Build the right feedback loop, and the bug is 90% fixed.
 
@@ -56,14 +62,20 @@ Stop and say so explicitly. List what you tried. Ask the user for: (a) access to
 
 ### Completion criterion: a tight loop that goes red
 
-Phase 1 is done when the loop is **tight** and **red-capable**: you can name **one command** (a script path, a test invocation, a curl) that you have **already run at least once** (show the invocation and its output, redacted), and that is:
+Phase 1 is done when the loop is **tight** and **red-capable**: you have either **one automated command already run** (show its invocation and terminal result, redacted), or **one structured human procedure already observed** (record the steps, expected symptom, actual observations, and pass/fail verdict).
+
+The human may supply observations from runs they already performed; you do not have to direct those runs yourself. Label these as user-reported, not independently verified by the agent. Ask only for missing details needed to judge the loop. In a hypothetical scenario, assess the supplied evidence conditionally without claiming any real reproduction took place.
+
+Either loop must be:
 
 - [ ] **Red-capable**: it drives the actual bug code path and asserts the **user's exact symptom**, so it can go red on this bug and green once fixed. Not "runs without erroring"; it must be able to _catch this specific bug_.
 - [ ] **Deterministic**: same verdict every run (flaky bugs: a pinned, high reproduction rate, per above).
 - [ ] **Fast**: seconds, not minutes.
-- [ ] **Agent-runnable**: you can run it unattended; a human in the loop only as structured above.
+- [ ] **Repeatable**: either the agent can run it unattended, or the human can repeat the recorded steps and report observations as structured above.
 
-If you catch yourself reading code to build a theory before this command exists, **stop: jumping straight to a hypothesis is the exact failure this skill prevents.** No red-capable command, no Phase 2.
+Shell admission or a running-job receipt is not a terminal result: wait for completion before claiming a pass or failure. Read truncated evidence with `tool_output` only when a retained output handle is provided; otherwise report the missing evidence, never invent a handle or infer from the visible tail.
+
+If you catch yourself reading code to build a theory before this observed loop exists, **stop: jumping straight to a hypothesis is the exact failure this skill prevents.** No observed red-capable loop, no Phase 2.
 
 ## Phase 2: Reproduce + minimise
 
@@ -86,6 +98,8 @@ Done when **every remaining element is load-bearing**: removing any one of them 
 Do not proceed until you have reproduced **and** minimised.
 
 ## Phase 3: Hypothesise
+
+When available, use `source_code_context` to locate the reproduced path, `file_index` before focused source reads, and `source_code_refs` to trace callers and candidate regression seams; otherwise use `file_glob`, `file_grep`, and `file_read`. Graph counts are lower bounds: missing dynamic calls or tests are not proof of absence.
 
 Generate **3–5 ranked hypotheses** before testing any of them. Single-hypothesis generation anchors on the first plausible idea.
 

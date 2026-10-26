@@ -53,9 +53,9 @@ What every pack's reference maps onto:
 
 | Caudra | Spelled |
 | --- | --- |
-| delegate work | the `task` tool, a task. Several `task` calls in one turn run in parallel. `mode: "plan"` is read-only; `mode: "build"` may edit. `background: true` returns at once, and the task's final report arrives in the conversation by itself: never poll, and check a running task with one `task_control` `status` call. A settled task is resumed by its `task_id`. |
+| delegate work | the `task` tool, a task. Use `batch` for independent parallel calls. `mode: "plan"` is read-only; `mode: "build"` may edit. `background: true` returns at once, and the task's final report arrives in the conversation by itself: never poll, and use `task_control` `status` only when details are needed. A settled task is resumed by its `task_id`. |
 | a task in its own worktree | the brief tells it to `git worktree add` a new branch under the scratch directory, off the base the step names, and to work only there |
-| ask the user | the `question` tool. A headless run has none, so the step says to ask in plain text then. |
+| ask the user | the `question` tool when available with an answer channel, otherwise plain text. Capability, not the frontend name, determines the route. A deferred, skipped, or dismissed question is unresolved, never consent. |
 | a todo list | `todo_write` |
 | run another skill of the pack | load `<pack>/<name>` with the `skill` tool and follow it. When the text tells the user to type it, write `/<pack>:<name>`. |
 | write a skill | load `caudra-docs/skills` with the `skill` tool |
@@ -72,4 +72,6 @@ Map first. Remove a step only when Caudra has nothing like it, and then remove i
 
 ## Plan mode
 
-Caudra opens sessions in Plan mode, where only the session plan changes. A step that writes a plan or a spec says: in Plan mode, write it with the `plan` tool (Caudra's session plan; Ctrl+O opens it, and autopilot can review it); in Build mode, write the file where the step names. A step that builds, edits, commits, or writes any other file needs Build mode: the user switches with Tab, and a task's mode is capped by its caller's, so `mode: "build"` cannot lift a task out of Plan mode.
+In Plan mode, only the session plan may change, not even a scratch file. A step that writes a plan or a spec says: the main agent reads the existing plan with `plan`, preserves unrelated sections, and saves the complete revised content. A delegated task returns its draft to the parent instead. Ctrl+O opens the plan, and autopilot can review it. Saving neither approves it nor changes mode. A portable handoff may be returned in the reply rather than replacing the implementation plan.
+
+A step that builds, edits, commits, or writes any other file needs Build mode and authorization for that work: the user switches with Tab, and a task's mode is capped by its caller's, so `mode: "build"` cannot lift a task out of Plan mode. Re-read drafts before authorized publication so human edits are included. Distinguish a saved draft from a written file or published issue.

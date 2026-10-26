@@ -15,16 +15,18 @@ Shape each question so the user answers in their own words as easily as they pic
 
 Word each question so accepting the recommended option accepts your recommended answer.
 
-A headless run has no `question` tool. Then ask the round in plain text, numbered, each question followed by your recommended answer:
+Use `question` when it is available and has an answer channel, regardless of the frontend. If it is unavailable or reports no answer channel, ask the round in plain text, numbered, each question followed by your recommended answer:
 
 ```
-❓ **Q1** - **<question title>**: <question body>
+**Q1** - **<question title>**: <question body>
 
-➡️ <your recommended answer>
+Recommended: <your recommended answer>
 ```
 
 Each round the user answers reshapes the tree: settled decisions push the frontier outward and unblock questions that depended on them. Recompute the frontier and ask the next round. A question whose answer depends on another question still open in this round belongs to a _later_ round, not this one.
 
-Finding _facts_ is your job, never the user's. When a frontier question needs a fact from the environment (filesystem, tools, etc.), start a `task` with `mode: "plan"` and `background: true` to find it; don't ask the user for anything you could look up yourself. Don't block on it: a running exploration is an unsettled prerequisite, so only the questions downstream of it wait for its report, which arrives in the conversation by itself; ask the rest of the frontier now. The _decisions_ are the user's: put each to them and wait.
+Deferred, skipped, or dismissed questions remain unresolved. A question ID is not an answer, and your recommendation is not consent. Do not re-ask a pending question or guess its answer. Continue only work independent of it; if none remains, say what answer you need and end the turn. Delivered answers reopen the relevant branch. Set `background: true` only when that parameter is available and the answer is not needed for your next steps.
+
+Finding _facts_ is your job, never the user's. Use direct tools for small lookups. Delegate substantial independent exploration with `task`, `mode: "plan"`, and `background: true`. A running exploration is an unsettled prerequisite: its report arrives by itself, so do not poll or repeat the work. Ask the rest of the frontier while it runs. The _decisions_ are the user's: put each to them and wait.
 
 The session is done when the frontier is empty: every branch of the design tree visited, nothing left silently assumed. Do not act on it until the user confirms you have reached a shared understanding.
