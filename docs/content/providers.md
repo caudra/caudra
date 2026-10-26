@@ -188,25 +188,20 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Small | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
-| Small | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
 | Small | claude-haiku-5.5 | $0.10 / $0.50 | 200K ctx / 100K out |
 | Small | mai-code-1.1-flash | $0.20 / $1.20 | 200K ctx / 100K out |
 | Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-|  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | gemini-3.8-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-sonnet-5.5 | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
-|  | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
 |  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
 |  | gemini-4-argon | $2.00 / $10.00 | 200K ctx / 65K out |
 |  | gpt-6.1-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
-|  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
 |  | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |

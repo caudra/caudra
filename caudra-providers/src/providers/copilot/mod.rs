@@ -95,9 +95,6 @@ const EFFORT_TO_XHIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effor
 const EFFORT_TO_XHIGH_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
     "low", "medium", "high", "xhigh",
 ])];
-const EFFORT_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high",
-])];
 const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
 const KIMI_EFFORT: &[StaticReasoningOption] =
@@ -123,42 +120,6 @@ const GEMINI_FLASH_PROMO: ModelPricing = ModelPricing {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["gpt-5-mini"],
-            small: true,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.25,
-                output: 2.00,
-                cache_write: 0.00,
-                cache_read: 0.025,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            small: true,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
         ModelEntry {
             prefixes: &["gpt-5.4-nano"],
             small: true,
@@ -232,19 +193,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
-            prefixes: &["gemini-3.7-flash"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            // GitHub's promotional rate through 2026-12-31. `/models` reports
-            // the live rate.
-            pricing: GEMINI_FLASH_PROMO,
-            max_output_tokens: Some(GEMINI_MAX_OUTPUT),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
-        },
-        ModelEntry {
             prefixes: &["gemini-3.8-flash"],
             small: false,
             family: ModelFamily::Generic,
@@ -310,24 +258,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
             prefixes: &["kimi-k3"],
@@ -438,24 +368,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.50,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.25,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
             prefixes: &["gpt-5.6-sol"],
@@ -1406,8 +1318,17 @@ mod tests {
 
     const OPUS_CACHE_WRITE: f64 = 6.25;
     const TEST_TOKEN: &str = "copilot-test-token";
-    const TEST_SPEC: &str = "copilot/gpt-5.4";
+    const TEST_SPEC: &str = "copilot/gpt-5.4-nano";
     const OTHER_MODEL_ID: &str = "grok-4.6";
+
+    #[test_case("gpt-5-mini")]
+    #[test_case("gpt-5.4-mini")]
+    #[test_case("gemini-3.7-flash")]
+    #[test_case("gpt-5.5")]
+    #[test_case("gpt-5.4")]
+    fn retired_models_have_no_static_entry(model_id: &str) {
+        assert!(lookup_entry(models(), model_id).is_err());
+    }
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -1656,7 +1577,7 @@ mod tests {
     }
 
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
-    #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
+    #[test_case("copilot/gpt-5.4-nano", 100_000, 100_000, 0.02 + 0.125; "gpt_5_4_nano_retains_its_rates")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
     #[test_case("copilot/claude-opus-5.5", 1_000_000, 1_000_000, 4.00 + 20.00; "opus 5.5 beats opus 5 prefix")]
     #[test_case("copilot/gpt-6-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6 sol has its own rates")]
@@ -1785,7 +1706,7 @@ mod tests {
     #[test_case(ThinkingConfig::Effort("medium".into()), "medium" ; "declared level passes through")]
     #[test_case(ThinkingConfig::Effort("max".into()), "xhigh" ; "undeclared level snaps down")]
     fn responses_reasoning_uses_effort_object(thinking: ThinkingConfig, expected: &str) {
-        let model = Model::from_spec("copilot/gpt-5.4").unwrap();
+        let model = Model::from_spec(TEST_SPEC).unwrap();
         let mut body = json!({});
         responses::apply_responses_reasoning(&mut body, &thinking, &model);
         assert_eq!(
@@ -1798,7 +1719,7 @@ mod tests {
     #[test]
     fn filters_enabled_chat_models() {
         let enabled = CopilotModel {
-            id: "gpt-5.4".into(),
+            id: "gpt-5.4-nano".into(),
             policy: Some(CopilotModelPolicy {
                 state: "enabled".into(),
             }),
@@ -1860,7 +1781,7 @@ mod tests {
     #[test_case(CHAT_COMPLETIONS_PATH ; "chat_completions")]
     fn enterprise_sends_post_to_its_own_endpoint(path: &str) {
         let provider = enterprise_provider();
-        let model = Model::from_spec("copilot-enterprise/gpt-5.4").unwrap();
+        let model = Model::from_spec("copilot-enterprise/gpt-5.4-nano").unwrap();
         cache_model(&provider, &model.id, path);
 
         let wire = dry_run(&provider, &model).unwrap();
