@@ -100,6 +100,13 @@ pub struct Accepted {
 pub const ACCEPTED: &[Accepted] = &[
     Accepted {
         provider: "google",
+        model: "gemini-2.5-computer-use-preview-10-2025",
+        field: Field::Unlisted,
+        catalog: "2025-10-07",
+        reason: "Retired July 28, 2026 per https://ai.google.dev/gemini-api/docs/deprecations. Keep the shutdown selector out of the table.",
+    },
+    Accepted {
+        provider: "google",
         model: "gemini-4-argon",
         field: Field::MaxOutput,
         catalog: "32768",
