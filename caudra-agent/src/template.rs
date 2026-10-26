@@ -34,7 +34,7 @@ pub fn env_vars() -> Vars {
 /// Said only in a verified linked worktree, where the working directory alone
 /// does not tell which repository the checkout belongs to or that sibling
 /// checkouts share its memory and plans.
-fn checkout_section(cwd: &Path) -> String {
+pub(crate) fn checkout_section(cwd: &Path) -> String {
     let Some(checkout) = checkout::discover(cwd).filter(Checkout::is_linked) else {
         return String::new();
     };

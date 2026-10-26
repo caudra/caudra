@@ -71,7 +71,7 @@ impl LoadedInstructions {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Instructions {
     pub text: String,
     pub loaded: LoadedInstructions,
@@ -115,7 +115,7 @@ pub fn environment_block(vars: &Vars, model: &Model) -> String {
 /// baseline stays put and an edit reaches the model as a diff against it.
 /// Compaction and conversation revert swap the transcript wholesale and have
 /// already paid that cost, which is the one moment a fresh baseline is free.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InstructionBaseline {
     instructions: Instructions,
     epoch: u64,
@@ -160,12 +160,11 @@ impl InstructionBaseline {
     }
 
     fn settle(&mut self, current: Instructions, adopt: bool) -> Option<String> {
-        if current.text != self.instructions.text {
-            if !adopt {
-                self.drifted = true;
-                return Some(announcement(&self.instructions.text, &current.text));
-            }
+        if adopt {
             self.instructions = current;
+        } else if current.text != self.instructions.text {
+            self.drifted = true;
+            return Some(announcement(&self.instructions.text, &current.text));
         }
         // The system prompt matches disk, either because nothing changed or
         // because the baseline was just adopted. A diff the transcript still
@@ -836,6 +835,16 @@ mod tests {
             "{EXPECTED_DRIFT_NOTICE}"
         );
         assert_eq!(baseline.text(), BASELINE_TEXT);
+    }
+
+    #[test]
+    fn rebasing_identical_text_adopts_the_current_loaded_sources() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        let current = instructions_of(BASELINE_TEXT);
+        let path = PathBuf::from(LOCAL_INSTRUCTION_FILE);
+        assert!(!current.loaded.contains_or_insert(path.clone()));
+        assert!(baseline.rebase(current, EPOCH + 1).is_none());
+        assert!(baseline.loaded().contains_or_insert(path));
     }
 
     /// A session that began with no instruction files has nothing in its system

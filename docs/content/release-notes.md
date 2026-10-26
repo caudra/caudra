@@ -19,6 +19,10 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **mattpocock skills**: `[plugins.skill] mattpocock = true` adds 16 of [Matt Pocock's skills](https://github.com/mattpocock/skills), translated for Caudra, as the `mattpocock` skill and a `/mattpocock:<name>` command for each. They cover grilling a plan, domain modeling, test-first building, diagnosing bugs, code review, specs and tickets, and handoffs. Grilling asks through the `question` tool, and switching the pack applies at once in the terminal UI. Both packs can be on together. See [mattpocock](/docs/skills/#mattpocock).
 - **Guide running tasks**: `task_control` `guide` lets the main agent send a running task changed requirements or a reply to its report. The task reads it at its next step, and `interrupt: true` replaces its current turn instead. The message waits in the task chat's queue like your own guidance. Guidance a task never reads comes back with its result. See [Inspect and control tasks](/docs/sessions/#inspect-and-control-tasks).
 
+### Fixes
+
+- **Fresh context after compaction**: Compaction refreshes system reminders immediately, including after a long idle. It no longer replays outdated environment, memory, and model notices only to correct them on your next message.
+
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 
 [v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)

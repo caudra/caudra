@@ -28,7 +28,6 @@ use caudra_providers::{
 use super::cache_warming::{CacheWarmer, FinishedRequest, WarmStop, Warmable, prefix_fingerprint};
 use super::commit_preamble;
 use super::compaction;
-use super::favorites;
 use super::goal::{
     EvaluationDraft, Evaluator, GOAL_EVALUATOR_ROLE, GoalApply, GoalHandle, GoalSnapshot,
     GoalStatus, GoalVerdict, ResolvedEvaluator, continuation_message, is_unrecoverable,
@@ -43,6 +42,7 @@ use super::instructions::LoadedInstructions;
 use super::measured::{MeasuredContext, SentRequest};
 use super::mention_preamble;
 use super::provider_projection;
+use super::refresh::{ActiveContext, ContextRefresh, StandingState, favorite_models};
 use super::relative_paths::PathBase;
 use super::speculative::SpeculativeRuns;
 use super::steering::{
@@ -72,7 +72,6 @@ use crate::decisions::{
     push_fitting, question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
-use crate::mcp::code::catalog;
 use crate::memory::relevance::{Judge, Recall, RecallFocus, RecallQuery, Recalled};
 use crate::memory::search::significant_words;
 use crate::memory::store::MemoryStore;
@@ -86,8 +85,7 @@ use crate::tools::native::plan::{self, PlanTarget};
 use crate::tools::native::report_to_parent::GUIDANCE_PREFIX;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{
-    BATCH_TOOL_NAME, CODE_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
-    TASK_TOOL_NAME,
+    BATCH_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
 };
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::{AutopilotEvent, TodoItem, TodoStatus};
@@ -467,6 +465,7 @@ pub struct Agent<'h> {
     memory: Option<String>,
     configuration: Option<String>,
     mode_notice: Option<String>,
+    compaction_refresh: Option<&'h mut dyn ContextRefresh>,
     event_tx: EventSender,
     tools: Value,
     tools_fixed: bool,
@@ -654,6 +653,7 @@ impl<'h> Agent<'h> {
             memory: run.memory,
             configuration: run.configuration,
             mode_notice: run.mode_notice,
+            compaction_refresh: None,
             event_tx: run.event_tx,
             tools: run.tools,
             tools_fixed: run.tools_fixed,
@@ -741,6 +741,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
         self.mcp = mcp.map(|mcp| mcp.with_actor_policy(Arc::clone(&self.profile_tool_policy)));
+        self
+    }
+
+    pub fn with_compaction_refresh(mut self, refresh: &'h mut dyn ContextRefresh) -> Self {
+        self.compaction_refresh = Some(refresh);
         self
     }
 
@@ -1218,57 +1223,9 @@ impl<'h> Agent<'h> {
         let Some(latest) = inputs.last() else {
             return String::new();
         };
-        let mut standing = Vec::from_iter(standing_notice(
-            self.history.as_slice(),
-            crate::prompt::ENVIRONMENT_MARKER,
-            self.environment.as_deref(),
-        ));
-        standing.extend(relocation_notice(
-            self.history.as_slice(),
-            self.environment.as_deref(),
-        ));
-        standing.extend(standing_notice(
-            self.history.as_slice(),
-            crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
-            self.instructions.as_deref(),
-        ));
-        standing.extend(standing_notice(
-            self.history.as_slice(),
-            crate::prompt::MEMORY_UPDATED_MARKER,
-            self.memory.as_deref(),
-        ));
-        standing.extend(standing_notice(
-            self.history.as_slice(),
-            crate::prompt::CONFIGURATION_CHANGED_MARKER,
-            self.configuration.as_deref(),
-        ));
-        standing.extend(self.autopilot_notice());
-        standing.extend(standing_notice(
-            self.history.as_slice(),
-            crate::prompt::TASK_MODE_MARKER,
-            self.mode_notice.as_deref(),
-        ));
         self.mode = latest.mode.clone();
         self.plan = latest.plan.clone();
-        let tool_context = self.tool_context();
-        let favorites = if self.chooses_task_models(&tool_context) {
-            let policy = Arc::clone(&self.model_policy);
-            smol::unblock(move || favorites::list(&policy)).await
-        } else {
-            None
-        };
-        standing.extend(favorites::notice(self.history.as_slice(), favorites));
-        let code_available = tool_context.tool_available(CODE_TOOL_NAME);
-        standing.extend(catalog::notice(
-            self.history.as_slice(),
-            self.catalog_mcp().filter(|_| code_available).as_ref(),
-            code_available && self.permissions.decisions().is_some(),
-        ));
-        standing.extend(mode_switch_notice_with_tools(
-            self.history.as_slice(),
-            &latest.mode,
-            |name| tool_context.tool_available(name),
-        ));
+        let mut standing = self.standing_reminders(self.history.as_slice()).await;
         if let Some(peers) = &self.peers {
             let human_input = inputs.iter().any(|input| {
                 !input.message.trim().is_empty() || !input.images.is_empty() || input.resume
@@ -1691,6 +1648,43 @@ impl<'h> Agent<'h> {
         self.is_main_session()
             && self.config.task_model_choice
             && tool_context.tool_available(TASK_TOOL_NAME)
+    }
+
+    async fn standing_reminders(&self, history: &[Message]) -> Vec<Message> {
+        let listed = self.current_favorites().await;
+        self.standing_reminders_with_favorites(history, listed)
+    }
+
+    async fn current_favorites(&self) -> Option<String> {
+        if self.is_main_session() && self.config.task_model_choice {
+            favorite_models(&self.model_policy).await
+        } else {
+            None
+        }
+    }
+
+    fn standing_reminders_with_favorites(
+        &self,
+        history: &[Message],
+        listed: Option<String>,
+    ) -> Vec<Message> {
+        let tool_context = self.tool_context();
+        let mcp = self.catalog_mcp();
+        StandingState {
+            environment: self.environment.as_deref(),
+            instructions: self.instructions.as_deref(),
+            memory: self.memory.as_deref(),
+            configuration: self.configuration.as_deref(),
+            mode_notice: self.mode_notice.as_deref(),
+            mode: &self.mode,
+            autopilot: self.main_autopilot().map(AutopilotHandle::is_engaged),
+            favorites: self.chooses_task_models(&tool_context),
+            model_policy: &self.model_policy,
+            mcp: mcp.as_ref(),
+            decisions: self.permissions.decisions().is_some(),
+            tools: &self.tool_filter,
+        }
+        .collect_resolved(history, |name| tool_context.tool_available(name), listed)
     }
 
     fn main_autopilot(&self) -> Option<&AutopilotHandle> {
@@ -4251,36 +4245,75 @@ impl<'h> Agent<'h> {
             None
         };
         let retention = compaction::Retention::new(&self.permissions, &self.goal, self.history);
-        let compacted = compaction::compact_history(
+        let mut compacted = compaction::prepare_compaction(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
-            compaction::CompactionContext {
-                cancel: &self.cancel,
-                retry_now: &self.retry_now,
-                config: &self.config,
-                extractor: extractor.as_ref(),
-                retention,
-                session: (main_session || self.child_jobs().is_some()).then_some(
-                    BackgroundReminderContext {
-                        background: self.background.as_ref().filter(|_| main_session),
-                        jobs: self.jobs.as_ref(),
-                        workflow: self.workflow.as_ref().filter(|_| main_session),
-                    },
-                ),
-            },
+            &self.config,
+            extractor.as_ref(),
+            retention,
+            &self.cancel,
+            &self.retry_now,
         )
         .await?;
-        let usage = compacted.usage;
+        let usage = compacted.spend.usage;
         let cost = compact_model.billed_cost(&usage, false);
         self.total_usage += usage;
         self.record_spend(usage, cost, compact_model.billing);
-        if let Some(spend) = compacted.extraction {
+        if let Some(spend) = compacted.spend.extraction {
             self.total_usage += spend.usage;
             self.record_spend(spend.usage, spend.cost, spend.billing);
         }
-        compacted.result?;
+        compacted.validate()?;
+        let listed = self
+            .cancel
+            .race(self.current_favorites())
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
+        if let Some(refresh) = &mut self.compaction_refresh {
+            let refreshed = self
+                .cancel
+                .race(refresh.refresh(
+                    &compacted.history,
+                    ActiveContext {
+                        provider: &self.provider,
+                        model: &self.model,
+                        system: &self.system,
+                        tools: &self.tools,
+                        tool_filter: &self.tool_filter,
+                        mode: &self.mode,
+                        plan: self.plan.as_ref(),
+                        options: &self.opts,
+                    },
+                ))
+                .await
+                .map_err(|_| AgentError::Cancelled)??;
+            self.system = refreshed.system;
+            self.environment = refreshed.environment;
+            self.instructions = refreshed.instructions;
+            self.memory = refreshed.memory;
+            self.configuration = refreshed.configuration;
+            self.tools = refreshed.tools;
+            self.tool_filter = refreshed.tool_filter;
+            self.loaded_instructions = refreshed.loaded_instructions;
+            self.remote_project_context = refreshed.remote_project_context;
+            self.task_environment = refreshed.task_environment;
+            self.memory_store = refreshed.memory_store;
+        }
+        let reminders =
+            self.standing_reminders_with_favorites(compacted.history.as_slice(), listed);
+        compacted.refresh_reminders(reminders);
+        compacted.finish(
+            self.history,
+            &self.event_tx,
+            &self.config,
+            BackgroundReminderContext {
+                background: self.background.as_ref().filter(|_| main_session),
+                jobs: self.jobs.as_ref(),
+                workflow: self.workflow.as_ref().filter(|_| main_session),
+            },
+        )?;
         self.measured = None;
         self.rollback_len = self.history.len();
         steering::lock(&self.steering).reset_patterns();
@@ -4805,7 +4838,7 @@ pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, messa
 }
 
 /// The text of the most recent standing reminder of the kind `markers` name.
-pub(crate) fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a str> {
+pub fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a str> {
     history
         .iter()
         .rev()
@@ -4859,7 +4892,7 @@ pub(super) fn stranded_reminders(history: &[Message], head_end: usize) -> Vec<Me
 /// working directory than the environment last announced. Paths from before
 /// still look valid, and in a sibling worktree they are, into the wrong
 /// checkout. Said on the one turn the environment changes, so never twice.
-fn relocation_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
+pub(super) fn relocation_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
     let to = working_directory(environment?)?;
     let from = working_directory(last_announced(
         history,
@@ -4939,7 +4972,7 @@ fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> 
     })
 }
 
-fn mode_switch_notice_with_tools(
+pub(super) fn mode_switch_notice_with_tools(
     history: &[Message],
     next: &AgentMode,
     available: impl Fn(&str) -> bool,
@@ -5117,6 +5150,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::RefreshedContext;
     use crate::agent::goal_progress::MAX_STALLED_TURNS;
     use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot, render};
     use crate::cancel::CancelTrigger;
@@ -5134,11 +5168,16 @@ mod tests {
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::NamedMock;
-    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool};
+    use crate::tools::{
+        CODE_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool,
+    };
     use crate::types::{TodoPriority, TodoStatus};
     use crate::{Envelope, QueueItemId};
 
     const AUTH_ERROR_STATUS: u16 = 401;
+    const REFRESHED_SYSTEM: &str = "fresh system prefix";
+    const REFRESH_FAILED: &str = "context refresh failed";
+    const REFRESHED_ENVIRONMENT: &str = "<system-reminder>\n# Environment\n\n- Working directory: /current\n- Date: 2026-10-26\n</system-reminder>";
     const DECISION_BASE_URL: &str = "http://127.0.0.1:1";
     const DECISION_GOAL: &str = "tests pass";
     const FEATURE_INPUT_TOKENS: u64 = 1_000;
@@ -6829,6 +6868,157 @@ mod tests {
                     .try_iter()
                     .any(|envelope| matches!(envelope.event, AgentEvent::Injected { .. }))
             );
+        });
+    }
+
+    struct TestContextRefresh {
+        fail: bool,
+        calls: usize,
+    }
+
+    impl ContextRefresh for TestContextRefresh {
+        fn refresh<'a>(
+            &'a mut self,
+            history: &'a History,
+            active: ActiveContext<'a>,
+        ) -> BoxFuture<'a, Result<RefreshedContext, AgentError>> {
+            Box::pin(async move {
+                self.calls += 1;
+                assert!(
+                    history
+                        .as_slice()
+                        .iter()
+                        .any(|message| message.is_compaction_summary)
+                );
+                if self.fail {
+                    return Err(AgentError::Config {
+                        message: REFRESH_FAILED.into(),
+                    });
+                }
+                Ok(RefreshedContext {
+                    system: REFRESHED_SYSTEM.into(),
+                    environment: Some(REFRESHED_ENVIRONMENT.into()),
+                    instructions: None,
+                    memory: None,
+                    configuration: None,
+                    tools: active.tools.clone(),
+                    tool_filter: active.tool_filter.clone(),
+                    loaded_instructions: LoadedInstructions::new(),
+                    remote_project_context: None,
+                    task_environment: crate::template::env_vars(),
+                    memory_store: None,
+                })
+            })
+        }
+    }
+
+    #[test_case(false; "fresh_context")]
+    #[test_case(true; "refresh_failure")]
+    fn automatic_compaction_refreshes_before_completion(fail: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let old_epoch = history.epoch();
+            let mut refresh = TestContextRefresh { fail, calls: 0 };
+            let (agent, events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let old_system = agent.system.clone();
+            let mut agent = agent.with_compaction_refresh(&mut refresh);
+            let result = agent.do_compact().await;
+            let events: Vec<_> = events.drain().map(|envelope| envelope.event).collect();
+            if fail {
+                assert!(
+                    matches!(result, Err(AgentError::Config { message }) if message == REFRESH_FAILED)
+                );
+                assert_eq!(agent.history.epoch(), old_epoch);
+                assert_eq!(agent.system, old_system);
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::CompactionDone
+                        | AgentEvent::TurnComplete(_)
+                        | AgentEvent::Injected { .. }
+                )));
+            } else {
+                result.unwrap();
+                assert_eq!(agent.system, REFRESHED_SYSTEM);
+                assert_eq!(
+                    last_announced(
+                        agent.history.as_slice(),
+                        &[crate::prompt::ENVIRONMENT_MARKER]
+                    ),
+                    Some(REFRESHED_ENVIRONMENT)
+                );
+                let injected = events.iter().position(|event| matches!(event, AgentEvent::Injected { text, .. } if text == REFRESHED_ENVIRONMENT)).unwrap();
+                let done = events
+                    .iter()
+                    .position(|event| matches!(event, AgentEvent::CompactionDone))
+                    .unwrap();
+                assert!(injected < done);
+                assert!(
+                    agent
+                        .standing_reminders(agent.history.as_slice())
+                        .await
+                        .is_empty()
+                );
+            }
+            drop(agent);
+            assert_eq!(refresh.calls, 1);
+        });
+    }
+
+    struct WaitingContextRefresh(flume::Sender<()>);
+
+    impl ContextRefresh for WaitingContextRefresh {
+        fn refresh<'a>(
+            &'a mut self,
+            _: &'a History,
+            _: ActiveContext<'a>,
+        ) -> BoxFuture<'a, Result<RefreshedContext, AgentError>> {
+            Box::pin(async move {
+                self.0.send(()).unwrap();
+                future::pending().await
+            })
+        }
+    }
+
+    #[test]
+    fn cancellation_during_context_refresh_keeps_history_and_summary_spend() {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let epoch = history.epoch();
+            let response = text_response(StopReason::EndTurn);
+            let usage = response.usage;
+            let (started, ready) = flume::bounded(1);
+            let mut refresh = WaitingContextRefresh(started);
+            let (agent, events) = make_agent(MockProvider::new(vec![response]), &mut history);
+            let (trigger, token) = CancelToken::new();
+            let mut agent = agent
+                .with_cancel(token)
+                .with_compaction_refresh(&mut refresh);
+            let (result, ()) = future::zip(agent.do_compact(), async {
+                ready.recv_async().await.unwrap();
+                trigger.cancel();
+            })
+            .await;
+            assert!(matches!(result, Err(AgentError::Cancelled)));
+            assert_eq!(agent.history.epoch(), epoch);
+            assert_eq!(agent.total_usage.input, usage.input);
+            assert_eq!(agent.total_usage.output, usage.output);
+            let events: Vec<_> = events.drain().map(|envelope| envelope.event).collect();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ModelUsage {
+                    purpose: LedgerPurpose::Compaction,
+                    ..
+                }
+            )));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CompactionDone
+                    | AgentEvent::TurnComplete(_)
+                    | AgentEvent::Injected { .. }
+            )));
         });
     }
 
@@ -9115,6 +9305,7 @@ mod tests {
                 &mut history,
             );
             agent.config.generate_titles = false;
+            agent.mode = plan_mode();
             agent.auto_compact = true;
             agent.measured = Some(MeasuredContext {
                 reported: u32::MAX,

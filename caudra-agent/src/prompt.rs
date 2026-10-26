@@ -202,6 +202,8 @@ pub const MEMORY_UPDATED_PROMPT: &str = include_str!("prompts/memory_updated.md"
 /// Withdraws the update once the view in the system prompt holds those entries.
 /// Shares the heading, and so the kind, with the update it supersedes.
 pub const MEMORY_REFRESHED_PROMPT: &str = include_str!("prompts/memory_refreshed.md");
+pub const MEMORY_UNAVAILABLE_PROMPT: &str = "<system-reminder>\n# Memory updated\n\nThe current system prompt has no project memory view. Earlier memory-update reminders no longer apply.\n</system-reminder>";
+pub const INSTRUCTIONS_CUSTOM_PROMPT: &str = "<system-reminder>\n# Instructions changed\n\nThis session uses a custom system prompt. Earlier instruction-file update reminders no longer apply.\n</system-reminder>";
 pub const MEMORY_UPDATED_MARKER: &str = "# Memory updated";
 /// The tool array and system prompt are fixed so the prompt stays cached, and
 /// configuration that changes afterwards arrives here as a difference from them.

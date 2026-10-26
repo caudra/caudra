@@ -23,11 +23,11 @@ use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair
 use super::requirements::{
     self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput,
 };
-use super::run::{estimate_message_tokens, push_injected, stranded_reminders};
+use super::run::{estimate_message_tokens, stranded_reminders};
 use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use crate::cancel::CancelToken;
-use crate::decisions::{DecisionFeature, NoteAnchor, NoteSink};
+use crate::decisions::{DecisionFeature, NoteAnchor, NoteDraft, NoteSink};
 use crate::nudge::Nudge;
 use crate::{
     AgentError, AgentEvent, BackgroundReminderContext, DoneReason, EventSender, TurnCompleteEvent,
@@ -82,6 +82,101 @@ pub struct Spend {
 pub struct CompactionSpend {
     pub usage: TokenUsage,
     pub extraction: Option<Spend>,
+}
+
+pub struct PreparedCompaction {
+    pub history: History,
+    pub spend: CompactionSpend,
+    completed: Option<TurnCompleteEvent>,
+    event_tx: EventSender,
+    note: Option<NoteDraft>,
+    reminders_from: usize,
+    had_background: bool,
+}
+
+impl PreparedCompaction {
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self
+            .completed
+            .as_ref()
+            .is_none_or(|completed| completed.message.first_text_content().is_none())
+        {
+            return Err(AgentError::EmptySummary);
+        }
+        Ok(())
+    }
+
+    pub fn refresh_reminders(&mut self, notices: Vec<Message>) {
+        let mut reminders = self.history.as_slice()[self.reminders_from..].to_vec();
+        for notice in notices {
+            let markers = notice.user_text().and_then(|text| {
+                crate::prompt::STANDING_KINDS
+                    .iter()
+                    .find(|markers| markers.iter().any(|marker| text.contains(marker)))
+            });
+            if let Some(markers) = markers
+                && let Some(old) = reminders.iter_mut().find(|old| {
+                    old.user_text()
+                        .is_some_and(|text| markers.iter().any(|marker| text.contains(marker)))
+                })
+            {
+                *old = notice;
+            } else {
+                reminders.push(notice);
+            }
+        }
+        self.history
+            .replace_staged_tail(self.reminders_from, reminders);
+    }
+
+    pub fn finish(
+        mut self,
+        history: &mut History,
+        event_tx: &EventSender,
+        config: &AgentConfig,
+        session: BackgroundReminderContext<'_>,
+    ) -> Result<CompactionSpend, AgentError> {
+        self.validate()?;
+        let reminders = self.history.as_slice()[self.reminders_from..].to_vec();
+        history.install(std::mem::take(&mut self.history));
+        if let Some(completed) = self.completed.take() {
+            event_tx.send(AgentEvent::TurnComplete(Box::new(completed)))?;
+        }
+        if let Some(note) = self.note.take() {
+            event_tx.try_send(note.anchored(NoteAnchor::History(history.transcript().count())));
+        }
+        for reminder in reminders {
+            if let Some(text) = reminder.user_text() {
+                event_tx.send(AgentEvent::Injected {
+                    text: text.to_owned(),
+                    task_event: None,
+                    peer_event: None,
+                    automation_event: None,
+                    autopilot_event: None,
+                })?;
+            }
+        }
+        if self.had_background || session.had_context(history) {
+            session.refresh(history, event_tx, config.background_reminder_turns, true);
+        }
+        Ok(self.spend)
+    }
+}
+
+impl Drop for PreparedCompaction {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            self.event_tx.try_send(AgentEvent::ModelUsage {
+                usage: completed.usage,
+                cost: completed.cost,
+                billing: completed.billing,
+                provider: completed.provider,
+                model: completed.model,
+                purpose: LedgerPurpose::Compaction,
+                account: completed.account,
+            });
+        }
+    }
 }
 
 fn normalize(text: &Option<String>) -> Option<&str> {
@@ -149,6 +244,38 @@ pub(super) async fn compact_history(
     let had_background = session
         .as_ref()
         .is_some_and(|session| session.had_context(history));
+    let mut prepared = prepare_compaction(
+        provider, model, history, event_tx, config, extractor, retention, cancel, retry_now,
+    )
+    .await?;
+    prepared.had_background = had_background;
+    let spend = prepared.spend;
+    let result = if cancel.is_cancelled() {
+        Err(AgentError::Cancelled)
+    } else {
+        prepared
+            .finish(history, event_tx, config, session.unwrap_or_default())
+            .map(|_| ())
+    };
+    Ok(CompactionOutcome {
+        usage: spend.usage,
+        extraction: spend.extraction,
+        result,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_compaction(
+    provider: &dyn Provider,
+    model: &Model,
+    history: &History,
+    event_tx: &EventSender,
+    config: &AgentConfig,
+    extractor: Option<&SideModel>,
+    retention: Option<Retention>,
+    cancel: &CancelToken,
+    retry_now: &Nudge,
+) -> Result<PreparedCompaction, AgentError> {
     let compact_start = std::time::Instant::now();
     let head_end = head_end(
         history.as_slice(),
@@ -277,23 +404,22 @@ pub(super) async fn compact_history(
     }
     let usage = response.usage;
     let stranded = stranded_reminders(history.as_slice(), head_end);
-    let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
-    if result.is_ok() {
-        if let Some(note) = note {
-            event_tx.try_send(note.anchored(NoteAnchor::History(history.transcript().count())));
-        }
-        for reminder in stranded {
-            push_injected(history, event_tx, reminder);
-        }
-        if had_background && let Some(session) = session {
-            session.refresh(history, event_tx, config.background_reminder_turns, true);
-        }
+    let mut staged = history.staged();
+    let completed = finish_compact(response, &mut staged, head_end, compact_start, model);
+    let reminders_from = staged.len();
+    for reminder in stranded {
+        staged.push(reminder);
     }
-    Ok(CompactionOutcome {
-        usage,
-        result,
-        extraction,
-    })
+    let prepared = PreparedCompaction {
+        history: staged,
+        spend: CompactionSpend { usage, extraction },
+        completed: Some(completed),
+        event_tx: event_tx.clone(),
+        note,
+        reminders_from,
+        had_background: BackgroundReminderContext::default().had_context(history),
+    };
+    Ok(prepared)
 }
 
 /// Appends the list under [`REQUIREMENTS_MARKER`], returning exactly the text
@@ -378,15 +504,14 @@ fn finish_compact(
     mut response: StreamResponse,
     history: &mut History,
     head_end: usize,
-    event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> Result<(), AgentError> {
+) -> TurnCompleteEvent {
     // Set before the clone below: the event is how every surface learns the
     // turn was a summary, and one that denies it gets drawn as an ordinary
     // reply.
     response.message.is_compaction_summary = true;
-    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+    let completed = TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
@@ -397,12 +522,12 @@ fn finish_compact(
         account: response.account_name(),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
-    })));
+    };
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
     if response.message.first_text_content().is_none() {
-        return Err(AgentError::EmptySummary);
+        return completed;
     }
 
     let summarized = &history.as_slice()[..head_end];
@@ -432,7 +557,7 @@ fn finish_compact(
         "compaction completed"
     );
 
-    Ok(())
+    completed
 }
 
 fn retained_output_refs(messages: &[Message]) -> Vec<caudra_storage::tool_outputs::ToolOutputRef> {
@@ -523,16 +648,7 @@ pub async fn compact_with_session(
     .await?;
     compacted.result?;
     let usage = compacted.usage;
-    if let Some(post) = normalize(&config.post_compaction_instructions) {
-        history.push(Message::synthetic(post.to_string()));
-        event_tx.send(AgentEvent::Injected {
-            text: post.to_string(),
-            task_event: None,
-            peer_event: None,
-            automation_event: None,
-            autopilot_event: None,
-        })?;
-    }
+    append_post_compaction_instructions(history, event_tx, config)?;
 
     event_tx.send(AgentEvent::Done {
         usage,
@@ -544,6 +660,24 @@ pub async fn compact_with_session(
         usage,
         extraction: compacted.extraction,
     })
+}
+
+pub fn append_post_compaction_instructions(
+    history: &mut History,
+    event_tx: &EventSender,
+    config: &AgentConfig,
+) -> Result<(), AgentError> {
+    if let Some(post) = normalize(&config.post_compaction_instructions) {
+        history.push(Message::synthetic(post.to_owned()));
+        event_tx.send(AgentEvent::Injected {
+            text: post.to_owned(),
+            task_event: None,
+            peer_event: None,
+            automation_event: None,
+            autopilot_event: None,
+        })?;
+    }
+    Ok(())
 }
 
 /// A window that excludes output only needs the reserve to absorb estimation
@@ -755,6 +889,8 @@ mod tests {
     const KEPT_REPLY_INDEX: usize = 3;
     const ACTIVE_PLAN: &str = "current-plan";
     const PREVIOUS_PLAN: &str = "previous-plan";
+    const OLD_ENVIRONMENT: &str = "<system-reminder>\n# Environment\n\n- Working directory: /old\n- Date: 2026-10-16\n</system-reminder>";
+    const FRESH_ENVIRONMENT: &str = "<system-reminder>\n# Environment\n\n- Working directory: /new\n- Date: 2026-10-26\n</system-reminder>";
 
     pub(super) struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -1282,6 +1418,145 @@ mod tests {
             assert!(!plan.contains("`shell`"));
             assert!(!plan.contains(PREVIOUS_PLAN));
             assert!(!plan.contains("{plan_"));
+        });
+    }
+
+    #[test_case(false; "summarized_reminder")]
+    #[test_case(true; "retained_reminder")]
+    fn prepared_compaction_publishes_only_fresh_reminders(tail_keeps_it: bool) {
+        smol::block_on(async {
+            let mut messages = vec![
+                Message::user("first".into()),
+                Message::observation(OLD_ENVIRONMENT.into()),
+                assistant_text("reply one"),
+                Message::user("second".into()),
+            ];
+            if tail_keeps_it {
+                messages.push(Message::observation(OLD_ENVIRONMENT.into()));
+            }
+            messages.push(assistant_text("reply two"));
+            let mut history = History::new(messages);
+            let old_head = history.item_head();
+            let old_epoch = history.epoch();
+            let mirror = Arc::new(arc_swap::ArcSwap::from_pointee(history.snapshot().clone()));
+            history = history.with_mirror(Arc::clone(&mirror));
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let events = EventSender::new(raw_tx, 0);
+            let config = AgentConfig::default();
+            let mut prepared = prepare_compaction(
+                &provider,
+                &default_model(),
+                &history,
+                &events,
+                &config,
+                None,
+                None,
+                &CancelToken::none(),
+                &Nudge::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.item_head(), old_head);
+            assert_eq!(mirror.load().epoch, old_epoch);
+            assert!(rx.is_empty());
+            let policy = ModelPolicy::default();
+            let tools = crate::tools::ToolFilter::Only(Vec::new());
+            let state = crate::agent::StandingState {
+                environment: Some(FRESH_ENVIRONMENT),
+                instructions: None,
+                memory: None,
+                configuration: None,
+                mode_notice: None,
+                mode: &AgentMode::Build,
+                autopilot: None,
+                favorites: false,
+                model_policy: &policy,
+                mcp: None,
+                decisions: false,
+                tools: &tools,
+            };
+            let notices = state.collect(prepared.history.as_slice()).await;
+            let epoch = prepared.history.epoch();
+            prepared.refresh_reminders(notices);
+            assert_eq!(prepared.history.epoch(), epoch);
+            prepared
+                .finish(
+                    &mut history,
+                    &events,
+                    &config,
+                    BackgroundReminderContext::default(),
+                )
+                .unwrap();
+            assert_eq!(mirror.load().epoch, epoch);
+            let events: Vec<_> = rx.drain().map(|envelope| envelope.event).collect();
+            assert!(matches!(events.first(), Some(AgentEvent::TurnComplete(_))));
+            let injected: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Injected { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                injected
+                    .iter()
+                    .filter(|text| **text == FRESH_ENVIRONMENT)
+                    .count(),
+                1
+            );
+            assert!(!injected.contains(&OLD_ENVIRONMENT));
+            assert!(
+                injected
+                    .iter()
+                    .any(|text| text.contains(crate::prompt::RELOCATED_MARKER))
+            );
+            assert!(state.collect(history.as_slice()).await.is_empty());
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+            let restored = History::restored(history.active_items().to_vec()).unwrap();
+            assert_eq!(
+                crate::agent::last_announced(
+                    restored.as_slice(),
+                    &[crate::prompt::ENVIRONMENT_MARKER]
+                ),
+                Some(FRESH_ENVIRONMENT),
+            );
+        });
+    }
+
+    #[test]
+    fn abandoned_compaction_keeps_history_and_accounts_for_summary() {
+        smol::block_on(async {
+            let history =
+                History::new(vec![Message::user("first".into()), assistant_text("reply")]);
+            let epoch = history.epoch();
+            let head = history.item_head();
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let prepared = prepare_compaction(
+                &provider,
+                &default_model(),
+                &history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                None,
+                None,
+                &CancelToken::none(),
+                &Nudge::default(),
+            )
+            .await
+            .unwrap();
+            drop(prepared);
+            assert_eq!(history.epoch(), epoch);
+            assert_eq!(history.item_head(), head);
+            let events: Vec<_> = rx.drain().map(|envelope| envelope.event).collect();
+            assert!(matches!(
+                events.as_slice(),
+                [AgentEvent::ModelUsage {
+                    purpose: LedgerPurpose::Compaction,
+                    ..
+                }]
+            ));
         });
     }
 

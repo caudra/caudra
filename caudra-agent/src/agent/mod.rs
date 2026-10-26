@@ -11,6 +11,7 @@ pub(crate) mod judging;
 mod measured;
 pub mod mention_preamble;
 mod provider_projection;
+mod refresh;
 pub(crate) mod relative_paths;
 pub mod requirements;
 mod run;
@@ -34,8 +35,9 @@ pub(crate) use compaction::compaction_reserve;
 #[cfg(test)]
 pub(crate) use compaction::retention::{ToolResultView, retention_query, select_tool_results};
 pub use compaction::{
-    COMPACT_DESCRIPTION, COMPACTION_ANCHOR, CompactionSpend, Retention, Spend,
-    auto_compact_enabled, compact, compact_with_session, resolve_extractor,
+    COMPACT_DESCRIPTION, COMPACTION_ANCHOR, CompactionSpend, PreparedCompaction, Retention, Spend,
+    append_post_compaction_instructions, auto_compact_enabled, compact, compact_with_session,
+    prepare_compaction, resolve_extractor,
 };
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,
@@ -55,6 +57,10 @@ pub use instructions::{
     load_remote_instructions,
 };
 pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
+pub use refresh::{
+    ActiveContext, ContextRefresh, RefreshedContext, StandingState, favorite_models,
+};
+pub use run::last_announced;
 pub use run::{
     Agent, AgentParams, AgentRunParams, ConversationRoute, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
@@ -64,6 +70,6 @@ pub(crate) use run::{
     GOAL_MET_QUESTION, goal_prescreen_state, should_skip_goal, skill_questions, skill_shortlist,
     skill_state, suggested_skill,
 };
-pub(crate) use run::{last_announced, resolve_purpose_model_for_inspection, standing_notice};
+pub(crate) use run::{resolve_purpose_model_for_inspection, standing_notice};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;
 pub use surface::{PrefixKey, Settled, Surface, SurfaceBaseline};
