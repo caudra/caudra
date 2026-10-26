@@ -67,16 +67,16 @@
         "supplements/THIRD_PARTY_LICENSES/MattPocockSkills.txt"
       ]
     },
-    "rmcp@3.5.1": {
+    "rmcp@3.7.0": {
       "expression": "Apache-2.0 AND MIT",
-      "reason": "The published crate omits LICENSE. Its .cargo_vcs_info.json pins upstream revision 79437f291b2c44053d00dcd5db969fd0cca7c887, whose complete LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",
+      "reason": "The published crate includes LICENSE. Its .cargo_vcs_info.json pins upstream revision 5d6a11f2ae022f513aec0f6e0f10f89a57891a7f; the complete shipped LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",
       "provenance": {
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350",
+        "checksum": "ece64e19631fc38758181e637c15509a2c2709ee53bfde1e1d58f9dc991f919e",
         "declared_license": "Apache-2.0",
         "cargo_vcs_info": {
           "git": {
-            "sha1": "79437f291b2c44053d00dcd5db969fd0cca7c887"
+            "sha1": "5d6a11f2ae022f513aec0f6e0f10f89a57891a7f"
           },
           "path_in_vcs": "crates/rmcp"
         }
@@ -104,12 +104,12 @@
         "aws-lc/LICENSE"
       ]
     },
-    "monty-typeshed@1.2.0": {
+    "monty-typeshed@1.3.0": {
       "expression": "MIT AND Apache-2.0",
       "reason": "The MIT wrapper embeds typeshed stubs under Apache-2.0 with retained MIT portions. Preserve the complete upstream typeshed LICENSE and verify the vendored source_commit.txt against supplemental provenance.",
       "required_files": [
         "supplements/THIRD_PARTY_LICENSES/Monty.txt",
-        "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.2.0/LICENSE-typeshed"
+        "supplements/THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.3.0/LICENSE-typeshed"
       ]
     },
     "two-face@0.5.2+bat-0.26.1": {
@@ -228,20 +228,20 @@
     }
   },
   "git_sources": {
-    "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead": {
-      "reason": "License and original package manifests verified against the exact locked Git revision. Accepted manifest hashes are original Git bytes and Cargo 1.99.1 vendor-normalized bytes generated from that source; neither requires .git or Cargo.toml.orig in the vendor tree.",
+    "git+https://github.com/pydantic/monty.git?tag=v1.3.0#9ccbaffdd2cfd5839e0a0ff1248ab901de51eb4c": {
+      "reason": "License and original package manifests verified against the exact Git revision. Accepted manifest hashes are original Git bytes and Cargo 1.99.1 vendor-normalized bytes generated from that source; neither requires .git or Cargo.toml.orig in the vendor tree.",
       "packages": {
-        "monty@1.2.0": [
+        "monty@1.3.0": [
           "2cbafac5c82bd5a651f295081a6895ae75e430a3663b9a8feac07677d4e9abd5",
-          "1b9473c77683cc24be40c00e2222432cb3df1256a5ece3f3c35770d506fe559c"
+          "83e6e7dfbb80d602f189bc046f9ab6a358184a7312f12c6aa6e126d0a30113ef"
         ],
-        "monty-macros@1.2.0": [
+        "monty-macros@1.3.0": [
           "760b6831d31fb89965805677fad09189777e4fb6055b094216cab7d339fbe353",
-          "45cdc0a3760c91cb540d0beba3f62bbe183fc6afd3fe19054d44dcb94b894bb1"
+          "c7bcbd83b68d3fed55728e3a1aec2bdcce43f8b3c3336ea029488ace274ee281"
         ],
-        "monty-types@1.2.0": [
+        "monty-types@1.3.0": [
           "01585e9051aefe2dd771fa4b91181fc17ec7cb998bb61ef49afd30b3d42ffbd2",
-          "0f9d7c0f4d7e7a174508359623669ae7fa34cb00ee00de3d7563a89b4357c2d7"
+          "f22339351c10d9b81693ec7ca53cd81b983a7fb9b51716a8446b084b99c207d6"
         ]
       },
       "notices": [
@@ -272,9 +272,9 @@
   "workspace_sources": [
     {
       "repository": "https://github.com/pydantic/monty.git",
-      "revision": "e8db9aef41aa73f4f709c15a4bc8a2d198be5ead",
-      "tree_sha256": "c66e70bc8f9b790d6fc98ccea4bc4ced7bd29e6116c918dde8c6f178e1586ada",
-      "file_count": 1577,
+      "revision": "9ccbaffdd2cfd5839e0a0ff1248ab901de51eb4c",
+      "tree_sha256": "6a76b2a6052d133d95aa83f5a80f56d7a8e2e6e62953ecbf82d42af62f2cd53e",
+      "file_count": 1612,
       "reason": "Every tracked Git blob and symlink target verified against this revision. The tree fingerprint excludes only root .git, .cargo, .cargo-ok and target build/config entries; symlinks are hashed without following them."
     }
   ],
@@ -533,6 +533,32 @@
           "version": "0.0.14",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "checksum": "b1ac21186f9bd5a853e7f5447900081e0e46bf5288f63a35c37cab7b79c237b0",
+          "declared_license": "MIT"
+        }
+      },
+      "workcell-mcp": {
+        "char_str": {
+          "version": "0.0.4",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "c9cba78a5abb515610e10af297615434b019755b5d7be14e559ff5340dff50c4",
+          "declared_license": "MIT"
+        },
+        "ruff_python_ast": {
+          "version": "0.0.14",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "6aa1de604c478a790cfbcc9c1fef3060e619ed87dd776c6614862ed7e59dc461",
+          "declared_license": "MIT"
+        },
+        "ruff_python_parser": {
+          "version": "0.0.14",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "b44b423a842d5d2f10807189a260ba677d4eacdc98c5d0459b66bef67fb78d97",
+          "declared_license": "MIT"
+        },
+        "ruff_text_size": {
+          "version": "0.0.14",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965",
           "declared_license": "MIT"
         }
       }

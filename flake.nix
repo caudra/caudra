@@ -116,8 +116,8 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v1.2.0#e8db9aef41aa73f4f709c15a4bc8a2d198be5ead" =
-          "sha256-yOpD/aPZz/BBkICINUhNghfrmkXxwz6eN4fFZ3/DrtE=";
+        "git+https://github.com/pydantic/monty.git?tag=v1.3.0#9ccbaffdd2cfd5839e0a0ff1248ab901de51eb4c" =
+          "sha256-kH00wDHRIiixbcxpM9WmAwRY98EB8xRwWeO0RuX0SAc=";
         "git+https://github.com/tensorninja/tla-rs?rev=807f334a2825cd6f225fc9a61870d1ab6e4acd86#807f334a2825cd6f225fc9a61870d1ab6e4acd86" =
           "sha256-PjuAUIedfnuk9I3rYzWjbqhdirzmyJBQWnbmbJKhVm4=";
       };
@@ -148,8 +148,8 @@
             type = "github";
             owner = "pydantic";
             repo = "monty";
-            rev = "e8db9aef41aa73f4f709c15a4bc8a2d198be5ead";
-            narHash = "sha256-yOpD/aPZz/BBkICINUhNghfrmkXxwz6eN4fFZ3/DrtE=";
+            rev = "9ccbaffdd2cfd5839e0a0ff1248ab901de51eb4c";
+            narHash = "sha256-kH00wDHRIiixbcxpM9WmAwRY98EB8xRwWeO0RuX0SAc=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
@@ -157,7 +157,7 @@
           );
           montyWorker = craneLib.buildPackage {
             pname = "caudra-monty-worker";
-            version = "1.2.0";
+            version = "1.3.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
             cargoExtraArgs = "--locked --package monty-runtime --no-default-features";
@@ -174,7 +174,7 @@
               cp target/release/monty $debug/bin/monty
               cp target/release/monty $out/bin/monty
               $STRIP $out/bin/monty
-              $out/bin/monty --version | grep -qx 'monty-runtime 1.2.0'
+              $out/bin/monty --version | grep -qx 'monty-runtime 1.3.0'
             '';
             dontStrip = true;
           };

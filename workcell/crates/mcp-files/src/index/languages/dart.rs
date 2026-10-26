@@ -115,7 +115,7 @@ fn unwrap_member<'tree>(
     node: Node<'tree>,
     context: &Context<'_>,
 ) -> ExtractResult<Option<Node<'tree>>> {
-    if node.kind() != "class_member" {
+    if node.kind() != "member_declaration" {
         return Ok(Some(node));
     }
     Ok(context

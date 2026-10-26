@@ -71,8 +71,8 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     env:
-      RUFF_VERSION: 0.17.1
-      TY_VERSION: 0.0.88
+      RUFF_VERSION: 0.17.2
+      TY_VERSION: 0.0.92
     steps:
       - uses: actions/checkout@v7
         with:
@@ -80,7 +80,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.15.0"
+          python-version: "3.15.1"
       - name: Install verification tools
         run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}" "ty==${TY_VERSION}"
       - run: ruff format --check scripts/
@@ -134,9 +134,9 @@ jobs:
       - uses: actions/cache/restore@v6.1.0
         id: cargo-cache
         with:
-          key: alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
+          key: alpine-cargo-v1-3.24.3-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
           restore-keys: |
-            alpine-cargo-v1-3.24.2-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+            alpine-cargo-v1-3.24.3-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
           path: |
             ${{ runner.temp }}/alpine-cargo/registry/cache
             ${{ runner.temp }}/alpine-cargo/git/db
@@ -289,7 +289,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.15.0"
+          python-version: "3.15.1"
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.1 --profile minimal --target ${{ matrix.target }}

@@ -79,11 +79,21 @@
 ; so unlike the convention-based grammars these are NOT SCREAMING_SNAKE-gated in ingest.cpp.
 ; Shapes verified with --match on the constcheck fixture.
 
-(const_item
-    name: (identifier) @name) @definition.constant
+(source_file
+    (const_item
+        name: (identifier) @name) @definition.constant)
 
-(static_item
-    name: (identifier) @name) @definition.constant
+(declaration_list
+    (const_item
+        name: (identifier) @name) @definition.constant)
+
+(source_file
+    (static_item
+        name: (identifier) @name) @definition.constant)
+
+(declaration_list
+    (static_item
+        name: (identifier) @name) @definition.constant)
 
 ; references (calls)
 

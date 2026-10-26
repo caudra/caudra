@@ -119,7 +119,8 @@ def rewrite_links(
             (
                 dest[: -len(origin) + len(resolved)]
                 for origin, dest in files.items()
-                if origin.startswith(f"{resolved}/") and dest.endswith(origin[len(resolved) :])
+                if origin.startswith(f"{resolved}/")
+                and dest.endswith(origin[len(resolved) :])
             ),
             None,
         )
@@ -175,7 +176,11 @@ def sync(pack: Pack, source: Path) -> int:
         name: sha256(source / ported["root"] / name) for name in ported.get("files", [])
     }
     version_from = pack.config.get("version_from")
-    version = json.loads((source / version_from).read_text())["version"] if version_from else ""
+    version = (
+        json.loads((source / version_from).read_text())["version"]
+        if version_from
+        else ""
+    )
     manifest = {
         "repository": pack.config["repository"],
         "commit": commit_of(source),
@@ -189,10 +194,14 @@ def sync(pack: Pack, source: Path) -> int:
     pack.dest.mkdir(parents=True, exist_ok=True)
     pack.manifest.write_text(json.dumps(manifest, indent=2) + "\n")
     before = previous.get("ported_scripts", {})
-    changed = [name for name, digest in scripts.items() if before.get(name, digest) != digest]
+    changed = [
+        name for name, digest in scripts.items() if before.get(name, digest) != digest
+    ]
     print(f"{pack.name} {version}: {len(entries)} files")
     for name in changed:
-        print(f"PORT {name} changed upstream; update its Rust port in {pack.crate}/src/scripts")
+        print(
+            f"PORT {name} changed upstream; update its Rust port in {pack.crate}/src/scripts"
+        )
     stale = stale_translations(pack, entries) + untranslated_changes(
         pack, previous["files"], entries
     )
@@ -215,7 +224,9 @@ def stale_translations(pack: Pack, entries: dict[str, str]) -> list[str]:
     lines = []
     for name, digest in sorted(recorded_translations(pack).items()):
         if name not in entries:
-            lines.append(f"ORPHAN {name}: upstream removed it; delete or move the translation")
+            lines.append(
+                f"ORPHAN {name}: upstream removed it; delete or move the translation"
+            )
         elif entries[name] != digest:
             lines.append(
                 f"TRANSLATE {name}: upstream changed; see `git diff -- {pack.crate}/upstream/{name}`"
@@ -223,7 +234,9 @@ def stale_translations(pack: Pack, entries: dict[str, str]) -> list[str]:
     return lines
 
 
-def untranslated_changes(pack: Pack, before: dict[str, str], entries: dict[str, str]) -> list[str]:
+def untranslated_changes(
+    pack: Pack, before: dict[str, str], entries: dict[str, str]
+) -> list[str]:
     recorded = recorded_translations(pack)
     return [
         f"NEW {name}: upstream added or changed it; translate it if the check names it"
@@ -254,7 +267,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pack", choices=sorted(PACKS), help="the pack to sync")
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--source", type=Path, help="a checkout of the pack's repository")
+    action.add_argument(
+        "--source", type=Path, help="a checkout of the pack's repository"
+    )
     action.add_argument(
         "--mark",
         nargs="+",

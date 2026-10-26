@@ -1,5 +1,5 @@
 use image::{DynamicImage, RgbaImage};
-use resvg::tiny_skia::{Pixmap, Transform};
+use resvg::tiny_skia::{IntRect, NonZeroRect, Pixmap, Transform};
 use resvg::usvg::filter::Kind;
 use resvg::usvg::{ClipPath, Group, ImageHrefResolver, Mask, Node, Options, Paint, Tree};
 use thiserror::Error;
@@ -9,18 +9,20 @@ const MAX_PIXELS: u64 = 4_096 * 4_096;
 const MAX_TOTAL_PIXMAP_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TREE_NODES: usize = 10_000;
 const MAX_TREE_DEPTH: usize = 64;
-// resvg clips isolated intermediate layers to a 5x-by-5x canvas rectangle.
-const MAX_LAYER_AREA_MULTIPLIER: u64 = 25;
+const MAX_LAYER_DIMENSION_MULTIPLIER: u32 = 5;
+const MAX_LAYER_ORIGIN_MULTIPLIER: i32 = -2;
 // Masks and clips can retain multiple layer-sized buffers.
-const MASK_CLIP_BUFFERS: usize = 3;
-const FILTER_PRIMITIVE_BUFFERS: usize = 5;
+const MASK_CLIP_BUFFERS: u64 = 3;
+const FILTER_PRIMITIVE_BUFFERS: u64 = 5;
+const FILTER_SOURCE_BUFFERS: u64 = 1;
+const MAX_TURBULENCE_OCTAVES: u32 = 10;
+const LAYER_ANTIALIAS_PADDING: i32 = 2;
 
 /// A parsed SVG whose resource and allocation behavior is fixed by this module.
 pub(crate) struct SafeSvg {
     tree: Tree,
     width: f32,
     height: f32,
-    allocation_layers: usize,
 }
 
 #[derive(Debug, Error)]
@@ -59,12 +61,11 @@ impl SafeSvg {
         if !tree.patterns().is_empty() {
             return Err(SvgRasterizeError::UnsupportedFeature("pattern paint"));
         }
-        let stats = analyze_tree(tree.root())?;
+        analyze_tree(tree.root(), None)?;
         Ok(Self {
             tree,
             width,
             height,
-            allocation_layers: stats.max_allocation_layer_depth,
         })
     }
 
@@ -75,7 +76,9 @@ impl SafeSvg {
             .min(1.0);
         let width = scaled_dimension(self.width, scale, requested_size);
         let height = scaled_dimension(self.height, scale, requested_size);
-        validate_pixmap_budget(width, height, self.allocation_layers)?;
+        let context = RenderContext::new(width, height, scale)?;
+        let stats = analyze_tree(self.tree.root(), Some(&context))?;
+        validate_pixmap_budget(width, height, stats.max_allocation_pixels)?;
 
         // The only raster target is this bounded in-memory pixmap. resvg's
         // intermediate layers are bounded relative to it, and the budget above
@@ -131,16 +134,10 @@ fn scaled_dimension(value: f32, scale: f32, requested_size: u32) -> u32 {
 fn validate_pixmap_budget(
     width: u32,
     height: u32,
-    allocation_layers: usize,
+    allocation_pixels: u64,
 ) -> Result<(), SvgRasterizeError> {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
-    let allocation_layers = u64::try_from(allocation_layers).unwrap_or(u64::MAX);
-    // The output pixmap costs four bytes per pixel. Each simultaneously nested
-    // isolated or auxiliary buffer can use up to 25x the canvas area in resvg
-    // 0.48.1. Filter primitive buffers are also included in `allocation_layers`.
-    let allocation_factor =
-        1_u64.saturating_add(allocation_layers.saturating_mul(MAX_LAYER_AREA_MULTIPLIER));
-    let bytes = pixels.saturating_mul(4).saturating_mul(allocation_factor);
+    let bytes = pixels.saturating_add(allocation_pixels).saturating_mul(4);
     if pixels > MAX_PIXELS || bytes > MAX_TOTAL_PIXMAP_BYTES {
         Err(SvgRasterizeError::Allocation)
     } else {
@@ -148,51 +145,219 @@ fn validate_pixmap_budget(
     }
 }
 
+struct RenderContext {
+    transform: Transform,
+    max_bbox: IntRect,
+    render_bbox: IntRect,
+    pixmap_bounds: IntRect,
+}
+
+impl RenderContext {
+    fn new(width: u32, height: u32, scale: f32) -> Result<Self, SvgRasterizeError> {
+        let max_bbox = IntRect::from_xywh(
+            (width as i32) * MAX_LAYER_ORIGIN_MULTIPLIER,
+            (height as i32) * MAX_LAYER_ORIGIN_MULTIPLIER,
+            width * MAX_LAYER_DIMENSION_MULTIPLIER,
+            height * MAX_LAYER_DIMENSION_MULTIPLIER,
+        )
+        .ok_or(SvgRasterizeError::Allocation)?;
+        Ok(Self {
+            transform: Transform::from_scale(scale, scale),
+            max_bbox,
+            render_bbox: max_bbox,
+            pixmap_bounds: IntRect::from_xywh(0, 0, width, height)
+                .ok_or(SvgRasterizeError::Allocation)?,
+        })
+    }
+
+    fn for_group(&self, group: &Group) -> Result<Option<Self>, SvgRasterizeError> {
+        let transform = self.transform.pre_concat(group.transform());
+        if !group.should_isolate() {
+            return Ok(Some(Self {
+                transform,
+                max_bbox: self.max_bbox,
+                render_bbox: self.render_bbox,
+                pixmap_bounds: self.pixmap_bounds,
+            }));
+        }
+        let inverse = if group.filters().is_empty() {
+            Transform::identity()
+        } else {
+            let sx = transform.sx.hypot(transform.ky);
+            let sy = transform.kx.hypot(transform.sy);
+            Transform::from_row(
+                transform.sx / sx,
+                transform.ky / sx,
+                transform.kx / sy,
+                transform.sy / sy,
+                0.0,
+                0.0,
+            )
+            .invert()
+            .ok_or(SvgRasterizeError::Allocation)?
+        };
+        let max_bbox = transform_bbox(self.max_bbox, inverse)?;
+        let render_bbox = transform_bbox(self.render_bbox, inverse)?;
+        let transform = inverse.pre_concat(transform);
+        let bbox = group
+            .layer_bounding_box()
+            .transform(transform)
+            .ok_or(SvgRasterizeError::Allocation)?;
+        let ibbox = if group.filters().is_empty() {
+            IntRect::from_xywh(
+                (bbox.x().floor() as i32)
+                    .checked_sub(LAYER_ANTIALIAS_PADDING)
+                    .ok_or(SvgRasterizeError::Allocation)?,
+                (bbox.y().floor() as i32)
+                    .checked_sub(LAYER_ANTIALIAS_PADDING)
+                    .ok_or(SvgRasterizeError::Allocation)?,
+                (bbox.width().ceil() as u32)
+                    .checked_add((LAYER_ANTIALIAS_PADDING * 2) as u32)
+                    .ok_or(SvgRasterizeError::Allocation)?,
+                (bbox.height().ceil() as u32)
+                    .checked_add((LAYER_ANTIALIAS_PADDING * 2) as u32)
+                    .ok_or(SvgRasterizeError::Allocation)?,
+            )
+            .ok_or(SvgRasterizeError::Allocation)?
+        } else {
+            checked_int_rect(bbox)?
+        };
+        let Some(ibbox) = ibbox.intersect(&render_bbox) else {
+            return Ok(None);
+        };
+        let dx = bbox.x() - (bbox.x() - ibbox.x() as f32);
+        let dy = bbox.y() - (bbox.y() - ibbox.y() as f32);
+        Ok(Some(Self {
+            transform: Transform::from_translate(-dx, -dy).pre_concat(transform),
+            max_bbox,
+            render_bbox,
+            pixmap_bounds: IntRect::from_xywh(0, 0, ibbox.width(), ibbox.height())
+                .ok_or(SvgRasterizeError::Allocation)?,
+        }))
+    }
+
+    fn for_filter(&self, rect: NonZeroRect) -> Result<Option<Self>, SvgRasterizeError> {
+        let Some(region) =
+            checked_transformed_int_rect(rect, self.transform)?.intersect(&self.pixmap_bounds)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            transform: self
+                .transform
+                .post_translate(-region.x() as f32, -region.y() as f32),
+            max_bbox: self.max_bbox,
+            render_bbox: self.render_bbox,
+            pixmap_bounds: region
+                .translate_to(0, 0)
+                .ok_or(SvgRasterizeError::Allocation)?,
+        }))
+    }
+
+    fn for_filter_image(&self, subregion: IntRect) -> Result<Self, SvgRasterizeError> {
+        let (sx, sy) = self.transform.get_scale();
+        let max_bbox = IntRect::from_xywh(0, 0, self.max_bbox.width(), self.max_bbox.height())
+            .ok_or(SvgRasterizeError::Allocation)?;
+        Ok(Self {
+            transform: Transform::from_row(
+                sx,
+                0.0,
+                0.0,
+                sy,
+                subregion.x() as f32,
+                subregion.y() as f32,
+            ),
+            max_bbox,
+            render_bbox: self.pixmap_bounds,
+            pixmap_bounds: self.pixmap_bounds,
+        })
+    }
+
+    fn pixels(&self) -> u64 {
+        u64::from(self.max_bbox.width()) * u64::from(self.max_bbox.height())
+    }
+}
+
+fn transform_bbox(rect: IntRect, transform: Transform) -> Result<IntRect, SvgRasterizeError> {
+    rect.to_rect()
+        .transform(transform)
+        .and_then(|rect| rect.round_out())
+        .ok_or(SvgRasterizeError::Allocation)
+}
+
+fn checked_transformed_int_rect(
+    rect: NonZeroRect,
+    transform: Transform,
+) -> Result<IntRect, SvgRasterizeError> {
+    checked_int_rect(
+        rect.transform(transform)
+            .ok_or(SvgRasterizeError::Allocation)?,
+    )
+}
+
+fn checked_int_rect(rect: NonZeroRect) -> Result<IntRect, SvgRasterizeError> {
+    IntRect::from_xywh(
+        rect.x().floor() as i32,
+        rect.y().floor() as i32,
+        (rect.width().ceil() as u32).max(1),
+        (rect.height().ceil() as u32).max(1),
+    )
+    .ok_or(SvgRasterizeError::Allocation)
+}
+
 #[derive(Default)]
 struct TreeStats {
     nodes: usize,
-    max_allocation_layer_depth: usize,
+    max_allocation_pixels: u64,
 }
 
 impl TreeStats {
-    fn record(
-        &mut self,
-        depth: usize,
-        allocation_layer_depth: usize,
-    ) -> Result<(), SvgRasterizeError> {
+    fn record(&mut self, depth: usize, allocation_pixels: u64) -> Result<(), SvgRasterizeError> {
         self.nodes = self.nodes.saturating_add(1);
         if depth > MAX_TREE_DEPTH || self.nodes > MAX_TREE_NODES {
             return Err(SvgRasterizeError::Complexity);
         }
-        self.max_allocation_layer_depth =
-            self.max_allocation_layer_depth.max(allocation_layer_depth);
+        if allocation_pixels.saturating_mul(4) > MAX_TOTAL_PIXMAP_BYTES {
+            return Err(SvgRasterizeError::Allocation);
+        }
+        self.max_allocation_pixels = self.max_allocation_pixels.max(allocation_pixels);
         Ok(())
     }
 }
 
-fn analyze_tree(root: &Group) -> Result<TreeStats, SvgRasterizeError> {
+fn analyze_tree(
+    root: &Group,
+    context: Option<&RenderContext>,
+) -> Result<TreeStats, SvgRasterizeError> {
     let mut stats = TreeStats::default();
-    analyze_group(root, 0, 0, &mut stats)?;
+    analyze_group(root, 0, 0, context, &mut stats)?;
     Ok(stats)
 }
 
 fn analyze_group(
     group: &Group,
     depth: usize,
-    allocation_layer_depth: usize,
+    allocation_pixels: u64,
+    context: Option<&RenderContext>,
     stats: &mut TreeStats,
 ) -> Result<(), SvgRasterizeError> {
-    stats.record(depth, allocation_layer_depth)?;
+    stats.record(depth, allocation_pixels)?;
     for node in group.children() {
         match node {
             Node::Group(group) => {
-                analyze_render_group(group, depth + 1, allocation_layer_depth, stats)?;
+                analyze_render_group(group, depth + 1, allocation_pixels, context, stats)?;
             }
             Node::Text(text) => {
-                analyze_render_group(text.flattened(), depth + 1, allocation_layer_depth, stats)?;
+                analyze_render_group(
+                    text.flattened(),
+                    depth + 1,
+                    allocation_pixels,
+                    context,
+                    stats,
+                )?;
             }
             Node::Path(path) => {
-                stats.record(depth + 1, allocation_layer_depth)?;
+                stats.record(depth + 1, allocation_pixels)?;
                 if matches!(
                     path.fill().map(|fill| fill.paint()),
                     Some(Paint::Pattern(_))
@@ -214,30 +379,66 @@ fn analyze_group(
 fn analyze_render_group(
     group: &Group,
     depth: usize,
-    allocation_layer_depth: usize,
+    allocation_pixels: u64,
+    context: Option<&RenderContext>,
     stats: &mut TreeStats,
 ) -> Result<(), SvgRasterizeError> {
-    let layers = allocation_layer_depth.saturating_add(usize::from(group.should_isolate()));
-    analyze_group(group, depth, layers, stats)?;
+    let transformed_context = context
+        .map(|context| context.for_group(group))
+        .transpose()?
+        .flatten();
+    if context.is_some() && transformed_context.is_none() {
+        return Ok(());
+    }
+    let context = transformed_context.as_ref();
+    let pixels = context.map_or(0, RenderContext::pixels);
+    let layers =
+        allocation_pixels.saturating_add(pixels.saturating_mul(u64::from(group.should_isolate())));
+    analyze_group(group, depth, layers, context, stats)?;
 
     if let Some(clip) = group.clip_path() {
-        analyze_clip(clip, depth + 1, layers, stats)?;
+        analyze_clip(clip, depth + 1, layers, context, stats)?;
     }
     if let Some(mask) = group.mask() {
-        analyze_mask(mask, depth + 1, layers, stats)?;
+        analyze_mask(mask, depth + 1, layers, context, stats)?;
     }
     for filter in group.filters() {
+        let filter_context = context
+            .map(|context| context.for_filter(filter.rect()))
+            .transpose()?
+            .flatten();
+        if context.is_some() && filter_context.is_none() {
+            continue;
+        }
         for (retained_results, primitive) in filter.primitives().iter().enumerate() {
-            let retained_layers = layers.saturating_add(retained_results);
+            let subregion = filter_context
+                .as_ref()
+                .map(|context| checked_transformed_int_rect(primitive.rect(), context.transform))
+                .transpose()?;
+            let retained_results = u64::try_from(retained_results).unwrap_or(u64::MAX);
+            let retained_layers = layers.saturating_add(
+                pixels.saturating_mul(retained_results.saturating_add(FILTER_SOURCE_BUFFERS)),
+            );
             stats.record(
                 depth + 1,
-                retained_layers.saturating_add(FILTER_PRIMITIVE_BUFFERS),
+                retained_layers.saturating_add(pixels.saturating_mul(FILTER_PRIMITIVE_BUFFERS)),
             )?;
+            if let Kind::Turbulence(turbulence) = primitive.kind()
+                && turbulence.num_octaves() > MAX_TURBULENCE_OCTAVES
+            {
+                return Err(SvgRasterizeError::Complexity);
+            }
             if let Kind::Image(image) = primitive.kind() {
+                let context = filter_context
+                    .as_ref()
+                    .zip(subregion)
+                    .map(|(context, subregion)| context.for_filter_image(subregion))
+                    .transpose()?;
                 analyze_group(
                     image.root(),
                     depth + 1,
-                    retained_layers.saturating_add(1),
+                    retained_layers.saturating_add(pixels),
+                    context.as_ref(),
                     stats,
                 )?;
             }
@@ -249,13 +450,58 @@ fn analyze_render_group(
 fn analyze_clip(
     clip: &ClipPath,
     depth: usize,
-    allocation_layer_depth: usize,
+    allocation_pixels: u64,
+    context: Option<&RenderContext>,
     stats: &mut TreeStats,
 ) -> Result<(), SvgRasterizeError> {
-    let layers = allocation_layer_depth.saturating_add(MASK_CLIP_BUFFERS);
-    analyze_group(clip.root(), depth, layers, stats)?;
+    let layers = allocation_pixels.saturating_add(
+        context
+            .map_or(0, RenderContext::pixels)
+            .saturating_mul(MASK_CLIP_BUFFERS),
+    );
+    if let Some(context) = context {
+        analyze_clip_group(clip.root(), depth, layers, context, stats)?;
+    } else {
+        analyze_group(clip.root(), depth, layers, None, stats)?;
+    }
     if let Some(linked) = clip.clip_path() {
-        analyze_clip(linked, depth + 1, layers, stats)?;
+        analyze_clip(linked, depth + 1, layers, context, stats)?;
+    }
+    Ok(())
+}
+
+fn analyze_clip_group(
+    group: &Group,
+    depth: usize,
+    allocation_pixels: u64,
+    context: &RenderContext,
+    stats: &mut TreeStats,
+) -> Result<(), SvgRasterizeError> {
+    stats.record(depth, allocation_pixels)?;
+    for node in group.children() {
+        match node {
+            Node::Group(group) => {
+                let layers = allocation_pixels.saturating_add(
+                    context
+                        .pixels()
+                        .saturating_mul(u64::from(group.clip_path().is_some())),
+                );
+                analyze_clip_group(group, depth + 1, layers, context, stats)?;
+                if let Some(clip) = group.clip_path() {
+                    analyze_clip(clip, depth + 1, layers, Some(context), stats)?;
+                }
+            }
+            Node::Text(text) => {
+                analyze_clip_group(
+                    text.flattened(),
+                    depth + 1,
+                    allocation_pixels,
+                    context,
+                    stats,
+                )?;
+            }
+            Node::Path(_) | Node::Image(_) => stats.record(depth + 1, allocation_pixels)?,
+        }
     }
     Ok(())
 }
@@ -263,13 +509,18 @@ fn analyze_clip(
 fn analyze_mask(
     mask: &Mask,
     depth: usize,
-    allocation_layer_depth: usize,
+    allocation_pixels: u64,
+    context: Option<&RenderContext>,
     stats: &mut TreeStats,
 ) -> Result<(), SvgRasterizeError> {
-    let layers = allocation_layer_depth.saturating_add(MASK_CLIP_BUFFERS);
-    analyze_group(mask.root(), depth, layers, stats)?;
+    let layers = allocation_pixels.saturating_add(
+        context
+            .map_or(0, RenderContext::pixels)
+            .saturating_mul(MASK_CLIP_BUFFERS),
+    );
+    analyze_group(mask.root(), depth, layers, context, stats)?;
     if let Some(linked) = mask.mask() {
-        analyze_mask(linked, depth + 1, layers, stats)?;
+        analyze_mask(linked, depth + 1, layers, context, stats)?;
     }
     Ok(())
 }

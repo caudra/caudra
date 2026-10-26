@@ -24,7 +24,7 @@ const PERMISSION_ERROR: &str = "PermissionError";
 const GATHER_SUMS: &str =
     "await asyncio.gather(everything.get_sum(a=2, b=3), everything.get_sum(a=10, b=20))";
 const IMPORTED_ASYNCIO: &str = "imported `asyncio`";
-const UNAWAITED_SEARCH: &str = "dropped `await` before `search()`";
+const UNAWAITED_SEARCH: &str = "dropped `await` before `mcp.search()`";
 const MEANT_GET_SUM: &str = "Did you mean `get_sum`?";
 const TRUE: &str = "true";
 const DROPPED_RETURN: &str = "dropped `return` from the last line";
@@ -59,12 +59,12 @@ fn server_everything_works_in_whichever_era_it_speaks() {
 #[ignore = "needs Docker: make test-mcp-servers"]
 fn the_helpers_find_what_a_snippet_can_call() {
     let servers = building();
-    let listed = servers.run("servers()");
+    let listed = servers.run("mcp.servers()");
     assert!(completed(&listed).contains(EVERYTHING), "{listed:?}");
-    let found = servers.run("search('sum', server='everything')");
+    let found = servers.run("mcp.search('sum', server='everything')");
     assert!(completed(&found).contains(GET_SUM_CALLED_AS), "{found:?}");
     assert!(found.calls.is_empty(), "{:?}", found.calls);
-    let awaited = servers.run("await search('sum', server='everything')");
+    let awaited = servers.run("await mcp.search('sum', server='everything')");
     assert!(
         completed(&awaited).contains(GET_SUM_CALLED_AS),
         "{awaited:?}"
@@ -159,8 +159,8 @@ fn variables_last_between_runs_until_a_reset() {
 fn resources_are_listed_and_read() {
     let servers = building();
     let output = servers.run(&format!(
-        "listed = await resources('everything')\n\
-         read = await read_resource('everything', '{DOCUMENT}')\n\
+        "listed = await mcp.resources('everything')\n\
+         read = await mcp.read_resource('everything', '{DOCUMENT}')\n\
          [entry['uri'] for entry in listed if entry['uri'] == '{DOCUMENT}'] == [read[0]['uri']] and len(read[0]['text']) > 0"
     ));
     assert_eq!(completed(&output), TRUE);

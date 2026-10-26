@@ -11,7 +11,7 @@ RUN apt-get update \
     && apt-get upgrade --yes --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-FROM golang:1.27.2-bookworm AS go
+FROM golang:1.27.3-bookworm AS go
 
 RUN apt-get update \
     && apt-get upgrade --yes --no-install-recommends \
@@ -51,7 +51,7 @@ RUN rustc --version && cargo --version && go version
 
 # This distribution's Node is too old for the current tools. A pinned upstream
 # tarball avoids running a remote setup script during the build.
-ARG NODE_VERSION=26.12.0
+ARG NODE_VERSION=26.12.1
 RUN curl -fsSLo /tmp/node.tar.xz \
         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
@@ -62,7 +62,7 @@ RUN curl -fsSLo /tmp/node.tar.xz \
 # Node and Python tools the corpus targets, installed once at image build time.
 # Cases that deliberately exercise a resolver, such as `npm install` or
 # `pip install`, still reach the network when they run.
-RUN npm install --global npm@12.2.0 \
+RUN npm install --global npm@12.2.1 \
     && npm install --global --no-fund --no-audit typescript eslint jest vitest \
     && npm cache clean --force
 # `tqdm` and `rich` are the progress libraries the reduction is measured
@@ -76,7 +76,7 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir pytest tqdm ri
 # for the same reason as Node above. Its report format differs from `cargo test`
 # in every respect except Cargo's build preamble, which is why the corpus gives
 # it a rule of its own and why that rule needs its own measured case.
-ARG NEXTEST_VERSION=0.9.148
+ARG NEXTEST_VERSION=0.9.149
 RUN curl -fsSLo /tmp/nextest.tar.gz "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
     && tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest \
     && rm /tmp/nextest.tar.gz \

@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn a_write_outlasts_a_busy_timeout_and_runs_its_effect_once() {
-        let (_root, state, journal) = fixture();
+        let (_root, state, mut journal) = fixture();
         let (release, released) = channel();
         let (locked, holding) = channel();
         *RELEASE_HOLDER.lock().unwrap() = Some(release);
@@ -1202,7 +1202,8 @@ mod tests {
         });
         holding.recv().unwrap();
         journal
-            .connection()
+            .database
+            .connection_mut()
             .busy_handler(Some(release_holder_and_give_up))
             .unwrap();
         let effects = Cell::new(0);

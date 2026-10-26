@@ -32,9 +32,18 @@
 
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
 
-(var_declaration (var_spec name: (identifier) @name)) @definition.constant
+(source_file
+  (var_declaration
+    (var_spec name: (identifier) @name) @definition.constant))
 
-(const_declaration (const_spec name: (identifier) @name)) @definition.constant
+(source_file
+  (var_declaration
+    (var_spec_list
+      (var_spec name: (identifier) @name) @definition.constant)))
+
+(source_file
+  (const_declaration
+    (const_spec name: (identifier) @name) @definition.constant))
 
 ; ---- references (calls) ----
 

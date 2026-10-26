@@ -21,6 +21,18 @@ has no root NOTICE. The Go grammar origin remains tree-sitter-go v0.23.4,
 3c3775faa968158a8b4ac190a7fda867fd5fb748 (MIT), as preserved in
 TreeSitterQueries.txt; that origin is distinct from Workcell's parser version.
 
+The Go package-scope var/const patterns, grouped-var pattern, and Rust
+item-scope const/static patterns were selectively adapted from ripwire v0.6.8,
+released on 2026-10-19, at cd11226a6b42f9a63c880ba0d8d24bfbd31e1919. Go uses
+Workcell's definition.constant capture, with individual var_spec/const_spec
+spans rather than declaration-wide spans. Rust's local method ownership and
+qualified-call patterns remain intact. No other query set was replaced by
+this refresh; upstream-only subscript, mixin, import, and class-factory
+capture semantics were not imported. LICENSE is unchanged from the inspected
+revision above, and v0.6.8 has no root NOTICE. Its THIRD_PARTY.md adds Clojure,
+which is not incorporated here; the seventeen recorded grammar-origin pins
+are unchanged.
+
 The original ripwire import revision was not recorded. The inspected revision
 is a reproducible source for license and grammar-pin verification, not a claim
 that it was the imported revision. That import provenance remains unresolved.
