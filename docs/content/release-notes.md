@@ -19,6 +19,12 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **mattpocock skills**: `[plugins.skill] mattpocock = true` adds 16 of [Matt Pocock's skills](https://github.com/mattpocock/skills), translated for Caudra, as the `mattpocock` skill and a `/mattpocock:<name>` command for each. They cover grilling a plan, domain modeling, test-first building, diagnosing bugs, code review, specs and tickets, and handoffs. Grilling asks through the `question` tool, and switching the pack applies at once in the terminal UI. Both packs can be on together. See [mattpocock](/docs/skills/#mattpocock).
 - **Guide running tasks**: `task_control` `guide` lets the main agent send a running task changed requirements or a reply to its report. The task reads it at its next step, and `interrupt: true` replaces its current turn instead. The message waits in the task chat's queue like your own guidance. Guidance a task never reads comes back with its result. See [Inspect and control tasks](/docs/sessions/#inspect-and-control-tasks).
 
+### Fixes
+
+- **Content screening says why it withheld a result**: a result that enforced screening could not check, because the engine timed out or was unreachable, showed `◆ flagged` like a real detection. Its chip now names the cause, such as `◆ screening timed out`, `◆ engine unreachable`, or `◆ screening busy`, and the session's `/decisions` overview shows `screening incomplete` apart from `flagged`. The result is still withheld and the session is still tightened. Rows saved before this release show `◆ screening result`. See [the decision engine](/docs/permissions/#decision-engine-advice).
+- **A batch of fetches no longer times out its own screening**: content screening sends at most four engine requests at once across every result, so a batch of pages waits for a slot, shown as `◆ waiting to screen…`, instead of overloading the engine. A chunk whose request timed out or found the engine unreachable is asked once more on the same text, shown as `◆ retrying screening…`. Caudra never fetches the page again for this.
+- **Cancelling a turn clears its decision spinners**: a decision chip such as `◆ screening result…` kept spinning on its card after you cancelled the turn. Cancelling now removes every wait the turn leaves behind.
+
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 
 [v0.2.0-preview.14 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.14)

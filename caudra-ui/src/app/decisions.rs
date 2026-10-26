@@ -211,16 +211,13 @@ impl App {
         }
     }
 
-    /// Screens with `decisions` from now on. Content this session already flagged stays
-    /// flagged, so a rebuilt engine never loosens what the session may do.
+    /// Screens with `decisions` from now on. What this session already
+    /// flagged or could not screen still tightens it, so a rebuilt engine
+    /// never loosens what the session may do.
     pub(crate) fn adopt_decisions(&self, decisions: &Decisions) {
         let adopted = decisions.for_session(self.state.session.id);
-        if self
-            .permissions
-            .decisions()
-            .is_some_and(|current| current.is_tainted())
-        {
-            adopted.mark_tainted();
+        if let Some(current) = self.permissions.decisions() {
+            adopted.inherit_taint(&current.taint());
         }
         self.permissions.set_decisions(Some(adopted));
     }
@@ -319,7 +316,7 @@ impl App {
         let ctx = DecisionsModalContext {
             config,
             status: &status,
-            tainted: decisions.as_ref().is_some_and(Decisions::is_tainted),
+            taint: decisions.as_ref().map(Decisions::taint).unwrap_or_default(),
             mode: &mode,
             key_source: decisions.as_ref().and_then(Decisions::key_source),
             log_path: &log_path,
@@ -425,7 +422,7 @@ mod tests {
 
     use arc_swap::ArcSwapOption;
     use async_trait::async_trait;
-    use caudra_agent::decisions::{DecisionContext, PermissionPurpose};
+    use caudra_agent::decisions::{DecisionContext, PermissionPurpose, Taint};
     use caudra_config::decisions::{
         DecisionEndpoint, DecisionEndpointDef, DecisionFeatures, DecisionProtocol,
     };
@@ -909,22 +906,22 @@ mod tests {
         }
     }
 
-    #[test_case(true; "flagged")]
-    #[test_case(false; "clean")]
-    fn an_adopted_engine_keeps_what_the_session_flagged(tainted: bool) {
+    #[test_case(Taint { flagged: true, unscreened: false }; "flagged")]
+    #[test_case(Taint { flagged: false, unscreened: true }; "unscreened")]
+    #[test_case(Taint { flagged: true, unscreened: true }; "both")]
+    #[test_case(Taint::default(); "clean")]
+    fn an_adopted_engine_keeps_what_tightened_the_session(taint: Taint) {
         let (_tmp, app) = isolated_app();
         let running = Decisions::new(DecisionsConfig::default(), &app.storage).unwrap();
         app.adopt_decisions(&running);
-        if tainted {
-            app.permissions.decisions().unwrap().mark_tainted();
-        }
+        app.permissions.decisions().unwrap().inherit_taint(&taint);
 
         app.adopt_decisions(
             &Decisions::new(memory_search(FeatureMode::Enforce), &app.storage).unwrap(),
         );
 
         let adopted = app.permissions.decisions().unwrap();
-        assert_eq!(adopted.is_tainted(), tainted);
+        assert_eq!(adopted.taint(), taint);
         assert_eq!(adopted.session(), Some(app.state.session.id));
         assert_eq!(
             adopted.config().features.memory_search,

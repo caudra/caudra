@@ -3324,6 +3324,25 @@ impl MessagesPanel {
             }
             self.rebuild_tool_segment(id);
         }
+        self.drop_cancelled_waits();
+    }
+
+    /// The stale-run filter also drops the settles of decisions a cancelled
+    /// turn was still waiting on, including those asked after their call
+    /// ended, so every card's waits go with the turn.
+    fn drop_cancelled_waits(&mut self) {
+        let waited: Vec<usize> = self
+            .messages
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, msg)| !Self::is_live_workflow(msg))
+            .filter_map(|(index, msg)| {
+                card_decisions::settle_all(&mut msg.decisions).then_some(index)
+            })
+            .collect();
+        for index in waited {
+            self.redraw_decisions(index);
+        }
     }
 
     /// Only tests care how many; the panel itself only ever asks whether.

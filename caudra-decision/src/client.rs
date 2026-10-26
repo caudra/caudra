@@ -125,6 +125,9 @@ impl HttpDecisionClient {
         let mut retries = 0;
         loop {
             check_deadline(deadline)?;
+            if deadlines.is_abandoned() {
+                return Err(DecisionError::Timeout);
+            }
             let mut builder = Request::post(self.endpoint.clone())
                 .timeout(deadlines.linger.saturating_duration_since(Instant::now()))
                 .redirect_policy(RedirectPolicy::None)
@@ -877,10 +880,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1/decisions", listener.local_addr().unwrap());
         let now = Instant::now();
-        let deadlines = Deadlines {
-            answer: now + STREAM_DEADLINE,
-            linger: now + TEST_TIMEOUT,
-        };
+        let deadlines = Deadlines::new(now + STREAM_DEADLINE, now + TEST_TIMEOUT);
         let answer = deadlines.answer;
         let late = matches!(reply, Reply::Late);
         let task = thread::spawn(move || {
@@ -920,10 +920,7 @@ mod tests {
         let meter = Recorded::default();
         let result = future::block_on(client(&server.endpoint).decide_metered(
             &request(),
-            Deadlines {
-                answer: now + STREAM_DEADLINE,
-                linger: now + TEST_TIMEOUT,
-            },
+            Deadlines::new(now + STREAM_DEADLINE, now + TEST_TIMEOUT),
             &meter,
         ));
         server.task.join().unwrap();
@@ -945,6 +942,25 @@ mod tests {
         let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
         let result =
             future::block_on(client_for(&endpoint, openai).decide(&request(), Instant::now()));
+        assert_eq!(result, Err(DecisionError::Timeout));
+        assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn an_abandoned_call_starts_no_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
+        let now = Instant::now();
+        let deadlines = Deadlines::new(now + TEST_TIMEOUT, now + TEST_TIMEOUT);
+        deadlines.clone().abandon();
+
+        let result = future::block_on(client(&endpoint).decide_metered(
+            &request(),
+            deadlines,
+            &Recorded::default(),
+        ));
+
         assert_eq!(result, Err(DecisionError::Timeout));
         assert!(listener.accept().is_err());
     }

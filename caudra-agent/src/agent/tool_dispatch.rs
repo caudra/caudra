@@ -16,8 +16,8 @@ use crate::background::{JobScope, RunningShell, ShellJobMetadata, ShellLive, Wai
 use crate::code::hosted::direct_call_refusal;
 use crate::decisions::output_pointers::{self, OmittedOutput};
 use crate::decisions::{
-    DecisionFeature, Flag, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, Screening, Unscreened,
-    Withholding,
+    DecisionFeature, Flag, NoteAnchor, NoteDraft, NoteOutcome, NoteSink, Screening,
+    ScreeningVerdict, Unscreened, Withholding,
 };
 use crate::mcp::McpSession;
 use crate::mcp::call::CallScope;
@@ -656,11 +656,11 @@ pub async fn run(
                 let context = ctx
                     .permissions
                     .decision_context(serde_json::json!({"tool": canonical}));
+                let progress = |phase| pending.phase(phase);
                 ctx.cancel
-                    .race(
-                        ctx.permissions
-                            .run_passive_decision(decisions.screen_content(&content, &context)),
-                    )
+                    .race(ctx.permissions.run_passive_decision(
+                        decisions.screen_content(&content, &context, &progress),
+                    ))
                     .await
                     .ok()
                     .flatten()
@@ -673,7 +673,6 @@ pub async fn run(
                 receipts,
                 withholding,
             } => {
-                decisions.mark_tainted();
                 done.model_output =
                     Some(withholding.notice(canonical, &decisions.config().thresholds));
                 done.model_suffix = None;
@@ -685,20 +684,29 @@ pub async fn run(
                 for receipt in receipts {
                     decisions.record_effect_detached(&receipt, DecisionEffect::Skipped);
                 }
-                let summary = match withholding {
-                    Withholding::Flagged(_) => CONTENT_WITHHELD,
-                    Withholding::Unscreened(_) => CONTENT_WITHHELD_UNSCREENED,
+                let (outcome, summary) = match withholding {
+                    Withholding::Flagged(_) => {
+                        decisions.mark_flagged();
+                        (NoteOutcome::Acted, CONTENT_WITHHELD)
+                    }
+                    Withholding::Unscreened(_) => {
+                        decisions.mark_unscreened();
+                        (NoteOutcome::FellBack, CONTENT_WITHHELD_UNSCREENED)
+                    }
                 };
-                Some(NoteDraft::new(
-                    &decisions,
-                    DecisionFeature::ContentScreening,
-                    NoteOutcome::Acted,
-                    summary,
-                    withholding.details(),
-                ))
+                Some(
+                    NoteDraft::new(
+                        &decisions,
+                        DecisionFeature::ContentScreening,
+                        outcome,
+                        summary,
+                        withholding.details(),
+                    )
+                    .screened(withholding.verdict()),
+                )
             }
             Screening::Flagged { receipts, flags } => {
-                decisions.mark_tainted();
+                decisions.mark_flagged();
                 done.model_suffix = Some(match done.model_suffix.take() {
                     Some(suffix) => format!("{suffix}\n\n{CONTENT_CAUTION}"),
                     None => CONTENT_CAUTION.into(),
@@ -710,27 +718,36 @@ pub async fn run(
                 for receipt in receipts {
                     decisions.record_effect_detached(&receipt, DecisionEffect::Advised);
                 }
-                Some(NoteDraft::new(
+                Some(
+                    NoteDraft::new(
+                        &decisions,
+                        DecisionFeature::ContentScreening,
+                        NoteOutcome::Acted,
+                        CONTENT_FLAGGED,
+                        flags.iter().map(Flag::detail).collect(),
+                    )
+                    .screened(ScreeningVerdict::Flagged),
+                )
+            }
+            Screening::Shadow(flags) => Some(
+                NoteDraft::new(
                     &decisions,
                     DecisionFeature::ContentScreening,
-                    NoteOutcome::Acted,
+                    NoteOutcome::Shadow,
                     CONTENT_FLAGGED,
                     flags.iter().map(Flag::detail).collect(),
-                ))
-            }
-            Screening::Shadow(flags) => Some(NoteDraft::new(
-                &decisions,
-                DecisionFeature::ContentScreening,
-                NoteOutcome::Shadow,
-                CONTENT_FLAGGED,
-                flags.iter().map(Flag::detail).collect(),
-            )),
-            Screening::Failed(failure) => Some(NoteDraft::fell_back(
-                &decisions,
-                DecisionFeature::ContentScreening,
-                &failure,
-                CONTENT_FALLBACK,
-            )),
+                )
+                .screened(ScreeningVerdict::Flagged),
+            ),
+            Screening::Failed(unscreened) => Some(
+                NoteDraft::fell_back(
+                    &decisions,
+                    DecisionFeature::ContentScreening,
+                    &unscreened.to_string(),
+                    CONTENT_FALLBACK,
+                )
+                .screened(unscreened.verdict()),
+            ),
             Screening::Quiet => None,
         };
         pending.settle(note);
@@ -2277,7 +2294,7 @@ mod tests {
     use crate::agent::speculative::SpeculativeRuns;
     use crate::background::BackgroundTasks;
     use crate::cancel::CancelToken;
-    use crate::decisions::Decisions;
+    use crate::decisions::{Decisions, Taint};
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionManager, PermissionResource, PermissionResourceAccess,
         PermissionResourceKind, PermissionRisk,
@@ -2984,9 +3001,15 @@ mod tests {
         Decisions::with_engine(config, dir, ContentVerdict(noul)).unwrap()
     }
 
-    #[test_case(Some(1.0), CONTENT_WITHHELD, WITHHELD_FLAG_REASON; "flagged")]
-    #[test_case(None, CONTENT_WITHHELD_UNSCREENED, WITHHELD_FAILURE_REASON; "engine_failure_fails_closed")]
-    fn enforce_withholds_the_result_from_the_model(noul: Option<f64>, summary: &str, reason: &str) {
+    #[test_case(Some(1.0), CONTENT_WITHHELD, WITHHELD_FLAG_REASON, NoteOutcome::Acted, ScreeningVerdict::Flagged; "flagged")]
+    #[test_case(None, CONTENT_WITHHELD_UNSCREENED, WITHHELD_FAILURE_REASON, NoteOutcome::FellBack, ScreeningVerdict::TimedOut; "engine_failure_fails_closed")]
+    fn enforce_withholds_the_result_from_the_model(
+        noul: Option<f64>,
+        summary: &str,
+        reason: &str,
+        outcome: NoteOutcome,
+        verdict: ScreeningVerdict,
+    ) {
         smol::block_on(async {
             let fixture = ShellDispatchFixture::named(None, Effect::Allow, WEB_FETCH).await;
             let decisions = enforcing(&fixture.dir, noul);
@@ -3017,9 +3040,18 @@ mod tests {
                     _ => None,
                 })
                 .collect();
+            let flagged = verdict == ScreeningVerdict::Flagged;
+            assert_eq!(
+                decisions.taint(),
+                Taint {
+                    flagged,
+                    unscreened: !flagged
+                }
+            );
             assert_eq!(notes.len(), CONTENT_ROUNDS);
             for note in &notes {
-                assert_eq!(note.outcome, NoteOutcome::Acted);
+                assert_eq!(note.outcome, outcome);
+                assert_eq!(note.screening, Some(verdict));
                 assert_eq!(note.summary, format!("{}{summary}", note.outcome.lead()));
                 assert_eq!(note.details.len(), 1);
             }

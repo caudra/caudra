@@ -6270,6 +6270,7 @@ mod tests {
             outcome: NoteOutcome::Acted,
             summary: DECISION_NOTE_SUMMARY.into(),
             details: Vec::new(),
+            screening: None,
         });
         let anchors: Vec<NoteAnchor> = events
             .try_iter()

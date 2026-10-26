@@ -5308,7 +5308,7 @@ mod tests {
                 .auto_screening_restricted,
             restricted
         );
-        first.mark_tainted();
+        first.mark_flagged();
         assert!(manager.decisions().unwrap().is_tainted());
         assert!(!second.is_tainted());
     }

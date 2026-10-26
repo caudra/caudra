@@ -1196,7 +1196,7 @@ mod tests {
         let manager = default_mgr();
         manager.set_decisions(Some(service.decisions));
         let inherited = manager.fork();
-        manager.decisions().unwrap().mark_tainted();
+        manager.decisions().unwrap().mark_flagged();
         let session = CaudraId::generate();
         let other_root = manager.fork_session(session);
         let next_root = other_root.fork_session(CaudraId::generate());
@@ -1207,7 +1207,7 @@ mod tests {
         );
         assert!(inherited.decisions().unwrap().is_tainted());
         assert!(!other_root.decisions().unwrap().is_tainted());
-        other_root.decisions().unwrap().mark_tainted();
+        other_root.decisions().unwrap().mark_flagged();
         assert!(!next_root.decisions().unwrap().is_tainted());
         manager.set_decisions(None);
         assert!(inherited.decisions().is_none());

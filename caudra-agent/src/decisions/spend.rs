@@ -13,6 +13,7 @@ use futures_lite::future;
 use smol::Task;
 
 use super::Decisions;
+use super::admission::Hold;
 
 /// How long a call whose caller stopped waiting may still read its reply, so
 /// what the endpoint billed for it is booked.
@@ -76,22 +77,27 @@ pub(super) struct MeteredCall {
     model: String,
     cwd: String,
     meter: Arc<Collected>,
+    deadlines: Deadlines,
     task: Option<Task<Result<DecisionResponse, DecisionError>>>,
 }
 
 impl MeteredCall {
+    /// `hold` rides on the request's task and drops with it.
     pub(super) fn start(
         service: &Decisions,
         engine: Arc<dyn DecisionEngine>,
         request: DecisionRequest,
         deadlines: Deadlines,
         cwd: String,
+        hold: Hold,
     ) -> Self {
         let meter = Arc::new(Collected::default());
         let model = request.model.clone();
         let task = smol::spawn({
             let meter = Arc::clone(&meter);
+            let deadlines = deadlines.clone();
             async move {
+                let _hold = hold;
                 let linger = deadlines.linger;
                 future::race(
                     engine.decide_metered(&request, deadlines, meter.as_ref()),
@@ -108,6 +114,7 @@ impl MeteredCall {
             model,
             cwd,
             meter,
+            deadlines,
             task: Some(task),
         }
     }
@@ -142,10 +149,12 @@ impl Drop for MeteredCall {
         let model = mem::take(&mut self.model);
         let cwd = mem::take(&mut self.cwd);
         let meter = Arc::clone(&self.meter);
-        let lingering = self
-            .task
-            .take()
-            .and_then(|task| LingerSlot::claim(&service.0.lingering).map(|slot| (task, slot)));
+        if self.task.is_some() {
+            self.deadlines.abandon();
+        }
+        let lingering = self.task.take().and_then(|task| {
+            LingerSlot::claim(&service.0.limits.lingering).map(|slot| (task, slot))
+        });
         if lingering.is_none() && lock(&meter.0).is_empty() {
             return;
         }

@@ -4668,7 +4668,7 @@ pub(super) mod tests {
         )
         .unwrap();
         manager.set_decisions(Some(decisions));
-        manager.decisions().unwrap().mark_tainted();
+        manager.decisions().unwrap().mark_flagged();
         let (event_tx, _events) = flume::unbounded();
 
         let refusal = smol::block_on(delegated_call(

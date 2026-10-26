@@ -67,7 +67,7 @@ When a prompt appears, the delegate decides it. In [Auto mode](/docs/permissions
 | Tools and calls that always prompt | Deny with guidance, or leave it to you |
 | Protected files and commands, such as `.git`, `.ssh`, dotenv files, and file redirects | Deny with guidance, or leave it to you |
 | `sudo`, `su`, `doas`, `eval`, `source`, and command lines Caudra cannot read | Deny with guidance, or leave it to you |
-| Any prompt while content screening has flagged the session | Deny with guidance, or leave it to you |
+| Any prompt while content screening has tightened the session | Deny with guidance, or leave it to you |
 
 These are the classes that [Auto](/docs/permissions/#auto-mode) never decides, except ask rules. An ask rule you wrote reaches the delegate, which may approve that call once. Use a deny rule for a call that must never run.
 
@@ -75,7 +75,7 @@ An approval is always for this call only. The delegate never adds a rule or a li
 
 The delegate decides a permission prompt without tool results. It sees your words, the assistant's own text and calls, and the request, including the tool input, its resources, why it asks, and any engine advice. Text planted in a fetched page or a file therefore stays one step away from a grant.
 
-The flag that blocks grants comes from [content screening](/docs/permissions/#decision-engine-advice), which needs the decision engine. Without the decision engine, there is no such flag.
+Content screening tightens the session when it flags a result, or when enforced screening withholds a result it could not screen in full. See [content screening](/docs/permissions/#decision-engine-advice), which needs the decision engine. Without the decision engine, nothing tightens the session this way.
 
 Prompts from subagents, workflow agents, and background tasks reach the delegate too, because they share the session's permissions. A permissions reload while the delegate decides cancels the decision, and the prompt is asked again under the new rules.
 
@@ -198,7 +198,7 @@ A session that you resume stays engaged, with the budget it has used. When a goa
 Autopilot is delegated consent. It approves calls you did not see. Read these limits before you leave a session alone:
 
 - It never approves the reserved classes in the [permission table](#permission-prompts). Those need you, or a rule you wrote.
-- It approves nothing while content screening has flagged the session. That flag needs an active [decision endpoint](/docs/providers/#decision-endpoints) and [`content_screening`](/docs/configuration/#decisions-features) turned on. Without them, autopilot still runs, and the [engage notice](#before-you-leave-it-alone) says so.
+- It approves nothing while content screening has tightened the session. That needs an active [decision endpoint](/docs/providers/#decision-endpoints) and [`content_screening`](/docs/configuration/#decisions-features) turned on. Without them, autopilot still runs, and the [engage notice](#before-you-leave-it-alone) says so.
 - It decides permission prompts without tool results, which keeps injected text one step away. A determined injection can still shape the assistant's own requests.
 - It never adds a rule, so an approval does not outlive the call.
 - It is no security boundary. Use [sandboxes](/docs/sandboxes/), [stored rules](/docs/permissions/#stored-rules), and read-only modes for what must never happen.

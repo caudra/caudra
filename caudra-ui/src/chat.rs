@@ -25,7 +25,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::background::TaskSnapshot;
-use caudra_agent::decisions::{DecisionFeature, DecisionNote, PendingDecision};
+use caudra_agent::decisions::{DecisionFeature, DecisionNote, PendingDecision, ScreeningVerdict};
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
@@ -582,13 +582,16 @@ impl Chat {
         if subject == DecisionSubject::Turn {
             self.messages_panel.flush();
         }
-        if self.messages_panel.attach_decision(CardDecision::settled(
-            subject,
-            note.feature.clone(),
-            note.outcome,
-            &note.summary,
-            &note.details,
-        )) {
+        if self.messages_panel.attach_decision(
+            CardDecision::settled(
+                subject,
+                note.feature.clone(),
+                note.outcome,
+                &note.summary,
+                &note.details,
+            )
+            .screened(note.screening),
+        ) {
             return;
         }
         self.messages_panel.flush();
@@ -608,8 +611,9 @@ impl Chat {
         if subject == DecisionSubject::Turn {
             self.messages_panel.flush();
         }
-        self.messages_panel
-            .attach_decision(CardDecision::pending(subject, pending.feature));
+        self.messages_panel.attach_decision(
+            CardDecision::pending(subject, pending.feature).in_phase(pending.phase),
+        );
     }
 
     /// The engine answered with nothing to do. A call's own wait goes off its
@@ -1365,6 +1369,7 @@ pub(crate) fn decision_inserts<'a>(
                 &row.summary,
                 &row.details,
             )
+            .screened(row.screening.as_deref().and_then(ScreeningVerdict::parse))
         };
         match (&row.anchor, feature) {
             (StoredDecisionAnchor::History(len), Some(feature)) => {
@@ -1737,6 +1742,7 @@ fn host_turn_decision(display: &mut Vec<DisplayMessage>, decision: CardDecision)
         outcome,
         text,
         took,
+        ..
     } = decision.state
     {
         display.push(DisplayMessage::new(
@@ -4273,6 +4279,7 @@ mod tests {
     const SECOND_CALL_CHILD: &str = "t2:0";
     const UNKNOWN_CALL: &str = "t9";
     const RETIRED_FEATURE: &str = "retired_feature";
+    const UNKNOWN_SCREENING: &str = "retired_screening";
     const TURN_ROW: &str = "ranked before the turn";
     const FIRST_CALL_ROW: &str = "ranked in the first call";
     const SECOND_CALL_ROW: &str = "ranked in the second call";
@@ -4315,6 +4322,7 @@ mod tests {
             anchor,
             cause: None,
             details: Vec::new(),
+            phase: None,
         }))
     }
 
@@ -4332,6 +4340,7 @@ mod tests {
             anchor,
             cause: None,
             details,
+            phase: None,
         }))
     }
 
@@ -4773,6 +4782,7 @@ mod tests {
             details: Vec::new(),
             agent: None,
             anchor,
+            screening: None,
         }
     }
 
@@ -4969,6 +4979,34 @@ mod tests {
         assert_eq!(
             restored_turn(position, DecisionFeature::MemoryRecall.name()),
             shown
+        );
+    }
+
+    #[test_case(Some(ScreeningVerdict::TimedOut.as_str()), Some(ScreeningVerdict::TimedOut) ; "a_failure_keeps_its_cause")]
+    #[test_case(Some(ScreeningVerdict::Flagged.as_str()), Some(ScreeningVerdict::Flagged) ; "a_flag_stays_a_flag")]
+    #[test_case(None, None ; "a_row_stored_before_screening_said_stays_neutral")]
+    #[test_case(Some(UNKNOWN_SCREENING), None ; "a_cause_this_build_cannot_name_stays_neutral")]
+    fn a_restored_screening_keeps_what_it_concluded(
+        stored_screening: Option<&str>,
+        expected: Option<ScreeningVerdict>,
+    ) {
+        let row = StoredEngineDecision {
+            screening: stored_screening.map(str::to_owned),
+            ..stored(
+                DecisionFeature::ContentScreening.name(),
+                DECISION_SUMMARY,
+                StoredDecisionAnchor::History(0),
+            )
+        };
+
+        let restored = decision_inserts(&[], [&row]);
+
+        let [(_, decision)] = restored.turns.as_slice() else {
+            panic!("one restored turn decision");
+        };
+        assert!(
+            matches!(decision.state, DecisionState::Settled { screening, .. } if screening == expected),
+            "{decision:?}"
         );
     }
 

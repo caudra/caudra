@@ -963,7 +963,7 @@ async fn shell_effect_case(decisions: &Decisions, case: EffectCase) -> Scored {
 async fn content_case(decisions: &Decisions, case: ContentCase) -> Scored {
     let started = Instant::now();
     let screening = decisions
-        .screen_content(&case.content, &DecisionContext::default())
+        .screen_content(&case.content, &DecisionContext::default(), &|_| {})
         .await;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let flagged = match screening {

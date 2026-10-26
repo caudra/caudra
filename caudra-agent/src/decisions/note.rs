@@ -6,7 +6,7 @@ use caudra_storage::engine_decisions::{
 };
 use serde::{Serialize, Serializer};
 
-use super::{DecisionFeature, Decisions, candidate_text};
+use super::{DecisionFeature, Decisions, ScreeningVerdict, candidate_text};
 use crate::{AgentEvent, EventSender};
 
 const MAX_SUMMARY_BYTES: usize = 200;
@@ -86,6 +86,9 @@ pub struct DecisionNote {
     /// One candidate or value per line.
     pub details: Vec<String>,
     pub anchor: NoteAnchor,
+    /// Content screening's verdict, or why it reached none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screening: Option<ScreeningVerdict>,
 }
 
 impl DecisionNote {
@@ -110,6 +113,7 @@ impl DecisionNote {
             summary,
             details,
             anchor,
+            screening: None,
         }
     }
 
@@ -129,6 +133,7 @@ impl DecisionNote {
                 NoteAnchor::History(len) => StoredDecisionAnchor::History(*len),
                 NoteAnchor::Tool(id) => StoredDecisionAnchor::Tool(id.clone()),
             },
+            screening: self.screening.map(|verdict| verdict.as_str().to_owned()),
         }
     }
 }
@@ -162,6 +167,7 @@ pub struct NoteDraft {
     pub outcome: NoteOutcome,
     pub summary: String,
     pub details: Vec<String>,
+    pub screening: Option<ScreeningVerdict>,
 }
 
 impl NoteDraft {
@@ -180,6 +186,16 @@ impl NoteDraft {
             outcome,
             summary: format!("{}{acted}", outcome.lead()),
             details,
+            screening: None,
+        }
+    }
+
+    /// Says what content screening concluded, so a reader tells a flag from
+    /// a result that could not be screened without parsing the summary.
+    pub fn screened(self, verdict: ScreeningVerdict) -> Self {
+        Self {
+            screening: Some(verdict),
+            ..self
         }
     }
 
@@ -201,14 +217,17 @@ impl NoteDraft {
     }
 
     pub fn anchored(self, anchor: NoteAnchor) -> DecisionNote {
-        DecisionNote::new(
-            self.feature,
-            self.mode,
-            self.outcome,
-            &self.summary,
-            self.details,
-            anchor,
-        )
+        DecisionNote {
+            screening: self.screening,
+            ..DecisionNote::new(
+                self.feature,
+                self.mode,
+                self.outcome,
+                &self.summary,
+                self.details,
+                anchor,
+            )
+        }
     }
 }
 
@@ -276,8 +295,19 @@ impl NoteSink {
             anchor: self.anchor.clone(),
             cause: self.cause,
             details,
+            phase: None,
         }
     }
+}
+
+/// What a wait is held up by, when it is more than the engine thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingPhase {
+    /// Waiting for a slot to call the engine through.
+    Queued,
+    /// A call failed in a way worth one more try.
+    Retrying,
 }
 
 /// A decision a call waits on, so its card can say so until the answer.
@@ -294,6 +324,10 @@ pub struct PendingDecision {
     /// a wait, why the engine was not asked. Never stored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<String>,
+    /// What the wait is held up by. A wait heard again with another phase
+    /// replaces the one before, keeping its start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PendingPhase>,
 }
 
 /// Holds a [`PendingDecision`] open. Emitting the note settles it; dropped
@@ -320,6 +354,18 @@ impl PendingNote {
     /// Ends the wait without a note, saying what came closest.
     pub fn quiet(mut self, near_misses: Vec<String>) {
         self.near_misses = bounded_details(near_misses, MAX_NOTE_BYTES);
+    }
+
+    /// Says what the open wait is held up by now, `None` once it is only the
+    /// engine thinking again.
+    pub fn phase(&self, phase: Option<PendingPhase>) {
+        if let Some(sink) = self.sink.as_ref().filter(|_| self.pending) {
+            sink.event_tx
+                .try_send(AgentEvent::DecisionPending(Box::new(PendingDecision {
+                    phase,
+                    ..sink.pending(&self.feature, Vec::new())
+                })));
+        }
     }
 
     pub fn emit(mut self, draft: NoteDraft) {
@@ -570,6 +616,7 @@ mod tests {
                 details: vec![DETAIL.into()],
                 agent: agent.map(str::to_owned),
                 anchor: expected_anchor,
+                screening: None,
             }
         );
         assert_eq!(NoteOutcome::from(stored.outcome), note.outcome);
@@ -618,6 +665,7 @@ mod tests {
             outcome: NoteOutcome::Acted,
             summary: SUMMARY.into(),
             details: Vec::new(),
+            screening: None,
         }
     }
 
