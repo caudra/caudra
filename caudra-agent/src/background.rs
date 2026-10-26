@@ -2295,7 +2295,7 @@ impl BackgroundTasks {
         owned.steering_observations = None;
         owned.steering_order.clear();
         owned.live_sink = None;
-        let mut prepared = PreparedTask::prepare(&owned, request, Some(reporter.clone())).await?;
+        let prepared = PreparedTask::prepare(&owned, request, Some(reporter.clone())).await?;
         let (history, spec) = match prepared.checkpoint() {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -2317,7 +2317,7 @@ impl BackgroundTasks {
             return Err(CLOSED.into());
         }
         let generation = admission.scope.generation();
-        let mirror = prepared.mirror_history();
+        let mirror = prepared.mirror();
         let record = TaskRecord {
             payload: JobPayload::Agent,
             owner: JobOwner::Main,

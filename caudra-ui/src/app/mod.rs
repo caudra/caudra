@@ -188,7 +188,7 @@ use caudra_agent::types::{
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
     McpConfigErrors, McpSnapshotReader, Mention, PromptAdmission, QueueItemId, SharedHistory,
-    SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
+    SteeringQueue, SubagentHistoryStore, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::providers::ProvidersConfig;
@@ -768,6 +768,9 @@ pub struct App {
     decisions_slot: Arc<ArcSwapOption<DecisionsFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
+    /// Every finished task's transcript, which a `/btw` over a task reads once
+    /// the task is no longer open.
+    pub(crate) subagent_history: Option<SubagentHistoryStore>,
     /// The `/btw` thread behind the stream modal, alive exactly as long as it
     /// is; `/extract` shares the modal and never has one.
     pub(super) btw_thread: Option<btw::BtwThread>,
@@ -1085,6 +1088,7 @@ impl App {
             decisions_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_prompt: None,
+            subagent_history: None,
             btw_thread: None,
             context_store: None,
             effective_model_slot: None,

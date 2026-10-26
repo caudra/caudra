@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use caudra_agent::CancelToken;
+use caudra_agent::context::ContextKey;
 use caudra_providers::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     TokenUsage, project_messages,
@@ -12,6 +13,7 @@ use flume::Sender;
 use futures_lite::future;
 
 use crate::agent::BtwPrompt;
+use crate::chat::Chat;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::stream_modal::{
     QUESTION_PREFIX, StreamDone, StreamEvent, StreamFooter, StreamUsage,
@@ -21,8 +23,9 @@ use crate::components::{DisplayMessage, DisplayRole};
 use super::{App, HISTORY_UNREADABLE};
 
 const TITLE: &str = " /btw ";
-pub(super) const CLARIFICATION_MAIN_ONLY: &str = "Ask /btw is available for main-session questions only; task question context is not supported yet";
 const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
+pub(super) const TASK_HISTORY_UNAVAILABLE: &str =
+    "This task's conversation is not loaded, so /btw cannot read it";
 const CLARIFICATION_REMINDER: &str = "The user is clarifying a pending question form, not answering it. \
 The asking agent is still waiting. Explain the question or choices; do not select, submit, or change \
 answers. The following is the question currently being viewed, not a user decision:";
@@ -132,6 +135,9 @@ fn refuse_tool_calls(message: &Message) -> Message {
 /// Nothing here is persisted; it lives exactly as long as the modal.
 pub(crate) struct BtwThread {
     prompt: Arc<BtwPrompt>,
+    cache_key: Option<CacheKey>,
+    /// The task whose conversation this forks, `None` for the main one.
+    task: Option<String>,
     base: Vec<Message>,
     exchanges: Vec<(String, String)>,
     pending: Option<String>,
@@ -156,6 +162,8 @@ impl BtwThread {
         };
         Self {
             prompt,
+            cache_key: None,
+            task: None,
             base,
             exchanges: Vec::new(),
             pending: None,
@@ -190,6 +198,18 @@ impl BtwThread {
     #[cfg(test)]
     pub(super) fn pending(&self) -> Option<&str> {
         self.pending.as_deref()
+    }
+
+    /// The text of every message the thread opened over.
+    #[cfg(test)]
+    pub(super) fn base_texts(&self) -> Vec<String> {
+        self.base.iter().filter_map(answer_text).collect()
+    }
+
+    /// The model the thread asks and the cache it reads.
+    #[cfg(test)]
+    pub(super) fn route(&self) -> (String, Option<&CacheKey>) {
+        (self.prompt.model.spec(), self.cache_key.as_ref())
     }
 
     /// Files the pending question with its answer. No answer, which is what a
@@ -234,16 +254,9 @@ impl App {
         if !self.question_form.is_open() {
             return;
         }
-        let task_question =
-            self.question_subagent.is_some() || self.task_interactions.question.is_some();
-        if self.question_form.deferred_task().is_none() && task_question {
-            self.flash(CLARIFICATION_MAIN_ONLY.into());
-            return;
-        }
-        if !self
-            .btw_prompt
-            .as_ref()
-            .is_some_and(|prompt| !prompt.load().system.is_empty())
+        if self
+            .btw_prompt_for(self.question_asker().as_deref())
+            .is_none()
         {
             self.flash(PROMPT_INITIALIZING.into());
             return;
@@ -272,44 +285,113 @@ impl App {
         self.end_btw_thread();
     }
 
-    fn capture_btw_thread(&mut self) -> Option<BtwThread> {
-        let items = self
-            .shared_history
+    /// The task whose question the form shows, `None` for the main agent's.
+    fn question_asker(&self) -> Option<String> {
+        if self.question_form.deferred_task().is_some() {
+            return None;
+        }
+        self.question_subagent.clone().or_else(|| {
+            self.task_interactions
+                .question
+                .as_ref()
+                .map(|origin| origin.task_id.clone())
+        })
+    }
+
+    /// The prefix a side question over `task` sends, and the cache it reads.
+    /// A task this process ran continues its own prefix. One restored from an
+    /// earlier process has none, so it borrows the main session's.
+    fn btw_prompt_for(&self, task: Option<&str>) -> Option<(Arc<BtwPrompt>, Option<CacheKey>)> {
+        if let Some(prefix) = task.and_then(|task| {
+            self.context_store
+                .as_ref()?
+                .request_prefix(&ContextKey::task(task))
+        }) {
+            return Some((
+                Arc::new(BtwPrompt::from(prefix.as_ref())),
+                prefix.cache_key.clone(),
+            ));
+        }
+        let prompt = self.btw_prompt.as_ref()?.load_full();
+        (!prompt.system.is_empty()).then(|| {
+            let key = CacheKey::session(&SessionRef::from(self.state.session.id));
+            (prompt, Some(key))
+        })
+    }
+
+    /// The conversation a side question over `task` reads: an open task's as
+    /// it commits, then a finished one's as it was kept.
+    fn btw_history(&self, task: Option<&str>) -> Result<Vec<Message>, String> {
+        let unreadable = |error| format!("{HISTORY_UNREADABLE}{error}");
+        let Some(task) = task else {
+            let items = self
+                .shared_history
+                .as_ref()
+                .map(|h| Vec::clone(&h.load().messages))
+                .unwrap_or_default();
+            return project_messages(&items).map_err(unreadable);
+        };
+        if let Some(mirror) = self
+            .context_store
             .as_ref()
-            .map(|h| Vec::clone(&h.load().messages))
-            .unwrap_or_default();
-        let messages = match project_messages(&items) {
+            .and_then(|store| store.live_history(&ContextKey::task(task)))
+        {
+            return project_messages(&mirror.load().messages).map_err(unreadable);
+        }
+        self.subagent_history
+            .as_ref()
+            .and_then(|store| {
+                let snapshot = store.snapshot();
+                snapshot
+                    .records()
+                    .get(task)
+                    .map(|record| Vec::clone(record.messages()))
+            })
+            .ok_or_else(|| TASK_HISTORY_UNAVAILABLE.to_owned())
+    }
+
+    fn capture_btw_thread(&mut self, task: Option<String>) -> Option<BtwThread> {
+        let messages = match self.btw_history(task.as_deref()) {
             Ok(messages) => messages,
             Err(error) => {
-                self.status_bar
-                    .flash(format!("{HISTORY_UNREADABLE}{error}"));
+                self.status_bar.flash(error);
                 return None;
             }
         };
-        let Some(prompt) = self
-            .btw_prompt
-            .as_ref()
-            .map(|p| p.load_full())
-            .filter(|p| !p.system.is_empty())
-        else {
+        let Some((prompt, cache_key)) = self.btw_prompt_for(task.as_deref()) else {
             self.status_bar.flash(PROMPT_INITIALIZING.into());
             return None;
         };
-        Some(BtwThread::new(prompt, messages))
+        let mut thread = BtwThread::new(prompt, messages);
+        thread.cache_key = cache_key;
+        thread.task = task;
+        Some(thread)
+    }
+
+    /// The transcript of the conversation `task` names, while it is open.
+    fn btw_chat(&mut self, task: Option<&str>) -> Option<&mut Chat> {
+        let index = match task {
+            None => 0,
+            Some(task) => self.chat_for_task(task)?,
+        };
+        self.chats.get_mut(index)
     }
 
     fn install_btw_thread(&mut self, thread: BtwThread) {
-        self.btw_thread = Some(thread);
         // Streaming text is not in history yet and draws below every message,
         // so a marker appended now lands exactly where the snapshot cuts.
-        self.main_chat().push(DisplayMessage::new(
-            DisplayRole::Notice,
-            BTW_CUTOFF_MARKER.into(),
-        ));
+        if let Some(chat) = self.btw_chat(thread.task.as_deref()) {
+            chat.push(DisplayMessage::new(
+                DisplayRole::Notice,
+                BTW_CUTOFF_MARKER.into(),
+            ));
+        }
+        self.btw_thread = Some(thread);
     }
 
     pub(crate) fn start_btw(&mut self, question: String) {
-        let Some(thread) = self.capture_btw_thread() else {
+        let task = self.active_subagent_id().map(str::to_owned);
+        let Some(thread) = self.capture_btw_thread(task) else {
             return;
         };
         self.open_btw(thread, format!("{QUESTION_PREFIX}{question}"), question);
@@ -318,7 +400,8 @@ impl App {
     /// A `/btw` with a canned question, headed by a short label rather than
     /// the prompt, so copying the thread does not repeat the whole prompt.
     pub(crate) fn start_catchup(&mut self, focus: &str) {
-        let Some(thread) = self.capture_btw_thread() else {
+        let task = self.active_subagent_id().map(str::to_owned);
+        let Some(thread) = self.capture_btw_thread(task) else {
             return;
         };
         if !thread
@@ -362,7 +445,7 @@ impl App {
             .is_clarification()
             .then(|| self.question_form.clarification_context());
         if context.is_some() && self.btw_thread.is_none() {
-            let Some(thread) = self.capture_btw_thread() else {
+            let Some(thread) = self.capture_btw_thread(self.question_asker()) else {
                 self.stream_modal.handle_paste(&question);
                 return;
             };
@@ -388,13 +471,12 @@ impl App {
         let Some(thread) = &self.btw_thread else {
             return;
         };
-        // A btw forks the main conversation, so it shares its cache key on purpose.
-        let cache_key = CacheKey::session(&SessionRef::from(self.state.session.id));
+        // A btw forks a conversation, so it shares that conversation's cache key on purpose.
         smol::spawn(run_btw(
             Arc::clone(&thread.prompt),
             thread.request_messages(),
             tx,
-            Some(cache_key),
+            thread.cache_key.clone(),
             cancel,
         ))
         .detach();
@@ -410,8 +492,10 @@ impl App {
     /// way the modal closes reaches here through the tick, so no close path
     /// has to know about the marker.
     pub(crate) fn end_btw_thread(&mut self) {
-        if self.btw_thread.take().is_some() {
-            self.main_chat().remove_notice(BTW_CUTOFF_MARKER);
+        if let Some(thread) = self.btw_thread.take()
+            && let Some(chat) = self.btw_chat(thread.task.as_deref())
+        {
+            chat.remove_notice(BTW_CUTOFF_MARKER);
         }
     }
 }

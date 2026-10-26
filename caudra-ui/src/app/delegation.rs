@@ -151,7 +151,7 @@ impl App {
         })
     }
 
-    fn chat_for_task(&self, task_id: &str) -> Option<usize> {
+    pub(super) fn chat_for_task(&self, task_id: &str) -> Option<usize> {
         self.chats
             .iter()
             .position(|chat| chat.task_id().is_some_and(|id| &**id == task_id))

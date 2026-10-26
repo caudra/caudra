@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::automation::workflows::Workflows;
 use caudra_agent::background::{BackgroundTasks, BackgroundTransition};
-use caudra_agent::context::{ContextKey, ContextStore};
+use caudra_agent::context::{ContextKey, ContextStore, RequestPrefix};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
@@ -206,6 +206,19 @@ impl BtwPrompt {
         match (self.profile.as_deref(), current) {
             (Some(bound), Some(current)) => !bound.same_prompt(current),
             (bound, current) => bound.is_some() != current.is_some(),
+        }
+    }
+}
+
+impl From<&RequestPrefix> for BtwPrompt {
+    fn from(prefix: &RequestPrefix) -> Self {
+        Self {
+            provider: Arc::clone(&prefix.provider),
+            model: prefix.model.clone(),
+            system: prefix.system.clone(),
+            tools: prefix.tools.clone(),
+            opts: prefix.opts.clone(),
+            profile: None,
         }
     }
 }
@@ -503,6 +516,7 @@ impl AgentHandles {
         app.shared_history = Some(Arc::clone(&self.history));
         app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
+        app.subagent_history = Some(self.subagent_history.clone());
         app.learner = Some(Arc::clone(&self.learner));
         app.context_store = Some(self.context_store.clone());
         app.tools_preview_source = Some(Arc::clone(&self.tools_preview_source));

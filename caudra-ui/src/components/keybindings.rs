@@ -1237,7 +1237,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::QUESTION_ASK_BTW.label),
-        description: "Ask /btw about a pending main-agent question without answering it",
+        description: "Ask /btw about a pending question without answering it",
         context: KeybindContext::FormInput,
     },
     Keybind {

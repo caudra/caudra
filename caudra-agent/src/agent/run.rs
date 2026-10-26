@@ -62,7 +62,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::code::CodeSession;
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
-    ContextSnapshot, estimate_context_usage, estimate_unscaled_request,
+    ContextSnapshot, RequestPrefix, estimate_context_usage, estimate_unscaled_request,
 };
 use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
@@ -2351,6 +2351,26 @@ impl<'h> Agent<'h> {
         }));
     }
 
+    /// A task's prefix, as the request about to go out binds it, for a side
+    /// question over that task. The main session's is published by its host.
+    fn publish_request_prefix(&self) {
+        let Some(publisher) = self
+            .context_publisher
+            .as_ref()
+            .filter(|_| !self.is_main_session())
+        else {
+            return;
+        };
+        publisher.publish_prefix(RequestPrefix {
+            provider: Arc::clone(&self.provider),
+            model: Model::clone(&self.model),
+            system: self.system.clone(),
+            tools: self.tools.clone(),
+            opts: self.opts.clone(),
+            cache_key: self.cache_key.clone(),
+        });
+    }
+
     fn publish_prepared_context(&self) {
         if self.context_publisher.is_none() {
             return;
@@ -2429,6 +2449,7 @@ impl<'h> Agent<'h> {
                 ContextReadiness::CapturedCurrentRequest,
                 provider_history.as_ref(),
             );
+            self.publish_request_prefix();
             let sent = SentRequest {
                 estimated: estimate_unscaled_request(
                     &self.model,
@@ -6311,6 +6332,7 @@ mod tests {
     const PUBLISHED_CONTEXT_WINDOW: u32 = 123_456;
     const CAPTURED_CONTEXT_MISSING: &str = "current request must publish before provider dispatch";
     const PREPARED_CONTEXT_MISSING: &str = "completed turn must publish its next request";
+    const PREFIX_TASK: &str = "prefix-task";
     const BLOCKING_TOOL_NAME: &str = "blocking_context_tool";
     const BLOCKING_TOOL_RESULT: &str = "The blocking tool completed and returned this deliberately long result so the actual tool-result snapshot is distinguishable from the temporary unavailable-result projection used while execution is pending.";
     const BLOCKING_TOOL_CONTEXT_MISSING: &str =
@@ -7808,6 +7830,35 @@ mod tests {
             assert_eq!(captured.window.tokens, PUBLISHED_CONTEXT_WINDOW);
             assert_eq!(prepared.window.tokens, PUBLISHED_CONTEXT_WINDOW);
             assert!(prepared.usage.messages > captured.usage.messages);
+        });
+    }
+
+    #[test_case(|_| {}, None ; "main_run")]
+    #[test_case(|a| a.root_tool_use_id = Some(PREFIX_TASK.into()), Some(PREFIX_TASK) ; "subagent_run")]
+    fn only_a_task_run_publishes_its_request_prefix(
+        adjust: fn(&mut Agent<'_>),
+        published: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let key = ContextKey::task(PREFIX_TASK);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.context_publisher = Some(store.publisher(key.clone()));
+            agent.cache_key = Some(CacheKey::task(None, PREFIX_TASK));
+            adjust(&mut agent);
+
+            agent.run(default_input()).await.unwrap();
+
+            let prefix = store.request_prefix(&key);
+            assert_eq!(
+                prefix.as_ref().and_then(|prefix| prefix.cache_key.clone()),
+                published.map(|task| CacheKey::task(None, task))
+            );
+            assert!(prefix.is_none_or(|prefix| prefix.system == agent.system));
         });
     }
 

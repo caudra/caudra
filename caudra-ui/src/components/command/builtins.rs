@@ -635,14 +635,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         "/btw",
         "Ask a side question, with follow-ups (no tools, nothing enters history)",
         Node::args(&[Arg::text("question", "Your side question", None).required()]),
-    )
-    .main_only(),
+    ),
     BuiltinCommand::new(
         "/catchup",
-        "Bring yourself back up to speed on this session (a /btw, nothing enters history)",
+        "Bring yourself back up to speed on this session or the focused task (a /btw, nothing enters history)",
         Node::args(&[Arg::text("focus", "What to narrow the summary to", None)]),
-    )
-    .main_only(),
+    ),
     BuiltinCommand::new(
         "/extract",
         "List the requirements the session has gathered so far (Extract model, copyable, no history pollution)",

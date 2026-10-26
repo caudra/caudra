@@ -54,7 +54,7 @@ use caudra_agent::command::CustomCommand;
 use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::context::{
     ContextBuiltinState, ContextInventory, ContextModel, ContextReadiness, ContextReserve,
-    ContextUsage, ContextWindow,
+    ContextUsage, ContextWindow, RequestPrefix,
 };
 use caudra_agent::decisions::Decisions;
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
@@ -6433,7 +6433,6 @@ fn task_composer_executes_an_allowed_command() {
 #[test_case("/continue" ; "resume")]
 #[test_case("/model" ; "model")]
 #[test_case("/goal" ; "goal")]
-#[test_case("/btw" ; "btw")]
 fn task_composer_blocks_a_main_only_command(command: &str) {
     let (mut app, steer_tx) = focused_task_composer();
 
@@ -19794,6 +19793,149 @@ fn catchup_on_an_empty_conversation_flashes_instead_of_asking() {
     assert_eq!(app.status_bar.flash_text().unwrap(), NOTHING_TO_CATCH_UP);
 }
 
+const TASK_BTW_REQUEST: &str = "audit the migration";
+const TASK_BTW_MODEL: &str = "openai/gpt-5.4";
+const TASK_BTW_SYSTEM: &str = "task system";
+
+/// Where a task's conversation is when `/btw` asks about it.
+#[derive(Clone, Copy, Debug)]
+enum TaskSource {
+    /// The task is open, and its transcript is listed as it commits.
+    Live,
+    /// The task finished, and the store kept its transcript.
+    Finished,
+    Missing,
+}
+
+fn task_transcript() -> Vec<Message> {
+    vec![Message::user(TASK_BTW_REQUEST.into())]
+}
+
+/// Readies `app` for a `/btw` over [`TASK_ID`]: its conversation where
+/// `source` puts it, and its own prefix when `prefixed`. The returned guard
+/// keeps a live transcript listed.
+fn task_btw_source(
+    app: &mut App,
+    source: TaskSource,
+    prefixed: bool,
+) -> Option<caudra_agent::context::LiveHistory> {
+    let store = ContextStore::new();
+    let publisher = store.publisher(ContextKey::task(TASK_ID));
+    app.context_store = Some(store);
+    if prefixed {
+        publisher.publish_prefix(RequestPrefix {
+            provider: Arc::new(PendingProvider),
+            model: caudra_providers::Model::from_spec(TASK_BTW_MODEL).unwrap(),
+            system: TASK_BTW_SYSTEM.into(),
+            tools: serde_json::json!([]),
+            opts: RequestOptions::default(),
+            cache_key: Some(CacheKey::task(None, TASK_ID)),
+        });
+    }
+    match source {
+        TaskSource::Live => Some(publisher.track_history(Arc::new(ArcSwap::from_pointee(
+            HistorySnapshot::new(crate::history_items(&task_transcript())),
+        )))),
+        TaskSource::Finished => {
+            app.subagent_history = Some(SubagentHistoryStore::seeded(HashMap::from([(
+                TASK_ID.to_owned(),
+                Arc::new(task_transcript()),
+            )])));
+            None
+        }
+        TaskSource::Missing => None,
+    }
+}
+
+/// A task chat focused over a main session `/btw` could already ask about.
+fn focused_task_btw_app() -> App {
+    let (mut app, _steer_tx) = focused_task_composer();
+    let ready = btw_ready_app();
+    app.shared_history = ready.shared_history;
+    app.btw_prompt = ready.btw_prompt;
+    app
+}
+
+/// Types `line` into the focused composer and starts the side question it
+/// asks, as the event loop does.
+fn ask_aside(app: &mut App, line: &str) {
+    match &type_and_submit(app, line)[..] {
+        [Action::Btw(question)] => app.start_btw(question.clone()),
+        [Action::Catchup(focus)] => app.start_catchup(focus),
+        actions => panic!("{line} asked no side question: {} actions", actions.len()),
+    }
+}
+
+fn chat_notices(app: &App, index: usize) -> Vec<String> {
+    let chat = &app.chats[index];
+    (0..chat.message_count())
+        .filter_map(|i| chat.message_at(i))
+        .filter(|m| m.role == DisplayRole::Notice)
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+#[test_case(TaskSource::Live, true ; "open_task_continues_its_own_prefix")]
+#[test_case(TaskSource::Live, false ; "open_task_without_a_prefix_borrows_mains")]
+#[test_case(TaskSource::Finished, true ; "finished_task_reads_the_kept_transcript")]
+#[test_case(TaskSource::Finished, false ; "restored_task_borrows_mains_prefix")]
+fn btw_in_a_task_chat_reads_that_tasks_conversation(source: TaskSource, prefixed: bool) {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, source, prefixed);
+    let main_key = CacheKey::session(&SessionRef::from(app.state.session.id));
+    let task_key = CacheKey::task(None, TASK_ID);
+    let (model, cache) = if prefixed {
+        (TASK_BTW_MODEL.to_owned(), &task_key)
+    } else {
+        (test_model().spec(), &main_key)
+    };
+
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+
+    assert!(app.stream_modal.is_open());
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
+    assert_eq!(thread.route(), (model, Some(cache)));
+    assert_eq!(chat_notices(&app, 1), [super::btw::BTW_CUTOFF_MARKER]);
+    assert!(chat_notices(&app, 0).is_empty(), "main keeps no marker");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    assert!(app.btw_thread.is_none());
+    assert!(
+        chat_notices(&app, 1).is_empty(),
+        "the task's marker is gone"
+    );
+}
+
+#[test]
+fn btw_over_a_task_with_no_transcript_flashes_instead_of_asking() {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, TaskSource::Missing, true);
+
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.btw_thread.is_none());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::TASK_HISTORY_UNAVAILABLE)
+    );
+}
+
+#[test]
+fn catchup_in_a_task_chat_summarizes_that_task() {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, TaskSource::Live, false);
+
+    ask_aside(&mut app, "/catchup");
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
+    assert_eq!(thread.pending(), Some(CATCHUP_PROMPT));
+}
+
 const BTW_QUESTION: &str = "why sqlite?";
 const BTW_HEADER: &str = "Q: why sqlite?";
 const BTW_FOLLOW_UP: &str = "and postgres?";
@@ -20124,8 +20266,9 @@ fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
 
 #[test_case(false; "subagent_question")]
 #[test_case(true; "task_provenance_without_subagent")]
-fn question_btw_rejects_non_main_questions_without_changing_the_form(task: bool) {
+fn question_btw_reads_the_asking_tasks_conversation(task: bool) {
     let (mut app, answers) = question_btw_app();
+    let _live = task_btw_source(&mut app, TaskSource::Live, true);
     if task {
         app.task_interactions.question = Some(Arc::new(TaskProvenance {
             session_id: app.state.session.id,
@@ -20136,17 +20279,21 @@ fn question_btw_rejects_non_main_questions_without_changing_the_form(task: bool)
         app.question_subagent = Some(TASK_ID.into());
     }
     let before = rendered_question(&mut app);
-    assert!(
-        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
-            .is_empty()
-    );
 
+    question_btw_streaming(&mut app);
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
     assert_eq!(
-        app.status_bar.flash_text(),
-        Some(super::btw::CLARIFICATION_MAIN_ONLY)
+        thread.route(),
+        (
+            TASK_BTW_MODEL.to_owned(),
+            Some(&CacheKey::task(None, TASK_ID))
+        )
     );
-    assert!(!app.stream_modal.is_open());
-    assert!(app.btw_thread.is_none());
+    assert!(thread.pending().unwrap().ends_with(BTW_QUESTION));
+    assert!(chat_notices(&app, 0).is_empty(), "main keeps no marker");
+    app.update(Msg::Key(key(KeyCode::Esc)));
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(app.status, Status::Streaming);

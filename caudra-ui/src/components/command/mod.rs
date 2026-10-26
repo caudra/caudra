@@ -1903,6 +1903,12 @@ mod tests {
         assert_eq!(main != task, expected_dimmed);
     }
 
+    #[test_case("/btw" ; "btw")]
+    #[test_case("/catchup" ; "catchup")]
+    fn side_questions_run_in_a_task_chat(command: &str) {
+        assert!(!palette_for_scope(true).is_main_only(command, ""));
+    }
+
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
         let mut p = CommandPalette::new(
             custom,

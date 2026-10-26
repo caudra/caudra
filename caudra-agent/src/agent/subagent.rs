@@ -7,7 +7,6 @@
 //! both paths use the Subagent model purpose unless explicitly overridden.
 
 use std::env;
-use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,6 +42,7 @@ use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot, CancelToken};
 use crate::code::CodeSession;
 use crate::code::output::snippet_summary;
+use crate::context::LiveHistory;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionFeature, DecisionReceipt, DecisionState, Decisions, NoteDraft, NoteOutcome,
@@ -479,6 +479,10 @@ pub struct Subagent {
     /// Its own, so its `code` variables never mix with its parent's.
     code: CodeSession,
     history: History,
+    /// Holds every message `history` commits, as it commits it.
+    mirror: SharedHistory,
+    /// Lists `mirror` for a side question over this task while it is open.
+    live_history: Option<LiveHistory>,
     history_lease: Option<SubagentHistoryLease>,
     sub_event_tx: EventSender,
     child_cancel: crate::cancel::CancelToken,
@@ -512,6 +516,7 @@ impl Subagent {
         self.closed = true;
         self.parent_cancels.retire(&self.task_id, self.cancel_slot);
         self.history_lease.take();
+        self.live_history.take();
     }
 
     pub(crate) fn checkpoint(&self) -> Result<(JsonValue, JsonValue), String> {
@@ -522,12 +527,10 @@ impl Subagent {
         Ok((history, spec))
     }
 
-    /// Publishes the transcript as each message commits, for a saver that
-    /// keeps it while the task runs.
-    pub(crate) fn mirror_history(&mut self) -> SharedHistory {
-        let mirror = SharedHistory::default();
-        self.history = mem::take(&mut self.history).with_mirror(Arc::clone(&mirror));
-        mirror
+    /// The transcript as each message commits, for a saver that keeps it
+    /// while the task runs.
+    pub(crate) fn mirror(&self) -> SharedHistory {
+        Arc::clone(&self.mirror)
     }
 
     pub(crate) fn report_ready(&self) -> bool {
@@ -557,6 +560,7 @@ impl Subagent {
         if let Some(lease) = self.history_lease.take() {
             lease.complete_version(Arc::new(messages.clone()), self.parent_tool_use_id.clone());
         }
+        self.live_history.take();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             task_id: self.task_id.clone(),
             parent_tool_use_id: self.parent_tool_use_id.clone(),
@@ -1891,7 +1895,10 @@ fn build(
         .history_lease
         .history()
         .map_or_else(Vec::new, |messages| expand_history(messages));
-    let history = History::restored(history_items).map_err(|error| error.to_string())?;
+    let mirror = SharedHistory::default();
+    let history = History::restored(history_items)
+        .map_err(|error| error.to_string())?
+        .with_mirror(Arc::clone(&mirror));
 
     // Register a cancel trigger so the child token does not fire on drop and
     // kill the subagent at birth.
@@ -1908,6 +1915,9 @@ fn build(
         .context_publisher
         .as_ref()
         .map(|publisher| publisher.for_task(resolved.task_id.clone()));
+    let live_history = context_publisher
+        .as_ref()
+        .map(|publisher| publisher.track_history(Arc::clone(&mirror)));
 
     Ok(Subagent {
         steering: Arc::new(Mutex::new(Steering::new(
@@ -1984,6 +1994,8 @@ fn build(
             }),
         code: CodeSession::new(history.as_slice()),
         history,
+        mirror,
+        live_history,
         history_lease: Some(resolved.history_lease),
         sub_event_tx,
         child_cancel,
@@ -2604,6 +2616,7 @@ mod tests {
     const HOSTED_TOOL: &str = "execution_environment";
     const MAIN_ONLY_TOOL: &str = "main_only_mock";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
+    const LIVE_HISTORY_MISSING: &str = "an open subagent must list its live history";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
     /// Spelt out rather than read back off the activity, so a rename in
@@ -3175,6 +3188,30 @@ mod tests {
             assert!(store.latest(&ContextKey::task(PARENT_ID)).is_none());
             assert!(store.latest(&ContextKey::Main).is_none());
             subagent.close();
+        });
+    }
+
+    #[test]
+    fn an_open_subagent_lists_its_history_until_the_store_holds_it() {
+        smol::block_on(async {
+            let store = ContextStore::new();
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+            ctx.context_publisher = Some(store.publisher(ContextKey::Main));
+            let mut subagent = open_generic(&ctx, generic_options()).await.unwrap();
+            let key = ContextKey::task(subagent.id());
+
+            let listed = store.live_history(&key).expect(LIVE_HISTORY_MISSING);
+            assert!(Arc::ptr_eq(&listed, &subagent.mirror()));
+            subagent.close();
+
+            assert!(store.live_history(&key).is_none());
+            assert!(
+                ctx.subagent_history
+                    .snapshot()
+                    .records()
+                    .contains_key(subagent.id())
+            );
         });
     }
 

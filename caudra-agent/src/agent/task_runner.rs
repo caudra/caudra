@@ -313,8 +313,8 @@ impl PreparedTask {
         self.session.0.checkpoint()
     }
 
-    pub(crate) fn mirror_history(&mut self) -> SharedHistory {
-        self.session.0.mirror_history()
+    pub(crate) fn mirror(&self) -> SharedHistory {
+        self.session.0.mirror()
     }
 
     pub(crate) fn discard(mut self) {

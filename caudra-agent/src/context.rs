@@ -1,17 +1,17 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use caudra_config::{AgentConfig, CompactionBuffer, ProfileToolPolicy};
 use caudra_providers::calibration;
+use caudra_providers::provider::Provider;
 use caudra_providers::{
-    ContentBlock, Message, Model, Role, TokenScale, adapt_attachments_for_model,
-    estimate_tokens_cached,
+    CacheKey, ContentBlock, Message, Model, RequestOptions, Role, TokenScale,
+    adapt_attachments_for_model, estimate_tokens_cached,
 };
 use serde_json::Value;
 
-use crate::AgentMode;
 use crate::agent::{compaction_reserve, estimate_message_tokens};
 use crate::code::hosted::hosted_module;
 use crate::mcp::{McpSession, McpToolStatus};
@@ -22,6 +22,7 @@ use crate::tools::{
     CODE_TOOL_NAME, DescriptionContext, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
     ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
 };
+use crate::{AgentMode, SharedHistory};
 
 const MEMORY_READ_COMMAND: &str = "read";
 const BILLED_TO_PROFILES: &str = "profiles";
@@ -42,9 +43,32 @@ impl ContextKey {
     }
 }
 
+/// What a task's last request sent ahead of its messages, so a side question
+/// over that task continues the same cached prefix.
+pub struct RequestPrefix {
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+    pub system: String,
+    pub tools: Value,
+    pub opts: RequestOptions,
+    pub cache_key: Option<CacheKey>,
+}
+
+type Keyed<T> = Arc<RwLock<HashMap<ContextKey, T>>>;
+
+fn read<T>(map: &RwLock<HashMap<ContextKey, T>>) -> RwLockReadGuard<'_, HashMap<ContextKey, T>> {
+    map.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write<T>(map: &RwLock<HashMap<ContextKey, T>>) -> RwLockWriteGuard<'_, HashMap<ContextKey, T>> {
+    map.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Clone, Default)]
 pub struct ContextStore {
-    snapshots: Arc<RwLock<HashMap<ContextKey, Arc<ContextSnapshot>>>>,
+    snapshots: Keyed<Arc<ContextSnapshot>>,
+    prefixes: Keyed<Arc<RequestPrefix>>,
+    live_histories: Keyed<SharedHistory>,
 }
 
 impl ContextStore {
@@ -60,11 +84,17 @@ impl ContextStore {
     }
 
     pub fn latest(&self, key: &ContextKey) -> Option<Arc<ContextSnapshot>> {
-        self.snapshots
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(key)
-            .cloned()
+        read(&self.snapshots).get(key).cloned()
+    }
+
+    /// Kept after the task ends, so a finished task's prefix is still warm.
+    pub fn request_prefix(&self, key: &ContextKey) -> Option<Arc<RequestPrefix>> {
+        read(&self.prefixes).get(key).cloned()
+    }
+
+    /// The transcript of a task that is open right now.
+    pub fn live_history(&self, key: &ContextKey) -> Option<SharedHistory> {
+        read(&self.live_histories).get(key).cloned()
     }
 }
 
@@ -80,11 +110,41 @@ impl ContextPublisher {
     }
 
     pub fn publish(&self, snapshot: ContextSnapshot) {
-        self.store
-            .snapshots
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(self.key.clone(), Arc::new(snapshot));
+        write(&self.store.snapshots).insert(self.key.clone(), Arc::new(snapshot));
+    }
+
+    pub fn publish_prefix(&self, prefix: RequestPrefix) {
+        write(&self.store.prefixes).insert(self.key.clone(), Arc::new(prefix));
+    }
+
+    /// Lists `mirror` under this key until the guard drops.
+    pub fn track_history(&self, mirror: SharedHistory) -> LiveHistory {
+        write(&self.store.live_histories).insert(self.key.clone(), Arc::clone(&mirror));
+        LiveHistory {
+            store: self.store.clone(),
+            key: self.key.clone(),
+            mirror,
+        }
+    }
+}
+
+/// Unlists its mirror on drop, unless a newer run of the same task listed its
+/// own in the meantime.
+pub struct LiveHistory {
+    store: ContextStore,
+    key: ContextKey,
+    mirror: SharedHistory,
+}
+
+impl Drop for LiveHistory {
+    fn drop(&mut self) {
+        let mut histories = write(&self.store.live_histories);
+        if histories
+            .get(&self.key)
+            .is_some_and(|listed| Arc::ptr_eq(listed, &self.mirror))
+        {
+            histories.remove(&self.key);
+        }
     }
 }
 
@@ -2302,5 +2362,50 @@ mod tests {
             "thread/b"
         );
         assert!(store.latest(&ContextKey::Main).is_none());
+    }
+
+    fn prefix(system: &str) -> RequestPrefix {
+        RequestPrefix {
+            provider: Arc::new(crate::tools::NullProvider),
+            model: model(TEST_WINDOW, false),
+            system: system.into(),
+            tools: json!([]),
+            opts: RequestOptions::default(),
+            cache_key: Some(CacheKey::task(None, TASK_A)),
+        }
+    }
+
+    #[test]
+    fn a_task_prefix_is_kept_under_its_own_key() {
+        let store = ContextStore::default();
+        store
+            .publisher(ContextKey::Main)
+            .for_task(TASK_A)
+            .publish_prefix(prefix(SYSTEM_TEXT));
+
+        let published = store.request_prefix(&ContextKey::task(TASK_A)).unwrap();
+        assert_eq!(published.system, SYSTEM_TEXT);
+        assert_eq!(published.cache_key, Some(CacheKey::task(None, TASK_A)));
+        assert!(store.request_prefix(&ContextKey::Main).is_none());
+        assert!(store.request_prefix(&ContextKey::task(TASK_B)).is_none());
+    }
+
+    #[test_case(false ; "dropping_unlists_the_mirror")]
+    #[test_case(true ; "a_newer_run_keeps_its_own_listing")]
+    fn a_live_history_is_listed_while_its_guard_lives(relisted: bool) {
+        let store = ContextStore::default();
+        let publisher = store.publisher(ContextKey::task(TASK_A));
+        let first = SharedHistory::default();
+        let guard = publisher.track_history(Arc::clone(&first));
+        let listed = store.live_history(&ContextKey::task(TASK_A)).unwrap();
+        assert!(Arc::ptr_eq(&listed, &first));
+
+        let newer = SharedHistory::default();
+        let _newer_guard = relisted.then(|| publisher.track_history(Arc::clone(&newer)));
+        drop(guard);
+
+        let remaining = store.live_history(&ContextKey::task(TASK_A));
+        assert_eq!(remaining.is_some(), relisted);
+        assert!(remaining.is_none_or(|listed| Arc::ptr_eq(&listed, &newer)));
     }
 }
