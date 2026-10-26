@@ -278,6 +278,7 @@ Routing defaults: ministral-14b-latest (Fast), mistral-medium-latest (Best)
 |---------|--------|-------------------------------|---------|
 | Small | glm-5.3-flashx | $0.37 / $1.25 | 1000K ctx / 131K out |
 | Small | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
+| Small | glm-4.7-flashx | $0.07 / $0.40 | 200K ctx / 131K out |
 | Fast | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Small | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Small | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |

@@ -256,6 +256,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
+            prefixes: &["glm-4.7-flashx"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.07,
+                output: 0.40,
+                cache_write: 0.00,
+                cache_read: 0.01,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 200_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
             prefixes: &["glm-4.7-flash"],
             small: true,
             family: ModelFamily::Glm,
@@ -479,6 +497,7 @@ pub(crate) fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::lookup_entry;
     use test_case::test_case;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[
@@ -486,6 +505,27 @@ mod tests {
         {"type":"TOKENS_LIMIT","unit":6,"percentage":4,"nextResetTime":1778262784969},
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
+
+    #[test_case("glm-4.7-flashx", 0.07, 0.01, 0.40, false ; "paid_flashx")]
+    #[test_case("glm-4.7-flash", 0.00, 0.00, 0.00, true ; "free_flash")]
+    fn flashx_has_distinct_pricing(
+        id: &str,
+        input: f64,
+        cache_read: f64,
+        output: f64,
+        default: bool,
+    ) {
+        let entry = lookup_entry(models(), id).unwrap();
+        assert!(entry.prefixes.contains(&id));
+        assert_eq!(entry.pricing.input, input);
+        assert_eq!(entry.pricing.cache_read, cache_read);
+        assert_eq!(entry.pricing.output, output);
+        assert!(!entry.vision);
+        assert!(entry.small);
+        assert_eq!(entry.default, default);
+        assert_eq!(entry.context_window, 200_000);
+        assert_eq!(entry.max_output_tokens, Some(131072));
+    }
 
     #[test_case("zai/glm-5.3", true ; "glm_5_3_supports_thinking")]
     #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
