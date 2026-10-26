@@ -3263,6 +3263,16 @@ pub enum AgentEvent {
     QueueBatchConsumed {
         items: Vec<QueueConsumedItem>,
     },
+    /// The agent queued guidance on a running task's steering queue, which a
+    /// task chat shows as waiting until the task consumes it. With
+    /// `interrupt` it is the task's replacement and drops `superseded`.
+    TaskGuidanceQueued {
+        task_id: String,
+        id: crate::QueueItemId,
+        text: String,
+        interrupt: bool,
+        superseded: Option<crate::QueueItemId>,
+    },
     QueueDrained,
     Done {
         usage: TokenUsage,

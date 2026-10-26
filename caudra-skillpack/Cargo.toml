@@ -1,0 +1,24 @@
+[package]
+name = "caudra-skillpack"
+description = "Vendored skill packs served as the pages of one builtin skill: overlay loading, search, and the invariants every pack's tests check."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+checks = ["dep:regex", "dep:sha2"]
+
+[dependencies]
+caudra-docs = { workspace = true }
+include_dir = { workspace = true }
+regex = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

@@ -957,9 +957,11 @@ dependencies = [
  "caudra-config",
  "caudra-decision",
  "caudra-diff",
+ "caudra-mattpocock",
  "caudra-otel",
  "caudra-providers",
  "caudra-pstack",
+ "caudra-skillpack",
  "caudra-storage",
  "caudra-terminal-host",
  "caudra-workflow",
@@ -1246,6 +1248,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "caudra-mattpocock"
+version = "0.2.0-preview.14"
+dependencies = [
+ "caudra-skillpack",
+ "include_dir",
+ "regex",
+]
+
+[[package]]
 name = "caudra-otel"
 version = "0.2.0-preview.14"
 dependencies = [
@@ -1315,21 +1326,19 @@ name = "caudra-pstack"
 version = "0.2.0-preview.14"
 dependencies = [
  "caudra-automation",
- "caudra-docs",
  "caudra-script",
+ "caudra-skillpack",
  "include_dir",
  "jiff",
  "regex",
  "rhai",
  "serde",
  "serde_json",
- "sha2 0.11.1",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
  "tla-checker",
  "unicode-normalization",
- "yaml_serde",
 ]
 
 [[package]]
@@ -1365,6 +1374,20 @@ dependencies = [
  "sha2 0.11.1",
  "test-case",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "caudra-skillpack"
+version = "0.2.0-preview.14"
+dependencies = [
+ "caudra-docs",
+ "include_dir",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "test-case",
+ "yaml_serde",
 ]
 
 [[package]]

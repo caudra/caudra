@@ -5,8 +5,20 @@ use crate::{
     tools::{LocalToolFn, ToolEffect, ToolError, ToolFailure, typed_local_tool},
 };
 
+macro_rules! guidance_prefix {
+    () => {
+        "[Guidance from the agent that started this task]"
+    };
+}
+
 pub(crate) const NAME: &str = "report_to_parent";
-pub(crate) const CONTRACT: &str = "Work independently within the assigned scope. Use report_to_parent sparingly for an important finding, correction, or blocker. Give the report a short title for its compact card and put the full finding in message. Reports are one-way: no parent reply is expected. Continue useful independent work after reporting. If you cannot proceed without information or authority, use blocked: true to finish with the precise blocker and what is needed. Do not wait or poll for a reply. Reports do not replace the successful final result or its schema; blocked: true ends with a non-success outcome. Do not assume you received later main-conversation instructions.";
+/// Opens every message the parent agent steers into a running task.
+pub(crate) const GUIDANCE_PREFIX: &str = guidance_prefix!();
+pub(crate) const CONTRACT: &str = concat!(
+    "Work independently within the assigned scope. Use report_to_parent sparingly for an important finding, correction, or blocker. Give the report a short title for its compact card and put the full finding in message. Reports are one-way: no parent reply is expected. Continue useful independent work after reporting. If you cannot proceed without information or authority, use blocked: true to finish with the precise blocker and what is needed. Do not wait or poll for a reply. Reports do not replace the successful final result or its schema; blocked: true ends with a non-success outcome. The agent that started you may send guidance while you work. It arrives as a message beginning with ",
+    guidance_prefix!(),
+    ", and where it conflicts with your original prompt, the guidance wins. Never wait or poll for it, and it grants no authority beyond your mode and permissions."
+);
 const MAX_TITLE_CHARS: usize = 80;
 const INVALID_TITLE: &str = "title must be a nonempty single-line string of at most 80 characters without control characters";
 

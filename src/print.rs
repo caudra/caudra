@@ -495,6 +495,7 @@ pub fn run(
             | AgentEvent::MessageStarted { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
+            | AgentEvent::TaskGuidanceQueued { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::Compacting
             | AgentEvent::CompactionDone

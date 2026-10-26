@@ -4,7 +4,8 @@ use caudra_storage::background::{BackgroundCursor, JobOwner, MAX_HISTORY_PAGE};
 use serde_json::{Value, json};
 
 use crate::{
-    TaskCard, ToolOutput,
+    AgentEvent, TaskCard, ToolOutput,
+    background::{MAX_REQUEST_BYTES, guidance_text},
     tools::{
         DescriptionContext, ToolAudience, ToolContext,
         registry::{
@@ -17,31 +18,48 @@ use crate::{
 pub const DESCRIPTION: &str = "Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop.";
 const PROMOTION_GUIDANCE: &str =
     "The background action promotes a running foreground task without restarting it.";
+const GUIDE_GUIDANCE: &str = "The guide action sends a running agent task a message, such as updated requirements or a reply to its report, which it reads at its next step; interrupt stops its current turn and its jobs first. Guidance it never reads comes back with its result.";
 const PROMOTION_DENIED: &str = "task promotion requires a session that supports background tasks";
+const GUIDANCE_DENIED: &str = "guidance requires a session that runs agent tasks";
+const GUIDANCE_RECEIPT: &str = "Accepted, not yet read: the task reads it at its next step. Guidance it never reads comes back with its result.";
+const MESSAGE_REQUIRED: &str = "guide requires a nonempty message";
+const MESSAGE_TOO_LARGE: &str = "guidance message is too large";
+const GUIDE_FIELDS_REQUIRE_GUIDE: &str = "message and interrupt require guide";
+const INTERRUPT_NOT_BOOLEAN: &str = "interrupt must be a boolean";
+const GUIDE: &str = "guide";
+const REPLACE: &str = "replace";
+const GUIDANCE_QUEUED: &str = "queued";
+const GUIDANCE_REPLACING: &str = "replacing";
 /// The actions that only report on jobs, so their cards fold like any lookup's.
 const READ_ACTIONS: &[&str] = &["list", "status"];
 
 pub fn configure_execution(definition: &mut Value, promote: bool) {
     definition["description"] = if promote {
-        json!(format!("{DESCRIPTION} {PROMOTION_GUIDANCE}"))
+        json!(main_description())
     } else {
         json!(DESCRIPTION)
     };
     definition["input_schema"] = schema(promote);
 }
 
+fn main_description() -> String {
+    format!("{DESCRIPTION} {PROMOTION_GUIDANCE} {GUIDE_GUIDANCE}")
+}
+
 fn schema(promote: bool) -> Value {
-    let actions = if promote {
-        json!(["list", "status", "cancel", "background"])
-    } else {
-        json!(["list", "status", "cancel"])
-    };
-    json!({"type":"object","additionalProperties":false,"properties":{
-        "action":{"type":"string","enum":actions},
+    let mut schema = json!({"type":"object","additionalProperties":false,"properties":{
+        "action":{"type":"string","enum":["list", "status", "cancel"]},
         "task_id":{"type":"string","description":"Required except for list."},
         "before":{"type":"object","additionalProperties":false,"properties":{"sequence":{"type":"integer","minimum":0},"invocation_id":{"type":"string"}},"required":["sequence","invocation_id"],"description":"History cursor returned as next by list."},
         "limit":{"type":"integer","minimum":1,"maximum":MAX_HISTORY_PAGE}
-    },"required":["action"]})
+    },"required":["action"]});
+    if promote {
+        let properties = &mut schema["properties"];
+        properties["action"]["enum"] = json!(["list", "status", "cancel", "background", GUIDE]);
+        properties["message"] = json!({"type":"string","minLength":1,"maxLength":MAX_REQUEST_BYTES,"description":"Required for guide."});
+        properties["interrupt"] = json!({"type":"boolean","default":false,"description":"guide only: stop the task's current turn and its jobs, then run its next turn on this message."});
+    }
+    schema
 }
 
 pub struct TaskControl;
@@ -50,6 +68,8 @@ struct ControlCall {
     task_id: Option<String>,
     before: Option<BackgroundCursor>,
     limit: usize,
+    message: Option<String>,
+    interrupt: bool,
 }
 
 impl Tool for TaskControl {
@@ -57,7 +77,7 @@ impl Tool for TaskControl {
         "task_control"
     }
     fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Owned(format!("{DESCRIPTION} {PROMOTION_GUIDANCE}"))
+        Cow::Owned(main_description())
     }
     fn audience(&self) -> ToolAudience {
         ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB
@@ -69,19 +89,40 @@ impl Tool for TaskControl {
         let object = input
             .as_object()
             .ok_or_else(|| ParseError::custom("task control input must be an object"))?;
-        if object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "action" | "task_id" | "before" | "limit"))
-        {
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "action" | "task_id" | "before" | "limit" | "message" | "interrupt"
+            )
+        }) {
             return Err(ParseError::custom("unknown task control field"));
         }
         let action = input
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| ParseError::custom("action is required"))?;
-        if !matches!(action, "list" | "status" | "cancel" | "background") {
+        if !matches!(action, "list" | "status" | "cancel" | "background" | GUIDE) {
             return Err(ParseError::custom("unknown task action"));
         }
+        if action != GUIDE && (input.get("message").is_some() || input.get("interrupt").is_some()) {
+            return Err(ParseError::custom(GUIDE_FIELDS_REQUIRE_GUIDE));
+        }
+        let message = input
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty());
+        if action == GUIDE && message.is_none() {
+            return Err(ParseError::custom(MESSAGE_REQUIRED));
+        }
+        if message.is_some_and(|message| message.len() > MAX_REQUEST_BYTES) {
+            return Err(ParseError::custom(MESSAGE_TOO_LARGE));
+        }
+        let interrupt = match input.get("interrupt") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| ParseError::custom(INTERRUPT_NOT_BOOLEAN))?,
+        };
         let task_id = input
             .get("task_id")
             .and_then(Value::as_str)
@@ -110,15 +151,21 @@ impl Tool for TaskControl {
             task_id,
             before,
             limit,
+            message: message.map(str::to_owned),
+            interrupt,
         }))
     }
 }
 
 impl ToolInvocation for ControlCall {
     fn start_header(&self) -> HeaderFuture {
+        let verb = match self.interrupt {
+            true => REPLACE,
+            false => &self.action,
+        };
         HeaderFuture::Ready(HeaderResult::plain(match &self.task_id {
-            Some(id) => format!("{} {id}", self.action),
-            None => self.action.clone(),
+            Some(id) => format!("{verb} {id}"),
+            None => verb.to_owned(),
         }))
     }
     fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
@@ -139,6 +186,39 @@ impl ToolInvocation for ControlCall {
                             .is_some_and(|jobs| *jobs.owner() != JobOwner::Main))
                 {
                     return Err(ToolError::new(ToolFailure::Denied, PROMOTION_DENIED));
+                }
+                if self.action == GUIDE {
+                    let tasks = match &ctx.background {
+                        Some(tasks)
+                            if ctx
+                                .jobs
+                                .as_ref()
+                                .is_none_or(|jobs| *jobs.owner() == JobOwner::Main) =>
+                        {
+                            tasks
+                        }
+                        _ => return Err(ToolError::new(ToolFailure::Denied, GUIDANCE_DENIED)),
+                    };
+                    let id = self.task_id.as_deref().unwrap_or_default();
+                    let message = self.message.as_deref().unwrap_or_default();
+                    tasks.status_async(id).await.map_err(invisible)?;
+                    let (card, queued) = tasks.guide(id, message, self.interrupt).await?;
+                    ctx.event_tx.try_send(AgentEvent::TaskGuidanceQueued {
+                        task_id: card.task_id.clone(),
+                        id: queued.id,
+                        text: guidance_text(message),
+                        interrupt: self.interrupt,
+                        superseded: queued.superseded,
+                    });
+                    let guidance = match self.interrupt {
+                        true => GUIDANCE_REPLACING,
+                        false => GUIDANCE_QUEUED,
+                    };
+                    model_output = Some(
+                        json!({"task_id":card.task_id,"state":card.state,"guidance":guidance,"note":GUIDANCE_RECEIPT})
+                            .to_string(),
+                    );
+                    return Ok(ToolOutput::Tasks(vec![card]));
                 }
                 if self.action == "list" {
                     let first = self.before.is_none();
@@ -220,13 +300,20 @@ fn invisible(message: String) -> ToolError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTION, PROMOTION_DENIED, TaskControl, configure_execution};
+    use super::{
+        DESCRIPTION, GUIDANCE_DENIED, GUIDE, GUIDE_FIELDS_REQUIRE_GUIDE, INTERRUPT_NOT_BOOLEAN,
+        MAX_REQUEST_BYTES, MESSAGE_REQUIRED, MESSAGE_TOO_LARGE, PROMOTION_DENIED, TaskControl,
+        configure_execution,
+    };
     use crate::AgentMode;
     use crate::tools::ToolEffect;
     use crate::tools::registry::{Tool, ToolFailure};
+    use crate::tools::schema::ToolInputErrorKind;
     use crate::tools::test_support::stub_ctx;
     use serde_json::{Value, json};
     use test_case::test_case;
+
+    const GUIDANCE: &str = "Also cover the error path.";
 
     #[test_case(false; "shell_only")]
     #[test_case(true; "tasks_supported")]
@@ -270,10 +357,52 @@ mod tests {
     #[test_case(json!({"action":"status", "task_id":"shell-1"}) => ToolEffect::ReadOnly; "status")]
     #[test_case(json!({"action":"cancel", "task_id":"shell-1"}) => ToolEffect::Orchestrator; "cancel")]
     #[test_case(json!({"action":"background", "task_id":"shell-1"}) => ToolEffect::Orchestrator; "background")]
+    #[test_case(json!({"action":"guide", "task_id":"task-1", "message":GUIDANCE}) => ToolEffect::Orchestrator; "guide")]
     fn only_reads_take_a_read_effect(input: Value) -> ToolEffect {
         TaskControl
             .parse(&input)
             .unwrap()
             .call_effect(ToolEffect::Orchestrator)
+    }
+
+    #[test_case(false; "shell_only")]
+    #[test_case(true; "tasks_supported")]
+    fn guide_only_published_with_background_tasks(promote: bool) {
+        let mut definition = json!({"name":"task_control"});
+        configure_execution(&mut definition, promote);
+        let schema = &definition["input_schema"]["properties"];
+        assert_eq!(
+            schema["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(GUIDE)),
+            promote
+        );
+        assert_eq!(schema.get("message").is_some(), promote);
+        assert_eq!(schema.get("interrupt").is_some(), promote);
+    }
+
+    #[test_case(json!({"action":"guide", "task_id":"task-1"}), MESSAGE_REQUIRED; "missing_message")]
+    #[test_case(json!({"action":"guide", "task_id":"task-1", "message":" \n"}), MESSAGE_REQUIRED; "blank_message")]
+    #[test_case(json!({"action":"guide", "task_id":"task-1", "message":"x".repeat(MAX_REQUEST_BYTES + 1)}), MESSAGE_TOO_LARGE; "oversized_message")]
+    #[test_case(json!({"action":"guide", "task_id":"task-1", "message":GUIDANCE, "interrupt":"yes"}), INTERRUPT_NOT_BOOLEAN; "interrupt_not_boolean")]
+    #[test_case(json!({"action":"cancel", "task_id":"task-1", "message":GUIDANCE}), GUIDE_FIELDS_REQUIRE_GUIDE; "message_on_cancel")]
+    #[test_case(json!({"action":"status", "task_id":"task-1", "interrupt":true}), GUIDE_FIELDS_REQUIRE_GUIDE; "interrupt_on_status")]
+    fn malformed_guidance_is_refused(input: Value, expected: &str) {
+        let error = TaskControl.parse(&input).err().unwrap();
+        assert!(matches!(&error.kind, ToolInputErrorKind::Custom { detail } if detail == expected));
+    }
+
+    #[test]
+    fn guidance_without_background_tasks_is_denied() {
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            let call = TaskControl
+                .parse(&json!({"action":"guide", "task_id":"task-1", "message":GUIDANCE}))
+                .unwrap();
+            let result = call.execute(&ctx).await;
+            assert_eq!(result.failure, Some(ToolFailure::Denied));
+            assert_eq!(result.output.err().as_deref(), Some(GUIDANCE_DENIED));
+        });
     }
 }

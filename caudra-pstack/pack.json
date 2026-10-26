@@ -1,0 +1,45 @@
+{
+  "repository": "https://github.com/cursor/plugins",
+  "version_from": "pstack/plugin.json",
+  "link_scope": "pstack",
+  "roots": [
+    {
+      "from": "pstack",
+      "to": "pstack",
+      "files": ["README.md", "LICENSE", "plugin.json"],
+      "trees": ["skills", "agents", "docs/guide", "automations/benny"]
+    },
+    {
+      "from": "cursor-team-kit",
+      "to": "cursor-team-kit",
+      "files": [
+        "LICENSE",
+        "skills/deslop/SKILL.md",
+        "skills/control-cli/SKILL.md",
+        "skills/control-ui/SKILL.md"
+      ]
+    }
+  ],
+  "skipped_parts": ["scripts", "images", ".DS_Store", "node_modules"],
+  "text_suffixes": [".md", ".yaml", ".yml", ".json", ".tsv", ""],
+  "ported_scripts": {
+    "root": "pstack",
+    "files": [
+      "skills/poteto-mode/scripts/check-plan.mjs",
+      "skills/poteto-mode/scripts/worktree-audit.sh",
+      "skills/poteto-mode/scripts/watch-pr/cli.ts",
+      "skills/poteto-mode/scripts/watch-pr/github.ts",
+      "skills/poteto-mode/scripts/watch-pr/policy.ts",
+      "skills/poteto-mode/scripts/watch-pr/render.ts",
+      "skills/poteto-mode/scripts/watch-pr/types.ts",
+      "skills/poteto-mode/scripts/orch/orch.ts",
+      "skills/poteto-mode/scripts/orch/store.ts",
+      "skills/show-me-your-work/scripts/log.sh",
+      "skills/statechart/scripts/statechart.mjs",
+      "skills/statechart/scripts/tlc-to-chart.mjs",
+      "skills/statechart/scripts/chart-to-tla.mjs",
+      "skills/statechart/scripts/compare-charts.mjs",
+      "skills/statechart/scripts/lib.mjs"
+    ]
+  }
+}

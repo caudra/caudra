@@ -59,7 +59,11 @@ const WEBSEARCH_REMOTE: &str =
     "[websearch] does not apply here: web tools run on the remote Workcell";
 /// Keys that apply as soon as the file is saved, in a table whose other keys wait. A key
 /// may be a dotted path into the table.
-const NOW_KEYS: [(&str, &str); 2] = [("ui", "show_decisions"), ("plugins", "skill.pstack")];
+const NOW_KEYS: [(&str, &str); 3] = [
+    ("ui", "show_decisions"),
+    ("plugins", "skill.pstack"),
+    ("plugins", "skill.mattpocock"),
+];
 const KEY_PATH_SEPARATOR: char = '.';
 /// The tables whose settings a session adopts at its next turn.
 const LIVE_TABLES: [&str; 2] = ["agent", "autopilot"];
@@ -715,14 +719,14 @@ impl EventLoop<'_> {
         match (self.config_reload.reloader)(cwd) {
             Ok(config) => {
                 self.ctx.config_problems.clear(SETTINGS_FILE);
-                let pstack_switched =
-                    self.ctx.config.builtin_skills.pstack != config.agent.builtin_skills.pstack;
+                let packs_switched =
+                    self.ctx.config.builtin_skills.packs() != config.agent.builtin_skills.packs();
                 self.ctx.config = config.agent;
                 for runtime in &mut self.sessions {
                     runtime.app.settings.task_model_choice = self.ctx.config.task_model_choice;
                 }
-                if pstack_switched {
-                    self.apply_pstack(cwd, local, report);
+                if packs_switched {
+                    self.apply_skill_packs(cwd, local, report);
                 }
                 for runtime in &self.sessions {
                     runtime
@@ -767,18 +771,18 @@ impl EventLoop<'_> {
         }
     }
 
-    /// `builtin_skills.pstack` turned on or off: the skill and bundled automations the reloader
+    /// A skill pack turned on or off: the skills and pstack's bundled automations the reloader
     /// installed or removed, which each automation runtime lists at its next scan, the
-    /// `pstack-*` profiles, and the `/pstack:` commands of every tab, local or remote.
-    fn apply_pstack(&mut self, cwd: &Path, local: bool, report: &mut Report) {
+    /// `pstack-*` profiles, and the `/<pack>:` commands of every tab, local or remote.
+    fn apply_skill_packs(&mut self, cwd: &Path, local: bool, report: &mut Report) {
         skill::refresh(ToolRegistry::global());
         self.reload_prompt_profiles(report);
         if local {
             self.reload_commands(cwd);
         }
-        let pstack = self.ctx.config.builtin_skills.pstack;
+        let packs = self.ctx.config.builtin_skills.packs();
         for runtime in &mut self.sessions {
-            runtime.app.set_pstack(pstack);
+            runtime.app.set_skill_packs(packs.clone());
         }
     }
 
@@ -839,7 +843,7 @@ impl EventLoop<'_> {
         } else {
             Arc::from(discover_commands(
                 cwd,
-                self.ctx.config.builtin_skills.pstack,
+                &self.ctx.config.builtin_skills.packs(),
             ))
         };
         for runtime in &mut self.sessions {
@@ -936,6 +940,8 @@ mod tests {
     const PSTACK_ON: &str = "[plugins.skill]\npstack = true\n";
     const PSTACK_ON_DOCS_OFF: &str = "[plugins.skill]\npstack = true\ndocs = false\n";
     const PSTACK_KEY: &str = "plugins.skill.pstack";
+    const MATTPOCOCK_ON: &str = "[plugins.skill]\npstack = false\nmattpocock = true\n";
+    const MATTPOCOCK_KEY: &str = "plugins.skill.mattpocock";
     const PLUGINS_TABLE: &str = "plugins";
     const DECISIONS_ADDED: &str = "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\n\n[decisions.features]\nmemory_search = \"enforce\"\n";
     const LOADING_PROFILE: (&str, &str) = ("review", "Review carefully.");
@@ -1065,6 +1071,7 @@ mod tests {
     }
 
     #[test_case(PSTACK_OFF, PSTACK_ON, &[(PSTACK_KEY, false)] ; "the_pstack_switch_alone")]
+    #[test_case(PSTACK_OFF, MATTPOCOCK_ON, &[(MATTPOCOCK_KEY, false)] ; "the_mattpocock_switch_alone")]
     #[test_case(PSTACK_OFF, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true), (PSTACK_KEY, false)] ; "the_switch_beside_another_skill_flag")]
     #[test_case(PSTACK_ON, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true)] ; "another_skill_flag_alone")]
     fn a_nested_key_that_applies_at_once_is_named_by_its_path(

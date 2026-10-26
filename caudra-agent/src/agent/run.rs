@@ -83,6 +83,7 @@ use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
 use crate::tools::native::plan::{self, PlanTarget};
+use crate::tools::native::report_to_parent::GUIDANCE_PREFIX;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{
     BATCH_TOOL_NAME, CODE_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME,
@@ -4736,9 +4737,15 @@ fn goal_skip_note(
 }
 
 fn queued_message(display: &str) -> String {
-    format!(
-        "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
-    )
+    if display.starts_with(GUIDANCE_PREFIX) {
+        format!(
+            "<agent-guidance>\nThe agent that started this task sent guidance while you were working. Address it and continue.\n\n{display}\n</agent-guidance>"
+        )
+    } else {
+        format!(
+            "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9878,6 +9885,15 @@ mod tests {
                 |b| matches!(b, ContentBlock::Text { text } if text.contains("<user-interrupt>")),
             )
         })
+    }
+
+    #[test_case("use blue", "<user-interrupt>" ; "a user steer reads as the user")]
+    #[test_case(&format!("{GUIDANCE_PREFIX}\n\nuse blue"), "<agent-guidance>" ; "agent guidance reads as the agent")]
+    fn queued_messages_name_who_sent_them(display: &str, opening: &str) {
+        let wrapped = queued_message(display);
+
+        assert!(wrapped.starts_with(opening));
+        assert!(wrapped.contains(display));
     }
 
     fn tool_call_response(tool_name: &str, tool_id: &str) -> StreamResponse {

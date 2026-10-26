@@ -580,6 +580,34 @@ impl Subagent {
     }
 }
 
+/// What every turn of a task runs under, whoever wrote its message: steering
+/// carries the task's own mode, plan, and reasoning, never its sender's.
+#[derive(Clone)]
+pub(crate) struct TurnSettings {
+    mode: AgentMode,
+    plan: Option<PlanTarget>,
+    thinking: ThinkingConfig,
+    fast: bool,
+}
+
+impl TurnSettings {
+    pub(crate) fn input(&self, message: String) -> AgentInput {
+        AgentInput {
+            resume: false,
+            message,
+            mode: self.mode.clone(),
+            plan: self.plan.clone(),
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble: Vec::new(),
+            thinking: self.thinking.clone(),
+            fast: self.fast,
+            prompt: None,
+        }
+    }
+}
+
 /// What one `prompt` call produced. `text` is empty when the subagent only
 /// called tools and never wrote a message.
 pub struct PromptResult {
@@ -615,10 +643,19 @@ impl Subagent {
         self.closed
     }
 
-    /// The queue the UI steers through, before the first prompt hands it over.
-    #[cfg(test)]
+    /// The queue the task is steered through, until the first prompt hands it
+    /// to the UI.
     pub(crate) fn steer_queue(&self) -> Option<SteeringQueue> {
         self.steer_tx.clone()
+    }
+
+    pub(crate) fn turn_settings(&self) -> TurnSettings {
+        TurnSettings {
+            mode: self.mode.clone(),
+            plan: self.plan.clone(),
+            thinking: self.thinking.clone(),
+            fast: self.fast,
+        }
     }
 
     pub fn model_spec(&self) -> String {
@@ -743,16 +780,8 @@ impl Subagent {
 
         let mut input = AgentInput {
             resume,
-            message: message.unwrap_or_default(),
-            mode: self.mode.clone(),
-            plan: self.plan.clone(),
-            images: Vec::new(),
-            mentions: Vec::new(),
-            commits: Vec::new(),
             preamble,
-            thinking: self.thinking.clone(),
-            fast: self.fast,
-            prompt: None,
+            ..self.turn_settings().input(message.unwrap_or_default())
         };
         // A replacement stops only the turn it lands in; the task carries on
         // with the replacement as its next turn, and its caller keeps waiting.
@@ -774,17 +803,10 @@ impl Subagent {
                 images: replacement.images.clone(),
             });
             input = AgentInput {
-                resume: false,
-                message: replacement.message,
-                mode: self.mode.clone(),
-                plan: self.plan.clone(),
                 images: replacement.images,
                 mentions: replacement.mentions,
                 commits: replacement.commits,
-                preamble: Vec::new(),
-                thinking: self.thinking.clone(),
-                fast: self.fast,
-                prompt: None,
+                ..self.turn_settings().input(replacement.message)
             };
         };
         self.finish_prompt(result, text)

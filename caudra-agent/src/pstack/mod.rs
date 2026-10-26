@@ -1,24 +1,30 @@
 //! The bundled pstack, off unless `[plugins.skill] pstack = true`: its `pstack` skill, its
 //! bundled automations, the `/pstack:<skill>` commands, and the `pstack-<agent>` task profiles.
 
-use caudra_pstack::{Agent, Library, NAME, RoleTable, SKILL_DESCRIPTION, automations, library};
-
-use crate::automation::bundled::{install_bundled_automations, remove_bundled_automations};
-use crate::command::{ARGUMENTS_PLACEHOLDER, CommandScope, CommandSource, CustomCommand};
-use crate::prompt::profile::SystemPromptProfile;
-use crate::tools::native::skill::{
-    BuiltinSkill, SkillServe, install_builtin_skill, remove_builtin_skill,
+use caudra_pstack::{
+    Agent, NAME, RoleTable, SKILL_DESCRIPTION, automations, is_principle, library,
 };
 
+use crate::automation::bundled::{install_bundled_automations, remove_bundled_automations};
+use crate::command::CustomCommand;
+use crate::prompt::profile::SystemPromptProfile;
+use crate::skill_pack::{self, Pack};
+use crate::tools::native::skill::SkillServe;
+
 pub mod roles;
+
+static PSTACK: Pack = Pack {
+    description: SKILL_DESCRIPTION,
+    library: || library().pages(),
+    index: |serve| library().index(&table(serve)),
+    load: |address, serve| library().load(address, &table(serve)),
+    commanded: |skill| !is_principle(skill),
+};
 
 /// Applied at startup and on every settings reload. The skill and automation registries are
 /// process-wide; the commands and profiles follow the config each caller holds.
 pub fn install(on: bool) {
-    match on {
-        true => install_builtin_skill(skill()),
-        false => remove_builtin_skill(NAME),
-    }
+    skill_pack::install(&PSTACK, on);
     install_automations(on);
 }
 
@@ -29,11 +35,9 @@ fn install_automations(on: bool) {
     }
 }
 
+/// One per skill a user runs; the `principle-*` leaves are read from within other skills.
 pub fn commands(on: bool) -> Vec<CustomCommand> {
-    match on {
-        true => builtin_commands(library()),
-        false => Vec::new(),
-    }
+    skill_pack::commands_of(&PSTACK, on)
 }
 
 pub fn profiles(on: bool) -> Vec<SystemPromptProfile> {
@@ -43,40 +47,8 @@ pub fn profiles(on: bool) -> Vec<SystemPromptProfile> {
     }
 }
 
-fn skill() -> BuiltinSkill {
-    BuiltinSkill {
-        name: NAME.to_owned(),
-        description: SKILL_DESCRIPTION.to_owned(),
-        resolve: Box::new(|serve| (library().index(&table(serve)), None)),
-        pages: Some(Box::new(|address, serve| {
-            library().load(address, &table(serve))
-        })),
-    }
-}
-
 fn table(serve: &SkillServe) -> RoleTable {
     roles::table(&serve.model_policy, serve.task_model_choice)
-}
-
-/// One per skill a user runs; the `principle-*` leaves are read from within other skills.
-fn builtin_commands(library: &Library) -> Vec<CustomCommand> {
-    library
-        .skills()
-        .iter()
-        .filter(|skill| !skill.is_principle())
-        .map(|skill| CustomCommand {
-            name: skill.name.clone(),
-            description: skill.summary().to_owned(),
-            content: format!(
-                "Load the `{NAME}/{}` skill with the `skill` tool and follow it.\n\n{ARGUMENTS_PLACEHOLDER}",
-                skill.name
-            ),
-            scope: CommandScope::Builtin(NAME),
-            accepts_args: true,
-            argument_hint: None,
-            source: CommandSource::Builtin,
-        })
-        .collect()
 }
 
 fn profile(agent: &Agent) -> SystemPromptProfile {
@@ -110,7 +82,7 @@ mod tests {
 
     #[test]
     fn every_user_facing_skill_has_a_command() {
-        let commands = builtin_commands(library());
+        let commands = commands(true);
         let poteto = commands
             .iter()
             .find(|command| command.name == POTETO_MODE)
@@ -129,7 +101,7 @@ mod tests {
         let wanted = library()
             .skills()
             .iter()
-            .filter(|skill| !skill.is_principle())
+            .filter(|skill| !is_principle(skill))
             .count();
         assert_eq!(commands.len(), wanted);
     }

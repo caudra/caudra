@@ -34,7 +34,9 @@ use tracing::info;
 use crate::agent::LoadedInstructions;
 use crate::agent::change_recording::ChangeRecorder;
 use crate::agent::run::AgentParams;
-use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity, TaskModel};
+use crate::agent::subagent::{
+    self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity, TaskModel, TurnSettings,
+};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::code::CodeSession;
@@ -55,7 +57,7 @@ use crate::tools::{
 };
 use crate::types::WorkflowProvenance;
 use crate::workflow::WorkspaceRebind;
-use crate::{AgentConfig, AgentMode, EventSender, SharedHistory};
+use crate::{AgentConfig, AgentMode, EventSender, SharedHistory, SteeringQueue};
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
     "Report your final result. Call it exactly once when your task is complete.";
@@ -135,6 +137,9 @@ pub struct TaskOutcome {
     /// Input plus output tokens the subagent consumed during this call.
     pub tokens_used: u64,
     pub duration_ms: u64,
+    /// Guidance its parent sent that the task settled without reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undelivered_guidance: Vec<String>,
 }
 
 pub type TaskFuture<'a> = Pin<Box<dyn Future<Output = TaskOutcome> + Send + 'a>>;
@@ -317,6 +322,13 @@ impl PreparedTask {
         self.session.0.mirror()
     }
 
+    pub(crate) fn steering(&self) -> Option<(SteeringQueue, TurnSettings)> {
+        Some((
+            self.session.0.steer_queue()?,
+            self.session.0.turn_settings(),
+        ))
+    }
+
     pub(crate) fn discard(mut self) {
         self.session.0.discard_unstarted();
     }
@@ -414,6 +426,7 @@ fn finish(
         error,
         tokens_used,
         duration_ms,
+        undelivered_guidance: Vec::new(),
     }
 }
 

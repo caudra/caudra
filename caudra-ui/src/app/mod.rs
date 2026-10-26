@@ -193,8 +193,8 @@ use caudra_agent::{
 use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
-    Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
-    UiConfig,
+    Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SkillPacks,
+    SnapshotsConfig, UiConfig,
 };
 use caudra_docs::{DocsLibrary, ReleaseNotesSource};
 use caudra_lua::{
@@ -597,8 +597,8 @@ pub struct App {
     /// Set by the event loop after construction: whether a summarizer writes
     /// the memory's lines, which the inspector says when it does not.
     pub(crate) summarize_memory: bool,
-    /// Set by the event loop: `builtin_skills.pstack`, for the commands a remote `cd` rediscovers.
-    pub(crate) pstack: bool,
+    /// Set by the event loop: `builtin_skills.packs()`, for the commands a remote `cd` rediscovers.
+    pub(crate) skill_packs: SkillPacks,
     pub(super) task_picker: TaskPicker,
     task_picker_inputs: Option<tasks::PickerInputs>,
     pub(super) shell_modal: ShellModal,
@@ -820,6 +820,9 @@ struct PendingSteer {
     id: QueueItemId,
     text: String,
     draft: InputDraft,
+    /// Sent by the agent, whose task hands it back if never read, so the
+    /// user is never asked to resend it.
+    from_agent: bool,
 }
 
 struct PendingPatternSuggestions {
@@ -972,7 +975,7 @@ impl App {
             learn_reads: learning::LearnReads::default(),
             learner: None,
             summarize_memory: true,
-            pstack: false,
+            skill_packs: SkillPacks::default(),
             task_picker: TaskPicker::new(),
             task_picker_inputs: None,
             shell_modal: ShellModal::new(),
@@ -4350,7 +4353,12 @@ impl App {
             .or_default();
         if admission != PromptAdmission::Interrupt {
             let id = tx.push(input);
-            pending.push_back(PendingSteer { id, text, draft });
+            pending.push_back(PendingSteer {
+                id,
+                text,
+                draft,
+                from_agent: false,
+            });
             return vec![];
         }
         let replacement = tx.replace(input);
@@ -4358,9 +4366,46 @@ impl App {
             id: replacement.id,
             text,
             draft,
+            from_agent: false,
         });
         self.adopt_task_replacement(task_id, replacement.id, replacement.superseded);
         vec![]
+    }
+
+    /// Lists guidance the agent queued on a running task beside the user's
+    /// own, unless the task already read it.
+    fn task_guidance_queued(
+        &mut self,
+        task_id: &str,
+        id: QueueItemId,
+        text: String,
+        interrupt: bool,
+        superseded: Option<QueueItemId>,
+    ) {
+        if self
+            .subagent_steers
+            .get(task_id)
+            .is_some_and(|queue| queue.entries().iter().all(|entry| entry.id != id))
+        {
+            return;
+        }
+        let draft = InputDraft {
+            text: text.clone(),
+            paste_ranges: Vec::new(),
+        };
+        self.pending_subagent_steers
+            .entry(task_id.to_owned())
+            .or_default()
+            .push_back(PendingSteer {
+                id,
+                text,
+                draft,
+                from_agent: true,
+            });
+        if interrupt {
+            self.adopt_task_replacement(task_id, id, superseded);
+        }
+        self.clamp_active_queue_focus();
     }
 
     /// Records `id` as the task's replacement, which leads its queue the way
@@ -4663,21 +4708,22 @@ impl App {
         }
     }
 
+    /// Withdraws the user's unread steers into the unsent list. The agent's
+    /// stay queued: the task's settlement hands them back to the agent.
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
         self.subagent_replacements.remove(task_id);
-        let remaining = self
-            .subagent_steers
-            .remove(task_id)
-            .map(|queue| queue.drain())
-            .unwrap_or_default();
+        let queue = self.subagent_steers.remove(task_id);
         let Some(pending) = self.pending_subagent_steers.remove(task_id) else {
             return;
         };
-        let remaining_ids: std::collections::HashSet<_> =
-            remaining.into_iter().map(|(id, _)| id).collect();
         let unsent: VecDeque<_> = pending
             .into_iter()
-            .filter(|item| remaining_ids.contains(&item.id))
+            .filter(|item| {
+                !item.from_agent
+                    && queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.remove(item.id).is_some())
+            })
             .collect();
         if !unsent.is_empty() {
             self.unsent_subagent_steers
@@ -5882,6 +5928,16 @@ impl App {
             AgentEvent::ModelRerouted(reroute) => {
                 return self.model_rerouted(chat_idx, main_agent, *reroute);
             }
+            AgentEvent::TaskGuidanceQueued {
+                task_id,
+                id,
+                text,
+                interrupt,
+                superseded,
+            } => {
+                self.task_guidance_queued(&task_id, id, text, interrupt, superseded);
+                return vec![];
+            }
             event => event,
         };
 
@@ -6777,10 +6833,10 @@ impl App {
         }
     }
 
-    /// `builtin_skills.pstack` as saved now. A remote tab reads its commands from its own
+    /// `builtin_skills.packs()` as saved now. A remote tab reads its commands from its own
     /// project, so it rediscovers them here; a local one takes them from [`Self::reload_commands`].
-    pub(crate) fn set_pstack(&mut self, on: bool) {
-        self.pstack = on;
+    pub(crate) fn set_skill_packs(&mut self, packs: SkillPacks) {
+        self.skill_packs = packs;
         if self.settings_modal.is_open() {
             self.settings_modal.set_pstack(self.pstack_roles());
         }
@@ -6788,7 +6844,7 @@ impl App {
             && let Some(context) = &self.remote_project_context
         {
             self.command_palette.set_custom_commands(Arc::from(
-                caudra_agent::command::discover_remote_commands(context, on),
+                caudra_agent::command::discover_remote_commands(context, &self.skill_packs),
             ));
         }
     }
@@ -6839,7 +6895,7 @@ impl App {
             } else {
                 Arc::from(caudra_agent::command::discover_remote_commands(
                     &change.context,
-                    self.pstack,
+                    &self.skill_packs,
                 ))
             });
         self.workspace_session = Some(change.workspace);

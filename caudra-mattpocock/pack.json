@@ -1,0 +1,135 @@
+{
+  "repository": "https://github.com/mattpocock/skills",
+  "version_from": ".claude-plugin/plugin.json",
+  "roots": [
+    {
+      "from": "",
+      "to": "",
+      "files": [
+        "LICENSE"
+      ]
+    },
+    {
+      "from": "skills/engineering/code-review",
+      "to": "skills/code-review",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/codebase-design",
+      "to": "skills/codebase-design",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/diagnosing-bugs",
+      "to": "skills/diagnosing-bugs",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/domain-modeling",
+      "to": "skills/domain-modeling",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/grill-with-docs",
+      "to": "skills/grill-with-docs",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/improve-codebase-architecture",
+      "to": "skills/improve-codebase-architecture",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/pr",
+      "to": "skills/pr",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/retro",
+      "to": "skills/retro",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/tdd",
+      "to": "skills/tdd",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/to-spec",
+      "to": "skills/to-spec",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/engineering/to-tickets",
+      "to": "skills/to-tickets",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/productivity/grill-me",
+      "to": "skills/grill-me",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/productivity/grilling",
+      "to": "skills/grilling",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/productivity/handoff",
+      "to": "skills/handoff",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/productivity/to-questionnaire",
+      "to": "skills/to-questionnaire",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/productivity/writing-for-agents",
+      "to": "skills/writing-for-agents",
+      "trees": [
+        "."
+      ]
+    }
+  ],
+  "skipped_parts": [
+    "agents",
+    ".DS_Store",
+    "node_modules"
+  ],
+  "text_suffixes": [
+    ".md",
+    ".sh",
+    ""
+  ]
+}

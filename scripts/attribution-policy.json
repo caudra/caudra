@@ -54,6 +54,19 @@
         "supplements/THIRD_PARTY_LICENSES/CursorTeamKit.txt"
       ]
     },
+    "caudra-mattpocock@0.2.0-preview.14": {
+      "expression": "Apache-2.0 AND MIT",
+      "reason": "The Caudra glue and the page served in place of upstream's setup skill remain Apache-2.0. The embedded skills copied from mattpocock/skills (Matt Pocock) and their Caudra translations remain MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/MattPocockSkills.txt",
+          "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/MattPocockSkills.txt"
+      ]
+    },
     "rmcp@3.5.1": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The published crate omits LICENSE. Its .cargo_vcs_info.json pins upstream revision 79437f291b2c44053d00dcd5db969fd0cca7c887, whose complete LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",

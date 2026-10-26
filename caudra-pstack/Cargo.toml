@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-caudra-docs = { workspace = true }
+caudra-skillpack = { workspace = true }
 caudra-script = { workspace = true, features = ["rhai"] }
 include_dir = { workspace = true }
 jiff = { workspace = true }
@@ -17,13 +17,12 @@ regex = { workspace = true }
 rhai = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tla-checker = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+caudra-skillpack = { workspace = true, features = ["checks"] }
 caudra-automation = { workspace = true }
-sha2 = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }

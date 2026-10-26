@@ -25,7 +25,7 @@ use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegi
 use caudra_agent::worktree::Backend;
 use caudra_config::providers::{ProvidersConfig, builtin_provider};
 use caudra_config::sandbox::SandboxName;
-use caudra_config::{Config, Feature, StorageConfig};
+use caudra_config::{Config, Feature, SkillPacks, StorageConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::history_search::HistoryScope;
@@ -654,12 +654,12 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool, pstack: bool) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, packs: &SkillPacks) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    command::discover_commands(&cwd, pstack)
+    command::discover_commands(&cwd, packs)
 }
 
 fn login_placeholder_model() -> Result<Model> {
@@ -750,7 +750,7 @@ fn build_stack(
 
     let commands = discover_commands(
         cli.no_commands || remote,
-        config.agent.builtin_skills.pstack,
+        &config.agent.builtin_skills.packs(),
     );
 
     // A fresh session opens in `ui.default_mode`; a resumed one overrides this
@@ -2134,7 +2134,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
                         }
                         stack.commands = discover_commands(
                             cli.no_commands || workcell_runtime.is_remote(),
-                            stack.config.agent.builtin_skills.pstack,
+                            &stack.config.agent.builtin_skills.packs(),
                         );
                         committed_relocation = None;
                         continue;
@@ -2193,7 +2193,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
                 });
                 stack.commands = discover_commands(
                     cli.no_commands || workcell_runtime.is_remote(),
-                    stack.config.agent.builtin_skills.pstack,
+                    &stack.config.agent.builtin_skills.packs(),
                 );
                 committed_relocation = None;
                 continue;
