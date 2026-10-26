@@ -15,6 +15,7 @@ const MAX_LAYER_ORIGIN_MULTIPLIER: i32 = -2;
 const MASK_CLIP_BUFFERS: u64 = 3;
 const FILTER_PRIMITIVE_BUFFERS: u64 = 5;
 const FILTER_SOURCE_BUFFERS: u64 = 1;
+const MAX_TURBULENCE_OCTAVES: u32 = 10;
 const LAYER_ANTIALIAS_PADDING: i32 = 2;
 
 /// A parsed SVG whose resource and allocation behavior is fixed by this module.
@@ -422,6 +423,11 @@ fn analyze_render_group(
                 depth + 1,
                 retained_layers.saturating_add(pixels.saturating_mul(FILTER_PRIMITIVE_BUFFERS)),
             )?;
+            if let Kind::Turbulence(turbulence) = primitive.kind()
+                && turbulence.num_octaves() > MAX_TURBULENCE_OCTAVES
+            {
+                return Err(SvgRasterizeError::Complexity);
+            }
             if let Kind::Image(image) = primitive.kind() {
                 let context = filter_context
                     .as_ref()

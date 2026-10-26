@@ -493,3 +493,27 @@ fn bounded_primitive_regions_may_extend_beyond_the_filter() {
         [255, 0, 0, 255]
     );
 }
+
+fn turbulence_svg(octaves: u32) -> String {
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+            <filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="16" height="16">
+                <feTurbulence baseFrequency="0.1" numOctaves="{octaves}"/>
+            </filter><rect width="16" height="16" filter="url(#f)"/></svg>"#,
+    )
+}
+
+#[test]
+fn turbulence_octave_counts_beyond_visible_detail_are_rejected_before_rendering() {
+    for octaves in [11, u32::MAX] {
+        assert!(
+            matches!(
+                SafeSvg::parse(turbulence_svg(octaves).as_bytes()),
+                Err(SvgRasterizeError::Complexity)
+            ),
+            "{octaves}"
+        );
+    }
+    let svg = SafeSvg::parse(turbulence_svg(10).as_bytes()).unwrap();
+    assert_eq!(svg.rasterize(16).unwrap().width(), 16);
+}
