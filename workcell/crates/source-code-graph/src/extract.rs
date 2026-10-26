@@ -775,6 +775,105 @@ mod tests {
         assert!(facts.references.is_empty());
     }
 
+    #[test_case(Language::Go, "package example\nfunc run() { var local = helper() }\n" ; "go_local_var")]
+    #[test_case(Language::Go, "package example\nfunc run() { var (\nlocal = helper()\n) }\n" ; "go_local_var_group")]
+    #[test_case(Language::Go, "package example\nfunc run() { const local = helper() }\n" ; "go_local_const")]
+    #[test_case(Language::Go, "package example\nfunc run() { const (\nlocal = helper()\n) }\n" ; "go_local_const_group")]
+    #[test_case(Language::Go, "package example\nfunc (w Widget) run() { var local = helper() }\n" ; "go_method")]
+    #[test_case(Language::Go, "package example\nfunc run() { f := func() { var local = helper() }; _ = f }\n" ; "go_closure")]
+    #[test_case(Language::Rust, "fn run() { const LOCAL: usize = helper(); }" ; "rust_local_const")]
+    #[test_case(Language::Rust, "fn run() { static LOCAL: usize = helper(); }" ; "rust_local_static")]
+    #[test_case(Language::Rust, "impl Widget { fn run() { const LOCAL: usize = helper(); } }" ; "rust_method")]
+    #[test_case(Language::Rust, "fn run() { let f = || { static LOCAL: usize = helper(); }; }" ; "rust_closure")]
+    #[test_case(Language::Rust, "fn run() { if ready { const LOCAL: usize = helper(); } }" ; "rust_nested_block")]
+    fn local_initializers_keep_the_enclosing_callable(language: Language, source: &str) {
+        let facts = facts(source, language);
+        assert!(!facts.parse_error);
+        assert!(
+            facts
+                .definitions
+                .iter()
+                .all(|definition| definition.kind != SymbolKind::Constant)
+        );
+        let caller = facts
+            .definitions
+            .iter()
+            .position(|definition| definition.name == "run")
+            .unwrap();
+        assert_eq!(facts.references.len(), 1);
+        assert_eq!(facts.references[0].name, "helper");
+        assert_eq!(facts.references[0].kind, ReferenceKind::Call);
+        assert_eq!(facts.references[0].enclosing, Some(caller));
+    }
+
+    #[test_case("var First = first()\nvar Second = second()\n" ; "individual_vars")]
+    #[test_case("var (\nFirst = first()\nSecond = second()\n)\n" ; "grouped_vars")]
+    #[test_case("const First = first()\nconst Second = second()\n" ; "individual_consts")]
+    #[test_case("const (\nFirst = first()\nSecond = second()\n)\n" ; "grouped_consts")]
+    fn go_package_initializers_belong_to_their_own_spec(declarations: &str) {
+        let source = format!("package example\n{declarations}");
+        let facts = facts(&source, Language::Go);
+        assert!(!facts.parse_error);
+        assert_eq!(facts.definitions.len(), 2);
+        assert_eq!(facts.references.len(), 2);
+        for (index, (name, call)) in [("First", "first"), ("Second", "second")]
+            .into_iter()
+            .enumerate()
+        {
+            let definition = &facts.definitions[index];
+            assert_eq!(definition.name, name);
+            assert_eq!(definition.kind, SymbolKind::Constant);
+            assert_eq!(
+                &source[definition.span.start..definition.span.end],
+                format!("{name} = {call}()")
+            );
+            let reference = facts
+                .references
+                .iter()
+                .find(|reference| reference.name == call)
+                .unwrap();
+            assert_eq!(reference.kind, ReferenceKind::Call);
+            assert_eq!(reference.enclosing, Some(index));
+        }
+    }
+
+    #[test_case("const VALUE: usize = helper();" ; "crate_const")]
+    #[test_case("static VALUE: usize = helper();" ; "crate_static")]
+    #[test_case("mod nested { const VALUE: usize = helper(); }" ; "module_const")]
+    #[test_case("mod nested { static VALUE: usize = helper(); }" ; "module_static")]
+    #[test_case("impl Widget { const VALUE: usize = helper(); }" ; "associated_const")]
+    #[test_case("trait Contract { const VALUE: usize = helper(); }" ; "trait_default")]
+    fn rust_item_constants_keep_their_initializers(source: &str) {
+        let facts = facts(source, Language::Rust);
+        assert!(!facts.parse_error);
+        let index = facts
+            .definitions
+            .iter()
+            .position(|definition| definition.name == "VALUE")
+            .unwrap();
+        assert_eq!(facts.definitions[index].kind, SymbolKind::Constant);
+        assert_eq!(facts.references.len(), 1);
+        assert_eq!(facts.references[0].name, "helper");
+        assert_eq!(facts.references[0].enclosing, Some(index));
+    }
+
+    #[test_case("trait Contract { const VALUE: usize; }" ; "trait_requirement")]
+    #[test_case("unsafe extern \"C\" { static VALUE: usize; }" ; "foreign_static")]
+    fn rust_item_constants_without_initializers_remain_visible(source: &str) {
+        let facts = facts(source, Language::Rust);
+        assert!(!facts.parse_error);
+        assert!(facts.references.is_empty());
+        assert_eq!(
+            facts
+                .definitions
+                .iter()
+                .filter(|definition| definition.kind == SymbolKind::Constant)
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            ["VALUE"]
+        );
+    }
+
     #[test]
     fn attributes_a_call_to_the_method_that_contains_it() {
         // The regression ripwire paid for: when the method span is the whole impl block, this call

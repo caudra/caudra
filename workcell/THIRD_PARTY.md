@@ -32,6 +32,17 @@ The versioned origins in the query headers agree with that snapshot. Swift and T
 do not name versions, so their notice sources use its grammar pins. Resolving the original import
 revision remains a provenance gap.
 
+The selective v0.6.8 refresh (`cd11226a6b42f9a63c880ba0d8d24bfbd31e1919`) adopts Go's
+package-scope variable/constant restriction and grouped-variable coverage, and Rust's item-scope
+constant/static restriction. Go keeps Workcell's `definition.constant` vocabulary and captures
+individual variable and constant specs so grouped initializers have separate spans. Rust's local
+method-owner and qualified-call patterns are retained. The v0.6.7 Go type-alias adaptation is also
+retained. This is not a wholesale replacement or a claim about the original import revision.
+New upstream Python/Ruby subscript, Ruby mixin, and Python import captures are not incorporated:
+their distinct roles and semantic guards are not implemented by Workcell's extractor. TypeScript's
+query did not change between v0.6.7 and v0.6.8; its upstream-only class-factory and import captures
+remain unported. The refresh changes no grammar-origin pins in `TreeSitterQueries.txt`.
+
 The remaining 19 (cmake, containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make,
 markdown, nix, proto, scala, sql, starlark, tlaplus, xml, zig) are authored here against the
 vendored grammars and carry no upstream provenance.
