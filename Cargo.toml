@@ -297,8 +297,8 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v1.3.0", package = "monty" }
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v1.3.0", package = "monty-types" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "1.4.0", package = "monty" }
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "1.4.0", package = "monty-types" }
 # The fork carries optional `mcp`/`cli` features, the disjunctive-action label fix and `keep_graph` until upstream takes them.
 tla-checker = { git = "https://github.com/tensorninja/tla-rs", rev = "807f334a2825cd6f225fc9a61870d1ab6e4acd86", default-features = false }
 notify = { version = "=9.0.0-rc.6", default-features = false, features = ["flume", "macos_fsevent"] }
@@ -324,8 +324,8 @@ futures-util = "0.3.32"
 http = "1.4.2"
 httpdate = "1.0.3"
 lru = "0.19.0"
-monty-pool = "=1.3.0"
-monty-types-registry = { package = "monty-types", version = "=1.3.0" }
+monty-pool = "=1.4.0"
+monty-types-registry = { package = "monty-types", version = "=1.4.0" }
 # The parser Monty runs snippets with: keep in lockstep with Monty's own `ruff_*` versions.
 ruff_python_ast = "=0.0.14"
 ruff_python_parser = "=0.0.14"

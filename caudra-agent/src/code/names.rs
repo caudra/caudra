@@ -191,6 +191,7 @@ const STDLIB_MODULES: &[&str] = &[
     "csv",
     "dataclasses",
     "datetime",
+    "decimal",
     "functools",
     "hashlib",
     "itertools",
@@ -238,6 +239,7 @@ mod tests {
 
     #[test_case("bisect")]
     #[test_case("csv")]
+    #[test_case("decimal")]
     #[test_case("hashlib")]
     #[test_case("posixpath")]
     #[test_case("tomllib")]

@@ -170,6 +170,7 @@ fn render_inner(object: ObjectRef<'_>, depth: usize) -> Rendered {
         // No JSON analogue at all: the repr is the only faithful form, and the string rendering is
         // provided so a caller that only reads `result` still sees something meaningful.
         MontyNode::Complex(_)
+        | MontyNode::Decimal(_)
         | MontyNode::Bytes(_)
         | MontyNode::Date(_)
         | MontyNode::DateTime(_)
@@ -271,6 +272,33 @@ mod tests {
 
     const MODULE_NAME: &str = "tools";
     const MODULE_REPR: &str = "<module 'tools'>";
+
+    #[test_case("0.30", "Decimal('0.30')" ; "trailing_zero")]
+    #[test_case("12345678901234567890.123456789", "Decimal('12345678901234567890.123456789')" ; "precision")]
+    #[test_case("-0", "Decimal('-0')" ; "signed_zero")]
+    #[test_case("NaN", "Decimal('NaN')" ; "not_a_number")]
+    fn decimals_preserve_their_text_and_type(value: &str, expected_repr: &str) {
+        let decimal = MontyObject::decimal(value);
+        assert_eq!(
+            render(&decimal),
+            (
+                Value::String(expected_repr.to_owned()),
+                Some(expected_repr.to_owned())
+            )
+        );
+        assert_eq!(
+            to_json(&decimal),
+            Some(Value::String(expected_repr.to_owned()))
+        );
+        let nested = MontyObject::list([decimal]);
+        assert_eq!(
+            render(&nested),
+            (
+                serde_json::json!([expected_repr]),
+                Some(format!("[{expected_repr}]"))
+            )
+        );
+    }
 
     #[test_case(false ; "module")]
     #[test_case(true ; "nested_module")]

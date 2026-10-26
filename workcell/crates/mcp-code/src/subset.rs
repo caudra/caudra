@@ -8,7 +8,7 @@
 /// Verified name by name against a running worker by `every_advertised_module_imports`.
 macro_rules! available_modules {
     () => {
-        "asyncio, base64, binascii, bisect, collections, copy, csv, dataclasses, datetime, functools, hashlib, itertools, json, math, os, pathlib, posixpath, random, re, sys, time, tomllib, typing, unicodedata"
+        "asyncio, base64, binascii, bisect, collections, copy, csv, dataclasses, datetime, decimal, functools, hashlib, itertools, json, math, os, pathlib, posixpath, random, re, sys, time, tomllib, typing, unicodedata"
     };
 }
 
@@ -37,7 +37,7 @@ pub(crate) use {available_modules, untyped_builtins, withheld_builtins};
 ///
 /// Public because the contract belongs to this crate and a host restating it — or a test holding the
 /// description to the worker — must not retype the list, which is how the lists diverged before.
-pub const SUBSET_MODULES: [&str; 24] = [
+pub const SUBSET_MODULES: [&str; 25] = [
     "asyncio",
     "base64",
     "binascii",
@@ -47,6 +47,7 @@ pub const SUBSET_MODULES: [&str; 24] = [
     "csv",
     "dataclasses",
     "datetime",
+    "decimal",
     "functools",
     "hashlib",
     "itertools",

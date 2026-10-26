@@ -29,6 +29,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 - **mattpocock skills**: `[plugins.skill] mattpocock = true` adds 16 of [Matt Pocock's skills](https://github.com/mattpocock/skills), translated for Caudra, as the `mattpocock` skill and a `/mattpocock:<name>` command for each. They cover grilling a plan, domain modeling, test-first building, diagnosing bugs, code review, specs and tickets, and handoffs. Grilling uses `question` and respects deferred answers. Reviews include the requested uncommitted work and can use the session plan as a spec. Drafts preserve that plan, handoffs distinguish pending work from verified results, and publishing can use your configured MCP or CLI connection. Switching the pack applies at once in the terminal UI, and both packs can be on together. See [mattpocock](/docs/skills/#mattpocock).
 - **Guide running tasks**: `task_control` `guide` lets the main agent send a running task changed requirements or a reply to its report. The task reads it at its next step, and `interrupt: true` replaces its current turn instead. The message waits in the task chat's queue like your own guidance. Guidance a task never reads comes back with its result. See [Inspect and control tasks](/docs/sessions/#inspect-and-control-tasks).
+- **Decimal arithmetic in Python**: The `code` tool supports `decimal.Decimal` for exact decimal calculations. Decimal results retain their type and digits instead of being rounded to JSON floating-point numbers.
 
 ### Source analysis
 
