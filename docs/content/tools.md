@@ -265,7 +265,7 @@ Tasks wait for their final result by default. In the TUI, ACP, and the persisten
 
 ### `task_control` {#task_control}
 
-Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop. The background action promotes a running foreground task without restarting it.
+Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop. The background action promotes a running foreground task without restarting it. The guide action sends a running agent task a message, such as updated requirements or a reply to its report, which it reads at its next step; interrupt stops its current turn and its jobs first. Guidance it never reads comes back with its result.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -273,6 +273,8 @@ Inspect or control jobs visible to this owner. Actions: list, status, cancel. Li
 | `task_id` | string | no | Required except for list. |
 | `before` | object | no | History cursor returned as next by list. |
 | `limit` | integer | no |  |
+| `message` | string | no | Required for guide. |
+| `interrupt` | boolean | no | guide only: stop the task's current turn and its jobs, then run its next turn on this message. |
 
 ### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
 

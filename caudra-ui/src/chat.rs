@@ -395,6 +395,7 @@ impl Chat {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
             AgentEvent::QueueDrained
+            | AgentEvent::TaskGuidanceQueued { .. }
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
             | AgentEvent::QuestionClosed

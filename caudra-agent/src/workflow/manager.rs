@@ -1711,6 +1711,7 @@ complete(result);
                             error: Some(CANCELLED.to_owned()),
                             tokens_used: 0,
                             duration_ms: 0,
+                            undelivered_guidance: Vec::new(),
                         };
                     }
                     if label.starts_with(FAIL_PREFIX)
@@ -1727,6 +1728,7 @@ complete(result);
                             error: Some(FAILURE.to_owned()),
                             tokens_used: 0,
                             duration_ms: 0,
+                            undelivered_guidance: Vec::new(),
                         };
                     }
                     TaskOutcome {
@@ -1740,6 +1742,7 @@ complete(result);
                         error: None,
                         tokens_used: TOKENS_PER_AGENT,
                         duration_ms: 1,
+                        undelivered_guidance: Vec::new(),
                     }
                 }
                 .await;

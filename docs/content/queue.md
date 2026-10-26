@@ -59,6 +59,8 @@ A running task chat offers guide and replace, with no Up next group. `Enter`, `C
 
 Waiting guidance can take over too. Press `r` on its row or choose Replace current run from its menu. The main chat rules apply here as well. A newer replacement drops the older one, waiting guidance stays queued, and deleting a pending replacement before it starts ends the task as cancelled. `Esc Esc` still cancels the task, and nothing runs again. A finished task cannot be replaced, so the draft stays in the input.
 
+Guidance the main agent sends with [`task_control` `guide`](/docs/sessions/#inspect-and-control-tasks) joins the same queue and follows the same rules. When the task ends without reading it, the guidance goes back to the agent with the task's result rather than to your unsent list.
+
 ## Recovery
 
 Unclaimed prompts, their delivery modes, and their captured Build or Plan modes are saved with the session. Editing or reordering a prompt keeps its captured mode. A provider or tool error pauses delivery so the next prompt cannot race error recovery.

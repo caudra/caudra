@@ -3529,6 +3529,7 @@ impl EventPump {
             | AgentEvent::MessageStarted { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
+            | AgentEvent::TaskGuidanceQueued { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::Compacting
             | AgentEvent::CompactionDone

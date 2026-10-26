@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use crate::agent::subagent::{self, TaskIdentity, TaskModel};
 pub use crate::agent::task_runner::set_max_concurrent;
 use crate::agent::task_runner::{TaskOutcome, TaskRequest, run_task};
+use crate::background::unread_guidance_text;
 use crate::prompt::task_execution_guidance;
 use crate::subagent_history::SubagentTaskMode;
 use crate::tools::native::task_control;
@@ -39,7 +40,7 @@ Available system prompt profiles:
 Notes:
 1. Use direct tools for small lookups; delegate meaningful bounded work. Use workflows for staged repeatable orchestration.
 2. The agent's result is not visible to the user. Summarize it in your response.
-3. A fresh call gives the subagent no context beyond your prompt. Include the objective, relevant context, allowed scope/files, constraints, verification expectations, and what to report back. It does not automatically receive later user instructions. Write self-contained prose: compress by omitting, never by running words together.
+3. A fresh call gives the subagent no context beyond your prompt. Include the objective, relevant context, allowed scope/files, constraints, verification expectations, and what to report back. It does not automatically receive later user instructions; send changes to a running task with task_control guide. Write self-contained prose: compress by omitting, never by running words together.
 4. Every admitted task has a task_id. Pass it back after settlement to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode, profile, model, and thinking when continuing; they stay locked to the original run. Omit prompt too to resume an interrupted subagent that needs no new instruction.
 5. Tell it to return concise summaries with file:line refs, not full file contents.
 ";
@@ -350,10 +351,16 @@ fn render(outcome: TaskOutcome) -> ToolExecResult {
         model: outcome.model.as_deref(),
         thinking: outcome.thinking.as_deref(),
     };
-    match &outcome.task_id {
+    let mut result = match &outcome.task_id {
         Some(task_id) => with_metadata(task_id, ran_as, result),
         None => result,
+    };
+    if !outcome.undelivered_guidance.is_empty() {
+        let suffix = result.model_suffix.get_or_insert_default();
+        suffix.push('\n');
+        suffix.push_str(&unread_guidance_text(&outcome.undelivered_guidance));
     }
+    result
 }
 
 pub(crate) fn receipt(status: TaskCard) -> ToolExecResult {
@@ -435,6 +442,7 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const PLAN_MODE: &str = "plan";
     const SUMMARY: &str = "found the middleware in src/auth.rs:12";
+    const UNREAD_GUIDANCE: &str = "Check the session middleware too.";
     const REQUIRED_FIELD: &str = "answer";
     const BOOM: &str = "boom";
     const MODEL_NAME: &str = "sonnet";
@@ -651,6 +659,7 @@ mod tests {
             error: verdict.err().map(str::to_owned),
             tokens_used: 0,
             duration_ms: 0,
+            undelivered_guidance: Vec::new(),
         }
     }
 
@@ -856,6 +865,22 @@ mod tests {
             ..outcome(Some(TASK_ID), Err(BOOM))
         });
         assert_eq!(result.failure, Some(expected));
+    }
+
+    #[test]
+    fn guidance_a_task_never_read_rides_with_its_result() {
+        let unread = vec![UNREAD_GUIDANCE.to_owned()];
+        let result = render(TaskOutcome {
+            undelivered_guidance: unread.clone(),
+            ..outcome(Some(TASK_ID), Ok(Value::String(SUMMARY.into())))
+        });
+        assert_eq!(text_of(&result), SUMMARY);
+        assert!(
+            result
+                .model_suffix
+                .unwrap()
+                .ends_with(&unread_guidance_text(&unread))
+        );
     }
 
     #[test]

@@ -12,10 +12,12 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 [v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)
 
 - Matt Pocock's engineering skills ship as an opt-in pack beside pstack.
+- The main agent can guide or redirect a running task without stopping it.
 
 ### Changes
 
 - **mattpocock skills**: `[plugins.skill] mattpocock = true` adds 16 of [Matt Pocock's skills](https://github.com/mattpocock/skills), translated for Caudra, as the `mattpocock` skill and a `/mattpocock:<name>` command for each. They cover grilling a plan, domain modeling, test-first building, diagnosing bugs, code review, specs and tickets, and handoffs. Grilling asks through the `question` tool, and switching the pack applies at once in the terminal UI. Both packs can be on together. See [mattpocock](/docs/skills/#mattpocock).
+- **Guide running tasks**: `task_control` `guide` lets the main agent send a running task changed requirements or a reply to its report. The task reads it at its next step, and `interrupt: true` replaces its current turn instead. The message waits in the task chat's queue like your own guidance. Guidance a task never reads comes back with its result. See [Inspect and control tasks](/docs/sessions/#inspect-and-control-tasks).
 
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 

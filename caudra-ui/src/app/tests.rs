@@ -12590,6 +12590,115 @@ fn a_consumed_task_replacement_marks_the_cancelled_turn_before_its_prompt() {
     assert_eq!(chat.last_message_text(), TASK_REPLACEMENT);
 }
 
+const AGENT_GUIDANCE: &str = "[Guidance from the agent] cover the session cookies too";
+
+/// Queues guidance the way `task_control guide` does, then reports it.
+fn agent_guides(
+    app: &mut App,
+    steer_queue: &caudra_agent::SteeringQueue,
+    interrupt: bool,
+) -> caudra_agent::QueueItemId {
+    let mut input = app.continuation_input();
+    input.message = AGENT_GUIDANCE.into();
+    let queued = match interrupt {
+        true => steer_queue.replace(input),
+        false => caudra_agent::Replacement {
+            id: steer_queue.push(input),
+            superseded: None,
+        },
+    };
+    app.update(agent_msg(AgentEvent::TaskGuidanceQueued {
+        task_id: TASK_ID.into(),
+        id: queued.id,
+        text: AGENT_GUIDANCE.into(),
+        interrupt,
+        superseded: queued.superseded,
+    }));
+    queued.id
+}
+
+#[test]
+fn agent_guidance_waits_in_the_task_queue_until_consumed() {
+    let (mut app, steer_queue, _receiver) = running_task_chat();
+    let id = agent_guides(&mut app, &steer_queue, false);
+    assert_eq!(
+        task_queue_rows(&app),
+        [(
+            AGENT_GUIDANCE.to_owned(),
+            Some(caudra_agent::PromptAdmission::Steer)
+        )]
+    );
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_queue);
+    app.update(subagent_msg_with_info(
+        AgentEvent::QueueItemConsumed {
+            id,
+            text: AGENT_GUIDANCE.into(),
+            images: Vec::new(),
+        },
+        info,
+    ));
+    assert!(app.active_queue_entries().is_empty());
+    assert_eq!(app.chats[1].last_message_text(), AGENT_GUIDANCE);
+}
+
+#[test]
+fn agent_replacement_stops_the_turn_and_supersedes_the_users() {
+    let (mut app, steer_queue, receiver) = running_task_chat();
+    let turn = armed_turn(&receiver);
+    app.subagent_input_box.set_input(TASK_REPLACEMENT.into());
+    press_chord(&mut app, chord::INTERRUPT_PROMPT);
+    let id = agent_guides(&mut app, &steer_queue, true);
+    assert!(turn.is_cancelled());
+    assert_eq!(app.subagent_replacements[TASK_ID], id);
+    assert_eq!(
+        task_queue_rows(&app),
+        [(
+            AGENT_GUIDANCE.to_owned(),
+            Some(caudra_agent::PromptAdmission::Interrupt)
+        )]
+    );
+}
+
+#[test]
+fn guidance_the_task_already_read_is_not_listed() {
+    let (mut app, _steer_queue, _receiver) = running_task_chat();
+    app.update(agent_msg(AgentEvent::TaskGuidanceQueued {
+        task_id: TASK_ID.into(),
+        id: caudra_agent::QueueItemId::new(),
+        text: AGENT_GUIDANCE.into(),
+        interrupt: false,
+        superseded: None,
+    }));
+    assert!(app.active_queue_entries().is_empty());
+}
+
+#[test]
+fn a_settling_task_leaves_agent_guidance_queued_for_the_agent() {
+    let (mut app, steer_queue, _receiver) = running_task_chat();
+    app.subagent_input_box.set_input(TASK_GUIDANCE.into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    agent_guides(&mut app, &steer_queue, false);
+
+    app.preserve_unconsumed_steers(TASK_ID);
+
+    assert_eq!(
+        steer_queue
+            .entries()
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect::<Vec<_>>(),
+        [AGENT_GUIDANCE]
+    );
+    assert_eq!(
+        app.unsent_subagent_steers[TASK_ID]
+            .iter()
+            .map(|steer| steer.text.as_str())
+            .collect::<Vec<_>>(),
+        [TASK_GUIDANCE]
+    );
+}
+
 #[test]
 fn replace_key_on_task_guidance_promotes_it_in_place() {
     let (mut app, steer_queue, receiver) = running_task_chat();
@@ -13236,6 +13345,7 @@ fn checkpoint_and_restore_preserve_separate_unsent_task_messages() {
                     text: text.into(),
                     paste_ranges: Vec::new(),
                 },
+                from_agent: false,
             })
             .collect(),
     );
