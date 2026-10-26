@@ -14548,6 +14548,7 @@ CREATE TABLE subagents (
         assert!(table.lines().all(|line| line == line.trim_end()), "{table}");
     }
 
+    #[cfg(unix)]
     const HOME: &str = "/home/someone";
 
     #[test_case("/home/someone/workspace/caudra", Some(HOME), "~/workspace/caudra" ; "inside_home")]
