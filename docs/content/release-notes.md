@@ -11,7 +11,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)
 
-- Model catalog updates.
+- Model lists reflect retired OpenAI and Copilot models, with corrected prices and limits for Mistral, Z.AI, and DeepSeek.
 
 ### Models
 
@@ -19,6 +19,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **Copilot retirements reflected.** GPT-5 mini, GPT-5.4 mini, GPT-5.4, GPT-5.5, and Gemini 3.7 Flash are removed from the built-in list after their October 19 retirement.
 - **Mistral GLM Flash and cached-input prices.** `zai-glm-5-3-flash` has its own vision-capable entry and pricing instead of matching the larger GLM model. Cached input now uses the published rates for Mistral Medium, Mistral Small, and Ministral 14B.
 - **Z.AI FlashX pricing.** `glm-4.7-flashx` has its own paid rates instead of inheriting the free Flash model's pricing.
+- **DeepSeek output allowance corrected.** DeepSeek Flash and V4 Pro use the full 393,216-token output limit instead of 384,000.
 
 ## Caudra 0.2 Preview 14 {#v0-2-0-preview-14}
 

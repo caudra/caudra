@@ -20,6 +20,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 const PAD: &str = "";
 const THINKING_PAD_MARKERS: &[&str] = &["deepseek-v4", "deepseek-flash"];
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
+const MAX_OUTPUT_TOKENS: u32 = 393_216;
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "deepseek",
@@ -64,7 +65,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
-            max_output_tokens: Some(384_000),
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: 1_000_000,
             reasoning_options: None,
         },
@@ -82,7 +83,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
-            max_output_tokens: Some(384_000),
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: 1_000_000,
             reasoning_options: None,
         },
@@ -294,8 +295,17 @@ mod tests {
     const CALL_ID: &str = "c1";
     const TOOL_NAME: &str = "read";
     const TOOL_OUTPUT: &str = "out";
+    const PUBLISHED_OUTPUT_LIMIT: u32 = 384 * 1024;
+
     /// The hours and the surcharge as the pricing page states them.
     const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC";
+
+    #[test_case(FLASH)]
+    #[test_case(V4)]
+    fn resolved_model_keeps_the_full_output_allowance(spec: &str) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.max_output_tokens, Some(PUBLISHED_OUTPUT_LIMIT));
+    }
 
     /// `PEAK_HOURS` only reaches a bill through the manifest, and a schedule
     /// that never got hooked up looks exactly like off-peak all day. The

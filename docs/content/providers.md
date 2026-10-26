@@ -301,8 +301,8 @@ Routing defaults: glm-4.7-flash (Fast), glm-5.3 (Best)
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-|  | deepseek-flash, deepseek-v4-flash | $0.15 / $0.60 | 1000K ctx / 384K out |
-| Best | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
+|  | deepseek-flash, deepseek-v4-flash | $0.15 / $0.60 | 1000K ctx / 393K out |
+| Best | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 393K out |
 
 Routing defaults: deepseek-v4-pro (Best)
 
