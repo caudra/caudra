@@ -34,8 +34,9 @@ impl Decisions {
         };
         match prepared {
             Ok((request, questions, timeout_ms)) => {
-                self.run(feature, &questions, request, context, timeout_ms)
+                self.run(feature, &questions, request, context, timeout_ms, None)
                     .await
+                    .0
             }
             Err(error) => {
                 caudra_otel::emit::decision(

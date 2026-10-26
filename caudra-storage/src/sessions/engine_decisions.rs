@@ -15,7 +15,7 @@ use crate::sessions::{
 /// Rows each session keeps. An insert past it drops the oldest.
 pub const MAX_ENGINE_DECISIONS_PER_SESSION: usize = 2000;
 const ENGINE_DECISION_COLUMNS: &str =
-    "seq, at, feature, mode, outcome, summary, details, agent, tool_use_id, history_len";
+    "seq, at, feature, mode, outcome, summary, details, agent, tool_use_id, history_len, screening";
 const ACTED: &str = "acted";
 const SHADOW: &str = "shadow";
 const FELL_BACK: &str = "fell_back";
@@ -46,6 +46,13 @@ CREATE TABLE engine_decisions (
     CHECK((tool_use_id IS NULL) <> (history_len IS NULL)),
     PRIMARY KEY(session_id, seq)
 ) STRICT, WITHOUT ROWID;
+"#;
+
+/// Schema 40: what content screening concluded, by name, so a restored row
+/// tells a real flag from a result that could not be screened. Older rows
+/// have none.
+pub(crate) const SCREENING_COLUMN: &str = r#"
+ALTER TABLE engine_decisions ADD COLUMN screening TEXT CHECK(length(screening) <= 32);
 "#;
 
 /// What became of the feature's answer.
@@ -104,6 +111,9 @@ pub struct StoredEngineDecision {
     /// The subagent it was made for, `None` for the main agent.
     pub agent: Option<String>,
     pub anchor: StoredDecisionAnchor,
+    /// Content screening's verdict or the reason it had none, by name. `None`
+    /// for every other feature and for rows written before schema 40.
+    pub screening: Option<String>,
 }
 
 impl SessionDatabase {
@@ -124,7 +134,7 @@ impl SessionDatabase {
         {
             let mut insert = transaction.prepare(&format!(
                 "INSERT INTO engine_decisions (session_id, {ENGINE_DECISION_COLUMNS}) \
-                 SELECT ?1, coalesce(max(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
+                 SELECT ?1, coalesce(max(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
                  FROM engine_decisions WHERE session_id = ?1"
             ))?;
             for decision in decisions {
@@ -145,6 +155,7 @@ impl SessionDatabase {
                     decision.agent,
                     tool_use_id,
                     history_len,
+                    decision.screening,
                 ])?;
             }
         }
@@ -197,6 +208,7 @@ fn read_decision(row: &Row<'_>) -> Result<StoredEngineDecision, SessionError> {
         details: deserialize_json(&row.get::<_, String>(6)?, DETAILS_FIELD)?,
         agent: row.get(7)?,
         anchor: read_anchor(row.get(8)?, row.get(9)?)?,
+        screening: row.get(10)?,
     })
 }
 
@@ -236,6 +248,7 @@ mod tests {
     const DETAIL_KEPT: &str = "0.97  42+1 release-preview-7  kept 1st";
     const DETAIL_LEFT_OUT: &str = "0.12  7+1 old-notes  left out";
     const AGENT: &str = "review";
+    const SCREENING: &str = "timed_out";
     const TOOL_USE_ID: &str = "toolu_1";
     const AT_MS: u64 = 1_767_225_600_000;
     const HISTORY_LEN: usize = 12;
@@ -281,6 +294,7 @@ mod tests {
             details: vec![DETAIL_KEPT.into(), DETAIL_LEFT_OUT.into()],
             agent: None,
             anchor,
+            screening: None,
         }
     }
 
@@ -375,6 +389,7 @@ mod tests {
             StoredEngineDecision {
                 agent: Some(AGENT.into()),
                 details: Vec::new(),
+                screening: Some(SCREENING.into()),
                 ..decision(outcome, tool())
             },
         ];

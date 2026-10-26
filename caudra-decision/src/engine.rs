@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -35,19 +36,35 @@ impl Meter for Unmetered {
 
 /// `answer` is when the caller stops waiting. A request already sent may read
 /// its reply until `linger`, so its usage can still be metered, but no new
-/// attempt starts after `answer`.
+/// attempt starts after `answer`, nor once the caller abandons the call.
 #[derive(Clone, Debug)]
 pub struct Deadlines {
     pub answer: Instant,
     pub linger: Instant,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Deadlines {
-    pub fn at(deadline: Instant) -> Self {
+    pub fn new(answer: Instant, linger: Instant) -> Self {
         Self {
-            answer: deadline,
-            linger: deadline,
+            answer,
+            linger,
+            abandoned: Arc::default(),
         }
+    }
+
+    pub fn at(deadline: Instant) -> Self {
+        Self::new(deadline, deadline)
+    }
+
+    /// Says the caller stopped waiting before `answer`, so a retry it would
+    /// never read is not sent. Shared by every clone.
+    pub fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
     }
 }
 

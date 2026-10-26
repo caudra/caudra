@@ -93,7 +93,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 39;
+const SCHEMA_VERSION: i64 = 40;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -931,6 +931,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 39,
         sql: crate::background::TRANSCRIPTS,
     },
+    Migration {
+        from: 39,
+        to: 40,
+        sql: crate::engine_decisions::SCREENING_COLUMN,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1209,7 +1214,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1229,7 +1234,8 @@ fn full_schema() -> String {
         crate::learning::TABLES,
         crate::learning::TRANSCRIPTS,
         crate::shell_runs::TABLE,
-        crate::background::TRANSCRIPTS
+        crate::background::TRANSCRIPTS,
+        crate::engine_decisions::SCREENING_COLUMN
     )
 }
 
@@ -7138,10 +7144,18 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    /// Drops what schema 40 added. Every downgrade below 40 runs it first.
+    macro_rules! screening_downgrade {
+        () => {
+            "ALTER TABLE engine_decisions DROP COLUMN screening;"
+        };
+    }
+    const SCREENING_DOWNGRADE: &str = screening_downgrade!();
+    const SCREENING_PREVIOUS_SCHEMA: i64 = 39;
     /// Drops what schema 39 added. Every downgrade below 39 runs it first.
     macro_rules! background_transcripts_downgrade {
         () => {
-            "DROP TABLE background_transcripts;"
+            concat!(screening_downgrade!(), "DROP TABLE background_transcripts;")
         };
     }
     const BACKGROUND_TRANSCRIPTS_DOWNGRADE: &str = background_transcripts_downgrade!();
@@ -12383,6 +12397,38 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     }
 
     #[test]
+    fn engine_decisions_from_schema_thirty_nine_load_without_a_screening() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(SCREENING_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO engine_decisions (session_id, seq, at, feature, mode, outcome, \
+                 summary, details, tool_use_id) \
+                 VALUES (?1, 1, 0, 'content_screening', 'enforce', 'acted', '', '[]', 'call')",
+                [session.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", SCREENING_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        let rows = migrated.load_engine_decisions(session.id).unwrap();
+        assert_eq!(rows.len(), 1, "{MIGRATION_KEEPS_DECISIONS}");
+        assert_eq!(rows[0].screening, None);
+    }
+
+    #[test]
     fn purpose_usage_migrates_from_schema_twenty_five_keeping_sessions() {
         let (_temp, state) = state_dir();
         let mut database = SessionDatabase::open_state(&state).unwrap();
@@ -12678,7 +12724,8 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         }
         connection
             .execute(
-                "INSERT INTO engine_decisions VALUES (?1, 1, 0, 'code_context', 'enforce', 'acted', '', '{}', NULL, 'call', NULL)",
+                "INSERT INTO engine_decisions (session_id, seq, at, feature, mode, outcome, summary, details, agent, tool_use_id, history_len) \
+                 VALUES (?1, 1, 0, 'code_context', 'enforce', 'acted', '', '{}', NULL, 'call', NULL)",
                 params![id],
             )
             .unwrap();
@@ -12930,6 +12977,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(LEARNING_TRANSCRIPTS_DOWNGRADE, LEARNING_TRANSCRIPTS_PREVIOUS_SCHEMA; "learning_transcripts_from_thirty_four")]
     #[test_case(SHELL_RUNS_DOWNGRADE, SHELL_RUNS_PREVIOUS_SCHEMA; "shell_runs_from_thirty_five")]
     #[test_case(BACKGROUND_TRANSCRIPTS_DOWNGRADE, BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA; "background_transcripts_from_thirty_eight")]
+    #[test_case(SCREENING_DOWNGRADE, SCREENING_PREVIOUS_SCHEMA; "screening_from_thirty_nine")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -13878,6 +13926,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")
@@ -13994,6 +14043,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")

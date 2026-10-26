@@ -6157,6 +6157,28 @@ fn a_pending_chip_outlives_its_call_and_keeps_its_clock_out_of_search() {
     assert_eq!(panel.cadence(), Cadence::IDLE);
 }
 
+/// A cancelled turn's settles never arrive, so its waits go with it, on a
+/// card still running and on one whose call already ended.
+#[test_case(false ; "a_running_call")]
+#[test_case(true ; "an_ended_call")]
+fn cancelling_drops_the_waits_the_turn_never_settles(ended: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(DECISION_WAIT_CALL, SHELL_TOOL_NAME));
+    if ended {
+        panel.tool_done(done(DECISION_WAIT_CALL));
+    }
+    assert!(panel.attach_decision(CardDecision::pending(
+        DecisionSubject::Call(DECISION_WAIT_CALL.into()),
+        DecisionFeature::ContentScreening,
+    )));
+
+    panel.cancel_in_progress();
+
+    let text = buffer_text(&render(&mut panel, 80, 5));
+    assert!(!text.contains(SCREENING_WAIT), "{text}");
+    assert_eq!(panel.cadence(), Cadence::IDLE);
+}
+
 /// A row that only says what it would have done, and one whose engine failed,
 /// must not read as a row that acted, nor as each other.
 #[test]

@@ -14229,7 +14229,7 @@ fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
         ..Default::default()
     };
     let decisions = Decisions::new(config, &app.storage).unwrap();
-    decisions.mark_tainted();
+    decisions.mark_unscreened();
     app.permissions.set_decisions(Some(decisions.clone()));
     app.permissions.set_session_mode(Some(mode.clone()));
     assert!(app.execute_command(cmd(DECISIONS_COMMAND), 0).is_empty());

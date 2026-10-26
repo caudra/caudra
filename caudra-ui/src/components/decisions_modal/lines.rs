@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use caudra_agent::decisions::{DecisionFeature, endpoint_kind};
+use caudra_agent::decisions::{DecisionFeature, Taint, endpoint_kind};
 use caudra_config::ClockFormat;
 use caudra_config::decisions::{
     DecisionKeySource, DecisionThresholds, DecisionsConfig, FeatureMode,
@@ -67,6 +67,11 @@ pub(super) const API_KEY_FIELD: &str = "API key";
 pub(super) const ENGINE_OFF: &str =
     "No decision endpoint is active. Add one with /login or pick one with /decisions model.";
 pub(super) const CONTENT_FLAGGED: &str = "flagged";
+pub(super) const CONTENT_UNSCREENED: &str = "screening incomplete";
+pub(super) const CONTENT_CLEAN: &str = "not flagged";
+const CONTENT_SEPARATOR: &str = "; ";
+pub(super) const RESTRICTIONS_TIGHTENED: &str = "tightened";
+pub(super) const RESTRICTIONS_NORMAL: &str = "normal";
 pub(super) const LOGGING_HINT: &str =
     "Logging is off: set log = true under [decisions] in the global caudra.toml";
 pub(super) const READING: &str = "Reading decision log\u{2026}";
@@ -85,6 +90,22 @@ pub(super) const ACTIVITY_FOOTNOTE: [&str; 2] = [
 const ANSWERS_SECTION: &str = "Answers";
 pub(super) const JSON_SECTIONS: [&str; 5] =
     ["State", "Questions", ANSWERS_SECTION, "Meta", "Label"];
+
+/// What this session's results came to: a detection and a result that could
+/// not be screened are told apart, since either tightens the session.
+fn content_state(taint: &Taint) -> String {
+    let states: Vec<&str> = [
+        (taint.flagged, CONTENT_FLAGGED),
+        (taint.unscreened, CONTENT_UNSCREENED),
+    ]
+    .into_iter()
+    .filter_map(|(set, state)| set.then_some(state))
+    .collect();
+    match states.is_empty() {
+        true => CONTENT_CLEAN.to_owned(),
+        false => states.join(CONTENT_SEPARATOR),
+    }
+}
 
 pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'static>> {
     let config = ctx.config;
@@ -161,11 +182,12 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
 
     lines.push(Line::default());
     lines.push(heading(SESSION_HEADING, theme));
+    lines.push(field("Content", content_state(&ctx.taint), theme));
     lines.push(field(
-        "Content",
-        match ctx.tainted {
-            true => CONTENT_FLAGGED,
-            false => "not flagged",
+        "Restrictions",
+        match ctx.taint.flagged || ctx.taint.unscreened {
+            true => RESTRICTIONS_TIGHTENED,
+            false => RESTRICTIONS_NORMAL,
         },
         theme,
     ));

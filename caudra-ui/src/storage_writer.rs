@@ -2312,6 +2312,7 @@ mod tests {
             details: Vec::new(),
             agent: None,
             anchor,
+            screening: None,
         }
     }
 

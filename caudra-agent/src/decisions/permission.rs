@@ -242,7 +242,7 @@ mod tests {
                 .permission_action(&DecisionFeature::AutoScreening, &response)
                 .is_none()
         );
-        service.mark_tainted();
+        service.mark_flagged();
         let action = service.permission_action(&DecisionFeature::AutoScreening, &response);
         if escalates {
             let Some(PermissionAction::Escalate(flags)) = action else {

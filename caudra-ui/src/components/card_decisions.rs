@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use caudra_agent::decisions::{DecisionFeature, NoteAnchor, NoteOutcome};
+use caudra_agent::decisions::{
+    DecisionFeature, NoteAnchor, NoteOutcome, PendingPhase, ScreeningVerdict,
+};
 use caudra_agent::{format_live_duration, format_settled_duration};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -30,6 +32,8 @@ const MANY_DECISIONS: &str = "decisions";
 /// What a row says when every decision on it came to nothing.
 const ALL_QUIET: &str = "checked";
 const CHILD_SEPARATOR: char = ':';
+const QUEUED: &str = "waiting to screen";
+const RETRYING: &str = "retrying screening";
 
 /// What a decision is about: a call, drawn on the card that draws the call,
 /// or the turn, drawn on the row the transcript ended on when it was asked.
@@ -62,15 +66,22 @@ pub type ChildDecisions = Arc<HashMap<usize, Vec<CardDecision>>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecisionState {
-    /// The engine has not answered yet.
-    Pending { since: Instant },
+    /// The engine has not answered yet. `phase` says what holds it up,
+    /// when it is more than the engine thinking.
+    Pending {
+        since: Instant,
+        phase: Option<PendingPhase>,
+    },
     /// `text` is what a standalone row would hold: its title, then a detail
     /// per line. `took` is how long the wait it answered ran, unknown for one
-    /// that arrived without a wait and for a restored one.
+    /// that arrived without a wait and for a restored one. `screening` is
+    /// what content screening concluded, unknown for a row stored before
+    /// screening said.
     Settled {
         outcome: NoteOutcome,
         text: String,
         took: Option<Duration>,
+        screening: Option<ScreeningVerdict>,
     },
     /// A turn's wait the engine answered with nothing to do. `text` is titled
     /// by the feature's quiet words, then lists what came closest, one per
@@ -98,8 +109,25 @@ impl CardDecision {
             feature,
             state: DecisionState::Pending {
                 since: Instant::now(),
+                phase: None,
             },
         }
+    }
+
+    /// A wait held up by `phase`.
+    pub fn in_phase(mut self, phase: Option<PendingPhase>) -> Self {
+        if let DecisionState::Pending { phase: held, .. } = &mut self.state {
+            *held = phase;
+        }
+        self
+    }
+
+    /// An answer that says what content screening concluded.
+    pub fn screened(mut self, verdict: Option<ScreeningVerdict>) -> Self {
+        if let DecisionState::Settled { screening, .. } = &mut self.state {
+            *screening = verdict;
+        }
+        self
     }
 
     pub fn settled(
@@ -117,6 +145,7 @@ impl CardDecision {
                 outcome,
                 text,
                 took: None,
+                screening: None,
             },
         }
     }
@@ -135,7 +164,7 @@ impl CardDecision {
 
     fn waited(&self) -> Option<Duration> {
         match self.state {
-            DecisionState::Pending { since } => Some(live_elapsed(since)),
+            DecisionState::Pending { since, .. } => Some(live_elapsed(since)),
             DecisionState::Settled { .. } | DecisionState::Quiet { .. } => None,
         }
     }
@@ -150,21 +179,34 @@ impl CardDecision {
     fn chip(&self) -> Chip {
         let words = chip_words(&self.feature);
         let (lead, said, clock, tone) = match &self.state {
-            DecisionState::Pending { since } => {
+            DecisionState::Pending { since, phase } => {
                 let waited = live_elapsed(*since);
+                let said = match phase {
+                    Some(PendingPhase::Queued) => QUEUED,
+                    Some(PendingPhase::Retrying) => RETRYING,
+                    None => words.pending,
+                };
                 (
                     spinner_str(waited.as_millis()),
-                    format!("{}{PENDING_SUFFIX}", words.pending),
+                    format!("{said}{PENDING_SUFFIX}"),
                     Some(format_live_duration(waited)),
                     Tone::Pending,
                 )
             }
-            DecisionState::Settled { outcome, took, .. } => {
-                let (said, tone) = match outcome {
-                    NoteOutcome::Acted if words.loud => (words.acted, Tone::Loud),
-                    NoteOutcome::Acted => (words.acted, Tone::Acted),
-                    NoteOutcome::Shadow => (words.shadow, Tone::Shadow),
-                    NoteOutcome::FellBack => (words.failed, Tone::Loud),
+            DecisionState::Settled {
+                outcome,
+                took,
+                screening,
+                ..
+            } => {
+                let (said, tone) = match (outcome, screening) {
+                    (NoteOutcome::Shadow, _) => (words.shadow, Tone::Shadow),
+                    (NoteOutcome::Acted | NoteOutcome::FellBack, Some(verdict)) => {
+                        (verdict.label(), Tone::Loud)
+                    }
+                    (NoteOutcome::Acted, None) if words.loud => (words.acted, Tone::Loud),
+                    (NoteOutcome::Acted, None) => (words.acted, Tone::Acted),
+                    (NoteOutcome::FellBack, None) => (words.failed, Tone::Loud),
                 };
                 (
                     DECISION_PREFIX,
@@ -206,8 +248,15 @@ pub fn record(decisions: &mut Vec<CardDecision>, mut decision: CardDecision) {
         .find(|held| held.is_pending_for(&decision.subject, &decision.feature))
     {
         Some(slot) => {
-            if let DecisionState::Settled { took, .. } = &mut decision.state {
-                *took = slot.waited();
+            match (&mut decision.state, &slot.state) {
+                (DecisionState::Settled { took, .. }, _) => *took = slot.waited(),
+                (
+                    DecisionState::Pending { since, .. },
+                    DecisionState::Pending { since: held, .. },
+                ) => {
+                    *since = *held;
+                }
+                _ => {}
             }
             *slot = decision;
         }
@@ -238,7 +287,7 @@ pub fn quiet(
     near_misses: &[String],
 ) -> bool {
     for held in decisions.iter_mut() {
-        if let DecisionState::Pending { since } = held.state
+        if let DecisionState::Pending { since, .. } = held.state
             && held.subject == *subject
             && held.feature == *feature
         {
@@ -466,6 +515,7 @@ fn answered<'a>(
                 outcome,
                 text,
                 took,
+                ..
             } => Some((
                 decision_lines(text, *outcome, took.filter(|_| timed), true),
                 text.as_str(),
@@ -652,13 +702,13 @@ fn chip_words(feature: &DecisionFeature) -> ChipWords {
             "write check failed",
             "no writes",
         )),
-        DecisionFeature::ContentScreening => loud(words(
+        DecisionFeature::ContentScreening => words(
             "screening result",
-            "flagged",
+            "screening result",
             "would flag",
             "screening failed",
             "nothing flagged",
-        )),
+        ),
         DecisionFeature::OutputPointers => words(
             "finding omitted lines",
             "pointed",
@@ -703,7 +753,7 @@ const fn deciding(pending: &'static str, quiet: &'static str) -> ChipWords {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use caudra_agent::decisions::{DecisionFeature, NoteOutcome};
+    use caudra_agent::decisions::{DecisionFeature, NoteOutcome, PendingPhase, ScreeningVerdict};
     use ratatui::text::Span;
     use test_case::test_case;
 
@@ -745,7 +795,13 @@ mod tests {
     }
 
     fn timed(decision: CardDecision, waited: Duration) -> CardDecision {
-        let DecisionState::Settled { outcome, text, .. } = decision.state else {
+        let DecisionState::Settled {
+            outcome,
+            text,
+            screening,
+            ..
+        } = decision.state
+        else {
             unreachable!("only a settled decision is timed")
         };
         CardDecision {
@@ -753,6 +809,7 @@ mod tests {
                 outcome,
                 text,
                 took: Some(waited),
+                screening,
             },
             ..decision
         }
@@ -772,6 +829,7 @@ mod tests {
             feature,
             state: DecisionState::Pending {
                 since: Instant::now() - waited,
+                phase: None,
             },
         }
     }
@@ -805,6 +863,64 @@ mod tests {
         let chips = chip_spans([&decision]);
         assert_eq!(text(&chips.spans), format!(" {DECISION_PREFIX}{word}"));
         assert_eq!(chips.text, format!(" {DECISION_PREFIX}{word}"));
+    }
+
+    #[test_case(NoteOutcome::Acted, Some(ScreeningVerdict::Flagged), "flagged", Tone::Loud ; "a_flag")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::TimedOut), "screening timed out", Tone::Loud ; "timed_out")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Unreachable), "engine unreachable", Tone::Loud ; "unreachable")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Busy), "screening busy", Tone::Loud ; "busy")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::OutOfTime), "screening incomplete", Tone::Loud ; "out_of_time")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Failed), "screening failed", Tone::Loud ; "failed")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Partial), "screening incomplete", Tone::Loud ; "partial")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::TooLarge), "screening size limit", Tone::Loud ; "too_large")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Interrupted), "screening interrupted", Tone::Loud ; "interrupted")]
+    #[test_case(NoteOutcome::FellBack, Some(ScreeningVerdict::Unreadable), "screening read failed", Tone::Loud ; "unreadable")]
+    #[test_case(NoteOutcome::Acted, None, "screening result", Tone::Acted ; "a_stored_row_never_reads_as_a_flag")]
+    #[test_case(NoteOutcome::FellBack, None, "screening failed", Tone::Loud ; "a_stored_failure")]
+    fn a_content_chip_says_what_screening_concluded(
+        outcome: NoteOutcome,
+        verdict: Option<ScreeningVerdict>,
+        word: &str,
+        tone: Tone,
+    ) {
+        let decision =
+            settled(call(CALL), DecisionFeature::ContentScreening, outcome).screened(verdict);
+
+        let chip = decision.chip();
+
+        assert_eq!((chip.words.as_str(), chip.tone), (word, tone));
+        assert!(
+            verdict == Some(ScreeningVerdict::Flagged) || !chip.words.contains("flag"),
+            "{word}"
+        );
+    }
+
+    #[test_case(None, "screening result…" ; "asking")]
+    #[test_case(Some(PendingPhase::Queued), "waiting to screen…" ; "queued")]
+    #[test_case(Some(PendingPhase::Retrying), "retrying screening…" ; "retrying")]
+    fn a_screening_wait_says_what_holds_it_up_and_keeps_its_start(
+        phase: Option<PendingPhase>,
+        word: &str,
+    ) {
+        let _clock = FrozenClock::at(WAITED);
+        let _spinner = FrozenSpinner::at(0);
+        let feature = DecisionFeature::ContentScreening;
+        let waiting = waiting_for(call(CALL), feature.clone(), LONG_AGO);
+        let DecisionState::Pending { since: started, .. } = waiting.state else {
+            unreachable!("a wait is pending")
+        };
+        let mut decisions = vec![waiting];
+
+        record(&mut decisions, pending(call(CALL), feature).in_phase(phase));
+
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            matches!(decisions[0].state, DecisionState::Pending { since, phase: held } if since == started && held == phase)
+        );
+        assert_eq!(
+            text(&chip_spans(&decisions).spans),
+            format!(" {FIRST_FRAME}{word} {WAITED_TEXT}")
+        );
     }
 
     #[test_case(DecisionFeature::SourceCodeContext, "reranking…" ; "a_rerank")]

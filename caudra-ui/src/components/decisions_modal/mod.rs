@@ -9,7 +9,7 @@ mod lines;
 use std::path::Path;
 
 use arc_swap::ArcSwapOption;
-use caudra_agent::decisions::{DecisionFeature, DecisionStatus};
+use caudra_agent::decisions::{DecisionFeature, DecisionStatus, Taint};
 use caudra_config::ClockFormat;
 use caudra_config::decisions::{DecisionKeySource, DecisionsConfig, FeatureMode};
 use caudra_grab::grab_scope;
@@ -210,7 +210,7 @@ enum Logged<'a> {
 pub struct DecisionsModalContext<'a> {
     pub config: &'a DecisionsConfig,
     pub status: &'a DecisionStatus,
-    pub tainted: bool,
+    pub taint: Taint,
     pub mode: &'a PermissionMode,
     pub key_source: Option<DecisionKeySource>,
     pub log_path: &'a Path,
@@ -1110,8 +1110,10 @@ mod tests {
     use test_case::test_case;
 
     use super::lines::{
-        ACTIVITY_FOOTNOTE, API_KEY_FIELD, ENGINE_CONFIGURED, ENGINE_OFF, ERROR_MARK, JSON_SECTIONS,
-        LABEL_MARK, LOGGING_HINT, NO_DECISIONS, NO_SESSION_DECISIONS, READING, recent_row,
+        ACTIVITY_FOOTNOTE, API_KEY_FIELD, CONTENT_CLEAN, CONTENT_FLAGGED, CONTENT_UNSCREENED,
+        ENGINE_CONFIGURED, ENGINE_OFF, ERROR_MARK, JSON_SECTIONS, LABEL_MARK, LOGGING_HINT,
+        NO_DECISIONS, NO_SESSION_DECISIONS, READING, RESTRICTIONS_NORMAL, RESTRICTIONS_TIGHTENED,
+        recent_row,
     };
     use super::*;
     use crate::components::{buffer_text, escape_terminal_controls, key as press};
@@ -1162,6 +1164,7 @@ mod tests {
         status: DecisionStatus,
         mode: PermissionMode,
         key_source: Option<DecisionKeySource>,
+        taint: Taint,
     }
 
     impl Fixture {
@@ -1186,6 +1189,7 @@ mod tests {
                 status: DecisionStatus::default(),
                 mode: PermissionMode::Ask,
                 key_source: None,
+                taint: Taint::default(),
             }
         }
 
@@ -1193,7 +1197,7 @@ mod tests {
             DecisionsModalContext {
                 config: &self.config,
                 status: &self.status,
-                tainted: false,
+                taint: self.taint.clone(),
                 mode: &self.mode,
                 key_source: self.key_source,
                 log_path: Path::new(LOG_PATH),
@@ -1365,6 +1369,43 @@ mod tests {
         assert_eq!(modal.tab(), Tab::Recent);
         let screen = draw(&mut modal, &fixture, WIDE, TALL);
         assert!(screen.contains(STATE_MARKER), "{screen}");
+    }
+
+    #[test_case(false, false, CONTENT_CLEAN, RESTRICTIONS_NORMAL; "clean")]
+    #[test_case(true, false, CONTENT_FLAGGED, RESTRICTIONS_TIGHTENED; "flagged")]
+    #[test_case(false, true, CONTENT_UNSCREENED, RESTRICTIONS_TIGHTENED; "screening_failed")]
+    #[test_case(true, true, "flagged; screening incomplete", RESTRICTIONS_TIGHTENED; "both")]
+    fn the_session_tells_a_detection_from_a_result_it_could_not_screen(
+        flagged: bool,
+        unscreened: bool,
+        content: &str,
+        restrictions: &str,
+    ) {
+        let mut fixture = Fixture::new(true);
+        fixture.taint = Taint {
+            flagged,
+            unscreened,
+        };
+        let mut modal = opened(snapshot());
+
+        let screen = draw(&mut modal, &fixture, WIDE, TALL);
+
+        let rows: Vec<String> = screen
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(usize::from(WIDE))
+            .map(|row| row.iter().collect())
+            .collect();
+        let line = |name: &str| {
+            rows.iter()
+                .map(|row| row.trim_matches(|character: char| !character.is_alphanumeric()))
+                .find_map(|row| row.strip_prefix(name))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("{name}: {screen}"))
+                .to_owned()
+        };
+        assert_eq!(line("Content"), content, "{screen}");
+        assert_eq!(line("Restrictions"), restrictions, "{screen}");
     }
 
     #[test]
