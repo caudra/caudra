@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{StorageConfig, load_env_files};
-use caudra_providers::{format_hit_rate, format_tokens_u64};
+use caudra_providers::{NOT_BILLED_MARK, format_hit_rate, format_tokens_u64};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::retention::{
@@ -880,10 +880,11 @@ fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
             format_tokens_u64(row.output),
             format_tokens_u64(row.cache_read + row.cache_creation),
             format_hit_rate(row.cache_hit_rate),
-            // One column, so a row a plan covered says so with a tilde rather
+            // One column, so a row a plan covered says so with the mark rather
             // than reporting zero next to real tokens.
             match (row.cost, row.subscription_cost) {
-                (0.0, subscription) if subscription > 0.0 => format!("~${subscription:.4}"),
+                (0.0, subscription) if subscription > 0.0 =>
+                    format!("{NOT_BILLED_MARK}${subscription:.4}"),
                 _ => format!("${:.4}", row.cost + row.subscription_cost),
             },
             row.priced_turns + row.unpriced_turns,

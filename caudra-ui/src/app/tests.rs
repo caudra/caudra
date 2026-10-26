@@ -5741,10 +5741,23 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
 const SUBSCRIPTION_TURN_COST: f64 = 0.125;
 const API_TURN_COST: f64 = 0.5;
 const FREE_API_COST: f64 = 0.0;
-const SUBSCRIPTION_ON_BAR: &str = "~$0.125";
+/// A few cents of decision calls, billed through the API beside a subscription.
+const DECISION_CENTS: f64 = 0.01;
+const SUBSCRIBED_CHAT: Spent = (
+    SUBSCRIPTION_TURN_COST,
+    Billing::Subscription,
+    LedgerPurpose::Chat,
+);
+const API_CHAT: Spent = (API_TURN_COST, Billing::Api, LedgerPurpose::Chat);
+const FREE_API_CHAT: Spent = (FREE_API_COST, Billing::Api, LedgerPurpose::Chat);
+const DECISION_CALLS: Spent = (DECISION_CENTS, Billing::Api, LedgerPurpose::Decision);
+const SUBSCRIPTION_ON_BAR: &str = "\u{2248}$0.125";
 const API_ON_BAR: &str = "$0.5";
-const SUBSCRIPTION_IN_USAGE: &str = "subscription (not billed): $0.125";
+const FREE_API_AND_SUBSCRIPTION_ON_BAR: &str = "$0 \u{2248}$0.125";
+const DECISIONS_AND_SUBSCRIPTION_ON_BAR: &str = "$0.01 \u{2248}$0.125";
+const SUBSCRIPTION_IN_USAGE: &str = "\u{2248}$0.125";
 const API_IN_USAGE: &str = "$0.500";
+const DECISIONS_AND_SUBSCRIPTION_IN_USAGE: &str = "$0.010  \u{2248}$0.125";
 const SPEND_LOST_ON_RESTART: &str = "reopening a session must keep what it recorded spending";
 const SPEND_NOT_ON_SCREEN: &str = "the restored spend must be drawn where it was before";
 const SPEND_NOT_ADDED_ONCE: &str = "a turn after reopening must add to the restored spend once";
@@ -5764,6 +5777,26 @@ fn billed_turn(cost: f64, billing: Billing) -> Msg {
         context_size: None,
         context_window: 0,
     })))
+}
+
+/// What one call cost, who paid, and what it was for.
+type Spent = (f64, Billing, LedgerPurpose);
+
+/// Reports spend the way its purpose does: a chat turn completes, while a
+/// decision call arrives as usage beside it.
+fn spent(&(cost, billing, purpose): &Spent) -> Msg {
+    match purpose {
+        LedgerPurpose::Chat => billed_turn(cost, billing),
+        purpose => agent_msg(AgentEvent::ModelUsage {
+            usage: MAIN_TOKENS,
+            cost: Some(cost),
+            billing,
+            provider: TEST_PROVIDER.into(),
+            model: MAIN_MODEL.into(),
+            purpose,
+            account: None,
+        }),
+    }
 }
 
 /// Billed and subscription totals, for the session and for the main chat the
@@ -5817,23 +5850,20 @@ fn reopen(
     (writer, reopened)
 }
 
-#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription)], Some(SUBSCRIPTION_ON_BAR), SUBSCRIPTION_IN_USAGE, true ; "subscription_at_startup")]
-#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription)], Some(SUBSCRIPTION_ON_BAR), SUBSCRIPTION_IN_USAGE, false ; "subscription_loaded")]
-#[test_case(&[(API_TURN_COST, Billing::Api)], Some(API_ON_BAR), API_IN_USAGE, true ; "api_at_startup")]
-#[test_case(&[(FREE_API_COST, Billing::Api), (SUBSCRIPTION_TURN_COST, Billing::Subscription)], None, SUBSCRIPTION_IN_USAGE, true ; "free_api_and_subscription_on_one_model")]
-#[test_case(&[(SUBSCRIPTION_TURN_COST, Billing::Subscription), (FREE_API_COST, Billing::Api)], None, SUBSCRIPTION_IN_USAGE, false ; "subscription_then_free_api_on_one_model")]
-fn restart_keeps_the_recorded_spend(
-    turns: &[(f64, Billing)],
-    on_bar: Option<&str>,
-    in_usage: &str,
-    startup: bool,
-) {
+#[test_case(&[SUBSCRIBED_CHAT], SUBSCRIPTION_ON_BAR, SUBSCRIPTION_IN_USAGE, true ; "subscription_at_startup")]
+#[test_case(&[SUBSCRIBED_CHAT], SUBSCRIPTION_ON_BAR, SUBSCRIPTION_IN_USAGE, false ; "subscription_loaded")]
+#[test_case(&[API_CHAT], API_ON_BAR, API_IN_USAGE, true ; "api_at_startup")]
+#[test_case(&[FREE_API_CHAT, SUBSCRIBED_CHAT], FREE_API_AND_SUBSCRIPTION_ON_BAR, SUBSCRIPTION_IN_USAGE, true ; "free_api_and_subscription_on_one_model")]
+#[test_case(&[SUBSCRIBED_CHAT, FREE_API_CHAT], FREE_API_AND_SUBSCRIPTION_ON_BAR, SUBSCRIPTION_IN_USAGE, false ; "subscription_then_free_api_on_one_model")]
+#[test_case(&[SUBSCRIBED_CHAT, DECISION_CALLS], DECISIONS_AND_SUBSCRIPTION_ON_BAR, DECISIONS_AND_SUBSCRIPTION_IN_USAGE, true ; "decision_cents_beside_a_subscription_at_startup")]
+#[test_case(&[DECISION_CALLS, SUBSCRIBED_CHAT], DECISIONS_AND_SUBSCRIPTION_ON_BAR, DECISIONS_AND_SUBSCRIPTION_IN_USAGE, false ; "decision_cents_beside_a_subscription_loaded")]
+fn restart_keeps_the_recorded_spend(turns: &[Spent], on_bar: &str, in_usage: &str, startup: bool) {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     crate::push_history_message(app.state.session_mut(), Message::user("spend".into()));
     app.status = Status::Streaming;
     app.run_id = 1;
-    for &(cost, billing) in turns {
-        app.update(billed_turn(cost, billing));
+    for turn in turns {
+        app.update(spent(turn));
     }
     let before = spend_shown(&app);
     let by_purpose = app.state.session.usage_by_purpose().clone();
@@ -5846,13 +5876,11 @@ fn restart_keeps_the_recorded_spend(
         &by_purpose,
         "{SPEND_LOST_ON_RESTART}"
     );
-    if let Some(on_bar) = on_bar {
-        let screen = rendered_wide(&mut app, SIGMA_BAR_WIDTH);
-        assert!(
-            screen.contains(on_bar),
-            "{SPEND_NOT_ON_SCREEN}: {on_bar}\n{screen}"
-        );
-    }
+    let screen = rendered_wide(&mut app, SIGMA_BAR_WIDTH);
+    assert!(
+        screen.contains(on_bar),
+        "{SPEND_NOT_ON_SCREEN}: {on_bar}\n{screen}"
+    );
     let screen = usage_screen(&mut app);
     assert!(
         screen.contains(in_usage),

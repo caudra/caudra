@@ -14,7 +14,7 @@ use crate::config_problems::ConfigProblem;
 use crate::theme;
 
 use caudra_providers::accounts::AccountTier;
-use caudra_providers::format_tokens;
+use caudra_providers::{NOT_BILLED_MARK, format_tokens};
 use caudra_storage::sessions::PermissionMode;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -107,9 +107,7 @@ const SANDBOX_TIERS: [&str; 2] = [SANDBOX_PREFIX, SANDBOX_BARE_PREFIX];
 const SANDBOX_NAME_MAX_WIDTH: usize = CHAT_NAME_MAX_WIDTH;
 const MARQUEE_STEP: Duration = Duration::from_millis(120);
 const MARQUEE_PAUSE: Duration = Duration::from_millis(600);
-/// Marks a figure a subscription already covers. One column is all the bar can
-/// spare to say the number is a price rather than a bill.
-const NOT_BILLED_MARK: &str = "~";
+const SESSION_SUM_MARK: &str = "\u{03a3}";
 /// Joins the model a pending mode switch leaves to the one it arrives on,
 /// matching the glyph the mode label uses for the same switch.
 const MODEL_TRANSITION_ARROW: &str = "\u{2192}";
@@ -126,7 +124,8 @@ const TIP_CONTEXT: &str = "Context: ";
 const TIP_COMPACTS: &str = "Compacts at ";
 const TIP_CHAT_SPEND: &str = "This chat: ";
 const TIP_SESSION_SPEND: &str = "Whole session: ";
-const TIP_NOT_BILLED: &str = "~ marks spend your subscription covers";
+/// Follows [`NOT_BILLED_MARK`] on the tooltip line that explains it.
+const TIP_NOT_BILLED: &str = " marks spend your subscription covers";
 const TIP_RETRY: &str = "Attempt ";
 const TIP_RESUME: &str = "Click to follow new output again";
 const TIP_YOLO: &str = "YOLO: tool calls run without asking. Deny rules still apply";
@@ -257,17 +256,35 @@ pub fn workflow_chip(runs: &[RunSnapshot]) -> Option<WorkflowChip> {
     })
 }
 
-/// What to draw in the bar's one cost slot. Billed spend wins the slot when a
-/// session mixes the two, because that is the number someone pays; the tilde
-/// would otherwise claim the whole figure is notional when part of it is real.
-fn spend(billed: Option<f64>, subscription: Option<f64>) -> Option<String> {
-    match (billed, subscription) {
-        (Some(billed), _) => Some(format!("${}", compact_price(billed))),
-        (None, Some(subscription)) => {
-            Some(format!("{NOT_BILLED_MARK}${}", compact_price(subscription)))
-        }
-        (None, None) => None,
-    }
+/// What the bar's cost slot draws, at both of its widths.
+struct SpendFigure {
+    /// Every payer the session has, billed first: `$0.01 ≈$9.05`.
+    full: String,
+    /// The larger figure alone, in its own marking, for a bar too narrow to
+    /// carry both. The same as `full` for a session with one payer.
+    short: String,
+}
+
+/// A session that mixes payers shows both figures, because a few cents of
+/// billed calls must not hide dollars a subscription covered, and the mark
+/// marks only the figure nobody is invoiced for.
+fn spend(billed: Option<f64>, subscription: Option<f64>) -> Option<SpendFigure> {
+    let billed_text = |cost| format!("${}", compact_price(cost));
+    let covered_text = |cost| format!("{NOT_BILLED_MARK}${}", compact_price(cost));
+    let (full, short) = match (billed, subscription) {
+        (Some(billed), Some(covered)) => (
+            format!("{} {}", billed_text(billed), covered_text(covered)),
+            if covered > billed {
+                covered_text(covered)
+            } else {
+                billed_text(billed)
+            },
+        ),
+        (Some(billed), None) => (billed_text(billed), billed_text(billed)),
+        (None, Some(covered)) => (covered_text(covered), covered_text(covered)),
+        (None, None) => return None,
+    };
+    Some(SpendFigure { full, short })
 }
 
 fn compact_price(value: f64) -> String {
@@ -561,6 +578,7 @@ enum Reduction {
     ShortWorkflows,
     ShortPermission,
     DropTransition,
+    ShortSpend,
     DropSpend,
     DropContext,
     DropFast,
@@ -597,6 +615,7 @@ impl Reduction {
             | Self::DropCompactionBorder
             | Self::CompactContext
             | Self::ShortWorkflows
+            | Self::ShortSpend
             | Self::DropSpend
             | Self::DropContext
             | Self::DropWorkflows => Band::Live,
@@ -619,9 +638,12 @@ impl Reduction {
 /// and its counts survive. Yolo is a warning, and `[!]` is the only rung that
 /// leaves a chip with no word at all.
 ///
+/// A session that mixes payers gives up its smaller figure before it gives up
+/// the price altogether.
+///
 /// A split footer walks this same ladder once per row, skipping the rungs of
 /// the other [`Band`], so both layouts give up their chips in one order.
-const LADDER: [Reduction; 16] = [
+const LADDER: [Reduction; 17] = [
     Reduction::DropGauge,
     Reduction::LeafModel,
     Reduction::DropGlobalSpend,
@@ -631,6 +653,7 @@ const LADDER: [Reduction; 16] = [
     Reduction::ShortWorkflows,
     Reduction::ShortPermission,
     Reduction::DropTransition,
+    Reduction::ShortSpend,
     Reduction::DropSpend,
     Reduction::DropContext,
     Reduction::DropFast,
@@ -651,8 +674,8 @@ struct SpendText {
     /// in use so the bar says how far off it is rather than only how full it is.
     border: Option<String>,
     over_border: bool,
-    spend: Option<String>,
-    global: Option<String>,
+    spend: Option<SpendFigure>,
+    global: Option<SpendFigure>,
     /// `None` without a window to measure against.
     gauge: Option<Gauge>,
 }
@@ -685,7 +708,10 @@ impl SpendText {
             spend: spend(stats.cost, stats.subscription_cost),
             global: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
-                .map(|global| format!("\u{03a3}{global}")),
+                .map(|global| SpendFigure {
+                    full: format!("{SESSION_SUM_MARK}{}", global.full),
+                    short: format!("{SESSION_SUM_MARK}{}", global.short),
+                }),
             gauge: Gauge::new(stats),
         }
     }
@@ -772,6 +798,7 @@ fn cells(glyph: char, count: u8) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Fit {
     spend: bool,
+    short_spend: bool,
     global_spend: bool,
     context: ContextTier,
     compaction_border: bool,
@@ -786,6 +813,7 @@ struct Fit {
 impl Fit {
     const FULL: Self = Self {
         spend: true,
+        short_spend: false,
         global_spend: true,
         context: ContextTier::Gauge,
         compaction_border: true,
@@ -808,6 +836,7 @@ impl Fit {
             Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
             Reduction::ShortPermission => self.permission = PermissionTier::Sigil,
             Reduction::DropTransition => self.transition = false,
+            Reduction::ShortSpend => self.short_spend = true,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropFast => self.fast = false,
@@ -923,11 +952,26 @@ impl Fit {
         }
     }
 
+    fn spend_tier(self, figure: &SpendFigure) -> &str {
+        match self.short_spend {
+            true => &figure.short,
+            false => &figure.full,
+        }
+    }
+
     /// Both figures answer the same question, so they are drawn and hit as one
     /// control rather than as a price with a total stuck to it.
     fn money_text(self, spend: &SpendText) -> Option<Cow<'_, str>> {
-        let chat = spend.spend.as_deref().filter(|_| self.spend);
-        let session = spend.global.as_deref().filter(|_| self.global_spend);
+        let chat = spend
+            .spend
+            .as_ref()
+            .filter(|_| self.spend)
+            .map(|figure| self.spend_tier(figure));
+        let session = spend
+            .global
+            .as_ref()
+            .filter(|_| self.global_spend)
+            .map(|figure| self.spend_tier(figure));
         match (chat, session) {
             (Some(chat), Some(session)) => Some(Cow::Owned(format!(" {chat} {session}"))),
             (Some(only), None) | (None, Some(only)) => Some(Cow::Owned(format!(" {only}"))),
@@ -2064,13 +2108,13 @@ fn context_tip(stats: &UsageStats) -> String {
 
 fn usage_tip(stats: &UsageStats) -> Option<String> {
     let chat = spend(stats.cost, stats.subscription_cost)?;
-    let mut lines = vec![format!("{TIP_CHAT_SPEND}{chat}")];
+    let mut lines = vec![format!("{TIP_CHAT_SPEND}{}", chat.full)];
     let session = spend(stats.global_cost, stats.global_subscription_cost);
     if let Some(session) = session.as_ref().filter(|_| stats.show_global) {
-        lines.push(format!("{TIP_SESSION_SPEND}{session}"));
+        lines.push(format!("{TIP_SESSION_SPEND}{}", session.full));
     }
     if lines.iter().any(|line| line.contains(NOT_BILLED_MARK)) {
-        lines.push(TIP_NOT_BILLED.to_owned());
+        lines.push(format!("{NOT_BILLED_MARK}{TIP_NOT_BILLED}"));
     }
     Some(lines.join("\n"))
 }
@@ -2584,6 +2628,19 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.5";
     const SIGMA: char = '\u{03a3}';
+    /// Subscription spend for the chat and the session, larger than the billed
+    /// [`CHAT_COST`] and [`SESSION_COST`] beside it.
+    const COVERED_COSTS: (f64, f64) = (4.5, 9.25);
+    const MIXED_CHAT_GLYPHS: &str = "$0.25 \u{2248}$4.5";
+    const MIXED_MONEY_GLYPHS: &str = "$0.25 \u{2248}$4.5 \u{03a3}$1.5 \u{2248}$9.25";
+    const SHORT_MIXED_GLYPHS: &str = "\u{2248}$4.5";
+    /// The tooltip names the session in words, so its figure needs no sigma.
+    const MIXED_SESSION_TIP: &str = "Whole session: $1.5 \u{2248}$9.25";
+    /// Room for both payers of both figures.
+    const MIXED_WIDE_BUDGET: usize = 160;
+    const SHORT_SPEND_MSG: &str =
+        "a mixed price must show both payers, then the larger, then nothing";
+    const TIP_PAYERS_MSG: &str = "the tooltip must name both payers whatever the bar dropped";
     const GOAL_CONDITION: &str = "all focused tests pass";
     const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
     const RETRY_MESSAGE: &str = "Rate limited: rate_limit_error";
@@ -2930,6 +2987,16 @@ mod tests {
 
     /// The same bar mid mode switch, `leaving` naming the model it is leaving.
     fn with_ladder_ctx_leaving(leaving: Option<&str>, f: impl FnOnce(&StatusBarContext<'_>)) {
+        with_ladder_ctx_spending(leaving, None, f);
+    }
+
+    /// The ladder bar, with `covered` spend beside the billed figures when a
+    /// subscription paid for part of the session.
+    fn with_ladder_ctx_spending(
+        leaving: Option<&str>,
+        covered: Option<(f64, f64)>,
+        f: impl FnOnce(&StatusBarContext<'_>),
+    ) {
         let ctx = StatusBarContext {
             status: &Status::Idle,
             mode: ModeLabel {
@@ -2941,10 +3008,10 @@ mod tests {
             pending_model: leaving.map(Cow::Borrowed),
             stats: UsageStats {
                 global_cost: Some(SESSION_COST),
-                global_subscription_cost: None,
+                global_subscription_cost: covered.map(|(_, session)| session),
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
-                subscription_cost: None,
+                subscription_cost: covered.map(|(chat, _)| chat),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 compaction_border: Some(COMPACTION_BORDER),
                 show_global: true,
@@ -3208,6 +3275,48 @@ mod tests {
 
             assert!(glyphs.starts_with(CHAT_COST_TEXT), "{glyphs}");
             assert!(glyphs.ends_with(SESSION_COST_TEXT), "{glyphs}");
+        });
+    }
+
+    /// Walking down from a wide bar, a mixed price shows both payers, then the
+    /// larger figure alone, then nothing, and never one of those out of order.
+    /// The hit covers whatever tier is drawn.
+    #[test]
+    fn a_mixed_price_gives_up_its_smaller_figure_before_the_price() {
+        with_ladder_ctx_spending(None, Some(COVERED_COSTS), |ctx| {
+            let tiers: Vec<Option<String>> = (0..=MIXED_WIDE_BUDGET)
+                .rev()
+                .map(|budget| {
+                    drawn_glyphs(
+                        &right_side(ctx, LADDER_CWD, budget),
+                        StatusBarHitTarget::Usage,
+                    )
+                })
+                .collect();
+            let mut seen = tiers.clone();
+            seen.dedup();
+
+            assert_eq!(
+                seen,
+                [
+                    Some(MIXED_MONEY_GLYPHS.to_owned()),
+                    Some(MIXED_CHAT_GLYPHS.to_owned()),
+                    Some(SHORT_MIXED_GLYPHS.to_owned()),
+                    None,
+                ],
+                "{SHORT_SPEND_MSG}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_spend_tooltip_names_both_payers() {
+        with_ladder_ctx_spending(None, Some(COVERED_COSTS), |ctx| {
+            let tip = usage_tip(&ctx.stats).expect(MISSING_HIT_MSG);
+
+            assert!(tip.contains(MIXED_CHAT_GLYPHS), "{TIP_PAYERS_MSG}: {tip}");
+            assert!(tip.contains(MIXED_SESSION_TIP), "{TIP_PAYERS_MSG}: {tip}");
+            assert!(tip.contains(TIP_NOT_BILLED), "{TIP_PAYERS_MSG}: {tip}");
         });
     }
 
@@ -5083,18 +5192,26 @@ mod tests {
         assert_eq!(truncate_tail(input, max_width), expected);
     }
 
-    /// The tilde is the bar's only room to say a figure is a price rather than
+    /// The mark is the bar's only room to say a figure is a price rather than
     /// a bill, so a session that owes real money must not wear one.
-    #[test_case(Some(0.123), None,        Some("$0.123")  ; "billed_spend_is_bare")]
-    #[test_case(None,        Some(4.567), Some("~$4.567") ; "subscription_is_marked")]
-    #[test_case(Some(0.123), Some(4.567), Some("$0.123")  ; "billed_wins_a_mixed_slot")]
-    #[test_case(Some(0.250), None,        Some("$0.25")   ; "empty_hundredth_is_trimmed")]
-    #[test_case(Some(1.500), None,        Some("$1.5")    ; "empty_hundredths_are_trimmed")]
-    #[test_case(Some(0.0004), None,       Some("$0.000")  ; "tiny_real_cost_does_not_claim_zero")]
-    #[test_case(Some(0.0), None,          Some("$0")      ; "known_zero_is_zero")]
-    #[test_case(None,        None,        None            ; "nothing_spent_shows_nothing")]
-    fn spend_cases(billed: Option<f64>, subscription: Option<f64>, expected: Option<&str>) {
-        assert_eq!(spend(billed, subscription).as_deref(), expected);
+    #[test_case(Some(0.123), None,        Some(("$0.123", "$0.123"))           ; "billed_spend_is_bare")]
+    #[test_case(None,        Some(4.567), Some(("\u{2248}$4.567", "\u{2248}$4.567"))         ; "subscription_is_marked")]
+    #[test_case(Some(0.123), Some(4.567), Some(("$0.123 \u{2248}$4.567", "\u{2248}$4.567")) ; "a_mixed_slot_shows_both_and_squeezes_to_the_larger")]
+    #[test_case(Some(4.567), Some(0.123), Some(("$4.567 \u{2248}$0.123", "$4.567"))  ; "a_larger_bill_keeps_its_own_marking")]
+    #[test_case(Some(0.0),   Some(0.125), Some(("$0 \u{2248}$0.125", "\u{2248}$0.125"))     ; "a_free_bill_never_hides_a_subscription")]
+    #[test_case(Some(0.250), None,        Some(("$0.25", "$0.25"))             ; "empty_hundredth_is_trimmed")]
+    #[test_case(Some(1.500), None,        Some(("$1.5", "$1.5"))               ; "empty_hundredths_are_trimmed")]
+    #[test_case(Some(0.0004), None,       Some(("$0.000", "$0.000"))           ; "tiny_real_cost_does_not_claim_zero")]
+    #[test_case(Some(0.0), None,          Some(("$0", "$0"))                   ; "known_zero_is_zero")]
+    #[test_case(None,        None,        None                                 ; "nothing_spent_shows_nothing")]
+    fn spend_cases(billed: Option<f64>, subscription: Option<f64>, expected: Option<(&str, &str)>) {
+        let figure = spend(billed, subscription);
+        assert_eq!(
+            figure
+                .as_ref()
+                .map(|figure| (figure.full.as_str(), figure.short.as_str())),
+            expected
+        );
     }
 
     #[test_case("model", 7, "[model]" ; "fits")]

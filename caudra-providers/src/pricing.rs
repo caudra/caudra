@@ -16,6 +16,9 @@ use jiff::tz::TimeZone;
 
 use crate::model::{Billing, Model, ModelPricing, TokenUsage};
 
+/// Marks a figure a subscription covered: what the same tokens are worth at API
+/// rates, with no invoice behind it. Every place that prints one uses this.
+pub const NOT_BILLED_MARK: &str = "\u{2248}";
 const HOURS_PER_DAY: u8 = 24;
 const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = HOURS_PER_DAY as i64 * SECONDS_PER_HOUR;

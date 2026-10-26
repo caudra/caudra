@@ -8,8 +8,8 @@ use caudra_config::ClockFormat;
 use caudra_grab::grab_scope;
 use caudra_providers::accounts::AccountStatus;
 use caudra_providers::{
-    AgentError, Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
-    format_tokens, format_tokens_u64, model_cost,
+    AgentError, Billing, Model, ModelSpend, NOT_BILLED_MARK, ProviderUsage, TokenUsage, add_cost,
+    format_hit_rate, format_tokens, format_tokens_u64, model_cost,
 };
 use caudra_storage::cache_warming::{EpisodeKind, WarmingSummary};
 use caudra_storage::sessions::StoredTokenUsage;
@@ -80,10 +80,11 @@ const STALE_PREFIX: &str = "couldn't refresh: ";
 const STALE_FROM: &str = "showing figures from ";
 const FRESH_FROM: &str = "as of ";
 const NOTE_SEPARATOR: &str = " · ";
-/// What a subscription figure is: the API list price for the same tokens, with
-/// no invoice behind it.
-const SUBSCRIPTION_LINE: &str = "subscription (not billed)";
-const NOT_BILLED_MARK: &str = "~";
+/// Follows [`NOT_BILLED_MARK`] to say what a subscription figure is: the API
+/// list price for the same tokens, with no invoice behind it.
+const SUBSCRIPTION_LEGEND: &str = " is what a subscription covered, not billed";
+const SESSION_DECIMALS: usize = 3;
+const LIFETIME_DECIMALS: usize = 2;
 const WARMING_HEADING: &str = "Cache warming";
 const WARMING_HEADER: [&str; 7] = ["mode", "episodes", "warms", "cost", "saved", "net", "hit"];
 /// A shadow row is what warming would have done, never what it did.
@@ -554,8 +555,16 @@ fn build_lines(
         theme.keybind_section,
     )));
 
-    lines.push(Line::from(totals_row(ctx.total, ctx.total_cost, theme)));
-    lines.extend(subscription_line(ctx.subscription_cost, theme));
+    let covered = covered_spend(ctx.subscription_cost);
+    let mut totals = totals_row(ctx.total, theme);
+    totals.extend(spend_spans(
+        ctx.total_cost,
+        covered,
+        SESSION_DECIMALS,
+        theme,
+    ));
+    lines.push(Line::from(totals));
+    lines.extend(subscription_legend(covered, theme));
 
     if let Some(state) = quota {
         lines.push(Line::default());
@@ -787,37 +796,36 @@ fn build_lifetime_lines(
         );
     }
 
+    let covered = covered_spend(Some(lifetime.subscription_cost));
+    let mut totals = vec![
+        Span::raw(PREFIX),
+        Span::styled(
+            format!(
+                "base in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
+                format_tokens_u64(lifetime.input),
+                format_tokens_u64(lifetime.output),
+                format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
+                format_tokens_u64(lifetime.total_tokens()),
+                format_hit_rate(lifetime.cache_hit_rate()),
+                lifetime.turns(),
+            ),
+            fg,
+        ),
+    ];
+    totals.extend(spend_spans(
+        Some(lifetime.cost),
+        covered,
+        LIFETIME_DECIMALS,
+        theme,
+    ));
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{PREFIX}All time"),
             theme.keybind_section,
         )),
-        Line::from(vec![
-            Span::raw(PREFIX),
-            Span::styled(
-                format!(
-                    "base in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
-                    format_tokens_u64(lifetime.input),
-                    format_tokens_u64(lifetime.output),
-                    format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
-                    format_tokens_u64(lifetime.total_tokens()),
-                    format_hit_rate(lifetime.cache_hit_rate()),
-                    lifetime.turns(),
-                ),
-                fg,
-            ),
-            Span::styled(format!("  ${:.2}", lifetime.cost), theme.accent),
-        ]),
+        Line::from(totals),
     ];
-    if lifetime.subscription_cost > 0.0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{PREFIX}{SUBSCRIPTION_LINE}: ${:.2}",
-                lifetime.subscription_cost
-            ),
-            theme.status_dim,
-        )));
-    }
+    lines.extend(subscription_legend(covered, theme));
     if lifetime.ephemeral_cost > 0.0 {
         lines.push(Line::from(Span::styled(
             format!(
@@ -1043,22 +1051,41 @@ fn warming_lines(
     lines
 }
 
-/// Its own line rather than a share of the total: the headline number is money
-/// owed, and a subscription owes none. Absent when there is none to report.
-fn subscription_line(cost: Option<f64>, theme: &crate::theme::Theme) -> Option<Line<'static>> {
-    let cost = cost.filter(|cost| *cost > 0.0)?;
+/// Subscription spend worth reporting: none at all draws nothing, rather than
+/// a "≈$0.000" beside the bill.
+fn covered_spend(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|cost| *cost > 0.0)
+}
+
+/// The headline's money, billed first and the subscription figure beside it.
+/// Never one sum: the bill is money owed, and a subscription owes none, but a
+/// few cents of billed calls must not hide what the subscription covered.
+fn spend_spans(
+    billed: Option<f64>,
+    covered: Option<f64>,
+    decimals: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let billed = billed.map(|cost| format!("  ${cost:.decimals$}"));
+    let covered = covered.map(|cost| format!("  {NOT_BILLED_MARK}${cost:.decimals$}"));
+    [billed, covered]
+        .into_iter()
+        .flatten()
+        .map(|text| Span::styled(text, theme.accent))
+        .collect()
+}
+
+/// Says what the mark means, once there is a subscription figure to mark.
+fn subscription_legend(covered: Option<f64>, theme: &Theme) -> Option<Line<'static>> {
+    covered?;
     Some(Line::from(Span::styled(
-        format!("{PREFIX}{SUBSCRIPTION_LINE}: ${cost:.3}"),
+        format!("{PREFIX}{NOT_BILLED_MARK}{SUBSCRIPTION_LEGEND}"),
         theme.status_dim,
     )))
 }
 
-fn totals_row(
-    total: &TokenUsage,
-    cost: Option<f64>,
-    theme: &crate::theme::Theme,
-) -> Vec<Span<'static>> {
-    let mut spans = vec![
+fn totals_row(total: &TokenUsage, theme: &Theme) -> Vec<Span<'static>> {
+    vec![
         Span::raw(PREFIX),
         Span::styled(
             format!(
@@ -1072,11 +1099,7 @@ fn totals_row(
             ),
             Style::new().fg(theme.foreground),
         ),
-    ];
-    if let Some(c) = cost {
-        spans.push(Span::styled(format!("  ${c:.3}"), theme.accent));
-    }
-    spans
+    ]
 }
 
 fn table_tokens(tokens: u64) -> String {
@@ -1445,6 +1468,9 @@ mod tests {
     const RECORDED_TEXT: &str = "0.123";
     const SUBSCRIPTION_COST: f64 = 4.567;
     const SUBSCRIPTION_TEXT: &str = "4.567";
+    /// [`RECORDED_COST`] and [`SUBSCRIPTION_COST`] at the lifetime view's cents.
+    const LIFETIME_RECORDED: &str = "0.12";
+    const LIFETIME_COVERED: &str = "4.57";
     const TOTAL_STAYS_BILLED: &str =
         "the headline total is money owed, and a subscription owes none";
     /// 1M input tokens at the test model's $3/1M: what the modal would print if
@@ -1467,6 +1493,7 @@ mod tests {
     const FOLDED_BUCKET_VALUES: &str =
         " 124       56         254           70      504      57%   0.246";
     const BASE_INPUT_PREFIX: &str = "  base in 101 ";
+    const BASE_INPUT_LABEL: &str = "base in";
     const LIFETIME_MODEL: &str = "anthropic/claude-opus-5";
     const LIFETIME_PROJECT: &str = "/home/dev/caudra";
     const SCOPE_SURVIVES_CLOSE: &str =
@@ -1524,11 +1551,11 @@ mod tests {
     const TABLE_BODY: usize = 3;
     const DECIMAL_ALIGNMENT: &str = "numeric columns must share a decimal position";
     const TABLE_COST_CASES: [(Option<f64>, bool, &str); 6] = [
-        (Some(120.646), true, "~120.646"),
-        (Some(219.226), true, "~219.226"),
+        (Some(120.646), true, "\u{2248}120.646"),
+        (Some(219.226), true, "\u{2248}219.226"),
         (Some(0.400), false, "0.400"),
         (None, false, NO_COST_TEXT),
-        (Some(0.002), true, "~0.002"),
+        (Some(0.002), true, "\u{2248}0.002"),
         (Some(999.9996), false, "1000.000"),
     ];
 
@@ -1702,7 +1729,7 @@ mod tests {
         .collect();
         let lines = slice_rows(&slices, fg, theme.status_dim);
         let expected_costs = if subscription {
-            [" ~120.646", "   ~0.002", "~1000.000"]
+            [" \u{2248}120.646", "   \u{2248}0.002", "\u{2248}1000.000"]
         } else {
             [" 120.646", "   0.002", "1000.000"]
         };
@@ -2551,7 +2578,7 @@ mod tests {
         let theme = crate::theme::current();
         let total = TokenUsage::from(ALL_BUCKETS);
         let rows = match scope {
-            UsageScope::Session => line_texts(&[Line::from(totals_row(&total, None, &theme))]),
+            UsageScope::Session => line_texts(&[Line::from(totals_row(&total, &theme))]),
             UsageScope::Lifetime => lifetime_texts(Some(&LifetimeUsage {
                 input: u64::from(total.input),
                 output: u64::from(total.output),
@@ -2710,47 +2737,66 @@ mod tests {
         assert!(own.contains(FOLDED_RATE), "{own}");
     }
 
-    /// A subscription owes nothing, so folding its figure into the headline
-    /// would report money that no invoice will ever ask for.
-    #[test]
-    fn a_subscription_gets_its_own_line_and_never_joins_the_total() {
-        let model = test_model();
+    /// A subscription owes nothing, so its figure stands beside the bill marked
+    /// as not billed rather than folded into it. A few cents billed beside it
+    /// must not hide it either, so both sit on the headline.
+    #[test_case(Some(RECORDED_COST), None,                    Some(format!("  ${RECORDED_TEXT}"))                                ; "billed_only")]
+    #[test_case(None,                Some(SUBSCRIPTION_COST), Some(format!("  {NOT_BILLED_MARK}${SUBSCRIPTION_TEXT}"))                           ; "covered_only")]
+    #[test_case(Some(RECORDED_COST), Some(SUBSCRIPTION_COST), Some(format!("  ${RECORDED_TEXT}  {NOT_BILLED_MARK}${SUBSCRIPTION_TEXT}"))         ; "both_side_by_side")]
+    #[test_case(Some(RECORDED_COST), Some(0.0),               Some(format!("  ${RECORDED_TEXT}"))                                ; "nothing_covered_is_not_drawn")]
+    #[test_case(None,                None,                    None                                                               ; "unpriced")]
+    fn the_session_headline_shows_each_payer(
+        billed: Option<f64>,
+        covered: Option<f64>,
+        money: Option<String>,
+    ) {
         let total = TokenUsage {
             input: ONE_MILLION,
             ..Default::default()
         };
-        let rows = |subscription| {
-            modal_rows_with_subscription(
-                &total,
-                Some(RECORDED_COST),
-                subscription,
-                &HashMap::new(),
-                &model,
-            )
-        };
-
-        let quiet = rows(None).join("\n");
-        assert!(!quiet.contains(SUBSCRIPTION_LINE), "{quiet}");
-
-        let loud = rows(Some(SUBSCRIPTION_COST));
-        let line = loud
-            .iter()
-            .find(|t| t.contains(SUBSCRIPTION_LINE))
-            .unwrap_or_else(|| panic!("no subscription line: {loud:?}"));
-        assert!(line.contains(SUBSCRIPTION_TEXT), "{line}");
-        assert!(
-            !line.contains(ONE_MILLION_TEXT),
-            "{TOTAL_STAYS_BILLED}: {line}"
-        );
-
-        let totals = loud
+        let rows =
+            modal_rows_with_subscription(&total, billed, covered, &HashMap::new(), &test_model());
+        let totals = rows
             .iter()
             .find(|t| t.contains(ONE_MILLION_TEXT))
-            .unwrap_or_else(|| panic!("no totals row: {loud:?}"));
-        assert!(totals.contains(RECORDED_TEXT), "{totals}");
-        assert!(
-            !totals.contains(SUBSCRIPTION_TEXT),
-            "{TOTAL_STAYS_BILLED}: {totals}"
+            .unwrap_or_else(|| panic!("no totals row: {rows:?}"));
+
+        let drawn = totals
+            .find("  $")
+            .or_else(|| totals.find(&format!("  {NOT_BILLED_MARK}")))
+            .map(|at| &totals[at..]);
+        assert_eq!(
+            drawn.map(str::trim_end),
+            money.as_deref(),
+            "{TOTAL_STAYS_BILLED}"
+        );
+        assert_eq!(
+            rows.iter().any(|t| t.contains(SUBSCRIPTION_LEGEND)),
+            covered_spend(covered).is_some(),
+            "{rows:?}"
+        );
+    }
+
+    #[test_case(0.0,               None                                                    ; "billed_only")]
+    #[test_case(SUBSCRIPTION_COST, Some(format!("  ${LIFETIME_RECORDED}  {NOT_BILLED_MARK}${LIFETIME_COVERED}")) ; "both_side_by_side")]
+    fn the_lifetime_headline_shows_each_payer(covered: f64, both: Option<String>) {
+        let texts = lifetime_texts(Some(&LifetimeUsage {
+            subscription_cost: covered,
+            ..lifetime()
+        }));
+        let totals = texts
+            .iter()
+            .find(|t| t.contains(BASE_INPUT_LABEL))
+            .unwrap_or_else(|| panic!("no totals row: {texts:?}"));
+
+        match both {
+            Some(both) => assert!(totals.trim_end().ends_with(&both), "{totals}"),
+            None => assert!(!totals.contains(NOT_BILLED_MARK), "{totals}"),
+        }
+        assert_eq!(
+            texts.iter().any(|t| t.contains(SUBSCRIPTION_LEGEND)),
+            covered > 0.0,
+            "{texts:?}"
         );
     }
 

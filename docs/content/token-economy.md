@@ -162,9 +162,9 @@ While warming is off, Caudra still works out what it would have done and shows t
 
 ## Spend on a subscription
 
-A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.
+A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, marked `≈`. That is what the same work would have cost through the API.
 
-The status bar has room for one number. It shows real spend when there is any, and puts a tilde in front when a subscription covered the session: `~$0.123`. Clicking the figure opens `/usage`, where the headline total stays money owed and the subscription figure sits on its own line beneath it.
+The status bar shows billed spend first and the subscription figure beside it: `$0.01 ≈$9.05`. A session on a subscription often has both, because [decision engine](/docs/permissions/#decision-engine-advice) calls bill to an API key. When the bar runs short of room, it keeps the larger figure, then drops spend. Hovering the figure shows both payers for the chat and the whole session. Clicking it opens `/usage`, whose headline shows the same two figures side by side and never adds them together.
 
 Turns recorded before Caudra tracked the two apart are filed as billed spend, so an older ledger can overstate what you paid.
 

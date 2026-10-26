@@ -34,7 +34,7 @@ pub use model::{
     ModelInfo, ModelMarker, ModelPricing, ModelPurpose, PricingTier, StaticReasoningOption,
     ThinkingSupport, TokenUsage, format_tokens,
 };
-pub use pricing::{ModelSpend, SessionSpend, model_cost, settle_session};
+pub use pricing::{ModelSpend, NOT_BILLED_MARK, SessionSpend, model_cost, settle_session};
 pub use provider::WireRequest;
 pub use providers::Timeouts;
 pub use providers::anthropic::auth as anthropic_auth;
