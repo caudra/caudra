@@ -147,6 +147,10 @@ impl LoadingScreen {
         LoadProgress(self.updates.as_ref())
     }
 
+    pub(crate) fn is_active(&self) -> bool {
+        self.thread.is_some()
+    }
+
     /// Takes the card down, leaving the terminal as the main thread last drew
     /// it. Returns once the thread has written its last frame.
     pub(crate) fn close(&mut self) {

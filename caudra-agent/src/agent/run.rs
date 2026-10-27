@@ -21,8 +21,8 @@ use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     AutopilotMessageKind, Billing, CacheKey, ContentBlock, DOCUMENT_TOKENS_PER_PAGE, HistoryItem,
     HistoryItemKind, Message, Model, ModelError, ModelPurpose, ReasoningSource, RequestOptions,
-    Role, StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, UserOrigin,
-    estimate_tokens_cached,
+    Role, StandingReminderKind, StopReason, StreamResponse, ThinkingConfig, Timeouts, TokenUsage,
+    UserOrigin, estimate_tokens_cached,
 };
 
 use super::cache_warming::{CacheWarmer, FinishedRequest, WarmStop, Warmable, prefix_fingerprint};
@@ -39,6 +39,7 @@ use super::history::{
     sanitize_shutdown_history, settle_failed_attempt, user_request,
 };
 use super::instructions::LoadedInstructions;
+use super::live_switch::LiveSwitch;
 use super::measured::{MeasuredContext, SentRequest};
 use super::mention_preamble;
 use super::provider_projection;
@@ -476,6 +477,11 @@ pub struct Agent<'h> {
     cancel: CancelToken,
     retry_now: Nudge,
     stream_retry: StreamRetry,
+    /// Where the user's picks reach this run while it is in flight.
+    live: Option<LiveSwitch>,
+    /// The level a pick put in force, which outlives the inputs queued with
+    /// the level they were typed under.
+    live_thinking: Option<ThinkingConfig>,
     total_usage: TokenUsage,
     measured: Option<MeasuredContext>,
     num_turns: u32,
@@ -664,6 +670,8 @@ impl<'h> Agent<'h> {
             cancel: CancelToken::none(),
             retry_now: Nudge::default(),
             stream_retry: StreamRetry::default(),
+            live: None,
+            live_thinking: None,
             total_usage: TokenUsage::default(),
             measured: None,
             num_turns: 0,
@@ -806,6 +814,14 @@ impl<'h> Agent<'h> {
         }
     }
 
+    fn reasoning_source(&self) -> ReasoningSource {
+        ReasoningSource::sent(
+            &self.model,
+            self.provider.reasoning_transport(&self.model),
+            &self.opts.thinking,
+        )
+    }
+
     /// Where the conversation stands after the run, for a caller that builds
     /// an agent per run: the chat provider and model, which differ from the
     /// ones it started with once it moved to another provider, and the model
@@ -851,6 +867,11 @@ impl<'h> Agent<'h> {
     }
 
     /// Lets a waiting retry be cut short from outside the loop.
+    pub fn with_live_switch(mut self, live: LiveSwitch) -> Self {
+        self.live = Some(live);
+        self
+    }
+
     pub fn with_retry_now(mut self, retry_now: Nudge) -> Self {
         self.retry_now = retry_now;
         self
@@ -1243,7 +1264,10 @@ impl<'h> Agent<'h> {
             }
         }
         self.opts = RequestOptions {
-            thinking: latest.thinking.clone(),
+            thinking: self
+                .live_thinking
+                .clone()
+                .unwrap_or_else(|| latest.thinking.clone()),
             fast: latest.fast,
             cross: accounts::cross_route(
                 self.home_model.as_deref().unwrap_or(&self.model),
@@ -2386,6 +2410,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        self.apply_live_switch().await?;
         self.hold_cache_warmer();
         self.drain_decision_spend();
         // Whatever the previous turn started and nobody took is reported
@@ -2434,8 +2459,12 @@ impl<'h> Agent<'h> {
         let request_started = Instant::now();
         self.requests_since_recall += 1;
         let message_id = CaudraId::generate();
-        self.event_tx
-            .send(AgentEvent::MessageStarted { id: message_id })?;
+        let source = self.reasoning_source();
+        self.event_tx.send(AgentEvent::MessageStarted {
+            id: message_id,
+            model: source.spec(),
+            thinking: source.thinking,
+        })?;
         let (stream_result, warm, prefix, sent) = {
             let tools = &self.tools;
             repair_state.register_definitions(tools);
@@ -2473,6 +2502,7 @@ impl<'h> Agent<'h> {
                 self.cache_key.as_ref(),
                 self.speculative.as_ref(),
                 &mut stream_retry,
+                self.live.as_ref(),
             )
             .await;
             let opts = self.opts.clamped(&self.model);
@@ -2564,10 +2594,7 @@ impl<'h> Agent<'h> {
                         Message {
                             role: Role::Assistant,
                             content,
-                            reasoning_source: Some(ReasoningSource::new(
-                                &self.model,
-                                self.provider.reasoning_transport(&self.model),
-                            )),
+                            reasoning_source: Some(self.reasoning_source()),
                             ..Default::default()
                         },
                         message_id,
@@ -2580,6 +2607,12 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Reroute { reroute, forwarded }) => {
                 return self.reroute(*reroute, forwarded).await;
+            }
+            Err(StreamError::SettingsChanged { forwarded }) => {
+                if forwarded {
+                    self.event_tx.send(AgentEvent::StreamReset)?;
+                }
+                return Ok(TurnOutcome::Continue);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, turns = self.num_turns, "stream_message failed");
@@ -2636,10 +2669,7 @@ impl<'h> Agent<'h> {
             .empty_response
             .recent_tool_window;
         let after_tools = self.history.has_recent_tool_results(recent_tool_window);
-        response.message.reasoning_source = Some(ReasoningSource::new(
-            &self.model,
-            self.provider.reasoning_transport(&self.model),
-        ));
+        response.message.reasoning_source = Some(self.reasoning_source());
         let empty = !has_tools && steering::visible_text(&response.message).is_none();
         // Nothing came back at all, not even reasoning. The request that
         // produced it is unchanged, so repeating it asks the same question
@@ -2740,6 +2770,7 @@ impl<'h> Agent<'h> {
                     Some(&self.event_tx),
                     &self.cancel,
                     &self.retry_now,
+                    self.live.as_ref(),
                 )
                 .await?;
             true
@@ -3733,6 +3764,9 @@ impl<'h> Agent<'h> {
                     return Ok(TurnOutcome::Continue);
                 }
                 Wake::Response(Err(_)) | Wake::Cancelled => return Err(AgentError::Cancelled),
+                Wake::Poll if self.live.as_ref().is_some_and(LiveSwitch::is_pending) => {
+                    return Ok(TurnOutcome::Continue);
+                }
                 Wake::Poll => match self.provider.reload_auth_if_changed().await {
                     Ok(true) => {
                         self.readjust_model();
@@ -3772,13 +3806,22 @@ impl<'h> Agent<'h> {
             })?;
         let provider: Arc<dyn Provider> =
             Arc::from(provider::from_model_async(&mut model, self.timeouts).await?);
-        let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
-        let chat_follows_provider = Arc::ptr_eq(&self.provider, &self.chat_provider);
         let home = self
             .home_model
             .take()
             .unwrap_or_else(|| Arc::clone(&self.model));
         self.home_model = (home.spec() != model.spec()).then_some(home);
+        self.move_to(model, provider);
+        self.event_tx
+            .send(AgentEvent::ModelRerouted(Box::new(reroute)))?;
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Puts the conversation on `model`, keeping the chat route on it when it
+    /// already followed the request route.
+    fn move_to(&mut self, model: Model, provider: Arc<dyn Provider>) {
+        let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
+        let chat_follows_provider = Arc::ptr_eq(&self.provider, &self.chat_provider);
         self.model = Arc::new(model);
         self.provider = provider;
         if chat_follows_model {
@@ -3793,9 +3836,45 @@ impl<'h> Agent<'h> {
         }
         drop(steering);
         self.measured = None;
-        self.event_tx
-            .send(AgentEvent::ModelRerouted(Box::new(reroute)))?;
-        Ok(TurnOutcome::Continue)
+    }
+
+    /// Takes what the user picked since the last request. A picked model
+    /// becomes the one the conversation calls home, and it does not count as
+    /// a provider move.
+    async fn apply_live_switch(&mut self) -> Result<(), AgentError> {
+        let Some(mut change) = self.live.as_ref().and_then(LiveSwitch::take) else {
+            return Ok(());
+        };
+        change.route = change
+            .route
+            .filter(|(_, model)| model.spec() != self.model.spec());
+        if change.is_empty() {
+            return Ok(());
+        }
+        if let Some((provider, mut model)) = change.route.clone() {
+            provider.adjust_model(&mut model);
+            self.home_model = None;
+            self.move_to(model, provider);
+            self.opts.cross = accounts::cross_route(&self.model, &self.model_policy).map(Arc::new);
+        }
+        if let Some(thinking) = &change.thinking {
+            self.opts.thinking = thinking.clone();
+            self.live_thinking = Some(thinking.clone());
+        }
+        self.stream_retry = StreamRetry::default();
+        if let Some(warmer) = &self.cache_warmer {
+            warmer.stop(WarmStop::PrefixChanged);
+        }
+        if let Some(live) = &self.live {
+            live.record_applied(change);
+        }
+        let thinking = self.opts.thinking.label_for(&self.model);
+        info!(model = %self.model.spec(), thinking, "picked settings in force");
+        self.event_tx.send(AgentEvent::SettingsChanged {
+            model: self.model.spec(),
+            thinking,
+        })?;
+        Ok(())
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
@@ -5151,6 +5230,7 @@ mod tests {
 
     use super::*;
     use crate::agent::RefreshedContext;
+    use crate::agent::SettingsChange;
     use crate::agent::goal_progress::MAX_STALLED_TURNS;
     use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot, render};
     use crate::cancel::CancelTrigger;
@@ -7121,6 +7201,7 @@ mod tests {
         captured_system: Arc<Mutex<Vec<String>>>,
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        captured_thinking: Arc<Mutex<Vec<ThinkingConfig>>>,
     }
 
     struct PartialStreamProvider {
@@ -7230,6 +7311,7 @@ mod tests {
                 captured_system: Arc::default(),
                 captured_models: Arc::default(),
                 captured_messages: Arc::default(),
+                captured_thinking: Arc::default(),
             }
         }
     }
@@ -7242,10 +7324,11 @@ mod tests {
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
+                self.captured_thinking.lock().unwrap().push(opts.thinking);
                 self.captured_tools.lock().unwrap().push(tools.clone());
                 self.captured_system.lock().unwrap().push(system.to_owned());
                 self.captured_models.lock().unwrap().push(model.spec());
@@ -11254,6 +11337,131 @@ mod tests {
                     |block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "summary"),
                 )
             }));
+        });
+    }
+
+    const PICKED_MODEL: &str = "openai/gpt-6.1-sol";
+    const PICKED_LEVEL: &str = "low";
+
+    fn spent_then_answered() -> MockProvider {
+        MockProvider::with_results(vec![
+            Err(AgentError::Api {
+                status: RETRY_STATUS,
+                message: RETRY_BODY.into(),
+                retry_after: Some(LONG_RETRY_AFTER),
+            }),
+            Ok(text_response(StopReason::EndTurn)),
+        ])
+    }
+
+    fn picked(model: bool, thinking: bool) -> (SettingsChange, Arc<Mutex<Vec<String>>>) {
+        let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let models = Arc::clone(&provider.captured_models);
+        let change = SettingsChange {
+            route: model.then(|| {
+                (
+                    Arc::new(provider) as Arc<dyn Provider>,
+                    Model::from_spec(PICKED_MODEL).unwrap(),
+                )
+            }),
+            thinking: thinking.then(|| ThinkingConfig::Effort(PICKED_LEVEL.into())),
+        };
+        (change, models)
+    }
+
+    /// A conversation waiting out a spent quota stops waiting the moment the
+    /// user picks something else, and the request goes out again under it.
+    #[test_case(true, false ; "model")]
+    #[test_case(false, true ; "thinking")]
+    #[test_case(true, true ; "both")]
+    fn a_pick_during_the_backoff_resends_at_once(model: bool, thinking: bool) {
+        smol::block_on(async {
+            let spent = spent_then_answered();
+            let spent_models = Arc::clone(&spent.captured_models);
+            let spent_thinking = Arc::clone(&spent.captured_thinking);
+            let (change, picked_models) = picked(model, thinking);
+            let live = LiveSwitch::default();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(spent, &mut history);
+            let mut agent = agent
+                .with_live_switch(live.clone())
+                .with_home_model(Some(Model::from_spec(PICKED_MODEL).unwrap()));
+            let requester = live.clone();
+            let mut change = Some(change);
+            let pump = smol::spawn(async move {
+                let mut events = Vec::new();
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if matches!(envelope.event, AgentEvent::Retry { .. })
+                        && let Some(change) = change.take()
+                    {
+                        requester.request(change);
+                    }
+                    events.push(envelope);
+                }
+                events
+            });
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            let route = agent.conversation_route();
+            drop(agent);
+            let events = pump.await;
+
+            let expected_model = if model {
+                PICKED_MODEL.to_owned()
+            } else {
+                default_model().spec()
+            };
+            assert_eq!(route.model.spec(), expected_model);
+            assert_eq!(
+                route.home.is_none(),
+                model,
+                "a picked model is the conversation's home"
+            );
+            assert_eq!(
+                spent_models.lock().unwrap().len(),
+                if model { 1 } else { 2 }
+            );
+            assert_eq!(picked_models.lock().unwrap().len(), usize::from(model));
+            if !model {
+                assert_eq!(
+                    spent_thinking.lock().unwrap().last(),
+                    Some(&ThinkingConfig::Effort(PICKED_LEVEL.into()))
+                );
+            }
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::SettingsChanged { model, .. } if *model == expected_model
+            )));
+            let applied = live.take_applied().unwrap();
+            assert_eq!(applied.model_spec(), model.then(|| PICKED_MODEL.to_owned()));
+            assert_eq!(applied.thinking.is_some(), thinking);
+        });
+    }
+
+    /// A level picked mid-run outlives input queued under the old one.
+    #[test]
+    fn a_picked_level_outlives_queued_input() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let thinking = Arc::clone(&provider.captured_thinking);
+            let live = LiveSwitch::default();
+            live.request(SettingsChange::thinking(ThinkingConfig::Effort(
+                PICKED_LEVEL.into(),
+            )));
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_live_switch(live);
+            agent.apply_live_switch().await.unwrap();
+
+            agent.run(default_input()).await.unwrap();
+
+            assert_eq!(
+                thinking.lock().unwrap().as_slice(),
+                [ThinkingConfig::Effort(PICKED_LEVEL.into())]
+            );
         });
     }
 

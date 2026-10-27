@@ -3091,9 +3091,12 @@ pub enum AutopilotEvent {
 pub enum AgentEvent {
     TaskAdmitted(TaskCard),
     /// The assistant message the deltas that follow belong to, under the id
-    /// its history items are committed with.
+    /// its history items are committed with, and the model and level its
+    /// request carries, which is what the message's history stamp will say.
     MessageStarted {
         id: CaudraId,
+        model: String,
+        thinking: Option<String>,
     },
     TextDelta {
         text: String,
@@ -3352,6 +3355,14 @@ pub enum AgentEvent {
     /// The conversation's account ran out and no other took over, so the user
     /// may choose one instead of waiting.
     AccountExhausted(Box<AccountExhaustion>),
+    /// The model or level the user picked while the conversation ran is what
+    /// its requests now carry. `thinking` is snapped to `model`, and `None`
+    /// when it cannot reason.
+    SettingsChanged {
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+    },
     /// The conversation moved to another provider's model, because its own
     /// provider's subscriptions ran low or because it came back. Every later
     /// request of the run goes to `to`.
@@ -4126,6 +4137,10 @@ pub struct SubagentInfo {
     pub answer_tx: Option<flume::Sender<String>>,
     #[serde(skip)]
     pub steer_tx: Option<crate::SteeringQueue>,
+    /// Lets the owner move the running task to another model or level, or
+    /// cut its backoff short.
+    #[serde(skip)]
+    pub control: Option<crate::ConversationControl>,
 }
 
 /// Which workflow run an event belongs to, so a consumer can attribute an

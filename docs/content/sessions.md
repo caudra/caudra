@@ -207,6 +207,8 @@ Click `⋮` in the gutter beside a prompt, a reply, reasoning, or a tool call to
 
 The first line of the menu says when the message was sent, or when the tool call started, with its date when that was not today. A tool call that ended a model request also shows the request's tokens and cost, such as `135.9k↑ 872↓ $0.055`. Card headers do not show either. A restored session reads each time from the message's saved ID. Usage shows only for requests made since the session was opened.
 
+For a reply, reasoning, or tool call, the next line names the model that wrote it and the thinking level its request carried, such as `anthropic/claude-opus-5-5 · thinking high`. A model without thinking levels shows only its name. Messages saved before Caudra recorded the model have no model line. See [Switch models while work runs](/docs/commands/#switch-models-while-work-runs) for the rows that mark a change.
+
 In the main chat, the menu offers:
 
 - **Fork here** creates and focuses a new session. Inside Herdr or Orca it opens in a new tab there. See [Forks in Herdr and Orca](#forks-in-herdr-and-orca).

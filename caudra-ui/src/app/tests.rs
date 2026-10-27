@@ -76,11 +76,12 @@ use caudra_agent::types::{
     QuestionReply, QuestionSource, TodoItem, TodoPriority, TodoStatus,
 };
 use caudra_agent::{
-    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
-    EventSender, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
-    SharedBuf, SubagentActivity, SubagentProgress, TaskProvenance, TextOutput, ToolAccounting,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken,
+    ConversationControl, DoneReason, EventSender, GoalResult, GoalStatus, GoalVerdict,
+    HistorySnapshot, ImageMediaType, McpConfigErrors, McpPromptInfo, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, SettingsChange, SharedBuf, SubagentActivity,
+    SubagentProgress, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol, DecisionsConfig};
 use caudra_config::sandbox::SandboxName;
@@ -110,10 +111,11 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
-    PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredAutomationControls,
-    StoredGoalVerdict, StoredGoalWait, StoredImage, StoredInboundPolicy, StoredMode,
-    StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
-    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
+    PermissionMode, SESSIONS_DB_FILE, SessionDatabase, SessionLocation, SessionMeta,
+    StoredActiveGoal, StoredAutomationControls, StoredGoalVerdict, StoredGoalWait, StoredImage,
+    StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls, StoredPromptAdmission,
+    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
+    UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -138,16 +140,20 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::slice::from_ref;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LOAD_BENCH_DB: &str = "CAUDRA_BENCH_DB";
+const LOAD_BENCH_SESSION: &str = "CAUDRA_BENCH_SESSION";
+const LOAD_BENCH_SIZE: (u16, u16) = (120, 34);
 const TODO_MAIN_TEXT: &str = "Review the main implementation";
 const TODO_FIRST_ID: &str = "sticky-todo-research";
 const TODO_FIRST_NAME: &str = "Research task-local state";
@@ -365,6 +371,14 @@ const BACKOFF_SLEPT: &str = "a backgrounded task's countdown has to keep the loo
 /// render.
 const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
 const COUNTDOWN_DRAWN_FOR_THE_WRONG_CHAT: &str = "the bar draws the backoff of the chat on screen";
+const TASK_RETRY_NOT_NUDGED: &str = "a click on a task's countdown must cut that task's backoff";
+const TASK_PICK_LEAKED: &str = "a pick made in a task must go to the task, not the session";
+const TASK_SWITCH_HELD: &str = "a running task must get the pick at its next request";
+const STOPPED_TASK_NOT_RETARGETED: &str = "a stopped task must keep a pick for its continuation";
+const TASK_FOOTER_STALE: &str = "a task's footer must name what its requests now carry";
+const MAIN_SWITCH_MISROUTED: &str = "only a running main turn on the replaced slot takes a pick";
+const SWITCHED_LEVEL: &str = "high";
+const STOPPED_TASK_PROMPT: &str = "look into it";
 const BAR_CLAIMS_THE_COUNTDOWN: &str = "the bar borrows a countdown to draw, it does not own it";
 const RETRY_CONTROL_MISPLACED: &str = "only the main chat's countdown can be clicked";
 const TASK_THINKING: &str = "xhigh";
@@ -588,6 +602,64 @@ pub(crate) fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     (tmp, dir, writer, app)
 }
 
+#[test]
+#[ignore = "requires CAUDRA_BENCH_DB snapshot and CAUDRA_BENCH_SESSION; copies the database before writing"]
+fn benchmark_stored_session_restore() {
+    let source = std::env::var_os(LOAD_BENCH_DB).expect(LOAD_BENCH_DB);
+    let id = std::env::var(LOAD_BENCH_SESSION)
+        .expect(LOAD_BENCH_SESSION)
+        .parse()
+        .unwrap();
+    let tmp = private_tempdir();
+    fs::copy(source, tmp.path().join(SESSIONS_DB_FILE)).unwrap();
+    let dir = StateDir::from_path(tmp.path().to_owned());
+    let writer = Arc::new(test_writer(dir.clone()));
+    let mut app = build_app(dir.clone(), Arc::clone(&writer));
+    let started = Instant::now();
+    let (mut session, cursor) = SessionDatabase::open(&dir)
+        .unwrap()
+        .load_with_cursor(id)
+        .unwrap();
+    let read_ms = started.elapsed().as_millis();
+    writer.adopt_cursor(cursor);
+    let started = Instant::now();
+    let snapshot = super::permission_editor::attach_session_permissions(
+        &dir,
+        &writer,
+        &mut session,
+        &app.permissions,
+    )
+    .unwrap();
+    app.state.session = Arc::new(session);
+    app.conversation_permissions =
+        super::permission_editor::ConversationPermissions::Published(snapshot);
+    let permissions_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    app.restore_display();
+    let restore_ms = started.elapsed().as_millis();
+    let mut terminal =
+        Terminal::new(TestBackend::new(LOAD_BENCH_SIZE.0, LOAD_BENCH_SIZE.1)).unwrap();
+    let started = Instant::now();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let first_frame_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let second_frame_ms = started.elapsed().as_millis();
+    let mut rendered = DefaultHasher::new();
+    buffer_text(terminal.backend().buffer()).hash(&mut rendered);
+    let rendered = rendered.finish();
+    let chats = app.chats.len();
+    eprintln!(
+        "session={id} read_ms={read_ms} permissions_ms={permissions_ms} restore_ms={restore_ms} first_frame_ms={first_frame_ms} second_frame_ms={second_frame_ms} chats={chats} rendered={rendered:x}"
+    );
+    drop(app);
+    Arc::try_unwrap(writer)
+        .ok()
+        .unwrap()
+        .shutdown_checked(WRITER_DRAIN_TIMEOUT)
+        .unwrap();
+}
+
 pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
     Msg::Mouse(MouseEvent {
         kind,
@@ -657,6 +729,7 @@ fn subagent_info_with_tx(
         fast: false,
         answer_tx,
         steer_tx: None,
+        control: None,
     }
 }
 
@@ -2180,6 +2253,7 @@ mod background_runtime {
                     fast: false,
                     answer_tx: None,
                     steer_tx: None,
+                    control: None,
                 }),
                 run_id: fixture.app.run_id,
                 workflow: None,
@@ -6609,7 +6683,7 @@ fn task_composer_executes_an_allowed_command() {
 
 #[test_case("/compact" ; "compact")]
 #[test_case("/continue" ; "resume")]
-#[test_case("/model" ; "model")]
+#[test_case("/model next" ; "model_next")]
 #[test_case("/goal" ; "goal")]
 fn task_composer_blocks_a_main_only_command(command: &str) {
     let (mut app, steer_tx) = focused_task_composer();
@@ -6619,6 +6693,160 @@ fn task_composer_blocks_a_main_only_command(command: &str) {
     assert_eq!(app.status_bar.flash_text(), Some(MAIN_ONLY_CMD_MSG));
     assert!(actions.is_empty(), "{command} must not act on the main run");
     assert!(steer_tx.entries().is_empty(), "{command} must not steer");
+}
+
+/// `/model` and the footer chip on a task open a picker whose choice moves
+/// that task, never the session.
+#[test_case(false ; "command")]
+#[test_case(true ; "footer_chip")]
+fn a_task_model_pick_targets_the_task(from_footer: bool) {
+    let (mut app, _steer_tx) = focused_task_composer();
+    let session_model = app.state.model.spec();
+    if from_footer {
+        click_status(&mut app, StatusBarHitTarget::Model);
+    } else {
+        type_and_submit(&mut app, "/model");
+    }
+    assert!(app.model_picker.is_open());
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(
+        matches!(&actions[..], [Action::SwitchTaskModel { task_id, .. }] if task_id == TASK_ID),
+        "{TASK_PICK_LEAKED}"
+    );
+    assert_eq!(app.state.model.spec(), session_model, "{TASK_PICK_LEAKED}");
+}
+
+#[test]
+fn a_level_typed_in_a_running_task_reaches_it() {
+    let (mut app, _steer_tx) = focused_task_composer();
+    let control = ConversationControl::default();
+    app.subagent_controls
+        .insert(TASK_ID.into(), control.clone());
+    let session_level = app.state.thinking.clone();
+
+    type_and_submit(&mut app, &format!("/thinking {SWITCHED_LEVEL}"));
+
+    let change = control.live.take_pending().expect(TASK_SWITCH_HELD);
+    assert_eq!(
+        change.thinking,
+        Some(ThinkingConfig::Effort(SWITCHED_LEVEL.into()))
+    );
+    assert_eq!(app.state.thinking, session_level, "{TASK_PICK_LEAKED}");
+}
+
+#[test]
+fn a_pick_for_a_stopped_task_waits_for_its_continuation() {
+    let mut app = app_with_subagent();
+    finish_subagent(&mut app, TASK_ID, false);
+    app.subagent_history = Some(SubagentHistoryStore::seeded_with_specs(
+        HashMap::from([(
+            TASK_ID.into(),
+            Arc::new(vec![Message::user(STOPPED_TASK_PROMPT.into())]),
+        )]),
+        HashMap::from([(
+            TASK_ID.into(),
+            caudra_storage::sessions::StoredSubagentTaskSpec::default(),
+        )]),
+    ));
+    let mut model = other_model();
+    let provider = caudra_providers::provider::from_model_fallback(
+        &mut model,
+        caudra_providers::Timeouts::default(),
+    );
+
+    app.switch_task(TASK_ID, SettingsChange::model(Arc::from(provider), model));
+
+    let stored = &app.state.session.subagent_task_specs()[TASK_ID];
+    assert_eq!(
+        stored.model.as_deref(),
+        Some(OTHER_MODEL_SPEC),
+        "{STOPPED_TASK_NOT_RETARGETED}"
+    );
+    assert_eq!(app.chats[1].model_id.as_deref(), Some(OTHER_MODEL_SPEC));
+}
+
+#[test]
+fn a_task_footer_follows_the_switch_its_requests_took() {
+    let mut app = priced_subagent_app();
+
+    app.update(subagent_msg(
+        AgentEvent::SettingsChanged {
+            model: OTHER_MODEL_SPEC.into(),
+            thinking: Some(SWITCHED_LEVEL.into()),
+        },
+        TASK_ID,
+        Some(RESEARCH_NAME),
+    ));
+
+    let chat = &app.chats[1];
+    assert_eq!(
+        chat.model_id.as_deref(),
+        Some(OTHER_MODEL_SPEC),
+        "{TASK_FOOTER_STALE}"
+    );
+    assert_eq!(
+        chat.thinking.as_deref(),
+        Some(SWITCHED_LEVEL),
+        "{TASK_FOOTER_STALE}"
+    );
+}
+
+#[test]
+fn a_main_switch_asks_the_runtime_to_adopt_its_slot() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let actions = app.update(agent_msg(AgentEvent::SettingsChanged {
+        model: OTHER_MODEL_SPEC.into(),
+        thinking: None,
+    }));
+
+    assert!(matches!(&actions[..], [Action::AdoptLiveSwitch(spec)] if spec == OTHER_MODEL_SPEC));
+}
+
+/// A pick reaches a running main turn only while it runs on the slot the
+/// pick replaces: a Plan job's route keeps its model until the turn ends.
+#[test_case(Status::Streaming, true, true   ; "running_on_the_replaced_slot")]
+#[test_case(Status::Streaming, false, false ; "running_on_another_route")]
+#[test_case(Status::Idle, true, false       ; "idle")]
+fn a_main_model_pick_reaches_only_the_turn_it_replaces(
+    status: Status,
+    on_replaced: bool,
+    forwarded: bool,
+) {
+    let mut app = test_app();
+    let control = ConversationControl::default();
+    app.main_control = Some(control.clone());
+    app.status = status;
+    let mut running = if on_replaced {
+        app.state.model.clone()
+    } else {
+        other_model()
+    };
+    let provider: Arc<dyn caudra_providers::provider::Provider> =
+        Arc::from(caudra_providers::provider::from_model_fallback(
+            &mut running,
+            caudra_providers::Timeouts::default(),
+        ));
+    app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(crate::agent::ModelSlot {
+        model: running,
+        provider: Arc::clone(&provider),
+        home: None,
+    })));
+
+    app.forward_main_model(
+        &app.state.model.spec(),
+        SettingsChange::model(provider, other_model()),
+    );
+
+    assert_eq!(
+        control.live.is_pending(),
+        forwarded,
+        "{MAIN_SWITCH_MISROUTED}"
+    );
 }
 
 #[test]
@@ -11202,10 +11430,9 @@ fn priced_subagent_app() -> App {
     app
 }
 
-/// The session's model, reasoning level and goal stay on a task's bar for
-/// reference, but a click on them would move state the task does not own.
+/// The session's mode and goal stay on a task's bar for reference, but a
+/// click on them would move state the task does not own.
 #[test_case(StatusBarHitTarget::Mode  ; "mode")]
-#[test_case(StatusBarHitTarget::Model ; "model")]
 #[test_case(StatusBarHitTarget::Goal  ; "goal")]
 fn session_controls_are_read_only_in_subagent_chat(target: StatusBarHitTarget) {
     let mut app = priced_subagent_app();
@@ -18423,37 +18650,36 @@ fn retry_preserves_partial_output_only_after_injected_settlement(
     }
 }
 
-/// The countdown is a control, not just a label: clicking it asks the agent to
-/// stop waiting, and the chip goes away so the click visibly landed.
+/// The countdown is a control, not just a label: clicking it asks the chat on
+/// screen to stop waiting, and the chip goes away so the click visibly landed.
+/// A task's countdown cuts that task's backoff and leaves the main one alone.
 #[test]
-fn clicking_the_retry_countdown_only_nudges_the_main_chat() {
+fn clicking_the_retry_countdown_nudges_the_chat_on_screen() {
     let mut app = app_with_retrying_subagent();
     let (cmd_tx, cmd_rx) = flume::unbounded();
     app.cmd_tx = Some(cmd_tx);
+    let control = caudra_agent::ConversationControl::default();
+    app.subagent_controls
+        .insert(TASK_ID.into(), control.clone());
     app.update(agent_msg(retry_event()));
     let main_deadline = app.chats[0].retry().unwrap().deadline;
-    let task_deadline = app.chats[1].retry().unwrap().deadline;
-    let hit = status_hit(&mut app, StatusBarHitTarget::Retry);
 
     app.active_chat = 1;
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        assert!(
-            app.update(mouse_event(kind, hit.area.x, hit.area.y))
-                .is_empty()
-        );
-    }
-    assert!(cmd_rx.try_recv().is_err());
+    let task_wait = control.retry_now.listen();
+    assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
+
+    assert!(
+        smol::block_on(smol::future::poll_once(task_wait)).is_some(),
+        "{TASK_RETRY_NOT_NUDGED}"
+    );
+    assert!(app.chats[1].retry().is_none());
     assert_eq!(app.chats[0].retry().unwrap().deadline, main_deadline);
-    assert_eq!(app.chats[1].retry().unwrap().deadline, task_deadline);
+    assert!(cmd_rx.try_recv().is_err());
 
     app.active_chat = 0;
     assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
 
     assert!(app.chats[0].retry().is_none());
-    assert_eq!(app.chats[1].retry().unwrap().deadline, task_deadline);
     assert!(matches!(
         cmd_rx.try_recv(),
         Ok(crate::agent::AgentCommand::RetryNow)
@@ -18643,14 +18869,11 @@ fn a_backgrounded_tasks_backoff_keeps_the_loop_awake() {
 }
 
 /// The bar is drawn for whichever chat is on screen, so it must read that
-/// chat's backoff and no other's. Only the main chat's countdown answers the
-/// pointer: an immediate retry reaches the top-level agent alone, so clicking a
-/// task's chip would cut the main conversation's backoff short and leave the
-/// task on screen waiting out the one the user asked to skip.
+/// chat's backoff and no other's, and its countdown cuts that chat's short.
 #[test_case(0, 0, true, true   ; "the_main_chat_is_waiting_it_out")]
 #[test_case(1, 0, false, false ; "the_main_chat_is_not_the_one_retrying")]
-#[test_case(1, 1, true, false  ; "the_retrying_task_is_on_screen")]
-fn the_focused_chats_countdown_is_drawn_but_only_the_main_chats_is_clickable(
+#[test_case(1, 1, true, true   ; "the_retrying_task_is_on_screen")]
+fn the_focused_chats_countdown_is_drawn_and_clickable(
     retrying: usize,
     focused: usize,
     expect_chip: bool,

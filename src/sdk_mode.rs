@@ -3536,6 +3536,7 @@ impl EventPump {
             | AgentEvent::MemoryChanged
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::SettingsChanged { .. }
             | AgentEvent::AuthRestored
             | AgentEvent::SubagentProgress { .. }
             | AgentEvent::SubagentFinished { .. }
@@ -4489,6 +4490,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
         ] {
             pump.handle(Envelope {
@@ -5710,6 +5712,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
         ))
         .unwrap();
@@ -5746,6 +5749,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
             run_id: 1,
             task: None,
@@ -5787,6 +5791,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
             run_id: 1,
             task: None,
@@ -6796,6 +6801,7 @@ mod tests {
             fast: false,
             answer_tx: None,
             steer_tx: None,
+            control: None,
         };
 
         for envelope in [

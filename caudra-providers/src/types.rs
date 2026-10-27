@@ -384,6 +384,11 @@ pub struct ReasoningSource {
     pub provider: String,
     pub model: String,
     pub transport: ReasoningTransport,
+    /// The level the request that produced this carried, snapped to the
+    /// model. Absent for a model that cannot reason and for items saved
+    /// before it was recorded. Never part of replay gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl ReasoningSource {
@@ -392,7 +397,20 @@ impl ReasoningSource {
             provider: model.provider.to_string(),
             model: model.id.clone(),
             transport,
+            thinking: None,
         }
+    }
+
+    /// What a request to `model` at `thinking` produced.
+    pub fn sent(model: &Model, transport: ReasoningTransport, thinking: &ThinkingConfig) -> Self {
+        Self {
+            thinking: thinking.label_for(model),
+            ..Self::new(model, transport)
+        }
+    }
+
+    pub fn spec(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
     }
 
     pub fn matches(&self, model: &Model, transport: ReasoningTransport) -> bool {
@@ -1255,6 +1273,14 @@ pub enum ThinkingConfig {
 impl ThinkingConfig {
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    /// The level a request to `model` carries, snapped to it. `None` when the
+    /// model cannot reason at all.
+    pub fn label_for(&self, model: &Model) -> Option<String> {
+        model
+            .supports_thinking()
+            .then(|| self.resolve(model).to_string())
     }
 
     /// The one place a setting meets a model. Every level is snapped and every

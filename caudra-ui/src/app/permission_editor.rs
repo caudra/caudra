@@ -152,18 +152,25 @@ pub(crate) fn attach_session_permissions(
     session: &mut AppSession,
     manager: &Arc<PermissionManager>,
 ) -> Result<Arc<ArcSwap<PermissionSnapshot>>, String> {
+    let started = Instant::now();
     let storage = storage.clone();
     let writer = Arc::clone(writer);
     let manager = Arc::clone(manager);
     let initial = Arc::new(session.clone());
-    let snapshot = smol::block_on(smol::unblock(move || {
+    let clone_ms = started.elapsed().as_millis() as u64;
+    let (snapshot, save_ms, read_ms, attach_ms) = smol::block_on(smol::unblock(move || {
+        let saving = Instant::now();
         writer
             .save_sync(Arc::clone(&initial))
             .map_err(|error| error.to_string())?;
+        let save_ms = saving.elapsed().as_millis() as u64;
+        let reading = Instant::now();
         let current = SessionDatabase::open_read_only(&storage)
             .map_err(|error| error.to_string())?
             .permission_snapshot(PermissionOwner::Conversation(initial.id))
             .map_err(|error| error.to_string())?;
+        let read_ms = reading.elapsed().as_millis() as u64;
+        let attaching = Instant::now();
         let snapshot = Arc::new(ArcSwap::from_pointee(current));
         let publication = Arc::new(SessionPermissionPublication {
             storage,
@@ -174,12 +181,28 @@ pub(crate) fn attach_session_permissions(
         manager
             .attach_permission_publication(publication)
             .map_err(|error| error.to_string())?;
-        Ok::<_, String>(snapshot)
+        Ok::<_, String>((
+            snapshot,
+            save_ms,
+            read_ms,
+            attaching.elapsed().as_millis() as u64,
+        ))
     }))?;
+    let applying = Instant::now();
     snapshot
         .load()
         .apply_to_meta(session.id, &mut session.meta)
         .map_err(|error| error.to_string())?;
+    tracing::info!(
+        session_id = %session.id,
+        clone_ms,
+        save_ms,
+        read_ms,
+        attach_ms,
+        apply_ms = applying.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "session permissions attached"
+    );
     Ok(snapshot)
 }
 

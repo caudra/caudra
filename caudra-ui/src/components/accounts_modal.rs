@@ -56,6 +56,7 @@ const OVERRIDDEN_NOTE: &str = "--account or CAUDRA_ACCOUNT set it for this run."
 const NOT_SAVED: &str = "is not a saved account";
 const WAIT: &str = "Wait for it to refill";
 const BROWSE: &str = "Choose another account…";
+const OTHER_MODEL: &str = "Use another model…";
 const TURN_ON_AUTO: &str = "Switch and turn on Auto";
 const ORDER_ARROW: &str = " → ";
 const ORDER_HINT: &str = "o adds or drops a provider, Alt+↑↓ moves it.";
@@ -129,6 +130,8 @@ pub enum AccountsAction {
     Refresh,
     /// The card's way to the full list.
     Browse,
+    /// The card's way to the model picker, for the chat the spent account holds up.
+    PickModel,
 }
 
 /// One provider's pool as `/accounts` lists it.
@@ -206,6 +209,7 @@ enum CardChoice {
     ForRun(AccountName),
     Wait,
     Browse,
+    OtherModel,
 }
 
 struct CardRow {
@@ -619,6 +623,7 @@ impl AccountsModal {
                         retry: true,
                     },
                     CardChoice::ForRun(name) => AccountsAction::UseForRun(name),
+                    CardChoice::OtherModel => AccountsAction::PickModel,
                     CardChoice::Wait | CardChoice::Browse => AccountsAction::Closed,
                 }
             }
@@ -1187,6 +1192,10 @@ fn card_rows(exhaustion: &AccountExhaustion, now_ms: u64, clock: ClockFormat) ->
         label: BROWSE.into(),
         choice: CardChoice::Browse,
     });
+    rows.push(CardRow {
+        label: OTHER_MODEL.into(),
+        choice: CardChoice::OtherModel,
+    });
     rows
 }
 
@@ -1532,13 +1541,13 @@ pub(crate) mod tests {
     #[test_case(
         SelectionMode::Pinned,
         vec![alternative(WORK, Billing::Subscription, Some(88)), alternative(API, Billing::Api, None)],
-        &["Switch to work (88% left)", TURN_ON_AUTO, "Use api (pay per token) for this run", WAIT, BROWSE]
+        &["Switch to work (88% left)", TURN_ON_AUTO, "Use api (pay per token) for this run", WAIT, BROWSE, OTHER_MODEL]
         ; "pinned_offers_the_others_and_auto"
     )]
     #[test_case(
         SelectionMode::Auto,
         vec![alternative(API, Billing::Api, None)],
-        &["Use api (pay per token) for this run", WAIT, BROWSE]
+        &["Use api (pay per token) for this run", WAIT, BROWSE, OTHER_MODEL]
         ; "auto_offers_only_the_key"
     )]
     fn the_card_offers_somewhere_else_to_go(

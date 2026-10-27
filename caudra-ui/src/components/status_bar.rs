@@ -129,8 +129,8 @@ const TIP_BACK_TO_MAIN: &str = "Back to the main conversation";
 const TIP_BASH: &str = "The composer runs this line as a shell command";
 const TIP_MODE: &str = "Mode: ";
 const TIP_MODEL_PENDING: &str = "\nThe switch lands with the next message";
+const TIP_MODEL_LIVE: &str = "\nThe switch lands with the next request";
 const TIP_THINKING: &str = "Reasoning level: ";
-const TIP_TASK_SETTING: &str = "Set by the task's own model";
 const TIP_GOAL_CHECKS: &str = "checks";
 const TIP_TASKS: &str = "background tasks running";
 const TIP_SHELLS: &str = "background shells running";
@@ -370,19 +370,12 @@ impl StatusBarHitTarget {
     /// Which chat a control acts on, mirroring the [`ChatScope`] of the command
     /// it opens so the bar cannot refuse a click the palette would accept.
     ///
-    /// [`Self::Thinking`] is main-only although `/thinking` is [`ChatScope::Any`]:
-    /// the chip names the level whichever chat is on screen runs at, and a task
-    /// runs at the one its own model resolved. Clicking would edit the session
-    /// setting instead, so on a task the chip is a label.
+    /// [`Self::Model`], [`Self::Thinking`] and [`Self::Retry`] act on the chat
+    /// on screen: on a task they move that task or cut its own backoff short.
     ///
-    /// [`Self::Retry`] is main-only although every chat draws its own countdown:
-    /// asking for an immediate retry reaches the top-level agent alone, so on a
-    /// task the chip is a label and a click there would shorten the main
-    /// conversation's backoff instead of the one on screen.
-    ///
-    /// [`Self::Fast`] is main-only for the same reason as [`Self::Thinking`]:
-    /// a task draws the fast flag it runs under, which its spawner chose, so a
-    /// click there would turn the session's fast mode off instead.
+    /// [`Self::Fast`] is main-only: a task draws the fast flag it runs under,
+    /// which its spawner chose, so a click there would turn the session's fast
+    /// mode off instead.
     pub fn scope(self) -> ChatScope {
         match self {
             Self::BackToMain
@@ -401,17 +394,17 @@ impl StatusBarHitTarget {
             | Self::TrustReview
             | Self::Questions
             | Self::Message(_)
-            | Self::Overflow => ChatScope::Any,
-            Self::Mode
+            | Self::Overflow
             | Self::Model
             | Self::Thinking
+            | Self::Retry => ChatScope::Any,
+            Self::Mode
             | Self::Goal
             | Self::Workflows
             | Self::Automations
             | Self::Autopilot
             | Self::Account
-            | Self::Fast
-            | Self::Retry => ChatScope::MainOnly,
+            | Self::Fast => ChatScope::MainOnly,
         }
     }
 
@@ -484,6 +477,9 @@ pub struct StatusBarContext<'a> {
     /// `[leaving\u{2192}arriving]`. `None` once the switch has settled, which is
     /// every frame where the mode label names a mode rather than a transition.
     pub pending_model: Option<Cow<'a, str>>,
+    /// The pending switch is one the user picked while the chat runs, which
+    /// its next request takes, rather than one a mode switch waits with.
+    pub live_switch: bool,
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
@@ -2096,18 +2092,17 @@ fn chip_body(
         StatusBarHitTarget::Mode => format!("{TIP_MODE}{}", ctx.mode.full.trim()),
         StatusBarHitTarget::Model => match &ctx.pending_model {
             Some(leaving) => format!(
-                "{leaving} {MODEL_TRANSITION_ARROW} {}{TIP_MODEL_PENDING}",
-                ctx.model_id
+                "{leaving} {MODEL_TRANSITION_ARROW} {}{}",
+                ctx.model_id,
+                if ctx.live_switch {
+                    TIP_MODEL_LIVE
+                } else {
+                    TIP_MODEL_PENDING
+                }
             ),
             None => ctx.model_id.to_owned(),
         },
-        StatusBarHitTarget::Thinking => {
-            let level = ctx.thinking.as_deref()?;
-            match ctx.main_chat {
-                true => format!("{TIP_THINKING}{level}"),
-                false => format!("{TIP_THINKING}{level}\n{TIP_TASK_SETTING}"),
-            }
-        }
+        StatusBarHitTarget::Thinking => format!("{TIP_THINKING}{}", ctx.thinking.as_deref()?),
         StatusBarHitTarget::Goal => {
             let goal = ctx.goal?;
             format!(
@@ -3044,7 +3039,7 @@ mod tests {
     const MISSING_FAST_HIT_MSG: &str = "a fast session must be switchable back from the footer";
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
     const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
-    const TASK_LEVEL_CLICKABLE: &str = "a task footer's level is a label, not a control";
+    const TASK_LEVEL_INERT: &str = "a task footer's level must change the task's own";
     const SANDBOX_NAME: &str = "prowlix-instance";
     const SANDBOX_CHIP: &str = "[sandbox: prowlix-instance]";
     const SANDBOX_BARE_CHIP: &str = "[prowlix-instance]";
@@ -3210,6 +3205,7 @@ mod tests {
                 },
                 model_id: self.model_id,
                 pending_model: self.pending_model.map(Cow::Borrowed),
+                live_switch: false,
                 stats: UsageStats {
                     global_cost: self.global_cost,
                     show_global: self.show_global,
@@ -3384,6 +3380,7 @@ mod tests {
             },
             model_id: LADDER_MODEL_ID,
             pending_model: leaving.map(Cow::Borrowed),
+            live_switch: false,
             stats: UsageStats {
                 global_cost: Some(SESSION_COST),
                 global_subscription_cost: covered.map(|(_, session)| session),
@@ -5269,10 +5266,10 @@ mod tests {
         );
     }
 
-    /// A task runs at a level of its own, so its footer names one. The setting
-    /// behind the chip is still the session's, so the label answers nothing.
+    /// A task runs at a level of its own, so its footer names one, and a
+    /// click on it changes the task's.
     #[test]
-    fn a_subagent_footer_names_its_level_without_offering_a_control() {
+    fn a_subagent_footer_offers_its_own_level() {
         let (text, hits, _) = render_at(Fixture {
             main_chat: false,
             ..Default::default()
@@ -5282,11 +5279,11 @@ mod tests {
             text.contains(&format!("[{THINKING_LEVEL}]")),
             "{TASK_LEVEL_MISSING}: {text}"
         );
-        assert_eq!(StatusBarHitTarget::Thinking.scope(), ChatScope::MainOnly);
+        assert_eq!(StatusBarHitTarget::Thinking.scope(), ChatScope::Any);
         assert!(
             hits.iter()
-                .all(|hit| hit.target != StatusBarHitTarget::Thinking),
-            "{TASK_LEVEL_CLICKABLE}"
+                .any(|hit| hit.target == StatusBarHitTarget::Thinking),
+            "{TASK_LEVEL_INERT}"
         );
     }
 
@@ -5894,22 +5891,24 @@ mod tests {
         StatusBarHitTarget::Automations,
         StatusBarHitTarget::Retry,
     ];
-    const TASK_CONTROLS: [StatusBarHitTarget; 3] = [
+    const TASK_CONTROLS: [StatusBarHitTarget; 6] = [
         StatusBarHitTarget::BackToMain,
+        StatusBarHitTarget::Model,
+        StatusBarHitTarget::Thinking,
         StatusBarHitTarget::Context,
         StatusBarHitTarget::Usage,
+        StatusBarHitTarget::Retry,
     ];
     const TASK_HIT_MSG: &str = "a task's bar offers exactly the controls a task owns";
-    const INERT_RETRY_MSG: &str = "a task's countdown is drawn even though it cannot be clicked";
+    const TASK_RETRY_MSG: &str = "a task's bar draws its own countdown";
     /// Wide enough that every chip survives the ladder, so a control missing
     /// from the hits is one the scope refused rather than one the width dropped.
     const TASK_BAR_WIDTH: u16 = 200;
 
-    /// A task's bar still draws the session's model, reasoning level, workflow
-    /// count and goal, because they describe the run the task belongs to, and
-    /// its own backoff, because that is the task the user is watching. Only the
-    /// controls that read the transcript in front of you, or leave it, answer
-    /// the pointer.
+    /// A task's bar still draws the session's workflow count and goal, because
+    /// they describe the run the task belongs to. Only the controls that read
+    /// the transcript in front of you, leave it, or move the task itself to
+    /// another model, level or retry answer the pointer.
     #[test]
     fn a_task_bar_offers_only_the_controls_a_task_owns() {
         let goal = active_goal();
@@ -5933,7 +5932,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(text.contains(RETRY_COUNTDOWN_PREFIX), "{INERT_RETRY_MSG}");
+        assert!(text.contains(RETRY_COUNTDOWN_PREFIX), "{TASK_RETRY_MSG}");
         for target in ALL_CONTROLS {
             assert_eq!(
                 hits.iter().any(|hit| hit.target == target),
@@ -5985,7 +5984,7 @@ mod tests {
     }
 
     #[test_case(StatusBarHitTarget::Model, true, &[MODEL_ID], Some(CLICK_MODEL); "model_on_main")]
-    #[test_case(StatusBarHitTarget::Model, false, &[MODEL_ID], None; "model_on_a_task")]
+    #[test_case(StatusBarHitTarget::Model, false, &[MODEL_ID], Some(CLICK_MODEL); "model_on_a_task")]
     #[test_case(StatusBarHitTarget::Yolo, false, &[TIP_YOLO], Some(CLICK_ASK); "yolo_on_a_task")]
     #[test_case(StatusBarHitTarget::Context, true, &[TIP_CONTEXT], Some(CLICK_CONTEXT); "context")]
     #[test_case(StatusBarHitTarget::Cwd, true, &[TIP_CWD], None; "cwd")]

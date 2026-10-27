@@ -45,9 +45,9 @@ use caudra_agent::types::{LEARNING_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem};
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    BackgroundReminderContext, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope,
-    EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge,
-    SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
+    BackgroundReminderContext, CancelMap, CancelToken, CancelTrigger, ConversationControl,
+    DoneReason, Envelope, EventSender, GoalHandle, History, InstructionBaseline, Instructions,
+    McpCommand, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
@@ -410,7 +410,7 @@ pub(super) struct AgentLoop {
     context_system: String,
     context_options: RequestOptions,
     cancel_map: Arc<RunCancelMap>,
-    retry_now: Nudge,
+    control: ConversationControl,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
@@ -474,7 +474,7 @@ impl AgentLoop {
         answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
         queue: Arc<QueueReceiver>,
         cancel_map: Arc<RunCancelMap>,
-        retry_now: Nudge,
+        control: ConversationControl,
         init_cancel: CancelToken,
         session_id: Option<SessionRef>,
         mailbox: Option<SessionMailbox>,
@@ -566,7 +566,7 @@ impl AgentLoop {
             context_system: String::new(),
             context_options: RequestOptions::default(),
             cancel_map,
-            retry_now,
+            control,
             init_cancel,
             permissions,
             file_tracker: FileReadTracker::fresh(),
@@ -815,7 +815,7 @@ impl AgentLoop {
             extractor.as_ref(),
             retention,
             &CancelToken::none(),
-            &self.retry_now,
+            &self.control.retry_now,
         )
         .await?;
         let spend = prepared.spend;
@@ -1098,7 +1098,11 @@ impl AgentLoop {
         let loaded_instructions = self.instructions.loaded().clone();
         let answer_rx = Arc::clone(&self.answer_rx);
         let queue = Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>;
-        let retry_now = self.retry_now.clone();
+        let retry_now = self.control.retry_now.clone();
+        // A pick made after the last run settled is already in the slots this
+        // run starts from, and must not override one made since.
+        drop(self.control.live.take_pending());
+        let live = self.control.live.clone();
         let goal = self.goal.clone();
         let mcp = self.mcp.clone();
         let code = self.code.clone();
@@ -1128,6 +1132,7 @@ impl AgentLoop {
         .with_interrupt_source(queue)
         .with_cancel(cancel)
         .with_retry_now(retry_now)
+        .with_live_switch(live)
         .with_goal(goal)
         .with_mcp(mcp)
         .with_code(code)

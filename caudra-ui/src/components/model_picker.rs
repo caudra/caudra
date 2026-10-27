@@ -62,6 +62,7 @@ const INHERIT_ROW: &str = "inherit";
 const INHERIT_DETAIL: &str =
     "omit model and thinking: the profile's subagent_model, else the Subagent model";
 const INHERIT_SPEC: &str = "@inherit";
+const TASK_TITLE_PREFIX: &str = " Models · task ";
 
 fn home_footer_line() -> Vec<Hint> {
     vec![
@@ -89,6 +90,18 @@ fn pstack_footer_line() -> Vec<Hint> {
     ]
 }
 
+fn task_footer_line() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "switch"),
+        Hint::bind(key::TOGGLE_FAVORITE, "favorite"),
+        Hint::bind(key::ESC, "close"),
+    ]
+}
+
+fn task_title(task_name: &str) -> String {
+    format!("{TASK_TITLE_PREFIX}{task_name} ")
+}
+
 fn decisions_footer_line() -> Vec<Hint> {
     vec![Hint::bind(key::ENTER, "use"), Hint::bind(key::ESC, "back")]
 }
@@ -104,6 +117,11 @@ fn is_reset_key(key: KeyEvent) -> bool {
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
+    /// A model for the task the picker was opened on, not the session.
+    SelectForTask {
+        task_id: String,
+        spec: String,
+    },
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),
     ToggleFavorite(String),
@@ -249,6 +267,8 @@ enum PickerPage {
         seat: Option<usize>,
     },
     Decisions,
+    /// Plain models for one task, which the picker's `task_id` names.
+    Task,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +312,7 @@ pub struct ModelPicker {
     binding: Option<Binding>,
     /// The model the pstack seat runs on now, `None` for inherit or a new seat.
     pstack_model: Option<String>,
+    task_id: Option<String>,
     needs_rebuild: bool,
     anchor: Option<SelectionAnchor>,
     active_decision: Option<DecisionEndpoint>,
@@ -316,6 +337,7 @@ impl ModelPicker {
             page: PickerPage::Home,
             binding: None,
             pstack_model: None,
+            task_id: None,
             needs_rebuild: false,
             anchor: None,
             active_decision: None,
@@ -362,6 +384,7 @@ impl ModelPicker {
         self.current_model = Some(current_model.clone());
         self.model_policy = Some(model_policy.clone());
         self.active_decision = active_decision;
+        self.task_id = None;
         self.anchor = None;
         self.needs_rebuild = false;
         let _ = self.available.poll(self.models.load_full());
@@ -400,6 +423,24 @@ impl ModelPicker {
         self.picker.set_footer_builder(pstack_footer_line);
         let entries = self.load_entries();
         self.picker.open(entries, pstack_title(kind, seat));
+        self.preselect_page();
+        self.capture_anchor();
+    }
+
+    /// Only models, for the task `task_id`, with the cursor on the one it runs on.
+    pub fn open_task(
+        &mut self,
+        current_model: &Model,
+        model_policy: &ModelPolicy,
+        task_id: String,
+        task_name: &str,
+    ) {
+        self.open(current_model, model_policy, None);
+        self.page = PickerPage::Task;
+        self.task_id = Some(task_id);
+        self.picker.set_footer_builder(task_footer_line);
+        let entries = self.load_entries();
+        self.picker.open(entries, task_title(task_name));
         self.preselect_page();
         self.capture_anchor();
     }
@@ -517,6 +558,7 @@ impl ModelPicker {
             PickerPage::Home => self.job_entries(),
             PickerPage::Job(purpose) => binding_entries(purpose),
             PickerPage::Pstack { .. } => vec![inherit_entry()],
+            PickerPage::Task => Vec::new(),
             PickerPage::Decisions => return self.decision_entries(),
         };
         for entry in &mut entries {
@@ -650,7 +692,9 @@ impl ModelPicker {
 
     fn mark_selection(&self, entry: &mut ModelEntry, current_spec: &str) {
         entry.selected = match self.page {
-            PickerPage::Home => entry.job.is_none() && entry.spec == current_spec,
+            PickerPage::Home | PickerPage::Task => {
+                entry.job.is_none() && entry.spec == current_spec
+            }
             PickerPage::Job(_) => entry.job.is_none() && entry.binds == self.binding,
             PickerPage::Pstack { seat, .. } => match &self.pstack_model {
                 Some(model) => entry.spec == *model,
@@ -697,6 +741,11 @@ impl ModelPicker {
                     self.picker.select_item_by(|entry| entry.selected);
                 }
             },
+            PickerPage::Task => {
+                if let Some(spec) = self.current_model.as_ref().map(Model::spec) {
+                    self.preselect_spec(&spec);
+                }
+            }
         }
     }
 
@@ -787,6 +836,10 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if self.page == PickerPage::Task && key.code == KeyCode::Esc {
+            self.close();
+            return ModelPickerAction::Close;
+        }
         if let PickerPage::Pstack { kind, .. } = self.page {
             if key.code == KeyCode::Esc {
                 self.close();
@@ -847,6 +900,13 @@ impl ModelPicker {
             },
             PickerAction::Select(entry) => match self.page {
                 PickerPage::Decisions => ModelPickerAction::Consumed,
+                PickerPage::Task => match self.task_id.take() {
+                    Some(task_id) => ModelPickerAction::SelectForTask {
+                        task_id,
+                        spec: entry.spec,
+                    },
+                    None => ModelPickerAction::Consumed,
+                },
                 PickerPage::Home => match entry.job {
                     Some(purpose) => {
                         if purpose == ModelPurpose::Chat {

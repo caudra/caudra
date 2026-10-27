@@ -26,8 +26,8 @@ use caudra_agent::tools::{PathLocks, ToolContext};
 use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind, prepare_workspace_transition};
 use caudra_agent::{
-    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, EventSender, HistorySnapshot,
-    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox,
+    AgentConfig, AgentMode, CancelMap, CancelToken, ConversationControl, Envelope, EventSender,
+    HistorySnapshot, McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, SessionMailbox,
     SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_automation::event::SessionView;
@@ -259,6 +259,8 @@ pub(crate) struct AgentHandles {
     tools_preview_source: Arc<ToolsPreviewSource>,
     /// Resolved for the active lane without replacing the selected Chat slot.
     pub(crate) effective_model_slot: Arc<ArcSwap<ModelSlot>>,
+    /// The main run's picks and backoff wake, which the app holds a clone of.
+    pub(crate) control: ConversationControl,
     pub(crate) execution_mode: SharedMode,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
@@ -532,6 +534,7 @@ impl AgentHandles {
         self.queue
             .set_execution_mode(AgentMode::clone(&self.execution_mode.load()));
         app.effective_model_slot = Some(Arc::clone(&self.effective_model_slot));
+        app.main_control = Some(self.control.clone());
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
             self.goal.adopt(&app.state.goal);
@@ -882,7 +885,7 @@ fn spawn_agent_internal(
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let retry_now = Nudge::default();
+    let control = ConversationControl::default();
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
@@ -949,7 +952,7 @@ fn spawn_agent_internal(
         answer_rx,
         queue_rx,
         Arc::clone(&cancel_map),
-        retry_now.clone(),
+        control.clone(),
         init_cancel,
         session_id.clone(),
         mailbox.clone(),
@@ -977,7 +980,7 @@ fn spawn_agent_internal(
         cmd_rx,
         cancel_map,
         Arc::clone(&subagent_cancels),
-        retry_now,
+        control.retry_now.clone(),
         agent_loop.cache_warmer(),
     );
     let tools_preview_source = Arc::new(agent_loop.tools_preview_source());
@@ -1002,6 +1005,7 @@ fn spawn_agent_internal(
         context_store,
         tools_preview_source,
         effective_model_slot,
+        control,
         execution_mode,
         mcp_handle,
         mcp_config_errors,

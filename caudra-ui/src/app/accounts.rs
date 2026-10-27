@@ -23,8 +23,8 @@ use tracing::warn;
 
 use super::App;
 use super::goal::LogPlace;
-use crate::agent::AgentCommand;
 use crate::components::accounts_modal::{AccountsAction, AccountsView, ProviderAccounts};
+use crate::components::producer::Producer;
 use crate::components::status_bar::AccountChip;
 use crate::components::{Action, DisplayMessage, DisplayRole, format_compact, format_elapsed};
 use crate::repaint::Dirty;
@@ -50,6 +50,7 @@ impl App {
             }
         };
         let stale = subscriptions(&view, |account| stale(account, view.now_ms));
+        self.exhausted_task = None;
         self.accounts_modal.open(view);
         if !stale.is_empty() {
             self.fetch_quotas(stale);
@@ -96,6 +97,9 @@ impl App {
             AccountsAction::Refresh => {
                 self.refresh_accounts();
                 return Vec::new();
+            }
+            AccountsAction::PickModel => {
+                return self.open_model_picker_for(self.exhausted_task.clone());
             }
             AccountsAction::Select { selection, retry } => {
                 select_account(&self.storage, &provider, &selection).map(|()| {
@@ -237,12 +241,15 @@ impl App {
     }
 
     /// Cuts the wait of the request a spent account holds up, as the status
-    /// bar's "retry now" does.
+    /// bar's "retry now" does, in the chat the card came up for.
     fn retry_now(&mut self) {
-        self.main_chat().clear_retry();
-        if let Some(cmd_tx) = &self.cmd_tx {
-            let _ = cmd_tx.try_send(AgentCommand::RetryNow);
-        }
+        let task_id = self.exhausted_task.clone();
+        let chat = task_id
+            .as_deref()
+            .and_then(|task_id| self.chat_index.get(task_id).copied())
+            .unwrap_or(0);
+        self.chats[chat].clear_retry();
+        self.retry_chat(task_id);
     }
 
     /// A switch is drawn in the chat that made it.
@@ -306,6 +313,10 @@ impl App {
                 summary,
             },
         );
+        self.chats[chat_idx].set_producer(Some(Producer {
+            model: reroute.to.clone(),
+            thinking: None,
+        }));
         if main_agent {
             vec![Action::FollowReroute(Box::new(reroute))]
         } else {
@@ -328,8 +339,8 @@ impl App {
         chat.push(DisplayMessage::new(DisplayRole::Notice, summary));
     }
 
-    /// The row goes in the chat whose request waits; the card comes up only
-    /// for the main agent's, and never over another overlay.
+    /// The row goes in the chat whose request waits; the card comes up for
+    /// the main agent's and for the task on screen, never over another overlay.
     pub(super) fn account_exhausted(
         &mut self,
         chat_idx: usize,
@@ -342,11 +353,19 @@ impl App {
             DisplayRole::Error,
             exhausted_row(&display_name(&exhaustion.provider), &exhaustion, now_ms()),
         ));
-        if !main_agent || (self.any_overlay_open() && !self.accounts_modal.is_open()) {
+        let task_on_screen = !main_agent && chat_idx == self.active_chat;
+        if !(main_agent || task_on_screen)
+            || (self.any_overlay_open() && !self.accounts_modal.is_open())
+        {
             return;
         }
         match self.accounts_view() {
-            Ok(view) => self.accounts_modal.show_exhaustion(view, exhaustion),
+            Ok(view) => {
+                self.exhausted_task = task_on_screen
+                    .then(|| self.active_subagent_id().map(str::to_owned))
+                    .flatten();
+                self.accounts_modal.show_exhaustion(view, exhaustion);
+            }
             Err(error) => warn!(%error, "spent account card unavailable"),
         }
     }

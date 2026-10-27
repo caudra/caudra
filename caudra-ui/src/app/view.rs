@@ -14,7 +14,7 @@ use crate::components::status_bar::{
 };
 use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
-use crate::components::{Overlay, hover_style};
+use crate::components::{Overlay, Status, hover_style};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use crate::update;
@@ -859,18 +859,32 @@ impl App {
             effective_model.as_deref(),
             effective_context.as_deref(),
         );
+        let in_force = effective_model_spec.as_deref().unwrap_or_else(|| {
+            chat.model_id
+                .as_deref()
+                .unwrap_or(&self.state.session.model)
+        });
+        // A model picked while the chat runs is named behind the arrow until
+        // the request that carries it goes out.
+        let live_pending = match chat.task_id() {
+            Some(task_id) => self.subagent_controls.get(task_id.as_ref()),
+            None => self
+                .main_control
+                .as_ref()
+                .filter(|_| main_chat && self.status == Status::Streaming),
+        }
+        .and_then(|control| control.live.pending_model());
+        let (model_id, pending_model) = match (&live_pending, leaving) {
+            (Some(arriving), _) => (arriving.as_str(), Some(in_force)),
+            (None, Some(leaving)) => (self.state.session.model.as_str(), Some(leaving)),
+            (None, None) => (in_force, None),
+        };
         let ctx = StatusBarContext {
             status: &self.status,
             mode,
-            model_id: match leaving {
-                Some(_) => &self.state.session.model,
-                None => effective_model_spec.as_deref().unwrap_or_else(|| {
-                    chat.model_id
-                        .as_deref()
-                        .unwrap_or(&self.state.session.model)
-                }),
-            },
-            pending_model: leaving.map(Cow::Borrowed),
+            model_id,
+            pending_model: pending_model.map(Cow::Borrowed),
+            live_switch: live_pending.is_some(),
             stats: UsageStats {
                 global_cost: self.state.cost,
                 global_subscription_cost: self.state.subscription_cost,
