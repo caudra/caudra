@@ -56,7 +56,7 @@ The parent can keep working on a separate scope. When nothing independent remain
 
 The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns. The reminder about a [long-running background shell](/docs/context/#long-running-background-shells) does, like a result.
 
-The footer keeps a differently styled spinner and a waiting label while background work or result delivery will wake the main agent. It does not mean a model request is running. Queued next messages and goal checks wait until that work settles and the main agent processes its results. See [Queue and Steering](/docs/queue/) for guide and replace behavior.
+The footer keeps a differently styled spinner and a `waiting for background work` message while background work or result delivery will wake the main agent. A crowded footer shortens the message to `waiting`. It does not mean a model request is running. Queued next messages and goal checks wait until that work settles and the main agent processes its results. See [Queue and Steering](/docs/queue/) for guide and replace behavior.
 
 ### Inspect and control tasks
 

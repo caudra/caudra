@@ -25285,13 +25285,15 @@ fn non_below_split_reserves_band_and_keeps_status_aligned(dir: caudra_lua::Split
 
 /// Too short to spare a transcript row for a second footer row.
 const SHORT_TERMINAL_ROWS: u16 = 12;
+const MEDIUM_TERMINAL_ROWS: u16 = 24;
 const FOOTER_EDGE_MSG: &str = "the footer must sit on the terminal's bottom edge";
 
 /// Only the terminal's height picks the footer's rows, so nothing the footer
 /// shows can move the composer above it.
-#[test_case(TEST_AREA.height    => 2 ; "a_tall_terminal_splits_it")]
+#[test_case(TEST_AREA.height    => 3 ; "a_tall_terminal_gives_messages_a_row")]
+#[test_case(MEDIUM_TERMINAL_ROWS => 2 ; "a_medium_terminal_splits_it")]
 #[test_case(SHORT_TERMINAL_ROWS => 1 ; "a_short_terminal_keeps_one_row")]
-fn the_footer_takes_two_rows_unless_the_terminal_is_short(rows: u16) -> u16 {
+fn the_footer_rows_follow_the_terminal_height(rows: u16) -> u16 {
     let area = Rect {
         height: rows,
         ..TEST_AREA
