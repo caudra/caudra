@@ -27,8 +27,8 @@ const SNIPPET: &str = "(await srv.echo(text='hi'))";
 
 /// Plain computation runs through the `code` tool on the bundled worker's hosted pool, and
 /// Workcell's own isolated `code` is not registered in its place.
-#[test]
-fn production_host_computes_through_the_code_tool_with_the_embedded_worker() {
+#[cfg_attr(test, test)]
+pub fn production_host_computes_through_the_code_tool_with_the_embedded_worker() {
     assert!(bundled_worker_available(), "{MISSING_REQUIRED_WORKER}");
     let root = TempDir::new().expect("tempdir");
     let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
@@ -77,8 +77,8 @@ impl ScriptHost for Echo {
 }
 
 /// `code` snippets run on the same bundled worker, through the host-call drive loop.
-#[test]
-fn production_host_runs_mcp_snippets_with_the_embedded_worker() {
+#[cfg_attr(test, test)]
+pub fn production_host_runs_mcp_snippets_with_the_embedded_worker() {
     assert!(bundled_worker_available(), "{MISSING_REQUIRED_WORKER}");
     let root = TempDir::new().expect("tempdir");
     let host = WorkcellHost::new_production(root.path(), None).expect("Workcell host");
@@ -130,8 +130,8 @@ impl ScriptHost for Fixed {
 
 /// The interpreter prints a call's answer exactly as the `code` card writes its `repr`, which
 /// is what lets the card fold a dump of it.
-#[test]
-fn production_host_prints_an_answer_as_its_repr() {
+#[cfg_attr(test, test)]
+pub fn production_host_prints_an_answer_as_its_repr() {
     assert!(bundled_worker_available(), "{MISSING_REQUIRED_WORKER}");
     let answer = json!({
         "runtime": "workcell · server-process",

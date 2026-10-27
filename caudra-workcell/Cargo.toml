@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "embedded-worker-smoke"
+path = "src/bin/embedded-worker-smoke.rs"
+test = false
+bench = false
+
 [dependencies]
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
