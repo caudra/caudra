@@ -31,12 +31,12 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    diagnose::{Surface, UNRESOLVED_REFERENCE_RULE},
+    diagnose::{Surface, UNRESOLVED_REFERENCE_RULE, host_module_guidance},
     group::{
         Captured, CapturedOutput, CodeToolGroup, Completion, SCRIPT_NAME, captured_empty, execution,
     },
     render::{from_json, to_json},
-    repair::{Repair, SETTLED_HELPER, looks_like_javascript, reads_as_python, repair},
+    repair::{Repair, SETTLED_HELPER, StubIndex, looks_like_javascript, reads_as_python, repair},
     suspend::{Answer, answer},
     types::{CodeExecution, MAX_CODE_BYTES, MAX_TIMEOUT_MS, Outcome, PreparedCode},
 };
@@ -308,7 +308,8 @@ impl CodeToolGroup {
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn
                 | Repair::Settled
-                | Repair::Translated => true,
+                | Repair::Translated
+                | Repair::Unimported(_) => true,
             })
             .collect();
         executed.taught_code = repaired.taught;
@@ -330,18 +331,30 @@ impl CodeToolGroup {
             type_check,
         } = prepared;
         let started = Instant::now();
-        let stubs = type_check.then(|| format!("{HOSTED_STUBS_PRELUDE}{stubs}"));
-        let repl = hosted_repl_config(type_check, timeout_ms, stubs);
+        let repl = hosted_repl_config(
+            type_check,
+            timeout_ms,
+            type_check.then(|| format!("{HOSTED_STUBS_PRELUDE}{stubs}")),
+        );
+        let failure = |error: &PoolError, duration, captured| {
+            let mut output = Self::failure(
+                type_check,
+                error,
+                timeout_ms,
+                duration,
+                Surface::Hosted,
+                captured,
+            );
+            if let Some(guidance) =
+                host_module_guidance(error, |module| StubIndex::of(stubs).is_namespace(module))
+            {
+                output.diagnostic = Some(guidance);
+            }
+            output
+        };
         let failed =
             |error: &PoolError, captured, state: Option<HostedState>, note| HostedExecution {
-                execution: Some(execution(Self::failure(
-                    type_check,
-                    error,
-                    timeout_ms,
-                    started.elapsed(),
-                    Surface::Hosted,
-                    captured,
-                ))),
+                execution: Some(execution(failure(error, started.elapsed(), captured))),
                 state,
                 state_note: note,
                 repairs: Vec::new(),
@@ -404,14 +417,9 @@ impl CodeToolGroup {
                 return failed(&error, captured, base, note);
             }
             // The snippet raised: the session is intact, including what it assigned before raising.
-            Err(HostedDriveError::Pool(error @ PoolError::Runtime(_), captured)) => Self::failure(
-                type_check,
-                &error,
-                timeout_ms,
-                duration,
-                Surface::Hosted,
-                captured,
-            ),
+            Err(HostedDriveError::Pool(error @ PoolError::Runtime(_), captured)) => {
+                failure(&error, duration, captured)
+            }
             Err(HostedDriveError::Pool(error, captured)) => {
                 drop(session);
                 let (state, note) = discarded(note, base);

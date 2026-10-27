@@ -7,6 +7,7 @@
 //! Diagnostics are fixed strings built from Monty-supplied exception text. Nothing else about the
 //! host, the worker, or its configuration is disclosed.
 
+use monty_pool::PoolError;
 use monty_types::{ExcType, MontyException};
 
 use crate::subset::{
@@ -33,6 +34,9 @@ const INDENTATION_GUIDANCE: &str = "The snippet's indentation is not valid Pytho
 /// How the interpreter's `NameError` starts, before the name.
 const NAME_ERROR_PREFIX: &str = "name '";
 const NAME_ERROR_QUOTE: char = '\'';
+/// How the interpreter's `ModuleNotFoundError` starts, before the module.
+const MISSING_MODULE_PREFIX: &str = "No module named '";
+const MODULE_SEPARATOR: char = '.';
 /// The withheld builtin a hosted run's host answers itself.
 const HOSTED_HELP: &str = "help";
 
@@ -187,6 +191,40 @@ fn module_guidance(detail: &str) -> String {
         "Only these standard library modules exist: {}. Third-party packages cannot be installed or imported. Do not retry this import; compute the result with the available modules, or use a different tool. ({detail})",
         available_modules!()
     )
+}
+
+/// Guidance for a failed import of a host module, which is in scope before a hosted snippet runs.
+/// The import guidance would tell the caller to give up on a call it can make. `None` when the
+/// failure is no import, or `is_host_module` rejects the module it names.
+pub(crate) fn host_module_guidance(
+    error: &PoolError,
+    is_host_module: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let (module, detail) = match error {
+        PoolError::Typing(diagnostics) => {
+            let trimmed = diagnostics.trim();
+            (unresolved_import(trimmed)?, format!("\n{trimmed}"))
+        }
+        PoolError::Runtime(exception)
+            if matches!(
+                exception.exc_type(),
+                ExcType::ModuleNotFoundError | ExcType::ImportError
+            ) =>
+        {
+            let message = exception.message()?;
+            let (module, _) = message
+                .strip_prefix(MISSING_MODULE_PREFIX)?
+                .split_once(NAME_ERROR_QUOTE)?;
+            (module, format!(" ({message})"))
+        }
+        _ => return None,
+    };
+    let root = module.split(MODULE_SEPARATOR).next()?;
+    is_host_module(root).then(|| {
+        format!(
+            "`{root}` is a host module already in scope, not one to import. Drop the import and call it directly, as `await {root}.<call>(...)`; `help(\"{root}\")` lists its calls.{detail}"
+        )
+    })
 }
 
 /// Guidance for one of the subset's modules, used without importing it.
@@ -605,6 +643,28 @@ mod tests {
         let text = diagnosis.diagnostic.expect("guidance");
         assert!(text.contains("unicodedata"));
         assert!(text.contains("Do not retry this import"));
+    }
+
+    const HOST_MODULE: &str = "mcp";
+    const HOST_MODULE_GUIDANCE: &str = "`mcp` is a host module already in scope";
+
+    fn is_host_module(module: &str) -> bool {
+        module == HOST_MODULE
+    }
+
+    #[test_case(PoolError::Typing("snippet.py:1:6: error[unresolved-import] Cannot resolve imported module `mcp`".to_owned()) ; "checked")]
+    #[test_case(PoolError::Typing("snippet.py:1:8: error[unresolved-import] Cannot resolve imported module `mcp.search`".to_owned()) ; "checked_dotted")]
+    #[test_case(PoolError::Runtime(exception(ExcType::ModuleNotFoundError, "No module named 'mcp'")) ; "raised")]
+    fn an_import_of_a_host_module_says_it_is_in_scope(error: PoolError) {
+        let text = host_module_guidance(&error, is_host_module).expect("guidance");
+        assert!(text.contains(HOST_MODULE_GUIDANCE), "{text}");
+        assert!(!text.contains("Do not retry"), "{text}");
+    }
+
+    #[test_case(PoolError::Typing("snippet.py:1:8: error[unresolved-import] Cannot resolve imported module `requests`".to_owned()) ; "another_module")]
+    #[test_case(PoolError::Runtime(exception(ExcType::NameError, "name 'mcp' is not defined")) ; "no_import")]
+    fn other_failures_get_no_host_module_guidance(error: PoolError) {
+        assert_eq!(host_module_guidance(&error, is_host_module), None);
     }
 
     #[test]

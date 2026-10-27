@@ -76,6 +76,9 @@ const BODY_FIELD: &str = "body";
 const LEFT_FIELD: &str = "left";
 const RIGHT_FIELD: &str = "right";
 const TYPE_FIELD: &str = "type";
+const ALIAS_FIELD: &str = "alias";
+const IMPORT_STATEMENTS: [&str; 2] = ["import_statement", "import_from_statement"];
+const ALIASED_IMPORT: &str = "aliased_import";
 const INDENT: u8 = b' ';
 
 /// One change made to a snippet before it ran.
@@ -100,6 +103,8 @@ pub enum Repair {
     Settled,
     /// The snippet was JavaScript, and ran as the Python it translates to.
     Translated,
+    /// An import of a host module, which is in scope before the snippet runs, was dropped.
+    Unimported(String),
 }
 
 impl Repair {
@@ -133,6 +138,9 @@ impl Repair {
                 "snippets are Python: it ran as the Python shown, so write Python next time"
                     .to_owned(),
             ),
+            Self::Unimported(module) => Some(format!(
+                "`{module}` is a host module already in scope: call `await {module}.<call>(...)` without importing it"
+            )),
             Self::Settled => None,
         }
     }
@@ -164,6 +172,10 @@ impl fmt::Display for Repair {
                 formatter.write_str("ran `asyncio.gather` without `return_exceptions`")
             }
             Self::Translated => formatter.write_str("ran the JavaScript as Python"),
+            Self::Unimported(module) => write!(
+                formatter,
+                "dropped `import {module}`: host modules are already in scope"
+            ),
         }
     }
 }
@@ -192,7 +204,8 @@ impl Repaired {
                 | Repair::Unawaited(_)
                 | Repair::FinalReturn
                 | Repair::Settled
-                | Repair::Translated => None,
+                | Repair::Translated
+                | Repair::Unimported(_) => None,
             })
             .collect()
     }
@@ -231,6 +244,13 @@ pub(crate) fn repair(code: String, stubs: &str) -> Repaired {
                 code
             }
         }
+    };
+    let code = match unimported(&code, &stubs) {
+        Some((unimported, modules)) => {
+            repairs.extend(modules.into_iter().map(Repair::Unimported));
+            unimported
+        }
+        None => code,
     };
     let translated = repairs.contains(&Repair::Translated);
     let syntax_taught = (!translated && !repairs.is_empty()).then(|| code.clone());
@@ -327,6 +347,93 @@ fn syntax_repaired(code: String, stubs: &StubIndex) -> (String, Vec<Repair>) {
         Some(candidate) => (candidate, repairs),
         None => (code, Vec::new()),
     }
+}
+
+/// The snippet without its top-level imports of host modules, which are in scope before it runs:
+/// `import gh` and `from mcp import gh` are dropped, and `import gh as g` becomes `g = gh`. A
+/// statement that imports anything else is kept whole. The modules come back once each, in the
+/// order first seen; `None` when nothing was dropped or the result does not read as Python.
+fn unimported(code: &str, stubs: &StubIndex) -> Option<(String, Vec<String>)> {
+    let tree = parse(code).filter(|tree| !tree.root_node().has_error())?;
+    let root = tree.root_node();
+    let mut replacements = Vec::new();
+    let mut modules = Vec::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let Some(imported) = host_imports(statement, code, stubs) else {
+            continue;
+        };
+        let bindings: Vec<String> = imported
+            .iter()
+            .filter(|(module, bound)| module != bound)
+            .map(|(module, bound)| format!("{bound} = {module}"))
+            .collect();
+        let end = match bindings.is_empty() {
+            true => dropped_end(statement, code),
+            false => statement.end_byte(),
+        };
+        replacements.push((statement.start_byte()..end, bindings.join("; ")));
+        for (module, _) in imported {
+            if !modules.iter().any(|seen| seen == module) {
+                modules.push(module.to_owned());
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return None;
+    }
+    let mut unimported = code.to_owned();
+    for (range, text) in replacements.into_iter().rev() {
+        unimported.replace_range(range, &text);
+    }
+    reads_as_python(&unimported).then_some((unimported, modules))
+}
+
+/// What an import statement imports, as `(module, bound as)`, when every name is a host module.
+fn host_imports<'code>(
+    statement: Node<'_>,
+    code: &'code str,
+    stubs: &StubIndex,
+) -> Option<Vec<(&'code str, &'code str)>> {
+    if !IMPORT_STATEMENTS.contains(&statement.kind()) {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    let imported = statement
+        .children_by_field_name(NAME_FIELD, &mut cursor)
+        .map(|name| {
+            let (module, bound) = match name.kind() == ALIASED_IMPORT {
+                true => (
+                    name.child_by_field_name(NAME_FIELD)?,
+                    name.child_by_field_name(ALIAS_FIELD)?,
+                ),
+                false => (name, name),
+            };
+            Some((&code[module.byte_range()], &code[bound.byte_range()]))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!imported.is_empty()
+        && imported
+            .iter()
+            .all(|(module, _)| stubs.is_namespace(module)))
+    .then_some(imported)
+}
+
+/// Where a dropped statement's text ends: past the `;` after it and the spaces that follow, so the
+/// statement after it on the line keeps the line's indentation.
+fn dropped_end(statement: Node<'_>, code: &str) -> usize {
+    let Some(separator) = statement
+        .next_sibling()
+        .filter(|next| next.kind() == STATEMENT_SEPARATOR)
+    else {
+        return statement.end_byte();
+    };
+    let after = separator.end_byte();
+    after
+        + code[after..]
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count()
 }
 
 /// `code` with `edits` made, from the end so earlier offsets stay valid.
@@ -1095,6 +1202,52 @@ mod tests {
         assert_eq!(repaired.repairs, unawaited);
     }
 
+    #[test_case("import gh\nawait gh.list()", "\nawait gh.list()", &["gh"] ; "import")]
+    #[test_case("from mcp import gh\nawait gh.list()", "\nawait gh.list()", &["gh"] ; "from_another_module")]
+    #[test_case("import gh as g\nawait g.list()", "g = gh\nawait g.list()", &["gh"] ; "aliased")]
+    #[test_case("import gh; r = await gh.list()", "r = await gh.list()", &["gh"] ; "before_a_semicolon")]
+    #[test_case("x = 1; import gh\nx", "x = 1; \nx", &["gh"] ; "after_a_semicolon")]
+    #[test_case("import gh, gh as g\nawait g.list()", "g = gh\nawait g.list()", &["gh"] ; "named_once")]
+    fn imports_of_host_modules_are_dropped(code: &str, expected: &str, modules: &[&str]) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, expected);
+        let unimported: Vec<Repair> = modules
+            .iter()
+            .map(|module| Repair::Unimported((*module).to_owned()))
+            .collect();
+        assert_eq!(repaired.repairs, unimported);
+        assert_eq!(repaired.taught.as_deref(), Some(expected));
+        assert_eq!(repaired.code.lines().count(), code.lines().count());
+    }
+
+    #[test_case("from mcp import search\nsearch('x')" ; "a_host_function")]
+    #[test_case("import json\njson.dumps(1)" ; "a_standard_module")]
+    #[test_case("import gh, json" ; "beside_another_module")]
+    #[test_case("import linear\nlinear.list()" ; "a_name_the_stubs_lack")]
+    #[test_case("import gh.list" ; "a_dotted_name")]
+    #[test_case("from mcp import *" ; "a_wildcard")]
+    #[test_case("def f():\n    import gh\n    return gh" ; "inside_a_function")]
+    fn other_imports_are_left_alone(code: &str) {
+        let repaired = repaired(code);
+        assert_eq!(repaired.code, code);
+        assert!(repaired.repairs.is_empty(), "{:?}", repaired.repairs);
+    }
+
+    #[test]
+    fn a_dropped_host_import_leaves_the_call_to_be_repaired_further() {
+        let repaired = repaired("from mcp import gh\nr = await gh.list({state: \"open\"})");
+        let expected = "\nr = await gh.list(state=\"open\")";
+        assert_eq!(repaired.code, expected);
+        assert_eq!(
+            repaired.repairs,
+            [
+                Repair::Unimported("gh".to_owned()),
+                Repair::Unpacked("gh.list".to_owned())
+            ]
+        );
+        assert_eq!(repaired.taught.as_deref(), Some(expected));
+    }
+
     #[test_case("```python\nx = 1\n```", "\nx = 1\n" ; "python")]
     #[test_case("\n```\nx = 1\n```\n", "\n\nx = 1\n" ; "bare_with_blank_lines")]
     #[test_case("```py\njson.dumps(1)\n```", "\njson.dumps(1)\n" ; "then_repaired_further")]
@@ -1177,6 +1330,7 @@ mod tests {
     #[test_case(Repair::Dedented, true ; "dedented")]
     #[test_case(Repair::Settled, false ; "settled")]
     #[test_case(Repair::Translated, true ; "translated")]
+    #[test_case(Repair::Unimported("gh".to_owned()), true ; "unimported")]
     fn only_slips_carry_a_lesson(repair: Repair, teaches: bool) {
         assert_eq!(repair.lesson().is_some(), teaches);
     }
