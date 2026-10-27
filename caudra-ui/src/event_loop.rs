@@ -58,7 +58,7 @@ use caudra_agent::worktree::{
 };
 use caudra_agent::{
     AgentConfig, AgentEvent, AgentMode, CancelToken, DoneReason, Envelope, McpCommand,
-    McpConfigErrors, McpHandle, mcp,
+    McpConfigErrors, McpHandle, SettingsChange, mcp,
 };
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
@@ -143,7 +143,7 @@ use crate::{
     AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
     SessionRelocationHandoff, SessionTab,
 };
-use crate::{load_app_session, open_app_session_with_cursor};
+use crate::{load_app_session, open_app_session_with_cursor_reporting};
 
 use crate::pane_signals::PaneSignals;
 use crate::storage_writer::StorageWriter;
@@ -2246,18 +2246,33 @@ impl<'t> EventLoop<'t> {
     fn paint(&mut self) -> io::Result<CompletedFrame<'_>> {
         let app = &mut self.sessions[self.focused].app;
         let loading = &mut self.loading;
+        let started = loading.is_active().then(Instant::now);
+        let session_id = app.state.session.id;
+        let mut compose_ms = 0;
         app.sync_image_root();
         if let Err(error) = terminal::flush_image_output() {
             tracing::warn!(%error, "image upload failed");
         }
-        self.terminal.draw(|f| {
+        let frame = self.terminal.draw(|f| {
             app.view(f);
             color_compat::downgrade_if_needed(f.buffer_mut());
             app.apply_terminal_links(f.buffer_mut());
+            if let Some(started) = started {
+                compose_ms = started.elapsed().as_millis() as u64;
+            }
             // After composing, which is slow for a transcript just loaded, and
             // before the frame goes out over the card's cells.
             loading.close();
-        })
+        })?;
+        if let Some(started) = started {
+            info!(
+                %session_id,
+                compose_ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                "loaded session first frame"
+            );
+        }
+        Ok(frame)
     }
 
     /// Repaints the focused session, so the card covers what the user was
@@ -3925,8 +3940,9 @@ impl<'t> EventLoop<'t> {
                 .map_err(|error| format!("Failed to open session: {error}"))?,
         );
         let lease_ms = lap();
-        let (session, cursor) = open_app_session_with_cursor(id, &self.ctx.storage)
-            .map_err(|e| format!("Failed to load session: {e}"))?;
+        let (session, cursor) =
+            open_app_session_with_cursor_reporting(id, &self.ctx.storage, progress)
+                .map_err(|e| format!("Failed to load session: {e:#}"))?;
         let read_ms = lap();
         progress.session(0, 1, &session.title);
         // Both branches below end with this session in a tab the writer saves.
@@ -5027,6 +5043,13 @@ impl<'t> EventLoop<'t> {
                     self.focused_app().flash(e);
                 }
             }
+            Action::SwitchTaskModel { task_id, spec } => match self.resolve_model(&spec) {
+                Ok((model, provider)) => self.sessions[idx]
+                    .app
+                    .switch_task(&task_id, SettingsChange::model(provider, model)),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            Action::AdoptLiveSwitch(spec) => self.adopt_live_switch(idx, &spec),
             Action::CompleteProviderSetup(spec) => {
                 if let Err(error) = self.change_model_with(&spec, App::select_setup_model) {
                     self.focused_app().flash(error);
@@ -5295,28 +5318,57 @@ impl<'t> EventLoop<'t> {
         self.change_model_with(spec, App::select_model)
     }
 
+    /// A pick made while the main run works also reaches it, at its next
+    /// request, when the run is on the slot the pick replaces.
     fn change_model_with(
         &mut self,
         spec: &str,
         select: fn(&mut App, &Model),
     ) -> Result<(), String> {
-        if !self.ctx.model_policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        let mut new_model =
-            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+        let (new_model, provider) = self.resolve_model(spec)?;
+        let replaced = self.ctx.model_slot.load().model.spec();
         let app = self.focused_app();
+        let thinking = app.state.thinking.clone();
         select(app, &new_model);
         app.record_recent_model(spec);
         app.usage_slot.store(None);
+        app.forward_main_model(
+            &replaced,
+            SettingsChange {
+                route: Some((Arc::clone(&provider), new_model.clone())),
+                thinking: (app.state.thinking != thinking).then(|| app.state.thinking.clone()),
+            },
+        );
         self.ctx.model_slot.store(Arc::new(ModelSlot {
             model: new_model,
-            provider: Arc::from(new_provider),
+            provider,
             home: None,
         }));
         Ok(())
+    }
+
+    /// Checked as a pick is made, so a model that cannot run is refused here
+    /// rather than once a conversation is already moving to it.
+    fn resolve_model(&self, spec: &str) -> Result<(Model, Arc<dyn Provider>), String> {
+        if !self.ctx.model_policy.allows(spec) {
+            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
+        }
+        let mut model = Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
+        let provider = from_model(&mut model, self.ctx.timeouts)
+            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+        Ok((model, Arc::from(provider)))
+    }
+
+    /// The main run took a pick mid-run, so automatic continuations start
+    /// from the model it moved to rather than the one it started on.
+    fn adopt_live_switch(&mut self, idx: usize, spec: &str) {
+        let selected = self.ctx.model_slot.load_full();
+        if selected.model.spec() != spec {
+            return;
+        }
+        let runtime = &mut self.sessions[idx];
+        runtime.handles.effective_model_slot.store(selected);
+        runtime.app.sync_execution_mode();
     }
 
     fn change_system_prompt_profile(&mut self, idx: usize, name: &str) {
@@ -5454,11 +5506,16 @@ impl<'t> EventLoop<'t> {
             }
         };
         self.sessions[idx].app.usage_slot.store(None);
-        self.ctx.model_slot.store(Arc::new(ModelSlot {
+        let followed = Arc::new(ModelSlot {
             home: (home.spec() != model.spec()).then_some(home),
             model,
             provider: Arc::from(provider),
-        }));
+        });
+        let effective = &self.sessions[idx].handles.effective_model_slot;
+        if effective.load().model.spec() == reroute.from {
+            effective.store(Arc::clone(&followed));
+        }
+        self.ctx.model_slot.store(followed);
     }
 
     fn refresh_provider(&mut self, slug: String) {
@@ -6764,6 +6821,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
             task: None,
             workflow: None,

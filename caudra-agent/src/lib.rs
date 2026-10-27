@@ -35,13 +35,14 @@ pub use mentions::Mention;
 pub(crate) mod sigil;
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
-    EMPTY_RESPONSE_RULE, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict,
-    History, HistorySnapshot, InstructionBaseline, InstructionSource, Instructions,
-    LoadedInstructions, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, ProjectedHistory,
-    SharedHistory, UNAVAILABLE_RESULT, find_subdirectory_instructions, goal_checkin_message,
-    goal_kickoff_message, goal_wait_message, is_instruction_file, is_run_failure_marker,
-    project_for_inspection, project_request, stored_todos,
+    Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, ConversationControl,
+    DEFAULT_GOAL_CONTINUATION_LIMIT, EMPTY_RESPONSE_RULE, GoalError, GoalHandle, GoalResult,
+    GoalSnapshot, GoalStatus, GoalVerdict, History, HistorySnapshot, InstructionBaseline,
+    InstructionSource, Instructions, LiveSwitch, LoadedInstructions, MAX_GOAL_CHARS,
+    MAX_GOAL_CONTINUATION_LIMIT, ProjectedHistory, SettingsChange, SharedHistory,
+    UNAVAILABLE_RESULT, find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
+    goal_wait_message, is_instruction_file, is_run_failure_marker, project_for_inspection,
+    project_request, stored_todos,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
@@ -79,9 +80,9 @@ pub mod workflow;
 pub mod workspace_transfer;
 pub mod worktree;
 pub use stored_session::{
-    StoredSession, latest_stored_session, load_stored_session, open_stored_session,
-    open_stored_session_with_cursor, resolve_resume_workspace, resume_workspace_session,
-    workspace_logical_cwd,
+    StoredSession, latest_stored_session, load_stored_session, load_stored_session_observed,
+    open_stored_session, open_stored_session_with_cursor, open_stored_session_with_cursor_observed,
+    resolve_resume_workspace, resume_workspace_session, workspace_logical_cwd,
 };
 pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,

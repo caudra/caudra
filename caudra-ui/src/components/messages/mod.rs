@@ -35,6 +35,7 @@ use crate::chat::batch_child_id;
 use crate::components::commit_popup::CommitIndex;
 use crate::components::input::image_chip_label;
 use crate::components::keybindings::key;
+use crate::components::producer::Producer;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::highlight;
 use crate::inline_image::{self, ImageRef, ImageSpan};
@@ -215,6 +216,7 @@ impl MessageActionTarget {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MessageDetails {
     pub created: Option<Timestamp>,
+    pub producer: Option<Producer>,
     pub usage: Option<String>,
 }
 
@@ -994,6 +996,12 @@ pub struct MessagesPanel {
     /// streams the instruction it is being given before any agent is attached
     /// to it, and that is the one case where the buffer is not the model's.
     streaming_role: DisplayRole,
+    /// The settings the message streaming now was requested with, which
+    /// every model row pushed from here on is stamped with.
+    producer: Option<Producer>,
+    /// The stamp of the last model row, which a row with another stamp gets
+    /// a note against, as a restore derives it.
+    last_stamp: Option<Producer>,
     started_at: Instant,
     scroll_top: u32,
     auto_scroll: bool,
@@ -1170,6 +1178,8 @@ impl MessagesPanel {
                 ms,
             ),
             streaming_role: DisplayRole::Assistant,
+            producer: None,
+            last_stamp: None,
             started_at: Instant::now(),
             scroll_top: u32::MAX,
             auto_scroll: true,
@@ -1397,11 +1407,8 @@ impl MessagesPanel {
     /// Whether this card draws its body in a fixed window rather than
     /// abridging it to a budget.
     fn card_scrolls(&self, tool_id: &str) -> bool {
-        self.tool_card(tool_id).is_some_and(|(_, role)| {
-            self.rctx(&role.name, role.effect, tool_id)
-                .card_scroll
-                .is_some()
-        })
+        self.tool_card(tool_id)
+            .is_some_and(|(_, role)| self.policy.scrolls(&role.name))
     }
 
     /// `None` means header-only. A card the reader has not spoken about rests
@@ -1413,12 +1420,28 @@ impl MessagesPanel {
     /// shows, so it is never `full` and a click that would have opened one
     /// closes it instead.
     fn tool_expansion(&self, tool_id: &str, open_by_default: bool) -> Option<Disclosure> {
+        self.tool_expansion_at(
+            tool_id,
+            open_by_default,
+            self.tool_card(tool_id).map(|(index, _)| index),
+        )
+    }
+
+    fn tool_expansion_at(
+        &self,
+        tool_id: &str,
+        open_by_default: bool,
+        msg_index: Option<usize>,
+    ) -> Option<Disclosure> {
         let full = match self.disclosure.get(tool_id) {
             Some(CardState::Closed) => return None,
-            Some(CardState::Full) => !self.card_scrolls(tool_id),
-            None if open_by_default => self
-                .tool_card(tool_id)
-                .is_some_and(|(index, _)| self.rests_whole(index)),
+            Some(CardState::Full) => !msg_index.is_some_and(|index| {
+                self.messages[index]
+                    .role
+                    .tool_name()
+                    .is_some_and(|name| self.policy.scrolls(name))
+            }),
+            None if open_by_default => msg_index.is_some_and(|index| self.rests_whole(index)),
             None => return None,
         };
         Some(Disclosure {
@@ -1781,8 +1804,43 @@ impl MessagesPanel {
     /// correct it later.
     pub fn push(&mut self, mut msg: DisplayMessage) -> usize {
         msg.created.get_or_insert_with(Timestamp::now);
+        if msg.producer.is_none()
+            && matches!(
+                msg.role,
+                DisplayRole::Assistant | DisplayRole::Thinking | DisplayRole::Tool(_)
+            )
+        {
+            msg.producer.clone_from(&self.producer);
+        }
+        if let Some(producer) = &msg.producer {
+            if let Some(note) = self
+                .last_stamp
+                .as_ref()
+                .and_then(|last| last.change_note(producer))
+            {
+                let mut row = DisplayMessage::new(DisplayRole::Notice, note);
+                row.created = msg.created;
+                self.messages.push(row);
+            }
+            self.last_stamp = Some(producer.clone());
+        }
         self.messages.push(msg);
         self.messages.len() - 1
+    }
+
+    /// A request went out with `producer`'s settings. What streamed before
+    /// it is settled first, so it keeps the stamp it was written under.
+    pub fn message_started(&mut self, producer: Producer) {
+        self.flush();
+        self.producer = Some(producer);
+    }
+
+    /// Settles what rows pushed from here on are stamped with, and starts the
+    /// comparison afresh: a row already says how the route moved, or a
+    /// compaction summary another model writes follows.
+    pub fn set_producer(&mut self, producer: Option<Producer>) {
+        self.producer = producer;
+        self.last_stamp = None;
     }
 
     /// Drops the whole segment cache, so keep it for one-off corrections and
@@ -2018,6 +2076,8 @@ impl MessagesPanel {
         for msg in &mut msgs {
             msg.body_open = None;
         }
+        self.last_stamp = msgs.iter().rev().find_map(|msg| msg.producer.clone());
+        self.producer.clone_from(&self.last_stamp);
         self.dropped_snapshots.clear();
         *self.messages = msgs;
         self.cache.clear();
@@ -3199,12 +3259,8 @@ impl MessagesPanel {
             return;
         }
         let inst_id = segment::instruction_id(parent_id);
-        let exp = self
-            .tool_expansion(&inst_id, self.card_opens_by_default(parent_id))
-            .map(|d| d.full);
-        let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
-            .content_width(self.viewport_width);
-        let tl = build_instructions_lines(blocks, width, exp, self.token_scale);
+        let exp = self.tool_expansion(&inst_id, self.card_opens_by_default(parent_id));
+        let tl = self.instruction_lines(blocks, exp);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let compact = self.card_draws_compact(parent_id);
@@ -3214,12 +3270,29 @@ impl MessagesPanel {
         } else {
             let compact = self.card_draws_compact(parent_id);
             let msg_index = self.cache.get(parent_idx).and_then(|s| s.msg_index);
-            let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction, msg_index);
-            seg.search_text = tl.search_text.clone();
-            seg.apply_highlight(tl, &self.hl_worker, compact);
+            let seg = self.instruction_segment(inst_id, msg_index, tl, compact);
             self.cache.insert(parent_idx + 1, seg);
         }
         self.cache.update_margins(self.viewport_width);
+    }
+
+    fn instruction_lines(&self, blocks: &[InstructionBlock], exp: Option<Disclosure>) -> ToolLines {
+        let width = SegmentChrome::for_kind(SegmentKind::Instruction, self.viewport_width, 0)
+            .content_width(self.viewport_width);
+        build_instructions_lines(blocks, width, exp.map(|d| d.full), self.token_scale)
+    }
+
+    fn instruction_segment(
+        &self,
+        id: String,
+        msg_index: Option<usize>,
+        lines: ToolLines,
+        compact: bool,
+    ) -> Segment {
+        let mut segment = Segment::with_tool(id, SegmentKind::Instruction, msg_index);
+        segment.search_text = lines.search_text.clone();
+        segment.apply_highlight(lines, &self.hl_worker, compact);
+        segment
     }
 
     fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
@@ -3766,6 +3839,7 @@ impl MessagesPanel {
             .get(target.message)
             .map(|msg| MessageDetails {
                 created: msg.created,
+                producer: msg.producer.clone(),
                 usage: msg.turn_usage.clone(),
             })
             .unwrap_or_default()
@@ -4548,15 +4622,15 @@ impl MessagesPanel {
 
     /// Whether call `inner` of the card batch child `child` draws opens without a click.
     fn nested_child_rests_open(&self, tool_id: &str, child: usize, inner: usize) -> bool {
-        let Some(ToolOutput::Batch { entries, .. }) = self
+        let output = self
             .tool_card(tool_id)
-            .and_then(|(msg_index, _)| self.messages[msg_index].tool_output.as_deref())
-        else {
+            .and_then(|(msg_index, _)| self.messages[msg_index].tool_output.as_deref());
+        let Some(ToolOutput::Batch { entries, .. }) = output else {
             return false;
         };
         let views = self.batch_views.get(tool_id).cloned().unwrap_or_default();
         let limits = RenderLimits::new(false, usize::MAX, views, self.tool_output_lines)
-            .with_policy(self.policy.clone(), self.child_windows(tool_id));
+            .with_policy(self.policy.clone(), self.child_windows(tool_id, output));
         code_view::nested_child_rests_open(&limits, entries, child, inner)
     }
 
@@ -5642,7 +5716,13 @@ impl MessagesPanel {
     /// than per panel: an always-collapsed tool draws its row inside an
     /// expanded transcript, and the row's width comes from the chrome that
     /// row actually gets.
-    fn rctx(&self, tool: &str, effect: ToolEffect, tool_id: &str) -> RenderCtx<'_> {
+    fn rctx(
+        &self,
+        tool: &str,
+        effect: ToolEffect,
+        tool_id: &str,
+        output: Option<&ToolOutput>,
+    ) -> RenderCtx<'_> {
         let compact = self.draws_compact(tool, effect);
         let kind = if compact {
             SegmentKind::ToolInline
@@ -5656,7 +5736,7 @@ impl MessagesPanel {
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
             card_scroll: self.policy.window(tool, at.offset, at.follow),
-            child_scroll: self.child_windows(tool_id),
+            child_scroll: self.child_windows(tool_id, output),
             policy: self.policy.clone(),
             compact,
             batch_views: &self.batch_views,
@@ -5675,11 +5755,12 @@ impl MessagesPanel {
     /// Where every scrolling child of this card has its window. Built from
     /// the roster rather than from the scroll map, so a child the reader has
     /// never touched still gets the window its tool asks for.
-    fn child_windows(&self, tool_id: &str) -> Arc<HashMap<usize, ScrollWindow>> {
-        let Some(ToolOutput::Batch { entries, .. }) = self
-            .tool_card(tool_id)
-            .and_then(|(idx, _)| self.messages[idx].tool_output.as_deref())
-        else {
+    fn child_windows(
+        &self,
+        tool_id: &str,
+        output: Option<&ToolOutput>,
+    ) -> Arc<HashMap<usize, ScrollWindow>> {
+        let Some(ToolOutput::Batch { entries, .. }) = output else {
             return Arc::default();
         };
         let windows: HashMap<usize, ScrollWindow> = entries
@@ -5770,6 +5851,7 @@ impl MessagesPanel {
         &mut self,
         tool_id: &str,
         msg_index: usize,
+        context_index: usize,
         status: ToolStatus,
         exp: Option<Disclosure>,
     ) -> ToolLines {
@@ -5780,6 +5862,7 @@ impl MessagesPanel {
                 msg.role.tool_name().unwrap_or_default(),
                 msg.role.tool_effect().unwrap_or_default(),
                 tool_id,
+                panel.messages[context_index].tool_output.as_deref(),
             );
             Self::build_held_tool_lines(msg, status, &rctx, exp, floor)
         };
@@ -6122,10 +6205,10 @@ impl MessagesPanel {
             return;
         };
 
-        let exp = self.tool_expansion(tool_id, opens);
+        let exp = self.tool_expansion_at(tool_id, opens, Some(msg_idx));
         // Before the build: the syntax set may finish loading while it runs.
         let ready = highlight::is_ready();
-        let tl = self.build_anchored_tool_lines(tool_id, msg_idx, status, exp);
+        let tl = self.build_anchored_tool_lines(tool_id, msg_idx, msg_idx, status, exp);
         let msg = &self.messages[msg_idx];
 
         let instructions = msg
@@ -6159,11 +6242,35 @@ impl MessagesPanel {
         // the screen.
         let full = self.cache.msg_count() == 0;
         let ready = highlight::is_ready();
+        let tool_indices: HashMap<_, _> = if full {
+            self.messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, msg)| msg.role.tool_id().map(|id| (id.to_owned(), index)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let mut segment_indices: HashMap<_, _> = if full {
+            self.cache
+                .segments()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, segment)| segment.tool_id.clone().map(|id| (id, index)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         for i in self.cache.msg_count()..self.messages.len() {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.tool_expansion(&t.id, self.opens_by_default(t, i));
+                let context_index = tool_indices
+                    .get(&t.id)
+                    .copied()
+                    .unwrap_or_else(|| self.tool_card(&t.id).unwrap().0);
+                let exp =
+                    self.tool_expansion_at(&t.id, self.opens_by_default(t, i), Some(context_index));
                 let status = t.status;
                 let id = t.id.clone();
                 let compact = self.draws_compact(&t.name, t.effect);
@@ -6172,21 +6279,51 @@ impl MessagesPanel {
                     .as_deref()
                     .and_then(|o| o.owned_instructions());
                 let (tl, uncoloured) = if full {
-                    command_text::deferring(|| self.build_anchored_tool_lines(&id, i, status, exp))
+                    command_text::deferring(|| {
+                        self.build_anchored_tool_lines(&id, i, context_index, status, exp)
+                    })
                 } else {
-                    (self.build_anchored_tool_lines(&id, i, status, exp), !ready)
+                    (
+                        self.build_anchored_tool_lines(&id, i, context_index, status, exp),
+                        !ready,
+                    )
                 };
                 let drawn = tl.lines.len();
                 let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
                 seg.search_text = tl.search_text.clone();
                 seg.apply_highlight(tl, &self.hl_worker, compact);
                 seg.uncoloured = uncoloured;
+                if full {
+                    segment_indices.insert(id.clone(), self.cache.len());
+                }
                 self.cache.push(seg);
                 self.hold_card_height(&id, status, drawn);
 
-                if let Some(blocks) = blocks {
-                    let last_idx = self.cache.len().saturating_sub(1);
-                    self.upsert_instruction_segment(&id, &blocks, last_idx);
+                if !full {
+                    if let Some(blocks) = blocks {
+                        self.upsert_instruction_segment(&id, &blocks, self.cache.len() - 1);
+                    }
+                } else if let Some(blocks) = blocks.filter(|blocks| !blocks.is_empty())
+                    && let DisplayRole::Tool(parent) = &self.messages[context_index].role
+                {
+                    let compact = self.draws_compact(&parent.name, parent.effect);
+                    let inst_id = segment::instruction_id(&id);
+                    let exp = self.tool_expansion_at(
+                        &inst_id,
+                        self.opens_by_default(parent, context_index),
+                        tool_indices.get(&inst_id).copied(),
+                    );
+                    let lines = self.instruction_lines(&blocks, exp);
+                    if let Some(&index) = segment_indices.get(&inst_id) {
+                        let segment = self.cache.get_mut(index).unwrap();
+                        segment.search_text = lines.search_text.clone();
+                        segment.update_with_reuse(lines, &self.hl_worker, compact);
+                    } else {
+                        let segment =
+                            self.instruction_segment(inst_id.clone(), Some(i), lines, compact);
+                        segment_indices.insert(inst_id, self.cache.len());
+                        self.cache.push(segment);
+                    }
                 }
             } else {
                 let kind = segment_kind(&msg.role);
@@ -7164,7 +7301,12 @@ mod shell_receipt_tests {
         buf.append(SnapshotLine::plain(OUTPUT.into()));
         let _ = panel.poll_live_bufs();
         if depth < 2 {
-            let mut ctx = panel.rctx(tool, ToolEffect::Unknown, ROOT);
+            let mut ctx = panel.rctx(
+                tool,
+                ToolEffect::Unknown,
+                ROOT,
+                panel.messages.last().unwrap().tool_output.as_deref(),
+            );
             ctx.width = 100;
             ctx.policy.expanded = true;
             ctx.policy.scroll_card_lines = 0;
@@ -7277,7 +7419,12 @@ mod retained_progress_tests {
     #[test_case(Some(HISTORY_PREFIX) ; "history_never_refills")]
     fn only_pure_output_root_windows_offer_refill_rows(history_start: Option<usize>) {
         let panel = panel(false);
-        let rctx = panel.rctx(TASK_TOOL_NAME, ToolEffect::Orchestrator, PARENT_ID);
+        let rctx = panel.rctx(
+            TASK_TOOL_NAME,
+            ToolEffect::Orchestrator,
+            PARENT_ID,
+            panel.messages[0].tool_output.as_deref(),
+        );
         let mut lines =
             super::build_tool_lines(&panel.messages[0], ToolStatus::InProgress, &rctx, None);
         lines.scroll_spans = vec![history_span(history_start)];

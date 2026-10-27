@@ -211,7 +211,15 @@ While the main agent can set `model`, a `# Model favorites` [reminder](/docs/con
 - `anthropic/claude-opus-5-5`: lane Best; jobs Chat, Subagent; thinking low–max, never off
 ```
 
-Starring or unstarring a model in `/model` updates the list with your next message. A change made in another Caudra window reaches this session after a restart."#;
+Starring or unstarring a model in `/model` updates the list with your next message. A change made in another Caudra window reaches this session after a restart.
+
+### Switch models while work runs
+
+`/model` and `/thinking` act on the chat on screen. In the main chat, a model or level picked while a turn runs reaches that turn. In a task chat, the pick moves only that task, whether it is running or finished. Clicking the model or thinking chip in the footer does the same. In the task picker, `Ctrl+T` opens the model list for the selected task, or for Main.
+
+The request in flight finishes on the model it started with, and the next request goes to the new one. A request that waits for a retry, a rate limit, or a spent account stops waiting and goes out at once. So a task stuck until a quota resets can continue on another provider: open it, pick another model, and it resumes. The [spent-account card](/docs/accounts/) offers **Use another model…** for the same case. A finished task keeps the pick and uses it when it is continued. A picked model becomes the one the conversation returns to after a provider move, and the next request rebuilds the prompt cache on it.
+
+Each reply records the model and thinking level that wrote it. Where they change between two messages, a row such as `Model: anthropic/claude-opus-5-5 → openai/gpt-6.1-sol` or `Thinking: high → low` marks the place, live and in a restored session. A provider move has its own row, so no second row follows it. Messages saved before Caudra recorded the model show no row. The [message menu](/docs/sessions/#message-actions) names the model of each message."#;
 
 const SHELLS: &str = r#"## Shell commands
 

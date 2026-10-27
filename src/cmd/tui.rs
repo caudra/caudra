@@ -32,8 +32,8 @@ use caudra_storage::history_search::HistoryScope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{
-    SessionDatabase, SessionError, SessionLease, SessionLocation, SessionRelocation,
-    SessionRelocationResult,
+    SessionDatabase, SessionError, SessionLease, SessionLocation, SessionOpenRetry,
+    SessionRelocation, SessionRelocationResult,
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::version::{self, UpdateChannel};
@@ -59,7 +59,7 @@ use crate::cmd::permissions::discover::{
     discover_for_project_cancellable,
 };
 use crate::docs;
-use crate::progress::ConsoleSpinner;
+use crate::progress::{ConsoleSpinner, SessionLoadProgress};
 use crate::release_notes;
 use crate::setup;
 use crate::startup::project_notices;
@@ -808,7 +808,11 @@ fn resolve_session(
         });
     }
     if continue_session {
-        if let Some(summary) = AppSession::list(cwd, storage)?.into_iter().next() {
+        if let Some(summary) = SessionDatabase::open_state(storage)?
+            .list(cwd)?
+            .into_iter()
+            .next()
+        {
             let lease = Arc::new(SessionLease::acquire(storage, summary.id)?);
             let (session, cursor) = setup::load_session_with_cursor(summary.id, storage)?;
             StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
@@ -1213,17 +1217,24 @@ fn restore_workspace_tabs(
             );
             continue;
         };
-        let opened = (|| -> Result<SessionTab> {
+        let progress = SessionLoadProgress::new();
+        let observe = |event| progress.report(event);
+        let retry = SessionOpenRetry::new(id, &observe, &|| false);
+        let opened = (|| -> Result<(SessionTab, SessionDatabase)> {
             let lease = Arc::new(SessionLease::acquire(storage, id)?);
-            let session = caudra_agent::load_stored_session(id, storage)?;
+            let database = SessionDatabase::open_for_session(storage, &retry)?;
+            let (session, cursor) = database.load_with_cursor_for_session(id, &retry)?;
             StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
-            Ok(SessionTab {
-                session,
-                lease,
-                cursor: None,
-            })
+            Ok((
+                SessionTab {
+                    session,
+                    lease,
+                    cursor: Some(cursor),
+                },
+                database,
+            ))
         })();
-        let tab = match opened {
+        let (tab, database) = match opened {
             Ok(tab) => tab,
             Err(error) => {
                 restore_warning(
@@ -1254,7 +1265,7 @@ fn restore_workspace_tabs(
             );
             continue;
         }
-        if let Err(error) = caudra_storage::sessions::mark_opened(id, storage) {
+        if let Err(error) = database.mark_opened_for_session(id, &retry) {
             restore_warning(
                 &mut warnings,
                 format!("Stored workspace tab {id} could not be opened: {error}"),
@@ -1363,7 +1374,7 @@ fn resolve_remote_sessions(
     };
     let tab = if let Some(id) = resume_id {
         let lease = Arc::new(SessionLease::acquire(storage, id)?);
-        let session = setup::load_session(id, storage)?;
+        let (session, cursor) = setup::load_session_with_cursor(id, storage)?;
         StoredWorkspaceBinding::validate_resume_identity(
             session.workspace_binding(),
             Some(binding),
@@ -1372,7 +1383,7 @@ fn resolve_remote_sessions(
         SessionTab {
             session,
             lease,
-            cursor: None,
+            cursor: Some(cursor),
         }
     } else {
         let session = AppSession::new_with_workspace(model, cwd, binding.clone());
@@ -1635,7 +1646,6 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
     let session_cwd = workcell_runtime
         .is_remote()
         .then_some(workcell_runtime.display().cwd.as_str());
-    let resume_spinner = ConsoleSpinner::resume(&cli);
     let resolved = resolve_sessions(
         cli.continue_session,
         cli.session.as_deref(),
@@ -1644,7 +1654,6 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
         &storage,
         workcell_runtime.stored_binding(),
     )?;
-    drop(resume_spinner);
     let resolve_sessions_ms = lap();
     super::sandbox::remember_session_source(
         &storage,

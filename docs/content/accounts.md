@@ -158,6 +158,7 @@ When the pinned account is spent, or every account is spent on Auto, a card asks
 - Use an API key for this run only, whether or not it sets `fallback`.
 - Wait until the account refills, at the reset time the provider reported.
 - Choose another account from the full list.
+- Use another model, which opens the model list for the chat that waits. See [Switch models while work runs](/docs/commands/#switch-models-while-work-runs).
 
 `Esc` puts the card away, and the request keeps waiting until the account refills.
 

@@ -187,7 +187,7 @@ jobs:
               python3 scripts/time-command.py worker-fetch cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
               export CARGO_PROFILE_RELEASE_STRIP=none
-              python3 scripts/time-command.py application-build cargo build --locked --release --package caudra --target ${{ matrix.target }} --timings
+              python3 scripts/time-command.py application-build cargo build --locked --release -p caudra -p caudra-workcell --bin caudra --bin embedded-worker-smoke --target ${{ matrix.target }} --timings
               python3 scripts/time-command.py attribution python3 scripts/build-attribution.py \
                 --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
                 --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
@@ -198,10 +198,7 @@ jobs:
               cp target/code-worker/symbols/bin/monty target/release-symbols/monty
               strip target/${{ matrix.target }}/release/caudra
               test "$(target/${{ matrix.target }}/release/caudra --version)" = "caudra ${GITHUB_REF_NAME#v}"
-              python3 scripts/time-command.py smoke-build cargo test --locked --release --target ${{ matrix.target }} \
-                -p caudra-workcell --test embedded_worker --no-run --timings
-              python3 scripts/time-command.py smoke-execute cargo test --locked --release --target ${{ matrix.target }} \
-                -p caudra-workcell --test embedded_worker
+              python3 scripts/time-command.py smoke-execute target/${{ matrix.target }}/release/embedded-worker-smoke
               smoke_output="$(OPENAI_API_KEY=release-smoke \
                 XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
                 target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
@@ -339,7 +336,7 @@ jobs:
           fi
           export WORKCELL_BUNDLED_MONTY_WORKER="$worker"
           export CARGO_PROFILE_RELEASE_STRIP=none
-          python3 scripts/time-command.py application-build cargo build --locked --release --package caudra --target ${{ matrix.target }} --timings
+          python3 scripts/time-command.py application-build cargo build --locked --release -p caudra -p caudra-workcell --bin caudra --bin embedded-worker-smoke --target ${{ matrix.target }} --timings
           python3 scripts/time-command.py attribution python3 scripts/build-attribution.py \
             --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
             --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
@@ -349,20 +346,19 @@ jobs:
           cp "$PWD/target/code-worker/symbols/bin/"* target/release-symbols/
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             binary="target/${{ matrix.target }}/release/caudra.exe"
+            smoke="target/${{ matrix.target }}/release/embedded-worker-smoke.exe"
             cp "$binary" target/release-symbols/
             if [[ -f "target/${{ matrix.target }}/release/caudra.pdb" ]]; then
               cp "target/${{ matrix.target }}/release/caudra.pdb" target/release-symbols/
             fi
           else
             binary="target/${{ matrix.target }}/release/caudra"
+            smoke="target/${{ matrix.target }}/release/embedded-worker-smoke"
             cp "$binary" target/release-symbols/
             strip "$binary"
           fi
           test "$("$binary" --version)" = "${BINARY_NAME} ${GITHUB_REF_NAME#v}"
-          python3 scripts/time-command.py smoke-build cargo test --locked --release --target ${{ matrix.target }} \
-            -p caudra-workcell --test embedded_worker --no-run --timings
-          python3 scripts/time-command.py smoke-execute cargo test --locked --release --target ${{ matrix.target }} \
-            -p caudra-workcell --test embedded_worker
+          python3 scripts/time-command.py smoke-execute "$smoke"
           smoke_output="$(OPENAI_API_KEY=release-smoke \
             XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
             "$binary" --model openai/gpt-5.1 tools --enabled-only --names 2>&1)"

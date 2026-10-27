@@ -13,6 +13,7 @@ use caudra_storage::log::target;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::live_switch::LiveSwitch;
 use super::speculative::SpeculativeRuns;
 use super::tool_body::BodyStream;
 use super::tool_delegation::{Delegated, DelegationStream};
@@ -562,6 +563,11 @@ pub(crate) enum StreamError {
         reroute: Box<Reroute>,
         forwarded: bool,
     },
+    /// The user picked another model or level while the request waited, so it
+    /// goes out again under those instead.
+    SettingsChanged {
+        forwarded: bool,
+    },
     Other(AgentError),
 }
 
@@ -577,6 +583,9 @@ impl From<StreamError> for AgentError {
             StreamError::Cancelled { .. } => Self::Cancelled,
             StreamError::Auth { error, .. } => error,
             StreamError::Reroute { reroute, .. } => Self::Rerouted(reroute),
+            // Only a request sent with live settings stops for them, and its
+            // agent applies them rather than converting the error.
+            StreamError::SettingsChanged { .. } => Self::Cancelled,
             StreamError::Partial { error, .. } => error,
             StreamError::Other(e) => e,
         }
@@ -628,9 +637,14 @@ impl StreamRetry {
         event_tx: Option<&EventSender>,
         cancel: &CancelToken,
         retry_now: &Nudge,
+        live: Option<&LiveSwitch>,
     ) -> Result<(), AgentError> {
         if !error.is_retryable() {
             return Err(error);
+        }
+        let changed = live.map(LiveSwitch::listen);
+        if live.is_some_and(LiveSwitch::is_pending) {
+            return Ok(());
         }
         let first_attempt_at = *self.first_attempt_at.get_or_insert_with(Instant::now);
         let hint_ms = error
@@ -705,9 +719,17 @@ impl StreamRetry {
                 async {
                     smol::Timer::at(deadline).await;
                 },
-                async {
-                    nudged.await;
-                },
+                futures_lite::future::race(
+                    async {
+                        nudged.await;
+                    },
+                    async {
+                        match changed {
+                            Some(changed) => changed.await,
+                            None => std::future::pending().await,
+                        }
+                    },
+                ),
             )
             .await;
         };
@@ -749,6 +771,7 @@ pub(crate) async fn stream_with_retry(
     cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
     retry: &mut StreamRetry,
+    live: Option<&LiveSwitch>,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
         provider,
@@ -764,6 +787,7 @@ pub(crate) async fn stream_with_retry(
         cache_key,
         speculative,
         retry,
+        live,
     )
     .await
 }
@@ -794,6 +818,7 @@ pub(crate) async fn stream_silent_with_retry(
         cache_key,
         None,
         &mut StreamRetry::default(),
+        None,
     )
     .await
 }
@@ -813,6 +838,7 @@ async fn stream_with_retry_inner(
     cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
     retry: &mut StreamRetry,
+    live: Option<&LiveSwitch>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = caudra_providers::adapt_attachments_for_model(model, messages);
@@ -862,9 +888,10 @@ async fn stream_with_retry_inner(
                 }
                 let durations: Vec<_> = reasoning.iter().map(|run| run.duration).collect();
                 attach_reasoning_durations(&mut r.message, &durations);
-                r.message.reasoning_source = Some(ReasoningSource::new(
+                r.message.reasoning_source = Some(ReasoningSource::sent(
                     model,
                     provider.reasoning_transport(model),
+                    &opts.thinking,
                 ));
                 emit_api_request(model, &r, opts, started.elapsed());
                 retry.recovered(model);
@@ -900,9 +927,10 @@ async fn stream_with_retry_inner(
                 }
                 content.append(&mut message.content);
                 message.content = content;
-                message.reasoning_source = Some(ReasoningSource::new(
+                message.reasoning_source = Some(ReasoningSource::sent(
                     model,
                     provider.reasoning_transport(model),
+                    &opts.thinking,
                 ));
                 return Err(StreamError::Partial {
                     response: Box::new(StreamResponse {
@@ -958,7 +986,7 @@ async fn stream_with_retry_inner(
                         continue;
                     }
                     retry
-                        .wait(e, model, event_tx, cancel, retry_now)
+                        .wait(e, model, event_tx, cancel, retry_now, live)
                         .await
                         .map_err(|error| match error {
                             AgentError::Cancelled => StreamError::Cancelled {
@@ -967,6 +995,9 @@ async fn stream_with_retry_inner(
                             },
                             error => StreamError::Other(error),
                         })?;
+                    if live.is_some_and(LiveSwitch::is_pending) {
+                        return Err(StreamError::SettingsChanged { forwarded });
+                    }
                     continue;
                 }
                 // The status is reported but never the body: see
@@ -1139,7 +1170,14 @@ mod tests {
             let nudge = Nudge::default();
             let mut retry = StreamRetry::default();
             retry
-                .wait(provider.error(), &model, Some(&sender), &cancel, &nudge)
+                .wait(
+                    provider.error(),
+                    &model,
+                    Some(&sender),
+                    &cancel,
+                    &nudge,
+                    None,
+                )
                 .await
                 .unwrap();
             let first_attempt_at = retry.first_attempt_at;
@@ -1156,6 +1194,7 @@ mod tests {
                 None,
                 None,
                 &mut retry,
+                None,
             )
             .await;
             let expected_attempts = if recover { 2 } else { MAX_RETRIES };
@@ -1176,7 +1215,7 @@ mod tests {
                 assert_eq!(retry.state.attempts(), 0);
                 assert_eq!(retry.first_attempt_at, None);
                 retry
-                    .wait(provider.error(), &model, None, &cancel, &nudge)
+                    .wait(provider.error(), &model, None, &cancel, &nudge, None)
                     .await
                     .unwrap();
                 assert_eq!(retry.state.attempts(), 1);
@@ -1189,7 +1228,14 @@ mod tests {
                 assert_eq!(retry.state.attempts(), MAX_RETRIES);
                 assert_eq!(retry.first_attempt_at, first_attempt_at);
                 let error = retry
-                    .wait(provider.error(), &model, Some(&sender), &cancel, &nudge)
+                    .wait(
+                        provider.error(),
+                        &model,
+                        Some(&sender),
+                        &cancel,
+                        &nudge,
+                        None,
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(error.to_string(), provider.error().to_string());
@@ -1214,7 +1260,14 @@ mod tests {
             let mut trigger = Some(trigger);
             let nudge = Nudge::default();
             let mut retry = StreamRetry::default();
-            let wait = retry.wait(provider.error(), &model, Some(&sender), &cancel, &nudge);
+            let wait = retry.wait(
+                provider.error(),
+                &model,
+                Some(&sender),
+                &cancel,
+                &nudge,
+                None,
+            );
             let (result, ()) = futures_lite::future::zip(wait, async {
                 let envelope = rx.recv_async().await.unwrap();
                 assert!(matches!(envelope.event, AgentEvent::Retry {
@@ -1266,6 +1319,7 @@ mod tests {
                 None,
                 None,
                 &mut retry,
+                None,
             );
             let (result, ()) = futures_lite::future::zip(request, async {
                 loop {
@@ -1649,6 +1703,7 @@ mod tests {
                 None,
                 Some(&runs),
                 &mut retry,
+                None,
             );
             let result = futures_lite::future::race(request, async {
                 if cancelled {

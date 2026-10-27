@@ -13,6 +13,7 @@ use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::card_decisions::{self, CardDecision, DecisionState, DecisionSubject};
 use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::{MessageActionTarget, MessageDetails, MessagesPanel};
+use crate::components::producer::Producer;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
 use crate::components::tooltip::Tip;
@@ -254,6 +255,7 @@ impl Chat {
                 | AgentEvent::AccountRouted { .. }
                 | AgentEvent::AccountExhausted(_)
                 | AgentEvent::ModelRerouted(_)
+                | AgentEvent::SettingsChanged { .. }
                 | AgentEvent::TaskAdmitted(_)
                 | AgentEvent::Retry { .. }
                 | AgentEvent::SubagentProgress { .. }
@@ -380,8 +382,14 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
+            AgentEvent::MessageStarted {
+                model, thinking, ..
+            } => self
+                .messages_panel
+                .message_started(Producer { model, thinking }),
             AgentEvent::Compacting => {
                 self.messages_panel.flush();
+                self.messages_panel.set_producer(None);
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Notice,
                     COMPACTION_BORDER_TEXT.into(),
@@ -401,7 +409,6 @@ impl Chat {
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
             | AgentEvent::QuestionClosed
-            | AgentEvent::MessageStarted { .. }
             | AgentEvent::SubagentFinished { .. }
             | AgentEvent::Autopilot(_) => {}
             AgentEvent::Decision(note) => match self.show_decisions {
@@ -420,6 +427,7 @@ impl Chat {
             | AgentEvent::AccountRouted { .. }
             | AgentEvent::AccountExhausted(_)
             | AgentEvent::ModelRerouted(_)
+            | AgentEvent::SettingsChanged { .. }
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
             | AgentEvent::SubagentProgress { .. }
@@ -1147,6 +1155,10 @@ impl Chat {
         )
     }
 
+    pub fn set_producer(&mut self, producer: Option<Producer>) {
+        self.messages_panel.set_producer(producer);
+    }
+
     pub fn bind_sources(&mut self, messages: &[DisplayMessage]) {
         self.messages_panel.bind_sources(messages);
     }
@@ -1402,16 +1414,22 @@ pub(crate) fn decision_inserts<'a>(
 /// Puts each restored decision on the first card drawing its call, a batch
 /// child's on its batch's card.
 pub(crate) fn attach_card_decisions(display: &mut [DisplayMessage], cards: Vec<CardDecision>) {
+    if cards.is_empty() {
+        return;
+    }
+    let mut first_cards = HashMap::new();
+    for (index, message) in display.iter().enumerate() {
+        if let Some(call_id) = message.role.tool_id() {
+            first_cards.entry(call_id.to_owned()).or_insert(index);
+        }
+    }
     for decision in cards {
         let DecisionSubject::Call(call_id) = &decision.subject else {
             continue;
         };
         let mut call_id = call_id.as_str();
         let card = loop {
-            if let Some(card) = display
-                .iter()
-                .position(|msg| msg.role.tool_id() == Some(call_id))
-            {
+            if let Some(&card) = first_cards.get(call_id) {
                 break Some(card);
             }
             match batch_child_id(call_id) {
@@ -1466,6 +1484,7 @@ pub fn interleaved_history_to_display(
     decisions.sort_by_key(|(position, _)| *position);
     let mut decisions = decisions.into_iter().peekable();
     let results = build_tool_results_map(items);
+    let mut group_text = build_user_text_map(items);
     let mut group_images: HashMap<CaudraId, Vec<ImageSource>> = HashMap::new();
     for item in items {
         if let HistoryItemKind::User { images, .. } = &item.kind
@@ -1479,11 +1498,12 @@ pub fn interleaved_history_to_display(
     }
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
-    let mut displayed_user_groups = HashSet::new();
     let mut stall_row: Option<usize> = None;
+    let mut last_producer: Option<Producer> = None;
     for (index, item) in items.iter().enumerate() {
         while let Some((_, row)) = inserts.next_if(|(position, _)| *position <= index) {
             display.push(row);
+            last_producer = None;
         }
         while let Some((_, decision)) = decisions.next_if(|(position, _)| *position <= index) {
             host_turn_decision(&mut display, decision);
@@ -1550,9 +1570,7 @@ pub fn interleaved_history_to_display(
                 ..
             } => {}
             HistoryItemKind::User { .. } => {
-                if displayed_user_groups.insert(item.group_id)
-                    && let Some((id, text)) = visible_user_text(items, item.group_id)
-                {
+                if let Some(UserGroupText::Visible(id, text)) = group_text.remove(&item.group_id) {
                     let images: Arc<[ImageSource]> = group_images
                         .remove(&item.group_id)
                         .map_or_else(Arc::default, Arc::from);
@@ -1703,6 +1721,7 @@ pub fn interleaved_history_to_display(
                     progress: None,
                     plan_path: None,
                     created: None,
+                    producer: None,
                     turn_usage: None,
                     truncated_lines,
                     render_snapshot: None,
@@ -1721,9 +1740,26 @@ pub fn interleaved_history_to_display(
             | HistoryItemKind::Reasoning { .. }
             | HistoryItemKind::ToolResult { .. } => {}
         }
+        let producer = item_producer(item);
+        if is_compaction_summary(item) {
+            last_producer = None;
+        } else if let Some(producer) = &producer
+            && display.len() > first_row
+        {
+            if let Some(note) = last_producer
+                .as_ref()
+                .and_then(|last| last.change_note(producer))
+            {
+                display.insert(first_row, DisplayMessage::new(DisplayRole::Notice, note));
+            }
+            last_producer = Some(producer.clone());
+        }
         let created = item_created(item);
         for row in &mut display[first_row..] {
             row.created = created;
+            if !matches!(row.role, DisplayRole::Notice) {
+                row.producer.clone_from(&producer);
+            }
         }
     }
     display.extend(inserts.map(|(_, row)| row));
@@ -1761,6 +1797,25 @@ fn item_created(item: &HistoryItem) -> Option<Timestamp> {
     Timestamp::from_millisecond(i64::try_from(millis).ok()?).ok()
 }
 
+fn item_producer(item: &HistoryItem) -> Option<Producer> {
+    match &item.kind {
+        HistoryItemKind::AssistantText { source, .. }
+        | HistoryItemKind::Reasoning { source, .. }
+        | HistoryItemKind::ToolCall { source, .. } => source.as_ref().map(Producer::from),
+        HistoryItemKind::User { .. } | HistoryItemKind::ToolResult { .. } => None,
+    }
+}
+
+fn is_compaction_summary(item: &HistoryItem) -> bool {
+    matches!(
+        item.kind,
+        HistoryItemKind::AssistantText {
+            is_compaction_summary: true,
+            ..
+        }
+    )
+}
+
 /// The text a prompt's bubble shows, live and restored alike, so the two can
 /// be matched to bind the live bubble to its history.
 pub(crate) fn format_with_images(text: &str, image_count: usize) -> String {
@@ -1771,28 +1826,39 @@ pub(crate) fn format_with_images(text: &str, image_count: usize) -> String {
     }
 }
 
-fn visible_user_text(items: &[HistoryItem], group_id: CaudraId) -> Option<(CaudraId, &str)> {
-    let mut users = items.iter().filter(|item| item.group_id == group_id);
-    let first = users
-        .clone()
-        .find(|item| matches!(item.kind, HistoryItemKind::User { .. }))?;
-    let HistoryItemKind::User {
-        display_text,
-        origin: UserOrigin::Turn,
-        ..
-    } = &first.kind
-    else {
-        return None;
-    };
-    if let Some(display_text) = display_text {
-        return (!display_text.is_empty()).then_some((first.id, display_text.as_str()));
-    }
-    users.find_map(|item| match &item.kind {
-        HistoryItemKind::User { text, .. } if !text.trim().is_empty() => {
-            Some((item.id, text.as_str()))
+enum UserGroupText<'a> {
+    Hidden,
+    Pending,
+    Visible(CaudraId, &'a str),
+}
+
+fn build_user_text_map(items: &[HistoryItem]) -> HashMap<CaudraId, UserGroupText<'_>> {
+    let mut groups = HashMap::new();
+    for item in items {
+        let HistoryItemKind::User {
+            text,
+            display_text,
+            origin,
+            ..
+        } = &item.kind
+        else {
+            continue;
+        };
+        let group = groups.entry(item.group_id).or_insert_with(|| {
+            if *origin != UserOrigin::Turn {
+                return UserGroupText::Hidden;
+            }
+            match display_text.as_deref() {
+                Some("") => UserGroupText::Hidden,
+                Some(text) => UserGroupText::Visible(item.id, text),
+                None => UserGroupText::Pending,
+            }
+        });
+        if matches!(group, UserGroupText::Pending) && !text.trim().is_empty() {
+            *group = UserGroupText::Visible(item.id, text);
         }
-        _ => None,
-    })
+    }
+    groups
 }
 
 /// Rebuilds a Lua restore request from the data retained by a tool row.
@@ -1986,13 +2052,15 @@ mod tests {
     use caudra_config::decisions::FeatureMode;
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
-        AutopilotOrigin, Billing, ContentBlock, Message, Model, PeerAudience, PeerMessageOrigin,
-        ReasoningTransport, Role, StandingReminderKind, TaskEventOrigin, estimate_tokens_cached,
-        project_messages, token_label,
+        AutopilotOrigin, Billing, ContentBlock, ImageMediaType, Message, Model, PeerAudience,
+        PeerMessageOrigin, ReasoningTransport, Role, StandingReminderKind, TaskEventOrigin,
+        estimate_tokens_cached, project_messages, token_label,
     };
     use caudra_storage::engine_decisions::StoredDecisionOutcome;
     use caudra_workspace::PlanRef;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::hint::black_box;
+    use std::time::Instant;
     use test_case::test_case;
 
     use crate::animation::test_clock::FrozenClock;
@@ -2116,6 +2184,13 @@ mod tests {
         "<automation name=\"ci-watch\">The nightly build failed on main.</automation>";
     const TODO_TEXT: &str = "Verify the task-local todo list";
     const TODO_CALL: &str = "todo-update";
+    const BLANK_USER_TEXT: &str = " \t\n";
+    const FIRST_IMAGE: &str = "Zmlyc3Q=";
+    const SECOND_IMAGE: &str = "c2Vjb25k";
+    const THIRD_IMAGE: &str = "dGhpcmQ=";
+    const NESTED_CALL_CHILD: &str = "t2:0:1";
+    const INVALID_CALL_CHILD: &str = "t2:not-an-index";
+    const LOAD_SCALING_BASE: usize = 1_000;
 
     fn chat() -> Chat {
         Chat::new(
@@ -3195,6 +3270,117 @@ mod tests {
                 (&DisplayRole::Injected, SYNTHETIC_TEXT),
             ]
         );
+    }
+
+    fn grouped_user_items(specs: &[(UserOrigin, &str, Option<&str>)]) -> Vec<HistoryItem> {
+        let messages: Vec<_> = specs
+            .iter()
+            .map(|_| Message::user(USER_TEXT.into()))
+            .collect();
+        let mut items = crate::history_items(&messages);
+        let group_id = items[0].group_id;
+        for (item, &(origin, text, display_text)) in items.iter_mut().zip(specs) {
+            item.group_id = group_id;
+            let HistoryItemKind::User {
+                origin: saved_origin,
+                text: saved_text,
+                display_text: saved_display,
+                ..
+            } = &mut item.kind
+            else {
+                unreachable!();
+            };
+            *saved_origin = origin;
+            *saved_text = text.into();
+            *saved_display = display_text.map(str::to_owned);
+        }
+        items
+    }
+
+    #[test_case(&[(UserOrigin::Turn, USER_TEXT, None), (UserOrigin::Turn, REPLY_TEXT, None)], Some((0, USER_TEXT)); "first_nonblank_text_wins")]
+    #[test_case(&[(UserOrigin::Turn, USER_TEXT, Some(REPLY_TEXT)), (UserOrigin::Turn, INJECTED_TEXT, None)], Some((0, REPLY_TEXT)); "explicit_display_wins")]
+    #[test_case(&[(UserOrigin::Turn, USER_TEXT, Some(BLANK_USER_TEXT)), (UserOrigin::Turn, REPLY_TEXT, None)], Some((0, BLANK_USER_TEXT)); "whitespace_display_is_visible")]
+    #[test_case(&[(UserOrigin::Turn, USER_TEXT, Some("")), (UserOrigin::Turn, REPLY_TEXT, None)], None; "empty_display_hides_entire_group")]
+    #[test_case(&[(UserOrigin::Turn, BLANK_USER_TEXT, None), (UserOrigin::Mention, USER_TEXT, Some(REPLY_TEXT)), (UserOrigin::Turn, INJECTED_TEXT, None)], Some((1, USER_TEXT)); "fallback_uses_raw_text_and_source_of_first_nonblank_user")]
+    #[test_case(&[(UserOrigin::Turn, "", None), (UserOrigin::Turn, BLANK_USER_TEXT, None)], None; "blank_group_has_no_bubble")]
+    #[test_case(&[(UserOrigin::Observation, INJECTED_TEXT, None), (UserOrigin::Turn, USER_TEXT, None)], None; "first_observation_blocks_later_turn")]
+    #[test_case(&[(UserOrigin::Synthetic, SYNTHETIC_TEXT, Some(USER_TEXT)), (UserOrigin::Turn, USER_TEXT, None)], None; "first_synthetic_blocks_later_turn")]
+    #[test_case(&[(UserOrigin::Mention, MENTION_BODY, None), (UserOrigin::Turn, USER_TEXT, None)], None; "first_mention_blocks_later_turn")]
+    fn restored_user_groups_preserve_text_and_source(
+        specs: &[(UserOrigin, &str, Option<&str>)],
+        expected: Option<(usize, &str)>,
+    ) {
+        let mut items = grouped_user_items(specs);
+        let expected =
+            expected.map(|(index, text)| (Some(DisplaySource::User(items[index].id)), text));
+        let unrelated = crate::history_items(&[Message::user(REPLY_TEXT.into())]).remove(0);
+        let unrelated_source = Some(DisplaySource::User(unrelated.id));
+        let mut assistant = crate::history_items(&[Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: REPLY_TEXT.into(),
+            }],
+            ..Default::default()
+        }])
+        .remove(0);
+        assistant.group_id = items[0].group_id;
+        items.insert(1, unrelated);
+        items.insert(0, assistant);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+        let users: Vec<_> = display
+            .iter()
+            .filter(|message| message.role == DisplayRole::User)
+            .map(|message| (message.source, message.text.as_str()))
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .chain([(unrelated_source, REPLY_TEXT)])
+            .collect();
+        assert_eq!(users, expected);
+    }
+
+    #[test_case(false; "hidden_reminders")]
+    #[test_case(true; "visible_reminders")]
+    fn restored_user_groups_keep_noncontiguous_images_in_history_order(show_reminders: bool) {
+        let mut items = grouped_user_items(&[
+            (UserOrigin::Turn, USER_TEXT, None),
+            (UserOrigin::Mention, MENTION_BODY, None),
+            (UserOrigin::Observation, INJECTED_TEXT, None),
+        ]);
+        let images: Vec<_> = [FIRST_IMAGE, SECOND_IMAGE, THIRD_IMAGE]
+            .into_iter()
+            .map(|data| ImageSource::new(ImageMediaType::Png, data.into()))
+            .collect();
+        for (item, image) in items.iter_mut().zip(&images) {
+            let HistoryItemKind::User { images, .. } = &mut item.kind else {
+                unreachable!();
+            };
+            images.push(image.clone());
+        }
+        let source = Some(DisplaySource::User(items[0].id));
+        let unrelated_image = images[0].clone();
+        let unrelated = crate::history_items(&[Message::user_with_images(
+            REPLY_TEXT.into(),
+            vec![unrelated_image.clone()],
+        )])
+        .remove(0);
+        items.insert(1, unrelated);
+
+        let display = history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            show_reminders,
+        )
+        .0;
+        assert_eq!(display[0].source, source);
+        assert_eq!(display[0].images.as_ref(), images);
+        assert_eq!(display[0].text, format!("{USER_TEXT} [3 images]"));
+        assert_eq!(display[1].images.as_ref(), [unrelated_image]);
+        assert_eq!(display[1].text, format!("{REPLY_TEXT} [1 image]"));
+        assert_eq!(display.len(), 2 + usize::from(show_reminders));
     }
 
     #[test_case(false; "hidden_reminders")]
@@ -4773,6 +4959,188 @@ mod tests {
         assert_eq!(live_placement(&chat), [FIRST_CALL]);
     }
 
+    fn restored_call_card(call_id: &str) -> DisplayMessage {
+        DisplayMessage::new(
+            DisplayRole::Tool(Box::new(ToolRole {
+                id: call_id.into(),
+                status: ToolStatus::Success,
+                name: SHELL_TOOL_NAME.into(),
+                effect: ToolEffect::Unknown,
+            })),
+            String::new(),
+        )
+    }
+
+    fn restored_card_decision(subject: DecisionSubject, summary: &str) -> CardDecision {
+        CardDecision::settled(
+            subject,
+            DecisionFeature::MemorySearch,
+            NoteOutcome::Acted,
+            summary,
+            &[],
+        )
+    }
+
+    #[test_case(&[FIRST_CALL, FIRST_CALL], Some(FIRST_CALL), Some(0); "first_duplicate_card_wins")]
+    #[test_case(&[SECOND_CALL, SECOND_CALL_CHILD], Some(SECOND_CALL_CHILD), Some(1); "exact_child_beats_earlier_parent")]
+    #[test_case(&[SECOND_CALL, SECOND_CALL_CHILD, NESTED_CALL_CHILD], Some(NESTED_CALL_CHILD), Some(2); "exact_nested_child_beats_ancestors")]
+    #[test_case(&[SECOND_CALL, SECOND_CALL_CHILD], Some(NESTED_CALL_CHILD), Some(1); "nearest_ancestor_wins")]
+    #[test_case(&[SECOND_CALL], Some(NESTED_CALL_CHILD), Some(0); "nested_child_falls_back_to_root")]
+    #[test_case(&[SECOND_CALL], Some(INVALID_CALL_CHILD), None; "invalid_suffix_does_not_fall_back")]
+    #[test_case(&[SECOND_CALL, INVALID_CALL_CHILD], Some(INVALID_CALL_CHILD), Some(1); "exact_nonnumeric_id_is_valid")]
+    #[test_case(&[FIRST_CALL], Some(UNKNOWN_CALL), None; "missing_call_is_dropped")]
+    #[test_case(&[], Some(FIRST_CALL), None; "no_tool_cards")]
+    #[test_case(&[FIRST_CALL], None, None; "turn_decisions_are_not_attached")]
+    fn restored_card_decisions_preserve_target_and_order(
+        call_ids: &[&str],
+        subject: Option<&str>,
+        target: Option<usize>,
+    ) {
+        let mut display: Vec<_> = call_ids.iter().map(|id| restored_call_card(id)).collect();
+        display.insert(0, DisplayMessage::new(DisplayRole::User, USER_TEXT.into()));
+        let existing = restored_card_decision(DecisionSubject::Turn, TURN_ROW);
+        for message in &mut display {
+            message.decisions.push(existing.clone());
+        }
+        let subject = subject.map_or(DecisionSubject::Turn, |id| DecisionSubject::Call(id.into()));
+        let cards = vec![
+            restored_card_decision(subject.clone(), FIRST_CALL_ROW),
+            restored_card_decision(subject, SECOND_CALL_ROW),
+        ];
+
+        attach_card_decisions(&mut display, cards.clone());
+
+        for (index, message) in display.iter().enumerate() {
+            let mut expected = vec![existing.clone()];
+            if target.is_some_and(|target| index == target + 1) {
+                expected.extend(cards.clone());
+            }
+            assert_eq!(message.decisions, expected);
+        }
+    }
+
+    fn reference_visible_user_text(
+        items: &[HistoryItem],
+        group_id: CaudraId,
+    ) -> Option<(CaudraId, &str)> {
+        let mut users = items.iter().filter(|item| item.group_id == group_id);
+        let first = users
+            .clone()
+            .find(|item| matches!(item.kind, HistoryItemKind::User { .. }))?;
+        let HistoryItemKind::User {
+            display_text,
+            origin: UserOrigin::Turn,
+            ..
+        } = &first.kind
+        else {
+            return None;
+        };
+        if let Some(display_text) = display_text {
+            return (!display_text.is_empty()).then_some((first.id, display_text.as_str()));
+        }
+        users.find_map(|item| match &item.kind {
+            HistoryItemKind::User { text, .. } if !text.trim().is_empty() => {
+                Some((item.id, text.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    fn reference_attach_card_decisions(display: &mut [DisplayMessage], cards: Vec<CardDecision>) {
+        for decision in cards {
+            let DecisionSubject::Call(call_id) = &decision.subject else {
+                continue;
+            };
+            let mut call_id = call_id.as_str();
+            let card = loop {
+                if let Some(card) = display
+                    .iter()
+                    .position(|message| message.role.tool_id() == Some(call_id))
+                {
+                    break Some(card);
+                }
+                match batch_child_id(call_id) {
+                    Some((parent, _)) => call_id = parent,
+                    None => break None,
+                }
+            };
+            if let Some(card) = card {
+                display[card].decisions.push(decision);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual before/after session-load scaling measurements"]
+    fn session_load_indexes_scaling() {
+        for size in [
+            LOAD_SCALING_BASE,
+            LOAD_SCALING_BASE * 2,
+            LOAD_SCALING_BASE * 4,
+        ] {
+            let messages = vec![Message::user(USER_TEXT.into()); size * 2];
+            let mut items = crate::history_items(&messages);
+            let groups: Vec<_> = items[..size].iter().map(|item| item.group_id).collect();
+            for (index, item) in items.iter_mut().enumerate() {
+                item.group_id = groups[index % size];
+                if index < size
+                    && let HistoryItemKind::User { text, .. } = &mut item.kind
+                {
+                    *text = BLANK_USER_TEXT.into();
+                }
+            }
+            let started = Instant::now();
+            let before: Vec<_> = groups
+                .iter()
+                .map(|&group| reference_visible_user_text(black_box(&items), group))
+                .collect();
+            let user_before = started.elapsed();
+            let started = Instant::now();
+            let mut index = build_user_text_map(black_box(&items));
+            let after: Vec<_> = groups
+                .iter()
+                .map(|group| match index.remove(group) {
+                    Some(UserGroupText::Visible(id, text)) => Some((id, text)),
+                    _ => None,
+                })
+                .collect();
+            let user_after = started.elapsed();
+            assert_eq!(before, after);
+
+            let call_ids: Vec<_> = (0..size)
+                .map(|index| format!("{FIRST_CALL}-{index}"))
+                .collect();
+            let mut before: Vec<_> = call_ids.iter().map(|id| restored_call_card(id)).collect();
+            before.extend(call_ids.iter().map(|id| restored_call_card(id)));
+            let mut after = before.clone();
+            let cards: Vec<_> = call_ids
+                .iter()
+                .flat_map(|id| {
+                    [
+                        restored_card_decision(
+                            DecisionSubject::Call(format!("{id}:0:1")),
+                            CHILD_ROW,
+                        ),
+                        restored_card_decision(DecisionSubject::Call(id.clone()), FIRST_CALL_ROW),
+                    ]
+                })
+                .collect();
+            let after_cards = cards.clone();
+            let started = Instant::now();
+            reference_attach_card_decisions(black_box(&mut before), cards);
+            let cards_before = started.elapsed();
+            let started = Instant::now();
+            attach_card_decisions(black_box(&mut after), after_cards);
+            let cards_after = started.elapsed();
+            for (before, after) in before.iter().zip(&after) {
+                assert_eq!(before.decisions, after.decisions);
+            }
+            println!(
+                "groups={size} user_before={user_before:?} user_after={user_after:?} cards_before={cards_before:?} cards_after={cards_after:?}"
+            );
+        }
+    }
+
     fn stored(feature: &str, summary: &str, anchor: StoredDecisionAnchor) -> StoredEngineDecision {
         StoredEngineDecision {
             seq: 0,
@@ -5069,6 +5437,185 @@ mod tests {
             annotation,
             output.annotation(TokenScale::UNIT),
             "{RESTORED_SCALE_MSG}"
+        );
+    }
+
+    const STAMP_PROVIDER: &str = "anthropic";
+    const STAMP_OPUS: &str = "claude-opus-5-5";
+    const STAMP_SONNET: &str = "claude-sonnet-5";
+    const STAMP_HIGH: &str = "high";
+    const STAMP_LOW: &str = "low";
+    const THINKING_NOTE: &str = "Thinking: high → low";
+    const MODEL_NOTE: &str = "Model: anthropic/claude-opus-5-5 → anthropic/claude-sonnet-5";
+    const ROUTE_ROW: &str = "Moved to another provider";
+
+    fn stamp(model: &str, thinking: &str) -> ReasoningSource {
+        ReasoningSource {
+            provider: STAMP_PROVIDER.into(),
+            model: model.into(),
+            transport: ReasoningTransport::Other,
+            thinking: Some(thinking.into()),
+        }
+    }
+
+    fn stamped_reply(block: ContentBlock, source: Option<ReasoningSource>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![block],
+            reasoning_source: source,
+            ..Default::default()
+        }
+    }
+
+    fn reply_text() -> ContentBlock {
+        ContentBlock::Text {
+            text: REPLY_TEXT.into(),
+        }
+    }
+
+    fn notes(display: &[DisplayMessage]) -> Vec<&str> {
+        display
+            .iter()
+            .filter(|row| row.role == DisplayRole::Notice)
+            .map(|row| row.text.as_str())
+            .collect()
+    }
+
+    /// Each reply says who wrote it, and a change between neighbours is
+    /// noted where it took effect, derived from the stamps alone.
+    #[test]
+    fn restored_replies_carry_their_producer_and_note_each_change() {
+        let messages = vec![
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_HIGH))),
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_LOW))),
+            Message::user(USER_TEXT.into()),
+            stamped_reply(
+                ContentBlock::tool_use(
+                    "t1",
+                    SHELL_TOOL_NAME,
+                    serde_json::json!({"command": "true"}),
+                ),
+                Some(stamp(STAMP_SONNET, STAMP_LOW)),
+            ),
+        ];
+
+        let display = display_messages(&messages, &empty_outputs()).0;
+
+        assert_eq!(notes(&display), [THINKING_NOTE, MODEL_NOTE]);
+        let last = display.last().unwrap();
+        assert!(matches!(last.role, DisplayRole::Tool(_)));
+        assert_eq!(
+            last.producer,
+            Some(Producer::from(&stamp(STAMP_SONNET, STAMP_LOW)))
+        );
+        let note_at = display
+            .iter()
+            .position(|row| row.text == MODEL_NOTE)
+            .unwrap();
+        assert!(matches!(display[note_at + 1].role, DisplayRole::Tool(_)));
+        assert!(
+            display
+                .iter()
+                .filter(|row| row.role == DisplayRole::User)
+                .all(|row| row.producer.is_none())
+        );
+    }
+
+    /// A route row already says how the conversation moved, a compaction
+    /// summary is another model's, and a reply saved before the stamp says
+    /// nothing either way.
+    #[test_case(Some(stamp(STAMP_OPUS, STAMP_HIGH)), true, false ; "after_a_route_row")]
+    #[test_case(None, false, false ; "unstamped_neighbour")]
+    #[test_case(Some(stamp(STAMP_OPUS, STAMP_HIGH)), false, true ; "after_a_compaction_summary")]
+    fn some_changes_go_unnoted(first: Option<ReasoningSource>, route_row: bool, compacted: bool) {
+        let mut summary = stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_HIGH)));
+        summary.is_compaction_summary = true;
+        let mut messages = vec![
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), first),
+        ];
+        if compacted {
+            messages.push(Message::synthetic(COMPACTION_ANCHOR.into()));
+            messages.push(summary);
+        }
+        messages.push(Message::user(USER_TEXT.into()));
+        messages.push(stamped_reply(
+            reply_text(),
+            Some(stamp(STAMP_SONNET, STAMP_LOW)),
+        ));
+        let items = crate::history_items(&messages);
+        let inserts = route_row
+            .then(|| {
+                (
+                    items.len() - 1,
+                    DisplayMessage::new(DisplayRole::Notice, ROUTE_ROW.into()),
+                )
+            })
+            .into_iter()
+            .collect();
+
+        let display = interleaved_history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            true,
+            inserts,
+            Vec::new(),
+        )
+        .0;
+
+        assert!(
+            !notes(&display)
+                .iter()
+                .any(|note| note.starts_with(MODEL_NOTE)),
+            "{:?}",
+            notes(&display)
+        );
+    }
+
+    /// Live, the note lands above the first row a change wrote, and every row
+    /// is stamped with its request's settings. A request that wrote nothing,
+    /// as one that failed, leaves no note, as a restore has nothing of it.
+    #[test]
+    fn a_live_change_is_noted_and_stamped_as_a_restore_would() {
+        let mut chat = chat();
+        let started = |source: &ReasoningSource| AgentEvent::MessageStarted {
+            id: CaudraId::generate(),
+            model: source.spec(),
+            thinking: source.thinking.clone(),
+        };
+        chat.handle_event(started(&stamp(STAMP_OPUS, STAMP_HIGH)), None);
+        chat.handle_event(
+            AgentEvent::TextDelta {
+                text: REPLY_TEXT.into(),
+            },
+            None,
+        );
+        chat.handle_event(started(&stamp(STAMP_SONNET, STAMP_HIGH)), None);
+        chat.handle_event(started(&stamp(STAMP_OPUS, STAMP_LOW)), None);
+        chat.handle_event(
+            AgentEvent::TextDelta {
+                text: REPLY_TEXT.into(),
+            },
+            None,
+        );
+        chat.flush();
+
+        let rows: Vec<&DisplayMessage> = (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].producer,
+            Some(Producer::from(&stamp(STAMP_OPUS, STAMP_HIGH)))
+        );
+        assert_eq!(rows[1].role, DisplayRole::Notice);
+        assert_eq!(rows[1].text, THINKING_NOTE);
+        assert_eq!(
+            rows[2].producer,
+            Some(Producer::from(&stamp(STAMP_OPUS, STAMP_LOW)))
         );
     }
 }

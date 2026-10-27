@@ -2,7 +2,7 @@ use caudra_providers::{HistoryItem, TokenUsage};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
-    Session, SessionCursor, SessionDatabase, SessionError, mark_opened,
+    Session, SessionCursor, SessionDatabase, SessionError, SessionOpenEvent, SessionOpenRetry,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{WorkspacePath, WorkspaceSession};
@@ -175,9 +175,42 @@ pub fn open_stored_session_with_cursor(
     id: CaudraId,
     storage: &StateDir,
 ) -> Result<(StoredSession, SessionCursor), SessionError> {
-    let loaded = SessionDatabase::open(storage)?.load_with_cursor(id)?;
-    mark_opened(id, storage)?;
-    Ok(loaded)
+    open_stored_session_with_cursor_observed(id, storage, &|_| {})
+}
+
+pub fn open_stored_session_with_cursor_observed(
+    id: CaudraId,
+    storage: &StateDir,
+    progress: &dyn Fn(SessionOpenEvent),
+) -> Result<(StoredSession, SessionCursor), SessionError> {
+    read_stored_session_with_cursor(id, storage, progress, true)
+}
+
+pub fn load_stored_session_observed(
+    id: CaudraId,
+    storage: &StateDir,
+    progress: &dyn Fn(SessionOpenEvent),
+) -> Result<StoredSession, SessionError> {
+    read_stored_session_with_cursor(id, storage, progress, false).map(|(session, _)| session)
+}
+
+fn read_stored_session_with_cursor(
+    id: CaudraId,
+    storage: &StateDir,
+    progress: &dyn Fn(SessionOpenEvent),
+    record_open: bool,
+) -> Result<(StoredSession, SessionCursor), SessionError> {
+    let retry = SessionOpenRetry::new(id, progress, &|| false);
+    let result = (|| {
+        let database = SessionDatabase::open_for_session(storage, &retry)?;
+        let loaded = database.load_with_cursor_for_session(id, &retry)?;
+        if record_open {
+            database.mark_opened_for_session(id, &retry)?;
+        }
+        Ok(loaded)
+    })();
+    progress(SessionOpenEvent::Finished);
+    result
 }
 
 /// A load that is the user opening the session: resume, `--continue`, the
@@ -186,9 +219,7 @@ pub fn open_stored_session(
     id: CaudraId,
     storage: &StateDir,
 ) -> Result<StoredSession, SessionError> {
-    let session = load_stored_session(id, storage)?;
-    mark_opened(id, storage)?;
-    Ok(session)
+    open_stored_session_with_cursor(id, storage).map(|(session, _)| session)
 }
 
 pub fn latest_stored_session(
@@ -636,8 +667,39 @@ pub(crate) mod tests {
         load_stored_session(id, &storage).unwrap();
         assert_eq!(last_opened_at(), None, "{LOAD_IS_NOT_ACTIVITY}");
 
+        load_stored_session_observed(id, &storage, &|_| {}).unwrap();
+        assert_eq!(last_opened_at(), None, "{LOAD_IS_NOT_ACTIVITY}");
+
         open_stored_session(id, &storage).unwrap();
         assert!(last_opened_at().is_some(), "{OPEN_IS_ACTIVITY}");
+    }
+
+    #[test_case(true; "opened")]
+    #[test_case(false; "missing")]
+    fn observed_open_finishes_progress_on_either_result(saved: bool) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = StoredSession::new(MODEL, CWD);
+        if saved {
+            session.save(&storage).unwrap();
+        }
+        let events = Mutex::new(Vec::new());
+        let opened = open_stored_session_with_cursor_observed(session.id, &storage, &|event| {
+            events.lock().unwrap().push(event);
+        });
+        if saved {
+            let (loaded, cursor) = opened.unwrap();
+            assert_eq!(loaded.id, session.id);
+            assert_eq!(cursor.session_id(), session.id);
+            assert_eq!(loaded.updated_at, session.updated_at);
+            assert_eq!(
+                loaded.persisted_write_version(),
+                session.persisted_write_version()
+            );
+        } else {
+            assert!(opened.is_err());
+        }
+        assert_eq!(*events.lock().unwrap(), [SessionOpenEvent::Finished]);
     }
 
     fn native_file_index() -> ToolOutput {

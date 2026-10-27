@@ -6,11 +6,13 @@
 //! exactly when someone reaches for the interrupt that would leave the database
 //! part-migrated.
 
-use std::io::IsTerminal;
+use std::cell::Cell;
+use std::io::{IsTerminal, Write};
 use std::io::{stderr, stdout};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use caudra_storage::sessions::SessionOpenEvent;
 use caudra_storage::sessions::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -28,6 +30,8 @@ const RECLAIM_MESSAGE: &str = "reclaiming (pages)";
 const SPINNER_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";
 const RESUME_MESSAGE: &str = "Loading session";
 const SPINNER_TICKS: &str = "|/-\\ ";
+const DATABASE_WAIT_MESSAGE: &str = "Session database busy; retrying";
+const DATABASE_RECOVERED_MESSAGE: &str = "Session database available; continuing load";
 
 /// One line that keeps turning while startup works on something slow, so the
 /// wait before the full-screen UI never looks like a hang.
@@ -37,14 +41,6 @@ impl ConsoleSpinner {
     pub fn sandbox(cli: &Cli) -> Option<Self> {
         let message = sandbox_message(cli, stdout().is_terminal(), stderr().is_terminal())?;
         Self::start_named(message)
-    }
-
-    /// Reading a large stored session takes seconds before the UI can draw.
-    pub fn resume(cli: &Cli) -> Option<Self> {
-        if !resumes(cli) {
-            return None;
-        }
-        Self::start_named(RESUME_MESSAGE.to_owned())
     }
 
     pub fn start_named(message: String) -> Option<Self> {
@@ -76,8 +72,57 @@ impl Drop for ConsoleSpinner {
     }
 }
 
-fn resumes(cli: &Cli) -> bool {
-    cli.session.is_some() || cli.continue_session
+pub struct SessionLoadProgress {
+    spinner: Option<ConsoleSpinner>,
+    waiting: Cell<bool>,
+}
+
+impl SessionLoadProgress {
+    pub fn new() -> Self {
+        Self {
+            spinner: ConsoleSpinner::start_named(RESUME_MESSAGE.to_owned()),
+            waiting: Cell::new(false),
+        }
+    }
+
+    pub fn report(&self, event: SessionOpenEvent) {
+        if let Some(line) = self.update(event) {
+            let _ = writeln!(stderr().lock(), "{line}");
+        }
+    }
+
+    fn update(&self, event: SessionOpenEvent) -> Option<String> {
+        match event {
+            SessionOpenEvent::Waiting {
+                operation,
+                waited,
+                budget,
+            } => {
+                let already_waiting = self.waiting.replace(true);
+                if let Some(spinner) = &self.spinner {
+                    spinner.0.set_message(format!(
+                        "{DATABASE_WAIT_MESSAGE} ({operation}, {:.1}s / {}s)",
+                        waited.as_secs_f64(),
+                        budget.as_secs()
+                    ));
+                } else if !already_waiting {
+                    return Some(format!(
+                        "{DATABASE_WAIT_MESSAGE} ({operation}; up to {}s)",
+                        budget.as_secs()
+                    ));
+                }
+            }
+            SessionOpenEvent::Recovered | SessionOpenEvent::Finished => {
+                let was_waiting = self.waiting.replace(false);
+                if let Some(spinner) = &self.spinner {
+                    spinner.0.set_message(RESUME_MESSAGE);
+                } else if was_waiting && matches!(event, SessionOpenEvent::Recovered) {
+                    return Some(DATABASE_RECOVERED_MESSAGE.to_owned());
+                }
+            }
+        }
+        None
+    }
 }
 
 fn sandbox_message(cli: &Cli, stdout_terminal: bool, stderr_terminal: bool) -> Option<String> {
@@ -215,20 +260,21 @@ fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsoleSpinner, advance, enter_phase, new_bar, resumes, sandbox_message, uninstall,
+        ConsoleSpinner, DATABASE_RECOVERED_MESSAGE, DATABASE_WAIT_MESSAGE, SessionLoadProgress,
+        advance, enter_phase, new_bar, sandbox_message, uninstall,
     };
     use crate::cli::Cli;
     use caudra_config::StorageConfig;
     use caudra_storage::StateDir;
-    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::sessions::progress::{MIGRATION, PRUNE, PruneEvent};
     use caudra_storage::sessions::sweep::prune;
+    use caudra_storage::sessions::{SessionDatabase, SessionOpenEvent};
     use clap::Parser;
     use indicatif::ProgressDrawTarget;
-    use std::env;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+    use std::{cell::Cell, env, time::Duration};
     use test_case::test_case;
 
     const SANDBOX_NAME: &str = "saved-dev";
@@ -342,11 +388,59 @@ mod tests {
         );
     }
 
-    #[test_case(&["caudra"], false; "fresh")]
-    #[test_case(&["caudra", "--continue"], true; "continue_session")]
-    #[test_case(&["caudra", "--session", "saved-session"], true; "session")]
-    fn only_a_resume_spins_while_sessions_load(args: &[&str], expected: bool) {
-        assert_eq!(resumes(&Cli::parse_from(args)), expected);
+    fn database_wait() -> SessionOpenEvent {
+        SessionOpenEvent::Waiting {
+            operation: UNMEASURED_STAGE,
+            waited: Duration::from_secs(6),
+            budget: Duration::from_secs(30),
+        }
+    }
+
+    #[test_case(SessionOpenEvent::Recovered; "recovered")]
+    #[test_case(SessionOpenEvent::Finished; "failed")]
+    fn session_spinner_restores_loading_phase(event: SessionOpenEvent) {
+        let progress = SessionLoadProgress {
+            spinner: Some(ConsoleSpinner::new(
+                super::RESUME_MESSAGE.to_owned(),
+                ProgressDrawTarget::hidden(),
+            )),
+            waiting: Cell::new(false),
+        };
+        let bar = progress.spinner.as_ref().unwrap().0.clone();
+        assert!(progress.update(database_wait()).is_none());
+        assert_eq!(
+            bar.message(),
+            format!("{DATABASE_WAIT_MESSAGE} ({UNMEASURED_STAGE}, 6.0s / 30s)")
+        );
+        assert!(progress.update(event).is_none());
+        assert_eq!(bar.message(), super::RESUME_MESSAGE);
+        drop(progress);
+        assert!(bar.is_finished());
+    }
+
+    #[test]
+    fn redirected_session_progress_is_concise_and_scoped() {
+        let progress = SessionLoadProgress {
+            spinner: None,
+            waiting: Cell::new(false),
+        };
+        let other = SessionLoadProgress {
+            spinner: None,
+            waiting: Cell::new(false),
+        };
+        assert_eq!(
+            progress.update(database_wait()).unwrap(),
+            format!("{DATABASE_WAIT_MESSAGE} ({UNMEASURED_STAGE}; up to 30s)")
+        );
+        assert!(progress.update(database_wait()).is_none());
+        assert!(other.update(SessionOpenEvent::Recovered).is_none());
+        assert_eq!(
+            progress.update(SessionOpenEvent::Recovered).as_deref(),
+            Some(DATABASE_RECOVERED_MESSAGE)
+        );
+        assert!(progress.update(SessionOpenEvent::Finished).is_none());
+        assert!(progress.update(database_wait()).is_some());
+        assert!(progress.update(SessionOpenEvent::Finished).is_none());
     }
 
     #[test_case(false; "success")]

@@ -2490,6 +2490,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             };
             let mut envelope = Envelope {
                 event: AgentEvent::TaskAdmitted(card.clone()),

@@ -47,7 +47,13 @@ const CANCEL: Bind = Bind {
     modifiers: KeyModifiers::CONTROL,
     label: "Ctrl+K",
 };
+const SWITCH_MODEL: Bind = Bind {
+    code: KeyCode::Char('t'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "Ctrl+T",
+};
 const STOP_HINT: Hint = Hint::bind(CANCEL, "stop task");
+const MODEL_HINT: Hint = Hint::bind(SWITCH_MODEL, "model");
 
 /// `Preview` is the reason this must not be dropped: the picker moved the
 /// selection but only the app can focus the task behind it, so a discarded
@@ -73,6 +79,9 @@ pub enum TaskPickerAction {
         task: Box<TaskCard>,
         promote: bool,
     },
+    /// Committed to a task to move to another model: the app opens the
+    /// model picker for it.
+    SwitchModel(String),
     /// Cancelled. The app restores whichever task was focused on open.
     Closed(Option<String>),
     Copy(String),
@@ -243,6 +252,16 @@ impl TaskPicker {
         let older = key::OLDER_HISTORY.matches(key);
         if older || key::RECENT_HISTORY.matches(key) {
             return TaskPickerAction::History { older };
+        }
+        if SWITCH_MODEL.matches(key) {
+            return match self.picker.selected_item() {
+                Some(item) if item.workflow.is_none() => {
+                    let id = item.id.clone();
+                    self.close();
+                    TaskPickerAction::SwitchModel(id)
+                }
+                _ => TaskPickerAction::Consumed,
+            };
         }
         if PROMOTE.matches(key) || CANCEL.matches(key) {
             let promote = PROMOTE.matches(key);
@@ -431,6 +450,7 @@ fn footer_with(controls: &[Hint]) -> Vec<Hint> {
     [
         Hint::bind(key::ENTER, "open"),
         Hint::bind(key::ESC, "cancel"),
+        MODEL_HINT,
     ]
     .into_iter()
     .chain(controls.iter().copied())
@@ -907,6 +927,17 @@ mod tests {
         assert!(
             matches!(action, TaskPickerAction::Control { task, promote: actual } if task.invocation_id == INVOCATION && actual == promote)
         );
+    }
+
+    #[test]
+    fn the_model_key_hands_the_selected_task_to_the_model_picker() {
+        let mut picker = opened();
+        assert!(picker.select(DONE_ID));
+
+        let action = picker.handle_key(SWITCH_MODEL.to_key_event());
+
+        assert!(matches!(action, TaskPickerAction::SwitchModel(id) if id == DONE_ID));
+        assert!(!picker.is_open());
     }
 
     #[test_case(key::OLDER_HISTORY, true; "older")]

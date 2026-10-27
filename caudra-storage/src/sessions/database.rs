@@ -112,6 +112,10 @@ const RECREATE_OPERATION: &str = "session recreate";
 const RUNTIME_CONTENTION_BUDGET: Duration = Duration::from_secs(30);
 const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RUNTIME_MAX_BACKOFF: Duration = Duration::from_millis(100);
+const SESSION_OPEN_CONNECTION: &str = "opening session database";
+const SESSION_OPEN_READ: &str = "loading session transcript";
+const SESSION_OPEN_MARK: &str = "recording session open";
+const SESSION_OPEN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_CONNECTION_SETUP: &str = "connection setup";
 const RUNTIME_OWNER_CHECKPOINT: &str = "job owner checkpoint";
 const INITIALIZATION_LOCKED: &str = "session database initialization is locked";
@@ -1589,6 +1593,159 @@ impl Drop for WriteTiming {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOpenEvent {
+    Waiting {
+        operation: &'static str,
+        waited: Duration,
+        budget: Duration,
+    },
+    Recovered,
+    Finished,
+}
+
+pub struct SessionOpenRetry<'a> {
+    id: CaudraId,
+    progress: &'a dyn Fn(SessionOpenEvent),
+    cancelled: &'a dyn Fn() -> bool,
+    waited: Cell<Duration>,
+    attempts: Cell<usize>,
+}
+
+impl<'a> SessionOpenRetry<'a> {
+    pub fn new(
+        id: CaudraId,
+        progress: &'a dyn Fn(SessionOpenEvent),
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            id,
+            progress,
+            cancelled,
+            waited: Cell::new(Duration::ZERO),
+            attempts: Cell::new(0),
+        }
+    }
+
+    fn check(&self, operation: &'static str) -> Result<(), SessionError> {
+        if (self.cancelled)() {
+            return Err(SessionError::SessionOpenCancelled { operation });
+        }
+        Ok(())
+    }
+
+    pub fn run<T>(
+        &self,
+        operation: &'static str,
+        attempt: impl FnMut() -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        self.run_with_clock(operation, attempt, Instant::now, thread::sleep)
+    }
+
+    fn run_with_clock<T>(
+        &self,
+        operation: &'static str,
+        mut attempt: impl FnMut() -> Result<T, SessionError>,
+        now: impl Fn() -> Instant,
+        wait: impl Fn(Duration),
+    ) -> Result<T, SessionError> {
+        let mut backoff = RUNTIME_INITIAL_BACKOFF;
+        let mut next_progress = Duration::ZERO;
+        let mut contended = false;
+        loop {
+            self.check(operation)?;
+            match attempt() {
+                Ok(value) => {
+                    if contended {
+                        tracing::info!(
+                            session_id = %self.id,
+                            operation,
+                            attempts = self.attempts.get(),
+                            waited_ms = self.waited.get().as_millis(),
+                            "session database contention recovered"
+                        );
+                        (self.progress)(SessionOpenEvent::Recovered);
+                    }
+                    return Ok(value);
+                }
+                Err(SessionError::Sqlite(source)) if sqlite_busy(&source) => {
+                    let started = now();
+                    let attempts = self.attempts.get() + 1;
+                    self.attempts.set(attempts);
+                    let waited = self.waited.get();
+                    let remaining = RUNTIME_CONTENTION_BUDGET.saturating_sub(waited);
+                    let extended_code = source.sqlite_error().map(|error| error.extended_code);
+                    if remaining <= backoff {
+                        warn!(
+                            session_id = %self.id,
+                            operation,
+                            attempts,
+                            waited_ms = waited.as_millis(),
+                            primary_code = ffi::SQLITE_BUSY,
+                            extended_code,
+                            "session database remained busy"
+                        );
+                        return Err(SessionError::SessionOpenContention {
+                            operation,
+                            attempts,
+                            waited,
+                            source,
+                        });
+                    }
+                    if !contended || waited >= next_progress {
+                        tracing::debug!(
+                            session_id = %self.id,
+                            operation,
+                            attempts,
+                            waited_ms = waited.as_millis(),
+                            primary_code = ffi::SQLITE_BUSY,
+                            extended_code,
+                            "waiting for session database"
+                        );
+                        (self.progress)(SessionOpenEvent::Waiting {
+                            operation,
+                            waited,
+                            budget: RUNTIME_CONTENTION_BUDGET,
+                        });
+                        next_progress = waited + SESSION_OPEN_PROGRESS_INTERVAL;
+                    }
+                    contended = true;
+                    self.check(operation)?;
+                    let reporting = now().saturating_duration_since(started);
+                    wait(backoff.min(remaining.saturating_sub(reporting)));
+                    self.waited
+                        .set(waited + now().saturating_duration_since(started));
+                    backoff = (backoff * 2).min(RUNTIME_MAX_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn sqlite_busy(error: &SqliteError) -> bool {
+    matches!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy))
+}
+
+enum ConnectionRetry<'a> {
+    Ordinary,
+    Runtime(&'a RuntimeRetry<'a>),
+    Session(&'a SessionOpenRetry<'a>),
+}
+
+impl ConnectionRetry<'_> {
+    fn run<T>(
+        &self,
+        mut attempt: impl FnMut() -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        match self {
+            Self::Ordinary => attempt(),
+            Self::Runtime(retry) => retry.run(RUNTIME_CONNECTION_SETUP, attempt),
+            Self::Session(retry) => retry.run(SESSION_OPEN_CONNECTION, attempt),
+        }
+    }
+}
+
 pub struct RuntimeRetry<'a> {
     started: Instant,
     deadline: Instant,
@@ -1643,9 +1800,7 @@ impl<'a> RuntimeRetry<'a> {
             self.check_at(operation, now())?;
             match attempt() {
                 Ok(value) => return Ok(value),
-                Err(SessionError::Sqlite(source))
-                    if matches!(source.sqlite_error_code(), Some(ErrorCode::DatabaseBusy)) =>
-                {
+                Err(SessionError::Sqlite(source)) if sqlite_busy(&source) => {
                     let attempts = self.retries.get() + 1;
                     self.retries.set(attempts);
                     let current = now();
@@ -1691,17 +1846,55 @@ impl<'a> RuntimeRetry<'a> {
 impl SessionDatabase {
     pub fn open(state_dir: &StateDir) -> Result<Self, SessionError> {
         let mut database = Self::open_state(state_dir)?;
-        database.process_cleanup_jobs()?;
+        database.open_maintenance(false)?;
+        Ok(database)
+    }
+
+    pub fn open_for_session(
+        state_dir: &StateDir,
+        retry: &SessionOpenRetry<'_>,
+    ) -> Result<Self, SessionError> {
+        retry.check(SESSION_OPEN_CONNECTION)?;
+        let migration_lock = shared_state_lock(
+            &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
+            OWNER_FILE_MODE,
+        )?;
+        let connection = open_writable_connection(
+            state_dir,
+            &migration_lock,
+            ConnectionRetry::Session(retry),
+            true,
+        )?;
+        let mut database = Self {
+            connection,
+            state_dir: state_dir.clone(),
+            change_stores: registered_change_stores(),
+            _migration_lock: migration_lock,
+        };
+        database.open_maintenance(true)?;
+        Ok(database)
+    }
+
+    fn open_maintenance(&mut self, defer_busy: bool) -> Result<(), SessionError> {
+        match self.process_cleanup_jobs() {
+            Err(SessionError::Sqlite(source)) if defer_busy && sqlite_busy(&source) => {
+                warn!(%source, "session cleanup deferred while database is busy");
+            }
+            result => {
+                result?;
+            }
+        }
+        let state_dir = &self.state_dir;
         if let Err(error) = crate::tool_outputs::retire_legacy_outputs(state_dir) {
             warn!(%error, "legacy tool output removal deferred");
         }
         // Recovery archives are bounded auxiliary exports. Unsafe or damaged
         // archive paths must never be followed, but they also must not make the
         // canonical database unavailable.
-        if let Err(error) = database.reconcile_pending_archives() {
+        if let Err(error) = self.reconcile_pending_archives() {
             warn!(%error, "session archive reconciliation deferred");
         }
-        Ok(database)
+        Ok(())
     }
 
     /// Opens the repository for `state` table work only. Skips artifact
@@ -1722,7 +1915,8 @@ impl SessionDatabase {
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        let connection = open_writable_connection(state_dir, &migration_lock, None, false)?;
+        let connection =
+            open_writable_connection(state_dir, &migration_lock, ConnectionRetry::Ordinary, false)?;
         Ok(Some(Self {
             connection,
             state_dir: state_dir.clone(),
@@ -1783,7 +1977,12 @@ impl SessionDatabase {
         } else {
             shared_state_lock(&lock_path, OWNER_FILE_MODE)?
         };
-        let connection = open_writable_connection(state_dir, &migration_lock, retry, true)?;
+        let connection = open_writable_connection(
+            state_dir,
+            &migration_lock,
+            retry.map_or(ConnectionRetry::Ordinary, ConnectionRetry::Runtime),
+            true,
+        )?;
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
@@ -2330,6 +2529,15 @@ impl SessionDatabase {
             params![id.as_bytes().as_slice()],
         )?;
         Ok(())
+    }
+
+    pub fn mark_opened_for_session(
+        &self,
+        id: CaudraId,
+        retry: &SessionOpenRetry<'_>,
+    ) -> Result<(), SessionError> {
+        self.connection.busy_timeout(Duration::ZERO)?;
+        retry.run(SESSION_OPEN_MARK, || self.mark_opened(id))
     }
 
     pub fn set_pinned(&self, id: CaudraId, pinned: bool) -> Result<(), SessionError> {
@@ -3147,6 +3355,47 @@ impl SessionDatabase {
         let loaded = load_on(&transaction, id, eager_load_limit())?;
         transaction.commit()?;
         Ok(loaded)
+    }
+
+    pub fn load_with_cursor_for_session<M, U, T>(
+        &self,
+        id: CaudraId,
+        retry: &SessionOpenRetry<'_>,
+    ) -> Result<(Session<M, U, T>, SessionCursor), SessionError>
+    where
+        M: DeserializeOwned + Send,
+        U: DeserializeOwned + Default + Send,
+        T: DeserializeOwned + Send,
+    {
+        self.session_read_transaction(retry, |transaction| {
+            load_on(transaction, id, eager_load_limit())
+        })
+    }
+
+    fn session_read_transaction<T>(
+        &self,
+        retry: &SessionOpenRetry<'_>,
+        mut read: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        self.connection.busy_timeout(Duration::ZERO)?;
+        retry.run(SESSION_OPEN_READ, || {
+            let transaction = self.connection.unchecked_transaction()?;
+            let result = (|| {
+                let value = read(&transaction)?;
+                retry.check(SESSION_OPEN_READ)?;
+                transaction.commit()?;
+                Ok(value)
+            })();
+            if result.is_err() && !self.connection.is_autocommit() {
+                self.connection
+                    .execute_batch("ROLLBACK")
+                    .map_err(|source| SessionError::SessionOpenRollback {
+                        operation: SESSION_OPEN_READ,
+                        source,
+                    })?;
+            }
+            result
+        })
     }
 
     pub fn list(&self, cwd: &str) -> Result<Vec<SessionSummary>, SessionError> {
@@ -5033,7 +5282,7 @@ fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> 
 fn open_writable_connection(
     state_dir: &StateDir,
     migration_lock: &File,
-    retry: Option<&RuntimeRetry<'_>>,
+    retry: ConnectionRetry<'_>,
     create: bool,
 ) -> Result<Connection, SessionError> {
     if create {
@@ -5055,23 +5304,15 @@ fn open_writable_connection(
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?)
     };
-    let mut connection = if let Some(retry) = retry {
-        retry.run(RUNTIME_CONNECTION_SETUP, open)?
-    } else {
-        open()?
-    };
-    connection.busy_timeout(if retry.is_some() {
-        Duration::ZERO
-    } else {
+    let mut connection = retry.run(open)?;
+    connection.busy_timeout(if matches!(retry, ConnectionRetry::Ordinary) {
         BUSY_TIMEOUT
+    } else {
+        Duration::ZERO
     })?;
     let read_version =
         || Ok(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?);
-    let version = if let Some(retry) = retry {
-        retry.run(RUNTIME_CONNECTION_SETUP, read_version)?
-    } else {
-        read_version()?
-    };
+    let version = retry.run(read_version)?;
     if !create && version == 0 {
         return Err(SessionError::UnsupportedSchemaVersion {
             found: version,
@@ -5089,7 +5330,7 @@ fn open_writable_connection(
             })?;
     }
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-    if let Some(retry) = retry {
+    if let ConnectionRetry::Runtime(retry) = &retry {
         retry.run(RUNTIME_CONNECTION_SETUP, || {
             configure_wal_retention(&connection, true)
         })?;
@@ -5101,6 +5342,16 @@ fn open_writable_connection(
             retry.check(RUNTIME_CONNECTION_SETUP)?;
             initialize(&mut connection, state_dir, Some(retry))?;
         }
+    } else if let ConnectionRetry::Session(session_retry) = &retry {
+        retry.run(|| configure_wal_retention(&connection, true))?;
+        if version == SCHEMA_VERSION {
+            retry.run(|| configure_current_schema(&connection))?;
+        } else {
+            session_retry.check(SESSION_OPEN_CONNECTION)?;
+            connection.busy_timeout(BUSY_TIMEOUT)?;
+            initialize(&mut connection, state_dir, None)?;
+            connection.busy_timeout(Duration::ZERO)?;
+        }
     } else {
         configure_wal_retention(&connection, true)?;
         initialize(&mut connection, state_dir, None)?;
@@ -5108,11 +5359,9 @@ fn open_writable_connection(
     if cutover {
         migration_lock.lock_shared().map_err(StorageError::from)?;
     }
-    if let Some(retry) = retry {
-        retry.run(RUNTIME_CONNECTION_SETUP, || configure(&connection))?;
+    retry.run(|| configure(&connection))?;
+    if let ConnectionRetry::Runtime(retry) = retry {
         retry.check(RUNTIME_CONNECTION_SETUP)?;
-    } else {
-        configure(&connection)?;
     }
     Ok(connection)
 }
@@ -7047,7 +7296,7 @@ mod tests {
     #[cfg(unix)]
     use std::process;
     use std::ptr::null_mut;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, mpsc};
 
     use super::*;
     use crate::automation::{
@@ -7464,6 +7713,338 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
 
     fn sqlite_failure(code: c_int) -> SessionError {
         SqliteError::SqliteFailure(SqliteErrorCode::new(code), None).into()
+    }
+
+    #[test_case(ffi::SQLITE_BUSY; "busy")]
+    #[test_case(ffi::SQLITE_BUSY_SNAPSHOT; "snapshot")]
+    #[test_case(ffi::SQLITE_BUSY_RECOVERY; "recovery")]
+    fn session_open_retry_recovers_typed_busy(code: c_int) {
+        let events = RefCell::new(Vec::new());
+        let progress = |event| events.borrow_mut().push(event);
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &progress, &|| false);
+        let started = Instant::now();
+        let clock = Cell::new(started);
+        let recovery = started + RUNTIME_CONTENTION_BUDGET / 2;
+        retry
+            .run_with_clock(
+                SESSION_OPEN_MARK,
+                || {
+                    if clock.get() < recovery {
+                        Err(sqlite_failure(code))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || clock.get(),
+                |wait| clock.set(clock.get() + wait),
+            )
+            .unwrap();
+        assert!(retry.waited.get() > BUSY_TIMEOUT);
+        assert_eq!(
+            events.borrow().first(),
+            Some(&SessionOpenEvent::Waiting {
+                operation: SESSION_OPEN_MARK,
+                waited: Duration::ZERO,
+                budget: RUNTIME_CONTENTION_BUDGET,
+            })
+        );
+        assert_eq!(events.borrow().last(), Some(&SessionOpenEvent::Recovered));
+        assert!(events.borrow().len() < retry.attempts.get());
+    }
+
+    #[test_case(ffi::SQLITE_LOCKED; "locked")]
+    #[test_case(ffi::SQLITE_LOCKED_SHAREDCACHE; "shared_cache")]
+    #[test_case(ffi::SQLITE_IOERR; "io_error")]
+    #[test_case(ffi::SQLITE_CORRUPT; "corrupt")]
+    #[test_case(ffi::SQLITE_READONLY; "read_only")]
+    #[test_case(ffi::SQLITE_CONSTRAINT; "constraint")]
+    fn session_open_retry_rejects_permanent_errors(code: c_int) {
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &|_| unreachable!(), &|| false);
+        let attempts = Cell::new(0);
+        let result: Result<(), _> = retry.run_with_clock(
+            SESSION_OPEN_READ,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(sqlite_failure(code))
+            },
+            Instant::now,
+            |_| unreachable!(),
+        );
+        assert!(matches!(result, Err(SessionError::Sqlite(error))
+            if error.sqlite_error().unwrap().extended_code == code));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(retry.waited.get(), Duration::ZERO);
+    }
+
+    #[test]
+    fn session_open_retry_budget_is_cumulative_and_excludes_loading() {
+        let events = RefCell::new(Vec::new());
+        let progress = |event| events.borrow_mut().push(event);
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &progress, &|| false);
+        let clock = Cell::new(Instant::now());
+        let recovery = clock.get() + RUNTIME_CONTENTION_BUDGET / 2;
+        retry
+            .run_with_clock(
+                SESSION_OPEN_CONNECTION,
+                || {
+                    if clock.get() < recovery {
+                        Err(sqlite_failure(ffi::SQLITE_BUSY))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || clock.get(),
+                |wait| clock.set(clock.get() + wait),
+            )
+            .unwrap();
+        let setup_wait = retry.waited.get();
+        clock.set(clock.get() + RUNTIME_CONTENTION_BUDGET * 2);
+        retry
+            .run_with_clock(
+                SESSION_OPEN_READ,
+                || {
+                    clock.set(clock.get() + RUNTIME_CONTENTION_BUDGET * 2);
+                    Ok(())
+                },
+                || clock.get(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(retry.waited.get(), setup_wait);
+        let result: Result<(), _> = retry.run_with_clock(
+            SESSION_OPEN_MARK,
+            || Err(sqlite_failure(ffi::SQLITE_BUSY_SNAPSHOT)),
+            || clock.get(),
+            |wait| clock.set(clock.get() + wait),
+        );
+        assert!(matches!(result, Err(SessionError::SessionOpenContention {
+            operation: SESSION_OPEN_MARK, waited, source, ..
+        }) if waited == retry.waited.get()
+            && source.sqlite_error().unwrap().extended_code == ffi::SQLITE_BUSY_SNAPSHOT));
+        assert!(retry.waited.get() > setup_wait);
+        assert!(retry.waited.get() <= RUNTIME_CONTENTION_BUDGET);
+        assert!(RUNTIME_CONTENTION_BUDGET - retry.waited.get() <= RUNTIME_MAX_BACKOFF);
+        assert!(matches!(
+            events.borrow().last(),
+            Some(SessionOpenEvent::Waiting {
+                operation: SESSION_OPEN_MARK,
+                ..
+            })
+        ));
+    }
+
+    #[test_case(true; "before_attempt")]
+    #[test_case(false; "after_busy")]
+    fn session_open_retry_observes_cancellation(initially_cancelled: bool) {
+        let cancelled = Cell::new(initially_cancelled);
+        let is_cancelled = || cancelled.get();
+        let progress = |_| cancelled.set(true);
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &progress, &is_cancelled);
+        let attempts = Cell::new(0);
+        let result: Result<(), _> = retry.run_with_clock(
+            SESSION_OPEN_MARK,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(sqlite_failure(ffi::SQLITE_BUSY))
+            },
+            Instant::now,
+            |_| unreachable!(),
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::SessionOpenCancelled {
+                operation: SESSION_OPEN_MARK,
+            })
+        ));
+        assert_eq!(attempts.get(), usize::from(!initially_cancelled));
+    }
+
+    #[test]
+    fn session_open_waits_for_writer_without_reloading_payload_or_cursor() {
+        let (_temp, state) = state_dir();
+        let mut original = SessionDatabase::open_state(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        let saved = original.save(&session, None).unwrap();
+        original
+            .connection
+            .execute("UPDATE sessions SET last_opened_at = 0", [])
+            .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let writer_state = &state;
+            scope.spawn(move || {
+                let writer = SessionDatabase::open_state(writer_state).unwrap();
+                let transaction =
+                    Transaction::new_unchecked(&writer.connection, TransactionBehavior::Immediate)
+                        .unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(RUNTIME_CONTENTION_BUDGET).unwrap();
+                transaction.rollback().unwrap();
+                released_tx.send(()).unwrap();
+            });
+            ready_rx.recv_timeout(RUNTIME_CONTENTION_BUDGET).unwrap();
+            let events = RefCell::new(Vec::new());
+            let loaded = Cell::new(false);
+            let progress = |event| {
+                if matches!(event, SessionOpenEvent::Waiting { .. }) {
+                    assert!(loaded.get());
+                    assert!(matches!(
+                        event,
+                        SessionOpenEvent::Waiting {
+                            operation: SESSION_OPEN_MARK,
+                            ..
+                        }
+                    ));
+                    release_tx.send(()).unwrap();
+                    released_rx.recv_timeout(RUNTIME_CONTENTION_BUDGET).unwrap();
+                }
+                events.borrow_mut().push(event);
+            };
+            let retry = SessionOpenRetry::new(session.id, &progress, &|| false);
+            let database = SessionDatabase::open_for_session(&state, &retry).unwrap();
+            let (restored, cursor): (TestSession, _) = database
+                .load_with_cursor_for_session(session.id, &retry)
+                .unwrap();
+            loaded.set(true);
+            database
+                .mark_opened_for_session(session.id, &retry)
+                .unwrap();
+            assert_eq!(restored.messages(), session.messages());
+            assert_eq!(restored.updated_at, session.updated_at);
+            assert_eq!(cursor.write_version(), saved.write_version());
+            assert!(cursor.shares_lineage(&restored));
+            assert_eq!(events.borrow().len(), 2);
+            assert_eq!(events.borrow().last(), Some(&SessionOpenEvent::Recovered));
+            let opened: i64 = database
+                .connection
+                .query_row("SELECT last_opened_at FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert!(opened > 0);
+        });
+    }
+
+    #[test]
+    fn session_open_read_restarts_from_a_fresh_snapshot() {
+        let (_temp, state) = state_dir();
+        let mut writer = SessionDatabase::open_state(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        writer.save(&session, None).unwrap();
+        let progress = |event| {
+            if matches!(event, SessionOpenEvent::Waiting { .. }) {
+                writer
+                    .connection
+                    .execute(
+                        "UPDATE sessions SET title = ?1, write_version = write_version + 1",
+                        [NEXT_GENERATION],
+                    )
+                    .unwrap();
+            }
+        };
+        let retry = SessionOpenRetry::new(session.id, &progress, &|| false);
+        let database = SessionDatabase::open_for_session(&state, &retry).unwrap();
+        let attempts = Cell::new(0);
+        let (restored, cursor): (TestSession, _) = database
+            .session_read_transaction(&retry, |transaction| {
+                attempts.set(attempts.get() + 1);
+                let loaded = load_on(transaction, session.id, eager_load_limit())?;
+                if attempts.get() == 1 {
+                    Err(sqlite_failure(ffi::SQLITE_BUSY_SNAPSHOT))
+                } else {
+                    Ok(loaded)
+                }
+            })
+            .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(restored.title, NEXT_GENERATION);
+        assert_eq!(restored.messages(), session.messages());
+        assert_eq!(cursor.write_version(), 1);
+        assert!(cursor.shares_lineage(&restored));
+        assert!(database.connection.is_autocommit());
+    }
+
+    #[test]
+    fn session_open_read_refuses_retry_after_rollback_failure() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(
+            unsafe {
+                ffi::sqlite3_set_authorizer(
+                    database.connection.handle(),
+                    Some(deny_rollback),
+                    null_mut(),
+                )
+            },
+            ffi::SQLITE_OK
+        );
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &|_| unreachable!(), &|| false);
+        let result: Result<(), _> =
+            database.session_read_transaction(&retry, |_| Err(sqlite_failure(ffi::SQLITE_BUSY)));
+        assert!(matches!(
+            result,
+            Err(SessionError::SessionOpenRollback {
+                operation: SESSION_OPEN_READ,
+                ..
+            })
+        ));
+        assert_eq!(retry.attempts.get(), 0);
+        assert_eq!(
+            unsafe { ffi::sqlite3_set_authorizer(database.connection.handle(), None, null_mut()) },
+            ffi::SQLITE_OK
+        );
+        database.connection.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn session_open_cleanup_defers_busy_after_external_effects() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database.delete(session.id, Some(0)).unwrap();
+        database
+            .connection
+            .execute(
+                "DELETE FROM cleanup_jobs WHERE kind != 'workflow_scratch'",
+                [],
+            )
+            .unwrap();
+        let artifact = state
+            .path()
+            .join(WORKFLOW_SCRATCH_DIR)
+            .join(session.id.to_string());
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join(ARTIFACT_NAME), ARTIFACT_NAME).unwrap();
+        let writer = SessionDatabase::open_state(&state).unwrap();
+        let transaction =
+            Transaction::new_unchecked(&writer.connection, TransactionBehavior::Immediate).unwrap();
+        let retry = SessionOpenRetry::new(session.id, &|_| unreachable!(), &|| false);
+        let mut opened = SessionDatabase::open_for_session(&state, &retry).unwrap();
+        assert!(!artifact.exists());
+        assert_eq!(opened.due_cleanup_jobs().unwrap(), 1);
+        assert_eq!(retry.attempts.get(), 0);
+        transaction.rollback().unwrap();
+        assert_eq!(opened.process_cleanup_jobs().unwrap(), 1);
+        assert_eq!(opened.due_cleanup_jobs().unwrap(), 0);
+    }
+
+    #[test]
+    fn session_open_preserves_migration_blockers() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", OWNER_CHECKPOINT_PREVIOUS_SCHEMA)
+            .unwrap();
+        let retry = SessionOpenRetry::new(CaudraId::generate(), &|_| unreachable!(), &|| false);
+        assert!(matches!(
+            SessionDatabase::open_for_session(&state, &retry),
+            Err(SessionError::MigrationBlocked { .. })
+        ));
+        assert_eq!(retry.attempts.get(), 0);
     }
 
     #[test_case(ffi::SQLITE_BUSY; "busy")]
@@ -8646,8 +9227,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
-    #[test_case(OWNER_CHECKPOINT_PREVIOUS_SCHEMA; "schema_13")]
-    fn owner_checkpoint_migration_preserves_root_history(version: i64) {
+    #[test_case(OWNER_CHECKPOINT_PREVIOUS_SCHEMA, false; "schema_13")]
+    #[test_case(OWNER_CHECKPOINT_PREVIOUS_SCHEMA, true; "session_open_schema_13")]
+    fn owner_checkpoint_migration_preserves_root_history(version: i64, session_open: bool) {
         let (_temp, state) = state_dir();
         let (_fresh_temp, fresh_state) = state_dir();
         let mut database = SessionDatabase::open(&state).unwrap();
@@ -8663,7 +9245,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .pragma_update(None, "user_version", version)
             .unwrap();
         drop(database);
-        let database = SessionDatabase::open(&state).unwrap();
+        let retry = SessionOpenRetry::new(session.id, &|_| unreachable!(), &|| false);
+        let database = if session_open {
+            SessionDatabase::open_for_session(&state, &retry).unwrap()
+        } else {
+            SessionDatabase::open(&state).unwrap()
+        };
         let fresh = SessionDatabase::open(&fresh_state).unwrap();
         let backup = Connection::open(
             state
