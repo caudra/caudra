@@ -1926,6 +1926,7 @@ impl App {
                     || self.worktree_picker.is_open()
                     || self.accounts_modal.is_open()
                     || self.logs_modal.is_open()
+                    || self.help_modal.is_open()
                 {
                     self.route_text_paste(&text);
                     return vec![];
@@ -2605,8 +2606,11 @@ impl App {
         }
 
         if self.help_modal.is_open() {
-            guard_repeat!(false);
-            self.help_modal.handle_key(key);
+            keyboard_text!(help_modal, self.help_modal.text_input_active());
+            guard_repeat!(self.help_modal.text_input_active());
+            if let Some(text) = self.help_modal.handle_key(key) {
+                self.copy_to_clipboard(&text);
+            }
             return Some(vec![]);
         }
 
@@ -8004,6 +8008,10 @@ impl App {
         }
         if self.logs_modal.is_open() {
             self.logs_modal.handle_paste(text);
+            return;
+        }
+        if self.help_modal.is_open() {
+            self.help_modal.handle_paste(text);
             return;
         }
         if self.search_modal.is_open() {

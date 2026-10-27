@@ -117,7 +117,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Dismissing a modal.** `Esc` closes the panel or picker in front of you, and so does a press anywhere outside it. That press is swallowed, so it does not also act on what is under it. The permission prompt, the question form, the plan form, and the paste editor stay where they are, because each is waiting on an answer or holding text only you have. On the question form, `Esc` answers nothing and the agent carries on. `Ctrl+C` stops the agent that asked, so the run waits for your next message. On the agent's own questions, `F5` opens a note for anything your answers leave out. The note goes with your answers, or with `Esc`, and `Ctrl+C` moves it to the composer to start your next message. On a [deferred question](/docs/sessions/#deferred-questions), the agent is not waiting, so `Esc` hides the form and keeps your draft for later.
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
 - **Escape hatch.** `Esc Esc` stops the main run and all session tasks and workflows. With no session work left, it opens rewind instead. See [Stop and replace](/docs/queue/#stop-and-replace).
-- **Help.** `F1` lists every keybinding, or see [Keybindings](/docs/keybindings/).
+- **Help.** `F1` lists every keybinding, and `/` filters the list. Or see [Keybindings](/docs/keybindings/).
 - **These docs.** `/docs` opens this manual inside Caudra, for the version you run, and `/` searches every page. The agent reads the same pages through the [`caudra-docs` skill](/docs/skills/#caudra-docs).
 
 ## Default model (optional)

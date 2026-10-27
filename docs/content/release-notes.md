@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 16 {#v0-2-0-preview-16}
+
+[v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)
+
+- The keybindings list filters as you type after `/`, and shows modifiers as compact symbols.
+
+### Changes
+
+- **Filter the keybindings list.** In the `F1` list, press `/` and type to keep only the keys whose action, key, or section matches every word. `Enter` keeps the filter and `Esc` clears it. The list is wider, every section starts at the same column, and modifiers show as `⌃`, `⇧`, `⌥`, and `⌘`. Typing `ctrl` or `shift` still finds them. See [Keybindings](/docs/keybindings/).
+
 ## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
 
 [v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)

@@ -3976,6 +3976,8 @@ fn paste_file_path_triggers_image_load() {
 #[test_case(open_docs_modal, IMAGE_PATH_PASTE ; "path_into_docs")]
 #[test_case(open_logs_modal, ""               ; "clipboard_into_logs")]
 #[test_case(open_docs_modal, ""               ; "clipboard_into_docs")]
+#[test_case(open_help_modal, IMAGE_PATH_PASTE ; "path_into_help")]
+#[test_case(open_help_modal, ""               ; "clipboard_into_help")]
 fn an_image_paste_into_a_modal_stays_out_of_the_composer(open: fn(&mut App), text: &str) {
     let mut app = test_app();
     open(&mut app);
@@ -23978,6 +23980,7 @@ fn associated_text_updates_the_owning_filter(open: fn(&mut App)) {
 
 #[test_case(open_docs_modal; "docs_search")]
 #[test_case(open_logs_modal; "logs_search")]
+#[test_case(open_help_modal; "help_search")]
 fn associated_logical_shortcut_opens_a_field_without_inserting_its_text(open: fn(&mut App)) {
     let mut app = test_app();
     open(&mut app);
@@ -23987,8 +23990,13 @@ fn associated_logical_shortcut_opens_a_field_without_inserting_its_text(open: fn
     ));
     assert!(!app.docs_modal.text_input_active());
     assert!(!app.logs_modal.text_input_active());
+    assert!(!app.help_modal.text_input_active());
     app.update(associated_key(key(KeyCode::Char('/')), Some("/")));
-    assert!(app.docs_modal.text_input_active() || app.logs_modal.text_input_active());
+    assert!(
+        app.docs_modal.text_input_active()
+            || app.logs_modal.text_input_active()
+            || app.help_modal.text_input_active()
+    );
     app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
     let screen = rendered_visible_text(&mut app);
     assert!(screen.contains(KEYBOARD_COMMIT));
