@@ -3065,6 +3065,7 @@ const APPLIED_PATCH_LINE: &str = "applied_change";
 const STREAMED_PATCH_MSG: &str =
     "a finished file of a streaming patch is drawn before the call runs";
 const APPLIED_PATCH_MSG: &str = "the applied diff replaces the one read from the patch text";
+const PATCH_UNHIGHLIGHTED_MSG: &str = "a patch preview must not schedule syntax highlighting";
 
 fn patched_file(patch: &str) -> PatchedFile {
     PatchedFile {
@@ -3095,12 +3096,28 @@ fn a_streamed_patch_draws_its_finished_files_until_the_applied_diff_replaces_the
     streaming_patch(&mut panel);
     let streaming = buffer_text(&render(&mut panel, 80, 24));
     assert!(
+        panel
+            .cache
+            .segments()
+            .iter()
+            .all(|segment| !segment.has_pending_highlight()),
+        "{PATCH_UNHIGHLIGHTED_MSG}"
+    );
+    assert!(
         streaming.contains(STREAMED_PATCH_LINE),
         "{STREAMED_PATCH_MSG}: {streaming}"
     );
 
     panel.tool_start(start(TOOL_ID, FILE_APPLY_PATCH_TOOL_NAME));
     let started = buffer_text(&render(&mut panel, 80, 24));
+    assert!(
+        panel
+            .cache
+            .segments()
+            .iter()
+            .all(|segment| !segment.has_pending_highlight()),
+        "{PATCH_UNHIGHLIGHTED_MSG}"
+    );
     assert!(
         started.contains(STREAMED_PATCH_LINE),
         "{STREAMED_PATCH_MSG}: {started}"
@@ -3119,6 +3136,13 @@ fn a_streamed_patch_draws_its_finished_files_until_the_applied_diff_replaces_the
     assert!(
         finished.contains(APPLIED_PATCH_LINE),
         "{APPLIED_PATCH_MSG}: {finished}"
+    );
+    assert!(
+        panel
+            .cache
+            .segments()
+            .iter()
+            .any(|segment| segment.has_pending_highlight())
     );
     assert!(
         !finished.contains(STREAMED_PATCH_LINE),

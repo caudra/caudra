@@ -2409,10 +2409,15 @@ impl ToolLineBuilder {
     /// its budget with the call's own output.
     fn push_rendered_code(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let mut limits = self.limits.clone();
-        if self.is_in_progress() && matches!(output, Some(ToolOutput::Patch { .. })) {
+        let streaming_patch =
+            self.is_in_progress() && matches!(output, Some(ToolOutput::Patch { .. }));
+        if streaming_patch {
             limits.budget = usize::MAX;
         }
-        let content = code_view::render_tool_content(input, output, false, limits);
+        let mut content = code_view::render_tool_content(input, output, false, limits);
+        if streaming_patch {
+            content.highlights.clear();
+        }
         self.push_content(content);
     }
 
@@ -3768,13 +3773,13 @@ mod tests {
     use caudra_agent::decisions::DecisionFeature;
     use caudra_agent::peers::SendReceipt;
     use caudra_agent::tools::{
-        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
-        SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
+        BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME,
+        SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::{
         BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, McpBlock, McpServerKind,
-        ShellFilterInfo, SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput,
-        ToolInput, ToolOutput,
+        PatchedFile, ShellFilterInfo, SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity,
+        TextOutput, ToolInput, ToolOutput,
     };
     use std::time::Duration;
     use test_case::test_case;
@@ -4056,6 +4061,55 @@ mod tests {
             path: path.into(),
             byte_count: HEADING_SOURCE.len(),
             lines: vec![HEADING_SOURCE.into()],
+        }
+    }
+
+    const PATCH_BEFORE: &str = "fn old() {}";
+    const PATCH_PARTIAL: &str = "fn ne";
+    const PATCH_AFTER: &str = "fn new() {}";
+    const PATCH_HIGHLIGHT_MSG: &str = "only a settled patch schedules syntax highlighting";
+
+    #[test_case(false ; "resting")]
+    #[test_case(true ; "expanded")]
+    fn streaming_patch_has_no_syntax_highlight_requests(full: bool) {
+        for (status, after) in [
+            (ToolStatus::InProgress, PATCH_PARTIAL),
+            (ToolStatus::InProgress, PATCH_AFTER),
+            (ToolStatus::Success, PATCH_AFTER),
+        ] {
+            let output = ToolOutput::Patch {
+                files: vec![PatchedFile {
+                    path: SOURCE_PATH.into(),
+                    patch: format!("@@\n-{PATCH_BEFORE}\n+{after}\n"),
+                    additions: 1,
+                    deletions: 1,
+                    truncated: false,
+                }],
+            };
+            let mut msg = write_msg(SOURCE_PATH, None, Some(output));
+            if let DisplayRole::Tool(role) = &mut msg.role {
+                role.name = FILE_APPLY_PATCH_TOOL_NAME.into();
+                role.status = status;
+            }
+            let lines = build_tool_lines(&msg, status, &test_rctx(80), Some(exp(full)));
+            assert_eq!(
+                lines.highlight.is_empty(),
+                status == ToolStatus::InProgress,
+                "{PATCH_HIGHLIGHT_MSG}"
+            );
+            let text = lines_text(&lines);
+            assert!(text.contains(PATCH_BEFORE), "{text}");
+            assert!(text.contains(after), "{text}");
+            assert!(text.contains('-') && text.contains('+'), "{text}");
+            for style in [theme::current().diff_old, theme::current().diff_new] {
+                assert!(
+                    lines
+                        .lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.style == style)
+                );
+            }
         }
     }
 
