@@ -1,13 +1,15 @@
-use caudra_providers::{HistoryItem, TokenUsage};
+use caudra_providers::{HistoryItem, HistoryItemKind, TokenUsage, UserOrigin};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
-    Session, SessionCursor, SessionDatabase, SessionError, SessionOpenEvent, SessionOpenRetry,
+    Session, SessionActivity, SessionCursor, SessionDatabase, SessionError, SessionOpenEvent,
+    SessionOpenRetry,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{WorkspacePath, WorkspaceSession};
 
 use crate::ToolOutput;
+use std::collections::HashSet;
 
 pub type StoredSession = Session<HistoryItem, TokenUsage, ToolOutput>;
 
@@ -15,6 +17,30 @@ const RESUME_SCOPE_ERROR: &str =
     "session workspace identity changed; fork or explicitly rebind the session";
 const RESUME_PATH_ERROR: &str = "persisted remote cwd is not a bounded logical workspace path";
 const MAX_RESUME_COMPONENTS: usize = 256;
+
+pub fn recover_session_activity(session: &StoredSession) -> SessionActivity {
+    if let Some(activity) = &session.meta.activity {
+        return activity.clone();
+    }
+    let mut users = HashSet::new();
+    for item in session.messages() {
+        if item.stands_for.is_none()
+            && matches!(
+                item.kind,
+                HistoryItemKind::User {
+                    origin: UserOrigin::Turn,
+                    ..
+                }
+            )
+        {
+            users.insert(item.group_id);
+        }
+    }
+    SessionActivity {
+        user_exchanges: users.len() as u64,
+        ..SessionActivity::default()
+    }
+}
 
 pub async fn workspace_logical_cwd(workspace: &WorkspaceSession) -> Result<String, String> {
     let service = workspace
@@ -254,7 +280,9 @@ pub(crate) mod tests {
         IndexSourceRange, ShellFilterInfo, ShellOutput,
     };
     use crate::{McpBlock, McpOutput};
+    use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::sessions::SessionDatabase;
+    use caudra_storage::sessions::StoredSubagentTaskSpec;
 
     const CWD: &str = "/repo";
     const MODEL: &str = "anthropic/test";
@@ -270,6 +298,56 @@ pub(crate) mod tests {
     const FORM_COMES_FROM_INPUT: &str = "a bare answer is filled in from the input on restore";
     const ANSWER_NOTE: &str = "Keep the bucket private";
     const NOTE_PERSISTED: &str = "the note the user wrote is stored with the picks";
+
+    #[test_case(0; "legacy_zero")]
+    #[test_case(29; "legacy_nonzero")]
+    fn session_activity_recovery_deduplicates_groups_and_versions(legacy_turns: u64) {
+        let mut session = StoredSession::new(MODEL, CWD);
+        session.meta.activity = None;
+        session.meta.turns = legacy_turns;
+        let response = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: ANSWER_NOTE.into(),
+            }],
+            ..Message::default()
+        };
+        let mut history = crate::History::new(vec![
+            Message::user(ANSWER_QUESTION.into()),
+            response.clone(),
+            Message::synthetic(ANSWER_NOTE.into()),
+        ])
+        .into_items();
+        let mut copy = history[0].clone();
+        copy.id = CaudraId::generate();
+        history.push(copy.clone());
+        copy.id = CaudraId::generate();
+        copy.group_id = CaudraId::generate();
+        copy.stands_for = Some(history[0].id);
+        history.push(copy);
+        session.replace_messages(history);
+        let child = crate::History::new(vec![response]).into_items();
+        session.set_subagent_history(ANSWER_CALL.into(), child.clone(), None);
+        session.set_subagent_history(
+            ANSWER_LABEL.into(),
+            child,
+            Some(StoredSubagentTaskSpec::version()),
+        );
+        let activity = recover_session_activity(&session);
+        assert_eq!(activity.user_exchanges, 1);
+        assert_eq!(activity.main_model_turns, 0);
+        assert_eq!(activity.subagent_model_turns, 0);
+        assert!(!activity.complete);
+        session.meta.activity = Some(activity.clone());
+        session.replace_messages(Vec::new());
+        assert_eq!(recover_session_activity(&session), activity);
+    }
+
+    #[test]
+    fn session_activity_recovery_keeps_new_zero_exact() {
+        let session = StoredSession::new(MODEL, CWD);
+        assert_eq!(recover_session_activity(&session), SessionActivity::new());
+    }
 
     pub(crate) struct ResumeService {
         pub revision: AtomicUsize,

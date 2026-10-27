@@ -3527,6 +3527,7 @@ impl EventPump {
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::MessageStarted { .. }
+            | AgentEvent::UserExchangeAdmitted { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::TaskGuidanceQueued { .. }

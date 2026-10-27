@@ -1301,7 +1301,13 @@ impl<'h> Agent<'h> {
             } else {
                 Message::user_with_images(input.message, input.images)
             };
-            self.history.push(message);
+            let group_id = CaudraId::generate();
+            self.history.push_in(message, group_id);
+            if self.is_main_session() {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::UserExchangeAdmitted { group_id });
+            }
         }
         if !telemetry.is_empty()
             && let Some(autopilot) = self.main_autopilot()
@@ -2646,7 +2652,7 @@ impl<'h> Agent<'h> {
         }
         let usage = response.usage;
         self.total_usage += usage;
-        self.emit_turn_complete(&response)?;
+        self.emit_turn_complete(&response, interrupted.is_some())?;
         self.record_spend(
             usage,
             self.model
@@ -3877,7 +3883,11 @@ impl<'h> Agent<'h> {
         Ok(())
     }
 
-    fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+    fn emit_turn_complete(
+        &self,
+        response: &StreamResponse,
+        interrupted: bool,
+    ) -> Result<(), AgentError> {
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
@@ -3885,6 +3895,7 @@ impl<'h> Agent<'h> {
                 model: self.model.id.clone(),
                 provider: self.model.provider.to_string(),
                 purpose: LedgerPurpose::Chat,
+                interrupted,
                 cost: self
                     .model
                     .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
@@ -7872,6 +7883,54 @@ mod tests {
         }
     }
 
+    #[test_case(false, false => 1; "human_prompt")]
+    #[test_case(false, true => 0; "automatic_preamble")]
+    #[test_case(true, false => 0; "child_prompt")]
+    fn session_activity_admission_only_counts_main_user_inputs(
+        child: bool,
+        automatic: bool,
+    ) -> usize {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            if child {
+                agent.audience = ToolAudience::GENERAL_SUB;
+            }
+            let mut input = default_input();
+            if automatic {
+                input.message.clear();
+                input.preamble.push(Message::synthetic(GO.into()));
+            }
+            agent.push_user_inputs(vec![input], false).await;
+            events
+                .try_iter()
+                .filter(|envelope| {
+                    matches!(envelope.event, AgentEvent::UserExchangeAdmitted { .. })
+                })
+                .count()
+        })
+    }
+
+    #[test_case(false; "completed")]
+    #[test_case(true; "interrupted")]
+    fn session_activity_completion_marker_preserves_response_usage(interrupted: bool) {
+        let mut history = History::default();
+        let (agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let mut response = text_response(StopReason::EndTurn);
+        response.usage = REPAIR_USAGE;
+        agent.emit_turn_complete(&response, interrupted).unwrap();
+        let event = events.try_recv().unwrap();
+        let AgentEvent::TurnComplete(turn) = event.event else {
+            panic!("expected response accounting")
+        };
+        assert_eq!(turn.interrupted, interrupted);
+        assert_eq!(turn.usage, REPAIR_USAGE);
+        assert_eq!(
+            serde_json::to_value(&turn.message).unwrap(),
+            serde_json::to_value(&response.message).unwrap()
+        );
+    }
+
     fn repair_schema() -> Value {
         serde_json::json!({
             "type": "object",
@@ -8337,6 +8396,7 @@ mod tests {
             assert!(matches!(
                 events.as_slice(),
                 [
+                    AgentEvent::UserExchangeAdmitted { .. },
                     AgentEvent::MessageStarted { .. },
                     AgentEvent::TextDelta { text },
                     AgentEvent::StreamReset,
@@ -9987,6 +10047,21 @@ mod tests {
             drop(agent);
 
             let events = drain_events(&event_rx);
+            let admitted: Vec<_> = events
+                .iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::UserExchangeAdmitted { group_id } => Some(group_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(admitted.len(), 2);
+            assert_ne!(admitted[0], admitted[1]);
+            assert!(admitted.iter().all(|group| {
+                history
+                    .active_items()
+                    .iter()
+                    .any(|item| item.group_id == *group)
+            }));
             let items = events
                 .iter()
                 .find_map(|envelope| match &envelope.event {
@@ -11787,6 +11862,14 @@ mod tests {
                     })
             );
             let events = drain_events(&events);
+            let interrupted: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    AgentEvent::TurnComplete(turn) => Some(turn.interrupted),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(interrupted, [true, false]);
             let settled = events
                 .iter()
                 .position(|event| matches!(event.event, AgentEvent::ToolResultsSubmitted { .. }))

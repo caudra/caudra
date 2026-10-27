@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use caudra_providers::TokenUsage;
 use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::SessionActivity;
 
 use crate::AppSession;
 
@@ -25,6 +26,7 @@ const WORDMARK: &[&str] = &[
 
 const LABEL_WIDTH: usize = 10;
 const LABEL_SESSION: &str = "Session";
+const LABEL_ACTIVITY: &str = "Activity";
 const LABEL_MODEL: &str = "Model";
 const LABEL_USAGE: &str = "Usage";
 const LABEL_SUBSCRIPTION: &str = "On plan";
@@ -32,7 +34,9 @@ const LABEL_CONTINUE: &str = "Continue";
 const LABEL_SAVED: &str = "Saved";
 
 const SEPARATOR: &str = " · ";
-const NOUN_TURN: &str = "turn";
+const NOUN_EXCHANGE: &str = "user exchange";
+const NOUN_TURN: &str = "model turn";
+const UNKNOWN_COUNT: &str = "unknown";
 const NOUN_OTHER_SESSION: &str = "other session";
 const RESUME_PREFIX: &str = "Resume session: ";
 const RESUME_COMMAND: &str = "caudra -s";
@@ -54,7 +58,7 @@ pub struct ExitSummary {
     usage: TokenUsage,
     cost: Option<f64>,
     subscription_cost: Option<f64>,
-    turns: u64,
+    activity: Option<SessionActivity>,
     run_time: Duration,
     other_sessions: usize,
 }
@@ -77,7 +81,7 @@ impl ExitSummary {
                     .values()
                     .filter_map(|u| u.subscription_cost),
             ),
-            turns: session.meta.turns,
+            activity: session.meta.activity.clone(),
             run_time,
             other_sessions,
         }
@@ -89,7 +93,8 @@ impl ExitSummary {
             writeln!(out, "{BOLD}{row}{RESET}").unwrap();
         }
         out.push('\n');
-        push_row(&mut out, LABEL_SESSION, &self.session_row());
+        push_row(&mut out, LABEL_SESSION, &self.title);
+        push_row(&mut out, LABEL_ACTIVITY, &self.activity_row());
         push_row(&mut out, LABEL_MODEL, &self.model_row());
         // An unpriced provider still reports tokens; a session that never sent
         // a turn has nothing to report at all.
@@ -122,11 +127,25 @@ impl ExitSummary {
         format!("{RESUME_COMMAND} {}", self.id)
     }
 
-    fn session_row(&self) -> String {
-        match self.turns {
-            0 => self.title.clone(),
-            count => format!("{}{SEPARATOR}{}", self.title, pluralize(count, NOUN_TURN)),
+    fn activity_row(&self) -> String {
+        let Some(activity) = &self.activity else {
+            return format!(
+                "{UNKNOWN_COUNT} {NOUN_EXCHANGE}s{SEPARATOR}{UNKNOWN_COUNT} {NOUN_TURN}s"
+            );
+        };
+        let exchanges = activity_count(activity.user_exchanges, activity.complete, NOUN_EXCHANGE);
+        let turns = activity_count(activity.model_turns(), activity.complete, NOUN_TURN);
+        let mut row = format!("{exchanges}{SEPARATOR}{turns}");
+        if activity.subagent_model_turns > 0 {
+            let partial = if activity.complete { "" } else { "+" };
+            write!(
+                row,
+                " ({}{partial} subagent)",
+                activity.subagent_model_turns
+            )
+            .unwrap();
         }
+        row
     }
 
     fn model_row(&self) -> String {
@@ -177,6 +196,14 @@ fn pluralize(count: u64, noun: &str) -> String {
     }
 }
 
+fn activity_count(count: u64, complete: bool, noun: &str) -> String {
+    match (complete, count) {
+        (true, _) => pluralize(count, noun),
+        (false, 0) => format!("{UNKNOWN_COUNT} {noun}s"),
+        (false, _) => format!("{count}+ {noun}s"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,8 +225,14 @@ mod tests {
     const RESUMABLE: &str = "the banner must always say how to get back in";
     const BRANDED: &str = "the banner must carry the wordmark";
     const ONE_LINE: &str = "a redirected stderr gets exactly one line";
+    const RECORDED_ACTIVITY: &str = "1 user exchange · 3 model turns (1 subagent)";
+    const UNKNOWN_ACTIVITY: &str = "unknown user exchanges · unknown model turns";
 
     fn summary(usage: TokenUsage, cost: Option<f64>) -> ExitSummary {
+        let mut activity = SessionActivity::new();
+        activity.user_exchanges = 5;
+        activity.main_model_turns = 120;
+        activity.subagent_model_turns = 700;
         ExitSummary {
             id: CaudraId::generate(),
             title: TITLE.into(),
@@ -207,7 +240,7 @@ mod tests {
             usage,
             cost,
             subscription_cost: None,
-            turns: 48,
+            activity: Some(activity),
             run_time: RUN_TIME,
             other_sessions: 0,
         }
@@ -254,13 +287,62 @@ mod tests {
         assert!(!spent().banner().contains(LABEL_SAVED), "{NO_OTHERS}");
     }
 
-    #[test_case(0  => TITLE.to_string()                        ; "an_untouched_session_is_just_its_title")]
-    #[test_case(1  => format!("{TITLE}{SEPARATOR}1 turn")      ; "a_single_turn_reads_singular")]
-    #[test_case(48 => format!("{TITLE}{SEPARATOR}48 turns")    ; "more_turns_read_plural")]
-    fn session_row_counts_the_exchanges(turns: u64) -> String {
+    #[test_case(0, 0, 0, true, "0 user exchanges · 0 model turns"; "exact_empty_session")]
+    #[test_case(1, 1, 0, true, "1 user exchange · 1 model turn"; "singular_counts")]
+    #[test_case(5, 120, 700, true, "5 user exchanges · 820 model turns (700 subagent)"; "main_and_subagents")]
+    #[test_case(1, 1, 0, false, "1+ user exchanges · 1+ model turns"; "partial_singular_is_a_lower_bound")]
+    #[test_case(5, 120, 700, false, "5+ user exchanges · 820+ model turns (700+ subagent)"; "legacy_lower_bounds")]
+    #[test_case(0, 0, 0, false, "unknown user exchanges · unknown model turns"; "missing_history")]
+    #[test_case(0, 2, 0, true, "0 user exchanges · 2 model turns"; "automatic_work")]
+    fn activity_row_separates_exchanges_and_model_turns(
+        user_exchanges: u64,
+        main_model_turns: u64,
+        subagent_model_turns: u64,
+        complete: bool,
+        expected: &str,
+    ) {
         let mut summary = spent();
-        summary.turns = turns;
-        summary.session_row()
+        let mut activity = SessionActivity::new();
+        activity.user_exchanges = user_exchanges;
+        activity.main_model_turns = main_model_turns;
+        activity.subagent_model_turns = subagent_model_turns;
+        activity.complete = complete;
+        summary.activity = Some(activity);
+        assert_eq!(summary.activity_row(), expected);
+        assert!(summary.banner().contains(expected));
+    }
+
+    #[test]
+    fn missing_activity_does_not_claim_an_exact_zero() {
+        let mut summary = spent();
+        summary.activity = None;
+        assert_eq!(summary.activity_row(), UNKNOWN_ACTIVITY);
+    }
+
+    #[test_case(false; "recorded_activity_is_independent_of_legacy_turns")]
+    #[test_case(true; "legacy_turns_do_not_become_model_turns")]
+    fn summary_reads_the_persisted_activity(legacy: bool) {
+        let mut session = AppSession::new(MODEL, "/tmp");
+        session.meta.turns = 97;
+        session.meta.activity = if legacy {
+            None
+        } else {
+            let mut activity = SessionActivity::new();
+            activity.record_user_exchange(CaudraId::generate());
+            activity.record_model_turn(false);
+            activity.record_model_turn(false);
+            activity.record_model_turn(true);
+            Some(activity)
+        };
+        let summary = ExitSummary::new(&session, RUN_TIME, 0);
+        assert_eq!(
+            summary.activity_row(),
+            if legacy {
+                UNKNOWN_ACTIVITY
+            } else {
+                RECORDED_ACTIVITY
+            }
+        );
     }
 
     /// The reported case: an `Instant::elapsed()` carries nanoseconds, and the

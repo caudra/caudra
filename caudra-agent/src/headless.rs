@@ -288,10 +288,11 @@ impl SessionStore {
 
     fn from_session(
         dir: StateDir,
-        session: StoredSession,
+        mut session: StoredSession,
         created: bool,
         lease: Arc<SessionLease>,
     ) -> Self {
+        session.meta.activity = Some(crate::recover_session_activity(&session));
         let database = SessionDatabase::open(&dir)
             .map_err(|error| warn!(%error, "session database unavailable"))
             .ok();
@@ -789,6 +790,22 @@ impl SessionStore {
     ) -> Result<(), caudra_storage::sessions::SessionError> {
         self.write_goal_log();
         match &envelope.event {
+            AgentEvent::UserExchangeAdmitted { group_id } if envelope.subagent.is_none() => {
+                self.session
+                    .meta
+                    .activity
+                    .get_or_insert_with(Default::default)
+                    .record_user_exchange(*group_id);
+            }
+            AgentEvent::TurnComplete(turn)
+                if turn.purpose == LedgerPurpose::Chat && !turn.interrupted =>
+            {
+                self.session
+                    .meta
+                    .activity
+                    .get_or_insert_with(Default::default)
+                    .record_model_turn(envelope.subagent.is_some());
+            }
             AgentEvent::SessionTitle {
                 title: Some(title), ..
             } => {
@@ -1858,6 +1875,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     }
                 };
             let error_tx = event_tx.clone();
+            let (agent_tx, agent_rx) = flume::unbounded();
             let mut history = History::new(Vec::new());
             let permissions = Arc::new(PermissionManager::new_persistent(
                 params.permissions_config,
@@ -2001,7 +2019,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     memory: None,
                     configuration: None,
                     mode_notice: None,
-                    event_tx,
+                    event_tx: event_tx.rebind(agent_tx),
                     tools,
                     tools_fixed: false,
                     memory_store,
@@ -2041,8 +2059,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 .collect();
             store.set_mode(&mode);
             store.set_reasoning(&params.thinking, fast);
-            let result = agent
-                .run(AgentInput {
+            let result = futures_lite::future::or(
+                agent.run(AgentInput {
                     message: params.prompt,
                     mode,
                     plan: None,
@@ -2054,9 +2072,19 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     fast,
                     prompt: None,
                     resume: false,
-                })
-                .await;
+                }),
+                async {
+                    while let Ok(envelope) = agent_rx.recv_async().await {
+                        forward_print_event(&mut store, envelope, &error_tx);
+                    }
+                    futures_lite::future::pending().await
+                },
+            )
+            .await;
             drop(agent);
+            for envelope in agent_rx.try_iter() {
+                forward_print_event(&mut store, envelope, &error_tx);
+            }
             if let Some(peer) = peer_session {
                 peer.close();
             }
@@ -2090,6 +2118,15 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         goal,
         task,
     })
+}
+
+fn forward_print_event(store: &mut SessionStore, envelope: Envelope, events: &EventSender) {
+    if let Err(error) = store.record_event(&envelope) {
+        let _ = events.send(AgentEvent::Error {
+            message: format!("{PERSIST_FAILED}: {error}"),
+        });
+    }
+    let _ = events.send_envelope(envelope);
 }
 
 /// Saves a print run's session row before anything can spill an output into
@@ -9585,12 +9622,75 @@ complete(#{ report: first.output });
             model: MODEL_SPEC.into(),
             provider: String::new(),
             purpose: LedgerPurpose::Chat,
+            interrupted: false,
             cost: Some(cost),
             billing: Billing::Api,
             account: None,
             context_size: None,
             context_window: 0,
         }))
+    }
+
+    #[test_case(false; "interactive")]
+    #[test_case(true; "print_forwarding")]
+    fn session_activity_counts_admission_and_chat_events_only(print: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let group_id = CaudraId::generate();
+        let mut events = vec![
+            main_run(AgentEvent::UserExchangeAdmitted { group_id }),
+            main_run(AgentEvent::UserExchangeAdmitted { group_id }),
+            main_run(answered(0.0)),
+            main_run(answered(0.0)),
+            main_run(ended()),
+            main_run(ended()),
+        ];
+        let mut child_response = main_run(answered(0.0));
+        child_response.subagent = Some(child());
+        events.push(child_response);
+        let mut auxiliary = main_run(answered(0.0));
+        if let AgentEvent::TurnComplete(turn) = &mut auxiliary.event {
+            turn.purpose = LedgerPurpose::Compaction;
+        }
+        events.push(auxiliary);
+        let mut partial = main_run(answered(0.0));
+        if let AgentEvent::TurnComplete(turn) = &mut partial.event {
+            turn.interrupted = true;
+        }
+        events.push(partial);
+        let (sender, receiver) = flume::unbounded();
+        let sender = EventSender::new(sender, 0);
+        for event in events {
+            if print {
+                forward_print_event(&mut store, event, &sender);
+            } else {
+                store.record_event(&event).unwrap();
+            }
+        }
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|event| matches!(event.event, AgentEvent::Error { .. }))
+        );
+        store
+            .record_turn(
+                &History::default(),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
+        store
+            .record_turn(
+                &History::default(),
+                MODEL_SPEC.into(),
+                &permission_manager(),
+            )
+            .unwrap();
+        let activity = load(&tmp).meta.activity.unwrap();
+        assert_eq!(activity.user_exchanges, 1);
+        assert_eq!(activity.main_model_turns, 2);
+        assert_eq!(activity.subagent_model_turns, 1);
+        assert!(activity.complete);
     }
 
     fn ended() -> AgentEvent {

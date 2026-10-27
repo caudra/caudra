@@ -26,6 +26,7 @@ use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::peers::PeerSession;
 use caudra_agent::permissions::PermissionManager;
+use caudra_agent::recover_session_activity;
 use caudra_agent::session_fork::history_output_ids;
 use caudra_agent::worktree::ClosePlan;
 use caudra_config::Feature;
@@ -491,7 +492,8 @@ impl App {
             structured_permission_rules: state.session.meta.structured_permission_rules.clone(),
             permission_generation: state.session.meta.permission_generation,
             context_size: state.context_size,
-            turns: state.turns,
+            turns: state.session.meta.turns,
+            activity: state.session.meta.activity.clone(),
             input_draft: (!draft.is_empty()).then_some(draft.text),
             input_draft_images: self
                 .input_box
@@ -1557,6 +1559,7 @@ impl App {
                 .cloned()
                 .collect(),
         );
+        child.meta.activity = Some(recover_session_activity(&child));
 
         child.copy_saved_outputs_from(self.state.session.id, history_output_ids(output_histories));
 

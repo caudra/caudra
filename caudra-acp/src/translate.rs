@@ -1264,6 +1264,7 @@ mod tests {
         cost: Option<f64>,
     ) -> TurnCompleteEvent {
         TurnCompleteEvent {
+            interrupted: false,
             message: Message::default(),
             usage: caudra_providers::TokenUsage {
                 input: 1_000,

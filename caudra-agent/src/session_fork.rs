@@ -14,7 +14,9 @@ use caudra_storage::{StateDir, StorageError};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{History, StoredSession, active_task_history_versions_with_outputs};
+use crate::{
+    History, StoredSession, active_task_history_versions_with_outputs, recover_session_activity,
+};
 
 const TASK_METADATA_OPEN: &str = "<task_metadata>";
 const TASK_METADATA_CLOSE: &str = "</task_metadata>";
@@ -197,6 +199,8 @@ fn save_fork(
             fork.insert_tool_output(tool_id, output.as_ref().clone());
         }
     }
+    fork.meta.activity = None;
+    fork.meta.activity = Some(recover_session_activity(&fork));
     fork.save(storage).map_err(|source| SessionForkError::Save {
         target: target.id.clone(),
         source: Box::new(source),

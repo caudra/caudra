@@ -1,15 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use caudra_agent::GoalHandle;
 use caudra_agent::autopilot::AutopilotHandle;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
+use caudra_agent::{GoalHandle, recover_session_activity};
 use caudra_config::ModelPolicy;
 use caudra_providers::provider::adjust_model;
-use caudra_providers::{
-    HistoryItem, HistoryItemKind, Model, ThinkingConfig, Timeouts, TokenUsage, UserOrigin,
-    settle_session,
-};
+use caudra_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use caudra_storage::StateDir;
 use caudra_storage::sessions::{StoredMode, StoredPlanTarget};
 
@@ -30,9 +27,6 @@ pub(crate) struct SessionState {
     /// into `cost`, which is money the user owes.
     pub subscription_cost: Option<f64>,
     pub context_size: u32,
-    /// Survives compaction, which throws away the history a count could
-    /// otherwise be derived from.
-    pub turns: u64,
     pub mode: Mode,
     /// The mode the agent was last handed. A toggle only reaches it on the next
     /// message, so while this trails `mode` the status bar shows the pending
@@ -133,13 +127,7 @@ impl SessionState {
         let token_usage = session.token_usage;
         let spend = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
-        // Sessions saved before the counter existed, and every headless run,
-        // carry a zero: recover what the surviving history still shows rather
-        // than reporting nothing.
-        let turns = match session.meta.turns {
-            0 => counted_turns(session.messages()),
-            turns => turns,
-        };
+        session.meta.activity = Some(recover_session_activity(&session));
         let goal = GoalHandle::from_meta(&session.meta);
 
         let applied_model = model.spec();
@@ -172,7 +160,6 @@ impl SessionState {
             cost: spend.billed,
             subscription_cost: spend.subscription,
             context_size,
-            turns,
             mode,
             applied_mode,
             applied_model,
@@ -195,28 +182,6 @@ impl SessionState {
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
-}
-
-/// A user turn expands to one item per text and image block, so the group is
-/// the exchange. Groups are contiguous, which is what lets this dedupe against
-/// the previous one instead of collecting every id.
-fn counted_turns(items: &[HistoryItem]) -> u64 {
-    let mut turns = 0;
-    let mut counted = None;
-    for item in items {
-        let user_turn = matches!(
-            item.kind,
-            HistoryItemKind::User {
-                origin: UserOrigin::Turn,
-                ..
-            }
-        );
-        if user_turn && counted != Some(item.group_id) {
-            turns += 1;
-            counted = Some(item.group_id);
-        }
-    }
-    turns
 }
 
 impl From<Mode> for StoredMode {
@@ -242,9 +207,10 @@ mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
     use caudra_providers::{
-        Billing, ContentBlock, FastPricing, ImageMediaType, ImageSource, Message, ModelPricing,
-        Role, ThinkingSupport,
+        Billing, ContentBlock, FastPricing, HistoryItem, ImageMediaType, ImageSource, Message,
+        ModelPricing, Role, ThinkingSupport,
     };
+    use caudra_storage::sessions::SessionActivity;
     use caudra_storage::thinking::StoredThinking;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workspace::PlanRef;
@@ -266,8 +232,6 @@ mod tests {
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
-    const ITEMS_PER_TURN: &str = "the fixture must spread each exchange over several items";
-    const TURNS_NOT_ITEMS: &str = "an exchange is one turn however many items it expands to";
     const MODE_DEFAULT: &str = "a session opens in the default mode unless it stored a choice";
     const PLAN_PATH_FOLLOWS_MODE: &str = "only a session opening in plan needs a plan file";
     const LEVEL_LOST: &str = "the level last chosen must survive into a session that has none";
@@ -684,21 +648,39 @@ mod tests {
         ])
     }
 
-    /// A prompt with an image expands to a text item and an image item, and an
-    /// answer to one item per block, so items badly overstate the exchanges.
-    #[test]
-    fn counted_turns_counts_exchanges_not_items() {
-        let items = two_turn_history();
-        assert!(items.len() > 4, "{ITEMS_PER_TURN}");
-        assert_eq!(counted_turns(&items), 2, "{TURNS_NOT_ITEMS}");
-    }
-
-    #[test_case(0  => 2  ; "a_session_saved_before_the_counter_recovers_it_from_history")]
-    #[test_case(97 => 97 ; "a_stored_count_outlives_the_history_compaction_dropped")]
-    fn resume_restores_the_turn_count(stored: u64) -> u64 {
+    #[test_case(0; "zero_legacy_turns")]
+    #[test_case(97; "legacy_done_count_is_not_activity")]
+    fn resume_recovers_incomplete_activity_without_reusing_legacy_turns(legacy: u64) {
         let mut session = AppSession::new("test-model", "/tmp");
         session.replace_messages(two_turn_history());
-        session.meta.turns = stored;
-        resumed(session, &test_model()).turns
+        session.meta.turns = legacy;
+        session.meta.activity = None;
+
+        let state = resumed(session, &test_model());
+        let activity = state.session.meta.activity.as_ref().unwrap();
+
+        assert_eq!(activity.user_exchanges, 2);
+        assert_eq!(activity.main_model_turns, 0);
+        assert_eq!(activity.subagent_model_turns, 0);
+        assert!(!activity.complete);
+        assert_eq!(state.session.meta.turns, legacy);
+    }
+
+    #[test_case(0, true; "exact_zero_is_not_missing")]
+    #[test_case(97, true; "exact_lifetime_outlives_history")]
+    #[test_case(97, false; "recovered_baseline_remains_incomplete")]
+    fn resume_preserves_existing_activity(stored: u64, complete: bool) {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.replace_messages(two_turn_history());
+        let mut activity = SessionActivity::new();
+        activity.user_exchanges = stored;
+        activity.main_model_turns = stored;
+        activity.subagent_model_turns = stored;
+        activity.complete = complete;
+        session.meta.activity = Some(activity.clone());
+
+        let state = resumed(session, &test_model());
+
+        assert_eq!(state.session.meta.activity.as_ref(), Some(&activity));
     }
 }

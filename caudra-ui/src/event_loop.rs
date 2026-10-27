@@ -752,6 +752,23 @@ impl SessionRuntime {
             && self.shell_rx.is_empty()
     }
 
+    fn settle_shutdown_activity(&mut self) {
+        if !self.delivery_idle()
+            || matches!(self.app.status, Status::Streaming)
+            || self.app.cancelling_run.is_some()
+            || self.handles.active_background_tasks() > 0
+            || !self.handles.agent_rx.is_empty()
+        {
+            self.app
+                .state
+                .session_mut()
+                .meta
+                .activity
+                .get_or_insert_default()
+                .complete = false;
+        }
+    }
+
     fn delivery_idle(&self) -> bool {
         !self.handles.queue.has_priority_input() && !self.handles.queue.is_processing()
     }
@@ -5614,7 +5631,8 @@ impl<'t> EventLoop<'t> {
 
         let mut apps = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
-        for rt in self.sessions.drain(..) {
+        for mut rt in self.sessions.drain(..) {
+            rt.settle_shutdown_activity();
             let SessionRuntime {
                 mut app,
                 lease,
@@ -7212,6 +7230,32 @@ mod tests {
         plan_spawn_context(&mut source)
             .spawn_fresh_runtime(&source.state.session, None)
             .unwrap()
+    }
+
+    #[test_case(|_| {}, true; "fully_drained")]
+    #[test_case(start_a_run, false; "stream_still_running")]
+    #[test_case(leave_an_agent_event, false; "events_not_drained")]
+    #[test_case(|runtime| runtime.app.cancelling_run = Some(runtime.app.run_id), false; "cancellation_not_settled")]
+    fn shutdown_activity_only_claims_exact_totals_after_agent_drain(
+        change: fn(&mut SessionRuntime),
+        complete: bool,
+    ) {
+        let mut runtime = idle_runtime();
+        change(&mut runtime);
+        runtime.settle_shutdown_activity();
+        assert_eq!(
+            runtime
+                .app
+                .state
+                .session
+                .meta
+                .activity
+                .as_ref()
+                .unwrap()
+                .complete,
+            complete
+        );
+        runtime.handles.cancel();
     }
 
     #[test_case(|_| {}, PaneState::Done; "settled")]

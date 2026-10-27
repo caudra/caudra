@@ -3089,6 +3089,9 @@ pub enum AutopilotEvent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    UserExchangeAdmitted {
+        group_id: CaudraId,
+    },
     TaskAdmitted(TaskCard),
     /// The assistant message the deltas that follow belong to, under the id
     /// its history items are committed with, and the model and level its
@@ -3705,6 +3708,8 @@ pub struct TurnCompleteEvent {
     /// conversation and must not be billed as if it were the conversation.
     #[serde(skip)]
     pub purpose: LedgerPurpose,
+    #[serde(skip)]
+    pub interrupted: bool,
     #[serde(skip)]
     pub cost: Option<f64>,
     /// Who owes `cost`. A subscription turn is priced at API rates for

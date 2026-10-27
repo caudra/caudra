@@ -511,6 +511,47 @@ pub struct StoredAutomationControls {
     pub armed: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivity {
+    pub user_exchanges: u64,
+    pub main_model_turns: u64,
+    pub subagent_model_turns: u64,
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_group: Option<CaudraId>,
+}
+
+impl SessionActivity {
+    pub fn new() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn record_user_exchange(&mut self, group_id: CaudraId) {
+        if self.last_user_group == Some(group_id) {
+            return;
+        }
+        self.last_user_group = Some(group_id);
+        self.user_exchanges = self.user_exchanges.saturating_add(1);
+    }
+
+    pub fn record_model_turn(&mut self, subagent: bool) {
+        let count = if subagent {
+            &mut self.subagent_model_turns
+        } else {
+            &mut self.main_model_turns
+        };
+        *count = count.saturating_add(1);
+    }
+
+    pub fn model_turns(&self) -> u64 {
+        self.main_model_turns
+            .saturating_add(self.subagent_model_turns)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -542,6 +583,8 @@ pub struct SessionMeta {
     /// from.
     #[serde(default)]
     pub turns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1296,7 +1339,10 @@ where
             usage_by_model: HashMap::new(),
             usage_by_purpose: HashMap::new(),
             tool_usage: Vec::new(),
-            meta: SessionMeta::default(),
+            meta: SessionMeta {
+                activity: Some(SessionActivity::new()),
+                ..SessionMeta::default()
+            },
             created_at: now,
             updated_at: now,
             revision: 0,
@@ -1877,8 +1923,8 @@ mod tests {
     };
     use super::{
         HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
-        SessionCursor, SessionDatabase, SessionError, SessionMeta, StorageError, TitleSource,
-        UnrecordedCall,
+        SessionActivity, SessionCursor, SessionDatabase, SessionError, SessionMeta, StorageError,
+        TitleSource, UnrecordedCall,
     };
     use crate::StateDir;
     use crate::id::CaudraId;
@@ -1893,6 +1939,52 @@ mod tests {
     type TestSession = Session<Value, Value, Value>;
 
     const RUN_STARTED_AT: i64 = 1_000;
+
+    #[test_case(false; "legacy_unknown")]
+    #[test_case(true; "new_exact_zero")]
+    fn session_activity_round_trips_without_inventing_legacy_counts(fresh: bool) {
+        let mut session = TestSession::new("test", "/project");
+        if !fresh {
+            session.meta = serde_json::from_str(r#"{"turns":19}"#).unwrap();
+        }
+        let encoded = serde_json::to_string(&session).unwrap();
+        let decoded: TestSession = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.meta.activity, fresh.then(SessionActivity::new));
+        assert_eq!(decoded.meta.turns, if fresh { 0 } else { 19 });
+    }
+
+    #[test_case(false; "incomplete")]
+    #[test_case(true; "complete")]
+    fn session_activity_survives_full_incremental_and_rewritten_history(complete: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut database = SessionDatabase::open(&dir).unwrap();
+        let mut session = TestSession::new("test", "/project");
+        let mut activity = SessionActivity {
+            complete,
+            ..SessionActivity::default()
+        };
+        let group = CaudraId::generate();
+        activity.record_user_exchange(group);
+        activity.record_user_exchange(group);
+        activity.record_model_turn(false);
+        activity.record_model_turn(true);
+        session.meta.activity = Some(activity.clone());
+        session.push_message(user_message("prompt"));
+        let cursor = database.save(&session, None).unwrap();
+        activity.record_model_turn(false);
+        session.meta.activity = Some(activity.clone());
+        let cursor = database.save(&session, Some(&cursor)).unwrap();
+        session.replace_messages(Vec::new());
+        database.save(&session, Some(&cursor)).unwrap();
+        let loaded = TestSession::load(session.id, &dir).unwrap();
+        assert_eq!(loaded.meta.activity, Some(activity));
+        let activity = loaded.meta.activity.unwrap();
+        assert_eq!(activity.user_exchanges, 1);
+        assert_eq!(activity.model_turns(), 3);
+        assert_eq!(activity.subagent_model_turns, 1);
+        assert_eq!(activity.complete, complete);
+    }
 
     #[test_case(None, false => 0; "a_fresh_run")]
     #[test_case(Some(2), false => 0; "a_new_turn_forgets_attempts")]

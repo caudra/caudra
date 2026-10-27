@@ -5472,6 +5472,24 @@ impl App {
                     | AgentEvent::LearnerActivity(_)
             )
         {
+            if envelope.task.is_none()
+                && envelope.workflow.is_none()
+                && self.cancelling_run == Some(envelope.run_id)
+                && match &envelope.event {
+                    AgentEvent::UserExchangeAdmitted { .. } => envelope.subagent.is_none(),
+                    AgentEvent::TurnComplete(turn) => {
+                        matches!(turn.purpose, LedgerPurpose::Chat) && !turn.interrupted
+                    }
+                    _ => false,
+                }
+            {
+                self.state
+                    .session_mut()
+                    .meta
+                    .activity
+                    .get_or_insert_default()
+                    .complete = false;
+            }
             let cancelled_terminal = envelope.subagent.is_none()
                 && self.cancelling_run == Some(envelope.run_id)
                 && matches!(
@@ -5507,6 +5525,19 @@ impl App {
                     current_run_id = self.run_id,
                     "tool render event dropped: stale run_id"
                 );
+            }
+            return vec![];
+        }
+
+        if let AgentEvent::UserExchangeAdmitted { group_id } = envelope.event {
+            if envelope.subagent.is_none() && envelope.task.is_none() && envelope.workflow.is_none()
+            {
+                self.state
+                    .session_mut()
+                    .meta
+                    .activity
+                    .get_or_insert_default()
+                    .record_user_exchange(group_id);
             }
             return vec![];
         }
@@ -5682,6 +5713,14 @@ impl App {
         self.chats[chat_idx].clear_retry();
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
+            if matches!(tc.purpose, LedgerPurpose::Chat) && !tc.interrupted {
+                self.state
+                    .session_mut()
+                    .meta
+                    .activity
+                    .get_or_insert_default()
+                    .record_model_turn(!main_agent);
+            }
             self.state.token_usage += tc.usage;
             self.add_session_spend(tc.cost, tc.billing);
             add_chat_spend(&mut self.chats[chat_idx], tc.cost, tc.billing);
@@ -6118,7 +6157,6 @@ impl App {
                     self.settle_open_run();
                     self.bind_main_chat_sources();
                     if !self.goal_deferred {
-                        self.state.turns += 1;
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
                         self.retain_session_task_routes();
                     }

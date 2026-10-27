@@ -111,11 +111,11 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
-    PermissionMode, SESSIONS_DB_FILE, SessionDatabase, SessionLocation, SessionMeta,
-    StoredActiveGoal, StoredAutomationControls, StoredGoalVerdict, StoredGoalWait, StoredImage,
-    StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls, StoredPromptAdmission,
-    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
-    UnrecordedCall,
+    PermissionMode, SESSIONS_DB_FILE, SessionActivity, SessionDatabase, SessionLocation,
+    SessionMeta, StoredActiveGoal, StoredAutomationControls, StoredGoalVerdict, StoredGoalWait,
+    StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls,
+    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -823,6 +823,7 @@ fn turn_complete_from(
         model: model.into(),
         provider: provider.into(),
         purpose,
+        interrupted: false,
         cost,
         billing: Billing::Api,
         account: None,
@@ -3294,13 +3295,13 @@ mod background_runtime {
                 task: Some(Arc::new(stale)),
             })));
             assert!(!super::rendered(&mut fixture.app).contains(STALE_SHELL_PROGRESS));
-            let turns = fixture.app.state.turns;
+            let activity = fixture.app.state.session.meta.activity.clone();
             fixture.app.update(envelope(AgentEvent::Done {
                 usage: Default::default(),
                 num_turns: 0,
                 reason: DoneReason::EndTurn,
             }));
-            assert_eq!(fixture.app.state.turns, turns);
+            assert_eq!(fixture.app.state.session.meta.activity, activity);
             assert_eq!(fixture.app.chats.len(), chats);
             assert!(
                 fixture
@@ -3581,30 +3582,328 @@ fn a_refused_reset_keeps_the_session_and_reports_why() {
     assert_eq!(app.status_bar.flash_text(), None);
 }
 
-const TURNS_UNCOUNTED: &str = "a finished exchange must move the session's turn counter";
-const TURNS_UNSAVED: &str =
-    "the exit summary reads the counter off the session, so it must be saved";
 const LEVEL_UNSET: &str = "no level has been chosen yet";
 const LEVEL_UNSAVED: &str = "the chosen level must reach disk to survive a restart";
 const LEVEL_LEAKED: &str = "one model's depth must not follow the user onto another";
 const LEVEL_LOST_ON_RETURN: &str = "returning to a model must restore the level chosen there";
+const ACTIVITY_TASK: &str = "activity-child";
+const ACTIVITY_PROMPT: &str = "count this exchange";
 
-/// Compaction discards the history a count could be derived from, so the
-/// exit summary reads a stored counter instead. A deferred goal keeps the
-/// turn open, and its extra `Done` must not bill the same exchange twice.
-#[test_case(false, 1 ; "a_finished_turn_counts_once")]
-#[test_case(true,  0 ; "a_deferred_goal_leaves_the_turn_open")]
-fn completed_turns_reach_the_stored_counter(deferred: bool, expected: u64) {
+#[test_case(false; "finished_run")]
+#[test_case(true; "deferred_goal")]
+fn activity_counts_admission_and_each_chat_response_not_done(deferred: bool) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     app.goal_deferred = deferred;
+    let group_id = CaudraId::generate();
 
+    for _ in 0..2 {
+        app.update(agent_msg(AgentEvent::UserExchangeAdmitted { group_id }));
+    }
+    for _ in 0..3 {
+        app.update(agent_msg(turn_complete(
+            TokenUsage::default(),
+            MAIN_MODEL,
+            None,
+        )));
+    }
+    app.update(subagent_msg(
+        turn_complete(TokenUsage::default(), MAIN_MODEL, None),
+        ACTIVITY_TASK,
+        None,
+    ));
+
+    end_turn(&mut app);
     end_turn(&mut app);
     app.checkpoint();
 
-    assert_eq!(app.state.turns, expected, "{TURNS_UNCOUNTED}");
-    assert_eq!(app.state.session.meta.turns, expected, "{TURNS_UNSAVED}");
+    let activity = app.state.session.meta.activity.as_ref().unwrap();
+    assert_eq!(activity.user_exchanges, 1);
+    assert_eq!(activity.main_model_turns, 3);
+    assert_eq!(activity.subagent_model_turns, 1);
+    assert_eq!(activity.model_turns(), 4);
+    assert!(activity.complete);
+    assert_eq!(app.state.session.meta.turns, 0);
+}
+
+#[test_case(LedgerPurpose::Goal; "goal")]
+#[test_case(LedgerPurpose::Compaction; "compaction")]
+#[test_case(LedgerPurpose::Title; "title")]
+#[test_case(LedgerPurpose::Btw; "btw")]
+#[test_case(LedgerPurpose::Extract; "extract")]
+#[test_case(LedgerPurpose::ToolJsonRepair; "repair")]
+#[test_case(LedgerPurpose::Decision; "decision")]
+#[test_case(LedgerPurpose::Memory; "memory")]
+#[test_case(LedgerPurpose::Autopilot; "autopilot")]
+#[test_case(LedgerPurpose::CacheWarm; "cache_warm")]
+#[test_case(LedgerPurpose::Learning; "learning")]
+fn activity_excludes_auxiliary_model_responses(purpose: LedgerPurpose) {
+    let mut app = test_app();
+    app.run_id = 1;
+    for child in [false, true] {
+        let event = turn_complete_from(
+            TEST_PROVIDER,
+            TokenUsage::default(),
+            MAIN_MODEL,
+            None,
+            purpose,
+            0,
+        );
+        app.update(if child {
+            subagent_msg(event, ACTIVITY_TASK, None)
+        } else {
+            agent_msg(event)
+        });
+    }
+
+    assert_eq!(
+        app.state.session.meta.activity,
+        Some(SessionActivity::new())
+    );
+}
+
+#[test_case(false, false; "main_partial_keeps_usage")]
+#[test_case(true, false; "child_partial_keeps_usage")]
+#[test_case(false, true; "stale_cancelled_partial_keeps_exact_activity")]
+fn activity_excludes_interrupted_chat_responses(child: bool, cancelled: bool) {
+    let mut app = streaming_app_with_history();
+    let mut event = turn_complete(MAIN_TOKENS, MAIN_MODEL, None);
+    if let AgentEvent::TurnComplete(turn) = &mut event {
+        turn.interrupted = true;
+    }
+    if cancelled {
+        app.begin_main_cancel(false, true);
+    }
+
+    app.update(if child {
+        subagent_msg(event, ACTIVITY_TASK, None)
+    } else {
+        agent_msg(event)
+    });
+
+    assert_eq!(
+        app.state.token_usage,
+        if cancelled {
+            TokenUsage::default()
+        } else {
+            MAIN_TOKENS
+        }
+    );
+    assert_eq!(
+        app.state.session.meta.activity,
+        Some(SessionActivity::new())
+    );
+}
+
+#[test_case(false; "stale_main_run")]
+#[test_case(true; "unowned_task")]
+fn activity_rejects_stale_or_unowned_events(task: bool) {
+    let mut app = test_app();
+    app.run_id = 2;
+    for event in [
+        AgentEvent::UserExchangeAdmitted {
+            group_id: CaudraId::generate(),
+        },
+        turn_complete(TokenUsage::default(), MAIN_MODEL, None),
+    ] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            task: task.then(|| {
+                Arc::new(TaskProvenance {
+                    session_id: app.state.session.id,
+                    task_id: ACTIVITY_TASK.into(),
+                    invocation_id: ACTIVITY_TASK.into(),
+                })
+            }),
+            subagent: None,
+            run_id: if task { app.run_id } else { 1 },
+            workflow: None,
+        })));
+    }
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::UserExchangeAdmitted {
+            group_id: CaudraId::generate(),
+        },
+        ACTIVITY_TASK,
+        None,
+        app.run_id,
+    ));
+
+    assert_eq!(
+        app.state.session.meta.activity,
+        Some(SessionActivity::new())
+    );
+}
+
+#[test_case(None, false; "processed_before_cancel_stays_exact")]
+#[test_case(Some(false), false; "dropped_admission_marks_partial")]
+#[test_case(Some(true), false; "dropped_chat_response_marks_partial")]
+#[test_case(Some(true), true; "dropped_child_response_marks_partial")]
+fn activity_keeps_completed_responses_when_a_run_is_cancelled(
+    dropped_model_turn: Option<bool>,
+    child: bool,
+) {
+    let mut app = streaming_app_with_history();
+    app.update(agent_msg(AgentEvent::UserExchangeAdmitted {
+        group_id: CaudraId::generate(),
+    }));
+    for _ in 0..2 {
+        app.update(agent_msg(turn_complete(
+            TokenUsage::default(),
+            MAIN_MODEL,
+            None,
+        )));
+    }
+
+    app.begin_main_cancel(false, true);
+    if let Some(model_turn) = dropped_model_turn {
+        let event = if model_turn {
+            turn_complete(TokenUsage::default(), MAIN_MODEL, None)
+        } else {
+            AgentEvent::UserExchangeAdmitted {
+                group_id: CaudraId::generate(),
+            }
+        };
+        app.update(if child {
+            subagent_msg(event, ACTIVITY_TASK, None)
+        } else {
+            agent_msg(event)
+        });
+    }
+    end_turn(&mut app);
+    app.checkpoint();
+
+    let activity = app.state.session.meta.activity.as_ref().unwrap();
+    assert_eq!(activity.user_exchanges, 1);
+    assert_eq!(activity.main_model_turns, 2);
+    assert_eq!(activity.subagent_model_turns, 0);
+    assert_eq!(activity.complete, dropped_model_turn.is_none());
+}
+
+#[test]
+fn activity_does_not_count_history_snapshots_or_done_replay() {
+    let mut app = streaming_app_with_history();
+    for _ in 0..2 {
+        app.checkpoint();
+        app.update(agent_msg(AgentEvent::SubagentHistory {
+            task_id: ACTIVITY_TASK.into(),
+            parent_tool_use_id: ACTIVITY_TASK.into(),
+            root_tool_use_id: ACTIVITY_TASK.into(),
+            name: ACTIVITY_TASK.into(),
+            model: MAIN_MODEL.into(),
+            messages: vec![
+                Message::user(ACTIVITY_PROMPT.into()),
+                fork_reply(FORK_FIRST_REPLY),
+            ],
+            spec: None,
+        }));
+        end_turn(&mut app);
+    }
+
+    assert!(!app.state.session.messages().is_empty());
+    assert!(!app.state.session.subagent_messages()[ACTIVITY_TASK].is_empty());
+    assert_eq!(
+        app.state.session.meta.activity,
+        Some(SessionActivity::new())
+    );
+}
+
+#[test_case(true, true; "exact_startup")]
+#[test_case(false, true; "incomplete_startup")]
+#[test_case(true, false; "exact_session_switch")]
+#[test_case(false, false; "incomplete_session_switch")]
+fn activity_survives_checkpoint_save_and_resume(complete: bool, startup: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(ACTIVITY_PROMPT.into()),
+    );
+    app.run_id = 1;
+    app.state.session_mut().meta.turns = 97;
+    app.state
+        .session_mut()
+        .meta
+        .activity
+        .as_mut()
+        .unwrap()
+        .complete = complete;
+    let group_id = CaudraId::generate();
+    app.update(agent_msg(AgentEvent::UserExchangeAdmitted { group_id }));
+    app.update(agent_msg(turn_complete(
+        TokenUsage::default(),
+        MAIN_MODEL,
+        None,
+    )));
+    app.update(subagent_msg(
+        turn_complete(TokenUsage::default(), MAIN_MODEL, None),
+        ACTIVITY_TASK,
+        None,
+    ));
+    let expected = app.state.session.meta.activity.clone();
+
+    let (writer, mut app) = reopen(app, writer, &dir, startup);
+
+    assert_eq!(app.state.session.meta.activity, expected);
+    assert_eq!(app.state.session.meta.turns, 97);
+    app.update(agent_msg(AgentEvent::UserExchangeAdmitted { group_id }));
+    app.update(agent_msg(AgentEvent::UserExchangeAdmitted {
+        group_id: CaudraId::generate(),
+    }));
+    app.update(agent_msg(turn_complete(
+        TokenUsage::default(),
+        MAIN_MODEL,
+        None,
+    )));
+    let activity = app.state.session.meta.activity.as_ref().unwrap();
+    assert_eq!(activity.user_exchanges, 2);
+    assert_eq!(activity.main_model_turns, 2);
+    assert_eq!(activity.subagent_model_turns, 1);
+    assert_eq!(activity.complete, complete);
+    drain_writer(app, writer);
+}
+
+#[test]
+fn activity_survives_revert_and_model_change_but_new_session_starts_empty() {
+    let (_tmp, _dir, writer, mut app) = tempdir_app();
+    let items = crate::history_items(&[
+        Message::user(ACTIVITY_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+        Message::user(ACTIVITY_PROMPT.into()),
+        fork_reply(FORK_FIRST_REPLY),
+    ]);
+    let first_reply = items[1].id;
+    app.state.session_mut().replace_messages(items);
+    let mut activity = SessionActivity::new();
+    activity.user_exchanges = 10;
+    activity.main_model_turns = 20;
+    activity.subagent_model_turns = 30;
+    app.state.session_mut().meta.activity = Some(activity.clone());
+    app.restore_display();
+
+    app.revert_to(first_reply, RestoreMode::Conversation);
+    app.state.update_model(&test_model());
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.activity.as_ref(), Some(&activity));
+    app.unrevert();
+    assert_eq!(app.state.session.meta.activity.as_ref(), Some(&activity));
+
+    let forked = app
+        .fork_at(DisplaySource::AssistantText(first_reply))
+        .unwrap();
+    let inherited = forked.session.meta.activity.as_ref().unwrap();
+    assert_eq!(inherited.user_exchanges, 1);
+    assert_eq!(inherited.main_model_turns, 0);
+    assert_eq!(inherited.subagent_model_turns, 0);
+    assert!(!inherited.complete);
+    assert_eq!(app.state.session.meta.activity.as_ref(), Some(&activity));
+
+    app.reset_session();
+    assert_eq!(
+        app.state.session.meta.activity,
+        Some(SessionActivity::new())
+    );
+    drain_writer(app, writer);
 }
 
 #[test]
@@ -5847,6 +6146,7 @@ fn billed_turn(cost: f64, billing: Billing) -> Msg {
         model: MAIN_MODEL.into(),
         provider: TEST_PROVIDER.into(),
         purpose: LedgerPurpose::Chat,
+        interrupted: false,
         cost: Some(cost),
         billing,
         account: None,

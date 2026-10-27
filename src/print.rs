@@ -493,6 +493,7 @@ pub fn run(
             | AgentEvent::Question(_)
             | AgentEvent::QuestionClosed
             | AgentEvent::MessageStarted { .. }
+            | AgentEvent::UserExchangeAdmitted { .. }
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::TaskGuidanceQueued { .. }

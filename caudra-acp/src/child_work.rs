@@ -858,6 +858,7 @@ mod tests {
 
     fn turn() -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            interrupted: false,
             message: Message::default(),
             usage: TokenUsage {
                 output: OUTPUT_TOKENS,

@@ -1146,6 +1146,7 @@ mod tests {
 
     fn turn_complete(cost: f64) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            interrupted: false,
             message: Message::default(),
             usage: TokenUsage::default(),
             model: String::new(),

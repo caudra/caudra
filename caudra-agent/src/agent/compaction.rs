@@ -518,6 +518,7 @@ fn finish_compact(
         model: model.id.clone(),
         provider: model.provider.to_string(),
         purpose: LedgerPurpose::Compaction,
+        interrupted: false,
         cost: model.billed_cost(&response.usage, false),
         billing: response.billing(model),
         account: response.account_name(),

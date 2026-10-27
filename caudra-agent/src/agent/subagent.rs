@@ -135,7 +135,10 @@ async fn relay_session_events(
             // A failed subagent reaches the user as its task tool result, and
             // the parent's own session must not take a child's verdict as its
             // own: in the UI an error ends the session it arrives on.
-            AgentEvent::Error { .. } => continue,
+            AgentEvent::Error { .. } => {
+                let _ = usage_tx.send(TokenUsage::default());
+                continue;
+            }
             // Already stamped, so this is a grandchild's live tool work and
             // this session sits blocked on the nested task that ran it.
             // Restamping would open a card in this session's transcript for a
@@ -913,17 +916,13 @@ impl Subagent {
         if let Some(applied) = self.control.live.take_applied() {
             self.adopt(applied);
         }
-        // Consume every emitted Done, including cancellation and turn-limit exits,
-        // so a later explicit invocation cannot read a stale usage total. Provider
-        // errors do not emit Done and must not wait for the relay.
-        if result.is_ok() {
-            match self.usage_rx.recv_async().await {
-                Ok(_) => {}
-                Err(_) => tracing::warn!(
-                    name = %self.name,
-                    "subagent event relay stopped before Done"
-                ),
-            }
+        if let Err(error) = &result {
+            let _ = self.sub_event_tx.send(AgentEvent::Error {
+                message: error.to_string(),
+            });
+        }
+        if self.usage_rx.recv_async().await.is_err() {
+            tracing::warn!(name = %self.name, "subagent event relay stopped before settlement");
         }
         (result, text)
     }
@@ -3383,6 +3382,7 @@ mod tests {
             model: "test-model".into(),
             provider: "test-provider".into(),
             purpose: LedgerPurpose::Chat,
+            interrupted: false,
             cost: Some(cost),
             billing: Billing::Api,
             account: None,
@@ -3391,8 +3391,9 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn relay_session_events_reports_live_usage_and_done_total() {
+    #[test_case(false; "completed_run")]
+    #[test_case(true; "failed_run_flushes_completed_responses")]
+    fn relay_session_events_reports_live_usage_and_done_total(failed: bool) {
         let (sub_tx, sub_rx) = flume::unbounded();
         let (parent_raw_tx, parent_rx) = flume::unbounded();
         let subagent_info = parent_info();
@@ -3402,9 +3403,6 @@ mod tests {
         for event in [
             turn(tokens(100, 20), 0.25),
             turn(tokens(50, 10), 0.5),
-            AgentEvent::Error {
-                message: IGNORED_ERROR.into(),
-            },
             AgentEvent::SubagentHistory {
                 task_id: "nested-task".into(),
                 parent_tool_use_id: "nested-call".into(),
@@ -3414,10 +3412,16 @@ mod tests {
                 messages: Vec::new(),
                 spec: None,
             },
-            AgentEvent::Done {
-                usage: DONE_USAGE,
-                num_turns: 2,
-                reason: DoneReason::EndTurn,
+            if failed {
+                AgentEvent::Error {
+                    message: IGNORED_ERROR.into(),
+                }
+            } else {
+                AgentEvent::Done {
+                    usage: DONE_USAGE,
+                    num_turns: 2,
+                    reason: DoneReason::EndTurn,
+                }
             },
         ] {
             sub_tx.send(envelope(event)).unwrap();
@@ -3444,7 +3448,15 @@ mod tests {
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
         assert_eq!(live, expected);
-        assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
+        assert_eq!(
+            usage_rx.try_recv(),
+            Ok(if failed {
+                TokenUsage::default()
+            } else {
+                DONE_USAGE
+            })
+        );
+        assert!(usage_rx.try_recv().is_err());
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected.len() + 1);

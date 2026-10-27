@@ -405,6 +405,7 @@ impl Chat {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
             AgentEvent::QueueDrained
+            | AgentEvent::UserExchangeAdmitted { .. }
             | AgentEvent::TaskGuidanceQueued { .. }
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
@@ -4159,6 +4160,7 @@ mod tests {
 
     fn turn_complete(text: &str, purpose: LedgerPurpose) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            interrupted: false,
             message: Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: text.into() }],
