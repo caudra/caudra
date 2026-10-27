@@ -1505,6 +1505,7 @@ mod tests {
         cache_creation: 53,
         cost: Some(RECORDED_COST),
         subscription_cost: None,
+        no_cost_estimate: false,
     };
     const BUCKET_HEADERS: &str = "base in      out  cache read  cache write    total   hit    cost";
     const BUCKET_VALUES: &str = " 101       37         211           53      402      58%   0.123";
@@ -1539,6 +1540,20 @@ mod tests {
     const PURPOSE_HEADING: &str = "Per purpose";
     const GOAL_PURPOSE: &str = "goal";
     const CHAT_PURPOSE: &str = "chat";
+    const DECISION_PURPOSE: &str = "decision";
+    const OPENAI_PROVIDER: &str = "openai";
+    const OPENAI_DECISION_MODEL: &str = "openai/gpt-6-luna";
+    const OPENAI_CHAT_MODEL: &str = "openai/gpt-6-astra";
+    const LEGACY_DECISION_MODEL: &str = "decision/gpt-6-luna";
+    const LEGACY_DECISION_USAGE: StoredTokenUsage = StoredTokenUsage {
+        input: 23,
+        output: 19,
+        cache_read: 43,
+        cache_creation: 17,
+        cost: Some(RECORDED_COST),
+        subscription_cost: None,
+        no_cost_estimate: false,
+    };
     const HIDDEN_ROWS: usize = 2;
     const NONE_HIDDEN: &str = "a cap that would hide one row shows it instead";
     const PURPOSES_WHOLE: &str = "purposes are a short fixed list and always show whole";
@@ -2260,6 +2275,130 @@ mod tests {
             "{PURPOSE_ORDER}: {rows:?}"
         );
         assert!(rows[heading + 3].ends_with(RECORDED_TEXT), "{rows:?}");
+    }
+
+    #[test_case(false; "new_session")]
+    #[test_case(true; "resumed_session_with_legacy_decisions")]
+    fn decision_usage_groups_by_provider_without_rewriting_historical_models(legacy: bool) {
+        let model = test_model();
+        let ingested_decision = StoredTokenUsage {
+            no_cost_estimate: true,
+            ..ALL_BUCKETS
+        };
+        let mut by_model = HashMap::from([
+            (OPENAI_DECISION_MODEL.to_owned(), ingested_decision),
+            (OPENAI_CHAT_MODEL.to_owned(), ALL_BUCKETS),
+        ]);
+        let decision_usage = if legacy {
+            by_model.insert(LEGACY_DECISION_MODEL.to_owned(), LEGACY_DECISION_USAGE);
+            StoredTokenUsage {
+                input: 124,
+                output: 56,
+                cache_read: 254,
+                cache_creation: 70,
+                cost: Some(2.0 * RECORDED_COST),
+                subscription_cost: None,
+                no_cost_estimate: true,
+            }
+        } else {
+            ingested_decision
+        };
+        let by_purpose = HashMap::from([
+            (CHAT_PURPOSE.to_owned(), ALL_BUCKETS),
+            (DECISION_PURPOSE.to_owned(), decision_usage),
+        ]);
+        let ctx = UsageModalContext {
+            total: &TokenUsage::default(),
+            total_cost: None,
+            subscription_cost: None,
+            by_model: &by_model,
+            by_purpose: &by_purpose,
+            model: &model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+            lifetime: None,
+            accounts: &[],
+            warming: None,
+        };
+
+        let models = model_rows(&ctx);
+        assert_eq!(models.len(), if legacy { 3 } else { 2 });
+        for row in &models {
+            assert_eq!(row.usage, by_model[&row.label]);
+            assert_eq!(row.spend.usd, row.usage.cost);
+            assert_eq!(row.spend.billing, Billing::Api);
+        }
+
+        let providers = provider_rows(&models, &model.provider);
+        assert_eq!(providers.len(), if legacy { 2 } else { 1 });
+        let openai = providers
+            .iter()
+            .find(|row| row.label == OPENAI_PROVIDER)
+            .unwrap();
+        assert_eq!(
+            openai.usage,
+            StoredTokenUsage {
+                input: 202,
+                output: 74,
+                cache_read: 422,
+                cache_creation: 106,
+                cost: Some(2.0 * RECORDED_COST),
+                subscription_cost: None,
+                no_cost_estimate: true,
+            }
+        );
+        assert_eq!(openai.spend.usd, Some(2.0 * RECORDED_COST));
+        assert_eq!(openai.spend.billing, Billing::Api);
+        let historical = providers.iter().find(|row| row.label == DECISION_PURPOSE);
+        assert_eq!(
+            historical.map(|row| row.usage),
+            legacy.then_some(LEGACY_DECISION_USAGE)
+        );
+
+        let purposes = purpose_rows(&by_purpose);
+        assert_eq!(purposes.len(), 2);
+        let decision = purposes
+            .iter()
+            .find(|row| row.label == DECISION_PURPOSE)
+            .unwrap();
+        assert_eq!(decision.usage, decision_usage);
+        assert_eq!(decision.spend.usd, decision_usage.cost);
+        assert_eq!(decision.spend.billing, Billing::Api);
+        let chat = purposes
+            .iter()
+            .find(|row| row.label == CHAT_PURPOSE)
+            .unwrap();
+        assert_eq!(chat.usage, ALL_BUCKETS);
+
+        let lines = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
+        assert_eq!(
+            lines.iter().any(|line| line.ends_with(PROVIDER_HEADING)),
+            legacy
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim_start().starts_with(OPENAI_DECISION_MODEL))
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .any(|line| line.trim_start().starts_with(LEGACY_DECISION_MODEL)),
+            legacy
+        );
+        let heading = lines
+            .iter()
+            .position(|line| line.ends_with(PURPOSE_HEADING))
+            .unwrap();
+        let decision_line = lines[heading..]
+            .iter()
+            .find(|line| line.split_whitespace().next() == Some(DECISION_PURPOSE))
+            .unwrap();
+        assert!(decision_line.ends_with(if legacy {
+            FOLDED_BUCKET_VALUES
+        } else {
+            BUCKET_VALUES
+        }));
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {

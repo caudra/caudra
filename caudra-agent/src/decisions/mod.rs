@@ -76,7 +76,7 @@ pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt, red
 const CACHE_ENTRIES: usize = 128;
 const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
 const DEADLINE_REJECTED: &str = "timeout exceeds the supported clock range";
-pub(crate) const USAGE_PROVIDER: &str = "decision";
+const UNKNOWN_USAGE_PROVIDER: &str = "decision";
 const EFFECT_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_META: &str = "protocol";
 const ENDPOINT_META: &str = "endpoint";
@@ -579,7 +579,7 @@ impl Decisions {
     }
 
     /// Takes the spend not booked yet, for the agent to count.
-    pub fn take_spend(&self) -> BTreeMap<String, Spent> {
+    pub fn take_spend(&self) -> BTreeMap<(String, String), Spent> {
         self.spend().take()
     }
 
@@ -1019,6 +1019,9 @@ impl Decisions {
         if billed.is_empty() {
             return;
         }
+        let provider = self
+            .endpoint()
+            .map_or(UNKNOWN_USAGE_PROVIDER, |endpoint| endpoint.name.as_str());
         let spent: Vec<_> = billed
             .iter()
             .map(|billed| {
@@ -1032,7 +1035,7 @@ impl Decisions {
         let turns: Vec<_> = spent
             .iter()
             .map(|(usage, cost)| TurnUsage {
-                provider: USAGE_PROVIDER.into(),
+                provider: provider.into(),
                 account: String::new(),
                 model: model.into(),
                 cwd: cwd.into(),
@@ -1067,7 +1070,7 @@ impl Decisions {
             tracing::warn!(model, "decision usage could not be recorded");
         }
         for (usage, cost) in spent {
-            self.spend().add(model, usage, cost);
+            self.spend().add(provider, model, usage, cost);
         }
     }
 }
@@ -1193,15 +1196,15 @@ mod tests {
     };
     use caudra_decision::wire::MAX_REQUEST_BYTES;
     use caudra_decision::{
-        Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
-        QuestionSet, Usage,
+        Answer, Billed, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
+        NoulAnswer, QuestionSet, Usage,
     };
     use caudra_providers::TokenUsage;
     use caudra_storage::decision_log::{
         DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, StatsThresholds,
     };
     use caudra_storage::id::CaudraId;
-    use caudra_storage::usage_ledger::UsageLedger;
+    use caudra_storage::usage_ledger::{LedgerPurpose, UsageLedger};
     use caudra_storage::{StateDir, now_epoch};
     use futures_lite::future;
     use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1217,7 +1220,8 @@ mod tests {
         DecisionContext, DecisionFeature, Decisions, DecisionsError, ENDPOINT_META, ENGINE_HTTP,
         ENGINE_INVALID, ENGINE_REFUSED, ENGINE_TIMED_OUT, ENGINE_UNREACHABLE, PROTOCOL_META,
         PendingPhase, PermissionAction, PermissionPurpose, REQUEST_REJECTED, STATE_REJECTED,
-        Screening, ScreeningVerdict, Spent, Withholding, questions, record_meta, stats_thresholds,
+        Screening, ScreeningVerdict, Spent, UNKNOWN_USAGE_PROVIDER, Withholding, questions,
+        record_meta, stats_thresholds,
     };
 
     const SECRET: &str = "never-store-this-credential";
@@ -2410,7 +2414,7 @@ mod tests {
     }
 
     /// What a call left lingering books, once it does, or nothing by `SPEND_WAIT`.
-    async fn booked(service: &Decisions) -> BTreeMap<String, Spent> {
+    async fn booked(service: &Decisions) -> BTreeMap<(String, String), Spent> {
         let deadline = Instant::now() + SPEND_WAIT;
         loop {
             let spent = service.take_spend();
@@ -2461,16 +2465,36 @@ mod tests {
                 }
             }
             assert!(gate.service.take_spend().is_empty());
+            let mut next = gate.service.for_session(CaudraId::generate());
+            Arc::get_mut(&mut next.0)
+                .unwrap()
+                .config
+                .endpoint
+                .as_mut()
+                .unwrap()
+                .name = ENDPOINT_NAME.into();
+            next.inherit_spend(&gate.service);
             gate.release.send(()).unwrap();
             assert_eq!(
-                booked(&gate.service).await,
-                BTreeMap::from([(PRICED_MODEL.to_owned(), gated_spend())])
+                booked(&next).await,
+                BTreeMap::from([(
+                    (
+                        DecisionProtocol::TypeSafe.as_str().into(),
+                        PRICED_MODEL.into()
+                    ),
+                    gated_spend()
+                )])
             );
             let ledger = UsageLedger::open(&StateDir::from_path(gate.root.path().into()))
                 .unwrap()
                 .lifetime()
                 .unwrap();
             assert_eq!(ledger.priced_turns, 1);
+            assert_eq!(ledger.by_provider.len(), 1);
+            assert_eq!(
+                ledger.by_provider[0].label,
+                DecisionProtocol::TypeSafe.as_str()
+            );
         });
     }
 
@@ -2489,6 +2513,68 @@ mod tests {
         });
     }
 
+    #[test_case(Some(DecisionProtocol::OpenAI), DecisionProtocol::OpenAI.as_str(); "openai")]
+    #[test_case(Some(DecisionProtocol::TypeSafe), DecisionProtocol::TypeSafe.as_str(); "typesafe")]
+    #[test_case(Some(DecisionProtocol::OpenAI), ENDPOINT_NAME; "custom_openai_endpoint")]
+    #[test_case(None, UNKNOWN_USAGE_PROVIDER; "unknown_endpoint")]
+    fn billed_usage_keeps_the_endpoint_name(protocol: Option<DecisionProtocol>, provider: &str) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::from_path(root.path().into());
+            let config = DecisionsConfig {
+                endpoint: protocol.map(|protocol| {
+                    DecisionEndpoint::new(provider, protocol, BASE_URL.parse().unwrap())
+                }),
+                ..DecisionsConfig::default()
+            };
+            let model = config
+                .endpoint
+                .as_ref()
+                .map_or(PRICED_MODEL, |endpoint| &endpoint.model)
+                .to_owned();
+            let service = Decisions::with_engine(
+                config,
+                &state_dir,
+                FakeEngine {
+                    requests: Arc::default(),
+                    behavior: Behavior::Answer(0.0),
+                },
+            )
+            .unwrap();
+            service
+                .book(
+                    &model,
+                    "",
+                    vec![Billed {
+                        model: model.clone(),
+                        usage: Usage {
+                            input_tokens: GATED_INPUT_TOKENS,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        },
+                    }],
+                )
+                .await;
+            let spent = service.take_spend();
+            assert_eq!(spent.len(), 1);
+            let spent = &spent[&(provider.into(), model.clone())];
+            assert_eq!(spent.usage.input, GATED_INPUT_TOKENS as u32);
+            let buckets = UsageLedger::open(&state_dir)
+                .unwrap()
+                .buckets(None)
+                .unwrap();
+            assert_eq!(buckets.len(), 1);
+            let bucket = &buckets[0];
+            assert_eq!(bucket.provider, provider);
+            assert_eq!(bucket.model, model);
+            assert_eq!(bucket.purpose, LedgerPurpose::Decision.storage_name());
+            assert_eq!(bucket.input, GATED_INPUT_TOKENS);
+            assert_eq!(bucket.cost, spent.cost.unwrap_or_default());
+            assert!(!bucket.subscription);
+        });
+    }
+
     #[test]
     fn an_answered_call_is_booked_before_it_returns() {
         smol::block_on(async {
@@ -2497,27 +2583,66 @@ mod tests {
             screen(&gate.service).await.unwrap();
             assert_eq!(
                 gate.service.take_spend(),
-                BTreeMap::from([(PRICED_MODEL.to_owned(), gated_spend())])
+                BTreeMap::from([(
+                    (
+                        DecisionProtocol::TypeSafe.as_str().into(),
+                        PRICED_MODEL.into()
+                    ),
+                    gated_spend()
+                )])
             );
         });
     }
 
-    #[test_case(false; "fresh_successor")]
-    #[test_case(true; "successor_with_its_own_spend")]
-    fn a_switched_service_keeps_the_spend_of_the_one_it_replaced(successor_spent: bool) {
+    #[test_case(false, false; "fresh_successor")]
+    #[test_case(true, false; "successor_with_its_own_spend")]
+    #[test_case(false, true; "fresh_different_provider")]
+    #[test_case(true, true; "different_provider_with_its_own_spend")]
+    fn a_switched_service_keeps_the_spend_of_the_one_it_replaced(
+        successor_spent: bool,
+        different_provider: bool,
+    ) {
         let gate = gated(TEST_NORMAL_TIMEOUT_MS);
         let session = CaudraId::generate();
         let previous = gate.service.for_session(session);
         let next = gate.service.for_session(session);
         let spent = gated_spend();
-        previous.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+        let provider = DecisionProtocol::TypeSafe.as_str();
+        let next_provider = if different_provider {
+            ENDPOINT_NAME
+        } else {
+            provider
+        };
+        previous
+            .spend()
+            .add(provider, PRICED_MODEL, spent.usage, spent.cost);
         if successor_spent {
-            next.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+            next.spend()
+                .add(next_provider, PRICED_MODEL, spent.usage, spent.cost);
         }
         next.inherit_spend(&previous);
         let taken = next.take_spend();
-        let expected_input = spent.usage.input * if successor_spent { 2 } else { 1 };
-        assert_eq!(taken[PRICED_MODEL].usage.input, expected_input);
+        let expected_input = spent.usage.input
+            * if successor_spent && !different_provider {
+                2
+            } else {
+                1
+            };
+        assert_eq!(
+            taken[&(provider.into(), PRICED_MODEL.into())].usage.input,
+            expected_input
+        );
+        assert_eq!(
+            taken.len(),
+            if successor_spent && different_provider {
+                2
+            } else {
+                1
+            }
+        );
+        if successor_spent && different_provider {
+            assert_eq!(taken[&(next_provider.into(), PRICED_MODEL.into())], spent);
+        }
         assert!(previous.take_spend().is_empty());
     }
 
@@ -2534,13 +2659,24 @@ mod tests {
         manager.set_decisions(Some(replaced.clone()));
         manager.set_decisions(Some(gate.service.for_session(session)));
         let spent = gated_spend();
-        replaced.spend().add(PRICED_MODEL, spent.usage, spent.cost);
+        replaced.spend().add(
+            DecisionProtocol::TypeSafe.as_str(),
+            PRICED_MODEL,
+            spent.usage,
+            spent.cost,
+        );
         let other_session = manager.fork_session(CaudraId::generate());
         assert!(other_session.decisions().unwrap().take_spend().is_empty());
         let subagent = manager.fork();
         assert_eq!(
             subagent.decisions().unwrap().take_spend(),
-            BTreeMap::from([(PRICED_MODEL.to_owned(), spent)])
+            BTreeMap::from([(
+                (
+                    DecisionProtocol::TypeSafe.as_str().into(),
+                    PRICED_MODEL.into()
+                ),
+                spent
+            )])
         );
         assert!(manager.decisions().unwrap().take_spend().is_empty());
     }

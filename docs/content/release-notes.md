@@ -20,9 +20,9 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 > **Important**
 >
-> **Close every other Caudra session before you start Preview 16.** Its first start upgrades the session database for saved tool outputs and optional CPU measurements beside shell runs. Existing shell history is kept, with unavailable measurements left unknown.
+> Close other Caudra sessions before starting Preview 16. Its first start upgrades the session database for saved tool outputs, decision usage, and optional CPU measurements beside shell runs. Existing shell history is kept, with unavailable measurements left unknown.
 >
-> Updating from Preview 15 saves a copy first at `backups/caudra.db.v40.bak` in your state directory. Preview 15 and earlier cannot open the upgraded database, and `caudra rollback` restores only the previous binary.
+> Updating from Preview 15 saves a copy first at `backups/caudra.db.v40.bak` in the state directory. Older builds cannot open the upgraded database, and `caudra rollback` restores only the previous binary.
 
 ### Models
 
@@ -43,6 +43,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 ### Fixes
 
 - **Shell ETAs respect literal sleeps.** A command such as `sleep 30` now gets its ETA from the requested duration, even without past runs. Consecutive sleeps add up. For a supported chain such as `sleep 30 && make build`, the ETA adds 30 seconds to the model's estimate for `make build` alone. If the remaining work has no reliable numerical estimate, the card shows `at least 30s`. Conditional sleeps and polling loops still use the learned model, and the rule does not change timeouts or background delivery.
+- **Decision usage names its provider.** New decision calls appear under their configured endpoint, such as `openai`, in session and lifetime usage, including when you resume an older session. Their purpose stays `decision`, and an unknown decision price stays unknown rather than borrowing chat rates. Previously recorded usage keeps its old attribution because the original endpoint was not saved with those totals.
 - **Stable colors while patches stream.** Patch previews keep their addition and removal colors without syntax highlighting until the tool finishes, avoiding repeated recoloring as text arrives.
 - **`Scratch` is where temporary files go.** The workbench's `Scratch` folder now lists the temporary directory the agent is told to use, even after `/cd`, in a worktree, or in a session from another project. It used to list that project's own folder, which was often missing. See [Workbench](/docs/workbench/#files-outside-the-project).
 - **Pictures in batches fold and open.** A `view_image` call inside a batch shows its picture, which opening the row used to leave blank. A `view_image` call is now a row in every view, with its picture open under it outside the compact view, and a click on the row folds or opens it like a `file_read`. See [Images](/docs/markdown/#images).

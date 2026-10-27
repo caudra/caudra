@@ -154,6 +154,7 @@ impl UsageLedger {
                 cache_read: turn.cache_read,
                 cost: turn.cost,
                 subscription_cost: None,
+                no_cost_estimate: turn.purpose == LedgerPurpose::Decision,
             },
             cost: turn.cost,
         })
