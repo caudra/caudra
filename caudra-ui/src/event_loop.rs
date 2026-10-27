@@ -105,6 +105,7 @@ use crossterm::event::{
     Event, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use jiff::Timestamp;
+use ratatui::CompletedFrame;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -134,6 +135,7 @@ use crate::components::{
 use crate::config_problems::ConfigProblems;
 use crate::inline_image;
 use crate::input::InputReader;
+use crate::loading_screen::{LoadPhase, LoadProgress, LoadingScreen};
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
 use crate::update::{self, UpdateFlow, UpdateNotice};
@@ -1276,6 +1278,7 @@ impl SpawnCtx {
                 cursor: None,
             },
             Vec::new(),
+            LoadProgress::SILENT,
         )
     }
 
@@ -1338,6 +1341,7 @@ impl SpawnCtx {
         &self,
         tab: SessionTab,
         automations: Vec<ProfileArming>,
+        progress: LoadProgress<'_>,
     ) -> Result<SessionRuntime, String> {
         let started = Instant::now();
         let mut phase_start = started;
@@ -1411,6 +1415,7 @@ impl SpawnCtx {
         let change_recorder =
             RecorderSlot::new(ArcSwapOption::from(changes.recorder.map(Arc::new)));
         let prepare_ms = lap();
+        progress.phase(LoadPhase::History);
         let initial_history = match crate::active_session_history(&session) {
             Ok(history) => history,
             Err(error) => {
@@ -1426,6 +1431,7 @@ impl SpawnCtx {
             || session_has_content(&session, self.ui_config.default_mode);
         let (system_prompt_profile_name, system_prompt_profile) =
             self.resolve_prompt_profile(&session)?;
+        progress.phase(LoadPhase::Permissions);
         let permissions = Arc::new(self.permissions.fork_session(session.id));
         // Publishing writes the session out so a conversation grant has a row
         // to be fenced against. A session holding nothing has nothing to keep,
@@ -1443,8 +1449,10 @@ impl SpawnCtx {
         permissions.set_session_mode(session.meta.permission_mode.clone());
         let goal = caudra_agent::GoalHandle::from_meta(&session.meta);
         let permissions_ms = lap();
+        progress.phase(LoadPhase::Subagents);
         let subagent_history = crate::agent::stored_subagent_history(&session);
         let subagent_history_ms = lap();
+        progress.phase(LoadPhase::Agent);
         let mut handles = AgentHandles::spawn(
             &self.model_slot,
             initial_history,
@@ -1546,6 +1554,7 @@ impl SpawnCtx {
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
         handles.apply_to_app(&mut app);
         app.restore_autopilot(self.autopilot.clone());
+        progress.phase(LoadPhase::Transcript);
         if restore_session {
             app.restore_resumed_session();
         }
@@ -1587,7 +1596,28 @@ impl SpawnCtx {
 /// Installs the startup theme, following the terminal background when the
 /// theme in use has a light half. Only the in-memory name is set, so the pick
 /// the user saved interactively survives.
-fn start_theme(ui_config: &UiConfig, warnings: &mut Vec<String>) -> Option<AutoSwitch> {
+/// The picker's counterpart of `session runtime spawned`: what opening a stored
+/// session cost before the user got control back.
+fn log_session_opened(
+    id: CaudraId,
+    reused_tab: bool,
+    lease_ms: u64,
+    read_ms: u64,
+    open_ms: u64,
+    started: Instant,
+) {
+    info!(
+        session_id = %id,
+        reused_tab,
+        lease_ms,
+        read_ms,
+        open_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        "session opened"
+    );
+}
+
+pub(crate) fn start_theme(ui_config: &UiConfig, warnings: &mut Vec<String>) -> Option<AutoSwitch> {
     // Without `ui.theme` this is the pick from `/theme`, or the default.
     let chosen = ui_config
         .theme
@@ -1654,6 +1684,9 @@ pub(crate) struct EventLoop<'t> {
     last_focused: Option<CaudraId>,
     last_workspace_tabs: Option<WorkspaceTabsSnapshot>,
     terminal_focused: bool,
+    /// Up from a load until the next frame is composed, which on a large
+    /// transcript is a wait of its own.
+    loading: LoadingScreen,
     pane_signals: PaneSignals,
     ctx: SpawnCtx,
     input: InputReader,
@@ -1901,6 +1934,8 @@ impl<'t> EventLoop<'t> {
     pub(crate) fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
         params: EventLoopParams,
+        auto_theme: Option<AutoSwitch>,
+        loading: LoadingScreen,
     ) -> Result<Self> {
         let EventLoopParams {
             peer_host,
@@ -1965,10 +2000,8 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
 
-        // Apply the config theme before the warmup thread spawns, or warmup
-        // could bake the syntax palette from the old theme.
-        let auto_theme = start_theme(&ui_config, &mut startup_warnings);
-
+        // The caller applied the config theme already: warmup must not bake
+        // the syntax palette from the old one.
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
             std::thread::spawn(crate::highlight::warmup);
@@ -2068,11 +2101,17 @@ impl<'t> EventLoop<'t> {
 
         let provider_ms = lap();
 
-        let armings = launch_armings(sessions.len(), focused, launch_automations);
+        let count = sessions.len();
+        let armings = launch_armings(count, focused, launch_automations);
+        let progress = loading.progress();
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .zip(armings)
-            .map(|(tab, cli)| ctx.spawn_runtime(tab, cli))
+            .enumerate()
+            .map(|(index, (tab, cli))| {
+                progress.session(index, count, &tab.session.title);
+                ctx.spawn_runtime(tab, cli, progress)
+            })
             .collect::<Result<_, _>>()
             .map_err(|error| eyre!(error))?;
         ctx.allow_workspace_recovery = true;
@@ -2136,6 +2175,7 @@ impl<'t> EventLoop<'t> {
             last_focused: None,
             last_workspace_tabs: None,
             terminal_focused: false,
+            loading,
             pane_signals,
             ctx,
             input,
@@ -2203,6 +2243,42 @@ impl<'t> EventLoop<'t> {
         (resume, metadata)
     }
 
+    fn paint(&mut self) -> io::Result<CompletedFrame<'_>> {
+        let app = &mut self.sessions[self.focused].app;
+        let loading = &mut self.loading;
+        app.sync_image_root();
+        if let Err(error) = terminal::flush_image_output() {
+            tracing::warn!(%error, "image upload failed");
+        }
+        self.terminal.draw(|f| {
+            app.view(f);
+            color_compat::downgrade_if_needed(f.buffer_mut());
+            app.apply_terminal_links(f.buffer_mut());
+            // After composing, which is slow for a transcript just loaded, and
+            // before the frame goes out over the card's cells.
+            loading.close();
+        })
+    }
+
+    /// Repaints the focused session, so the card covers what the user was
+    /// looking at rather than a picker that already closed, then hands the
+    /// terminal to the card. The cursor hides because the card's thread moves
+    /// it; the next frame shows it again. A load that succeeds keeps the card
+    /// in [`Self::loading`] until that frame is composed.
+    fn show_loading(&mut self, title: &str) -> LoadingScreen {
+        let screen = match self.paint() {
+            Ok(frame) => frame.buffer.clone(),
+            Err(error) => {
+                tracing::warn!(%error, "frame under the loading card failed to paint");
+                return LoadingScreen::idle();
+            }
+        };
+        if let Err(error) = self.terminal.hide_cursor() {
+            tracing::debug!(%error, "cursor failed to hide under the loading card");
+        }
+        LoadingScreen::show(&screen, title)
+    }
+
     pub(crate) fn run(mut self, mut initial_prompt: Option<String>) -> Result<ShutdownReport> {
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
@@ -2251,16 +2327,7 @@ impl<'t> EventLoop<'t> {
             let painted = owed && limiter.admit(Instant::now(), urgent);
             if painted {
                 urgent = false;
-                let app = &mut self.sessions[self.focused].app;
-                app.sync_image_root();
-                if let Err(error) = terminal::flush_image_output() {
-                    tracing::warn!(%error, "image upload failed");
-                }
-                if let Err(e) = self.terminal.draw(|f| {
-                    app.view(f);
-                    color_compat::downgrade_if_needed(f.buffer_mut());
-                    app.apply_terminal_links(f.buffer_mut());
-                }) {
+                if let Err(e) = self.paint() {
                     break Err(e.into());
                 }
                 self.sessions[self.focused].capture_peer_review();
@@ -3117,6 +3184,7 @@ impl<'t> EventLoop<'t> {
     /// Exits with the editor's status code; `-1` (flashed on the focused
     /// session) when the editor could not be launched.
     fn open_editor(&mut self, path: &std::path::Path) -> i32 {
+        self.loading.close();
         let result = {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
@@ -3540,6 +3608,7 @@ impl<'t> EventLoop<'t> {
                         cursor: None,
                     },
                     Vec::new(),
+                    LoadProgress::SILENT,
                 ) {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -3841,12 +3910,25 @@ impl<'t> EventLoop<'t> {
             self.focused = i;
             return Ok(());
         }
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
+        // The title is unknown until the session is read.
+        let loading = self.show_loading("");
+        let progress = loading.progress();
         let lease = Arc::new(
             SessionLease::acquire(&self.ctx.storage, id)
                 .map_err(|error| format!("Failed to open session: {error}"))?,
         );
+        let lease_ms = lap();
         let (session, cursor) = open_app_session_with_cursor(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
+        let read_ms = lap();
+        progress.session(0, 1, &session.title);
         // Both branches below end with this session in a tab the writer saves.
         self.ctx.storage_writer.adopt_cursor(cursor);
         if self.ctx.workspace_session.is_none() {
@@ -3854,11 +3936,16 @@ impl<'t> EventLoop<'t> {
         }
         let (profile_name, profile) = self.ctx.resolve_prompt_profile(&session)?;
         let focused = &mut self.sessions[self.focused];
-        if focused.quiescent() && !focused.app.has_content() && self.ctx.workspace_session.is_none()
-        {
+        let reuses_tab = focused.quiescent()
+            && !focused.app.has_content()
+            && self.ctx.workspace_session.is_none();
+        if reuses_tab {
             let model = focused.app.state.model.clone();
             focused.close_peer();
-            let loaded = match focused.app.apply_loaded_session(session, &model) {
+            let loaded = match focused
+                .app
+                .apply_loaded_session_reporting(session, &model, progress)
+            {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     focused.install_peer(&self.ctx);
@@ -3870,6 +3957,8 @@ impl<'t> EventLoop<'t> {
             focused.app.state.system_prompt_profile_override =
                 self.ctx.prompt_profile_override.is_some();
             let old_lease = std::mem::replace(&mut self.sessions[self.focused].lease, lease);
+            self.loading = loading;
+            log_session_opened(id, reuses_tab, lease_ms, read_ms, lap(), started);
             self.dispatch(self.focused, vec![Action::LoadSession(Box::new(loaded))]);
             drop(old_lease);
             return Ok(());
@@ -3881,7 +3970,10 @@ impl<'t> EventLoop<'t> {
                 cursor: None,
             },
             Vec::new(),
+            progress,
         )?;
+        self.loading = loading;
+        log_session_opened(id, reuses_tab, lease_ms, read_ms, lap(), started);
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
@@ -4803,13 +4895,16 @@ impl<'t> EventLoop<'t> {
                         None,
                     ),
                 };
-                let runtime = match self.ctx.spawn_runtime(tab, Vec::new()) {
+                let loading = self.show_loading(&tab.session.title);
+                let runtime = match self.ctx.spawn_runtime(tab, Vec::new(), loading.progress()) {
                     Ok(runtime) => runtime,
                     Err(error) => {
+                        drop(loading);
                         self.sessions[idx].app.flash(error);
                         return;
                     }
                 };
+                self.loading = loading;
                 let child = self.push_runtime(runtime);
                 if let Some(message) = fork_tab::joined([host_warning, warning]) {
                     self.sessions[child].app.flash(message);
@@ -4955,6 +5050,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
+                self.loading.close();
                 let result = terminal::with_normal_terminal(self.terminal, || match provider {
                     SubscriptionProvider::OpenAi => openai_auth::login()
                         .and_then(|login| {

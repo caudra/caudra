@@ -25,15 +25,26 @@ pub(crate) const BAR_CHARS: &str = "=> ";
 pub(crate) const BAR_REFRESH: Duration = Duration::from_millis(100);
 const BACKUP_MESSAGE: &str = "backing up (pages)";
 const RECLAIM_MESSAGE: &str = "reclaiming (pages)";
-const SANDBOX_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";
+const SPINNER_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";
+const RESUME_MESSAGE: &str = "Loading session";
 const SPINNER_TICKS: &str = "|/-\\ ";
 
-pub struct SandboxProgress(ProgressBar);
+/// One line that keeps turning while startup works on something slow, so the
+/// wait before the full-screen UI never looks like a hang.
+pub struct ConsoleSpinner(ProgressBar);
 
-impl SandboxProgress {
-    pub fn start(cli: &Cli) -> Option<Self> {
+impl ConsoleSpinner {
+    pub fn sandbox(cli: &Cli) -> Option<Self> {
         let message = sandbox_message(cli, stdout().is_terminal(), stderr().is_terminal())?;
         Self::start_named(message)
+    }
+
+    /// Reading a large stored session takes seconds before the UI can draw.
+    pub fn resume(cli: &Cli) -> Option<Self> {
+        if !resumes(cli) {
+            return None;
+        }
+        Self::start_named(RESUME_MESSAGE.to_owned())
     }
 
     pub fn start_named(message: String) -> Option<Self> {
@@ -48,7 +59,7 @@ impl SandboxProgress {
     fn new(message: String, target: ProgressDrawTarget) -> Self {
         let bar = ProgressBar::new_spinner()
             .with_style(
-                ProgressStyle::with_template(SANDBOX_TEMPLATE)
+                ProgressStyle::with_template(SPINNER_TEMPLATE)
                     .expect("static template")
                     .tick_chars(SPINNER_TICKS),
             )
@@ -59,10 +70,14 @@ impl SandboxProgress {
     }
 }
 
-impl Drop for SandboxProgress {
+impl Drop for ConsoleSpinner {
     fn drop(&mut self) {
         self.0.finish_and_clear();
     }
+}
+
+fn resumes(cli: &Cli) -> bool {
+    cli.session.is_some() || cli.continue_session
 }
 
 fn sandbox_message(cli: &Cli, stdout_terminal: bool, stderr_terminal: bool) -> Option<String> {
@@ -199,7 +214,9 @@ fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxProgress, advance, enter_phase, new_bar, sandbox_message, uninstall};
+    use super::{
+        ConsoleSpinner, advance, enter_phase, new_bar, resumes, sandbox_message, uninstall,
+    };
     use crate::cli::Cli;
     use caudra_config::StorageConfig;
     use caudra_storage::StateDir;
@@ -325,11 +342,18 @@ mod tests {
         );
     }
 
+    #[test_case(&["caudra"], false; "fresh")]
+    #[test_case(&["caudra", "--continue"], true; "continue_session")]
+    #[test_case(&["caudra", "--session", "saved-session"], true; "session")]
+    fn only_a_resume_spins_while_sessions_load(args: &[&str], expected: bool) {
+        assert_eq!(resumes(&Cli::parse_from(args)), expected);
+    }
+
     #[test_case(false; "success")]
     #[test_case(true; "early_error")]
     fn sandbox_cleanup(fail: bool) {
         let progress =
-            SandboxProgress::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
+            ConsoleSpinner::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
         let bar = progress.0.clone();
         assert!(!bar.is_finished());
         let result = (move || {
@@ -346,7 +370,7 @@ mod tests {
     #[test]
     fn sandbox_cleanup_on_unwind() {
         let progress =
-            SandboxProgress::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
+            ConsoleSpinner::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
         let bar = progress.0.clone();
         let result = catch_unwind(AssertUnwindSafe(move || {
             let _progress = progress;

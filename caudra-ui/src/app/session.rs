@@ -19,6 +19,7 @@ use crate::components::{
     Action, DisplayMessage, DisplaySource, ForkDraft, ForkedSession, LoadedSession,
 };
 use crate::input_document::InputDraft;
+use crate::loading_screen::{LoadPhase, LoadProgress};
 use crate::repaint::{Dirty, Watch};
 use caudra_agent::GoalHandle;
 use caudra_agent::HistorySnapshot;
@@ -1597,10 +1598,20 @@ impl App {
         self.state.context_size = if current == 0 { 0 } else { baseline + current };
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_loaded_session(
+        &mut self,
+        session: AppSession,
+        fallback_model: &Model,
+    ) -> Result<LoadedSession, String> {
+        self.apply_loaded_session_reporting(session, fallback_model, LoadProgress::SILENT)
+    }
+
+    pub(crate) fn apply_loaded_session_reporting(
         &mut self,
         mut session: AppSession,
         fallback_model: &Model,
+        progress: LoadProgress<'_>,
     ) -> Result<LoadedSession, String> {
         if self.permission_mutation_pending() {
             return Err(PERMISSION_WORKER_BUSY.into());
@@ -1642,6 +1653,7 @@ impl App {
                 .replace_workspace_cursor(binding)
                 .map_err(|error| error.to_string())?;
         }
+        progress.phase(LoadPhase::Permissions);
         let permissions = Arc::new(self.permissions.fork_session(session.id));
         // A loaded session that holds nothing owns no row worth publishing
         // against, so it waits for its first run like a fresh one.
@@ -1691,6 +1703,7 @@ impl App {
         }
         self.reset_ui_chrome();
         self.automatic_wakes_suppressed = automatic_wakes_suppressed;
+        progress.phase(LoadPhase::Transcript);
         self.restore_display();
 
         self.request_pattern_suggestions();

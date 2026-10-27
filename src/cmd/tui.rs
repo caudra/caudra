@@ -59,7 +59,7 @@ use crate::cmd::permissions::discover::{
     discover_for_project_cancellable,
 };
 use crate::docs;
-use crate::progress::SandboxProgress;
+use crate::progress::ConsoleSpinner;
 use crate::release_notes;
 use crate::setup;
 use crate::startup::project_notices;
@@ -1414,7 +1414,7 @@ fn merge_prompt(flag: Option<String>, piped: Option<String>) -> Option<String> {
 }
 
 fn sandbox_phase<T>(name: &str, phase: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _progress = SandboxProgress::start_named(format!("Sandbox '{name}': {phase}"));
+    let _progress = ConsoleSpinner::start_named(format!("Sandbox '{name}': {phase}"));
     operation().wrap_err_with(|| format!(
         "Sandbox '{name}': {phase} failed. Sessions saved; active TUI ended. Inspect/Reconcile the sandbox before explicitly reopening or retrying. No automatic retry, acknowledgement or local fallback."
     ))
@@ -1467,7 +1467,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
     let resumed_sandbox =
         super::sandbox::recover_session_source(&mut cli, &persistent_storage, &cwd)?;
 
-    let sandbox_progress = SandboxProgress::start(&cli);
+    let sandbox_progress = ConsoleSpinner::sandbox(&cli);
     let mut workcell_runtime = Arc::new(super::workcell_runtime::WorkcellRuntime::initialize(
         &cli.workcell,
         &cwd,
@@ -1635,6 +1635,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
     let session_cwd = workcell_runtime
         .is_remote()
         .then_some(workcell_runtime.display().cwd.as_str());
+    let resume_spinner = ConsoleSpinner::resume(&cli);
     let resolved = resolve_sessions(
         cli.continue_session,
         cli.session.as_deref(),
@@ -1643,6 +1644,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
         &storage,
         workcell_runtime.stored_binding(),
     )?;
+    drop(resume_spinner);
     let resolve_sessions_ms = lap();
     super::sandbox::remember_session_source(
         &storage,

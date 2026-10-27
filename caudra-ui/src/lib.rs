@@ -21,6 +21,7 @@ mod highlight;
 pub mod image;
 mod inline_image;
 mod input_document;
+mod loading_screen;
 mod markdown;
 mod pane_signals;
 mod provenance;
@@ -70,15 +71,14 @@ use caudra_workspace::{WorkspaceChangeService, WorkspaceSession};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use flume::Receiver;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Stylize;
-use ratatui::widgets::Paragraph;
+use ratatui::buffer::Buffer;
+use ratatui::widgets::Block;
 
 use event_loop::Handoff;
+use loading_screen::LoadingScreen;
 
 #[cfg(test)]
 const PATTERN_TEST_SAMPLE_LIMIT: usize = 64;
-const LOADING_PREFIX: &str = "Loading";
 
 pub type AppSession = caudra_agent::StoredSession;
 
@@ -310,47 +310,43 @@ pub enum RunOutcome {
     },
 }
 
-/// Paints one frame before the event loop is built, because building it
-/// restores every session it was handed and that is not instant on a large
-/// transcript. Without this the terminal sits on a bare alternate screen with
-/// nothing to say it is working.
-fn draw_loading_screen<B: ratatui::backend::Backend>(
+/// Paints the themed, empty screen the loading card sits on before the event
+/// loop is built, because building it restores every session it was handed
+/// and that is not instant on a large transcript.
+fn draw_backdrop<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
-    message: &str,
-) {
-    let _ = terminal.draw(|frame| {
-        let area = frame.area();
-        let line = Rect {
-            y: area.height / 2,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(
-            Paragraph::new(message).alignment(Alignment::Center).dim(),
-            line,
-        );
-    });
+) -> Option<Buffer> {
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(Block::new().style(theme::current().surface_style()), area);
+            color_compat::downgrade_if_needed(frame.buffer_mut());
+        })
+        .ok()
+        .map(|frame| frame.buffer.clone())
 }
 
-/// Names the session being restored when there is one, since on startup that
-/// is the only thing distinguishing a slow open from a hung one.
-fn loading_message(params: &EventLoopParams) -> String {
-    loading_text(
-        params
-            .sessions
-            .get(params.focused)
-            .map(|tab| tab.session.title.as_str()),
-    )
-}
-
-fn loading_text(title: Option<&str>) -> String {
-    match title.map(str::trim).filter(|title| !title.is_empty()) {
-        Some(title) => format!("{LOADING_PREFIX} {title}"),
-        None => LOADING_PREFIX.to_owned(),
+/// A fresh session restores nothing, so it gets the backdrop alone.
+fn startup_loading(params: &EventLoopParams, backdrop: Option<&Buffer>) -> LoadingScreen {
+    let default_mode = params.ui_config.default_mode;
+    match backdrop {
+        Some(screen)
+            if params
+                .sessions
+                .iter()
+                .any(|tab| app::session_has_content(&tab.session, default_mode)) =>
+        {
+            let title = params
+                .sessions
+                .get(params.focused)
+                .map_or("", |tab| tab.session.title.as_str());
+            LoadingScreen::show(screen, title)
+        }
+        _ => LoadingScreen::idle(),
     }
 }
 
-pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
+pub fn run(mut params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let initial_prompt = if params.launch_autopilot {
         initial_prompt.map(app::autopilot::launch_prompt)
     } else {
@@ -371,8 +367,13 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         let terminal_ms = lap();
         color_compat::init();
         let color_compat_ms = lap();
-        draw_loading_screen(&mut terminal, &loading_message(&params));
-        let el = event_loop::EventLoop::new(&mut terminal, params)?;
+        // Before the first frame, so the backdrop and the card wear the theme
+        // the session will, and before the input reader that would eat the
+        // background probe's reply.
+        let auto_theme = event_loop::start_theme(&params.ui_config, &mut params.startup_warnings);
+        let backdrop = draw_backdrop(&mut terminal);
+        let loading = startup_loading(&params, backdrop.as_ref());
+        let el = event_loop::EventLoop::new(&mut terminal, params, auto_theme, loading)?;
         tracing::info!(
             terminal_ms,
             color_compat_ms,
@@ -451,39 +452,4 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             }
         }
     })
-}
-
-#[cfg(test)]
-mod loading_screen_tests {
-    use super::{draw_loading_screen, loading_text};
-
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use test_case::test_case;
-
-    const FRAME_SHOWS_MESSAGE: &str = "the frame drawn before the event loop must show the message";
-    const SESSION_TITLE: &str = "Add echo to allowed tool calls";
-
-    #[test_case(Some(SESSION_TITLE), "Loading Add echo to allowed tool calls"; "a titled session is named")]
-    #[test_case(Some("  "), "Loading"; "a blank title is dropped")]
-    #[test_case(None, "Loading"; "a session without a title still reports work")]
-    fn loading_text_names_the_session(title: Option<&str>, expected: &str) {
-        assert_eq!(loading_text(title), expected);
-    }
-
-    #[test]
-    fn the_loading_frame_reaches_the_buffer() {
-        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
-
-        draw_loading_screen(&mut terminal, &loading_text(None));
-
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(rendered.contains("Loading"), "{FRAME_SHOWS_MESSAGE}");
-    }
 }
