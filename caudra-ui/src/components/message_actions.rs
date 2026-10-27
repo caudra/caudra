@@ -22,6 +22,7 @@ const WIDTH_PERCENT: u16 = 38;
 const DETAIL_INDENT: &str = "  ";
 const DETAIL_SEPARATOR: &str = " · ";
 const DATE_FORMAT: &str = "%Y-%m-%d ";
+const THINKING_PREFIX: &str = "thinking ";
 pub(crate) const ACTIONS_MAIN_CHAT_ONLY: &str = "Fork and revert work from the main chat";
 pub(crate) const ACTIONS_AFTER_SAVE: &str = "Fork and revert open once this turn is saved";
 
@@ -72,12 +73,13 @@ pub enum Offer<'a> {
 }
 
 /// When the message was made, with its date unless that is `now`'s, then the
-/// usage of the request its card closed.
-pub(crate) fn details_line(
+/// usage of the request its card closed; under it, the model that wrote it
+/// and at what level. A line with nothing known is left out.
+pub(crate) fn details_lines(
     details: &MessageDetails,
     clock: ClockFormat,
     now: Timestamp,
-) -> Option<Line<'static>> {
+) -> Option<Vec<Line<'static>>> {
     let theme = theme::current();
     let zone = TimeZone::system();
     let time = details.created.map(|created| {
@@ -97,13 +99,31 @@ pub(crate) fn details_line(
         .usage
         .clone()
         .map(|usage| Span::styled(usage, theme.tool_dim));
-    let indent = Span::raw(DETAIL_INDENT);
-    let spans: Vec<Span<'static>> = match (time, usage) {
-        (None, None) => return None,
-        (Some(time), Some(usage)) => vec![indent, time, Span::raw(DETAIL_SEPARATOR), usage],
-        (Some(only), None) | (None, Some(only)) => vec![indent, only],
-    };
-    Some(Line::from(spans))
+    let model = details
+        .producer
+        .as_ref()
+        .map(|producer| Span::styled(producer.model.clone(), theme.timestamp));
+    let thinking = details
+        .producer
+        .as_ref()
+        .and_then(|producer| producer.thinking.as_ref())
+        .map(|level| Span::styled(format!("{THINKING_PREFIX}{level}"), theme.tool_dim));
+    let lines: Vec<Line<'static>> = [detail_line([time, usage]), detail_line([model, thinking])]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn detail_line(parts: [Option<Span<'static>>; 2]) -> Option<Line<'static>> {
+    let mut spans = vec![Span::raw(DETAIL_INDENT)];
+    for part in parts.into_iter().flatten() {
+        if spans.len() > 1 {
+            spans.push(Span::raw(DETAIL_SEPARATOR));
+        }
+        spans.push(part);
+    }
+    (spans.len() > 1).then(|| Line::from(spans))
 }
 
 pub struct MessageActions {
@@ -121,8 +141,8 @@ impl MessageActions {
         }
     }
 
-    pub fn open(&mut self, offer: Offer, details: Option<Line<'static>>) {
-        self.picker.set_info_lines(details.map(|line| vec![line]));
+    pub fn open(&mut self, offer: Offer, details: Option<Vec<Line<'static>>>) {
+        self.picker.set_info_lines(details);
         let (source, pending_revert, files_withheld) = match offer {
             Offer::Actions {
                 source,
@@ -264,6 +284,7 @@ impl Overlay for MessageActions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::producer::Producer;
     use caudra_storage::id::CaudraId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use jiff::ToSpan;
@@ -291,6 +312,8 @@ mod tests {
     const WITHHELD: &str = "No recorded file changes after this message";
     const USAGE: &str = "135.9k↑ 872↓ $0.055";
     const CREATED_MS: i64 = 1_790_000_000_000;
+    const MODEL: &str = "anthropic/claude-opus-5-5";
+    const LEVEL: &str = "high";
     const DAY_HOURS: i64 = 24;
 
     #[test]
@@ -345,58 +368,83 @@ mod tests {
         Timestamp::from_millisecond(CREATED_MS).unwrap()
     }
 
-    fn details(created: bool, usage: bool) -> MessageDetails {
+    fn details(created: bool, usage: bool, producer: Option<Option<&str>>) -> MessageDetails {
         MessageDetails {
             created: created.then(self::created),
+            producer: producer.map(|thinking| Producer {
+                model: MODEL.into(),
+                thinking: thinking.map(str::to_owned),
+            }),
             usage: usage.then(|| USAGE.to_owned()),
         }
     }
 
-    fn line_text(line: &Line) -> String {
-        line.spans
+    fn lines_text(lines: &[Line]) -> Vec<String> {
+        lines
             .iter()
-            .map(|span| span.content.as_ref())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect()
     }
 
-    #[test_case(true, true ; "time_then_usage")]
-    #[test_case(true, false ; "time_alone")]
-    #[test_case(false, true ; "usage_alone")]
-    #[test_case(false, false ; "nothing_says_nothing")]
-    fn the_details_line_reads_time_then_usage(created: bool, usage: bool) {
+    #[test_case(true, true, None, &["{time} · {usage}"] ; "time_then_usage")]
+    #[test_case(true, false, None, &["{time}"] ; "time_alone")]
+    #[test_case(false, true, None, &["{usage}"] ; "usage_alone")]
+    #[test_case(false, false, None, &[] ; "nothing_says_nothing")]
+    #[test_case(true, true, Some(Some(LEVEL)), &["{time} · {usage}", "{model} · thinking {level}"] ; "model_and_level_under_the_time")]
+    #[test_case(true, false, Some(None), &["{time}", "{model}"] ; "model_without_a_recorded_level")]
+    #[test_case(false, false, Some(Some(LEVEL)), &["{model} · thinking {level}"] ; "model_alone")]
+    fn the_details_read_time_and_usage_then_the_model(
+        created: bool,
+        usage: bool,
+        producer: Option<Option<&str>>,
+        expected: &[&str],
+    ) {
         let now = self::created();
         let time = now
             .to_zoned(TimeZone::system())
             .strftime(crate::clock::hms(ClockFormat::Hour24))
             .to_string();
-        let expected = match (created, usage) {
-            (true, true) => Some(format!("{time}{DETAIL_SEPARATOR}{USAGE}")),
-            (true, false) => Some(time),
-            (false, true) => Some(USAGE.to_owned()),
-            (false, false) => None,
-        }
-        .map(|text| format!("{DETAIL_INDENT}{text}"));
-        let line = details_line(&details(created, usage), ClockFormat::Hour24, now);
-        assert_eq!(line.as_ref().map(line_text), expected);
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|line| {
+                let text = line
+                    .replace("{time}", &time)
+                    .replace("{usage}", USAGE)
+                    .replace("{model}", MODEL)
+                    .replace("{level}", LEVEL)
+                    .replace(" · ", DETAIL_SEPARATOR);
+                format!("{DETAIL_INDENT}{text}")
+            })
+            .collect();
+        let lines = details_lines(&details(created, usage, producer), ClockFormat::Hour24, now);
+        assert_eq!(
+            lines.as_deref().map(lines_text).unwrap_or_default(),
+            expected
+        );
     }
 
     #[test_case(0, false ; "today_is_only_the_time")]
     #[test_case(2 * DAY_HOURS, true ; "another_day_names_its_date")]
     fn the_date_shows_only_when_it_is_not_today(hours_later: i64, dated: bool) {
         let now = created().checked_add(hours_later.hours()).unwrap();
-        let line = details_line(&details(true, false), ClockFormat::Hour24, now).unwrap();
+        let lines = details_lines(&details(true, false, None), ClockFormat::Hour24, now).unwrap();
         let date = created()
             .to_zoned(TimeZone::system())
             .strftime("%Y-%m-%d")
             .to_string();
-        assert_eq!(line_text(&line).contains(&date), dated);
+        assert_eq!(lines_text(&lines)[0].contains(&date), dated);
     }
 
     #[test]
     fn opening_without_details_clears_the_last_ones() {
         let mut actions = MessageActions::new();
         let source = DisplaySource::User(CaudraId::generate());
-        let line = details_line(&details(false, true), ClockFormat::Hour24, created());
+        let line = details_lines(&details(false, true, None), ClockFormat::Hour24, created());
         actions.open(offer(source, false, None), line);
         assert_eq!(
             actions.picker.info_text(),
@@ -410,7 +458,7 @@ mod tests {
     #[test]
     fn nothing_to_offer_opens_on_the_reason() {
         let mut actions = MessageActions::new();
-        let line = details_line(&details(false, true), ClockFormat::Hour24, created());
+        let line = details_lines(&details(false, true, None), ClockFormat::Hour24, created());
         actions.open(Offer::Nothing(ACTIONS_MAIN_CHAT_ONLY), line);
 
         assert!(actions.is_open());

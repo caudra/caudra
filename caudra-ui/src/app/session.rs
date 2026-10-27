@@ -686,6 +686,7 @@ impl App {
         self.chat_index.clear();
         self.subagent_answers.clear();
         self.subagent_steers.clear();
+        self.subagent_controls.clear();
         self.pending_subagent_steers.clear();
         self.subagent_replacements.clear();
         self.unsent_subagent_steers.clear();

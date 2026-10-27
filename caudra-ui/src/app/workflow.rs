@@ -1615,6 +1615,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             }),
             run_id: WORKFLOW_EVENT_RUN_ID,
             workflow: Some(WorkflowProvenance {

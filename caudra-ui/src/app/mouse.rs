@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use crate::agent::AgentCommand;
 use crate::components::audit_log::PanelTab;
 use crate::components::command::ChatScope;
 use crate::components::document_view::COPIED_SELECTION;
@@ -1384,12 +1383,11 @@ impl App {
             StatusBarHitTarget::Mode if !self.is_bash_input() => self.toggle_mode(),
             StatusBarHitTarget::Model => {
                 self.clear_control_hovers();
-                self.run_builtin(caudra_lua::BuiltinAction::ModelPicker)
+                self.open_model_picker_here()
             }
-            StatusBarHitTarget::Thinking if self.state.model.supports_thinking() => {
+            StatusBarHitTarget::Thinking => {
                 self.clear_control_hovers();
-                self.thinking_picker
-                    .open(&self.state.model, &self.state.thinking);
+                self.open_thinking_picker_here();
                 Vec::new()
             }
             StatusBarHitTarget::Goal => {
@@ -1494,10 +1492,7 @@ impl App {
             // "retrying in 0s" reads like the click missed.
             StatusBarHitTarget::Retry => {
                 self.clear_control_hovers();
-                self.active_chat().clear_retry();
-                if let Some(cmd_tx) = &self.cmd_tx {
-                    let _ = cmd_tx.try_send(AgentCommand::RetryNow);
-                }
+                self.retry_here();
                 Vec::new()
             }
             // Stands in for the first folded control, which goes through the

@@ -1594,6 +1594,7 @@ mod tests {
                 provider: model.provider.to_string(),
                 model: OTHER_MODEL.into(),
                 transport: Default::default(),
+                thinking: None,
             });
         } else {
             boundary.is_compaction_summary = true;

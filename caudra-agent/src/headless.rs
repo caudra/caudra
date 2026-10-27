@@ -10307,6 +10307,7 @@ complete(#{ report: first.output });
             fast: false,
             answer_tx: None,
             steer_tx: None,
+            control: None,
         }
     }
 

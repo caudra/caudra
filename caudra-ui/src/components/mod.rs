@@ -57,6 +57,7 @@ pub(crate) mod permission_prompt;
 pub(crate) mod permission_scope;
 pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
+pub(crate) mod producer;
 pub(crate) mod progress_bar;
 pub(crate) mod projection_modal;
 pub(crate) mod prompt_profile_picker;
@@ -146,6 +147,7 @@ use card_decisions::CardDecision;
 use keybindings::{Bind, key};
 use modal::FooterHits;
 use peer_manager::SubscriptionChange;
+use producer::Producer;
 use worktree_picker::WorktreeView;
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -1151,6 +1153,13 @@ pub enum Action {
     ChangeRemoteWorkingDirectory(caudra_workspace::DirectoryNavigation),
     RemoteControl(String),
     ChangeModel(String),
+    /// Moves one task, running or stopped, to another model.
+    SwitchTaskModel {
+        task_id: String,
+        spec: String,
+    },
+    /// The main run's requests now go to the model a pick made mid-run.
+    AdoptLiveSwitch(String),
     CompleteProviderSetup(String),
     ChangeSystemPromptProfile(String),
     RefreshProvider {
@@ -1435,6 +1444,9 @@ pub struct DisplayMessage {
     /// When the message was made: stamped as it reaches the transcript, or
     /// read from its history id on restore.
     pub created: Option<Timestamp>,
+    /// Which model wrote the message, at what level. Absent on a row no
+    /// model wrote and on one saved before the stamp was recorded.
+    pub producer: Option<Producer>,
     /// The usage and cost of the model request this card closed.
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
@@ -1526,6 +1538,7 @@ impl DisplayMessage {
             progress: None,
             plan_path: None,
             created: None,
+            producer: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
@@ -1556,6 +1569,7 @@ impl DisplayMessage {
             progress: None,
             plan_path: Some(plan_path),
             created: None,
+            producer: None,
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
