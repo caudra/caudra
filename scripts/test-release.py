@@ -1255,7 +1255,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         commands = (
             "cargo fetch --locked --manifest-path Cargo.toml",
             'cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"',
-            "cargo build --locked --release --package caudra --target ${{ matrix.target }}",
+            (
+                "cargo build --locked --release -p caudra -p caudra-workcell "
+                "--bin caudra --bin embedded-worker-smoke --target ${{ matrix.target }}"
+            ),
             "python3 scripts/build-attribution.py \\",
         )
         for job in ("build-linux", "build-other"):
@@ -1405,18 +1408,50 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses", "".join(jobs.values())
         )
 
-    def test_release_executes_only_the_dedicated_worker_smoke_target(self):
+    def test_release_builds_worker_smoke_with_the_application_and_executes_it_directly(
+        self,
+    ):
         _, jobs = self.workflow("release")
         for name in ("build-linux", "build-other"):
             with self.subTest(job=name):
                 body = jobs[name]
-                self.assertEqual(body.count("--test embedded_worker"), 2)
-                self.assertIn("--test embedded_worker --no-run --timings", body)
+                self.assertEqual(body.count("cargo build "), 1)
                 self.assertIn(
-                    "time-command.py smoke-execute cargo test --locked --release", body
+                    "cargo build --locked --release -p caudra -p caudra-workcell "
+                    "--bin caudra --bin embedded-worker-smoke "
+                    "--target ${{ matrix.target }} --timings",
+                    body,
                 )
-                self.assertNotIn("caudra-workcell production_host_executes", body)
+                self.assertEqual(body.count("time-command.py smoke-execute "), 1)
+                for forbidden in (
+                    "cargo test",
+                    "cargo nextest",
+                    "smoke-build",
+                    "--features",
+                    "test-support",
+                ):
+                    self.assertNotIn(forbidden, body)
+                for step in re.split(r"(?m)^      - ", body):
+                    if step.startswith("name: Package"):
+                        self.assertNotIn("embedded-worker-smoke", step)
+                        self.assertNotIn("$smoke", step)
                 self.assertIn("path: target/cargo-timings/", body)
+        self.assertIn(
+            "time-command.py smoke-execute "
+            "target/${{ matrix.target }}/release/embedded-worker-smoke",
+            jobs["build-linux"],
+        )
+        self.assertRegex(
+            jobs["build-other"],
+            r'if \[\[ "\$\{\{ runner.os \}\}" == "Windows" \]\]; then\n'
+            r'            binary="[^"\n]+/caudra.exe"\n'
+            r'            smoke="target/\$\{\{ matrix.target \}\}/release/embedded-worker-smoke.exe"',
+        )
+        self.assertIn(
+            'smoke="target/${{ matrix.target }}/release/embedded-worker-smoke"',
+            jobs["build-other"],
+        )
+        self.assertIn('time-command.py smoke-execute "$smoke"', jobs["build-other"])
         self.assertIn('WORKCELL_REQUIRE_CODE_WORKER: "1"', self.workflow("release")[0])
 
     def test_musl_cache_keeps_worker_identity_and_source_without_build_targets(self):
@@ -1461,6 +1496,37 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("runner: ubuntu-24.04-arm\n", jobs["warm"])
         self.assertNotIn("vars.CAUDRA_RUNNER_PROFILE", jobs["warm"])
         self.assertNotIn("cargo build", jobs["warm"])
+
+    def test_intel_warmer_uses_the_release_cache_from_trusted_main(self):
+        header, jobs = self.workflow("worker-cache")
+        warmer = jobs["warm-intel"]
+        self.assertIn(
+            "github.repository == 'caudra/caudra' && github.ref == 'refs/heads/main'",
+            warmer,
+        )
+        runners = runpy.run_path(str(WORKFLOWS.parent.parent / "scripts/ci-runners.py"))
+        self.assertIn(f"runs-on: {runners['GITHUB']['macos_x64']}", warmer)
+        self.assertIn("ref: ${{ github.sha }}", warmer)
+        self.assertIn("persist-credentials: false", warmer)
+        self.assertIn("CAUDRA_RUNNER_PROFILE: github", warmer)
+        self.assertIn('timing: "true"', warmer)
+        steps = (
+            "uses: actions/setup-python@v7",
+            'python-version: "3.15.1"',
+            "run: rustup show",
+            "uses: ./.github/actions/code-worker",
+        )
+        positions = [warmer.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        for trigger in (
+            '"rust-toolchain.toml"',
+            '"scripts/build-code-worker.py"',
+            '".cargo/**"',
+            '".github/actions/code-worker/**"',
+        ):
+            self.assertIn(trigger, header)
+        self.assertNotIn("cargo build", warmer)
+        self.assertNotIn("pull_request", header)
 
     def test_worker_identity_reuses_hosts_but_separates_flags_toolchains_and_paths(
         self,
