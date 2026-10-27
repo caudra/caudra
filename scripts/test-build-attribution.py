@@ -1384,6 +1384,44 @@ class AttributionTests(unittest.TestCase):
                 )
                 self.assertEqual(attribution.digest(data), entry["sha256"])
 
+    def test_locked_clipboard_supplement_supplies_missing_bsl_text(self):
+        repository = Path(__file__).resolve().parent.parent
+        locked = tomllib.loads((repository / "Cargo.lock").read_text())
+        dependency = next(p for p in locked["package"] if p["name"] == "clipboard-win")
+        policy = attribution.load_policy(repository)
+        key = dependency["name"] + "@" + dependency["version"]
+        supplement = policy["packages"][key]
+        package = self.package("clipboard-win", "BSL-1.0")
+        package.update(
+            version=dependency["version"],
+            source=dependency["source"],
+            checksum=dependency["checksum"],
+        )
+        vcs_path = Path(package["manifest_path"]).parent / ".cargo_vcs_info.json"
+        vcs_path.write_text(json.dumps(supplement["provenance"]["cargo_vcs_info"]))
+        with self.assertRaisesRegex(
+            attribution.AttributionError, "Missing license texts"
+        ):
+            attribution.package_licenses(package, repository, {})
+        found, expression, chosen = attribution.package_licenses(
+            package, repository, policy
+        )
+        self.assertEqual(expression, "BSL-1.0")
+        self.assertEqual(chosen, ["BSL-1.0"])
+        self.assertEqual([name for _, name in found], supplement["required_files"])
+        for field, value, error in (
+            ("version", "unreviewed", "Missing license texts"),
+            ("checksum", "changed", "package checksum mismatch"),
+            ("license", "MIT", "declared-license mismatch"),
+        ):
+            with self.subTest(field=field):
+                changed = {**package, field: value}
+                with self.assertRaisesRegex(attribution.AttributionError, error):
+                    attribution.package_licenses(changed, repository, policy)
+        vcs_path.write_text(json.dumps({"git": {"sha1": "changed"}, "path_in_vcs": ""}))
+        with self.assertRaisesRegex(attribution.AttributionError, "revision mismatch"):
+            attribution.package_licenses(package, repository, policy)
+
     def test_supplement_rejects_changed_line_endings(self):
         package = self.package()
         license_path = self.root / "supplement.txt"

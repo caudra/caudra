@@ -18,6 +18,38 @@
     "THIRD_PARTY_LICENSES/additional/provenance.json"
   ],
   "packages": {
+    "clipboard-win@5.4.3": {
+      "reason": "The published include list omits LICENSE. Preserve the complete BSL-1.0 text verbatim from the crate's exact reported upstream revision; do not infer copyright ownership from author metadata.",
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a",
+        "declared_license": "BSL-1.0",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/dependencies/clipboard-win-5.4.3/LICENSE",
+          "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/dependencies/clipboard-win-5.4.3/LICENSE"
+      ],
+      "review_evidence": {
+        "repository": "https://github.com/DoumanAsh/clipboard-win",
+        "upstream_revision": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
+        "upstream_path": "LICENSE",
+        "git_blob_sha1": "36b7cd93cdfbac762f5be4c6ce276df2ea6305c2",
+        "manifest_git_blob_sha1": "3963175b9ce365b689f87ee60e0f447685f82780",
+        "manifest_sha256": "e805923f16aa563f35e0d9999527d20224cbb5dceb82dd0bc8f0401771e512e4",
+        "verification": "The published archive SHA-256 matches Cargo.lock and all 17 extracted files match the archive. Cargo.toml.orig, README.md and all packaged Rust files match the exact upstream revision. LICENSE is the only upstream legal file; no separate NOTICE or copyright notice was found in the pinned repository or published source."
+      }
+    },
     "caudra-highlight@0.2.0-preview.15": {
       "expression": "Apache-2.0 AND MIT AND MPL-2.0",
       "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. The TLA+, PlusCal and TLC config grammars converted from vscode-tlaplus remain MIT; preserve its upstream license. This aggregate expression does not relicense individual files.",
