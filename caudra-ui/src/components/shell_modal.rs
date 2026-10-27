@@ -543,6 +543,12 @@ impl ShellModal {
         self.map_action(action, &search)
     }
 
+    pub(crate) fn bar_claims(&self, event: &MouseEvent) -> bool {
+        self.page
+            .as_ref()
+            .is_some_and(|page| page.scrollbar.claims(event))
+    }
+
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ShellModalAction {
         if let Some(page) = &mut self.page {
             match page.scrollbar.handle(&event) {

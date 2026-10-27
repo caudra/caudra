@@ -42,6 +42,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Fixes
 
+- **Shell output scrollbars do not select text.** Clicking or dragging the scrollbar in shell command details now scrolls output without selecting adjacent text.
 - **Shell ETAs respect literal sleeps.** A command such as `sleep 30` now gets its ETA from the requested duration, even without past runs. Consecutive sleeps add up. For a supported chain such as `sleep 30 && make build`, the ETA adds 30 seconds to the model's estimate for `make build` alone. If the remaining work has no reliable numerical estimate, the card shows `at least 30s`. Conditional sleeps and polling loops still use the learned model, and the rule does not change timeouts or background delivery.
 - **Decision usage names its provider.** New decision calls appear under their configured endpoint, such as `openai`, in session and lifetime usage, including when you resume an older session. Their purpose stays `decision`, and an unknown decision price stays unknown rather than borrowing chat rates. Previously recorded usage keeps its old attribution because the original endpoint was not saved with those totals.
 - **Stable colors while patches stream.** Patch previews keep their addition and removal colors without syntax highlighting until the tool finishes, avoiding repeated recoloring as text arrives.

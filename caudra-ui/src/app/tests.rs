@@ -21795,6 +21795,202 @@ fn dragging_picker_row_keeps_overlay_text_selection() {
     ));
 }
 
+mod shell_details_scrollbar {
+    use super::{App, Msg, TEST_AREA, buffer_text, test_app};
+    use crate::components::shell_modal::{ShellInputs, ShellModalAction};
+    use crate::selection::{SelectionState, SelectionZone};
+    use caudra_agent::ToolOutput;
+    use caudra_agent::background::{ShellOutputView, ShellSnapshot, ShellView};
+    use caudra_storage::shell_history::{
+        ShellExecutionOwner, ShellExecutionRecord, ShellExecutionState,
+    };
+    use caudra_workbench::scroll::SCROLLBAR_THUMB;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use test_case::test_case;
+
+    const EXECUTION_ID: &str = "scrollbar-execution";
+    const COMMAND: &str = "cargo test";
+    const WORKDIR: &str = ".";
+    const OUTPUT_PREFIX: &str = "shell-output";
+    const OUTPUT_ROWS: usize = 100;
+    const STARTED_MS: u64 = 1_000;
+    const FINISHED_MS: u64 = 2_000;
+    const DRAG_ROWS: u16 = 2;
+    const SELECTION_COLUMNS: u16 = 5;
+    const MISSING_TEXT: &str = "the shell details fixture must render its text and scrollbar";
+    const NO_SELECTION: &str = "a scrollbar gesture must not start or retain text selection";
+    const BODY_SELECTED: &str = "a body text drag must still schedule an overlay selection copy";
+    const OUTPUT_MOVED: &str = "dragging or clicking below the thumb must advance shell output";
+
+    fn draw(app: &mut App) -> Buffer {
+        let mut terminal =
+            Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn locate(buffer: &Buffer, text: &str) -> Position {
+        let glyphs: Vec<_> = text.chars().map(String::from).collect();
+        (buffer.area.top()..buffer.area.bottom())
+            .find_map(|row| {
+                let cells: Vec<_> = (buffer.area.left()..buffer.area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                cells
+                    .windows(glyphs.len())
+                    .position(|cells| cells == glyphs.as_slice())
+                    .map(|column| Position::new(buffer.area.left() + column as u16, row))
+            })
+            .expect(MISSING_TEXT)
+    }
+
+    fn first_output(buffer: &Buffer) -> usize {
+        buffer_text(buffer)
+            .lines()
+            .find_map(|line| line.split_once(OUTPUT_PREFIX))
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .expect(MISSING_TEXT)
+            .parse()
+            .unwrap()
+    }
+
+    fn opened() -> (App, Buffer) {
+        let mut app = test_app();
+        let output = (0..OUTPUT_ROWS)
+            .map(|index| format!("{OUTPUT_PREFIX} {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.shell_modal.open(ShellInputs {
+            snapshot: Some(Arc::new(ShellSnapshot {
+                executions: vec![Arc::new(ShellView {
+                    record: ShellExecutionRecord {
+                        execution_id: EXECUTION_ID.into(),
+                        owner: ShellExecutionOwner::default(),
+                        call_id: EXECUTION_ID.into(),
+                        command: COMMAND.into(),
+                        command_truncated: false,
+                        workdir: WORKDIR.into(),
+                        remote: Some(false),
+                        timeout_ms: None,
+                        created_at_ms: STARTED_MS,
+                        finished_at_ms: Some(FINISHED_MS),
+                        state: ShellExecutionState::Succeeded,
+                        started: true,
+                        reason: None,
+                        eta: None,
+                    },
+                    output: ShellOutputView::Kept(Arc::new(ToolOutput::Plain(output.into()))),
+                    history_error: None,
+                })],
+                jobs: BTreeMap::new(),
+            })),
+            cards: Vec::new(),
+        });
+        assert!(matches!(
+            app.shell_modal.show(EXECUTION_ID),
+            Some(ShellModalAction::Consumed)
+        ));
+        let buffer = draw(&mut app);
+        (app, buffer)
+    }
+
+    fn event(kind: MouseEventKind, at: Position) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn send(app: &mut App, kind: MouseEventKind, at: Position) {
+        assert!(app.update(Msg::Mouse(event(kind, at))).is_empty());
+    }
+
+    fn select_body(app: &mut App, at: Position) {
+        let end = Position::new(at.x + SELECTION_COLUMNS, at.y);
+        send(app, MouseEventKind::Down(MouseButton::Left), at);
+        send(app, MouseEventKind::Drag(MouseButton::Left), end);
+        assert!(matches!(
+            app.selection_state,
+            Some(SelectionState::Dragging { .. })
+        ));
+        send(app, MouseEventKind::Up(MouseButton::Left), end);
+        let Some(SelectionState::PendingCopy { sel }) = &app.selection_state else {
+            panic!("{BODY_SELECTED}");
+        };
+        assert_eq!(sel.zone, SelectionZone::Overlay);
+    }
+
+    #[test_case(false ; "without_selection")]
+    #[test_case(true ; "clears_pending_selection")]
+    fn track_click_scrolls_without_selecting(preselected: bool) {
+        let (mut app, buffer) = opened();
+        let thumb = locate(&buffer, SCROLLBAR_THUMB);
+        let track = (thumb.y..buffer.area.bottom())
+            .rev()
+            .map(|row| Position::new(thumb.x, row))
+            .find(|at| {
+                app.shell_modal
+                    .bar_claims(&event(MouseEventKind::Down(MouseButton::Left), *at))
+            })
+            .expect(MISSING_TEXT);
+        let before = first_output(&buffer);
+        if preselected {
+            select_body(&mut app, locate(&buffer, OUTPUT_PREFIX));
+        }
+
+        send(&mut app, MouseEventKind::Down(MouseButton::Left), track);
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        assert!(first_output(&draw(&mut app)) > before, "{OUTPUT_MOVED}");
+        send(&mut app, MouseEventKind::Up(MouseButton::Left), track);
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        assert!(app.shell_modal.is_open());
+    }
+
+    #[test_case(false ; "release_in_body")]
+    #[test_case(true ; "release_outside_modal")]
+    fn thumb_drag_owns_motion_into_body_until_release(outside_modal: bool) {
+        let (mut app, buffer) = opened();
+        let thumb = locate(&buffer, SCROLLBAR_THUMB);
+        let body = locate(&buffer, OUTPUT_PREFIX);
+        let down = Position::new(thumb.x, thumb.y + DRAG_ROWS);
+        let left = Position::new(body.x, down.y + 1);
+        let before = first_output(&buffer);
+
+        send(&mut app, MouseEventKind::Down(MouseButton::Left), thumb);
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        send(&mut app, MouseEventKind::Drag(MouseButton::Left), down);
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        let after_down = first_output(&draw(&mut app));
+        assert!(after_down > before, "{OUTPUT_MOVED}");
+        send(&mut app, MouseEventKind::Drag(MouseButton::Left), left);
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        assert!(first_output(&draw(&mut app)) > after_down, "{OUTPUT_MOVED}");
+
+        let release = if outside_modal {
+            Position::new(TEST_AREA.x, TEST_AREA.y)
+        } else {
+            left
+        };
+        let up = event(MouseEventKind::Up(MouseButton::Left), release);
+        assert!(app.shell_modal.bar_claims(&up));
+        assert!(app.update(Msg::Mouse(up)).is_empty());
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+        assert!(!app.shell_modal.bar_claims(&up));
+        assert!(app.shell_modal.is_open());
+
+        let buffer = draw(&mut app);
+        select_body(&mut app, locate(&buffer, OUTPUT_PREFIX));
+    }
+}
+
 fn streaming_app_with_history() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;

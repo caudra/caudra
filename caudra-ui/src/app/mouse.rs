@@ -404,6 +404,12 @@ impl App {
                 return actions;
             }
         } else if self.shell_modal.is_open() {
+            if self.shell_modal.bar_claims(&event) {
+                self.clear_control_hovers();
+                self.selection_state = None;
+                let action = self.shell_modal.handle_mouse(event);
+                return self.handle_shell_modal_action(action);
+            }
             if let Some(actions) = self.route_overlay_mouse(
                 event,
                 |app, event| app.shell_modal.handle_mouse(event),
