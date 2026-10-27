@@ -79,7 +79,8 @@ use caudra_agent::{
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, PDF_DATA_URL_PREFIX, PatchedFile, SearchCap,
     SharedBuf, ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput,
-    SnapshotLine, SourceCodeGraphRow, TextOutput, TokenScale, ToolInput, ToolOutput,
+    SnapshotLine, SourceCodeGraphRow, TextOutput, TokenScale, ToolInput, ToolOutput, counted,
+    tally,
 };
 use caudra_config::{ShellNativeRedirect, WebConfig, WebNetwork};
 use caudra_storage::StateDir;
@@ -158,6 +159,14 @@ const WEBSEARCH_TOOL: &str = "websearch";
 /// The year a description states when the clock cannot be read.
 const FALLBACK_YEAR: i32 = 2026;
 const REFS_REACHED_UNIT: &str = "reached";
+const FILE_NOUN: &str = "file";
+const MATCH_NOUN: &str = "match";
+const MATCHES_NOUN: &str = "matches";
+const TEST_NOUN: &str = "test";
+const CANDIDATE_NOUN: &str = "candidate";
+const NO_MATCH: &str = "no match";
+const NOTHING_SHOWN: &str = "none";
+const ANNOTATION_SEPARATOR: &str = " \u{b7} ";
 const REFS_DECLINED: &str = "same-name calls declined";
 const CODE_WORKER_WARNING: &str = "The code tool is unavailable";
 const NO_CODE_WORKER_PATH: &str = "no code worker path was supplied";
@@ -2757,12 +2766,17 @@ impl RefsSummary {
     fn annotation(&self) -> String {
         if self.walked() {
             format!(
-                "{} \u{b7} {} tests",
-                shown_of(self.shown, self.total, REFS_REACHED_UNIT),
-                self.tests_reaching.unwrap_or_default()
+                "{}{ANNOTATION_SEPARATOR}{}",
+                shown_of(self.shown, self.total, REFS_REACHED_UNIT, REFS_REACHED_UNIT),
+                counted(self.tests_reaching.unwrap_or_default(), TEST_NOUN)
             )
         } else {
-            shown_of(self.shown, self.total, &self.unit)
+            shown_of(
+                self.shown,
+                self.total,
+                &self.unit,
+                &format!("{}s", self.unit),
+            )
         }
     }
 
@@ -2822,11 +2836,7 @@ fn remote_source_code_graph_result(
                 value,
             ))))
             .with_model_output(Some(model_output))
-            .with_annotation(Some(if candidates == 0 {
-                "no match".into()
-            } else {
-                format!("no match \u{b7} {candidates} candidates")
-            })),
+            .with_annotation(Some(refusal_annotation(candidates))),
         );
     }
     let string = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
@@ -2842,8 +2852,13 @@ fn remote_source_code_graph_result(
             ),
             graph_rows(&value["results"], None)?,
             format!(
-                "{} \u{b7} {} confidence",
-                shown_of(usize_value("shown"), usize_value("totalMatched"), "matches"),
+                "{}{ANNOTATION_SEPARATOR}{} confidence",
+                shown_of(
+                    usize_value("shown"),
+                    usize_value("totalMatched"),
+                    MATCH_NOUN,
+                    MATCHES_NOUN
+                ),
                 string("confidence")
             ),
         ),
@@ -3267,8 +3282,8 @@ impl WorkcellInvocation {
                     Ok(Ok(mut output)) => {
                         let reordered = rerank_context_rows(ctx, &mut output).await;
                         let annotation = format!(
-                            "{} \u{b7} {} confidence",
-                            shown_of(output.shown, output.total_matched, "matches"),
+                            "{}{ANNOTATION_SEPARATOR}{} confidence",
+                            shown_of(output.shown, output.total_matched, MATCH_NOUN, MATCHES_NOUN),
                             output.confidence
                         );
                         let headline = format!(
@@ -3989,9 +4004,9 @@ fn file_glob_result(output: FileGlobOutput, scale: TokenScale) -> ToolExecResult
 /// `count` is the window, `total` what matched. A scan that stopped early knows
 /// neither exactly, so it says so rather than quoting a total as if it were one.
 fn glob_annotation(output: &FileGlobOutput) -> String {
-    let files = if output.count == 1 { "file" } else { "files" };
+    let files = counted(output.count, FILE_NOUN);
     if !output.truncated {
-        return format!("{} {files}", output.count);
+        return files;
     }
     if output.scan_complete {
         return format!("{} of {} files", output.count, output.total);
@@ -3999,7 +4014,7 @@ fn glob_annotation(output: &FileGlobOutput) -> String {
     if output.total > output.count {
         return format!("{} of at least {} files", output.count, output.total);
     }
-    format!("{} {files}, scan capped", output.count)
+    format!("{files}, scan capped")
 }
 
 fn file_grep_result(output: FileGrepOutput) -> ToolExecResult {
@@ -4473,11 +4488,17 @@ fn selector_refusal_result(refusal: &SelectorRefusal) -> ToolExecResult {
         state,
     ))))
     .with_model_output(Some(exact))
-    .with_annotation(Some(if candidates == 0 {
-        "no match".to_owned()
-    } else {
-        format!("no match \u{b7} {candidates} candidates")
-    }))
+    .with_annotation(Some(refusal_annotation(candidates)))
+}
+
+fn refusal_annotation(candidates: usize) -> String {
+    match candidates {
+        0 => NO_MATCH.to_owned(),
+        _ => format!(
+            "{NO_MATCH}{ANNOTATION_SEPARATOR}{}",
+            counted(candidates, CANDIDATE_NOUN)
+        ),
+    }
 }
 
 fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<SourceCodeGraphRow> {
@@ -4530,11 +4551,11 @@ fn graph_footer(output: &impl SourceCodeGraphModelText) -> String {
         .to_owned()
 }
 
-fn shown_of(shown: usize, total: usize, unit: &str) -> String {
-    if total > shown {
-        format!("{shown} of {total} {unit}")
-    } else {
-        format!("{shown} {unit}")
+fn shown_of(shown: usize, total: usize, one: &str, many: &str) -> String {
+    match total {
+        0 => NOTHING_SHOWN.to_owned(),
+        total if total > shown => format!("{shown} of {total} {many}"),
+        _ => tally(shown, one, many),
     }
 }
 
@@ -9546,10 +9567,27 @@ mod tests {
         }
     }
 
+    #[test_case(0, 0, "none"           ; "nothing_matched")]
+    #[test_case(1, 1, "1 match"        ; "one_match_is_singular")]
+    #[test_case(3, 3, "3 matches"      ; "every_match_shown")]
+    #[test_case(2, 9, "2 of 9 matches" ; "a_window_names_the_total")]
+    fn shown_of_counts_what_the_card_shows(shown: usize, total: usize, expected: &str) {
+        assert_eq!(shown_of(shown, total, MATCH_NOUN, MATCHES_NOUN), expected);
+    }
+
+    #[test_case(0, "no match"                 ; "no_candidates")]
+    #[test_case(1, "no match · 1 candidate"   ; "one_candidate_is_singular")]
+    #[test_case(3, "no match · 3 candidates"  ; "several_candidates")]
+    fn a_refusal_counts_its_candidates(candidates: usize, expected: &str) {
+        assert_eq!(refusal_annotation(candidates), expected);
+    }
+
     #[test_case(glob_output(2, 2, true),   "2 files"              ; "complete_scan_reports_what_it_found")]
     #[test_case(glob_output(1, 340, true), "1 of 340 files"       ; "a_result_cap_knows_the_total")]
     #[test_case(glob_output(1, 5, false),  "1 of at least 5 files" ; "an_early_stop_only_has_a_lower_bound")]
-    #[test_case(glob_output(0, 0, false),  "0 files, scan capped" ; "an_early_stop_that_matched_nothing_quotes_no_total")]
+    #[test_case(glob_output(0, 0, false),  "no files, scan capped" ; "an_early_stop_that_matched_nothing_quotes_no_total")]
+    #[test_case(glob_output(0, 0, true),   "no files"             ; "a_complete_scan_that_matched_nothing_says_so")]
+    #[test_case(glob_output(1, 1, true),   "1 file"               ; "one_file_is_singular")]
     fn glob_annotation_distinguishes_a_capped_search_from_a_complete_one(
         output: FileGlobOutput,
         expected: &str,

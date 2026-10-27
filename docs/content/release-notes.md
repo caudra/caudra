@@ -24,6 +24,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 ### Fixes
 
 - **Pictures in batches fold and open.** A `view_image` call inside a batch shows its picture, which opening the row used to leave blank. A `view_image` call is now a row in every view, with its picture open under it outside the compact view, and a click on the row folds or opens it like a `file_read`. See [Images](/docs/markdown/#images).
+- **Tool cards name empty results.** A search that finds nothing reads `no matches` or `no files` rather than `0 matches in 0 files`, an empty file or folder reads `empty`, and a single result is singular, as in `1 match in 1 file` or `1 entry`.
 
 ## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
 
