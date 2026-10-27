@@ -633,7 +633,7 @@ impl EventPump {
             }
 
             let update = match event {
-                AgentEvent::MessageStarted { id } => {
+                AgentEvent::MessageStarted { id, .. } => {
                     reply = Some(MessageCursor::new(id.to_string()));
                     continue;
                 }
@@ -1173,16 +1173,20 @@ mod tests {
 
     /// The live stream of `blocks`, as the agent sends it for message `id`.
     fn streamed_blocks(id: CaudraId, blocks: &[MsgBlock]) -> Vec<AgentEvent> {
-        iter::once(AgentEvent::MessageStarted { id })
-            .chain(blocks.iter().map(|block| match block {
-                MsgBlock::Text { text } => AgentEvent::TextDelta { text: text.clone() },
-                MsgBlock::Thinking { thinking, .. } => AgentEvent::ThinkingDelta {
-                    text: thinking.clone(),
-                },
-                MsgBlock::ToolUse { id, .. } => shell_start(id),
-                _ => panic!("only streamed blocks"),
-            }))
-            .collect()
+        iter::once(AgentEvent::MessageStarted {
+            id,
+            model: String::new(),
+            thinking: None,
+        })
+        .chain(blocks.iter().map(|block| match block {
+            MsgBlock::Text { text } => AgentEvent::TextDelta { text: text.clone() },
+            MsgBlock::Thinking { thinking, .. } => AgentEvent::ThinkingDelta {
+                text: thinking.clone(),
+            },
+            MsgBlock::ToolUse { id, .. } => shell_start(id),
+            _ => panic!("only streamed blocks"),
+        }))
+        .collect()
     }
 
     /// Each chunk as its kind, message id, and text.
@@ -1472,6 +1476,7 @@ mod tests {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             });
             EventPump {
                 pending: Arc::clone(&pending),

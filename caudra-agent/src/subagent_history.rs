@@ -63,6 +63,8 @@ pub enum SubagentHistoryError {
     TaskSpecRequired { task_id: String },
     #[error("subagent task `{task_id}` is a generic session; continue it without task = true")]
     GenericSessionRequired { task_id: String },
+    #[error("subagent task `{task_id}` saved no settings to change; continue it once first")]
+    NoSpec { task_id: String },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -429,6 +431,40 @@ impl SubagentHistoryStore {
         })
     }
 
+    /// Moves a task that is not running to another model or level, so its
+    /// next continuation runs there. Returns the spec it now carries.
+    pub fn retarget(
+        &self,
+        task_id: &str,
+        model: Option<String>,
+        thinking: Option<StoredThinking>,
+    ) -> Result<SubagentTaskSpec, SubagentHistoryError> {
+        let mut state = self.lock();
+        if state.active.contains(task_id) {
+            return Err(SubagentHistoryError::AlreadyActive {
+                task_id: task_id.to_owned(),
+            });
+        }
+        let Some(record) = state.records.get(task_id) else {
+            return Err(SubagentHistoryError::Unknown {
+                task_id: task_id.to_owned(),
+            });
+        };
+        let Some(mut spec) = record.spec.clone() else {
+            return Err(SubagentHistoryError::NoSpec {
+                task_id: task_id.to_owned(),
+            });
+        };
+        spec.retarget(model, thinking);
+        let retargeted = SubagentHistoryRecord {
+            spec: Some(spec.clone()),
+            ..SubagentHistoryRecord::clone(record)
+        };
+        Arc::make_mut(&mut state.records).insert(task_id.to_owned(), Arc::new(retargeted));
+        state.revision += 1;
+        Ok(spec)
+    }
+
     #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
         self.lock().active.len()
@@ -691,6 +727,13 @@ pub struct SubagentHistoryLease {
 }
 
 impl SubagentHistoryLease {
+    /// Carries a pick made while the task ran into the spec it completes with.
+    pub(crate) fn retarget(&mut self, model: Option<String>, thinking: Option<StoredThinking>) {
+        if let Some(spec) = &mut self.spec {
+            spec.retarget(model, thinking);
+        }
+    }
+
     pub(crate) fn with_spec(mut self, spec: SubagentTaskSpec) -> Self {
         self.spec = Some(spec);
         self

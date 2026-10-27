@@ -936,6 +936,16 @@ impl Default for StoredSubagentTaskSpec {
 }
 
 impl StoredSubagentTaskSpec {
+    /// What the user moved the task to. A field left `None` keeps its own.
+    pub fn retarget(&mut self, model: Option<String>, thinking: Option<StoredThinking>) {
+        if model.is_some() {
+            self.model = model;
+        }
+        if thinking.is_some() {
+            self.thinking = thinking;
+        }
+    }
+
     pub fn generic() -> Self {
         Self {
             kind: StoredSubagentKind::Generic,

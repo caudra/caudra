@@ -502,6 +502,7 @@ pub fn run(
             | AgentEvent::MemoryChanged
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::StreamReset
+            | AgentEvent::SettingsChanged { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AuthRestored
             | AgentEvent::PermissionRequest(_)

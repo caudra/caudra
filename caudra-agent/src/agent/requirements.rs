@@ -588,6 +588,7 @@ mod tests {
             retained_output_refs: Vec::new(),
             retained_subagent_ids: Vec::new(),
             is_compaction_summary,
+            source: None,
         })
     }
 

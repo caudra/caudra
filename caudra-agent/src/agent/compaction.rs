@@ -323,6 +323,7 @@ pub async fn prepare_compaction(
                 None,
                 None,
                 &mut StreamRetry::default(),
+                None,
             )
             .await
             {
