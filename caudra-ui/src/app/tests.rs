@@ -5759,7 +5759,7 @@ const FREE_API_AND_SUBSCRIPTION_ON_BAR: &str = "$0 \u{2248}$0.125";
 const DECISIONS_AND_SUBSCRIPTION_ON_BAR: &str = "$0.01 \u{2248}$0.125";
 const SUBSCRIPTION_IN_USAGE: &str = "\u{2248}$0.125";
 const API_IN_USAGE: &str = "$0.500";
-const DECISIONS_AND_SUBSCRIPTION_IN_USAGE: &str = "$0.010  \u{2248}$0.125";
+const DECISIONS_AND_SUBSCRIPTION_IN_USAGE: &str = "$0.010\n\u{2248}$0.125";
 const SPEND_LOST_ON_RESTART: &str = "reopening a session must keep what it recorded spending";
 const SPEND_NOT_ON_SCREEN: &str = "the restored spend must be drawn where it was before";
 const SPEND_NOT_ADDED_ONCE: &str = "a turn after reopening must add to the restored spend once";
@@ -5885,7 +5885,7 @@ fn restart_keeps_the_recorded_spend(turns: &[Spent], on_bar: &str, in_usage: &st
     );
     let screen = usage_screen(&mut app);
     assert!(
-        screen.contains(in_usage),
+        in_usage.lines().all(|amount| screen.contains(amount)),
         "{SPEND_NOT_ON_SCREEN}: {in_usage}\n{screen}"
     );
 

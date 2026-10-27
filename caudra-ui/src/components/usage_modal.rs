@@ -556,15 +556,13 @@ fn build_lines(
     )));
 
     let covered = covered_spend(ctx.subscription_cost);
-    let mut totals = totals_row(ctx.total, theme);
-    totals.extend(spend_spans(
+    lines.extend(spend_lines(
+        totals_row(ctx.total, theme),
         ctx.total_cost,
         covered,
         SESSION_DECIMALS,
         theme,
     ));
-    lines.push(Line::from(totals));
-    lines.extend(subscription_legend(covered, theme));
 
     if let Some(state) = quota {
         lines.push(Line::default());
@@ -797,7 +795,7 @@ fn build_lifetime_lines(
     }
 
     let covered = covered_spend(Some(lifetime.subscription_cost));
-    let mut totals = vec![
+    let totals = vec![
         Span::raw(PREFIX),
         Span::styled(
             format!(
@@ -812,20 +810,17 @@ fn build_lifetime_lines(
             fg,
         ),
     ];
-    totals.extend(spend_spans(
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{PREFIX}All time"),
+        theme.keybind_section,
+    ))];
+    lines.extend(spend_lines(
+        totals,
         Some(lifetime.cost),
         covered,
         LIFETIME_DECIMALS,
         theme,
     ));
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{PREFIX}All time"),
-            theme.keybind_section,
-        )),
-        Line::from(totals),
-    ];
-    lines.extend(subscription_legend(covered, theme));
     if lifetime.ephemeral_cost > 0.0 {
         lines.push(Line::from(Span::styled(
             format!(
@@ -1057,22 +1052,45 @@ fn covered_spend(cost: Option<f64>) -> Option<f64> {
     cost.filter(|cost| *cost > 0.0)
 }
 
-/// The headline's money, billed first and the subscription figure beside it.
-/// Never one sum: the bill is money owed, and a subscription owes none, but a
-/// few cents of billed calls must not hide what the subscription covered.
-fn spend_spans(
+fn spend_lines(
+    totals: Vec<Span<'static>>,
     billed: Option<f64>,
     covered: Option<f64>,
     decimals: usize,
     theme: &Theme,
-) -> Vec<Span<'static>> {
-    let billed = billed.map(|cost| format!("  ${cost:.decimals$}"));
-    let covered = covered.map(|cost| format!("  {NOT_BILLED_MARK}${cost:.decimals$}"));
-    [billed, covered]
+) -> Vec<Line<'static>> {
+    let mut legend = subscription_legend(covered, theme);
+    let billed = billed.map(|cost| format!("${cost:.decimals$}"));
+    let covered = covered.map(|cost| format!("{NOT_BILLED_MARK}${cost:.decimals$}"));
+    let amounts: Vec<_> = [billed, covered]
         .into_iter()
         .flatten()
         .map(|text| Span::styled(text, theme.accent))
-        .collect()
+        .collect();
+    let width = amounts.iter().map(Span::width).max().unwrap_or_default();
+    let mut lines = vec![Line::from(totals)];
+    let offset = lines[0].width().max(
+        legend
+            .as_ref()
+            .filter(|_| amounts.len() == 2)
+            .map_or(0, Line::width),
+    ) + COL_GAP;
+    for (index, amount) in amounts.into_iter().enumerate() {
+        let padding = width - amount.width();
+        if index == 0 {
+            let spacing = offset + padding - lines[0].width();
+            lines[0].spans.push(Span::raw(" ".repeat(spacing)));
+            lines[0].spans.push(amount);
+        } else {
+            let mut line = legend.take().unwrap_or_default();
+            line.spans
+                .push(Span::raw(" ".repeat(offset + padding - line.width())));
+            line.spans.push(amount);
+            lines.push(line);
+        }
+    }
+    lines.extend(legend);
+    lines
 }
 
 /// Says what the mark means, once there is a subscription figure to mark.
@@ -2737,12 +2755,9 @@ mod tests {
         assert!(own.contains(FOLDED_RATE), "{own}");
     }
 
-    /// A subscription owes nothing, so its figure stands beside the bill marked
-    /// as not billed rather than folded into it. A few cents billed beside it
-    /// must not hide it either, so both sit on the headline.
     #[test_case(Some(RECORDED_COST), None,                    Some(format!("  ${RECORDED_TEXT}"))                                ; "billed_only")]
     #[test_case(None,                Some(SUBSCRIPTION_COST), Some(format!("  {NOT_BILLED_MARK}${SUBSCRIPTION_TEXT}"))                           ; "covered_only")]
-    #[test_case(Some(RECORDED_COST), Some(SUBSCRIPTION_COST), Some(format!("  ${RECORDED_TEXT}  {NOT_BILLED_MARK}${SUBSCRIPTION_TEXT}"))         ; "both_side_by_side")]
+    #[test_case(Some(RECORDED_COST), Some(SUBSCRIPTION_COST), Some(format!("  ${RECORDED_TEXT}")) ; "both_stacked")]
     #[test_case(Some(RECORDED_COST), Some(0.0),               Some(format!("  ${RECORDED_TEXT}"))                                ; "nothing_covered_is_not_drawn")]
     #[test_case(None,                None,                    None                                                               ; "unpriced")]
     fn the_session_headline_shows_each_payer(
@@ -2766,8 +2781,8 @@ mod tests {
             .or_else(|| totals.find(&format!("  {NOT_BILLED_MARK}")))
             .map(|at| &totals[at..]);
         assert_eq!(
-            drawn.map(str::trim_end),
-            money.as_deref(),
+            drawn.map(str::trim),
+            money.as_deref().map(str::trim),
             "{TOTAL_STAYS_BILLED}"
         );
         assert_eq!(
@@ -2778,7 +2793,7 @@ mod tests {
     }
 
     #[test_case(0.0,               None                                                    ; "billed_only")]
-    #[test_case(SUBSCRIPTION_COST, Some(format!("  ${LIFETIME_RECORDED}  {NOT_BILLED_MARK}${LIFETIME_COVERED}")) ; "both_side_by_side")]
+    #[test_case(SUBSCRIPTION_COST, Some(format!("{NOT_BILLED_MARK}${LIFETIME_COVERED}")) ; "both_stacked")]
     fn the_lifetime_headline_shows_each_payer(covered: f64, both: Option<String>) {
         let texts = lifetime_texts(Some(&LifetimeUsage {
             subscription_cost: covered,
@@ -2789,14 +2804,82 @@ mod tests {
             .find(|t| t.contains(BASE_INPUT_LABEL))
             .unwrap_or_else(|| panic!("no totals row: {texts:?}"));
 
+        assert!(
+            totals
+                .trim_end()
+                .ends_with(&format!("${LIFETIME_RECORDED}")),
+            "{totals}"
+        );
         match both {
-            Some(both) => assert!(totals.trim_end().ends_with(&both), "{totals}"),
+            Some(both) => {
+                let index = texts.iter().position(|text| text == totals).unwrap();
+                assert!(texts[index + 1].trim_end().ends_with(&both));
+            }
             None => assert!(!totals.contains(NOT_BILLED_MARK), "{totals}"),
         }
         assert_eq!(
             texts.iter().any(|t| t.contains(SUBSCRIPTION_LEGEND)),
             covered > 0.0,
             "{texts:?}"
+        );
+    }
+
+    #[test_case(UsageScope::Session, 0.013, 15.352 ; "session_subscription_wider")]
+    #[test_case(UsageScope::Lifetime, 0.013, 15.352 ; "lifetime_subscription_wider")]
+    #[test_case(UsageScope::Session, 153.013, 1.352 ; "session_bill_wider")]
+    #[test_case(UsageScope::Lifetime, 153.013, 1.352 ; "lifetime_bill_wider")]
+    #[test_case(UsageScope::Session, 0.0, 9.9996 ; "session_rounding_carry")]
+    #[test_case(UsageScope::Lifetime, 0.0, 9.9996 ; "lifetime_rounding_carry")]
+    fn mixed_totals_align_decimal_points(scope: UsageScope, billed: f64, covered: f64) {
+        let (rows, decimals) = match scope {
+            UsageScope::Session => (
+                modal_rows_with_subscription(
+                    &TokenUsage::default(),
+                    Some(billed),
+                    Some(covered),
+                    &HashMap::new(),
+                    &test_model(),
+                ),
+                SESSION_DECIMALS,
+            ),
+            UsageScope::Lifetime => (
+                lifetime_texts(Some(&LifetimeUsage {
+                    cost: billed,
+                    subscription_cost: covered,
+                    ..lifetime()
+                })),
+                LIFETIME_DECIMALS,
+            ),
+        };
+        let index = rows
+            .iter()
+            .position(|row| row.contains(BASE_INPUT_LABEL))
+            .unwrap();
+        let top = &rows[index];
+        let bottom = &rows[index + 1];
+        assert!(
+            top.trim_end().ends_with(&format!("${billed:.decimals$}")),
+            "{top}"
+        );
+        assert!(!top.contains(NOT_BILLED_MARK), "{top}");
+        assert!(
+            bottom
+                .trim_end()
+                .ends_with(&format!("{NOT_BILLED_MARK}${covered:.decimals$}")),
+            "{bottom}"
+        );
+        assert!(bottom.contains(SUBSCRIPTION_LEGEND), "{bottom}");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(SUBSCRIPTION_LEGEND))
+                .count(),
+            1
+        );
+        let decimal_column = |row: &str| row.rsplit_once('.').unwrap().0.chars().count();
+        assert_eq!(
+            decimal_column(top),
+            decimal_column(bottom),
+            "{top}\n{bottom}"
         );
     }
 
