@@ -56,8 +56,8 @@ pub(crate) use database::{
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
-    SOURCE_CODE_TOOL_RENAMES, SessionCursor, SessionDatabase, SessionRecreation,
-    SessionStorageStats, ToolBucket, ToolLedgerEntry, TrimReport, UsageBucket,
+    SOURCE_CODE_TOOL_RENAMES, SessionCursor, SessionDatabase, SessionOpenEvent, SessionOpenRetry,
+    SessionRecreation, SessionStorageStats, ToolBucket, ToolLedgerEntry, TrimReport, UsageBucket,
     WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR, WalFrames, describe_open_sessions,
     eager_load_limit, persistent_session_titles, set_eager_load_limit,
 };
@@ -114,6 +114,24 @@ pub enum SessionError {
     },
     #[error(transparent)]
     Sqlite(#[from] SqliteError),
+    #[error("{operation}: session open cancelled")]
+    SessionOpenCancelled { operation: &'static str },
+    #[error(
+        "{operation}: session database remained busy after {attempts} attempts ({waited:?} waiting): {source}"
+    )]
+    SessionOpenContention {
+        operation: &'static str,
+        attempts: usize,
+        waited: Duration,
+        #[source]
+        source: SqliteError,
+    },
+    #[error("{operation}: SQLite rollback failed; session open retry refused: {source}")]
+    SessionOpenRollback {
+        operation: &'static str,
+        #[source]
+        source: SqliteError,
+    },
     #[error("{operation}: storage operation cancelled")]
     RuntimeCancelled { operation: &'static str },
     #[error("{operation}: storage deadline exceeded")]

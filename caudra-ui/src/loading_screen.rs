@@ -8,6 +8,7 @@ use std::io::{Write, stdout};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use caudra_storage::sessions::SessionOpenEvent;
 use flume::{Receiver, RecvTimeoutError, Sender};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Buffer;
@@ -32,6 +33,7 @@ const DETAIL_SEPARATOR: &str = " · ";
 const GRACE: Duration = Duration::from_millis(200);
 const ELAPSED_SHOWN_FROM: Duration = Duration::from_secs(1);
 const THREAD_NAME: &str = "loading-screen";
+const DATABASE_BUSY: &str = "Session database busy; retrying";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoadPhase {
@@ -58,6 +60,7 @@ impl LoadPhase {
 
 enum Update {
     Phase(LoadPhase),
+    Database(SessionOpenEvent),
     Session {
         index: usize,
         count: usize,
@@ -75,6 +78,10 @@ impl LoadProgress<'_> {
 
     pub(crate) fn phase(self, phase: LoadPhase) {
         self.send(Update::Phase(phase));
+    }
+
+    pub(crate) fn session_open(self, event: SessionOpenEvent) {
+        self.send(Update::Database(event));
     }
 
     pub(crate) fn session(self, index: usize, count: usize, title: &str) {
@@ -198,10 +205,17 @@ fn write_out(bytes: &[u8]) {
     }
 }
 
+struct DatabaseWait {
+    operation: &'static str,
+    waited: Duration,
+    budget: Duration,
+}
+
 struct LoadingCard {
     title: Option<String>,
     phase: LoadPhase,
     position: Option<(usize, usize)>,
+    database_wait: Option<DatabaseWait>,
 }
 
 impl LoadingCard {
@@ -210,12 +224,24 @@ impl LoadingCard {
             title: shown_title(title),
             phase: LoadPhase::Reading,
             position: None,
+            database_wait: None,
         }
     }
 
     /// Without a title the phase moves up to the headline, so the card never
     /// has an empty row.
     fn lines(&self, elapsed: Duration) -> (&str, String) {
+        if let Some(wait) = &self.database_wait {
+            return (
+                DATABASE_BUSY,
+                format!(
+                    "{:.1}s / {:.0}s{DETAIL_SEPARATOR}{}",
+                    wait.waited.as_secs_f64(),
+                    wait.budget.as_secs_f64(),
+                    wait.operation,
+                ),
+            );
+        }
         let mut detail = Vec::new();
         let headline = match &self.title {
             Some(title) => {
@@ -322,6 +348,20 @@ impl Animator {
     fn update(&mut self, update: Update) {
         match update {
             Update::Phase(phase) => self.card.phase = phase,
+            Update::Database(event) => {
+                self.card.database_wait = match event {
+                    SessionOpenEvent::Waiting {
+                        operation,
+                        waited,
+                        budget,
+                    } => Some(DatabaseWait {
+                        operation,
+                        waited,
+                        budget,
+                    }),
+                    SessionOpenEvent::Recovered | SessionOpenEvent::Finished => None,
+                };
+            }
             Update::Session {
                 index,
                 count,
@@ -329,6 +369,7 @@ impl Animator {
             } => {
                 self.card.title = shown_title(&title);
                 self.card.position = (count > 1).then_some((index + 1, count));
+                self.card.database_wait = None;
             }
         }
     }
@@ -451,6 +492,16 @@ mod tests {
     const UNEXPECTED_TEXT: &str = "the card must not show this text";
     const RESTORE_MISMATCH: &str = "finishing must put back exactly what the card covered";
     const EARLY_PAINT: &str = "nothing may paint inside the grace period";
+    const OPERATION: &str = "recording session open";
+    const LONG_OPERATION: &str = "reading 漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字";
+    const WAITED: Duration = Duration::from_millis(7_500);
+    const WAIT_BUDGET: Duration = Duration::from_secs(30);
+    const WAIT_LABEL: &str = "7.5s / 30s";
+    const WAITING: SessionOpenEvent = SessionOpenEvent::Waiting {
+        operation: OPERATION,
+        waited: WAITED,
+        budget: WAIT_BUDGET,
+    };
 
     fn rendered(card: &LoadingCard, elapsed: Duration, area: Rect) -> String {
         let mut buf = Buffer::empty(area);
@@ -474,7 +525,116 @@ mod tests {
             title: shown_title(title),
             phase,
             position,
+            database_wait: None,
         }
+    }
+
+    #[test_case(SessionOpenEvent::Recovered; "recovered")]
+    #[test_case(SessionOpenEvent::Finished; "finished")]
+    fn database_wait_replaces_the_phase_until_cleared(event: SessionOpenEvent) {
+        let screen = beneath_screen(ASCII_ROW);
+        let started = Instant::now();
+        let mut animator = animator(&screen, started);
+        let mut out = mirror(&screen);
+        animator.update(Update::Phase(LoadPhase::History));
+        animator.update(Update::Database(WAITING));
+        animator.tick(started + GRACE, screen.area, &mut out);
+
+        let text = text_in(out.buffer(), screen.area);
+        for part in [DATABASE_BUSY, OPERATION, WAIT_LABEL] {
+            assert!(text.contains(part), "{MISSING_TEXT}: {part}");
+        }
+        animator.update(Update::Database(event));
+        animator.tick(started + GRACE, screen.area, &mut out);
+
+        let text = text_in(out.buffer(), screen.area);
+        for part in [TITLE, LoadPhase::History.label()] {
+            assert!(text.contains(part), "{MISSING_TEXT}: {part}");
+        }
+        for part in [DATABASE_BUSY, OPERATION, WAIT_LABEL] {
+            assert!(!text.contains(part), "{UNEXPECTED_TEXT}: {part}");
+        }
+    }
+
+    #[test]
+    fn waiting_updates_use_contention_time_not_total_loading_time() {
+        let screen = beneath_screen(ASCII_ROW);
+        let mut animator = animator(&screen, Instant::now());
+        animator.update(Update::Database(SessionOpenEvent::Waiting {
+            operation: OPERATION,
+            waited: Duration::ZERO,
+            budget: WAIT_BUDGET,
+        }));
+        animator.update(Update::Database(WAITING));
+
+        let text = rendered(&animator.card, WAIT_BUDGET * 2, screen.area);
+        assert!(text.contains(WAIT_LABEL), "{MISSING_TEXT}: {WAIT_LABEL}");
+        assert!(text.contains(SPINNER), "{MISSING_TEXT}: {SPINNER}");
+    }
+
+    #[test_case(Rect::new(0, 0, 45, 6); "narrow card")]
+    #[test_case(Rect::new(0, 0, 1, 1); "single cell")]
+    fn database_wait_clips_inside_the_card(area: Rect) {
+        let screen = beneath_screen(ASCII_ROW);
+        let mut animator = animator(&screen, Instant::now());
+        animator.update(Update::Database(SessionOpenEvent::Waiting {
+            operation: LONG_OPERATION,
+            waited: WAITED,
+            budget: WAIT_BUDGET,
+        }));
+
+        let text = rendered(&animator.card, Duration::ZERO, area);
+        if area.height >= CARD_HEIGHT {
+            assert!(text.contains(ELLIPSIS), "{MISSING_TEXT}: {ELLIPSIS}");
+            assert!(text.contains(WAIT_LABEL), "{MISSING_TEXT}: {WAIT_LABEL}");
+        }
+        assert!(!text.contains(LONG_OPERATION), "{UNEXPECTED_TEXT}");
+    }
+
+    #[test]
+    fn database_progress_is_scoped_to_its_loading_screen() {
+        let (first_tx, first_rx) = flume::unbounded();
+        let first = LoadingScreen {
+            updates: Some(first_tx),
+            thread: None,
+        };
+        let (second_tx, second_rx) = flume::unbounded();
+        let second = LoadingScreen {
+            updates: Some(second_tx),
+            thread: None,
+        };
+        first.progress().session_open(WAITING);
+        assert!(second_rx.is_empty());
+
+        let screen = beneath_screen(ASCII_ROW);
+        let mut first_animator = animator(&screen, Instant::now());
+        first_animator.update(first_rx.try_recv().unwrap());
+        assert_eq!(first_animator.card.lines(Duration::ZERO).0, DATABASE_BUSY);
+        let mut second_animator = animator(&screen, Instant::now());
+        second.progress().session(0, 1, TITLE);
+        second_animator.update(second_rx.try_recv().unwrap());
+        assert_eq!(second_animator.card.lines(Duration::ZERO).0, TITLE);
+        assert!(second_animator.card.database_wait.is_none());
+
+        first.progress().session_open(WAITING);
+        drop(first);
+        assert!(second_rx.is_empty());
+        assert!(second_animator.card.database_wait.is_none());
+    }
+
+    #[test]
+    fn moving_to_another_session_clears_the_previous_database_wait() {
+        let screen = beneath_screen(ASCII_ROW);
+        let mut animator = animator(&screen, Instant::now());
+        animator.update(Update::Database(WAITING));
+        animator.update(Update::Session {
+            index: 1,
+            count: 2,
+            title: TITLE.to_owned(),
+        });
+
+        assert_eq!(animator.card.lines(Duration::ZERO).0, TITLE);
+        assert!(animator.card.database_wait.is_none());
     }
 
     #[test_case(TITLE, LoadPhase::Permissions, &[TITLE, "Checking permissions"]; "title and phase")]

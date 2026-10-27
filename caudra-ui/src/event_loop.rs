@@ -143,7 +143,7 @@ use crate::{
     AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
     SessionRelocationHandoff, SessionTab,
 };
-use crate::{load_app_session, open_app_session_with_cursor};
+use crate::{load_app_session, open_app_session_with_cursor_reporting};
 
 use crate::pane_signals::PaneSignals;
 use crate::storage_writer::StorageWriter;
@@ -3925,8 +3925,9 @@ impl<'t> EventLoop<'t> {
                 .map_err(|error| format!("Failed to open session: {error}"))?,
         );
         let lease_ms = lap();
-        let (session, cursor) = open_app_session_with_cursor(id, &self.ctx.storage)
-            .map_err(|e| format!("Failed to load session: {e}"))?;
+        let (session, cursor) =
+            open_app_session_with_cursor_reporting(id, &self.ctx.storage, progress)
+                .map_err(|e| format!("Failed to load session: {e:#}"))?;
         let read_ms = lap();
         progress.session(0, 1, &session.title);
         // Both branches below end with this session in a tab the writer saves.

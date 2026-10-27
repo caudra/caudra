@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use super::workcell_runtime::WorkcellRuntime;
 use crate::cli::{Cli, SandboxAction, SandboxAuthAction, WorkcellSelectorArgs};
+use crate::progress::SessionLoadProgress;
 
 const LAST_SESSION_IN_SANDBOX: &str =
     "the most recent session here ran in a managed sandbox; use --session to resume a local one";
@@ -471,7 +472,15 @@ pub fn recover_session_source(
         }
         return Ok(None);
     };
-    let session = crate::setup::load_session(session_id.parse()?, state)?;
+    let progress = (!cli.print && !cli.is_sdk_mode()).then(SessionLoadProgress::new);
+    let session =
+        caudra_agent::load_stored_session_observed(session_id.parse()?, state, &|event| {
+            if let Some(progress) = &progress {
+                progress.report(event);
+            }
+        })
+        .context("inspect persisted session")?;
+    drop(progress);
     features.require_source(session.workspace_binding())?;
     let Some(binding) = session.workspace_binding() else {
         return Ok(None);
@@ -541,7 +550,9 @@ mod tests {
     #[cfg(unix)]
     use crate::cli::SandboxAuthAction;
     use crate::cli::{Cli, WorkcellSelectorArgs};
+    use caudra_agent::StoredSession;
     use caudra_config::sandbox::SandboxName;
+    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::{
         StateDir, id::CaudraId, sandbox_auth::MAX_SANDBOX_API_KEY_BYTES, state,
         workspace_binding::StoredWorkspaceBinding,
@@ -561,6 +572,7 @@ mod tests {
 
     const NAME: &str = "original";
     const SECRET: &str = "sandbox-secret-0123456789-abcdefghijk";
+    const TEST_MODEL: &str = "test/model";
     #[cfg(unix)]
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
@@ -589,6 +601,28 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cli.workcell.sandbox.as_deref(), explicit.then_some(NAME));
+    }
+
+    #[test_case(false; "interactive")]
+    #[test_case(true; "print")]
+    fn source_inspection_does_not_record_a_session_open(print: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let mut session = StoredSession::new(TEST_MODEL, temp.path().to_str().unwrap());
+        session.save(&storage).unwrap();
+        let mut cli =
+            Cli::try_parse_from(["caudra", "--session", &session.id.to_string()]).unwrap();
+        cli.print = print;
+        assert!(
+            recover_session_source(&mut cli, &storage, temp.path())
+                .unwrap()
+                .is_none()
+        );
+        let facts = SessionDatabase::open_state(&storage)
+            .unwrap()
+            .session_facts(None)
+            .unwrap();
+        assert_eq!(facts[0].last_opened_at, None);
     }
 
     #[test_case(false)]

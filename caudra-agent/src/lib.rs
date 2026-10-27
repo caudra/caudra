@@ -79,9 +79,9 @@ pub mod workflow;
 pub mod workspace_transfer;
 pub mod worktree;
 pub use stored_session::{
-    StoredSession, latest_stored_session, load_stored_session, open_stored_session,
-    open_stored_session_with_cursor, resolve_resume_workspace, resume_workspace_session,
-    workspace_logical_cwd,
+    StoredSession, latest_stored_session, load_stored_session, load_stored_session_observed,
+    open_stored_session, open_stored_session_with_cursor, open_stored_session_with_cursor_observed,
+    resolve_resume_workspace, resume_workspace_session, workspace_logical_cwd,
 };
 pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,

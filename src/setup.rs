@@ -20,6 +20,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+use crate::progress::SessionLoadProgress;
+
 const RUST_LOG: &str = "RUST_LOG";
 const MAX_EAGER_LOAD_MB: &str = "CAUDRA_MAX_EAGER_LOAD_MB";
 const EVENT_STARTED: &str = "caudra_started";
@@ -54,7 +56,11 @@ pub fn load_session_with_cursor(
     id: CaudraId,
     storage: &StateDir,
 ) -> Result<(StoredSession, caudra_storage::sessions::SessionCursor)> {
-    caudra_agent::open_stored_session_with_cursor(id, storage).context("load persisted session")
+    let progress = SessionLoadProgress::new();
+    caudra_agent::open_stored_session_with_cursor_observed(id, storage, &|event| {
+        progress.report(event);
+    })
+    .context("load persisted session")
 }
 
 /// The model a run opens on. `mode` picks which remembered choice answers, since
