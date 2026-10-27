@@ -119,7 +119,7 @@ Caudra keeps some of its own files outside the project. A `CAUDRA` section under
 | `Config` | Your [config directory](/docs/configuration/#directory-layout), with `caudra.toml`, `permissions.toml`, system prompts, skills, workflows, and automations |
 | `Plans` | The plans written in this project |
 | `Memories` | This project's [memory notes](/docs/memory/) |
-| `Scratch` | This project's scratch directory, for temporary files |
+| `Scratch` | The scratch directory the agent puts temporary files in, which stays the one Caudra started in |
 
 A folder that does not exist yet is left out until it does.
 
