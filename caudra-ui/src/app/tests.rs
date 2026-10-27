@@ -110,10 +110,11 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
-    PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredAutomationControls,
-    StoredGoalVerdict, StoredGoalWait, StoredImage, StoredInboundPolicy, StoredMode,
-    StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
-    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
+    PermissionMode, SESSIONS_DB_FILE, SessionDatabase, SessionLocation, SessionMeta,
+    StoredActiveGoal, StoredAutomationControls, StoredGoalVerdict, StoredGoalWait, StoredImage,
+    StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls, StoredPromptAdmission,
+    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
+    UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -138,16 +139,20 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::slice::from_ref;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LOAD_BENCH_DB: &str = "CAUDRA_BENCH_DB";
+const LOAD_BENCH_SESSION: &str = "CAUDRA_BENCH_SESSION";
+const LOAD_BENCH_SIZE: (u16, u16) = (120, 34);
 const TODO_MAIN_TEXT: &str = "Review the main implementation";
 const TODO_FIRST_ID: &str = "sticky-todo-research";
 const TODO_FIRST_NAME: &str = "Research task-local state";
@@ -586,6 +591,64 @@ pub(crate) fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let writer = Arc::new(test_writer(dir.clone()));
     let app = build_app(dir.clone(), Arc::clone(&writer));
     (tmp, dir, writer, app)
+}
+
+#[test]
+#[ignore = "requires CAUDRA_BENCH_DB snapshot and CAUDRA_BENCH_SESSION; copies the database before writing"]
+fn benchmark_stored_session_restore() {
+    let source = std::env::var_os(LOAD_BENCH_DB).expect(LOAD_BENCH_DB);
+    let id = std::env::var(LOAD_BENCH_SESSION)
+        .expect(LOAD_BENCH_SESSION)
+        .parse()
+        .unwrap();
+    let tmp = private_tempdir();
+    fs::copy(source, tmp.path().join(SESSIONS_DB_FILE)).unwrap();
+    let dir = StateDir::from_path(tmp.path().to_owned());
+    let writer = Arc::new(test_writer(dir.clone()));
+    let mut app = build_app(dir.clone(), Arc::clone(&writer));
+    let started = Instant::now();
+    let (mut session, cursor) = SessionDatabase::open(&dir)
+        .unwrap()
+        .load_with_cursor(id)
+        .unwrap();
+    let read_ms = started.elapsed().as_millis();
+    writer.adopt_cursor(cursor);
+    let started = Instant::now();
+    let snapshot = super::permission_editor::attach_session_permissions(
+        &dir,
+        &writer,
+        &mut session,
+        &app.permissions,
+    )
+    .unwrap();
+    app.state.session = Arc::new(session);
+    app.conversation_permissions =
+        super::permission_editor::ConversationPermissions::Published(snapshot);
+    let permissions_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    app.restore_display();
+    let restore_ms = started.elapsed().as_millis();
+    let mut terminal =
+        Terminal::new(TestBackend::new(LOAD_BENCH_SIZE.0, LOAD_BENCH_SIZE.1)).unwrap();
+    let started = Instant::now();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let first_frame_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let second_frame_ms = started.elapsed().as_millis();
+    let mut rendered = DefaultHasher::new();
+    buffer_text(terminal.backend().buffer()).hash(&mut rendered);
+    let rendered = rendered.finish();
+    let chats = app.chats.len();
+    eprintln!(
+        "session={id} read_ms={read_ms} permissions_ms={permissions_ms} restore_ms={restore_ms} first_frame_ms={first_frame_ms} second_frame_ms={second_frame_ms} chats={chats} rendered={rendered:x}"
+    );
+    drop(app);
+    Arc::try_unwrap(writer)
+        .ok()
+        .unwrap()
+        .shutdown_checked(WRITER_DRAIN_TIMEOUT)
+        .unwrap();
 }
 
 pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {

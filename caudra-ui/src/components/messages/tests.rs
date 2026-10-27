@@ -27,7 +27,7 @@ use caudra_agent::tools::{
     QUESTION_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
     TOOL_OUTPUT_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
-use caudra_agent::types::{TodoPriority, TodoStatus};
+use caudra_agent::types::{TextOutput, TodoPriority, TodoStatus};
 use caudra_agent::{
     ActivityChild, DecisionHelper, GrepFileEntry, GrepMatchGroup, McpBlock, McpHelper, McpOutput,
     McpServerKind, MemoryNote, MemoryOrigin, MemoryOutput, NO_FILES_FOUND, SearchCap,
@@ -110,6 +110,16 @@ const FENCED_COPY_ROW_MSG: &str = "the rendered fixture must contain the selecte
 const FENCED_COPY_WRAP_MSG: &str = "only the narrow fixture must soft-wrap the command";
 const FENCED_COMMAND_COPY_MSG: &str = "a command selection copies exact code without hidden fences";
 const FENCED_SOURCE_COPY_MSG: &str = "a complete block selection keeps the original Markdown";
+const FIRST_RENDER_IDS: [&str; 6] = ["read", "closed", "full", "plain", "mcp", "batch"];
+const FIRST_RENDER_BODY_ROWS: usize = 40;
+const FIRST_RENDER_WINDOW_ROWS: u32 = 5;
+const FIRST_RENDER_WIDTH: u16 = 80;
+const FIRST_RENDER_SIZES: [usize; 3] = [1_000, 2_000, 4_000];
+const FIRST_RENDER_SAMPLES: usize = 3;
+const FIRST_RENDER_INSTRUCTION_PATH: &str = "AGENTS.md";
+const FIRST_RENDER_INSTRUCTIONS: &str = "Keep the restored instruction body intact.";
+const FIRST_RENDER_DUPLICATE_INSTRUCTIONS: &str = "Use the last duplicate instruction body.";
+const FIRST_RENDER_ONLY_TOOLS_MSG: &str = "the first-render fixture contains only tool cards";
 
 fn live_task_card(call: &str, state: &str) -> TaskCard {
     serde_json::from_value(serde_json::json!({
@@ -4966,6 +4976,256 @@ fn read_code_with_instructions(blocks: Vec<InstructionBlock>) -> ToolOutput {
         lines: vec!["fn main() {}".into()],
         total_lines: 1,
         instructions: Some(blocks),
+    }
+}
+
+fn first_render_card(id: &str, tool: &str, output: ToolOutput) -> DisplayMessage {
+    let mut message = DisplayMessage::new(
+        DisplayRole::Tool(Box::new(ToolRole {
+            id: id.into(),
+            name: tool.into(),
+            effect: effect_of(tool),
+            status: ToolStatus::Success,
+        })),
+        id.into(),
+    );
+    message.tool_output = Some(Arc::new(output));
+    message
+}
+
+fn first_render_output(instructions: bool) -> ToolOutput {
+    let mut output = TextOutput::from(numbered_body(FIRST_RENDER_BODY_ROWS));
+    output.instructions = instructions.then(|| {
+        vec![InstructionBlock {
+            path: FIRST_RENDER_INSTRUCTION_PATH.into(),
+            content: FIRST_RENDER_INSTRUCTIONS.repeat(FIRST_RENDER_BODY_ROWS),
+        }]
+    });
+    ToolOutput::Plain(output)
+}
+
+fn first_render_fixture(duplicates: bool) -> Vec<DisplayMessage> {
+    let mut messages: Vec<_> = FIRST_RENDER_IDS[..4]
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            first_render_card(id, FILE_READ_TOOL_NAME, first_render_output(index < 3))
+        })
+        .collect();
+    messages.push(first_render_card(
+        FIRST_RENDER_IDS[4],
+        MCP_READ_TOOL,
+        ToolOutput::Mcp(McpOutput {
+            blocks: vec![McpBlock::Text {
+                text: numbered_body(FIRST_RENDER_BODY_ROWS),
+            }],
+            ..McpOutput::default()
+        }),
+    ));
+    let mut child = batch_child(SHELL_TOOL_NAME, FIRST_RENDER_IDS[5]);
+    child.output = Some(first_render_output(false));
+    messages.push(first_render_card(
+        FIRST_RENDER_IDS[5],
+        BATCH_TOOL_NAME,
+        ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+    ));
+    if duplicates {
+        messages.push(first_render_card(
+            &segment::instruction_id(FIRST_RENDER_IDS[0]),
+            FILE_READ_TOOL_NAME,
+            first_render_output(false),
+        ));
+        messages.push(first_render_card(
+            FIRST_RENDER_IDS[0],
+            FILE_WRITE_TOOL_NAME,
+            read_code_with_instructions(vec![InstructionBlock {
+                path: FIRST_RENDER_INSTRUCTION_PATH.into(),
+                content: FIRST_RENDER_DUPLICATE_INSTRUCTIONS.into(),
+            }]),
+        ));
+        let mut mcp = messages[4].clone();
+        if let DisplayRole::Tool(role) = &mut mcp.role {
+            role.id = FIRST_RENDER_IDS[3].into();
+        }
+        messages.push(mcp);
+        messages.push(first_render_card(
+            FIRST_RENDER_IDS[5],
+            BATCH_TOOL_NAME,
+            ToolOutput::Batch {
+                entries: vec![batch_child(FILE_WRITE_TOOL_NAME, FIRST_RENDER_IDS[5])],
+                text: String::new(),
+            },
+        ));
+    }
+    messages
+}
+
+fn first_render_panel(messages: Vec<DisplayMessage>, view: ViewMode) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.load_messages(messages);
+    panel.viewport_width = FIRST_RENDER_WIDTH;
+    panel.policy.scroll_card_lines = FIRST_RENDER_WINDOW_ROWS;
+    for (id, state) in [
+        (FIRST_RENDER_IDS[1], CardState::Closed),
+        (FIRST_RENDER_IDS[2], CardState::Full),
+    ] {
+        panel.disclosure.insert(id.into(), state);
+        panel.disclosure.insert(segment::instruction_id(id), state);
+    }
+    panel.raw_views.insert(FIRST_RENDER_IDS[4].into());
+    panel.batch_views.insert(
+        FIRST_RENDER_IDS[5].into(),
+        BatchViews::default().clicked(InnerTarget::Item(0), false),
+    );
+    panel.card_scroll.insert(
+        child_scroll_id(FIRST_RENDER_IDS[5], 0),
+        CardScroll {
+            offset: FIRST_RENDER_WINDOW_ROWS as usize,
+            follow: false,
+            history_base: None,
+        },
+    );
+    panel
+}
+
+fn rebuild_cards_individually(panel: &mut MessagesPanel) {
+    for index in panel.cache.msg_count()..panel.messages.len() {
+        let message = &panel.messages[index];
+        let DisplayRole::Tool(role) = &message.role else {
+            panic!("{FIRST_RENDER_ONLY_TOOLS_MSG}");
+        };
+        let id = role.id.clone();
+        let status = role.status;
+        let compact = panel.draws_compact(&role.name, role.effect);
+        let exp = panel.tool_expansion(&id, panel.opens_by_default(role, index));
+        let blocks = message
+            .tool_output
+            .as_deref()
+            .and_then(ToolOutput::owned_instructions);
+        let (context_index, _) = panel.tool_card(&id).unwrap();
+        let (lines, _) = command_text::deferring(|| {
+            panel.build_anchored_tool_lines(&id, index, context_index, status, exp)
+        });
+        let mut segment = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(index));
+        segment.search_text = lines.search_text.clone();
+        segment.apply_highlight(lines, &panel.hl_worker, compact);
+        panel.cache.push(segment);
+        if let Some(blocks) = blocks {
+            panel.upsert_instruction_segment(&id, &blocks, panel.cache.len() - 1);
+        }
+    }
+    panel.cache.update_margins(panel.viewport_width);
+    panel.cache.mark_built(panel.messages.len());
+}
+
+fn assert_first_render_cache_eq(actual: &MessagesPanel, expected: &MessagesPanel) {
+    assert_eq!(actual.cache.len(), expected.cache.len());
+    for (actual, expected) in actual
+        .cache
+        .segments()
+        .iter()
+        .zip(expected.cache.segments())
+    {
+        assert_eq!(actual.tool_id, expected.tool_id);
+        assert_eq!(actual.msg_index, expected.msg_index);
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.compact, expected.compact);
+        assert_eq!(actual.lines(), expected.lines());
+        assert_eq!(actual.search_text, expected.search_text);
+        assert_eq!(actual.truncation, expected.truncation);
+        assert_eq!(
+            actual.chrome(FIRST_RENDER_WIDTH),
+            expected.chrome(FIRST_RENDER_WIDTH)
+        );
+        assert_eq!(actual.scroll_spans.len(), expected.scroll_spans.len());
+        for (actual, expected) in actual.scroll_spans.iter().zip(&expected.scroll_spans) {
+            assert_eq!(
+                (
+                    actual.child,
+                    actual.first,
+                    actual.lines,
+                    actual.extent_lines,
+                    actual.total,
+                    actual.offset,
+                    actual.history_start
+                ),
+                (
+                    expected.child,
+                    expected.first,
+                    expected.lines,
+                    expected.extent_lines,
+                    expected.total,
+                    expected.offset,
+                    expected.history_start
+                ),
+            );
+        }
+    }
+}
+
+#[test_case(ViewMode::Auto, false; "auto")]
+#[test_case(ViewMode::Compact, false; "compact")]
+#[test_case(ViewMode::Expanded, false; "expanded")]
+#[test_case(ViewMode::Auto, true; "auto_duplicate_ids")]
+#[test_case(ViewMode::Compact, true; "compact_duplicate_ids")]
+#[test_case(ViewMode::Expanded, true; "expanded_duplicate_ids")]
+fn bulk_tool_cache_matches_individual_rendering(view: ViewMode, duplicates: bool) {
+    let messages = first_render_fixture(duplicates);
+    let mut bulk = first_render_panel(messages.clone(), view);
+    let mut individual = first_render_panel(messages, view);
+    bulk.rebuild_line_cache();
+    rebuild_cards_individually(&mut individual);
+    assert_first_render_cache_eq(&bulk, &individual);
+    if !duplicates {
+        for id in FIRST_RENDER_IDS {
+            command_text::deferring(|| individual.rebuild_tool_lines(id));
+        }
+        assert_first_render_cache_eq(&bulk, &individual);
+    }
+
+    let appended = first_render_card(
+        FIRST_RENDER_IDS[0],
+        FILE_READ_TOOL_NAME,
+        read_code_with_instructions(instruction_blocks()),
+    );
+    bulk.push(appended.clone());
+    individual.push(appended);
+    command_text::deferring(|| bulk.rebuild_line_cache());
+    rebuild_cards_individually(&mut individual);
+    assert_first_render_cache_eq(&bulk, &individual);
+}
+
+#[test_case(false; "plain_tools")]
+#[test_case(true; "instruction_tools")]
+#[ignore = "manual first-render scaling benchmark; run with --ignored --nocapture"]
+fn first_render_scaling(instructions: bool) {
+    for count in FIRST_RENDER_SIZES {
+        let mut timings = Vec::new();
+        for _ in 0..FIRST_RENDER_SAMPLES {
+            let messages = (0..count)
+                .map(|index| {
+                    first_render_card(
+                        &format!("first-render-{index}"),
+                        FILE_READ_TOOL_NAME,
+                        first_render_output(instructions),
+                    )
+                })
+                .collect();
+            let mut panel = first_render_panel(messages, ViewMode::Expanded);
+            let started = Instant::now();
+            panel.rebuild_line_cache();
+            timings.push(started.elapsed());
+            assert_eq!(panel.cache.len(), count * if instructions { 2 } else { 1 });
+        }
+        timings.sort();
+        eprintln!(
+            "first render: instructions={instructions}, cards={count}, median={:?}",
+            timings[FIRST_RENDER_SAMPLES / 2],
+        );
     }
 }
 
@@ -12286,7 +12546,12 @@ fn batch_panel_windows_do_not_override_visibility(streaming: bool, collapsed: bo
         ..start(TOOL_ID, BATCH_TOOL_NAME)
     });
     render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
-    assert!(!panel.child_windows(TOOL_ID).is_empty());
+    let (index, _) = panel.tool_card(TOOL_ID).unwrap();
+    assert!(
+        !panel
+            .child_windows(TOOL_ID, panel.messages[index].tool_output.as_deref())
+            .is_empty()
+    );
     assert_eq!(
         seg_text(&panel, TOOL_ID).contains(CHILD_SCRIPT_TOKENS[0]),
         visible

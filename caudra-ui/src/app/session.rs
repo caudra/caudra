@@ -728,6 +728,7 @@ impl App {
     }
 
     pub(crate) fn restore_display(&mut self) {
+        let restore_started = Instant::now();
         self.queue.hold_next_restore();
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
@@ -736,6 +737,7 @@ impl App {
         // summarized in the store, and this is the reader's only way back to
         // them. The subagent and tool-output reachability below reads the same
         // path on purpose, so a card drawn above the border keeps its output.
+        let phase_started = Instant::now();
         let active_history = match crate::transcript_session_history(&self.state.session) {
             Ok(history) => history,
             Err(error) => {
@@ -744,6 +746,8 @@ impl App {
                 Vec::new()
             }
         };
+        let transcript_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
         let decisions = self.stored_engine_decisions();
         let mut log_rows = self.autopilot_log_rows();
         log_rows.extend(self.goal_log_rows());
@@ -758,6 +762,8 @@ impl App {
             decisions.iter().filter(|row| row.agent.is_none()),
         );
         inserts.extend(restored.rows);
+        let preparation_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
         let (mut display_msgs, restore_items) = interleaved_history_to_display(
             &active_history,
             self.state.session.tool_outputs(),
@@ -767,6 +773,8 @@ impl App {
             restored.turns,
         );
         attach_card_decisions(&mut display_msgs, restored.cards);
+        let main_display_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
             self.state.session.subagent_messages(),
@@ -841,6 +849,8 @@ impl App {
                 subagent_versions.insert(subagent.tool_use_id.clone(), version_id.clone());
             }
         }
+        let reachability_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
         self.main_chat().load_messages(display_msgs);
         self.sync_todo_panel();
         let cost = self.state.cost;
@@ -908,6 +918,8 @@ impl App {
             .collect();
 
         self.fire_restore_items(restore_items);
+        let installation_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -942,8 +954,11 @@ impl App {
             let finished = restored_subagent_outcome(sa.outcome);
             self.push_restored_subagent(sa, display, items, finished);
         }
+        let subagent_display_elapsed = phase_started.elapsed();
 
+        let phase_started = Instant::now();
         self.sync_subagents();
+        let sync_elapsed = phase_started.elapsed();
 
         let eh = &self.lua_event_handle;
         if eh.is_disconnected() {
@@ -952,6 +967,20 @@ impl App {
         } else {
             eh.send_restore_complete(restoring);
         }
+        tracing::info!(
+            session_id = %self.state.session.id,
+            history_items = active_history.len(),
+            restored_subagents = self.chats.len().saturating_sub(1),
+            transcript_us = transcript_elapsed.as_micros() as u64,
+            preparation_us = preparation_elapsed.as_micros() as u64,
+            main_display_us = main_display_elapsed.as_micros() as u64,
+            reachability_us = reachability_elapsed.as_micros() as u64,
+            installation_us = installation_elapsed.as_micros() as u64,
+            subagent_display_us = subagent_display_elapsed.as_micros() as u64,
+            sync_us = sync_elapsed.as_micros() as u64,
+            total_us = restore_started.elapsed().as_micros() as u64,
+            "session display restored"
+        );
     }
 
     pub(super) fn fire_restore_items(&self, items: Vec<caudra_lua::RestoreItem>) {
@@ -1849,6 +1878,22 @@ pub(crate) fn reachable_subagent_ids(
     tool_outputs: &HashMap<String, Arc<caudra_agent::ToolOutput>>,
     subagents: &[StoredSubagent],
 ) -> HashSet<String> {
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut children_by_root: HashMap<&str, Vec<&str>> = HashMap::new();
+    for subagent in subagents {
+        if let Some(parent) = &subagent.parent_tool_use_id {
+            children_by_parent
+                .entry(parent)
+                .or_default()
+                .push(&subagent.tool_use_id);
+        }
+        if let Some(root) = &subagent.root_tool_use_id {
+            children_by_root
+                .entry(root)
+                .or_default()
+                .push(&subagent.tool_use_id);
+        }
+    }
     let mut reachable = tool_call_ids(items);
     reachable.extend(
         caudra_agent::active_task_history_versions_with_outputs(items, |call_id| {
@@ -1856,29 +1901,31 @@ pub(crate) fn reachable_subagent_ids(
         })
         .into_keys(),
     );
-    let mut active_calls = caudra_agent::history_tool_call_ids(items);
-    // A worklist rather than a rescan: choosing the next id by walking
-    // `reachable` for an unvisited one costs a pass over the whole set per
-    // step, so a transcript with thousands of tool calls spends most of a
-    // resume here. An id joins `pending` exactly when it joins `reachable`,
-    // which visits each one once and needs no visited set.
-    let mut pending: Vec<String> = reachable.iter().cloned().collect();
-    loop {
-        for subagent in subagents {
-            let linked =
-                subagent.parent_tool_use_id.as_ref().is_some_and(|parent| {
-                    reachable.contains(parent) || active_calls.contains(parent)
-                }) || subagent
-                    .root_tool_use_id
-                    .as_ref()
-                    .is_some_and(|root| active_calls.contains(root));
-            if linked && reachable.insert(subagent.tool_use_id.clone()) {
-                pending.push(subagent.tool_use_id.clone());
+    let mut pending: Vec<_> = reachable.iter().cloned().map(|id| (id, false)).collect();
+    pending.extend(
+        caudra_agent::history_tool_call_ids(items)
+            .into_iter()
+            .map(|id| (id, true)),
+    );
+    while let Some((task_id, is_active_call)) = pending.pop() {
+        let children = children_by_parent.remove(task_id.as_str());
+        let rooted = if is_active_call {
+            children_by_root.remove(task_id.as_str())
+        } else {
+            None
+        };
+        for child in children
+            .into_iter()
+            .flatten()
+            .chain(rooted.into_iter().flatten())
+        {
+            if reachable.insert(child.to_owned()) {
+                pending.push((child.to_owned(), false));
             }
         }
-        let Some(task_id) = pending.pop() else {
-            break;
-        };
+        if is_active_call {
+            continue;
+        }
         if let Some(history) = histories.get(&task_id) {
             let mut discovered = tool_call_ids(history);
             discovered.extend(
@@ -1889,10 +1936,14 @@ pub(crate) fn reachable_subagent_ids(
             );
             for id in discovered {
                 if reachable.insert(id.clone()) {
-                    pending.push(id);
+                    pending.push((id, false));
                 }
             }
-            active_calls.extend(caudra_agent::history_tool_call_ids(history));
+            pending.extend(
+                caudra_agent::history_tool_call_ids(history)
+                    .into_iter()
+                    .map(|id| (id, true)),
+            );
         }
     }
     reachable
@@ -2336,15 +2387,327 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::appended_len;
-    use caudra_agent::HistorySnapshot;
-    use caudra_providers::{HistoryItem, Message, expand_message};
+    use super::{appended_len, reachable_subagent_ids, tool_call_ids};
+    use caudra_agent::{HistorySnapshot, ToolOutput};
+    use caudra_providers::{ContentBlock, HistoryItem, Message, Role, expand_message};
+    use caudra_storage::sessions::{StoredSubagent, StoredSubagentOutcome};
+    use serde_json::{Value, json};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Instant;
     use test_case::test_case;
 
     const MERGED_LEN: usize = 2;
     const APPENDED_LEN_MSG: &str =
         "only a same-run extension of the merged ids may skip the full merge";
+    const CHAIN_LENGTH: usize = 128;
+    const SCALING_SIZES: [usize; 3] = [1_000, 2_000, 4_000];
+
+    fn call_history(call_id: &str, name: &str, input: Value) -> Vec<HistoryItem> {
+        expand_message(
+            &Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(call_id, name, input)],
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    fn subagent(id: &str, parent: Option<&str>, root: Option<&str>) -> StoredSubagent {
+        StoredSubagent {
+            tool_use_id: id.into(),
+            parent_tool_use_id: parent.map(str::to_owned),
+            root_tool_use_id: root.map(str::to_owned),
+            name: id.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+            outcome: StoredSubagentOutcome::Done,
+        }
+    }
+
+    fn id_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn parent_chain(len: usize) -> Vec<StoredSubagent> {
+        (0..len)
+            .map(|index| {
+                let parent = if index == 0 {
+                    "launch".into()
+                } else {
+                    format!("task-{}", index - 1)
+                };
+                subagent(&format!("task-{index}"), Some(&parent), None)
+            })
+            .collect()
+    }
+
+    #[test_case(false; "forward_order")]
+    #[test_case(true; "reverse_order")]
+    fn reachability_follows_parent_chains_in_any_order(reverse: bool) {
+        let items = call_history("launch", "task", json!({}));
+        let mut subagents = parent_chain(CHAIN_LENGTH);
+        let mut expected: HashSet<_> = subagents.iter().map(|sa| sa.tool_use_id.clone()).collect();
+        expected.insert("launch".into());
+        subagents.push(subagent("orphan", Some("missing"), None));
+        if reverse {
+            subagents.reverse();
+        }
+        let histories = HashMap::from([(
+            "orphan".into(),
+            Arc::new(call_history("hidden", "task", json!({}))),
+        )]);
+        let outputs = HashMap::new();
+        assert_eq!(
+            reachable_subagent_ids(&items, &histories, &outputs, &subagents),
+            expected
+        );
+        assert_eq!(
+            scanned_reachable_subagent_ids(&items, &histories, &outputs, &subagents),
+            expected
+        );
+    }
+
+    #[test_case("shell"; "non_container_call")]
+    #[test_case("task"; "container_call")]
+    fn reachability_distinguishes_active_roots_from_reachable_parents(name: &str) {
+        let items = call_history("launch", name, json!({}));
+        let subagents = [
+            subagent("parent-child", Some("launch"), None),
+            subagent("root-child", None, Some("launch")),
+            subagent("descendant", Some("parent-child"), None),
+            subagent("inactive-root", None, Some("parent-child")),
+            subagent("disconnected", None, None),
+        ];
+        let mut expected = id_set(&["parent-child", "root-child", "descendant"]);
+        if name == "task" {
+            expected.insert("launch".into());
+        }
+        assert_eq!(
+            reachable_subagent_ids(&items, &HashMap::new(), &HashMap::new(), &subagents),
+            expected
+        );
+    }
+
+    #[test_case(false; "inactive_reachable_root")]
+    #[test_case(true; "root_activated_by_descendant_history")]
+    fn reachability_activates_non_container_calls_discovered_inside_children(activate: bool) {
+        let items = call_history("launch", "task", json!({}));
+        let subagents = [
+            subagent("late", Some("launch"), None),
+            subagent("root-child", None, Some("late")),
+            subagent("parent-child", Some("nested-shell"), None),
+            subagent("nested-root-child", None, Some("nested-shell")),
+        ];
+        let mut histories = HashMap::from([
+            (
+                "late".into(),
+                Arc::new(call_history("discoverer", "task", json!({}))),
+            ),
+            (
+                "discoverer".into(),
+                Arc::new(call_history("nested-shell", "shell", json!({}))),
+            ),
+        ]);
+        let mut expected = id_set(&[
+            "launch",
+            "late",
+            "discoverer",
+            "parent-child",
+            "nested-root-child",
+        ]);
+        if activate {
+            Arc::make_mut(histories.get_mut("discoverer").unwrap()).extend(call_history(
+                "late",
+                "shell",
+                json!({}),
+            ));
+            expected.insert("root-child".into());
+        }
+        assert_eq!(
+            reachable_subagent_ids(&items, &histories, &HashMap::new(), &subagents),
+            expected
+        );
+    }
+
+    #[test_case(false; "descriptor_cycles")]
+    #[test_case(true; "descriptor_and_history_cycles")]
+    fn reachability_terminates_cycles_without_visiting_disconnected_histories(history_cycle: bool) {
+        let items = call_history("a", "task", json!({}));
+        let subagents = [
+            subagent("a", Some("c"), None),
+            subagent("b", Some("a"), Some("a")),
+            subagent("c", Some("b"), None),
+            subagent("x", Some("y"), None),
+            subagent("y", Some("x"), None),
+            subagent("self", Some("self"), Some("self")),
+        ];
+        let mut histories = HashMap::from([(
+            "x".into(),
+            Arc::new(call_history("hidden", "task", json!({}))),
+        )]);
+        if history_cycle {
+            histories.insert("a".into(), Arc::new(call_history("b", "task", json!({}))));
+            histories.insert("b".into(), Arc::new(call_history("a", "task", json!({}))));
+        }
+        assert_eq!(
+            reachable_subagent_ids(&items, &histories, &HashMap::new(), &subagents),
+            id_set(&["a", "b", "c"])
+        );
+    }
+
+    #[test_case(false; "retained_in_main_history")]
+    #[test_case(true; "retained_in_child_history")]
+    fn reachability_preserves_compaction_retained_ids(nested: bool) {
+        let retained = expand_message(
+            &Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+                retained_subagent_ids: vec!["retained".into()],
+                is_compaction_summary: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let subagents = [subagent("root-child", None, Some("retained"))];
+        let mut histories = HashMap::from([(
+            "retained".into(),
+            Arc::new(call_history("tail", "task", json!({}))),
+        )]);
+        let mut expected = id_set(&["retained", "root-child", "tail"]);
+        let items = if nested {
+            histories.insert("launch".into(), Arc::new(retained));
+            expected.insert("launch".into());
+            call_history("launch", "task", json!({}))
+        } else {
+            retained
+        };
+        assert_eq!(
+            reachable_subagent_ids(&items, &histories, &HashMap::new(), &subagents),
+            expected
+        );
+    }
+
+    #[test_case("task", false; "task_input")]
+    #[test_case("task", true; "typed_task_output")]
+    #[test_case("batch", true; "typed_batch_output")]
+    fn reachability_preserves_stable_task_ids_from_child_history_versions(name: &str, typed: bool) {
+        let items = call_history("launch", "task", json!({}));
+        let histories = HashMap::from([
+            (
+                "launch".into(),
+                Arc::new(call_history(
+                    "version",
+                    name,
+                    json!({"task_id": if typed { "stale" } else { "stable" }}),
+                )),
+            ),
+            (
+                "stable".into(),
+                Arc::new(call_history("tail", "task", json!({}))),
+            ),
+        ]);
+        let mut outputs = HashMap::new();
+        if typed {
+            let card = json!({"Tasks": [{
+                "task_id": "stable", "call_id": "version", "invocation_id": "runtime",
+                "root_call_id": "launch", "label": "task", "state": "succeeded", "mode": "build",
+                "background": true, "generation": 1, "created_at": 0, "updated_at": 0,
+                "result": null, "result_preview": null, "result_truncated": false,
+                "reports": [], "reports_truncated": false
+            }]});
+            let output = if name == "batch" {
+                json!({"Batch": {"entries": [{"tool": "task", "summary": "task", "status": "Success", "output": card}], "text": ""}})
+            } else {
+                card
+            };
+            outputs.insert(
+                "version".into(),
+                Arc::new(serde_json::from_value(output).unwrap()),
+            );
+        }
+        assert_eq!(
+            reachable_subagent_ids(&items, &histories, &outputs, &[]),
+            id_set(&["launch", "version", "stable", "tail"])
+        );
+    }
+
+    fn scanned_reachable_subagent_ids(
+        items: &[HistoryItem],
+        histories: &HashMap<String, Arc<Vec<HistoryItem>>>,
+        tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+        subagents: &[StoredSubagent],
+    ) -> HashSet<String> {
+        let discover = |history: &[HistoryItem]| {
+            let mut ids = tool_call_ids(history);
+            ids.extend(
+                caudra_agent::active_task_history_versions_with_outputs(history, |id| {
+                    tool_outputs.get(id).map(AsRef::as_ref)
+                })
+                .into_keys(),
+            );
+            ids
+        };
+        let mut reachable = discover(items);
+        let mut active_calls = caudra_agent::history_tool_call_ids(items);
+        let mut pending: Vec<_> = reachable.iter().cloned().collect();
+        loop {
+            for subagent in subagents {
+                let linked = subagent.parent_tool_use_id.as_ref().is_some_and(|parent| {
+                    reachable.contains(parent) || active_calls.contains(parent)
+                }) || subagent
+                    .root_tool_use_id
+                    .as_ref()
+                    .is_some_and(|root| active_calls.contains(root));
+                if linked && reachable.insert(subagent.tool_use_id.clone()) {
+                    pending.push(subagent.tool_use_id.clone());
+                }
+            }
+            let Some(task_id) = pending.pop() else {
+                break;
+            };
+            if let Some(history) = histories.get(&task_id) {
+                for id in discover(history) {
+                    if reachable.insert(id.clone()) {
+                        pending.push(id);
+                    }
+                }
+                active_calls.extend(caudra_agent::history_tool_call_ids(history));
+            }
+        }
+        reachable
+    }
+
+    #[test_case(false; "forward_chain")]
+    #[test_case(true; "reverse_chain")]
+    #[ignore = "manual reachability scaling comparison"]
+    fn reachability_scaling(reverse: bool) {
+        let items = call_history("launch", "task", json!({}));
+        let histories = HashMap::new();
+        let outputs = HashMap::new();
+        for size in SCALING_SIZES {
+            let mut subagents = parent_chain(size);
+            if reverse {
+                subagents.reverse();
+            }
+            let started = Instant::now();
+            let reference =
+                scanned_reachable_subagent_ids(&items, &histories, &outputs, &subagents);
+            let scanned = started.elapsed();
+            let started = Instant::now();
+            let indexed = reachable_subagent_ids(&items, &histories, &outputs, &subagents);
+            let elapsed = started.elapsed();
+            assert_eq!(indexed, reference);
+            assert_eq!(indexed.len(), size + 1);
+            eprintln!(
+                "reachability size={size} reverse={reverse} scanned={scanned:?} indexed={elapsed:?}"
+            );
+        }
+    }
 
     /// `turns` more prompts chained onto `items`, the way a producer appends.
     fn with_turns(items: &[HistoryItem], turns: usize) -> Vec<HistoryItem> {

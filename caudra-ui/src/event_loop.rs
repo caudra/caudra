@@ -2246,18 +2246,33 @@ impl<'t> EventLoop<'t> {
     fn paint(&mut self) -> io::Result<CompletedFrame<'_>> {
         let app = &mut self.sessions[self.focused].app;
         let loading = &mut self.loading;
+        let started = loading.is_active().then(Instant::now);
+        let session_id = app.state.session.id;
+        let mut compose_ms = 0;
         app.sync_image_root();
         if let Err(error) = terminal::flush_image_output() {
             tracing::warn!(%error, "image upload failed");
         }
-        self.terminal.draw(|f| {
+        let frame = self.terminal.draw(|f| {
             app.view(f);
             color_compat::downgrade_if_needed(f.buffer_mut());
             app.apply_terminal_links(f.buffer_mut());
+            if let Some(started) = started {
+                compose_ms = started.elapsed().as_millis() as u64;
+            }
             // After composing, which is slow for a transcript just loaded, and
             // before the frame goes out over the card's cells.
             loading.close();
-        })
+        })?;
+        if let Some(started) = started {
+            info!(
+                %session_id,
+                compose_ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                "loaded session first frame"
+            );
+        }
+        Ok(frame)
     }
 
     /// Repaints the focused session, so the card covers what the user was
