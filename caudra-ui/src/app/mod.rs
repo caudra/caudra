@@ -2409,6 +2409,10 @@ impl App {
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
         }
+        if key::ASK_BTW.matches(key) {
+            self.open_btw_prompt();
+            return Some(vec![]);
+        }
         if key::POP_QUEUE.matches(key) {
             return Some(self.run_builtin(BuiltinAction::PopQueue));
         }

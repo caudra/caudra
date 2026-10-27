@@ -23,7 +23,7 @@ use crate::components::{DisplayMessage, DisplayRole};
 use super::{App, HISTORY_UNREADABLE};
 
 const TITLE: &str = " /btw ";
-const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
+pub(super) const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
 pub(super) const TASK_HISTORY_UNAVAILABLE: &str =
     "This task's conversation is not loaded, so /btw cannot read it";
 const CLARIFICATION_REMINDER: &str = "The user is clarifying a pending question form, not answering it. \
@@ -272,6 +272,19 @@ impl App {
             .open_clarification(self.question_form.clarification_context());
     }
 
+    /// `F2`: an empty `/btw` that reads the conversation only once the first
+    /// question is sent, so the answer sees everything up to then.
+    pub(super) fn open_btw_prompt(&mut self) {
+        if self.btw_prompt_for(self.active_subagent_id()).is_none() {
+            self.flash(PROMPT_INITIALIZING.into());
+            return;
+        }
+        self.close_stream_modal();
+        self.autoscroll = None;
+        self.selection_state = None;
+        self.stream_modal.open_ask();
+    }
+
     pub(super) fn discard_question_btw(&mut self) {
         if self.stream_modal.is_clarification() {
             self.close_stream_modal();
@@ -444,8 +457,13 @@ impl App {
             .stream_modal
             .is_clarification()
             .then(|| self.question_form.clarification_context());
-        if context.is_some() && self.btw_thread.is_none() {
-            let Some(thread) = self.capture_btw_thread(self.question_asker()) else {
+        if self.btw_thread.is_none() {
+            let asker = if context.is_some() {
+                self.question_asker()
+            } else {
+                self.active_subagent_id().map(str::to_owned)
+            };
+            let Some(thread) = self.capture_btw_thread(asker) else {
                 self.stream_modal.handle_paste(&question);
                 return;
             };

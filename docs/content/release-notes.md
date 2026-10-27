@@ -12,10 +12,12 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 [v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)
 
 - The keybindings list filters as you type after `/`, and shows modifiers as compact symbols.
+- `F2` opens an empty `/btw`, so a side question no longer needs the command typed first.
 
 ### Changes
 
 - **Filter the keybindings list.** In the `F1` list, press `/` and type to keep only the keys whose action, key, or section matches every word. `Enter` keeps the filter and `Esc` clears it. The list is wider, every section starts at the same column, and modifiers show as `⌃`, `⇧`, `⌥`, and `⌘`. Typing `ctrl` or `shift` still finds them. See [Keybindings](/docs/keybindings/).
+- **`F2` asks a side question.** Outside a modal, `F2` opens an empty `/btw` that reads the conversation, or the focused task's, when you send. A question you close without sending comes back on the next `F2`. See [Commands](/docs/commands/).
 
 ## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
 

@@ -1,3 +1,4 @@
+use std::mem;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,8 @@ const INPUT_ROW: u16 = 1;
 const FOOTER_ROW: u16 = 1;
 const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
 const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
+const ASK_TITLE: &str = " /btw · Side question ";
+const ASK_PLACEHOLDER: &str = "Ask about this conversation…";
 const BACK_HINT: &str = " Back to questions";
 const COMPACT_BACK_HINT: &str = " Back";
 const INITIAL_SEND_HINT: &str = " Send";
@@ -121,6 +124,15 @@ const CLARIFICATION_FOOTER: [StreamControl; 3] = [
         hint: COPY_HINT,
         command: StreamCommand::Copy,
     },
+];
+/// Before the first question there is nothing to copy or follow up.
+const ASK_FOOTER: [StreamControl; 2] = [
+    StreamControl {
+        label: SEND_LABEL,
+        hint: INITIAL_SEND_HINT,
+        command: StreamCommand::Send,
+    },
+    CLOSE_CONTROL,
 ];
 
 /// What a finished side request cost. It reaches the session ledger through
@@ -354,6 +366,9 @@ pub struct StreamModal {
     /// A follow-up typed while the answer was still streaming, held until the
     /// host can extend the thread with it.
     queued: Option<String>,
+    /// What a dismissed side question left unsent, until the next
+    /// [`StreamModal::open_ask`]. Outlives [`StreamModal::close`].
+    parked_draft: String,
     popup: Rect,
     /// The thread's lines as the last frame wrapped them into `viewport`,
     /// which is what a press is read back against.
@@ -384,6 +399,7 @@ impl StreamModal {
             progress: None,
             rate: PromptRate::default(),
             queued: None,
+            parked_draft: String::new(),
             popup: Rect::default(),
             body: Vec::new(),
             parts: Vec::new(),
@@ -418,12 +434,43 @@ impl StreamModal {
         self.open = true;
     }
 
+    /// An empty side question that asks nothing until the first Enter, opened
+    /// on whatever the last one left unsent.
+    pub(crate) fn open_ask(&mut self) {
+        self.close();
+        self.open = true;
+        self.title = ASK_TITLE;
+        self.footer = StreamFooter::FollowUp;
+        let draft = mem::take(&mut self.parked_draft);
+        self.input.set_text(&draft);
+    }
+
+    pub(crate) fn forget_parked_draft(&mut self) {
+        self.parked_draft.clear();
+    }
+
     pub(crate) fn is_clarification(&self) -> bool {
         self.context.is_some()
     }
 
+    /// The follow-up queued behind a streaming answer, with whatever was typed
+    /// after it, so neither is lost when the modal goes away.
+    fn take_unsent(&mut self) -> Option<String> {
+        let queued = self.queued.take()?;
+        let draft = self.input.text();
+        Some(if draft.trim().is_empty() || draft.trim() == queued {
+            queued
+        } else {
+            format!("{queued}{DRAFT_SEPARATOR}{draft}")
+        })
+    }
+
     pub(crate) fn dismiss(&mut self) {
         if !self.is_clarification() {
+            let unsent = self.take_unsent().unwrap_or_else(|| self.input.text());
+            if !unsent.trim().is_empty() {
+                self.parked_draft = unsent;
+            }
             self.close();
             return;
         }
@@ -431,14 +478,8 @@ impl StreamModal {
         if self.is_streaming() {
             self.stop();
         }
-        if let Some(queued) = self.queued.take() {
-            let draft = self.input.text();
-            if draft.trim().is_empty() {
-                self.input.set_text(&queued);
-            } else if draft.trim() != queued {
-                self.input
-                    .set_text(&format!("{queued}{DRAFT_SEPARATOR}{draft}"));
-            }
+        if let Some(unsent) = self.take_unsent() {
+            self.input.set_text(&unsent);
         }
         self.open = false;
         self.footer_hits.reset();
@@ -905,6 +946,7 @@ impl StreamModal {
         match self.footer {
             StreamFooter::Close => &CLOSE_FOOTER,
             StreamFooter::Copy => &COPY_FOOTER,
+            StreamFooter::FollowUp if self.exchanges.is_empty() => &ASK_FOOTER,
             StreamFooter::FollowUp => &FOLLOW_UP_FOOTER,
         }
     }
@@ -1148,6 +1190,7 @@ impl StreamModal {
             None if !self.is_streaming() && self.is_clarification() => {
                 Some(CLARIFICATION_PLACEHOLDER.to_owned())
             }
+            None if self.exchanges.is_empty() => Some(ASK_PLACEHOLDER.to_owned()),
             None => self.is_streaming().then(|| WAITING_PLACEHOLDER.to_owned()),
         }
     }
@@ -2521,6 +2564,76 @@ mod tests {
         assert!(!m.is_open() && !m.is_clarification());
         assert!(m.exchanges.is_empty());
         assert!(m.text().is_empty());
+    }
+
+    #[test]
+    fn ask_opens_an_empty_composer_that_offers_only_send_and_close() {
+        let mut m = StreamModal::new(0);
+        m.open_ask();
+        assert!(m.is_open() && m.text_input_active() && !m.is_clarification());
+        assert!(!m.is_streaming() && m.exchanges.is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains(ASK_TITLE.trim()), "{screen}");
+        assert!(screen.contains(ASK_PLACEHOLDER), "{screen}");
+        assert!(screen.contains(&format!("{SEND_LABEL}{INITIAL_SEND_HINT}")));
+        assert!(screen.contains(&format!("{ESC_LABEL}{CLOSE_HINT}")));
+        assert!(!screen.contains(COPY_HINT.trim()), "{screen}");
+
+        assert!(matches!(
+            m.handle_key(key_ev(KeyCode::Enter)),
+            StreamAction::Consumed
+        ));
+        assert!(!m.is_open());
+    }
+
+    #[test_case(None, DRAFT, DRAFT.to_owned() ; "unsent_question")]
+    #[test_case(Some(DRAFT), "", DRAFT.to_owned() ; "queued_follow_up")]
+    #[test_case(
+        Some(DRAFT),
+        NEWER_DRAFT,
+        format!("{DRAFT}{DRAFT_SEPARATOR}{NEWER_DRAFT}")
+        ; "queued_and_typed"
+    )]
+    fn a_dismissed_ask_parks_what_it_left_unsent(
+        queued: Option<&str>,
+        typed: &str,
+        expected: String,
+    ) {
+        let mut m = StreamModal::new(0);
+        m.open_ask();
+        let _stream = queued.map(|question| {
+            let stream = follow_up(&mut m, HEADER);
+            type_text(&mut m, question);
+            assert!(matches!(
+                m.handle_key(key_ev(KeyCode::Enter)),
+                StreamAction::Consumed
+            ));
+            stream
+        });
+        type_text(&mut m, typed);
+
+        m.dismiss();
+        assert!(!m.is_open() && m.exchanges.is_empty());
+        m.close();
+        m.open_ask();
+
+        assert_eq!(m.input_text(), expected);
+        assert!(m.exchanges.is_empty() && !m.is_streaming());
+    }
+
+    #[test]
+    fn a_forgotten_parked_draft_does_not_come_back() {
+        let mut m = StreamModal::new(0);
+        m.open_ask();
+        type_text(&mut m, DRAFT);
+        m.dismiss();
+
+        m.forget_parked_draft();
+        m.open_ask();
+
+        assert!(m.input_text().is_empty());
     }
 
     #[test]

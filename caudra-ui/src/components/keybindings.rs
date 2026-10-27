@@ -178,7 +178,7 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "F1",
     };
-    pub const QUESTION_ASK_BTW: Bind = Bind {
+    pub const ASK_BTW: Bind = Bind {
         code: KeyCode::F(2),
         modifiers: KeyModifiers::NONE,
         label: "F2",
@@ -837,6 +837,11 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::General,
     },
     Keybind {
+        label: KeyLabel::Single(key::ASK_BTW.label),
+        description: "Ask a /btw side question about this chat",
+        context: KeybindContext::General,
+    },
+    Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search this chat or past sessions",
         context: KeybindContext::General,
@@ -1236,7 +1241,7 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::FormInput,
     },
     Keybind {
-        label: KeyLabel::Single(key::QUESTION_ASK_BTW.label),
+        label: KeyLabel::Single(key::ASK_BTW.label),
         description: "Ask /btw about a pending question without answering it",
         context: KeybindContext::FormInput,
     },

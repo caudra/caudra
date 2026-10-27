@@ -33,6 +33,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X` | Leader: lists the chords below, then runs the one you press |
 | `F1` / `Ctrl+X ?` | Show keybindings |
 | `F1` | In a modal with a ? on its border: open its docs above it |
+| `F2` | Ask a /btw side question about this chat |
 | `Ctrl+F` | Search this chat or past sessions |
 | `Ctrl+X y` | Copy last reply as markdown |
 | `Ctrl+X r` | Review the last reply |

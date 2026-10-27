@@ -302,6 +302,8 @@ Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bo
 
   In a task's chat, `/btw` reads that task's conversation and continues its cached prompt. A task that ran before Caudra restarted is read with the main session's prompt instead.
 
+  Press `F2` in a chat, with no modal open, to open an empty `/btw` and type the question there. It reads the conversation when you send it, not when the modal opens, and leaves the composer's draft alone. In a task's chat, including a finished one, it asks about that task. If you close it with a question typed but not sent, or with a follow-up still queued, the next `F2` brings the text back until the session changes.
+
   While a question form is waiting, press `F2` or click `Ask /btw` to clarify its choices. A question from a task or subagent is clarified over that task's conversation. `Esc` returns to the unchanged form and stops any streaming side response. Reopening restores the clarification thread until the form is submitted, dismissed, or cancelled.
 - **`/catchup`**: a `/btw` that brings you back up to speed when you have lost track of the session, after time away or while running several at once. The answer opens with the goal and where things stand, then lists what needs you, what the agent is doing now, what is done, what was decided, and what is still open, leaving out any that are empty. Add a few words after the command, such as `/catchup the migration`, to narrow it. Follow-ups and copying work as in `/btw`, and nothing enters history.
 - **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).

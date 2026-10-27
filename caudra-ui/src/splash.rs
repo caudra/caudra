@@ -26,7 +26,10 @@ const TIPS: &[(&str, &str)] = &[
     ),
     ("/tasks", "to see what your subagents are up to"),
     (key::SEARCH.label, "to find things in the conversation"),
-    ("/btw", "to ask something without interrupting the session"),
+    (
+        key::ASK_BTW.label,
+        "to ask something without interrupting the session",
+    ),
     ("/memory", "to view, edit, and delete persistent notes"),
     ("/cd", "to switch to a different directory"),
 ];
