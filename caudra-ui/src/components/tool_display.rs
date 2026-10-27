@@ -35,7 +35,7 @@ use jiff::tz::TimeZone;
 use caudra_markdown::render::truncate_long_lines;
 use caudra_providers::{TokenScale, token_label};
 
-use crate::inline_image::{self, ImageRef, ImageSpan};
+use crate::inline_image::ImageSpan;
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::prompt::profile::BUILTIN_PROFILE_NAME;
@@ -66,7 +66,6 @@ const JSON_ESCAPE_CHARS: usize = 6;
 const REPORT_TOOL_NAME: &str = "report_to_parent";
 const TASK_CONTROL_TOOL_NAME: &str = "task_control";
 const REPORT_BLOCKED: &str = "Blocked";
-const IMAGE_MISSING_PREFIX: &str = "[image missing: ";
 const REPORT_TITLE_MAX_CHARS: usize = 80;
 
 pub(crate) fn task_details(task: &TaskCard) -> String {
@@ -2482,6 +2481,11 @@ impl ToolLineBuilder {
                 .into_iter()
                 .map(|span| span.shift_lines(start)),
         );
+        self.images
+            .extend(content.images.into_iter().map(|image| ImageSpan {
+                rows: image.rows.start + start..image.rows.end + start,
+                ..image
+            }));
     }
 
     /// The window this card's own body is drawn in. A child's comes back from
@@ -2683,34 +2687,17 @@ impl ToolLineBuilder {
     /// The picture a tool showed or saved, drawn under its caption. A saved
     /// file that is gone since says so instead.
     fn push_picture(&mut self, output: Option<&ToolOutput>) {
-        let image = match output {
-            Some(ToolOutput::Image { source, .. }) => ImageRef::from_source(source, ""),
-            Some(ToolOutput::SavedImage { path, .. }) => {
-                let file = Path::new(path);
-                if !file.exists() {
-                    let dim = theme::current().tool_dim;
-                    self.lines.push(Line::from(vec![
-                        Span::styled(self.body_indent, dim),
-                        Span::styled(format!("{IMAGE_MISSING_PREFIX}{path}]"), dim),
-                    ]));
-                    return;
-                }
-                ImageRef::from_file(file, "")
-            }
-            _ => return,
-        };
-        let Some(image) = image else {
-            return;
-        };
-        let Some(drawn) = inline_image::draw(&image, self.body_width()) else {
+        let Some((drawn, image)) =
+            output.and_then(|output| code_view::picture_lines(output, self.body_width()))
+        else {
             return;
         };
         let start = self.lines.len();
         self.lines.extend(indented(drawn, self.body_indent));
-        self.images.push(ImageSpan {
+        self.images.extend(image.map(|image| ImageSpan {
             rows: start..self.lines.len(),
             image,
-        });
+        }));
     }
 
     /// The markdown renderer keeps its own provenance against the text it
@@ -3478,7 +3465,7 @@ pub fn build_tool_lines(
         }
         b.push_resolved_output(&resolved);
     }
-    if status == ToolStatus::Success && !rctx.compact {
+    if status == ToolStatus::Success {
         b.push_picture(msg.tool_output.as_deref());
     }
     if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
@@ -3767,6 +3754,7 @@ mod tests {
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
+    use crate::components::code_view::IMAGE_MISSING_PREFIX;
     use crate::components::command_text::deferring;
     use crate::components::command_text::tests::{
         NOT_TOLD_APART, assert_command_coloured, coloured,
@@ -9671,7 +9659,7 @@ mod tests {
     const SAVED_PICTURE: &str = "saved.png";
     const SAVED_TEXT: &str = "Generated image saved to saved.png";
     const PICTURE_SIDE: u32 = 32;
-    const NO_CARD_PICTURE: &str = "a settled card draws its picture only when open and not compact";
+    const NO_CARD_PICTURE: &str = "a settled card draws its picture whenever it is open";
 
     #[derive(Clone, Copy, Debug)]
     enum Shown {
@@ -9706,7 +9694,7 @@ mod tests {
 
     #[test_case(Shown::Bytes, ToolStatus::Success, false, true ; "viewed_bytes")]
     #[test_case(Shown::SavedFile, ToolStatus::Success, false, true ; "saved_file")]
-    #[test_case(Shown::SavedFile, ToolStatus::Success, true, false ; "compact_card")]
+    #[test_case(Shown::SavedFile, ToolStatus::Success, true, true ; "compact_card")]
     #[test_case(Shown::SavedFile, ToolStatus::Error, false, false ; "failed_call")]
     #[test_case(Shown::MissingFile, ToolStatus::Success, false, false ; "missing_file")]
     fn a_picture_card_reserves_rows_for_its_picture(

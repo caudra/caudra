@@ -15446,3 +15446,133 @@ fn copying_a_picture_card_names_the_file_instead_of_its_glyphs() {
     );
     assert!(!copied.contains(PIXEL_SYMBOL), "{COPIED_GLYPHS}: {copied}");
 }
+
+const VIEWED_PICTURE_TEXT: &str = "[image: shot.png 1 KB 32x32]";
+const PICTURE_RESTS_MSG: &str =
+    "a picture rests open under its row outside compact, and folded in compact";
+const PICTURE_FOLDS_MSG: &str = "a click on a picture's row folds it, and the next opens it again";
+const BATCH_PICTURE_CLICK_MSG: &str = "a click on a batch child's picture did not reach it";
+
+fn viewed_picture() -> ToolOutput {
+    ToolOutput::Image {
+        source: png_source(PROMPT_PICTURE_SIDE, PROMPT_PICTURE_SIDE),
+        text: VIEWED_PICTURE_TEXT.into(),
+    }
+}
+
+fn picture_area() -> Rect {
+    Rect::new(0, 0, PICTURE_PANEL.0, PICTURE_PANEL.1)
+}
+
+fn pictures_drawn(panel: &MessagesPanel) -> usize {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .map_or(0, |segment| segment.images().len())
+}
+
+/// A batch whose one child viewed a picture.
+fn panel_with_batch_picture(view: ViewMode) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
+    panel.set_view(view);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![caudra_agent::BatchToolEntry {
+                output: Some(viewed_picture()),
+                ..batch_child(VIEW_IMAGE_TOOL_NAME, "a")
+            }],
+            text: String::new(),
+        },
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    panel
+}
+
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn a_view_image_card_rests_open_and_folds_like_a_file_read(view: ViewMode, rests_open: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(start(TOOL_ID, VIEW_IMAGE_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        tool: VIEW_IMAGE_TOOL_NAME.into(),
+        output: viewed_picture(),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    let area = picture_area();
+    assert_eq!(
+        panel.card_closed(TOOL_ID),
+        !rests_open,
+        "{PICTURE_RESTS_MSG}"
+    );
+    assert_eq!(
+        pictures_drawn(&panel),
+        usize::from(rests_open),
+        "{PICTURE_RESTS_MSG}"
+    );
+
+    for open in [!rests_open, rests_open] {
+        assert!(
+            panel.toggle_expansion_at(area.y, area),
+            "{PICTURE_FOLDS_MSG}"
+        );
+        render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+        assert_eq!(panel.card_closed(TOOL_ID), !open, "{PICTURE_FOLDS_MSG}");
+        assert_eq!(
+            pictures_drawn(&panel),
+            usize::from(open),
+            "{PICTURE_FOLDS_MSG}"
+        );
+    }
+}
+
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn a_batch_picture_child_rests_open_and_folds(view: ViewMode, rests_open: bool) {
+    let mut panel = panel_with_batch_picture(view);
+    let area = picture_area();
+    assert_eq!(
+        pictures_drawn(&panel),
+        usize::from(rests_open),
+        "{PICTURE_RESTS_MSG}"
+    );
+
+    for open in [!rests_open, rests_open] {
+        assert!(
+            panel.handle_click(batch_child_row(&panel, 0), area),
+            "{PICTURE_FOLDS_MSG}"
+        );
+        render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+        assert_eq!(
+            pictures_drawn(&panel),
+            usize::from(open),
+            "{PICTURE_FOLDS_MSG}"
+        );
+    }
+}
+
+#[test]
+fn a_click_on_a_batch_childs_picture_opens_it() {
+    let mut panel = panel_with_batch_picture(ViewMode::Expanded);
+    decode_queued();
+    let _ = panel.tick();
+    let terminal = render(&mut panel, PICTURE_PANEL.0, PICTURE_PANEL.1);
+    let buffer = terminal.backend().buffer();
+
+    let (column, row) = (0..buffer.area.height)
+        .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
+        .find(|&at| buffer[at].symbol() == PIXEL_SYMBOL)
+        .expect(BATCH_PICTURE_CLICK_MSG);
+
+    assert!(
+        panel.image_at(row, column, buffer.area).is_some(),
+        "{BATCH_PICTURE_CLICK_MSG}"
+    );
+}

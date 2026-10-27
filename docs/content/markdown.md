@@ -239,6 +239,8 @@ Interactive targets must use HTTP or HTTPS, include a host, and contain no contr
 
 The transcript draws pictures as thumbnails up to 16 rows tall. They appear on `view_image` and `image_generate` tool cards, for Markdown images such as `![plot](out/plot.png)`, and under a prompt you sent with attached images.
 
+A tool card rests with its picture open, inside a batch too, except in the compact view. A `view_image` call is a row with its picture under it, and a click on the row folds the picture or opens it again. To keep pictures folded until you click, add `view_image` to `[ui] always_collapsed`.
+
 Markdown images load only from local files. A relative path resolves against the session's working directory, and a `file:` URL works too. Caudra never fetches an image over the network, and a session on a remote workspace never reads this machine's disk. When a picture cannot be drawn, its alt text stays as a label.
 
 Click a picture to open the image viewer. Each image attached to a draft shows as an `[Image #1]` chip under the composer, and a click on a chip opens the same viewer.

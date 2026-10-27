@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::animation::live_elapsed;
 use crate::highlight::{fallback_span, highlight_line};
+use crate::inline_image::{self, ImageRef, ImageSpan};
 use crate::markdown::{
     LinkMap, expand_notice, should_truncate, text_to_wrapped, truncation_notice,
 };
@@ -30,7 +31,7 @@ use super::{
 use caudra_agent::code::output::CodeOutput;
 use caudra_agent::tools::{
     CODE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
-    timeout_annotation,
+    VIEW_IMAGE_TOOL_NAME, timeout_annotation,
 };
 use caudra_agent::types::{AnswerSheet, TodoItem, TodoStatus};
 use caudra_agent::{
@@ -76,6 +77,11 @@ const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
+pub(crate) const IMAGE_MISSING_PREFIX: &str = "[image missing: ";
+/// The tools whose card is a row with its picture under it, folded and opened
+/// from that row the way a read's is, rather than a card that rests open with
+/// no row to fold back to.
+const PICTURE_ROW_TOOLS: &[&str] = &[VIEW_IMAGE_TOOL_NAME];
 const QUEUED_ANNOTATION: &str = "queued";
 /// What the markdown renderer calls a width it should not wrap to.
 pub(super) const UNCONSTRAINED_WIDTH: u16 = 0;
@@ -1096,6 +1102,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
     let mut links = LinkMap::default();
     let mut spans_out = Vec::new();
     let mut chips = Vec::new();
+    let mut images = Vec::new();
     let mut trace = SourceTrace::default();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
@@ -1304,6 +1311,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             if let Some(span) = body.span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
+            images.extend(shifted_images(body.images, lines.len()));
             rows.extend((0..body.lines.len()).map(|row| {
                 if let Some(Some(RowTarget::Raw(_))) = body.rows.get(row) {
                     Some(RowTarget::Raw(index))
@@ -1344,6 +1352,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         rows,
         spans: spans_out,
         chips,
+        images,
     }
 }
 
@@ -1533,6 +1542,7 @@ struct BatchCard {
     spans: Vec<ScrollSpan>,
     source: Option<BodySource>,
     chips: Vec<ChildChips>,
+    images: Vec<ImageSpan>,
 }
 
 /// Where a batch child's decision chips landed: the line holding them, the
@@ -1663,7 +1673,13 @@ fn child_body(
             source,
             truncation: false,
             span: None,
+            images: Vec::new(),
         };
+    }
+    if entry.status != BatchToolStatus::Error
+        && let Some(picture) = output.and_then(|output| picture_body(output, limits.width))
+    {
+        return picture;
     }
     if entry.status != BatchToolStatus::Error
         && let Some(ToolOutput::Markdown(text)) = output
@@ -1725,7 +1741,6 @@ fn child_body(
             Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
                 Some(plain_body(&text.text, limits.width))
             }
-            Some(ToolOutput::SavedImage { text, .. }) => Some(plain_body(text, limits.width)),
             Some(ToolOutput::Shell(shell)) => Some(plain_body(&shell.raw_text(), limits.width)),
             _ => None,
         }
@@ -1766,6 +1781,7 @@ struct ChildBody {
     source: Option<BodySource>,
     truncation: bool,
     span: Option<ScrollSpan>,
+    images: Vec<ImageSpan>,
 }
 
 impl ChildBody {
@@ -1778,10 +1794,14 @@ impl ChildBody {
             source: Some(source),
             truncation: false,
             span: None,
+            images: Vec::new(),
         }
     }
 
+    /// A picture cut by the kept rows is dropped whole: its rows would no
+    /// longer draw the picture its span names.
     fn keep_rows(&mut self, kept: Range<usize>) {
+        self.images = kept_images(std::mem::take(&mut self.images), &kept);
         self.highlights.retain_mut(|region| region.keep(&kept));
         self.links.rows = self
             .links
@@ -1839,6 +1859,7 @@ impl From<ToolContent> for ChildBody {
             source: content.source,
             truncation: content.truncation,
             span: None,
+            images: content.images,
         }
     }
 }
@@ -1866,6 +1887,8 @@ fn stacked(top: ChildBody, body: ChildBody, gap: bool) -> ChildBody {
     rows.resize(shift, None);
     rows.extend(body.rows);
     lines.extend(body.lines);
+    let mut images = top.images;
+    images.extend(shifted_images(body.images, shift));
     // The two halves were painted from different texts, so their ranges are
     // rebased onto the one the card ends up holding rather than spliced.
     let mut trace = SourceTrace::default();
@@ -1883,7 +1906,88 @@ fn stacked(top: ChildBody, body: ChildBody, gap: bool) -> ChildBody {
         rows,
         truncation: top.truncation || body.truncation,
         span: body.span.map(|span| span.shift_lines(shift)),
+        images,
     }
+}
+
+fn shifted_images(images: Vec<ImageSpan>, shift: usize) -> impl Iterator<Item = ImageSpan> {
+    images.into_iter().map(move |image| ImageSpan {
+        rows: image.rows.start + shift..image.rows.end + shift,
+        ..image
+    })
+}
+
+/// The pictures wholly inside `kept`, rebased onto its first row.
+fn kept_images(images: Vec<ImageSpan>, kept: &Range<usize>) -> Vec<ImageSpan> {
+    images
+        .into_iter()
+        .filter(|image| kept.start <= image.rows.start && image.rows.end <= kept.end)
+        .map(|image| ImageSpan {
+            rows: image.rows.start - kept.start..image.rows.end - kept.start,
+            ..image
+        })
+        .collect()
+}
+
+/// The picture a tool showed or saved, drawn to `width` columns, with what a
+/// click on it opens. A saved file that is gone since says so instead, and
+/// has nothing to open.
+pub(crate) fn picture_lines(
+    output: &ToolOutput,
+    width: u16,
+) -> Option<(Vec<Line<'static>>, Option<ImageRef>)> {
+    let image = match output {
+        ToolOutput::Image { source, .. } => ImageRef::from_source(source, ""),
+        ToolOutput::SavedImage { path, .. } => {
+            let file = Path::new(path);
+            if !file.exists() {
+                let missing = Span::styled(
+                    format!("{IMAGE_MISSING_PREFIX}{path}]"),
+                    theme::current().tool_dim,
+                );
+                return Some((vec![Line::from(missing)], None));
+            }
+            ImageRef::from_file(file, "")
+        }
+        _ => None,
+    }?;
+    let drawn = inline_image::draw(&image, width)?;
+    Some((drawn, Some(image)))
+}
+
+/// A child that showed or saved a picture: a saved file's caption, then the
+/// picture under it. The row already says what a viewed picture is.
+fn picture_body(output: &ToolOutput, width: u16) -> Option<ChildBody> {
+    let caption = match output {
+        ToolOutput::Image { .. } => None,
+        ToolOutput::SavedImage { text, .. } => Some(plain_body(text, width)),
+        _ => return None,
+    };
+    let mut trace = SourceTrace::default();
+    let mut lines = Vec::new();
+    if let Some((caption, source)) = caption {
+        trace.record(0, source);
+        lines = caption;
+    }
+    let mut images = Vec::new();
+    if let Some((drawn, image)) = picture_lines(output, width) {
+        let start = lines.len();
+        lines.extend(drawn);
+        images.extend(image.map(|image| ImageSpan {
+            rows: start..lines.len(),
+            image,
+        }));
+    }
+    Some(ChildBody {
+        highlights: Vec::new(),
+        links: LinkMap::none_for(&lines),
+        rows: vec![None; lines.len()],
+        source: trace.finish(&lines),
+        lines,
+        truncation: false,
+        span: None,
+        images,
+    })
 }
 
 /// Whether an opened child's body prints its summary row again. A shell or
@@ -3359,17 +3463,21 @@ pub(crate) fn code_child_rests_open(
     rests_open(policy, entry) || (!policy.compact && output.stands_in(index))
 }
 
-/// Whether a child that is a recognised server's answer rests whole: Caudra
-/// draws that card to be read, and three rows of it say next to nothing.
-/// Unlike [`always_whole`] a click still folds it, and compact and the
-/// always-collapsed list fold it the way they fold its own card.
+/// Whether a child rests whole: a recognised server's answer, which Caudra
+/// draws to be read and three rows of which say next to nothing, or a picture,
+/// which is what the call was for. Unlike [`always_whole`] a click still folds
+/// it, and compact and the always-collapsed list fold it the way they fold its
+/// own card.
 pub(crate) fn rests_open(policy: &CardPolicy, entry: &BatchToolEntry) -> bool {
     !policy.compact
         && !policy.stays_collapsed(&entry.tool, entry.effect)
-        && matches!(
-            &entry.output,
-            Some(ToolOutput::Mcp(McpOutput { kind: Some(_), .. }))
-        )
+        && match &entry.output {
+            Some(ToolOutput::Mcp(McpOutput { kind: Some(_), .. })) => true,
+            Some(ToolOutput::Image { .. } | ToolOutput::SavedImage { .. }) => {
+                entry.status == BatchToolStatus::Success
+            }
+            _ => false,
+        }
 }
 
 fn index_set(indices: impl IntoIterator<Item = usize>) -> Arc<[usize]> {
@@ -3515,6 +3623,16 @@ impl CardPolicy {
                 None => names_tool(pattern, tool),
             }
         })
+    }
+
+    /// Whether this call's card is drawn as a row in every view: one no mode
+    /// opens, or a picture's, which rests open under its row so a click there
+    /// can fold it.
+    pub fn draws_as_row(&self, tool: &str, effect: ToolEffect) -> bool {
+        self.stays_collapsed(tool, effect)
+            || PICTURE_ROW_TOOLS
+                .iter()
+                .any(|known| names_tool(known, tool))
     }
 
     /// Whether this tool's body is drawn in a fixed window rather than
@@ -3957,6 +4075,7 @@ pub struct ToolContent {
     /// changes the span count of every code row.
     pub source: Option<BodySource>,
     pub chips: Vec<ChildChips>,
+    pub(crate) images: Vec<ImageSpan>,
 }
 
 /// Where one window sits in a body, and how far into that body it sits, so a
@@ -4051,6 +4170,7 @@ pub fn render_tool_content(
     let mut output_source: Option<BodySource> = None;
     let mut output_links = LinkMap::default();
     let mut output_chips = Vec::new();
+    let mut output_images = Vec::new();
     let drawn_script = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
             (language, code)
@@ -4210,6 +4330,7 @@ pub fn render_tool_content(
             output_source = card.source;
             output_links = card.links;
             output_chips = card.chips;
+            output_images = card.images;
             (card.lines, false)
         }
         Some(ToolOutput::Code(output)) => {
@@ -4220,6 +4341,7 @@ pub fn render_tool_content(
             output_source = card.source;
             output_links = card.links;
             output_chips = card.chips;
+            output_images = card.images;
             (card.lines, truncated)
         }
         Some(ToolOutput::Mcp(output)) => {
@@ -4307,6 +4429,7 @@ pub fn render_tool_content(
             scroll_spans,
             source,
             chips,
+            images: shifted_images(output_images, body_start).collect(),
         },
         limits.width,
     )
@@ -4367,6 +4490,7 @@ pub(crate) fn render_mcp_content(
             scroll_spans: Vec::new(),
             source,
             chips: Vec::new(),
+            images: Vec::new(),
         },
         limits.width,
     );
@@ -4431,6 +4555,14 @@ fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
             .map(|chips| ChildChips {
                 line: wrapped.row_of(chips.line),
                 ..chips
+            })
+            .collect(),
+        images: content
+            .images
+            .into_iter()
+            .map(|image| ImageSpan {
+                rows: wrapped.row_of(image.rows.start)..wrapped.row_of(image.rows.end),
+                ..image
             })
             .collect(),
     }
@@ -4875,6 +5007,7 @@ mod tests {
             }]),
             source: None,
             chips: Vec::new(),
+            images: Vec::new(),
         };
 
         let wrapped = wrapped_content(content, CODE_CARD_WIDTH);
@@ -9486,5 +9619,55 @@ mod tests {
         let wrapped = WrappedRows::new(lines, 0, ROWS_OF_WIDTH);
 
         assert_eq!(wrapped.rows_of(&[0, 1, 2, 3, 9]), [0, 3, 4, 6, 6]);
+    }
+
+    const PICTURE_CARD_WIDTH: u16 = 30;
+    const PICTURE_SIDE: u32 = 32;
+    const WRAPPING_SUMMARY: &str = "a summary long enough to wrap the row above the picture";
+    const PICTURE_ROWS_MSG: &str =
+        "a child's picture spans exactly the rows that draw it, after indent and wrap";
+
+    #[test]
+    fn a_batch_childs_picture_spans_only_its_own_rows() {
+        let wrapping = BatchToolEntry {
+            summary: WRAPPING_SUMMARY.into(),
+            ..batch_entry("read", 0)
+        };
+        let picture = BatchToolEntry {
+            output: Some(ToolOutput::Image {
+                source: inline_image::tests::png_source(PICTURE_SIDE, PICTURE_SIDE),
+                text: String::new(),
+            }),
+            ..batch_entry(VIEW_IMAGE_TOOL_NAME, 0)
+        };
+        let output = ToolOutput::Batch {
+            entries: vec![wrapping, picture],
+            text: String::new(),
+        };
+        let limits = limits(BatchViews::default()).with_width(PICTURE_CARD_WIDTH);
+        render_tool_content(None, Some(&output), false, limits.clone());
+        inline_image::tests::decode_queued();
+
+        let content = render_tool_content(None, Some(&output), false, limits);
+
+        let [span] = content.images.as_slice() else {
+            panic!("{PICTURE_ROWS_MSG}: {} pictures", content.images.len());
+        };
+        let pixel_rows: Vec<usize> = content
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans
+                    .iter()
+                    .any(|span| inline_image::is_pixel(span.style))
+            })
+            .map(|(row, _)| row)
+            .collect();
+        assert_eq!(
+            pixel_rows,
+            span.rows.clone().collect::<Vec<_>>(),
+            "{PICTURE_ROWS_MSG}"
+        );
     }
 }

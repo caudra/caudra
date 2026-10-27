@@ -21,6 +21,10 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **`F2` asks a side question.** Outside a modal, `F2` opens an empty `/btw` that reads the conversation, or the focused task's, when you send. A question you close without sending comes back on the next `F2`. See [Commands](/docs/commands/).
 - **A footer row for messages.** On a terminal at least 30 rows tall, the footer has a third row for errors, retries, notices, `waiting for background work`, and the chips that wait on you, such as `[? 2]` or `[caudra.toml invalid]`. The row stays empty when there is nothing to say, so the composer never moves. A message too long for the row is cut in the middle, and resting the mouse on it shows the whole text. Chips with no room fold into a `[+N]` chip that lists them and opens the first on a click. With two rows or one, messages get only the space left once the meters reach their short form. The account chip now sits beside the spend, and it shortens to its quota before the price gives way. See [Quick start](/docs/quick-start/).
 
+### Fixes
+
+- **Pictures in batches fold and open.** A `view_image` call inside a batch shows its picture, which opening the row used to leave blank. A `view_image` call is now a row in every view, with its picture open under it outside the compact view, and a click on the row folds or opens it like a `file_read`. See [Images](/docs/markdown/#images).
+
 ## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
 
 [v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)

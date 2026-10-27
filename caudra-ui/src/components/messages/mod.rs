@@ -1286,10 +1286,11 @@ impl MessagesPanel {
     }
 
     /// Whether this call is drawn as a one-line row rather than a card. The
-    /// mode answers for most tools; an always-collapsed one answers for
-    /// itself, so expanded draws it as the row it would be anywhere else.
+    /// mode answers for most tools; an always-collapsed one and a picture
+    /// answer for themselves, so expanded draws them as the row they would be
+    /// anywhere else.
     fn draws_compact(&self, tool: &str, effect: ToolEffect) -> bool {
-        self.compact() || self.stays_collapsed(tool, effect)
+        self.compact() || self.policy.draws_as_row(tool, effect)
     }
 
     fn card_draws_compact(&self, tool_id: &str) -> bool {
