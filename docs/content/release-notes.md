@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 16 {#v0-2-0-preview-16}
+
+[v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)
+
+- GPT-6.1 Terra is available in the OpenAI and Copilot model lists.
+
+### Models
+
+- **GPT-6.1 Terra.** Adds `gpt-6.1-terra` for OpenAI and GitHub Copilot, with vision and configurable reasoning. Existing default models remain unchanged.
+
 ## Caudra 0.2 Preview 15 {#v0-2-0-preview-15}
 
 [v0.2.0-preview.15 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.15)

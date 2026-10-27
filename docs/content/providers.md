@@ -146,6 +146,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Best | **gpt-6-astra** (gpt-6 default) | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | gpt-6.1-sol | $2.00 / $10.00 | 372K ctx / 128K out |
+|  | gpt-6.1-terra | $1.00 / $5.00 | 372K ctx / 128K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 372K ctx / 128K out |
 | Best | **gpt-5.6-sol, gpt-5.6** (gpt-5.6 default) | $4.00 / $20.00 | 372K ctx / 128K out |
@@ -201,6 +202,7 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 |  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
 |  | gemini-4-argon | $2.00 / $10.00 | 200K ctx / 65K out |
 |  | gpt-6.1-sol | $2.00 / $10.00 | 200K ctx / 100K out |
+|  | gpt-6.1-terra | $1.00 / $5.00 | 200K ctx / 100K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |

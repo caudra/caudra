@@ -334,6 +334,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
+            prefixes: &["gpt-6.1-terra"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.00,
+                output: 5.00,
+                cache_write: 1.25,
+                cache_read: 0.05,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
             prefixes: &["gpt-6-sol"],
             small: false,
             family: ModelFamily::Generic,
@@ -1357,6 +1375,7 @@ mod tests {
     #[test_case("gpt-6-sol", Endpoint::Responses ; "gpt_6_takes_responses")]
     #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6_luna_takes_responses")]
     #[test_case("gpt-6.1-sol", Endpoint::Responses ; "gpt_6_point_release_takes_responses")]
+    #[test_case("gpt-6.1-terra", Endpoint::Responses ; "terra_takes_responses")]
     #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
     #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
     #[test_case("mai-code-1.1-flash", Endpoint::Responses ; "mai_code_takes_responses")]
@@ -1583,6 +1602,8 @@ mod tests {
     #[test_case("copilot/gpt-6-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6 sol has its own rates")]
     #[test_case("copilot/gpt-6-luna", 1_000_000, 1_000_000, 0.10 + 0.50; "gpt 6 luna has its own rates")]
     #[test_case("copilot/gpt-6.1-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6.1 sol has its own rates")]
+    #[test_case("copilot/gpt-6.1-terra", 100_000, 100_000, 0.10 + 0.50; "terra has its own rates")]
+    #[test_case("copilot-enterprise/gpt-6.1-terra", 100_000, 100_000, 0.10 + 0.50; "enterprise shares terra rates")]
     fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
         let usage = TokenUsage {
             input,

@@ -486,6 +486,7 @@ mod tests {
         "openai/gpt-6-luna",
         "openai/gpt-6-sol",
         "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-terra",
         "openai/gpt-5.4-nano",
         "openai/gpt-4.1-mini",
         "openai/gpt-4.1",
@@ -524,6 +525,7 @@ mod tests {
         "copilot/gemini-4-argon",
         "copilot/gpt-6-luna",
         "copilot/gpt-6.1-sol",
+        "copilot/gpt-6.1-terra",
         "copilot/gpt-6-sol",
         "copilot/gpt-5.6-luna",
         "copilot/gpt-5.6-sol",
@@ -551,9 +553,9 @@ mod tests {
     #[test_case("haiku", &[COPILOT], "copilot/claude-haiku-5.5" ; "copilot_haiku")]
     #[test_case("fable", &[ANTHROPIC], "anthropic/claude-fable-5-1" ; "fable")]
     #[test_case("anthropic/opus", &[OPENAI], "anthropic/claude-opus-5-5" ; "provider_beats_preference")]
-    #[test_case("gpt", &[OPENAI], "openai/gpt-6.1-sol" ; "gpt_newest_release")]
     #[test_case("gpt 5.4", &[OPENAI], "openai/gpt-5.4" ; "gpt_5_4_without_mini_or_nano")]
-    #[test_case("terra", &[OPENAI], "openai/gpt-5.6-terra" ; "terra")]
+    #[test_case("terra", &[OPENAI], "openai/gpt-6.1-terra" ; "terra_newest_release")]
+    #[test_case("terra", &[COPILOT], "copilot/gpt-6.1-terra" ; "copilot_terra_newest_release")]
     #[test_case("luna", &[OPENAI], "openai/gpt-6-luna" ; "luna_newest_line")]
     #[test_case("sol", &[OPENAI], "openai/gpt-6.1-sol" ; "sol_point_release")]
     #[test_case("astra", &[ANTHROPIC], "openai/gpt-6-astra" ; "astra_only_openai_serves")]
@@ -585,6 +587,7 @@ mod tests {
     }
 
     #[test_case("claude", &[ANTHROPIC], &["anthropic/claude-haiku-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] ; "claude_names_a_vendor")]
+    #[test_case("gpt", &[OPENAI], &["openai/gpt-6.1-sol", "openai/gpt-6.1-terra"] ; "gpt_newest_release_has_two_siblings")]
     #[test_case("sonnet", &[OPENAI, LOCAL], &["anthropic/claude-sonnet-5-5", "copilot/claude-sonnet-5.5"] ; "two_providers_serve_sonnet")]
     #[test_case("sonnet 4.6", &[], &["anthropic/claude-sonnet-4-6", "copilot/claude-sonnet-4.6"] ; "spellings_differ_by_provider")]
     fn an_ambiguous_listed_name_lists_its_candidates(
@@ -650,7 +653,6 @@ mod tests {
     #[test_case("anthropic", "sonnet")]
     #[test_case("anthropic", "haiku")]
     #[test_case("anthropic", "fable")]
-    #[test_case("openai", "gpt")]
     #[test_case("openai", "terra")]
     #[test_case("openai", "luna")]
     #[test_case("openai", "sol")]

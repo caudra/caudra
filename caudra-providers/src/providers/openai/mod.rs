@@ -182,6 +182,41 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
+            prefixes: &["gpt-6.1-terra"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.00,
+                output: 5.00,
+                cache_write: 1.25,
+                cache_read: 0.05,
+                fast: Some(FastPricing {
+                    input: 2.00,
+                    output: 10.00,
+                    cache_write: 2.50,
+                    cache_read: 0.10,
+                }),
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_ABOVE,
+                    input: 2.00,
+                    output: 7.50,
+                    cache_write: 2.50,
+                    cache_read: 0.10,
+                    fast: Some(FastPricing {
+                        input: 4.00,
+                        output: 15.00,
+                        cache_write: 5.00,
+                        cache_read: 0.20,
+                    }),
+                }]),
+            },
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
+            reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
             prefixes: &["gpt-6-sol"],
             small: false,
             family: ModelFamily::Gpt,
@@ -631,6 +666,7 @@ mod tests {
 
     #[test_case("gpt-6-astra", true)]
     #[test_case("gpt-6.1-sol", true)]
+    #[test_case("gpt-6.1-terra", true)]
     #[test_case("gpt-6-sol", true)]
     #[test_case("gpt-6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]
@@ -651,11 +687,12 @@ mod tests {
         );
     }
 
+    #[test_case("gpt-6.1-terra", false, 1.0, 0.05, 1.25, 5.0)]
     #[test_case("gpt-5.6-luna", true, 0.2, 0.02, 0.25, 1.2)]
     #[test_case("gpt-5.6-terra", false, 2.0, 0.2, 2.5, 12.0)]
     #[test_case("gpt-5.6-sol", false, 4.0, 0.4, 5.0, 20.0)]
     #[test_case("gpt-5.6", false, 4.0, 0.4, 5.0, 20.0)]
-    fn gpt_5_6_models_have_expected_tier_and_short_context_pricing(
+    fn models_have_expected_tier_and_short_context_pricing(
         model_id: &str,
         small: bool,
         input: f64,
@@ -666,7 +703,7 @@ mod tests {
         let model = models()
             .iter()
             .find(|model| model.prefixes.contains(&model_id))
-            .expect("GPT-5.6 model should be registered");
+            .expect("model should be registered");
 
         assert_eq!(model.small, small);
         assert_eq!(model.context_window, WIDE_CONTEXT_WINDOW);

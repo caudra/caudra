@@ -37,6 +37,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-luna",
@@ -833,6 +834,7 @@ mod tests {
 
     #[test_case("gpt-6-astra")]
     #[test_case("gpt-6.1-sol")]
+    #[test_case("gpt-6.1-terra")]
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
@@ -843,6 +845,7 @@ mod tests {
 
     #[test_case("gpt-6-astra", true)]
     #[test_case("gpt-6.1-sol", true)]
+    #[test_case("gpt-6.1-terra", true)]
     #[test_case("gpt-5.6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]
     #[test_case("gpt-5.6", true)]
@@ -857,6 +860,8 @@ mod tests {
     /// so a login keeps `instructions` while an API key gets the marked
     /// developer message.
     #[test_case("openai/gpt-5.6-sol", false, true ; "api_key_marks_a_5_6_model")]
+    #[test_case("openai/gpt-6.1-terra", false, true ; "api_key_marks_terra")]
+    #[test_case("openai/gpt-6.1-terra", true, false ; "login_keeps_instructions_on_terra")]
     #[test_case("openai/gpt-5.6-sol", true, false ; "login_keeps_instructions_on_a_5_6_model")]
     #[test_case("openai/gpt-5.6", false, true ; "api_key_marks_the_5_6_alias")]
     #[test_case("openai/gpt-5.6", true, false ; "login_keeps_instructions_on_the_5_6_alias")]
@@ -907,6 +912,7 @@ mod tests {
     /// A login runs Codex models on the Codex backend, a key runs them on the
     /// platform, and everything else speaks Chat Completions.
     #[test_case(CODEX_MODEL, false, TEST_BASE_URL, RESPONSES_PATH ; "a_key_posts_codex_models_to_the_platform")]
+    #[test_case("openai/gpt-6.1-terra", false, TEST_BASE_URL, RESPONSES_PATH ; "terra_tools_require_responses")]
     #[test_case(CODEX_MODEL, true, auth::CODING_PLAN_BASE_URL, RESPONSES_PATH ; "a_login_posts_codex_models_to_the_codex_backend")]
     #[test_case(CHAT_MODEL, false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "other_models_post_chat_completions")]
     #[test_case("openai/gpt-5.6", false, TEST_BASE_URL, RESPONSES_PATH ; "alias_uses_responses_with_a_key")]
@@ -929,6 +935,8 @@ mod tests {
 
     #[test_case("gpt-6-astra", Some(372_000))]
     #[test_case("gpt-6.1-sol", Some(372_000))]
+    #[test_case("gpt-6.1-terra", Some(372_000))]
+    #[test_case("gpt-6.1-terra-preview", None ; "terra_near_match_is_rejected")]
     #[test_case("gpt-6-sol", Some(372_000))]
     #[test_case("gpt-6-luna", Some(372_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
@@ -971,6 +979,7 @@ mod tests {
     #[test_case("openai/gpt-6-astra", true, Some(PRIORITY_SERVICE_TIER) ; "astra_sells_a_fast_tier")]
     #[test_case("openai/gpt-5.6-sol", true, Some(PRIORITY_SERVICE_TIER) ; "gpt_5_6_sells_a_fast_tier")]
     #[test_case("openai/gpt-6.1-sol", true, Some(PRIORITY_SERVICE_TIER) ; "gpt_6_1_sol_sells_a_fast_tier")]
+    #[test_case("openai/gpt-6.1-terra", true, Some(PRIORITY_SERVICE_TIER) ; "terra_sells_a_fast_tier")]
     #[test_case("openai/gpt-6-sol", false, None ; "standard_sends_no_tier")]
     #[test_case("openai/gpt-5.5", true, None ; "a_model_without_fast_pricing_stays_standard")]
     fn fast_mode_sets_the_service_tier(spec: &str, fast: bool, expected: Option<&str>) {
@@ -1048,6 +1057,9 @@ mod tests {
     #[test_case("gpt-5.6-terra", effort("max"), Some("max") ; "max_passes_through_on_5_6_terra")]
     #[test_case("gpt-5.6-luna", effort("max"), Some("max") ; "max_passes_through_on_5_6_luna")]
     #[test_case("gpt-6.1-sol", ThinkingConfig::Off, Some("low") ; "off_is_the_shallowest_level_on_6_1_sol")]
+    #[test_case("gpt-6.1-terra", ThinkingConfig::Off, Some("none") ; "terra_off_disables_reasoning")]
+    #[test_case("gpt-6.1-terra", effort("max"), Some("max") ; "terra_supports_max")]
+    #[test_case("gpt-6.1-terra", ThinkingConfig::Adaptive, None ; "terra_uses_api_default")]
     fn responses_reasoning_uses_the_levels_the_model_declares(
         model_id: &str,
         thinking: ThinkingConfig,
