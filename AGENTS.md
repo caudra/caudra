@@ -46,6 +46,8 @@ Dev and test builds keep only line tables and no incremental cache. For a debugg
 
 Make uses `sccache` when it is installed (`scripts/cargo-cache.mk`); `SCCACHE=` opts out. Never share `CARGO_TARGET_DIR` between worktrees.
 
+For long, serial mutation campaigns, optionally enable `CARGO_INCREMENTAL=1` in the runner—not globally. Measure speed and disk use; incremental builds cannot use `sccache`. Use normal settings for baseline/final verification and clean up campaign-created caches. Test narrowly and fail fast, but run remaining relevant tests before declaring survivors.
+
 ## Nix
 
 `nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
