@@ -94,7 +94,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -460,6 +460,11 @@ CREATE TABLE session_purpose_usage (
     subscription_cost REAL,
     PRIMARY KEY(session_id, purpose)
 ) STRICT, WITHOUT ROWID;
+"#;
+
+const USAGE_NO_COST_ESTIMATE_COLUMNS: &str = r#"
+ALTER TABLE model_usage ADD COLUMN no_cost_estimate INTEGER NOT NULL DEFAULT 0 CHECK(no_cost_estimate IN (0, 1));
+ALTER TABLE session_purpose_usage ADD COLUMN no_cost_estimate INTEGER NOT NULL DEFAULT 0 CHECK(no_cost_estimate IN (0, 1));
 "#;
 
 /// A per-session usage table, keyed by the column that names its rows, with
@@ -944,6 +949,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 41,
         sql: crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
     },
+    Migration {
+        from: 41,
+        to: 42,
+        sql: USAGE_NO_COST_ESTIMATE_COLUMNS,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1222,7 +1232,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{USAGE_NO_COST_ESTIMATE_COLUMNS}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -7007,8 +7017,8 @@ fn replace_usage(
     let insert = format!(
         "INSERT INTO {name} (\
              session_id, {key}, input_tokens, output_tokens, cache_creation, cache_read, \
-             cost, subscription_cost\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+             cost, subscription_cost, no_cost_estimate\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
     );
     for (label, usage) in usage {
         transaction.execute(
@@ -7022,6 +7032,7 @@ fn replace_usage(
                 i64::from(usage.cache_read),
                 usage.cost,
                 usage.subscription_cost,
+                usage.no_cost_estimate,
             ],
         )?;
     }
@@ -7037,7 +7048,7 @@ fn query_usage(
     let [input, output, cache_creation, cache_read] = fields;
     let mut statement = connection.prepare(&format!(
         "SELECT {key}, input_tokens, output_tokens, cache_creation, cache_read, cost, \
-                subscription_cost \
+                subscription_cost, no_cost_estimate \
          FROM {name} WHERE session_id = ?1"
     ))?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
@@ -7052,6 +7063,7 @@ fn query_usage(
                 cache_read: from_i64_u32(row.get(4)?, cache_read)?,
                 cost: row.get(5)?,
                 subscription_cost: row.get(6)?,
+                no_cost_estimate: row.get(7)?,
             },
         );
     }
@@ -7447,10 +7459,22 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    macro_rules! usage_no_cost_estimate_downgrade {
+        () => {
+            "ALTER TABLE model_usage DROP COLUMN no_cost_estimate; ALTER TABLE session_purpose_usage DROP COLUMN no_cost_estimate;"
+        };
+    }
+    const USAGE_NO_COST_ESTIMATE_DOWNGRADE: &str = usage_no_cost_estimate_downgrade!();
+    const USAGE_NO_COST_ESTIMATE_PREVIOUS_SCHEMA: i64 = 41;
+    const LEGACY_DECISION_MODEL: &str = "decision/gpt-6-luna";
+    const OPENAI_DECISION_MODEL: &str = "openai/gpt-6-luna";
     /// Drops what schema 41 added. Every downgrade below 41 runs it first.
     macro_rules! saved_tool_outputs_downgrade {
         () => {
-            "DROP TABLE saved_tool_outputs;"
+            concat!(
+                usage_no_cost_estimate_downgrade!(),
+                "DROP TABLE saved_tool_outputs;"
+            )
         };
     }
     const SAVED_TOOL_OUTPUTS_DOWNGRADE: &str = saved_tool_outputs_downgrade!();
@@ -7498,6 +7522,7 @@ mod tests {
         cache_read: 400,
         cost: Some(0.25),
         subscription_cost: None,
+        no_cost_estimate: false,
     };
     const ENGINE_DECISIONS_DOWNGRADE: &str =
         "DROP TABLE session_purpose_usage; DROP TABLE engine_decisions;";
@@ -12719,7 +12744,15 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .connection
             .execute_batch(SESSION_PURPOSE_USAGE_TABLE)
             .unwrap();
+        database
+            .connection
+            .execute_batch(USAGE_NO_COST_ESTIMATE_COLUMNS)
+            .unwrap();
         database.save(session, None).unwrap();
+        database
+            .connection
+            .execute_batch(USAGE_NO_COST_ESTIMATE_DOWNGRADE)
+            .unwrap();
         database
             .connection
             .execute_batch(PURPOSE_USAGE_DOWNGRADE)
@@ -13630,6 +13663,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(BACKGROUND_TRANSCRIPTS_DOWNGRADE, BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA; "background_transcripts_from_thirty_eight")]
     #[test_case(SCREENING_DOWNGRADE, SCREENING_PREVIOUS_SCHEMA; "screening_from_thirty_nine")]
     #[test_case(SAVED_TOOL_OUTPUTS_DOWNGRADE, SAVED_TOOL_OUTPUTS_PREVIOUS_SCHEMA; "saved_tool_outputs_from_forty")]
+    #[test_case(USAGE_NO_COST_ESTIMATE_DOWNGRADE, USAGE_NO_COST_ESTIMATE_PREVIOUS_SCHEMA; "usage_cost_estimates_from_forty_one")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -13643,6 +13677,51 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let migrated = SessionDatabase::open_state(&state).unwrap();
 
         assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    #[test_case(LEGACY_DECISION_MODEL, None; "legacy_unpriced_decisions")]
+    #[test_case(LEGACY_DECISION_MODEL, PURPOSE_TURN.cost; "legacy_priced_decisions")]
+    #[test_case(OPENAI_DECISION_MODEL, None; "provider_unpriced_decisions")]
+    #[test_case(OPENAI_DECISION_MODEL, PURPOSE_TURN.cost; "provider_priced_decisions")]
+    fn usage_cost_protection_migration_preserves_existing_values(model: &str, cost: Option<f64>) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        let usage = StoredTokenUsage {
+            cost,
+            subscription_cost: cost,
+            ..PURPOSE_TURN
+        };
+        session.add_model_usage(model, LedgerPurpose::Decision, usage);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(USAGE_NO_COST_ESTIMATE_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", USAGE_NO_COST_ESTIMATE_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            kept.usage_by_model(),
+            &HashMap::from([(model.to_owned(), usage)])
+        );
+        assert_eq!(
+            kept.usage_by_purpose(),
+            &HashMap::from([(LedgerPurpose::Decision.storage_name().to_owned(), usage)])
+        );
         let (_fresh_temp, fresh_state) = state_dir();
         let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
         assert_eq!(
@@ -14578,6 +14657,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(USAGE_NO_COST_ESTIMATE_COLUMNS, "")
                     .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
@@ -14696,6 +14776,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(USAGE_NO_COST_ESTIMATE_COLUMNS, "")
                     .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")

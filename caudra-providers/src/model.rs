@@ -1170,6 +1170,7 @@ impl TokenUsage {
             cache_read: self.cache_read,
             cost,
             subscription_cost,
+            no_cost_estimate: false,
         }
     }
 
@@ -2495,6 +2496,7 @@ mod tests {
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
                 subscription_cost: None,
+                no_cost_estimate: false,
             }
         );
         assert_eq!(COUNTERS.billed(None, Billing::Api).cost, None);

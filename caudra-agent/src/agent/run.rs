@@ -68,8 +68,8 @@ use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
-    NoteDraft, NoteOutcome, NoteSink, PendingNote, USAGE_PROVIDER as DECISION_PROVIDER,
-    push_fitting, question_tool_nudge, redact_decision_text, redacted_excerpt,
+    NoteDraft, NoteOutcome, NoteSink, PendingNote, push_fitting, question_tool_nudge,
+    redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
 use crate::memory::relevance::{Judge, Recall, RecallFocus, RecallQuery, Recalled};
@@ -3986,13 +3986,13 @@ impl<'h> Agent<'h> {
         let Some(decisions) = self.permissions.decisions() else {
             return;
         };
-        for (model, spent) in decisions.take_spend() {
+        for ((provider, model), spent) in decisions.take_spend() {
             self.record_spend(spent.usage, spent.cost, Billing::Api);
             self.event_tx.try_send(AgentEvent::ModelUsage {
                 usage: spent.usage,
                 cost: spent.cost,
                 billing: Billing::Api,
-                provider: DECISION_PROVIDER.into(),
+                provider,
                 model,
                 purpose: LedgerPurpose::Decision,
                 account: None,
@@ -5379,17 +5379,21 @@ mod tests {
             let [
                 AgentEvent::ModelUsage {
                     provider,
+                    model,
+                    usage,
                     purpose: LedgerPurpose::Decision,
                     cost: Some(cost),
                     billing: Billing::Api,
-                    ..
+                    account: None,
                 },
                 AgentEvent::Done { .. },
             ] = reported.as_slice()
             else {
                 panic!("expected the decision spend, then done: {reported:?}");
             };
-            assert_eq!(provider, DECISION_PROVIDER);
+            assert_eq!(provider, DecisionProtocol::TypeSafe.as_str());
+            assert_eq!(model, DecisionProtocol::TypeSafe.default_model());
+            assert_eq!(u64::from(usage.input), FEATURE_INPUT_TOKENS);
             assert!((cost - expected).abs() < COST_TOLERANCE);
             let goal_cost = agent.goal.snapshot().unwrap().cost.unwrap();
             assert!((goal_cost - expected).abs() < COST_TOLERANCE);

@@ -2384,6 +2384,7 @@ mod tests {
         cache_read: 3,
         cost: Some(0.25),
         subscription_cost: None,
+        no_cost_estimate: false,
     };
 
     #[test_case(false; "released_before_operation")]

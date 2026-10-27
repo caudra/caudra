@@ -25,7 +25,7 @@ pub(super) const MAX_LINGERING_CALLS: usize = 16;
 /// What a session's decision calls spent since the agent last booked it
 /// against the session, its goal and autopilot, per model.
 #[derive(Default)]
-pub struct DecisionSpend(Mutex<BTreeMap<String, Spent>>);
+pub struct DecisionSpend(Mutex<BTreeMap<(String, String), Spent>>);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Spent {
@@ -34,9 +34,11 @@ pub struct Spent {
 }
 
 impl DecisionSpend {
-    pub(super) fn add(&self, model: &str, usage: TokenUsage, cost: Option<f64>) {
+    pub(super) fn add(&self, provider: &str, model: &str, usage: TokenUsage, cost: Option<f64>) {
         let mut pending = lock(&self.0);
-        let spent = pending.entry(model.to_owned()).or_default();
+        let spent = pending
+            .entry((provider.to_owned(), model.to_owned()))
+            .or_default();
         spent.usage += usage;
         spent.cost = match (spent.cost, cost) {
             (Some(booked), Some(cost)) => Some(booked + cost),
@@ -44,13 +46,13 @@ impl DecisionSpend {
         };
     }
 
-    pub fn take(&self) -> BTreeMap<String, Spent> {
+    pub fn take(&self) -> BTreeMap<(String, String), Spent> {
         mem::take(&mut *lock(&self.0))
     }
 
     pub(super) fn absorb(&self, other: &Self) {
-        for (model, spent) in other.take() {
-            self.add(&model, spent.usage, spent.cost);
+        for ((provider, model), spent) in other.take() {
+            self.add(&provider, &model, spent.usage, spent.cost);
         }
     }
 }
@@ -204,6 +206,8 @@ mod tests {
 
     const MODEL: &str = "jev-1.14.0";
     const OTHER_MODEL: &str = "decision-1";
+    const PROVIDER: &str = "typesafe";
+    const OTHER_PROVIDER: &str = "custom";
 
     fn usage(input: u32) -> TokenUsage {
         TokenUsage {
@@ -215,20 +219,36 @@ mod tests {
     #[test_case(Some(1.0), Some(2.0), Some(3.0); "priced")]
     #[test_case(None, None, None; "unpriced")]
     #[test_case(None, Some(2.0), Some(2.0); "priced_after_unpriced")]
-    fn spend_coalesces_by_model(first: Option<f64>, second: Option<f64>, total: Option<f64>) {
+    fn spend_coalesces_by_provider_and_model(
+        first: Option<f64>,
+        second: Option<f64>,
+        total: Option<f64>,
+    ) {
         let spend = DecisionSpend::default();
-        spend.add(MODEL, usage(1), first);
-        spend.add(MODEL, usage(2), second);
-        spend.add(OTHER_MODEL, usage(4), None);
+        spend.add(PROVIDER, MODEL, usage(1), first);
+        spend.add(PROVIDER, MODEL, usage(2), second);
+        spend.add(PROVIDER, OTHER_MODEL, usage(4), None);
+        spend.add(OTHER_PROVIDER, MODEL, usage(8), first);
         let taken = spend.take();
+        assert_eq!(taken.len(), 3);
         assert_eq!(
-            taken[MODEL],
+            taken[&(PROVIDER.into(), MODEL.into())],
             Spent {
                 usage: usage(3),
                 cost: total
             }
         );
-        assert_eq!(taken[OTHER_MODEL].usage, usage(4));
+        assert_eq!(
+            taken[&(PROVIDER.into(), OTHER_MODEL.into())].usage,
+            usage(4)
+        );
+        assert_eq!(
+            taken[&(OTHER_PROVIDER.into(), MODEL.into())],
+            Spent {
+                usage: usage(8),
+                cost: first
+            }
+        );
         assert!(spend.take().is_empty());
     }
 

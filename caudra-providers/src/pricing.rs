@@ -164,12 +164,13 @@ pub struct ModelSpend {
 }
 
 impl ModelSpend {
-    /// What a row's turns recorded paying, `None` while nothing on it was
-    /// priced. A row can hold both payers when one model served under an API key
+    /// What a row's turns recorded paying, `None` only when estimation is allowed.
+    /// A row can hold both payers when one model served under an API key
     /// and a subscription, and the figure then folds them the way a provider
     /// row does: any charge makes it a bill, and a `$0` one does not.
     pub fn recorded(usage: &StoredTokenUsage) -> Option<Self> {
         let billing = match (usage.cost, usage.subscription_cost) {
+            (None, None) if usage.no_cost_estimate => Billing::Api,
             (None, None) => return None,
             (Some(cost), _) if cost > 0.0 => Billing::Api,
             (_, Some(_)) => Billing::Subscription,
@@ -606,6 +607,105 @@ mod tests {
             ..StoredTokenUsage::default()
         })
         .map(|spend| (spend.usd, spend.billing))
+    }
+
+    #[test_case(Billing::Api, false          ; "current_api_model")]
+    #[test_case(Billing::Subscription, false ; "current_subscription_model")]
+    #[test_case(Billing::Api, true           ; "catalog_model_under_api")]
+    #[test_case(Billing::Subscription, true  ; "catalog_model_under_subscription")]
+    fn unpriced_decisions_never_borrow_chat_prices(billing: Billing, catalog: bool) {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.billing = billing;
+        let id = if catalog {
+            SCHEDULED_SPEC.to_owned()
+        } else {
+            current.spec()
+        };
+        let legacy = stored(None);
+        assert!(model_cost(&id, &legacy, &current, false).usd.is_some());
+        let usage = StoredTokenUsage {
+            no_cost_estimate: true,
+            ..legacy
+        };
+        let expected = ModelSpend {
+            usd: None,
+            billing: Billing::Api,
+        };
+        assert_eq!(ModelSpend::recorded(&usage), Some(expected));
+        assert_eq!(model_cost(&id, &usage, &current, false), expected);
+        let mut by_model = HashMap::from([(id.clone(), usage)]);
+        for _ in 0..2 {
+            assert_eq!(
+                settle_session(&usage.into(), &mut by_model, &current, false),
+                SessionSpend::default()
+            );
+            assert_eq!(by_model[&id], usage);
+        }
+    }
+
+    #[test_case(Billing::Api          ; "legacy_api")]
+    #[test_case(Billing::Subscription ; "legacy_subscription")]
+    fn legacy_usage_still_estimates_chat_prices(billing: Billing) {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.billing = billing;
+        let usage = stored(None);
+        assert!(!usage.no_cost_estimate);
+        assert_eq!(ModelSpend::recorded(&usage), None);
+        let expected = ModelSpend {
+            usd: Some(LIST_PRICE),
+            billing,
+        };
+        assert_eq!(
+            model_cost(&current.spec(), &usage, &current, false),
+            expected
+        );
+        let mut by_model = HashMap::from([(current.spec(), usage)]);
+        let (billed, subscription) = expected.columns();
+        assert_eq!(
+            settle_session(&usage.into(), &mut by_model, &current, false),
+            SessionSpend {
+                billed,
+                subscription
+            }
+        );
+    }
+
+    #[test_case(Some(RECORDED), None, false ; "billed_chat_then_decision")]
+    #[test_case(None, Some(SUBSCRIPTION), false ; "covered_chat_then_decision")]
+    #[test_case(Some(RECORDED), Some(SUBSCRIPTION), false ; "both_payers_then_decision")]
+    #[test_case(Some(RECORDED), Some(SUBSCRIPTION), true ; "decision_then_both_payers")]
+    fn merging_unpriced_decisions_preserves_known_chat_costs(
+        cost: Option<f64>,
+        subscription_cost: Option<f64>,
+        decision_first: bool,
+    ) {
+        let current = model(CURRENT, INPUT_RATE);
+        let chat = StoredTokenUsage {
+            cost,
+            subscription_cost,
+            ..stored(None)
+        };
+        let decision = StoredTokenUsage {
+            no_cost_estimate: true,
+            ..stored(None)
+        };
+        let mut merged = if decision_first { decision } else { chat };
+        merged += if decision_first { chat } else { decision };
+        assert!(merged.no_cost_estimate);
+        assert_eq!(ModelSpend::recorded(&merged), ModelSpend::recorded(&chat));
+        assert_eq!(
+            model_cost(&current.spec(), &merged, &current, false),
+            model_cost(&current.spec(), &chat, &current, false)
+        );
+        let mut by_model = HashMap::from([(current.spec(), merged)]);
+        assert_eq!(
+            settle_session(&merged.into(), &mut by_model, &current, false),
+            SessionSpend {
+                billed: cost,
+                subscription: subscription_cost,
+            }
+        );
+        assert_eq!(by_model[&current.spec()], merged);
     }
 
     /// Rows written before the breakdown named a provider are bare. Loading one

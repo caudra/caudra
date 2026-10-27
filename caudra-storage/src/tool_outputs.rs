@@ -1431,7 +1431,9 @@ mod tests {
         database
             .connection()
             .execute_batch(&format!(
-                "DROP TABLE {SAVED_OUTPUTS_TABLE}; PRAGMA user_version = 40;"
+                "ALTER TABLE model_usage DROP COLUMN no_cost_estimate;
+                 ALTER TABLE session_purpose_usage DROP COLUMN no_cost_estimate;
+                 DROP TABLE {SAVED_OUTPUTS_TABLE}; PRAGMA user_version = 40;"
             ))
             .unwrap();
         database

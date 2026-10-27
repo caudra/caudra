@@ -245,13 +245,15 @@ pub struct StoredTokenUsage {
     /// What the turns billed, in USD. Prices move (some providers by the hour),
     /// so re-pricing these counters later would be fiction. `None` on unpriced
     /// models, and on entries written before we recorded it until the next load
-    /// settles an estimate into them.
+    /// settles an estimate into them, unless `no_cost_estimate` forbids it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
     /// The same figure for turns a subscription covered, kept out of `cost`
     /// because no one is invoiced for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_cost_estimate: bool,
 }
 
 /// One tool's calls within a session that ended one way. The session-scoped
@@ -302,6 +304,7 @@ impl std::ops::AddAssign for StoredTokenUsage {
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
         add_cost(&mut self.cost, rhs.cost);
         add_cost(&mut self.subscription_cost, rhs.subscription_cost);
+        self.no_cost_estimate = self.no_cost_estimate || rhs.no_cost_estimate;
     }
 }
 
@@ -1678,8 +1681,9 @@ where
         &mut self,
         model: &str,
         purpose: LedgerPurpose,
-        usage: StoredTokenUsage,
+        mut usage: StoredTokenUsage,
     ) {
+        usage.no_cost_estimate |= purpose == LedgerPurpose::Decision;
         *self.usage_by_model.entry(model.to_owned()).or_default() += usage;
         *self
             .usage_by_purpose
@@ -1909,6 +1913,26 @@ mod tests {
 
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
+    const LEGACY_DECISION_MODEL: &str = "decision/gpt-6-luna";
+    const OPENAI_DECISION_MODEL: &str = "openai/gpt-6-luna";
+    const LEGACY_DECISION_USAGE: StoredTokenUsage = StoredTokenUsage {
+        input: 100,
+        output: 20,
+        cache_creation: 5,
+        cache_read: 40,
+        cost: Some(0.25),
+        subscription_cost: None,
+        no_cost_estimate: false,
+    };
+    const RESUMED_DECISION_USAGE: StoredTokenUsage = StoredTokenUsage {
+        input: 30,
+        output: 10,
+        cache_creation: 2,
+        cache_read: 15,
+        cost: Some(0.125),
+        subscription_cost: None,
+        no_cost_estimate: false,
+    };
     const PENDING_DRAFT: &str = "half typed thought";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
@@ -2452,6 +2476,7 @@ mod tests {
                 cache_read: 40,
                 cost: Some(SONNET_COST),
                 subscription_cost: None,
+                no_cost_estimate: false,
             },
         );
         session.add_model_usage(
@@ -2485,6 +2510,165 @@ mod tests {
         assert_eq!(
             loaded.usage_by_purpose()[LedgerPurpose::Goal.storage_name()],
             loaded.usage_by_model()["claude-haiku-4"]
+        );
+    }
+
+    #[test_case(1; "first_resumed_call")]
+    #[test_case(2; "another_call_after_reload")]
+    fn resumed_decision_usage_preserves_legacy_keys_and_combines_purpose(calls: u32) {
+        let (_temp, state_dir) = state_dir();
+        let mut session = TestSession::new("anthropic/claude-sonnet-4", "/project");
+        session
+            .usage_by_model
+            .insert(LEGACY_DECISION_MODEL.to_owned(), LEGACY_DECISION_USAGE);
+        session.usage_by_purpose.insert(
+            LedgerPurpose::Decision.storage_name().to_owned(),
+            LEGACY_DECISION_USAGE,
+        );
+        session.save(&state_dir).unwrap();
+
+        let mut resumed = TestSession::load(session.id, &state_dir).unwrap();
+        assert_eq!(resumed.usage_by_model().len(), 1);
+        assert_eq!(
+            resumed.usage_by_model()[LEGACY_DECISION_MODEL],
+            LEGACY_DECISION_USAGE
+        );
+        assert_eq!(
+            resumed.usage_by_purpose()[LedgerPurpose::Decision.storage_name()],
+            LEGACY_DECISION_USAGE
+        );
+
+        for _ in 0..calls {
+            resumed.add_model_usage(
+                OPENAI_DECISION_MODEL,
+                LedgerPurpose::Decision,
+                RESUMED_DECISION_USAGE,
+            );
+            resumed.save(&state_dir).unwrap();
+            resumed = TestSession::load(session.id, &state_dir).unwrap();
+        }
+
+        assert_eq!(resumed.usage_by_model().len(), 2);
+        assert_eq!(
+            resumed.usage_by_model()[LEGACY_DECISION_MODEL],
+            LEGACY_DECISION_USAGE
+        );
+        assert_eq!(
+            resumed.usage_by_model()[OPENAI_DECISION_MODEL],
+            StoredTokenUsage {
+                input: 30 * calls,
+                output: 10 * calls,
+                cache_creation: 2 * calls,
+                cache_read: 15 * calls,
+                cost: Some(0.125 * f64::from(calls)),
+                subscription_cost: None,
+                no_cost_estimate: true,
+            }
+        );
+        assert_eq!(resumed.usage_by_purpose().len(), 1);
+        assert_eq!(
+            resumed.usage_by_purpose()[LedgerPurpose::Decision.storage_name()],
+            StoredTokenUsage {
+                input: 100 + 30 * calls,
+                output: 20 + 10 * calls,
+                cache_creation: 5 + 2 * calls,
+                cache_read: 40 + 15 * calls,
+                cost: Some(0.25 + 0.125 * f64::from(calls)),
+                subscription_cost: None,
+                no_cost_estimate: true,
+            }
+        );
+    }
+
+    #[test_case("{}", false; "legacy_usage")]
+    #[test_case(r#"{"no_cost_estimate":false}"#, false; "explicit_false")]
+    #[test_case(r#"{"no_cost_estimate":true}"#, true; "protected_usage")]
+    fn usage_cost_estimate_protection_round_trips_without_default_bloat(
+        source: &str,
+        protected: bool,
+    ) {
+        let usage: StoredTokenUsage = serde_json::from_str(source).unwrap();
+        assert_eq!(usage.no_cost_estimate, protected);
+        let serialized = serde_json::to_value(usage).unwrap();
+        assert_eq!(
+            serialized.get("no_cost_estimate").and_then(Value::as_bool),
+            protected.then_some(true)
+        );
+        assert_eq!(
+            serde_json::from_value::<StoredTokenUsage>(serialized).unwrap(),
+            usage
+        );
+    }
+
+    #[test_case(false, false, false; "ordinary_usage")]
+    #[test_case(false, true, true; "incoming_protection")]
+    #[test_case(true, false, true; "existing_protection")]
+    #[test_case(true, true, true; "both_protected")]
+    fn usage_merges_protection_without_losing_known_costs(
+        existing: bool,
+        incoming: bool,
+        expected: bool,
+    ) {
+        let mut total = StoredTokenUsage {
+            no_cost_estimate: existing,
+            subscription_cost: Some(HAIKU_COST),
+            ..usage(100, Some(SONNET_COST))
+        };
+        total += StoredTokenUsage {
+            no_cost_estimate: incoming,
+            ..usage(30, None)
+        };
+        assert_eq!(
+            total,
+            StoredTokenUsage {
+                no_cost_estimate: expected,
+                subscription_cost: Some(HAIKU_COST),
+                ..usage(130, Some(SONNET_COST))
+            }
+        );
+    }
+
+    #[test_case(LedgerPurpose::Chat, false, false; "chat_can_be_estimated")]
+    #[test_case(LedgerPurpose::Chat, true, true; "chat_preserves_explicit_protection")]
+    #[test_case(LedgerPurpose::Decision, false, true; "decisions_disable_estimates")]
+    #[test_case(LedgerPurpose::Decision, true, true; "decisions_keep_protection")]
+    fn unpriced_usage_protection_survives_session_reload(
+        purpose: LedgerPurpose,
+        incoming: bool,
+        protected: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut session = TestSession::new(OPENAI_DECISION_MODEL, "/project");
+        session.add_model_usage(
+            OPENAI_DECISION_MODEL,
+            purpose,
+            StoredTokenUsage {
+                no_cost_estimate: incoming,
+                ..usage(30, None)
+            },
+        );
+        session.save(&state_dir).unwrap();
+        let mut loaded = TestSession::load(session.id, &state_dir).unwrap();
+        let expected = StoredTokenUsage {
+            no_cost_estimate: protected,
+            ..usage(30, None)
+        };
+        assert_eq!(loaded.usage_by_model()[OPENAI_DECISION_MODEL], expected);
+        assert_eq!(loaded.usage_by_purpose()[purpose.storage_name()], expected);
+
+        loaded.add_model_usage(
+            OPENAI_DECISION_MODEL,
+            LedgerPurpose::Chat,
+            usage(10, Some(HAIKU_COST)),
+        );
+        loaded.save(&state_dir).unwrap();
+        let reloaded = TestSession::load(session.id, &state_dir).unwrap();
+        assert_eq!(
+            reloaded.usage_by_model()[OPENAI_DECISION_MODEL],
+            StoredTokenUsage {
+                no_cost_estimate: protected,
+                ..usage(40, Some(HAIKU_COST))
+            }
         );
     }
 
