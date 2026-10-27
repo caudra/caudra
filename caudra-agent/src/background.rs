@@ -568,7 +568,8 @@ impl BackgroundTasks {
                     if record.output_ref.is_none()
                         && let Some(outcome) = &record.outcome
                     {
-                        record.output_ref = Some(store_outcome(&load_dir, session, outcome)?);
+                        record.output_ref =
+                            Some(store_outcome(&load_dir, session, outcome, &retry)?);
                     }
                     for event in &mut record.events {
                         event.accepted |= db
@@ -2606,8 +2607,18 @@ impl BackgroundTasks {
         let terminal = outcome_text(&value);
         let dir = self.0.dir.clone();
         let session = self.0.session;
+        #[cfg(test)]
+        let save_checked = self.lock().save_checked.clone();
         let (value, reference, transcript) = smol::unblock(move || {
-            let reference = store_outcome(&dir, session, &value)?;
+            let waiting = || {
+                #[cfg(test)]
+                if let Some(checked) = &save_checked {
+                    let _ = checked.send(());
+                }
+                false
+            };
+            let reference =
+                store_outcome(&dir, session, &value, &RuntimeRetry::new(None, &waiting))?;
             let transcript = messages
                 .map(|messages| serde_json::to_string(&*messages))
                 .transpose();
@@ -2801,10 +2812,11 @@ fn store_outcome(
     dir: &StateDir,
     session: CaudraId,
     value: &Value,
+    retry: &RuntimeRetry<'_>,
 ) -> Result<ToolOutputRef, String> {
     let serialized = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     ToolOutputStore::new(dir.clone())
-        .put_named(session, &serialized, TASK_OUTPUT_LABEL)
+        .put_named_within(session, &serialized, TASK_OUTPUT_LABEL, retry)
         .map_err(|error| format!("could not persist complete task outcome: {error}"))
 }
 

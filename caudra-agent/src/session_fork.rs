@@ -8,12 +8,11 @@ use caudra_providers::{
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{PermissionMode, SessionError, StoredSubagentTaskSpec};
-use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
+use caudra_storage::tool_outputs::ToolOutputId;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
 use serde_json::Value;
 use thiserror::Error;
-use tracing::warn;
 
 use crate::{History, StoredSession, active_task_history_versions_with_outputs};
 
@@ -34,11 +33,6 @@ pub enum SessionForkError {
     },
     #[error("resolve the history to fork: {0}")]
     History(Box<HistoryProjectionError>),
-    #[error("copy tool outputs to fork {target}: {source}")]
-    Outputs {
-        target: SessionRef,
-        source: Box<ToolOutputError>,
-    },
     #[error("save fork session {target}: {source}")]
     Save {
         target: SessionRef,
@@ -63,9 +57,10 @@ pub struct ForkTarget<'a> {
 }
 
 /// Copies the active branch of `source`, the subagent histories it reaches,
-/// and the tool outputs they reference into a new stored session. The caller
-/// holds `target.id`'s lease. Returns the fork's history, rebased onto fresh
-/// item ids.
+/// and the tool outputs they reference into a new stored session, in one
+/// save that leaves no fork behind when any part fails. The caller holds
+/// `target.id`'s lease. Returns the fork's history, rebased onto fresh item
+/// ids.
 pub fn fork_stored_session(
     storage: &StateDir,
     source: &StoredSession,
@@ -89,18 +84,7 @@ pub fn fork_stored_session(
             rebase_history(items.as_ref().clone()).map(|history| (task_id.clone(), history))
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
-    copy_history_outputs(
-        storage,
-        source,
-        target.id,
-        iter::once(history.as_slice()).chain(subagent_histories.values().map(Vec::as_slice)),
-    )?;
-    if let Err(error) = save_fork(storage, source, &target, &history, subagent_histories) {
-        if let Err(cleanup) = ToolOutputStore::new(storage.clone()).delete_session(target.id.id()) {
-            warn!(target = %target.id, error = %cleanup, "fork tool output cleanup failed");
-        }
-        return Err(error);
-    }
+    save_fork(storage, source, &target, &history, subagent_histories)?;
     Ok(history)
 }
 
@@ -123,14 +107,12 @@ fn rebase_history(items: Vec<HistoryItem>) -> Result<Vec<HistoryItem>, HistoryPr
     Ok(History::new(messages).into_items())
 }
 
-fn copy_history_outputs<'a>(
-    storage: &StateDir,
-    source: &StoredSession,
-    target: &SessionRef,
+/// Every output `histories` reference, each once.
+pub fn history_output_ids<'a>(
     histories: impl IntoIterator<Item = &'a [HistoryItem]>,
-) -> Result<(), SessionForkError> {
+) -> Vec<ToolOutputId> {
     let mut seen = HashSet::new();
-    let mut references = Vec::new();
+    let mut ids = Vec::new();
     for item in histories.into_iter().flatten() {
         let output_refs = match &item.kind {
             HistoryItemKind::ToolResult {
@@ -148,17 +130,12 @@ fn copy_history_outputs<'a>(
             _ => &[],
         };
         for output_ref in output_refs {
-            if seen.insert(output_ref.id.clone()) {
-                references.push(output_ref.clone());
+            if seen.insert(&output_ref.id) {
+                ids.push(output_ref.id.clone());
             }
         }
     }
-    ToolOutputStore::new(storage.clone())
-        .copy_session_outputs(source.id, target.id(), &references)
-        .map_err(|source| SessionForkError::Outputs {
-            target: target.clone(),
-            source: Box::new(source),
-        })
+    ids
 }
 
 fn save_fork(
@@ -179,6 +156,12 @@ fn save_fork(
     fork.meta.fast = source.meta.fast;
     fork.replace_messages(history.to_vec());
     fork.set_title(format!("{} (fork)", source.title));
+    fork.copy_saved_outputs_from(
+        source.id,
+        history_output_ids(
+            iter::once(history).chain(subagent_histories.values().map(Vec::as_slice)),
+        ),
+    );
     let mut stored_tool_ids = all_tool_call_ids(history);
     for history in subagent_histories.values() {
         stored_tool_ids.extend(all_tool_call_ids(history));
@@ -453,6 +436,7 @@ mod tests {
         StoredMode, StoredPlanTarget, StoredSubagent, StoredSubagentOutcome,
     };
     use caudra_storage::thinking::StoredThinking;
+    use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputRef, ToolOutputStore};
     use std::path::Path;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -474,6 +458,9 @@ mod tests {
     const TASK_EVENT: &str = "task-result-event";
     const TASK_SUCCEEDED: &str = "succeeded";
     const LARGE_TASK_RESULT_BYTES: usize = 64 * 1024;
+    const COMPLETE_ARTIFACT: &str = "complete artifact";
+    const NESTED_ARTIFACT: &str = "nested artifact";
+    const OUTPUT_ID: &str = "calm-blue-wren";
     const PROFILE: &str = "review";
     const SANDBOX_ANCHOR: &str = "https://sandbox.test";
 
@@ -636,6 +623,30 @@ mod tests {
         assert_eq!(reachable_subagent_ids(&compacted, &session), expected);
     }
 
+    #[test_case(1; "single_observation")]
+    #[test_case(3; "repeated_observations_and_refs")]
+    fn retained_output_refs_are_listed_once_across_history_kinds(copies: usize) {
+        let reference = ToolOutputRef {
+            id: OUTPUT_ID.parse().unwrap(),
+            byte_count: COMPLETE_ARTIFACT.len(),
+            line_count: 1,
+        };
+        let mut observation = Message::observation(FORK_HISTORY.into());
+        observation.retained_output_refs = vec![reference.clone(); copies];
+        let mut messages = vec![observation; copies];
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: COMPLETE_ARTIFACT.into(),
+            }],
+            retained_output_refs: vec![reference.clone()],
+            ..Default::default()
+        });
+        let items = History::new(messages).into_items();
+
+        assert_eq!(history_output_ids([items.as_slice()]), [reference.id]);
+    }
+
     #[test]
     fn fork_rebases_item_identity_without_changing_provider_content() {
         let items = History::new(vec![
@@ -667,37 +678,40 @@ mod tests {
     }
 
     #[test]
-    fn fork_copies_rebased_history_output_refs_to_target_session() {
+    fn fork_copies_main_and_subagent_output_refs_to_target_session() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
         let store = ToolOutputStore::new(storage.clone());
-        let source = StoredSession::new(MODEL_SPEC, CWD);
-        let target = SessionRef::generate();
-        let output_ref = store.put(source.id, "complete artifact").unwrap();
-        let retained_ref = store.put(source.id, "nested artifact").unwrap();
-        let history = History::new(vec![
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use(
-                    "call-1",
-                    "bash",
-                    serde_json::json!({}),
-                )],
-                ..Default::default()
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call-1".into(),
-                    content: "preview".into(),
-                    is_error: false,
-                    output_ref: Some(output_ref.clone()),
-                }],
-                ..Default::default()
-            },
-        ])
-        .into_items();
-        let rebased = rebase_history(history).unwrap();
+        let mut source = StoredSession::new(MODEL_SPEC, CWD);
+        source.save(&storage).unwrap();
+        let target_id = SessionRef::generate();
+        let output_ref = store.put(source.id, COMPLETE_ARTIFACT).unwrap();
+        let retained_ref = store.put(source.id, NESTED_ARTIFACT).unwrap();
+        let history = rebase_history(
+            History::new(vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        "call-1",
+                        "bash",
+                        serde_json::json!({}),
+                    )],
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-1".into(),
+                        content: "preview".into(),
+                        is_error: false,
+                        output_ref: Some(output_ref.clone()),
+                    }],
+                    ..Default::default()
+                },
+            ])
+            .into_items(),
+        )
+        .unwrap();
         let compacted = rebase_history(
             History::new(vec![Message {
                 role: Role::Assistant,
@@ -711,23 +725,26 @@ mod tests {
         )
         .unwrap();
 
-        copy_history_outputs(
+        save_fork(
             &storage,
             &source,
-            &target,
-            [rebased.as_slice(), compacted.as_slice()],
+            &target(&target_id),
+            &history,
+            HashMap::from([(PHRASE_TASK.into(), compacted)]),
         )
         .unwrap();
 
         assert_eq!(
-            store.load_text(target.id(), output_ref.id.clone()).unwrap(),
-            "complete artifact"
+            store
+                .load_text(target_id.id(), output_ref.id.clone())
+                .unwrap(),
+            COMPLETE_ARTIFACT
         );
         assert_eq!(
-            store.load_text(target.id(), retained_ref.id).unwrap(),
-            "nested artifact"
+            store.load_text(target_id.id(), retained_ref.id).unwrap(),
+            NESTED_ARTIFACT
         );
-        assert!(rebased.iter().any(|item| matches!(
+        assert!(history.iter().any(|item| matches!(
             &item.kind,
             HistoryItemKind::ToolResult {
                 output_ref: Some(reference),
@@ -741,8 +758,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
         let store = ToolOutputStore::new(storage.clone());
-        let source = StoredSession::new(MODEL_SPEC, CWD);
-        let target = SessionRef::generate();
+        let mut source = StoredSession::new(MODEL_SPEC, CWD);
+        source.save(&storage).unwrap();
+        let target_id = SessionRef::generate();
         let complete = "x".repeat(LARGE_TASK_RESULT_BYTES);
         let reference = store.put(source.id, &complete).unwrap();
         let origin = TaskEventOrigin {
@@ -759,15 +777,55 @@ mod tests {
         let restored = serde_json::from_value(serde_json::to_value(items).unwrap()).unwrap();
         let forked = rebase_history(restored).unwrap();
 
-        copy_history_outputs(&storage, &source, &target, [forked.as_slice()]).unwrap();
+        save_fork(
+            &storage,
+            &source,
+            &target(&target_id),
+            &forked,
+            HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(
-            store.load_text(target.id(), reference.id.clone()).unwrap(),
+            store
+                .load_text(target_id.id(), reference.id.clone())
+                .unwrap(),
             complete
         );
         let messages = history_messages(forked);
         assert_eq!(messages[0].task_event.as_ref(), Some(&origin));
         assert_eq!(messages[0].retained_output_refs, [reference]);
+    }
+
+    #[test]
+    fn fork_missing_a_referenced_output_leaves_no_fork() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        let store = ToolOutputStore::new(storage.clone());
+        let mut source = StoredSession::new(MODEL_SPEC, CWD);
+        source.save(&storage).unwrap();
+        let target_id = SessionRef::generate();
+        let kept = store.put(source.id, COMPLETE_ARTIFACT).unwrap();
+        let gone = store.put(source.id, NESTED_ARTIFACT).unwrap();
+        store.delete(source.id, &gone.id).unwrap();
+        let mut message = Message::user(FORK_HISTORY.into());
+        message.retained_output_refs = vec![kept.clone(), gone];
+        let history = History::new(vec![message]).into_items();
+
+        let result = save_fork(
+            &storage,
+            &source,
+            &target(&target_id),
+            &history,
+            HashMap::new(),
+        );
+
+        assert!(matches!(result, Err(SessionForkError::Save { .. })));
+        assert!(ensure_fork_target_available(&storage, &target_id).is_ok());
+        assert!(matches!(
+            store.load_text(target_id.id(), kept.id),
+            Err(ToolOutputError::NotFound { .. })
+        ));
     }
 
     #[test_case(false; "direct")]

@@ -397,7 +397,7 @@ fn format_grep(call: &GrepCall, result: &ToolOutputGrepResult) -> String {
 mod tests {
     use super::*;
     use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{save_output_owner, stub_ctx};
     use caudra_providers::TokenScale;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
@@ -419,10 +419,10 @@ mod tests {
 
     fn fixture(text: &str) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-            temp.path().to_path_buf(),
-        )));
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
         let session: SessionRef = SESSION.parse().unwrap();
+        save_output_owner(&state_dir, session.id());
+        let store = Arc::new(ToolOutputStore::new(state_dir));
         let output = store.put(session.id(), text).unwrap();
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.session_id = Some(session);

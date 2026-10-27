@@ -32,6 +32,7 @@ use crate::repaint::{Cadence, Dirty};
 const RUN_LIMIT: usize = 50;
 pub(crate) const OFF_HERE: &str = "Learning is off in this session";
 pub(crate) const RUN_STARTED: &str = "Learning run requested";
+const RUN_UNSAVED: &str = "Learning needs this session saved first: ";
 pub(crate) const REVERTED: &str = "Reverted ";
 pub(crate) const LEFT_ALONE: &str = " changed since the run wrote it, so it was left alone";
 const REVERT_FAILED: &str = "Revert failed: ";
@@ -256,8 +257,15 @@ impl App {
             LearnAction::Close => self.learn_inspector.close(),
             LearnAction::Flash(message) => self.flash(message.into()),
             LearnAction::RunNow => {
-                let started = self.learner_handle().is_some_and(|handle| handle.run_now());
-                self.flash(if started { RUN_STARTED } else { OFF_HERE }.into());
+                let flash = match self.learner_handle() {
+                    None => OFF_HERE.to_owned(),
+                    Some(handle) => match self.publish_conversation_permissions() {
+                        Err(error) => format!("{RUN_UNSAVED}{error}"),
+                        Ok(()) if handle.run_now() => RUN_STARTED.to_owned(),
+                        Ok(()) => OFF_HERE.to_owned(),
+                    },
+                };
+                self.flash(flash);
             }
             LearnAction::Revert(edit) => {
                 let session = self.state.session.id.to_string();
@@ -342,21 +350,27 @@ fn revert(place: &LearnPlace, store: &LearningStore, edit: &StoredEdit, session:
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
-    use caudra_agent::AgentEvent;
+    use arc_swap::ArcSwapOption;
     use caudra_agent::history::HistoryProject;
     use caudra_agent::learning::pump::LEARNED;
     use caudra_agent::learning::targets::{InstructionFile, bullets};
-    use caudra_agent::learning::{LearnerActivity, LearnerStep};
-    use caudra_config::LearningTarget;
+    use caudra_agent::learning::{LearnerActivity, LearnerHandle, LearnerStep};
+    use caudra_agent::permissions::PermissionManager;
+    use caudra_agent::{AgentEvent, StoredSession};
+    use caudra_config::{LearningTarget, PermissionsConfig};
     use caudra_providers::Message;
     use caudra_storage::StateDir;
     use caudra_storage::learning::{FinishedRun, LearningEdit, LearningStore};
     use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
     use test_case::test_case;
 
-    use super::{LearnAction, LearnSnapshot, NO_TRANSCRIPT, OFF_HERE, REVERTED, RUN_ENDED};
+    use super::{
+        LearnAction, LearnSnapshot, NO_TRANSCRIPT, OFF_HERE, REVERTED, RUN_ENDED, RUN_STARTED,
+    };
     use crate::app::App;
+    use crate::app::permission_editor::ConversationPermissions;
     use crate::app::tests::{mouse_event, rendered, test_app};
     use crate::components::Overlay;
     use crate::components::learn_inspector::ALREADY_REVERTED;
@@ -455,6 +469,26 @@ mod tests {
         let mut app = test_app();
         app.handle_learn_action(LearnAction::RunNow);
         assert_eq!(app.status_bar.flash_text(), Some(OFF_HERE));
+    }
+
+    #[test]
+    fn run_now_in_a_fresh_tab_saves_the_session_first() {
+        let mut app = test_app();
+        app.permissions = Arc::new(PermissionManager::new_persistent_in(
+            PermissionsConfig::default(),
+            app.permissions.project_cwd(),
+            Arc::default(),
+            app.storage.clone(),
+        ));
+        app.conversation_permissions = ConversationPermissions::Pending;
+        let (handle, probe) = LearnerHandle::detached(OWNER);
+        app.learner = Some(Arc::new(ArcSwapOption::from_pointee(handle)));
+
+        app.handle_learn_action(LearnAction::RunNow);
+
+        assert_eq!(app.status_bar.flash_text(), Some(RUN_STARTED));
+        assert!(probe.asked_to_run_now());
+        assert!(StoredSession::load(app.state.session.id, &app.storage).is_ok());
     }
 
     fn step(app: &mut App, run_id: i64, step: LearnerStep) {

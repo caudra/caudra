@@ -3556,7 +3556,7 @@ impl RetentionConfig {
             max: None,
             env: None,
             choices: &[],
-            description: "Sessions outside this policy lose file revert, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
+            description: "Sessions outside this policy lose file revert, retained tool outputs, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
         },
         ConfigField {
             name: "forget",

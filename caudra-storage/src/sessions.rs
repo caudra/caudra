@@ -23,6 +23,7 @@ use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
 use crate::tool_ledger::{Latency, ToolOutcome};
+use crate::tool_outputs::ToolOutputId;
 use crate::usage_ledger::LedgerPurpose;
 use crate::workspace_binding::StoredWorkspaceBinding;
 use serde::de::DeserializeOwned;
@@ -46,6 +47,8 @@ pub mod sweep;
 #[path = "sessions/types.rs"]
 mod types;
 
+#[cfg(test)]
+pub(crate) use database::MAX_SQLITE_VALUE_BYTES;
 pub(crate) use database::{
     AFTER_SEPARATOR, WriteTiming, compress_payload, decompress_payload, deserialize_json, from_i64,
     from_i64_usize, id_from_row, to_i64,
@@ -188,8 +191,6 @@ pub enum SessionError {
         logical_bytes: usize,
         maximum: usize,
     },
-    #[error("tool output cleanup failed: {0}")]
-    ToolOutputCleanup(#[source] Box<crate::tool_outputs::ToolOutputError>),
     #[error("a session workspace identity cannot be changed after creation")]
     WorkspaceIdentityImmutable,
     #[error("session workspace identity changed; fork or explicitly rebind the session")]
@@ -761,6 +762,16 @@ pub struct Session<M, U, T> {
     /// is not itself the expected version of every existing clone.
     #[serde(skip, default = "new_write_version")]
     write_version: Arc<AtomicI64>,
+    /// What a fork takes of its source's saved outputs. The save that first
+    /// stores the fork copies them in its own transaction.
+    #[serde(skip)]
+    forked_outputs: Option<Arc<ForkedOutputs>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForkedOutputs {
+    source: CaudraId,
+    ids: Vec<ToolOutputId>,
 }
 
 impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
@@ -792,6 +803,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             rewrites: self.rewrites,
             base_write_version: AtomicI64::new(write_version),
             write_version: Arc::clone(&self.write_version),
+            forked_outputs: self.forked_outputs.clone(),
         }
     }
 }
@@ -1221,10 +1233,6 @@ fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), Sess
     Ok(())
 }
 
-pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<CaudraId>, SessionError> {
-    SessionDatabase::open(dir)?.persisted_session_ids()
-}
-
 impl<M, U, T> Session<M, U, T>
 where
     M: Serialize + DeserializeOwned + TitleSource + Clone + Send,
@@ -1267,6 +1275,7 @@ where
             rewrites: 0,
             base_write_version: AtomicI64::new(-1),
             write_version: new_write_version(),
+            forked_outputs: None,
         }
     }
 
@@ -1453,6 +1462,13 @@ where
         }
         session.set_meta(meta);
         session.set_token_usage(token_usage);
+    }
+
+    /// Has the save that first stores this session copy `ids` from `source`'s
+    /// saved outputs in its own transaction, so a fork never exists without
+    /// the outputs its history references.
+    pub fn copy_saved_outputs_from(&mut self, source: CaudraId, ids: Vec<ToolOutputId>) {
+        self.forked_outputs = (!ids.is_empty()).then(|| Arc::new(ForkedOutputs { source, ids }));
     }
 
     /// A change under an existing id is not expressible as an append, so it
@@ -1825,8 +1841,7 @@ mod tests {
         StoredPasteRange, StoredPauseLatch, StoredPauseSource, StoredPeerControls,
         StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
         StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredTurnWindow,
-        StoredUnattendedTurns, generate_title, meta_record, next_epoch, persisted_session_ids,
-        write_full_session,
+        StoredUnattendedTurns, generate_title, meta_record, next_epoch, write_full_session,
     };
     use super::{
         HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
@@ -3047,60 +3062,6 @@ mod tests {
     }
 
     #[test]
-    fn public_delete_succeeds_without_managed_output_directory() {
-        let (_temp, state_dir) = state_dir();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.save(&state_dir).unwrap();
-
-        TestSession::delete(session.id, &state_dir).unwrap();
-
-        assert!(!state_dir.path().join("tool-output").exists());
-    }
-
-    #[test]
-    fn public_delete_retry_cleans_outputs_after_session_is_already_gone() {
-        let (_temp, state_dir) = state_dir();
-        let session_id = CaudraId::generate();
-        let store = ToolOutputStore::new(state_dir.clone());
-        let output = store.put(session_id, "leftover output").unwrap();
-
-        let error = TestSession::delete(session_id, &state_dir).unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
-        assert!(matches!(
-            store.read(session_id, output.id, 1, 1),
-            Err(ToolOutputError::NotFound { .. })
-        ));
-    }
-
-    #[test]
-    fn public_delete_retry_cleans_outputs_after_database_row_is_gone() {
-        let (_temp, state_dir) = state_dir();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.save(&state_dir).unwrap();
-        SessionDatabase::open(&state_dir)
-            .unwrap()
-            .delete(session.id, None)
-            .unwrap();
-        let store = ToolOutputStore::new(state_dir.clone());
-        let output = store.put(session.id, "leftover output").unwrap();
-
-        let error = TestSession::delete(session.id, &state_dir).unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
-        assert!(matches!(
-            store.read(session.id, output.id, 1, 1),
-            Err(ToolOutputError::NotFound { .. })
-        ));
-    }
-
-    #[test]
     fn state_dir_session_ids_ignore_jsonl_files() {
         let (_temp, state_dir) = state_dir();
         let sessions_dir = state_dir.ensure_subdir(SESSIONS_DIR).unwrap();
@@ -3109,7 +3070,10 @@ mod tests {
         let stray: TestSession = Session::new("m", "/stray");
         write_legacy_jsonl(&sessions_dir.join(format!("{}.jsonl", stray.id)), &stray);
 
-        let ids = persisted_session_ids(&state_dir).unwrap();
+        let ids = SessionDatabase::open(&state_dir)
+            .unwrap()
+            .persisted_session_ids()
+            .unwrap();
 
         assert_eq!(ids, vec![canonical.id]);
     }

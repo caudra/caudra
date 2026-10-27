@@ -18,6 +18,7 @@ use caudra_config::{
 use caudra_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
+use caudra_storage::sessions::SessionDatabase;
 use caudra_storage::tool_outputs::ToolOutputStore;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -441,6 +442,7 @@ fn lua_output_limits_are_applied_centrally_and_full_output_is_stored() {
         temp.path().to_path_buf(),
     )));
     let session = SessionRef::generate();
+    save_output_owner(&temp, &session);
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.config.max_output_lines = 1_000;
     ctx.config.max_output_bytes = 100_000;
@@ -578,6 +580,7 @@ fn managed_output_finish_reference_propagates_from_lua() {
         temp.path().to_path_buf(),
     )));
     let session: SessionRef = TOOL_OUTPUT_SESSION_ID.parse().unwrap();
+    save_output_owner(&temp, &session);
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.session_id = Some(session.clone());
     ctx.tool_output_store = Some(Arc::clone(&store));
@@ -629,6 +632,7 @@ fn malformed_host_metadata_drops_managed_ref_without_overwriting_validation(
         temp.path().to_path_buf(),
     )));
     let session = SessionRef::generate();
+    save_output_owner(&temp, &session);
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.session_id = Some(session);
     ctx.tool_output_store = Some(store);
@@ -666,6 +670,7 @@ fn intentional_streamed_error_keeps_and_loads_managed_ref() {
         temp.path().to_path_buf(),
     )));
     let session = SessionRef::generate();
+    save_output_owner(&temp, &session);
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.session_id = Some(session);
     ctx.tool_output_store = Some(store);
@@ -693,12 +698,20 @@ fn tool_output_host() -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
+fn save_output_owner(temp: &tempfile::TempDir, session: &SessionRef) {
+    caudra_agent::tools::test_support::save_output_owner(
+        &StateDir::from_path(temp.path().to_path_buf()),
+        session.id(),
+    );
+}
+
 fn tool_output_fixture(text: &str) -> (tempfile::TempDir, ToolContext, String) {
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
         temp.path().to_path_buf(),
     )));
     let session: SessionRef = TOOL_OUTPUT_SESSION_ID.parse().unwrap();
+    save_output_owner(&temp, &session);
     let output = store.put(session.id(), text).unwrap();
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.session_id = Some(session);
@@ -3984,6 +3997,7 @@ fn bash_dispatch_context(
         max_store_bytes,
     ));
     let session = SessionRef::generate();
+    save_output_owner(temp, &session);
     let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
     ctx.config.no_rtk = true;
     ctx.session_id = Some(session.clone());
@@ -4058,7 +4072,7 @@ fn bash_small_output_discards_managed_artifact() {
     })
     .unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let (ctx, _store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
+    let (ctx, _store, _session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
 
     let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
         &reg,
@@ -4073,12 +4087,11 @@ fn bash_small_output_discards_managed_artifact() {
     assert!(!done.is_error);
     assert_eq!(done.output.as_text(), "small-output");
     assert!(done.output_ref.is_none());
-    let session_dir = temp
-        .path()
-        .join("tool-output")
-        .join(session.id().to_string());
-    let artifact_count = std::fs::read_dir(session_dir).map_or(0, |entries| entries.count());
-    assert_eq!(artifact_count, 0);
+    let stats = SessionDatabase::open(&StateDir::from_path(temp.path().to_path_buf()))
+        .unwrap()
+        .stats()
+        .unwrap();
+    assert_eq!(stats.saved_output_count, 0);
 }
 
 #[test]
@@ -4405,6 +4418,7 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         temp.path().to_path_buf(),
     )));
     let session = SessionRef::generate();
+    save_output_owner(&temp, &session);
     let thread_store = Arc::clone(&store);
     let thread_session = session.clone();
     let (result_tx, result_rx) = flume::bounded(1);
@@ -4476,6 +4490,7 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
         STORE_MAX_BYTES,
     ));
     let session = SessionRef::generate();
+    save_output_owner(&temp, &session);
     let thread_store = Arc::clone(&store);
     let thread_session = session.clone();
     let probe = format!("{PROBE_HEAD}{PROBE_TAIL}");

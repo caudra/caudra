@@ -356,8 +356,8 @@ pub fn run(
         .map(|limits| launch_autopilot(limits, &goal))
         .unzip();
 
-    // Print mode mints a throwaway session id and never opens a session store,
-    // so a generated title would have nowhere to land.
+    // A generated title arrives as an event a front end saves, and print mode
+    // saves its session only as the run ends, so the prompt names it instead.
     config.generate_titles = false;
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 

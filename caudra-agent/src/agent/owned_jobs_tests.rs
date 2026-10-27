@@ -13,7 +13,6 @@ mod owned_jobs_tests {
         StandingReminderKind, StopReason, StreamResponse, estimate_tokens,
     };
     use caudra_storage::background::ShellJobMetadata;
-    use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{SessionDatabase, SessionError, SessionLease};
     use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_storage::{StateDir, random_task_id};
@@ -228,12 +227,11 @@ mod owned_jobs_tests {
                     .flat_map(|message| &message.retained_output_refs)
                     .any(|retained| retained == reference)
             );
-            let fork = CaudraId::generate();
-            reopened
-                .copy_session_outputs(fixture.session.id, fork, std::slice::from_ref(reference))
-                .unwrap();
+            let mut fork = StoredSession::new(MODEL, &fixture.session.cwd);
+            fork.copy_saved_outputs_from(fixture.session.id, vec![reference.id.clone()]);
+            fork.save(&fixture.dir).unwrap();
             assert_eq!(
-                reopened.load_text(fork, reference.id.clone()).unwrap(),
+                reopened.load_text(fork.id, reference.id.clone()).unwrap(),
                 expected
             );
             restarted.shutdown().await.unwrap();

@@ -247,11 +247,13 @@ The new Caudra starts with only `--session` and the environment of the host's sh
 
 ## Managed tool outputs
 
-Retained tool output belongs to one session and is stored under `tool-output/<session-id>/` in the Caudra state directory. An output ID can be read or searched only from its owning session. Retained outputs expire only through [retention](#retention).
+Retained tool output belongs to one session and is stored compressed in the session database, `caudra.db`. An output ID can be read or searched only from its owning session. Retained outputs expire only through [retention](#retention).
 
-Each retained output is capped at 100 MiB. Deleting a session deletes its retained outputs. A fork copies the outputs referenced by its selected ancestor path and reachable subagent histories into the child session, preserving their opaque IDs there.
+Each retained output is capped at 32 MiB. Deleting or trimming a session deletes its retained outputs in the same transaction. A fork copies the outputs referenced by its selected ancestor path and reachable subagent histories into the child session as part of the child's first save, preserving their opaque IDs there. If an output cannot be copied, the fork is not saved.
 
-If a failed deletion or interrupted write leaves output without a session, output-store startup cleanup removes it after a seven-day grace period. Retained outputs belonging to a live session remain untouched.
+An output that nothing in its session's conversation, subagent transcripts, or rewind archives refers to, such as one saved by a turn that was cancelled before it recorded the call, is deleted by the [sweep](#retention) seven days after it was saved.
+
+Earlier versions kept outputs as files under `tool-output/` in the state directory. The upgrade to schema 41 imports them into the database and removes the directory afterwards. Files it cannot import, such as symbolic links, files over the cap, text that is not UTF-8, or outputs of sessions that no longer exist or were trimmed, are skipped and deleted with the directory.
 
 ## Fetched PDFs
 
@@ -269,7 +271,7 @@ Payloads are stored with zstd compression. A save that only adds to a session wr
 
 ## Retention
 
-Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and its file change records. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It cannot revert files to its earlier messages, has no `tool_output` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
+Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool outputs, rewind archives, and its file change records. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It cannot revert files to its earlier messages, has no `tool_output` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
 
 Trimming moves a session from full to transcript. Forgetting deletes it. A trimmed session that runs again becomes full for its new work and is trimmed again later.
 
@@ -298,7 +300,7 @@ forget = {}
 
 To keep the twenty most recently active sessions of every directory in full and strip the artifacts of anything older than ninety days, set `trim = { keep_last = 20, keep_within = "90d" }`. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
 
-The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the file change records of deleted sessions older than seven days are released, each change store is trimmed to its size budget, the write-ahead log is checkpointed, and free pages are returned to the filesystem. With the policies left empty the sweep only prunes, which reclaims space and leaves session data alone. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
+The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories and unreferenced tool outputs older than seven days are removed, the file change records of deleted sessions older than seven days are released, each change store is trimmed to its size budget, the write-ahead log is checkpointed, and free pages are returned to the filesystem. With the policies left empty the sweep only prunes, which reclaims space and leaves session data alone. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
 
 A schema migration prunes as its last step. Rewriting rows puts the pages they occupied on the free list, so an upgrade that skipped this could leave the file larger than the data it holds until the next sweep came due.
 
@@ -337,13 +339,13 @@ The index fills lazily. While the TUI is open, a background thread indexes saved
 
 ## What the state directory holds
 
-`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, tool output files, file change records, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
+`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, which holds retained tool outputs too, file change records, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
 
 The change record section lists the stores largest first, one per workspace directory, with their size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead. A store that no existing session holds is marked as orphaned rather than hidden. `/storage all` lists every store instead of the largest few, and the footer command toggles between them. When file revert is unavailable for the current session, the modal says why.
 
 Measuring walks the stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
 
-Recording keeps each store near its [size budget](#limits) on its own. To reclaim more, trim the sessions that use a store: `caudra storage trim <ID>`. Trimming releases the session's local file change records and drops its retained tool output files, rewind archives, the journals and timelines of its workflow runs, and the firings, actions, and script versions of its [automations](/docs/automations/#storage). The conversation stays and stays resumable, and the automations keep their bindings and state. Records that another session still holds, such as a fork, stay in the store, and the rest are deleted. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
+Recording keeps each store near its [size budget](#limits) on its own. To reclaim more, trim the sessions that use a store: `caudra storage trim <ID>`. Trimming releases the session's local file change records and drops its retained tool outputs, rewind archives, the journals and timelines of its workflow runs, and the firings, actions, and script versions of its [automations](/docs/automations/#storage). The conversation stays and stays resumable, and the automations keep their bindings and state. Records that another session still holds, such as a fork, stay in the store, and the rest are deleted. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
 
 ## Conversation revert
 

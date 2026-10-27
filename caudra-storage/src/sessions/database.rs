@@ -78,7 +78,7 @@ use crate::state::{
     WorkspaceTabs, remove_relocated_workspace_tabs, write_relocated_workspace_tabs,
 };
 use crate::tool_ledger::{Latency, ToolOutcome};
-use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
+use crate::tool_outputs::{copy_saved_outputs, delete_session_outputs};
 use crate::usage_ledger::LedgerPurpose;
 use crate::workflow::{
     SESSION_WORKFLOW_BYTES, WorkflowRunStatus, interrupt_runs, trim_workflow_runs, workflow_totals,
@@ -94,7 +94,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -133,7 +133,7 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_IMAGES_PER_ITEM: usize = 16;
 const MAX_DECODED_IMAGE_BYTES: usize = 24 * 1024 * 1024;
-const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
+pub(crate) const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
 /// Ceiling on `logical_bytes` a session may hydrate at. That figure is the sum
 /// of uncompressed payload lengths, so it is a proxy for hydration work rather
 /// than for resident bytes: the rows reach memory compressed and land as typed
@@ -173,12 +173,7 @@ const CHANGE_RECORDS_CLEANUP: &str = "change_records";
 /// Queued before change records. Prune removes the snapshot directories these
 /// named whole, so a pending one is dropped.
 const LEGACY_SNAPSHOT_CLEANUP: &str = "snapshot";
-const ARTIFACT_CLEANUP_KINDS: [&str; 4] = [
-    "tool_output",
-    "archive",
-    CHANGE_RECORDS_CLEANUP,
-    "workflow_scratch",
-];
+const ARTIFACT_CLEANUP_KINDS: [&str; 3] = ["archive", CHANGE_RECORDS_CLEANUP, "workflow_scratch"];
 const NO_CHANGE_STORES: &str =
     "this process cannot reach the change stores; a Caudra session or storage command will";
 /// What a session's file revert relies on, which the transcript tier drops.
@@ -940,6 +935,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 40,
         sql: crate::engine_decisions::SCREENING_COLUMN,
     },
+    Migration {
+        from: 40,
+        to: 41,
+        sql: crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1218,7 +1218,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1239,7 +1239,8 @@ fn full_schema() -> String {
         crate::learning::TRANSCRIPTS,
         crate::shell_runs::TABLE,
         crate::background::TRANSCRIPTS,
-        crate::engine_decisions::SCREENING_COLUMN
+        crate::engine_decisions::SCREENING_COLUMN,
+        crate::tool_outputs::SAVED_OUTPUTS_SCHEMA
     )
 }
 
@@ -1394,9 +1395,9 @@ pub struct SessionDatabase {
 }
 
 /// What the file itself costs on disk, with none of the surveying `stats`
-/// does. A writer polls this after every commit, and the snapshot and
-/// tool-output trees `stats` walks hold six-figure file counts on a long-lived
-/// state directory, which turns a survey per save into most of a second.
+/// does. A writer polls this after every commit, and the snapshot tree
+/// `stats` walks holds six-figure file counts on a long-lived state
+/// directory, which turns a survey per save into most of a second.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionFileBytes {
     pub database: u64,
@@ -1429,7 +1430,10 @@ pub struct SessionStorageStats {
     pub automation_bytes: u64,
     pub background_invocation_count: u64,
     pub background_bytes: u64,
-    pub tool_output_file_bytes: u64,
+    /// Saved full tool outputs, with their uncompressed size. The database
+    /// bytes already include what they occupy.
+    pub saved_output_count: u64,
+    pub saved_output_bytes: u64,
     /// What the local change record stores occupy.
     pub snapshot_bytes: u64,
     pub archive_bytes: u64,
@@ -1450,6 +1454,8 @@ pub struct TrimReport {
     pub automation_action_rows: u64,
     pub automation_source_rows: u64,
     pub automation_bytes: u64,
+    pub saved_output_rows: u64,
+    pub saved_output_bytes: u64,
     pub artifact_bytes: u64,
 }
 
@@ -1680,6 +1686,9 @@ impl SessionDatabase {
     pub fn open(state_dir: &StateDir) -> Result<Self, SessionError> {
         let mut database = Self::open_state(state_dir)?;
         database.process_cleanup_jobs()?;
+        if let Err(error) = crate::tool_outputs::retire_legacy_outputs(state_dir) {
+            warn!(%error, "legacy tool output removal deferred");
+        }
         // Recovery archives are bounded auxiliary exports. Unsafe or damaged
         // archive paths must never be followed, but they also must not make the
         // canonical database unavailable.
@@ -2262,6 +2271,11 @@ impl SessionDatabase {
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
+        let (saved_output_count, saved_output_bytes) = self.connection.query_row(
+            "SELECT count(*), coalesce(sum(byte_count), 0) FROM saved_tool_outputs",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
         let state_path = self.state_dir.path();
         Ok(SessionStorageStats {
             database_bytes: files.database,
@@ -2290,7 +2304,8 @@ impl SessionDatabase {
                 "background invocation count",
             )?,
             background_bytes: from_i64(background_bytes, "background bytes")?,
-            tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
+            saved_output_count: from_i64(saved_output_count, "saved output count")?,
+            saved_output_bytes: from_i64(saved_output_bytes, "saved output bytes")?,
             snapshot_bytes: directory_bytes(&state_path.join(WORKSPACE_CHANGES_DIR)),
             archive_bytes: directory_bytes(
                 &state_path
@@ -2525,6 +2540,7 @@ impl SessionDatabase {
         )?;
         let workflow = trim_workflow_runs(&transaction, id)?;
         let automation = trim_automations(&transaction, id)?;
+        let (saved_output_rows, saved_output_bytes) = delete_session_outputs(&transaction, id)?;
         let removed_rows = from_i64_usize(rows, "trimmed tool output rows")?;
         let removed_bytes = from_i64_usize(bytes, "trimmed tool output bytes")?;
         let metadata = metadata_without(&root.metadata, [RECORD_COVERAGE_FIELD])?;
@@ -2571,6 +2587,8 @@ impl SessionDatabase {
             automation_action_rows: automation.action_rows,
             automation_source_rows: automation.source_rows,
             automation_bytes: automation.bytes,
+            saved_output_rows,
+            saved_output_bytes,
             artifact_bytes,
         })
     }
@@ -2578,23 +2596,21 @@ impl SessionDatabase {
     /// Bytes under every external artifact directory of one session. Change
     /// records are shared between sessions, so none of them count.
     pub fn artifact_bytes(&self, id: CaudraId) -> u64 {
-        let state_path = self.state_dir.path();
-        let name = id.to_string();
-        let directories: u64 = [
-            state_path.join(TOOL_OUTPUT_DIR).join(&name),
-            state_path
-                .join(super::SESSIONS_DIR)
-                .join(super::ARCHIVE_DIR)
-                .join(&name),
-        ]
-        .iter()
-        .map(|path| directory_bytes(path))
-        .sum();
-        directories + session_scratch_bytes(&self.state_dir, id)
+        let archive = self
+            .state_dir
+            .path()
+            .join(super::SESSIONS_DIR)
+            .join(super::ARCHIVE_DIR)
+            .join(id.to_string());
+        directory_bytes(&archive) + session_scratch_bytes(&self.state_dir, id)
     }
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    pub(crate) fn state_dir(&self) -> &StateDir {
+        &self.state_dir
     }
 
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
@@ -3754,7 +3770,6 @@ impl SessionDatabase {
             return Ok(false);
         }
         let cleanup = match kind {
-            "tool_output" => delete_session_outputs(&self.state_dir, id),
             "archive" => remove_state_directory(
                 &self.state_dir,
                 &[super::SESSIONS_DIR, super::ARCHIVE_DIR],
@@ -3859,6 +3874,9 @@ impl SessionDatabase {
                         return Err(SessionError::AlreadyExists { id: session.id });
                     }
                     Err(error) => return Err(error),
+                }
+                if let Some(forked) = &session.forked_outputs {
+                    copy_saved_outputs(&transaction, forked.source, session.id, &forked.ids)?;
                 }
                 0
             }
@@ -4610,6 +4628,7 @@ where
         rewrites: 0,
         base_write_version: AtomicI64::new(root.write_version),
         write_version,
+        forked_outputs: None,
     };
     let mut cursor = SessionCursor::new(
         &session,
@@ -5612,6 +5631,9 @@ fn migrate_to_current(
         }
         if step.to == 39 {
             crate::background::move_transcripts(&transaction)?;
+        }
+        if step.to == 41 {
+            crate::tool_outputs::import_legacy_outputs(&transaction, state_dir)?;
         }
         transaction.pragma_update(None, "user_version", step.to)?;
         MIGRATION.report(MigrationEvent::Phase {
@@ -7176,10 +7198,21 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    /// Drops what schema 41 added. Every downgrade below 41 runs it first.
+    macro_rules! saved_tool_outputs_downgrade {
+        () => {
+            "DROP TABLE saved_tool_outputs;"
+        };
+    }
+    const SAVED_TOOL_OUTPUTS_DOWNGRADE: &str = saved_tool_outputs_downgrade!();
+    const SAVED_TOOL_OUTPUTS_PREVIOUS_SCHEMA: i64 = 40;
     /// Drops what schema 40 added. Every downgrade below 40 runs it first.
     macro_rules! screening_downgrade {
         () => {
-            "ALTER TABLE engine_decisions DROP COLUMN screening;"
+            concat!(
+                saved_tool_outputs_downgrade!(),
+                "ALTER TABLE engine_decisions DROP COLUMN screening;"
+            )
         };
     }
     const SCREENING_DOWNGRADE: &str = screening_downgrade!();
@@ -7822,7 +7855,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let removed = removed_session.id;
         let artifact = state_dir
             .path()
-            .join(TOOL_OUTPUT_DIR)
+            .join(WORKFLOW_SCRATCH_DIR)
             .join(removed.to_string());
         fs::create_dir_all(&artifact).unwrap();
         fs::write(artifact.join(ARTIFACT_NAME), ARTIFACT_NAME).unwrap();
@@ -11980,10 +12013,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(database_file_snapshot(&state_dir), before);
     }
 
-    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 2] {
         let name = id.to_string();
         [
-            state_dir.path().join(TOOL_OUTPUT_DIR).join(&name),
             state_dir
                 .path()
                 .join(super::super::SESSIONS_DIR)
@@ -11993,7 +12025,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         ]
     }
 
-    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 2] {
         let paths = artifact_paths(state_dir, id);
         for path in &paths {
             fs::create_dir_all(path).unwrap();
@@ -13010,6 +13042,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(SHELL_RUNS_DOWNGRADE, SHELL_RUNS_PREVIOUS_SCHEMA; "shell_runs_from_thirty_five")]
     #[test_case(BACKGROUND_TRANSCRIPTS_DOWNGRADE, BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA; "background_transcripts_from_thirty_eight")]
     #[test_case(SCREENING_DOWNGRADE, SCREENING_PREVIOUS_SCHEMA; "screening_from_thirty_nine")]
+    #[test_case(SAVED_TOOL_OUTPUTS_DOWNGRADE, SAVED_TOOL_OUTPUTS_PREVIOUS_SCHEMA; "saved_tool_outputs_from_forty")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -13958,6 +13991,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")
@@ -14075,6 +14109,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
                     .replace(crate::shell_runs::TABLE, "")

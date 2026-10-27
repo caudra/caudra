@@ -4916,10 +4916,10 @@ mod tests {
     fn public_dispatch_limits_and_persists_local_tool_output() {
         smol::block_on(async {
             let temp = TempDir::new().unwrap();
-            let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-                temp.path().to_path_buf(),
-            )));
+            let state_dir = StateDir::from_path(temp.path().to_path_buf());
             let session = SessionRef::generate();
+            crate::tools::test_support::save_output_owner(&state_dir, session.id());
+            let store = Arc::new(ToolOutputStore::new(state_dir));
             let full_output = (0..20)
                 .map(|line| format!("dispatch-{line}-{}", "x".repeat(100)))
                 .collect::<Vec<_>>()

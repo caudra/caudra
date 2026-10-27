@@ -15,6 +15,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - The keybindings list filters as you type after `/`, and shows modifiers as compact symbols.
 - `F2` opens an empty `/btw`, so a side question no longer needs the command typed first.
 - On a terminal at least 30 rows tall, errors and notices get their own footer row, so they no longer push the context and spend meters off a narrow screen.
+- Saved tool outputs move into the session database, compressed, and `caudra -p` runs are saved as sessions you can resume.
 
 ### Models
 
@@ -26,6 +27,8 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 - **Filter the keybindings list.** In the `F1` list, press `/` and type to keep only the keys whose action, key, or section matches every word. `Enter` keeps the filter and `Esc` clears it. The list is wider, every section starts at the same column, and modifiers show as `⌃`, `⇧`, `⌥`, and `⌘`. Typing `ctrl` or `shift` still finds them. See [Keybindings](/docs/keybindings/).
 - **`F2` asks a side question.** Outside a modal, `F2` opens an empty `/btw` that reads the conversation, or the focused task's, when you send. A question you close without sending comes back on the next `F2`. See [Commands](/docs/commands/).
 - **A footer row for messages.** On a terminal at least 30 rows tall, the footer has a third row for errors, retries, notices, `waiting for background work`, and the chips that wait on you, such as `[? 2]` or `[caudra.toml invalid]`. The row stays empty when there is nothing to say, so the composer never moves. A message too long for the row is cut in the middle, and resting the mouse on it shows the whole text. Chips with no room fold into a `[+N]` chip that lists them and opens the first on a click. With two rows or one, messages get only the space left once the meters reach their short form. The account chip now sits beside the spend, and it shortens to its quota before the price gives way. See [Quick start](/docs/quick-start/).
+- **Saved tool outputs live in `caudra.db`.** The full output behind a truncated tool result is stored compressed in the session database rather than as a file under `tool-output/`, which takes about a third of the space. Trimming or deleting a session removes its outputs in the same transaction, and a fork copies them as part of its first save, so a fork that cannot copy one is not saved. Each output is now capped at 32 MiB, down from 100 MiB. The upgrade imports the existing files, skips those it cannot use, such as outputs of deleted or trimmed sessions, and then removes the directory. `/storage` no longer shows a tool output share, and `caudra storage stats` counts saved outputs instead. See [Sessions](/docs/sessions/#managed-tool-outputs).
+- **`caudra -p` runs are saved.** A one-shot print run now saves its session when it ends, so it appears in session lists, its saved tool outputs stay readable, and `caudra --session <ID>` resumes it. See [Headless](/docs/headless/).
 
 ### Fixes
 

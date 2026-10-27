@@ -89,7 +89,7 @@ impl ToolOutputSinkWriter {
                             let result = sink
                                 .take()
                                 .ok_or_else(|| TOOL_OUTPUT_SINK_CLOSED_MSG.to_owned())
-                                .and_then(|sink| sink.discard().map_err(|error| error.to_string()));
+                                .map(drop);
                             let _ = reply.send(result);
                             return;
                         }
@@ -581,14 +581,11 @@ impl UserData for LuaCtx {
                     || "output".to_owned(),
                     |caller| format!("output-{}", caller.tool),
                 );
-            match store.begin_named(session_id, &label) {
-                Ok(sink) => match ToolOutputSinkWriter::spawn(sink) {
-                    Ok(sink) => Ok((
-                        Some(lua.create_userdata(LuaToolOutputSink(Some(sink)))?),
-                        None,
-                    )),
-                    Err(error) => Ok(err_pair(error)),
-                },
+            match ToolOutputSinkWriter::spawn(store.begin_named(session_id, &label)) {
+                Ok(sink) => Ok((
+                    Some(lua.create_userdata(LuaToolOutputSink(Some(sink)))?),
+                    None,
+                )),
                 Err(error) => Ok(err_pair(error)),
             }
         });
@@ -1025,10 +1022,11 @@ mod tests {
     #[test_case(None, false, "output"; "unknown_caller")]
     fn tool_output_sink_uses_caller_label(caller: Option<&str>, bundled: bool, expected_id: &str) {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-            temp.path().to_path_buf(),
-        )));
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
         let mut ctx = populated_ctx();
+        let session = ctx.session_id.as_ref().expect("populated session").id();
+        caudra_agent::tools::test_support::save_output_owner(&state_dir, session);
+        let store = Arc::new(ToolOutputStore::new(state_dir));
         ctx.tool_output_store = Some(Arc::clone(&store));
         let lua_ctx = match caller {
             Some(caller) => LuaCtx::handler_for_tool(&ctx, Arc::from(caller), bundled),

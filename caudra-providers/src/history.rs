@@ -1114,12 +1114,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::{self, File, FileTimes},
-        slice::from_ref,
-        sync::Arc,
-        time::SystemTime,
-    };
+    use std::{slice::from_ref, sync::Arc};
 
     use caudra_storage::{StateDir, sessions::Session, tool_outputs::ToolOutputStore};
     use serde_json::json;
@@ -1140,7 +1135,6 @@ mod tests {
     const STORED_OUTPUT: &str = "first\nsecond";
     const FULL_OUTCOME_REPEATS: usize = 4096;
     const FULL_OUTCOME_TAIL: &str = "complete_outcome_tail";
-    const OUTPUT_DIRECTORY: &str = "tool-output";
     const SESSION_MODEL: &str = "model";
     const SESSION_CWD: &str = "/project";
     const TOOL_NAME: &str = "read";
@@ -1608,36 +1602,18 @@ mod tests {
 
     #[test_case(READABLE_OUTPUT_ID; "readable")]
     #[test_case(LEGACY_OUTPUT_ID; "legacy")]
-    fn truncated_task_outcome_reference_survives_canonical_load_and_copy(id: &str) {
+    fn truncated_task_outcome_reference_survives_canonical_load(id: &str) {
         let temp = tempfile::tempdir().unwrap();
         let dir = StateDir::from_path(temp.path().to_path_buf());
         let mut session: Session<HistoryItem, Value, Value> =
             Session::new(SESSION_MODEL, SESSION_CWD);
-        let full_output = format!(
-            "{}\n{FULL_OUTCOME_TAIL}",
-            STORED_OUTPUT.repeat(FULL_OUTCOME_REPEATS)
-        );
+        let full_output = full_outcome();
         let reference = ToolOutputRef {
             id: id.parse().unwrap(),
             byte_count: full_output.len(),
             line_count: full_output.lines().count(),
         };
-        let directory = dir
-            .path()
-            .join(OUTPUT_DIRECTORY)
-            .join(session.id.to_string());
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(format!("{}.txt", reference.id));
-        fs::write(&path, &full_output).unwrap();
-        File::open(path)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
-            .unwrap();
-        let mut observation = Message::task_observation(STORED_OUTPUT.into(), task_event_origin());
-        observation.retained_output_refs.push(reference.clone());
-        for item in expand_message(&observation, None) {
-            session.push_message(item);
-        }
+        let observation = push_outcome(&mut session, &reference);
         session.save(&dir).unwrap();
         let loaded = Session::<HistoryItem, Value, Value>::load(session.id, &dir).unwrap();
         let projected = project_messages(loaded.messages()).unwrap();
@@ -1652,20 +1628,59 @@ mod tests {
         );
         let restored = expand_message(&projected[0], None);
         assert_eq!(restored[0].kind, loaded.messages()[0].kind);
-        let store = ToolOutputStore::new(dir);
-        assert_eq!(store.cleanup_orphans(&[session.id]).unwrap(), 0);
-        let target = CaudraId::generate();
-        store
-            .copy_session_outputs(session.id, target, &projected[0].retained_output_refs)
-            .unwrap();
+    }
+
+    #[test]
+    fn truncated_task_outcome_output_is_kept_and_copied_to_a_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session: Session<HistoryItem, Value, Value> =
+            Session::new(SESSION_MODEL, SESSION_CWD);
+        session.save(&dir).unwrap();
+        let store = ToolOutputStore::new(dir.clone());
+        let full_output = full_outcome();
+        let reference = store.put(session.id, &full_output).unwrap();
+        push_outcome(&mut session, &reference);
+        session.save(&dir).unwrap();
+        let loaded = Session::<HistoryItem, Value, Value>::load(session.id, &dir).unwrap();
+        let projected = project_messages(loaded.messages()).unwrap();
+        let mut fork: Session<HistoryItem, Value, Value> = Session::new(SESSION_MODEL, SESSION_CWD);
+        fork.copy_saved_outputs_from(
+            session.id,
+            projected[0]
+                .retained_output_refs
+                .iter()
+                .map(|reference| reference.id.clone())
+                .collect(),
+        );
+        fork.save(&dir).unwrap();
         assert_eq!(
-            store.load_text(target, reference.id.clone()).unwrap(),
+            store.load_text(fork.id, reference.id.clone()).unwrap(),
             full_output
         );
         let grep = store
-            .grep(target, reference.id, FULL_OUTCOME_TAIL, 1, 1, 0, 0)
+            .grep(fork.id, reference.id, FULL_OUTCOME_TAIL, 1, 1, 0, 0)
             .unwrap();
         assert_eq!(grep.rows[0].text, FULL_OUTCOME_TAIL);
+    }
+
+    fn full_outcome() -> String {
+        format!(
+            "{}\n{FULL_OUTCOME_TAIL}",
+            STORED_OUTPUT.repeat(FULL_OUTCOME_REPEATS)
+        )
+    }
+
+    fn push_outcome(
+        session: &mut Session<HistoryItem, Value, Value>,
+        reference: &ToolOutputRef,
+    ) -> Message {
+        let mut observation = Message::task_observation(STORED_OUTPUT.into(), task_event_origin());
+        observation.retained_output_refs.push(reference.clone());
+        for item in expand_message(&observation, None) {
+            session.push_message(item);
+        }
+        observation
     }
 
     #[test_case(false; "empty_user")]

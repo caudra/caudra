@@ -839,9 +839,23 @@ impl JobScope {
                     JobPayload::Question(_) => QUESTION_OUTPUT_LABEL.into(),
                     JobPayload::Agent => "output-shell".into(),
                 };
+                #[cfg(test)]
+                let save_checked = self.tasks.lock().save_checked.clone();
                 smol::unblock(move || {
+                    let waiting = || {
+                        #[cfg(test)]
+                        if let Some(checked) = &save_checked {
+                            let _ = checked.send(());
+                        }
+                        false
+                    };
                     ToolOutputStore::new(dir)
-                        .put_named(session, &retained, &label)
+                        .put_named_within(
+                            session,
+                            &retained,
+                            &label,
+                            &RuntimeRetry::new(None, &waiting),
+                        )
                         .map_err(|error| error.to_string())
                 })
                 .await?

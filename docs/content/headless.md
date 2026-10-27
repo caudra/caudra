@@ -101,7 +101,7 @@ A headless run reads the active [decision endpoint](/docs/providers/#decision-en
 
 Two caveats:
 
-- One-shot `--print` always starts a **new** session in **build** mode, unlike the TUI, which opens in plan mode unless [`ui.default_mode`](/docs/configuration/#ui) is `build`. Plan mode and session resume need the SDK path (or the TUI).
+- One-shot `--print` always starts a **new** session in **build** mode, unlike the TUI, which opens in plan mode unless [`ui.default_mode`](/docs/configuration/#ui) is `build`. Plan mode and session resume need the SDK path (or the TUI). The run saves its session, with its transcript and [retained tool outputs](/docs/sessions/#managed-tool-outputs), when it ends, so it appears in session lists and `caudra --session <ID>` resumes it. Its `session_id` is in the JSON output. With `--ephemeral`, the session is saved in the temporary store and removed when the run exits.
 - In embedded mode, the plan file for SDK `--permission-mode plan` is `./plan.md` under cwd rather than the state-dir `projects/<project-id>/plans/<slug>.md` files the TUI uses. Remote plans remain client-owned documents addressed by opaque reference. A `--fork-session` fork starts without a plan.
 
 With a Workcell selector, SDK stream sessions handle text-only `/remote` recovery commands and standalone `cd` messages before model dispatch. Recovery responses have system subtype `remote` or `remote_error`. Directory changes return `cwd` or `cwd_error`. See [Remote Workspaces](/docs/remote-workspaces/#recovery-commands) for exact commands, acknowledgement requirements, and the no-retry policy. For recovery without a model session, use [`caudra remote`](/docs/cli/#caudra-remote).

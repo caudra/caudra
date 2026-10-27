@@ -26,6 +26,7 @@ use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::peers::PeerSession;
 use caudra_agent::permissions::PermissionManager;
+use caudra_agent::session_fork::history_output_ids;
 use caudra_agent::worktree::ClosePlan;
 use caudra_config::Feature;
 use caudra_providers::{
@@ -41,7 +42,6 @@ use caudra_storage::sessions::{
     StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
     StoredSubagentTaskSpec,
 };
-use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use caudra_storage::worktrees::{self, CheckoutSessions};
 
 use crate::AppSession;
@@ -1383,9 +1383,7 @@ impl App {
         child.replace_messages(ancestor.clone());
         child.set_title(self.next_fork_title()?);
 
-        let mut output_ids = HashSet::new();
-        let mut output_refs = Vec::new();
-        collect_tool_output_refs(&ancestor, &mut output_ids, &mut output_refs);
+        let mut output_histories = vec![ancestor.as_slice()];
         let mut stored_tool_ids = all_tool_call_ids(&ancestor);
         let mut reachable = reachable_subagent_ids(
             &ancestor,
@@ -1496,7 +1494,7 @@ impl App {
             let Some(history) = self.state.session.subagent_messages().get(version_id) else {
                 continue;
             };
-            collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
+            output_histories.push(history);
             stored_tool_ids.extend(all_tool_call_ids(history));
             child.set_subagent_history(
                 task_id.clone(),
@@ -1530,13 +1528,7 @@ impl App {
                 .collect(),
         );
 
-        if !output_refs.is_empty() {
-            ToolOutputStore::new(self.storage.clone())
-                .copy_session_outputs(self.state.session.id, child.id, &output_refs)
-                .map_err(|error| {
-                    format!("Failed to copy managed tool outputs for fork: {error}")
-                })?;
-        }
+        child.copy_saved_outputs_from(self.state.session.id, history_output_ids(output_histories));
 
         let (plan, warning) = match self.copy_plan(child.id) {
             Ok(plan) => (plan, None),
@@ -1904,44 +1896,6 @@ pub(crate) fn reachable_subagent_ids(
         }
     }
     reachable
-}
-
-fn collect_tool_output_refs(
-    items: &[HistoryItem],
-    ids: &mut HashSet<ToolOutputId>,
-    references: &mut Vec<ToolOutputRef>,
-) {
-    for item in items {
-        match &item.kind {
-            HistoryItemKind::ToolResult {
-                output_ref: Some(output_ref),
-                ..
-            } => push_tool_output_ref(output_ref, ids, references),
-            HistoryItemKind::User {
-                retained_output_refs,
-                ..
-            }
-            | HistoryItemKind::AssistantText {
-                retained_output_refs,
-                ..
-            } => {
-                for output_ref in retained_output_refs {
-                    push_tool_output_ref(output_ref, ids, references);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn push_tool_output_ref(
-    output_ref: &ToolOutputRef,
-    ids: &mut HashSet<ToolOutputId>,
-    references: &mut Vec<ToolOutputRef>,
-) {
-    if ids.insert(output_ref.id.clone()) {
-        references.push(output_ref.clone());
-    }
 }
 
 fn split_fork_title(title: &str) -> (&str, Option<u32>) {
@@ -2382,17 +2336,12 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{appended_len, collect_tool_output_refs};
+    use super::appended_len;
     use caudra_agent::HistorySnapshot;
-    use caudra_providers::{ContentBlock, HistoryItem, Message, Role, expand_message};
-    use caudra_storage::tool_outputs::ToolOutputRef;
-    use std::collections::HashSet;
+    use caudra_providers::{HistoryItem, Message, expand_message};
     use std::sync::Arc;
     use test_case::test_case;
 
-    const OUTPUT_ID: &str = "calm-blue-wren";
-    const PROSE_ONLY_ID: &str = "bright-small-heron";
-    const OUTCOME: &str = "Complete retained task outcome";
     const MERGED_LEN: usize = 2;
     const APPENDED_LEN_MSG: &str =
         "only a same-run extension of the merged ids may skip the full merge";
@@ -2431,39 +2380,5 @@ mod tests {
             expected,
             "{APPENDED_LEN_MSG}"
         );
-    }
-
-    #[test_case(1; "single_observation")]
-    #[test_case(3; "repeated_observations_and_refs")]
-    fn retained_observation_refs_are_counted_once_across_history_kinds(copies: usize) {
-        let reference = ToolOutputRef {
-            id: OUTPUT_ID.parse().unwrap(),
-            byte_count: OUTCOME.len(),
-            line_count: 1,
-        };
-        let mut observation = Message::observation(PROSE_ONLY_ID.into());
-        observation.retained_output_refs = vec![reference.clone(); copies];
-        let mut messages = vec![observation; copies];
-        messages.push(Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: OUTCOME.into(),
-            }],
-            retained_output_refs: vec![reference.clone()],
-            ..Default::default()
-        });
-        let items = crate::history_items(&messages);
-        let mut ids = HashSet::new();
-        let mut references = Vec::new();
-        collect_tool_output_refs(&items, &mut ids, &mut references);
-        assert_eq!(
-            references
-                .iter()
-                .map(|reference| reference.byte_count)
-                .sum::<usize>(),
-            OUTCOME.len()
-        );
-        assert_eq!(ids.len(), 1);
-        assert_eq!(references, [reference]);
     }
 }

@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::AgentEvent;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use pump::LearnerProbe;
 pub use pump::{Learner, LearnerDeps, LearnerHandle};
 
 /// One step of a learner run, for a frontend that shows the run as it goes.

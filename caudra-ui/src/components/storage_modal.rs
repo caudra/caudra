@@ -29,7 +29,7 @@ const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
 const GRID_CELL_COUNT: usize = 100;
-const CATEGORY_COUNT: usize = 4;
+const CATEGORY_COUNT: usize = 3;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const COLLAPSED_STORES: usize = 6;
 const LEGEND_GAP: &str = "   ";
@@ -246,7 +246,6 @@ impl Overlay for StorageModal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Consumer {
     Database,
-    ToolOutputs,
     ChangeRecords,
     Archives,
 }
@@ -255,7 +254,6 @@ impl Consumer {
     fn glyph(self) -> &'static str {
         match self {
             Self::Database => "D",
-            Self::ToolOutputs => "O",
             Self::ChangeRecords => "C",
             Self::Archives => "A",
         }
@@ -264,7 +262,6 @@ impl Consumer {
     fn label(self) -> &'static str {
         match self {
             Self::Database => "Database",
-            Self::ToolOutputs => "Tool outputs",
             Self::ChangeRecords => "File change records",
             Self::Archives => "Archives",
         }
@@ -273,7 +270,6 @@ impl Consumer {
     fn style(self, theme: &Theme) -> Style {
         match self {
             Self::Database => theme.heading,
-            Self::ToolOutputs => theme.tool,
             Self::ChangeRecords => theme.accent,
             Self::Archives => theme.todo_pending,
         }
@@ -283,7 +279,6 @@ impl Consumer {
 fn consumers(stats: &SessionStorageStats) -> [(Consumer, u64); CATEGORY_COUNT] {
     [
         (Consumer::Database, database_bytes(stats)),
-        (Consumer::ToolOutputs, stats.tool_output_file_bytes),
         (Consumer::ChangeRecords, stats.snapshot_bytes),
         (Consumer::Archives, stats.archive_bytes),
     ]
@@ -629,7 +624,6 @@ mod tests {
     const SHM_BYTES: u64 = 32 * 1024;
     const PAGE_SIZE: u64 = 4_096;
     const CHANGE_RECORD_BYTES: u64 = 7 * 1024 * 1024 * 1024;
-    const TOOL_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
     const ARCHIVE_BYTES: u64 = 512 * 1024;
     const WORKFLOW_RUN_COUNT: u64 = 24;
     const WORKFLOW_CALL_COUNT: u64 = 960;
@@ -677,7 +671,8 @@ mod tests {
             automation_bytes: 0,
             background_invocation_count: 0,
             background_bytes: 0,
-            tool_output_file_bytes: TOOL_OUTPUT_BYTES,
+            saved_output_count: 0,
+            saved_output_bytes: 0,
             snapshot_bytes: CHANGE_RECORD_BYTES,
             archive_bytes: ARCHIVE_BYTES,
             pending_cleanup_jobs: 0,

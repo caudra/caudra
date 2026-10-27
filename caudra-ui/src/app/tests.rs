@@ -17276,7 +17276,8 @@ fn a_restored_task_names_its_model_on_the_call_that_launched_it(batch: bool) {
 fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
     let (_temp, storage, _, mut app) = tempdir_app();
     let source_session_id = app.state.session.id;
-    let store = ToolOutputStore::new(storage);
+    app.state.session_mut().save(&storage).unwrap();
+    let store = ToolOutputStore::new(storage.clone());
     let main_ref = store.put(source_session_id, "main full output").unwrap();
     let subagent_ref = store
         .put(source_session_id, "subagent full output")
@@ -17374,7 +17375,8 @@ fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
     session.set_subagent_messages("task-live".into(), subagent.clone());
     session.set_subagent_messages("task-nested".into(), nested_subagent.clone());
 
-    let forked = app.fork_at(DisplaySource::ToolResult(items[2].id)).unwrap();
+    let mut forked = app.fork_at(DisplaySource::ToolResult(items[2].id)).unwrap();
+    forked.session.save(&storage).unwrap();
 
     assert_eq!(forked.session.messages(), &items[..3]);
     assert_eq!(
@@ -17416,6 +17418,7 @@ fn fork_reloads_truncated_task_observation_without_output_retrieval(duplicate: b
     const ACK: &str = "The background task finished.";
     let (_temp, storage, _, mut app) = tempdir_app();
     let source = app.state.session.id;
+    app.state.session_mut().save(&storage).unwrap();
     let store = ToolOutputStore::new(storage.clone());
     let reference = store.put(source, OUTCOME).unwrap();
     let unrelated = store.put(source, UNRELATED).unwrap();
@@ -17596,7 +17599,8 @@ fn a_restored_compacted_session_hands_the_agent_its_todo_list() {
 #[test]
 fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
     let (_temp, storage, _, mut app) = tempdir_app();
-    let store = ToolOutputStore::new(storage);
+    app.state.session_mut().save(&storage).unwrap();
+    let store = ToolOutputStore::new(storage.clone());
     let output_ref = store
         .put(app.state.session.id, "nested full output")
         .unwrap();
@@ -17626,9 +17630,10 @@ fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
     session.replace_messages(items.clone());
     session.set_subagent_messages("old-task".into(), subagent.clone());
 
-    let forked = app
+    let mut forked = app
         .fork_at(DisplaySource::AssistantText(items[1].id))
         .unwrap();
+    forked.session.save(&storage).unwrap();
 
     assert_eq!(
         forked.session.subagent_messages()["old-task"].as_ref(),
@@ -17644,12 +17649,13 @@ fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
 }
 
 #[test]
-fn fork_fails_when_referenced_managed_output_is_missing() {
+fn fork_save_fails_when_referenced_managed_output_is_missing() {
     let (_temp, storage, _, mut app) = tempdir_app();
     let source_session_id = app.state.session.id;
-    let store = ToolOutputStore::new(storage);
+    app.state.session_mut().save(&storage).unwrap();
+    let store = ToolOutputStore::new(storage.clone());
     let missing_ref = store.put(source_session_id, "missing full output").unwrap();
-    store.delete_session(source_session_id).unwrap();
+    store.delete(source_session_id, &missing_ref.id).unwrap();
     let items = crate::history_items(&[
         Message::user("inspect".into()),
         Message {
@@ -17674,13 +17680,12 @@ fn fork_fails_when_referenced_managed_output_is_missing() {
     ]);
     app.state.session_mut().replace_messages(items.clone());
 
-    let Err(error) = app.fork_at(DisplaySource::ToolResult(items[2].id)) else {
-        panic!("fork unexpectedly succeeded with a missing managed output");
-    };
+    let mut forked = app.fork_at(DisplaySource::ToolResult(items[2].id)).unwrap();
+    let error = forked.session.save(&storage).unwrap_err().to_string();
 
-    assert!(error.contains("Failed to copy managed tool outputs for fork"));
     assert!(error.contains(&missing_ref.id.to_string()));
     assert!(error.contains(&source_session_id.to_string()));
+    assert!(AppSession::load(forked.session.id, &storage).is_err());
 }
 
 #[test_case("/sessions move", false, None; "move_picker")]

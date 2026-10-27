@@ -649,7 +649,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 |-------|------|---------|-------------|
 | `group_by` | string | `directory` | Evaluate policies per working directory (`directory`) or across every session (`none`) |
 | `sweep_interval_hours` | u64 | `24` | Hours between background sweeps. A sweep reclaims freed space, and applies `trim` and `forget` when they are set. `0` disables the sweep; `caudra storage` commands still work |
-| `trim` | table | `{}` | Sessions outside this policy lose file revert, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically |
+| `trim` | table | `{}` | Sessions outside this policy lose file revert, retained tool outputs, archives, and large rich outputs but stay resumable. Empty means never trim automatically |
 | `forget` | table | `{}` | Sessions outside this policy are deleted. Empty means never delete automatically |
 
 `trim` and `forget` are keep policies in `restic forget` terms: `keep_last`, `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly` take a count, and `keep_within` plus `keep_within_hourly` through `keep_within_yearly` take a duration such as `"90d"` or `"2y5m7d3h"`. A session is kept when any rule matches. An empty `forget` policy disables automatic deletion. See [Sessions](/docs/sessions/#retention) for what each tier keeps and how the sweep runs.

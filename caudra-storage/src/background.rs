@@ -828,10 +828,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use std::cell::{Cell, RefCell};
-    use std::fs::{self, File, FileTimes};
     use std::slice::from_ref;
     use std::sync::{Arc, Mutex};
-    use std::time::SystemTime;
     use test_case::test_case;
 
     use super::{
@@ -845,7 +843,7 @@ mod tests {
             RuntimeRetry, Session, SessionDatabase, SessionError, SessionLease, TitleSource,
             progress::{MIGRATION, MigrationEvent},
         },
-        tool_outputs::{TOOL_OUTPUT_DIR, ToolOutputStore},
+        tool_outputs::{ToolOutputStore, UNREFERENCED_OUTPUT_GRACE},
     };
 
     const TASK: &str = "task";
@@ -1444,19 +1442,14 @@ mod tests {
                 .unwrap()
             );
         }
-        for entry in fs::read_dir(
-            dir.path()
-                .join(TOOL_OUTPUT_DIR)
-                .join(session.id.to_string()),
-        )
-        .unwrap()
-        {
-            File::open(entry.unwrap().path())
-                .unwrap()
-                .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
-                .unwrap();
-        }
-        assert_eq!(store.cleanup_orphans(&[session.id]).unwrap(), 1);
+        db.connection()
+            .execute("UPDATE saved_tool_outputs SET created_at = 0", [])
+            .unwrap();
+        assert_eq!(
+            db.prune_unreferenced_outputs(UNREFERENCED_OUTPUT_GRACE, false)
+                .unwrap(),
+            1
+        );
         assert_eq!(
             store.load_text(session.id, reference.id.clone()).unwrap(),
             TASK
@@ -1468,7 +1461,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            db.stats().unwrap().tool_output_file_bytes,
+            db.stats().unwrap().saved_output_bytes,
             reference.byte_count as u64
         );
         assert_eq!(

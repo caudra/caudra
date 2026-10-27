@@ -960,11 +960,25 @@ pub fn cli_tool_ctx(project_cwd: &Path) -> ToolContext {
 pub mod test_support {
     use std::borrow::Cow;
 
-    use crate::{Envelope, EventSender, ToolOutput};
+    use caudra_storage::StateDir;
+    use caudra_storage::id::CaudraId;
+
+    use crate::{Envelope, EventSender, StoredSession, ToolOutput};
 
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+    const OUTPUT_OWNER_MODEL: &str = "test/model";
+    const OUTPUT_OWNER_CWD: &str = "/project";
+
+    /// Saves the session row that a test's tool outputs belong to.
+    pub fn save_output_owner(state_dir: &StateDir, session: CaudraId) {
+        let mut stored = StoredSession::new(OUTPUT_OWNER_MODEL, OUTPUT_OWNER_CWD);
+        stored.id = session;
+        stored
+            .save(state_dir)
+            .expect("save the output owner session");
+    }
 
     pub struct GuardedMock;
 

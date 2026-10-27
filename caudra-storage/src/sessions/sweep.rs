@@ -23,7 +23,7 @@ use super::{
 };
 use crate::id::CaudraId;
 use crate::retention::{self, Decision, GroupBy, KeepPolicy, SessionFacts};
-use crate::tool_outputs::ToolOutputStore;
+use crate::tool_outputs::UNREFERENCED_OUTPUT_GRACE;
 use crate::{StateDir, StorageError, lock_session_artifacts, try_exclusive_state_lock};
 
 const SWEEP_LOCK_FILE: &str = "caudra.db.sweep.lock";
@@ -31,7 +31,7 @@ const LAST_SWEEP_KEY: &str = "retention.last_sweep_at";
 const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
 const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";
 const CHANGE_STORES_PHASE: &str = "cleaning change stores";
-const TOOL_OUTPUT_PHASE: &str = "cleaning orphaned tool output";
+const TOOL_OUTPUT_PHASE: &str = "pruning unreferenced tool outputs";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.
@@ -167,7 +167,7 @@ impl ExecuteReport {
             .iter()
             .map(|outcome| match &outcome.kind {
                 OutcomeKind::Trimmed(report) => {
-                    report.artifact_bytes + report.tool_output_row_bytes
+                    report.artifact_bytes + report.tool_output_row_bytes + report.saved_output_bytes
                 }
                 OutcomeKind::Forgotten { artifact_bytes } => *artifact_bytes,
                 _ => 0,
@@ -183,7 +183,9 @@ pub struct PruneReport {
     pub cleanup_jobs_completed: u64,
     pub orphan_directories: u64,
     pub orphan_bytes: u64,
-    pub orphan_tool_output_entries: u64,
+    /// Saved tool outputs no session record references, removed once past
+    /// the grace period.
+    pub unreferenced_tool_outputs: u64,
     /// Change store holders with no session, released once past the grace
     /// period.
     pub orphan_record_holders: u64,
@@ -417,16 +419,8 @@ pub fn prune(
     PRUNE.report(PruneEvent::Phase {
         label: TOOL_OUTPUT_PHASE,
     });
-    let store = ToolOutputStore::new(state_dir.clone());
-    let orphan_outputs = if dry_run {
-        store.count_orphans(&known)
-    } else {
-        store
-            .cleanup_orphans(&known)
-            .map(|count| u64::try_from(count).unwrap_or(u64::MAX))
-    };
-    report.orphan_tool_output_entries =
-        orphan_outputs.map_err(|error| SessionError::ToolOutputCleanup(Box::new(error)))?;
+    report.unreferenced_tool_outputs =
+        database.prune_unreferenced_outputs(UNREFERENCED_OUTPUT_GRACE, dry_run)?;
     if !dry_run {
         PRUNE.report(PruneEvent::Phase {
             label: CHECKPOINT_PHASE,

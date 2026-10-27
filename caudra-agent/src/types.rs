@@ -5753,8 +5753,10 @@ mod tests {
     #[test]
     fn tool_results_prefers_bounded_model_output_and_attaches_output_ref() {
         let temp = TempDir::new().unwrap();
-        let store = ToolOutputStore::new(StateDir::from_path(temp.path().to_path_buf()));
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
         let session = SessionRef::generate();
+        crate::tools::test_support::save_output_owner(&state_dir, session.id());
+        let store = ToolOutputStore::new(state_dir);
         let output_ref = store
             .put(session.id(), "full output\n\nmodel context")
             .unwrap();

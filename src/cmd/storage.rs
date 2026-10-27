@@ -149,9 +149,10 @@ pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
                 println!("tool_outputs: {}", stats.tool_output_count);
                 println!("subagent_items: {}", stats.subagent_item_count);
                 println!("logical_bytes: {}", bytes(stats.logical_bytes));
+                println!("saved_tool_outputs: {}", stats.saved_output_count);
                 println!(
-                    "tool_output_file_bytes: {}",
-                    bytes(stats.tool_output_file_bytes)
+                    "saved_tool_output_bytes: {}",
+                    bytes(stats.saved_output_bytes)
                 );
                 println!("snapshot_bytes: {}", bytes(stats.snapshot_bytes));
                 println!("archive_bytes: {}", bytes(stats.archive_bytes));
@@ -677,9 +678,10 @@ fn render_outcomes(action: Action, report: &ExecuteReport) -> String {
     for outcome in &report.outcomes {
         let note = match &outcome.kind {
             OutcomeKind::Trimmed(trim) => format!(
-                "trimmed, {} rows and {} of artifacts released",
+                "trimmed, {} rows, {} saved tool outputs and {} of artifacts released",
                 trim.tool_output_rows,
-                bytes(trim.artifact_bytes + trim.tool_output_row_bytes)
+                trim.saved_output_rows,
+                bytes(trim.artifact_bytes + trim.tool_output_row_bytes + trim.saved_output_bytes)
             ),
             OutcomeKind::Forgotten { artifact_bytes } => {
                 format!(
@@ -733,10 +735,10 @@ fn render_prune(report: &PruneReport) -> String {
     );
     let _ = writeln!(
         out,
-        "  {prefix}remove {} orphaned artifact directories ({}) and {} orphaned tool output entries",
+        "  {prefix}remove {} orphaned artifact directories ({}) and {} unreferenced tool outputs",
         report.orphan_directories,
         bytes(report.orphan_bytes),
-        report.orphan_tool_output_entries
+        report.unreferenced_tool_outputs
     );
     let _ = writeln!(
         out,

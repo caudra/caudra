@@ -141,6 +141,7 @@ const DECISIONS_STARTUP_FAILED: &str = "Decision engine initialization failed; c
 const STALE_WORKFLOW_CONTROL: &str =
     "Workflow control was superseded by a session stop or mode change";
 const PERSIST_FAILED: &str = "Failed to persist session";
+const PERSIST_UNAVAILABLE: &str = "Session persistence unavailable";
 /// Automation events the host has not taken yet; past this the oldest is dropped, as the
 /// runtime drops its own.
 const AUTOMATION_EVENT_CAPACITY: usize = 1024;
@@ -1827,6 +1828,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
     let session_id = CaudraId::generate();
+    let mut store = open_print_store(&params, state_dir, session_id, &working_dir)?;
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
@@ -1960,7 +1962,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
                 active_prompt_profile_name: Some(active_prompt_profile_name),
                 subagent_cancels: Arc::new(CancelMap::new()),
-                subagent_history: SubagentHistoryStore::default(),
+                subagent_history: store.subagent_history.clone(),
                 registry: Arc::clone(registry),
                 audience: ToolAudience::MAIN,
                 tool_filter,
@@ -2037,6 +2039,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 .into_iter()
                 .map(|(_, commit)| commit)
                 .collect();
+            store.set_mode(&mode);
+            store.set_reasoning(&params.thinking, fast);
             let result = agent
                 .run(AgentInput {
                     message: params.prompt,
@@ -2057,10 +2061,18 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 peer.close();
             }
 
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 error!(error = %e, "agent error");
                 let _ = error_tx.send(AgentEvent::Error {
                     message: e.user_message(),
+                });
+            }
+            if matches!(result, Ok(DoneReason::Cancelled)) {
+                store.kill_unfinished_subagents();
+            }
+            if let Err(error) = store.record_turn(&history, base.model.spec(), &base.permissions) {
+                let _ = error_tx.send(AgentEvent::Error {
+                    message: format!("{PERSIST_FAILED}: {error}"),
                 });
             }
 
@@ -2078,6 +2090,50 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         goal,
         task,
     })
+}
+
+/// Saves a print run's session row before anything can spill an output into
+/// it, so the run is listed and resumable like any other session.
+fn open_print_store(
+    params: &HeadlessParams,
+    state_dir: StateDir,
+    session_id: CaudraId,
+    working_dir: &str,
+) -> Result<SessionStore, InteractiveStartError> {
+    let unavailable =
+        |error: String| InteractiveStartError(format!("{PERSIST_UNAVAILABLE}: {error}"));
+    let workspace_binding = params
+        .workspace_session
+        .as_ref()
+        .map(|workspace| {
+            StoredWorkspaceBinding::new_with_cursor(
+                workspace.binding().clone(),
+                workspace.cursor().clone(),
+                None,
+            )
+        })
+        .transpose()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let lease = SessionLease::acquire(&state_dir, session_id)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let mut store = SessionStore::open_in_with_lease(
+        state_dir,
+        session_id,
+        working_dir,
+        &params.model.spec(),
+        Arc::new(lease),
+        workspace_binding.as_ref(),
+    )
+    .map_err(|error| unavailable(error.to_string()))?;
+    store.set_system_prompt_profile(
+        params
+            .system_prompt_profile
+            .as_deref()
+            .map(SystemPromptProfile::name),
+    );
+    store.goal = params.goal.clone();
+    store.autopilot = params.autopilot.clone();
+    Ok(store)
 }
 
 pub struct InteractiveParams {
@@ -3596,9 +3652,7 @@ pub async fn prepare_interactive(
             Arc::clone(&params.session_lease),
             params.workspace_binding.as_ref(),
         )
-        .map_err(|error| {
-            InteractiveStartError(format!("Session persistence unavailable: {error}"))
-        })?
+        .map_err(|error| InteractiveStartError(format!("{PERSIST_UNAVAILABLE}: {error}")))?
     };
     store
         .verify_start_version(params.expected_write_version)
@@ -5753,6 +5807,51 @@ mod tests {
     }
 
     #[test]
+    fn print_session_is_saved_before_it_can_hold_outputs() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        let session = session_id();
+        let params = HeadlessParams {
+            model: Model::from_spec(MODEL_SPEC).unwrap(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            decisions_config: DecisionsConfig::default(),
+            seed_permission_mode: None,
+            snapshots: SnapshotsConfig::default(),
+            timeouts: Timeouts::default(),
+            prompt: String::new(),
+            thinking: crate::ThinkingConfig::default(),
+            images: Vec::new(),
+            prompt_slots: ResolvedSlots::default(),
+            system_prompt_profile: None,
+            prompt_profiles: Arc::new(PromptProfileCatalog::default()),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from(CWD),
+            fast: false,
+            model_policy: Arc::new(ModelPolicy::default()),
+            plugin_rules: Arc::default(),
+            goal: GoalHandle::default(),
+            remote_environment: None,
+            workspace_session: None,
+            remote_project_context: None,
+            host_cwd: None,
+            local_documents: None,
+            autopilot: None,
+        };
+
+        let _store = open_print_store(&params, state_dir.clone(), session, CWD).unwrap();
+
+        assert_eq!(StoredSession::load(session, &state_dir).unwrap().cwd, CWD);
+        let outputs = ToolOutputStore::new(state_dir);
+        let output = outputs.put(session, CHANGE_PROMPT).unwrap();
+        assert_eq!(
+            outputs.load_text(session, output.id).unwrap(),
+            CHANGE_PROMPT
+        );
+    }
+
+    #[test]
     fn refreshed_environment_keeps_remote_identity_and_scratch() {
         const STALE_DATE: &str = "stale date";
         const REMOTE_CWD: &str = "remote/project";
@@ -6325,10 +6424,10 @@ mod tests {
     fn record_turn_round_trips_managed_output_ref() {
         let tmp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut store = store_in(&tmp);
         let output_ref = ToolOutputStore::new(state_dir)
             .put(session_id(), "full output")
             .unwrap();
-        let mut store = store_in(&tmp);
         let history = History::new(vec![
             Message::user("inspect".into()),
             Message {

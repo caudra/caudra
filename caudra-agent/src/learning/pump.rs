@@ -161,6 +161,27 @@ impl LearnerHandle {
     pub fn project(&self) -> &str {
         &self.project
     }
+
+    /// A handle with no learner behind it, and the probe that sees what it asked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn detached(project: &str) -> (Self, LearnerProbe) {
+        let (wake, woken) = flume::unbounded();
+        let handle = Self {
+            wake,
+            project: project.to_owned(),
+        };
+        (handle, LearnerProbe(woken))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct LearnerProbe(Receiver<Wake>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl LearnerProbe {
+    pub fn asked_to_run_now(&self) -> bool {
+        self.0.try_iter().any(|wake| matches!(wake, Wake::Now))
+    }
 }
 
 #[derive(Debug, Error)]

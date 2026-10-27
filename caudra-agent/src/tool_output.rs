@@ -3,7 +3,6 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 
 use caudra_storage::StateDir;
-use caudra_storage::sessions::persisted_session_ids;
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore, line_count};
 use tracing::warn;
 
@@ -48,17 +47,19 @@ const SHELL_LABEL_COMMANDS: &[(&str, &[&str])] = &[
 static DEFAULT_STORE: LazyLock<Option<Arc<ToolOutputStore>>> = LazyLock::new(|| {
     StateDir::resolve()
         .map(|state_dir| {
-            let store = Arc::new(ToolOutputStore::new(state_dir.clone()));
-            // Reclaiming orphans enumerates every persisted session and walks
-            // the whole tool-output tree. Nothing the store serves depends on
-            // it, but running it here spent that on whichever thread first
-            // touched the store -- at startup, the one that has not drawn a
-            // frame yet. Detached, so a slow filesystem delays only the
-            // reclaim.
+            let store = Arc::new(ToolOutputStore::new(state_dir));
+            // Pruning reads every session record that owns an output. Nothing
+            // the store serves depends on it, so it runs detached rather than
+            // on whichever thread first touched the store -- at startup, the
+            // one that has not drawn a frame yet.
             let sweeper = Arc::clone(&store);
             if let Err(error) = thread::Builder::new()
                 .name(CLEANUP_THREAD_NAME.to_owned())
-                .spawn(move || reclaim_orphans(&sweeper, &state_dir))
+                .spawn(move || {
+                    if let Err(error) = sweeper.prune_unreferenced(false) {
+                        warn!(%error, "failed to prune unreferenced tool outputs");
+                    }
+                })
             {
                 warn!(%error, "tool output cleanup not started");
             }
@@ -67,17 +68,6 @@ static DEFAULT_STORE: LazyLock<Option<Arc<ToolOutputStore>>> = LazyLock::new(|| 
         .map_err(|error| warn!(%error, "tool output store unavailable"))
         .ok()
 });
-
-fn reclaim_orphans(store: &ToolOutputStore, state_dir: &StateDir) {
-    match persisted_session_ids(state_dir) {
-        Ok(session_ids) => {
-            if let Err(error) = store.cleanup_orphans(&session_ids) {
-                warn!(%error, "failed to clean up orphaned tool outputs");
-            }
-        }
-        Err(error) => warn!(%error, "failed to enumerate sessions for tool output cleanup"),
-    }
-}
 
 /// The text a saved result's preview was cut from, numbered as the stored copy
 /// is, and the 1-indexed lines the preview left out. A line the preview shows
@@ -527,11 +517,11 @@ fn fits(text: &str, max_lines: usize, max_bytes: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::sync::Arc;
 
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
+    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -557,6 +547,8 @@ mod tests {
     const WIDE_LINES: usize = 1_000;
     const LONG_LINE_FILL: usize = 40;
     const SUFFIX: &str = "model-only guidance";
+    const MODEL_SPEC: &str = "provider/model";
+    const CWD: &str = "/project";
 
     #[test_case("cargo test private_test_name --token=private", "cargo-test"; "ignores_arguments")]
     #[test_case("git status --short", "git-status"; "known_subcommand")]
@@ -661,10 +653,11 @@ mod tests {
         max_lines: usize,
         max_bytes: usize,
     ) -> (ToolContext, Arc<ToolOutputStore>, SessionRef) {
-        let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-            temp.path().to_path_buf(),
-        )));
-        let session = SessionRef::generate();
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut stored = crate::StoredSession::new(MODEL_SPEC, CWD);
+        stored.save(&state_dir).unwrap();
+        let store = Arc::new(ToolOutputStore::new(state_dir));
+        let session = SessionRef::from(stored.id);
         let mut ctx = context(max_lines, max_bytes);
         ctx.session_id = Some(session.clone());
         ctx.tool_output_store = Some(Arc::clone(&store));
@@ -1293,7 +1286,7 @@ mod tests {
             .map(|line| format!("streamed-{line}-{}", "x".repeat(40)))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut sink = store.begin(session.id()).unwrap();
+        let mut sink = store.begin(session.id());
         sink.append(&full_text).unwrap();
         let output_ref = sink.finish().unwrap();
         let mut done = done("placeholder".into(), false)
@@ -1321,11 +1314,11 @@ mod tests {
             store.load_text(session.id(), output_ref.id).unwrap(),
             full_text
         );
-        let session_dir = temp
-            .path()
-            .join("tool-output")
-            .join(session.id().to_string());
-        assert_eq!(fs::read_dir(session_dir).unwrap().count(), 1);
+        let stats = SessionDatabase::open(store.state_dir())
+            .unwrap()
+            .stats()
+            .unwrap();
+        assert_eq!(stats.saved_output_count, 1);
     }
 
     #[test]
@@ -1377,7 +1370,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (ctx, store, session) = stored_context(&temp, 20, 1_000);
         let output_ref = store.put(session.id(), "streamed text").unwrap();
-        store.delete_session(session.id()).unwrap();
+        store.delete(session.id(), &output_ref.id).unwrap();
         let mut done = done("placeholder".into(), false);
         done.output_ref = Some(output_ref.clone());
         done.model_output_from_ref = true;

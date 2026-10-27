@@ -812,8 +812,8 @@ version = 5
 # Type: u64.
 # sweep_interval_hours = 24
 
-# Sessions outside this policy lose file revert, tool output files, archives,
-# and large rich outputs but stay resumable. Empty means never trim
+# Sessions outside this policy lose file revert, retained tool outputs,
+# archives, and large rich outputs but stay resumable. Empty means never trim
 # automatically.
 # Type: table.
 # trim = {}

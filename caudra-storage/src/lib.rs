@@ -658,6 +658,7 @@ mod tests {
     const ORIGINAL: &[u8] = b"original";
     const OWNER_ONLY_FILE_MODE: u32 = 0o600;
     const PERSISTENT_TRACE: &str = "ephemeral session data reached the persistent root";
+    const TOOL_OUTPUT: &str = "tool output";
     const PROMPT_STASH_KEY: &str = "input.stash";
     const REPLACEMENT: &[u8] = b"replacement";
     #[cfg(windows)]
@@ -838,9 +839,8 @@ mod tests {
         let mut session = sessions::Session::<TestMessage, (), serde_json::Value>::new("test", CWD);
         let session_id = session.id;
         session.save(&state_dir).unwrap();
-        tool_outputs::ToolOutputStore::new(state_dir.clone())
-            .put(session_id, "tool output")
-            .unwrap();
+        let outputs = tool_outputs::ToolOutputStore::new(state_dir.clone());
+        let output = outputs.put(session_id, TOOL_OUTPUT).unwrap();
         let mut history = input_history::InputHistory::load(&state_dir, 10);
         history.push("prompt".into());
         prompt_stash::PromptStash::open(&state_dir)
@@ -873,7 +873,10 @@ mod tests {
             "{PERSISTENT_TRACE}"
         );
         assert!(volatile.join(sessions::SESSIONS_DB_FILE).is_file());
-        assert!(volatile.join(tool_outputs::TOOL_OUTPUT_DIR).is_dir());
+        assert_eq!(
+            outputs.load_text(session_id, output.id).unwrap(),
+            TOOL_OUTPUT
+        );
     }
 
     #[test]
