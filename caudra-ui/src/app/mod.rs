@@ -22,6 +22,7 @@ mod grab;
 mod grammar_agreement;
 mod image_paste;
 mod learning;
+mod live_switch;
 mod memory;
 pub(crate) mod mode;
 mod mouse;
@@ -776,6 +777,12 @@ pub struct App {
     pub(super) btw_thread: Option<btw::BtwThread>,
     pub(crate) context_store: Option<ContextStore>,
     pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
+    /// The main run's picks and backoff wake, while an agent loop serves it.
+    pub(crate) main_control: Option<caudra_agent::ConversationControl>,
+    /// Each running task's picks and backoff wake, by task id.
+    pub(crate) subagent_controls: HashMap<String, caudra_agent::ConversationControl>,
+    /// The task the spent-account card came up for, `None` for the main chat.
+    exhausted_task: Option<String>,
     pub(crate) execution_mode: Option<SharedMode>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -1095,6 +1102,9 @@ impl App {
             btw_thread: None,
             context_store: None,
             effective_model_slot: None,
+            main_control: None,
+            subagent_controls: HashMap::new(),
+            exhausted_task: None,
             execution_mode: None,
             image_paste_rx: vec![],
             storage_writer,
@@ -1676,6 +1686,7 @@ impl App {
     fn apply_thinking(&mut self, thinking: ThinkingConfig) {
         if self.state.thinking != thinking {
             self.prefix_changed();
+            self.forward_main(caudra_agent::SettingsChange::thinking(thinking.clone()));
         }
         self.state.thinking = thinking;
         self.state.thinking_explicit = true;
@@ -3154,6 +3165,9 @@ impl App {
                 vec![]
             }
             ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
+            ModelPickerAction::SelectForTask { task_id, spec } => {
+                vec![Action::SwitchTaskModel { task_id, spec }]
+            }
             ModelPickerAction::Bind(purpose, binding) => vec![Action::Bind(purpose, binding)],
             ModelPickerAction::Unbind(purpose) => vec![Action::Unbind(purpose)],
             ModelPickerAction::ToggleFavorite(spec) => {
@@ -3417,6 +3431,9 @@ impl App {
     fn handle_thinking_picker_action(&mut self, action: ThinkingPickerAction) -> Vec<Action> {
         match action {
             ThinkingPickerAction::Select(thinking) => self.apply_thinking(thinking),
+            ThinkingPickerAction::SelectForTask { task_id, thinking } => {
+                self.switch_task(&task_id, caudra_agent::SettingsChange::thinking(thinking));
+            }
             ThinkingPickerAction::Copy(text) => self.copy_to_clipboard(&text),
             ThinkingPickerAction::Consumed | ThinkingPickerAction::Closed => {}
         }
@@ -3714,14 +3731,7 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
                 self.sync_todo_panel();
             }
-            BuiltinAction::ModelPicker => {
-                self.model_picker.open(
-                    &self.state.model,
-                    &self.model_policy,
-                    self.active_decision_endpoint(),
-                );
-                return vec![Action::RefreshModels];
-            }
+            BuiltinAction::ModelPicker => return self.open_model_picker_here(),
             BuiltinAction::ViewToggle => {
                 self.view = self.view.next();
                 for chat in &mut self.chats {
@@ -4720,6 +4730,7 @@ impl App {
     /// stay queued: the task's settlement hands them back to the agent.
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
         self.subagent_replacements.remove(task_id);
+        self.subagent_controls.remove(task_id);
         let queue = self.subagent_steers.remove(task_id);
         let Some(pending) = self.pending_subagent_steers.remove(task_id) else {
             return;
@@ -5002,6 +5013,7 @@ impl App {
         self.question_subagent = None;
         self.preserve_all_unconsumed_steers();
         self.subagent_steers.clear();
+        self.subagent_controls.clear();
         self.pending_subagent_steers.clear();
         self.subagent_replacements.clear();
         self.shell.cancel_all();
@@ -5321,6 +5333,7 @@ impl App {
                 fast: false,
                 answer_tx: None,
                 steer_tx: None,
+                control: None,
             });
             info.name.clone_from(&card.label);
             if info.prompt.is_none() {
@@ -5406,6 +5419,7 @@ impl App {
                             fast: false,
                             answer_tx: None,
                             steer_tx: None,
+                            control: None,
                         })
                     });
                 if !session_owned {
@@ -5936,6 +5950,9 @@ impl App {
             AgentEvent::ModelRerouted(reroute) => {
                 return self.model_rerouted(chat_idx, main_agent, *reroute);
             }
+            AgentEvent::SettingsChanged { model, thinking } => {
+                return self.settings_changed(chat_idx, main_agent, model, thinking);
+            }
             AgentEvent::TaskGuidanceQueued {
                 task_id,
                 id,
@@ -6211,6 +6228,10 @@ impl App {
         }
         if let Some(ref tx) = subagent.steer_tx {
             self.subagent_steers.insert(task_id.clone(), tx.clone());
+        }
+        if let Some(control) = &subagent.control {
+            self.subagent_controls
+                .insert(task_id.clone(), control.clone());
         }
         if first_parent_event {
             self.chats[0].update_tool_summary(parent_tool_use_id, &subagent.name);
@@ -6503,14 +6524,7 @@ impl App {
             "/rename" => self.rename_session(&cmd.args),
             "/fork" => self.fork_latest(),
             "/model" => match subcommand(&cmd.args) {
-                (word, _) if word.is_empty() => {
-                    self.model_picker.open(
-                        &self.state.model,
-                        &self.model_policy,
-                        self.active_decision_endpoint(),
-                    );
-                    vec![Action::RefreshModels]
-                }
+                (word, _) if word.is_empty() => self.open_model_picker_here(),
                 (word, "") if word == NEXT_ARG => self.cycle_favorite_model(),
                 _ => self.flash_usage(MODEL_USAGE),
             },
@@ -6592,6 +6606,10 @@ impl App {
                 vec![]
             }
             "/thinking" => {
+                if let Some(task_id) = self.active_subagent_id().map(str::to_owned) {
+                    self.set_task_thinking(task_id, &cmd.args);
+                    return vec![];
+                }
                 match self.set_thinking(&cmd.args) {
                     Ok(thinking) => self.flash(format!("Thinking: {thinking}")),
                     Err(msg) => self.flash(msg),

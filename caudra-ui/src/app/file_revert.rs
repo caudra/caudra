@@ -34,7 +34,7 @@ use tracing::warn;
 use super::App;
 use super::session::{RevertTarget, resolve_revert_target, source_target_id};
 use crate::components::message_actions::{
-    ACTIONS_AFTER_SAVE, ACTIONS_MAIN_CHAT_ONLY, Offer, details_line,
+    ACTIONS_AFTER_SAVE, ACTIONS_MAIN_CHAT_ONLY, Offer, details_lines,
 };
 use crate::components::messages::MessageActionTarget;
 use crate::components::{DisplaySource, RestoreMode};
@@ -660,7 +660,7 @@ impl App {
     }
 
     pub(super) fn open_message_actions(&mut self, target: MessageActionTarget) {
-        let details = details_line(
+        let details = details_lines(
             &self.chats[self.active_chat].message_details(target),
             self.ui_config.clock_format,
             Timestamp::now(),
@@ -679,7 +679,7 @@ impl App {
     pub(super) fn open_message_actions_at(
         &mut self,
         source: DisplaySource,
-        details: Option<Line<'static>>,
+        details: Option<Vec<Line<'static>>>,
     ) {
         let withheld = self.file_revert_withheld(source);
         self.message_actions.open(

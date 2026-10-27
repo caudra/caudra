@@ -36,6 +36,7 @@ use caudra_storage::{
 
 use super::cache_warming::{CacheWarmer, WarmerContext, subagent_mode};
 use super::favorites;
+use super::live_switch::{ConversationControl, SettingsChange};
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
 use crate::background::JobScope;
@@ -490,6 +491,8 @@ pub struct Subagent {
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
     steer_tx: Option<SteeringQueue>,
+    /// The user's picks of model and level, and the wake for a backoff.
+    control: ConversationControl,
     parent_cancels: Arc<CancelMap<String>>,
     parent_tool_use_id: String,
     root_tool_use_id: String,
@@ -552,6 +555,9 @@ impl Subagent {
         }
         self.closed = true;
         self.parent_cancels.retire(&self.task_id, self.cancel_slot);
+        if let Some(untaken) = self.control.live.take_pending() {
+            self.adopt(untaken);
+        }
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let persisted_spec = self
             .history_lease
@@ -658,6 +664,27 @@ impl Subagent {
         }
     }
 
+    /// Makes a pick the task's own, so its next turn and its saved spec
+    /// carry it. A move the provider made on its own stays with the turn.
+    fn adopt(&mut self, change: SettingsChange) {
+        let model = change.model_spec();
+        let thinking = change.thinking.clone().map(StoredThinking::from);
+        if let Some((provider, model)) = change.route {
+            if self.params.chat_model.spec() == self.params.model.spec() {
+                self.params.chat_provider = Arc::clone(&provider);
+                self.params.chat_model = model.clone();
+            }
+            self.params.provider = provider;
+            self.params.model = model;
+        }
+        if let Some(level) = change.thinking {
+            self.thinking = level;
+        }
+        if let Some(lease) = &mut self.history_lease {
+            lease.retarget(model, thinking);
+        }
+    }
+
     pub fn model_spec(&self) -> String {
         self.params.model.spec()
     }
@@ -665,10 +692,7 @@ impl Subagent {
     /// The level this session's requests carry, snapped to its model. `None`
     /// when the model cannot reason at all.
     pub fn effective_thinking(&self) -> Option<String> {
-        self.params
-            .model
-            .supports_thinking()
-            .then(|| self.thinking.resolve(&self.params.model).to_string())
+        self.thinking.label_for(&self.params.model)
     }
 
     /// Tokens every prompt of this session has consumed so far.
@@ -775,6 +799,7 @@ impl Subagent {
                 fast: self.fast,
                 answer_tx: self.answer_tx.take(),
                 steer_tx: self.steer_tx.take(),
+                control: Some(self.control.clone()),
             });
         }
 
@@ -853,6 +878,8 @@ impl Subagent {
         .with_cancel(cancel)
         .with_mcp(self.mcp.clone())
         .with_code(self.code.clone())
+        .with_live_switch(self.control.live.clone())
+        .with_retry_now(self.control.retry_now.clone())
         .with_local_tools(Arc::clone(&self.local_tools))
         .with_steering(Arc::clone(&self.steering))
         .with_cache_warmer(CacheWarmer::new(
@@ -883,6 +910,9 @@ impl Subagent {
         // it before drop even on errors, which deliberately do not emit Done.
         self.usage += agent.usage();
         drop(agent);
+        if let Some(applied) = self.control.live.take_applied() {
+            self.adopt(applied);
+        }
         // Consume every emitted Done, including cancellation and turn-limit exits,
         // so a later explicit invocation cannot read a stale usage total. Provider
         // errors do not emit Done and must not wait for the relay.
@@ -2025,6 +2055,7 @@ fn build(
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
         steer_tx: Some(steer_tx),
+        control: ConversationControl::default(),
         parent_cancels: Arc::clone(&ctx.subagent_cancels),
         parent_tool_use_id: ids.parent_tool_use_id,
         root_tool_use_id: ids.root_tool_use_id,
@@ -3339,6 +3370,7 @@ mod tests {
             fast: false,
             answer_tx: None,
             steer_tx: None,
+            control: None,
         })
         .unwrap();
         info

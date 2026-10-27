@@ -13,6 +13,7 @@ use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::card_decisions::{self, CardDecision, DecisionState, DecisionSubject};
 use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::{MessageActionTarget, MessageDetails, MessagesPanel};
+use crate::components::producer::Producer;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
 use crate::components::tooltip::Tip;
@@ -254,6 +255,7 @@ impl Chat {
                 | AgentEvent::AccountRouted { .. }
                 | AgentEvent::AccountExhausted(_)
                 | AgentEvent::ModelRerouted(_)
+                | AgentEvent::SettingsChanged { .. }
                 | AgentEvent::TaskAdmitted(_)
                 | AgentEvent::Retry { .. }
                 | AgentEvent::SubagentProgress { .. }
@@ -380,8 +382,14 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
+            AgentEvent::MessageStarted {
+                model, thinking, ..
+            } => self
+                .messages_panel
+                .message_started(Producer { model, thinking }),
             AgentEvent::Compacting => {
                 self.messages_panel.flush();
+                self.messages_panel.set_producer(None);
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Notice,
                     COMPACTION_BORDER_TEXT.into(),
@@ -401,7 +409,6 @@ impl Chat {
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::MemoryChanged
             | AgentEvent::QuestionClosed
-            | AgentEvent::MessageStarted { .. }
             | AgentEvent::SubagentFinished { .. }
             | AgentEvent::Autopilot(_) => {}
             AgentEvent::Decision(note) => match self.show_decisions {
@@ -420,6 +427,7 @@ impl Chat {
             | AgentEvent::AccountRouted { .. }
             | AgentEvent::AccountExhausted(_)
             | AgentEvent::ModelRerouted(_)
+            | AgentEvent::SettingsChanged { .. }
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
             | AgentEvent::SubagentProgress { .. }
@@ -1147,6 +1155,10 @@ impl Chat {
         )
     }
 
+    pub fn set_producer(&mut self, producer: Option<Producer>) {
+        self.messages_panel.set_producer(producer);
+    }
+
     pub fn bind_sources(&mut self, messages: &[DisplayMessage]) {
         self.messages_panel.bind_sources(messages);
     }
@@ -1487,9 +1499,11 @@ pub fn interleaved_history_to_display(
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
     let mut stall_row: Option<usize> = None;
+    let mut last_producer: Option<Producer> = None;
     for (index, item) in items.iter().enumerate() {
         while let Some((_, row)) = inserts.next_if(|(position, _)| *position <= index) {
             display.push(row);
+            last_producer = None;
         }
         while let Some((_, decision)) = decisions.next_if(|(position, _)| *position <= index) {
             host_turn_decision(&mut display, decision);
@@ -1707,6 +1721,7 @@ pub fn interleaved_history_to_display(
                     progress: None,
                     plan_path: None,
                     created: None,
+                    producer: None,
                     turn_usage: None,
                     truncated_lines,
                     render_snapshot: None,
@@ -1725,9 +1740,26 @@ pub fn interleaved_history_to_display(
             | HistoryItemKind::Reasoning { .. }
             | HistoryItemKind::ToolResult { .. } => {}
         }
+        let producer = item_producer(item);
+        if is_compaction_summary(item) {
+            last_producer = None;
+        } else if let Some(producer) = &producer
+            && display.len() > first_row
+        {
+            if let Some(note) = last_producer
+                .as_ref()
+                .and_then(|last| last.change_note(producer))
+            {
+                display.insert(first_row, DisplayMessage::new(DisplayRole::Notice, note));
+            }
+            last_producer = Some(producer.clone());
+        }
         let created = item_created(item);
         for row in &mut display[first_row..] {
             row.created = created;
+            if !matches!(row.role, DisplayRole::Notice) {
+                row.producer.clone_from(&producer);
+            }
         }
     }
     display.extend(inserts.map(|(_, row)| row));
@@ -1763,6 +1795,25 @@ fn host_turn_decision(display: &mut Vec<DisplayMessage>, decision: CardDecision)
 fn item_created(item: &HistoryItem) -> Option<Timestamp> {
     let millis = item.stands_for.unwrap_or(item.id).created_ms()?;
     Timestamp::from_millisecond(i64::try_from(millis).ok()?).ok()
+}
+
+fn item_producer(item: &HistoryItem) -> Option<Producer> {
+    match &item.kind {
+        HistoryItemKind::AssistantText { source, .. }
+        | HistoryItemKind::Reasoning { source, .. }
+        | HistoryItemKind::ToolCall { source, .. } => source.as_ref().map(Producer::from),
+        HistoryItemKind::User { .. } | HistoryItemKind::ToolResult { .. } => None,
+    }
+}
+
+fn is_compaction_summary(item: &HistoryItem) -> bool {
+    matches!(
+        item.kind,
+        HistoryItemKind::AssistantText {
+            is_compaction_summary: true,
+            ..
+        }
+    )
 }
 
 /// The text a prompt's bubble shows, live and restored alike, so the two can
@@ -5386,6 +5437,185 @@ mod tests {
             annotation,
             output.annotation(TokenScale::UNIT),
             "{RESTORED_SCALE_MSG}"
+        );
+    }
+
+    const STAMP_PROVIDER: &str = "anthropic";
+    const STAMP_OPUS: &str = "claude-opus-5-5";
+    const STAMP_SONNET: &str = "claude-sonnet-5";
+    const STAMP_HIGH: &str = "high";
+    const STAMP_LOW: &str = "low";
+    const THINKING_NOTE: &str = "Thinking: high → low";
+    const MODEL_NOTE: &str = "Model: anthropic/claude-opus-5-5 → anthropic/claude-sonnet-5";
+    const ROUTE_ROW: &str = "Moved to another provider";
+
+    fn stamp(model: &str, thinking: &str) -> ReasoningSource {
+        ReasoningSource {
+            provider: STAMP_PROVIDER.into(),
+            model: model.into(),
+            transport: ReasoningTransport::Other,
+            thinking: Some(thinking.into()),
+        }
+    }
+
+    fn stamped_reply(block: ContentBlock, source: Option<ReasoningSource>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![block],
+            reasoning_source: source,
+            ..Default::default()
+        }
+    }
+
+    fn reply_text() -> ContentBlock {
+        ContentBlock::Text {
+            text: REPLY_TEXT.into(),
+        }
+    }
+
+    fn notes(display: &[DisplayMessage]) -> Vec<&str> {
+        display
+            .iter()
+            .filter(|row| row.role == DisplayRole::Notice)
+            .map(|row| row.text.as_str())
+            .collect()
+    }
+
+    /// Each reply says who wrote it, and a change between neighbours is
+    /// noted where it took effect, derived from the stamps alone.
+    #[test]
+    fn restored_replies_carry_their_producer_and_note_each_change() {
+        let messages = vec![
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_HIGH))),
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_LOW))),
+            Message::user(USER_TEXT.into()),
+            stamped_reply(
+                ContentBlock::tool_use(
+                    "t1",
+                    SHELL_TOOL_NAME,
+                    serde_json::json!({"command": "true"}),
+                ),
+                Some(stamp(STAMP_SONNET, STAMP_LOW)),
+            ),
+        ];
+
+        let display = display_messages(&messages, &empty_outputs()).0;
+
+        assert_eq!(notes(&display), [THINKING_NOTE, MODEL_NOTE]);
+        let last = display.last().unwrap();
+        assert!(matches!(last.role, DisplayRole::Tool(_)));
+        assert_eq!(
+            last.producer,
+            Some(Producer::from(&stamp(STAMP_SONNET, STAMP_LOW)))
+        );
+        let note_at = display
+            .iter()
+            .position(|row| row.text == MODEL_NOTE)
+            .unwrap();
+        assert!(matches!(display[note_at + 1].role, DisplayRole::Tool(_)));
+        assert!(
+            display
+                .iter()
+                .filter(|row| row.role == DisplayRole::User)
+                .all(|row| row.producer.is_none())
+        );
+    }
+
+    /// A route row already says how the conversation moved, a compaction
+    /// summary is another model's, and a reply saved before the stamp says
+    /// nothing either way.
+    #[test_case(Some(stamp(STAMP_OPUS, STAMP_HIGH)), true, false ; "after_a_route_row")]
+    #[test_case(None, false, false ; "unstamped_neighbour")]
+    #[test_case(Some(stamp(STAMP_OPUS, STAMP_HIGH)), false, true ; "after_a_compaction_summary")]
+    fn some_changes_go_unnoted(first: Option<ReasoningSource>, route_row: bool, compacted: bool) {
+        let mut summary = stamped_reply(reply_text(), Some(stamp(STAMP_OPUS, STAMP_HIGH)));
+        summary.is_compaction_summary = true;
+        let mut messages = vec![
+            Message::user(USER_TEXT.into()),
+            stamped_reply(reply_text(), first),
+        ];
+        if compacted {
+            messages.push(Message::synthetic(COMPACTION_ANCHOR.into()));
+            messages.push(summary);
+        }
+        messages.push(Message::user(USER_TEXT.into()));
+        messages.push(stamped_reply(
+            reply_text(),
+            Some(stamp(STAMP_SONNET, STAMP_LOW)),
+        ));
+        let items = crate::history_items(&messages);
+        let inserts = route_row
+            .then(|| {
+                (
+                    items.len() - 1,
+                    DisplayMessage::new(DisplayRole::Notice, ROUTE_ROW.into()),
+                )
+            })
+            .into_iter()
+            .collect();
+
+        let display = interleaved_history_to_display(
+            &items,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            true,
+            inserts,
+            Vec::new(),
+        )
+        .0;
+
+        assert!(
+            !notes(&display)
+                .iter()
+                .any(|note| note.starts_with(MODEL_NOTE)),
+            "{:?}",
+            notes(&display)
+        );
+    }
+
+    /// Live, the note lands above the first row a change wrote, and every row
+    /// is stamped with its request's settings. A request that wrote nothing,
+    /// as one that failed, leaves no note, as a restore has nothing of it.
+    #[test]
+    fn a_live_change_is_noted_and_stamped_as_a_restore_would() {
+        let mut chat = chat();
+        let started = |source: &ReasoningSource| AgentEvent::MessageStarted {
+            id: CaudraId::generate(),
+            model: source.spec(),
+            thinking: source.thinking.clone(),
+        };
+        chat.handle_event(started(&stamp(STAMP_OPUS, STAMP_HIGH)), None);
+        chat.handle_event(
+            AgentEvent::TextDelta {
+                text: REPLY_TEXT.into(),
+            },
+            None,
+        );
+        chat.handle_event(started(&stamp(STAMP_SONNET, STAMP_HIGH)), None);
+        chat.handle_event(started(&stamp(STAMP_OPUS, STAMP_LOW)), None);
+        chat.handle_event(
+            AgentEvent::TextDelta {
+                text: REPLY_TEXT.into(),
+            },
+            None,
+        );
+        chat.flush();
+
+        let rows: Vec<&DisplayMessage> = (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].producer,
+            Some(Producer::from(&stamp(STAMP_OPUS, STAMP_HIGH)))
+        );
+        assert_eq!(rows[1].role, DisplayRole::Notice);
+        assert_eq!(rows[1].text, THINKING_NOTE);
+        assert_eq!(
+            rows[2].producer,
+            Some(Producer::from(&stamp(STAMP_OPUS, STAMP_LOW)))
         );
     }
 }

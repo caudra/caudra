@@ -416,6 +416,7 @@ impl App {
                         fast: false,
                         answer_tx: None,
                         steer_tx: None,
+                        control: None,
                     });
                 }
                 let _ = self.reconcile_tasks();
@@ -743,6 +744,7 @@ impl App {
         self.chat_index.retain(|id, _| owned.contains(id));
         self.subagent_answers.retain(|id, _| owned.contains(id));
         self.subagent_steers.retain(|id, _| owned.contains(id));
+        self.subagent_controls.retain(|id, _| owned.contains(id));
         self.subagent_replacements
             .retain(|id, _| owned.contains(id));
     }
@@ -1176,6 +1178,7 @@ impl App {
                         fast: false,
                         answer_tx: None,
                         steer_tx: None,
+                        control: None,
                     });
                     chats = self.chats_by_card(&runtime);
                     index
@@ -1242,6 +1245,11 @@ impl App {
             TaskPickerAction::Opened(id) => self.preview_task(&id),
             TaskPickerAction::Control { task, promote } => {
                 self.start_task_control(*task, promote, ControlModal::Tasks);
+            }
+            TaskPickerAction::SwitchModel(id) => {
+                self.preview_task(&id);
+                let task = (id != MAIN_TASK_ID).then_some(id);
+                return self.open_model_picker_for(task);
             }
             // Previewing is a real focus, so the transcript behind the float is
             // the one the app already draws.

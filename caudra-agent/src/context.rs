@@ -2021,6 +2021,7 @@ mod tests {
             provider: host_metadata.clone(),
             model: host_metadata.clone(),
             transport: ReasoningTransport::Other,
+            thinking: None,
         });
         message.tool_result_image_owners = vec![host_metadata.clone()];
         message.retained_output_refs = vec![output_ref.clone()];

@@ -64,7 +64,7 @@ use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::{
-    HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
+    HistoryReadLimits, HistoryReadReport, SessionCursor, SessionLease, SessionRelocation,
 };
 use caudra_storage::version::UpdateChannel;
 use caudra_workspace::{WorkspaceChangeService, WorkspaceSession};
@@ -75,7 +75,7 @@ use ratatui::buffer::Buffer;
 use ratatui::widgets::Block;
 
 use event_loop::Handoff;
-use loading_screen::LoadingScreen;
+use loading_screen::{LoadProgress, LoadingScreen};
 
 #[cfg(test)]
 const PATTERN_TEST_SAMPLE_LIMIT: usize = 64;
@@ -179,11 +179,23 @@ pub(crate) fn load_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSe
 
 /// The picker path: the user chose this session, so it counts as opened. The
 /// cursor comes back too, so the first save stays a delta.
+#[cfg(test)]
 pub(crate) fn open_app_session_with_cursor(
     id: CaudraId,
     storage: &StateDir,
-) -> Result<(AppSession, caudra_storage::sessions::SessionCursor)> {
-    caudra_agent::open_stored_session_with_cursor(id, storage).context("load persisted session")
+) -> Result<(AppSession, SessionCursor)> {
+    open_app_session_with_cursor_reporting(id, storage, LoadProgress::SILENT)
+}
+
+pub(crate) fn open_app_session_with_cursor_reporting(
+    id: CaudraId,
+    storage: &StateDir,
+    progress: LoadProgress<'_>,
+) -> Result<(AppSession, SessionCursor)> {
+    caudra_agent::open_stored_session_with_cursor_observed(id, storage, &|event| {
+        progress.session_open(event);
+    })
+    .context("load persisted session")
 }
 
 pub(crate) fn session_history_head(session: &AppSession) -> Option<CaudraId> {

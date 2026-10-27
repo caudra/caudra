@@ -303,7 +303,7 @@ impl ChildWork {
                     .then(|| u64::from(used) * PERCENT / u64::from(turn.context_window));
                 route.progress(ctx, info, child, now);
             }
-            AgentEvent::MessageStarted { id } if standard => {
+            AgentEvent::MessageStarted { id, .. } if standard => {
                 child.reply = Some(MessageCursor::new(id.to_string()));
             }
             AgentEvent::TextDelta { text } if standard => {
@@ -828,6 +828,7 @@ mod tests {
             fast: false,
             answer_tx: None,
             steer_tx: None,
+            control: None,
         }
     }
 

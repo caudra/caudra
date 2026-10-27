@@ -21,6 +21,11 @@ const FLASH: Duration = Duration::from_millis(1000);
 pub enum ThinkingPickerAction {
     Consumed,
     Select(ThinkingConfig),
+    /// A level for the task the picker was opened on, not the session.
+    SelectForTask {
+        task_id: String,
+        thinking: ThinkingConfig,
+    },
     Closed,
     Copy(String),
 }
@@ -70,6 +75,7 @@ impl PickerItem for ThinkingItem {
 pub struct ThinkingPicker {
     picker: ListPicker<ThinkingItem>,
     flash_until: Option<Instant>,
+    task_id: Option<String>,
 }
 
 impl ThinkingPicker {
@@ -77,15 +83,24 @@ impl ThinkingPicker {
         Self {
             picker: ListPicker::new().with_max_visible(MAX_VISIBLE),
             flash_until: None,
+            task_id: None,
         }
     }
 
     pub fn open(&mut self, model: &Model, current: &ThinkingConfig) {
         self.flash_until = None;
+        self.task_id = None;
         self.fill(model, current);
     }
 
+    /// The levels of the model the task `task_id` runs on.
+    pub fn open_task(&mut self, model: &Model, current: &ThinkingConfig, task_id: String) {
+        self.open(model, current);
+        self.task_id = Some(task_id);
+    }
+
     pub fn flash(&mut self, model: &Model, current: &ThinkingConfig) {
+        self.task_id = None;
         self.fill(model, current);
         self.flash_until = Some(Instant::now() + FLASH);
     }
@@ -134,11 +149,13 @@ impl ThinkingPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ThinkingPickerAction {
-        Self::map_action(self.picker.handle_key(key))
+        let action = self.picker.handle_key(key);
+        self.map_action(action)
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ThinkingPickerAction {
-        Self::map_action(self.picker.handle_mouse(event))
+        let action = self.picker.handle_mouse(event);
+        self.map_action(action)
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -179,12 +196,18 @@ impl ThinkingPicker {
         }
     }
 
-    fn map_action(action: PickerAction<ThinkingItem>) -> ThinkingPickerAction {
+    fn map_action(&mut self, action: PickerAction<ThinkingItem>) -> ThinkingPickerAction {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 ThinkingPickerAction::Consumed
             }
-            PickerAction::Select(item) => ThinkingPickerAction::Select(item.config),
+            PickerAction::Select(item) => match self.task_id.take() {
+                Some(task_id) => ThinkingPickerAction::SelectForTask {
+                    task_id,
+                    thinking: item.config,
+                },
+                None => ThinkingPickerAction::Select(item.config),
+            },
             PickerAction::Close => ThinkingPickerAction::Closed,
             PickerAction::Copy(text) => ThinkingPickerAction::Copy(text),
         }

@@ -35,6 +35,7 @@ use crate::chat::batch_child_id;
 use crate::components::commit_popup::CommitIndex;
 use crate::components::input::image_chip_label;
 use crate::components::keybindings::key;
+use crate::components::producer::Producer;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::highlight;
 use crate::inline_image::{self, ImageRef, ImageSpan};
@@ -215,6 +216,7 @@ impl MessageActionTarget {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MessageDetails {
     pub created: Option<Timestamp>,
+    pub producer: Option<Producer>,
     pub usage: Option<String>,
 }
 
@@ -994,6 +996,12 @@ pub struct MessagesPanel {
     /// streams the instruction it is being given before any agent is attached
     /// to it, and that is the one case where the buffer is not the model's.
     streaming_role: DisplayRole,
+    /// The settings the message streaming now was requested with, which
+    /// every model row pushed from here on is stamped with.
+    producer: Option<Producer>,
+    /// The stamp of the last model row, which a row with another stamp gets
+    /// a note against, as a restore derives it.
+    last_stamp: Option<Producer>,
     started_at: Instant,
     scroll_top: u32,
     auto_scroll: bool,
@@ -1170,6 +1178,8 @@ impl MessagesPanel {
                 ms,
             ),
             streaming_role: DisplayRole::Assistant,
+            producer: None,
+            last_stamp: None,
             started_at: Instant::now(),
             scroll_top: u32::MAX,
             auto_scroll: true,
@@ -1794,8 +1804,43 @@ impl MessagesPanel {
     /// correct it later.
     pub fn push(&mut self, mut msg: DisplayMessage) -> usize {
         msg.created.get_or_insert_with(Timestamp::now);
+        if msg.producer.is_none()
+            && matches!(
+                msg.role,
+                DisplayRole::Assistant | DisplayRole::Thinking | DisplayRole::Tool(_)
+            )
+        {
+            msg.producer.clone_from(&self.producer);
+        }
+        if let Some(producer) = &msg.producer {
+            if let Some(note) = self
+                .last_stamp
+                .as_ref()
+                .and_then(|last| last.change_note(producer))
+            {
+                let mut row = DisplayMessage::new(DisplayRole::Notice, note);
+                row.created = msg.created;
+                self.messages.push(row);
+            }
+            self.last_stamp = Some(producer.clone());
+        }
         self.messages.push(msg);
         self.messages.len() - 1
+    }
+
+    /// A request went out with `producer`'s settings. What streamed before
+    /// it is settled first, so it keeps the stamp it was written under.
+    pub fn message_started(&mut self, producer: Producer) {
+        self.flush();
+        self.producer = Some(producer);
+    }
+
+    /// Settles what rows pushed from here on are stamped with, and starts the
+    /// comparison afresh: a row already says how the route moved, or a
+    /// compaction summary another model writes follows.
+    pub fn set_producer(&mut self, producer: Option<Producer>) {
+        self.producer = producer;
+        self.last_stamp = None;
     }
 
     /// Drops the whole segment cache, so keep it for one-off corrections and
@@ -2031,6 +2076,8 @@ impl MessagesPanel {
         for msg in &mut msgs {
             msg.body_open = None;
         }
+        self.last_stamp = msgs.iter().rev().find_map(|msg| msg.producer.clone());
+        self.producer.clone_from(&self.last_stamp);
         self.dropped_snapshots.clear();
         *self.messages = msgs;
         self.cache.clear();
@@ -3792,6 +3839,7 @@ impl MessagesPanel {
             .get(target.message)
             .map(|msg| MessageDetails {
                 created: msg.created,
+                producer: msg.producer.clone(),
                 usage: msg.turn_usage.clone(),
             })
             .unwrap_or_default()

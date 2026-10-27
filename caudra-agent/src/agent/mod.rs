@@ -8,6 +8,7 @@ mod goal_progress;
 mod history;
 mod instructions;
 pub(crate) mod judging;
+mod live_switch;
 mod measured;
 pub mod mention_preamble;
 mod provider_projection;
@@ -57,6 +58,7 @@ pub use instructions::{
     find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
     load_remote_instructions,
 };
+pub use live_switch::{ConversationControl, LiveSwitch, SettingsChange};
 pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
 pub use refresh::{
     ActiveContext, ContextRefresh, RefreshedContext, StandingState, favorite_models,
