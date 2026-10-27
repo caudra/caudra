@@ -15249,6 +15249,75 @@ fn a_printed_dict_opens_whole_on_a_click(view: ViewMode) {
     assert!(!dumped(&panel), "{DUMP_OPENS_MSG}");
 }
 
+const NESTED_DUMP_MSG: &str =
+    "a code run inside a batch opens its printed tree on a click, and the next folds it";
+const NESTED_CALL_MSG: &str =
+    "a code run inside a batch opens or folds its call's card on a click, and the next undoes it";
+
+/// A `code` run inside a batch answers its own clicks, as it does on its own card: its printed
+/// tree opens and folds, and the card of the call it printed opens and folds.
+#[test]
+fn a_code_run_in_a_batch_answers_its_own_clicks() {
+    const NESTED_TREE: RowTarget = RowTarget::Inner {
+        child: 0,
+        target: InnerTarget::Node {
+            child: 1,
+            tree: 0,
+            node: 0,
+        },
+    };
+    const NESTED_CALL: RowTarget = RowTarget::Inner {
+        child: 0,
+        target: InnerTarget::Item(0),
+    };
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, BATCH_TOOL));
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![caudra_agent::BatchToolEntry {
+                output: Some(ToolOutput::Code(code_card::tests::repeating_run())),
+                ..batch_child(CODE_TOOL_NAME, "")
+            }],
+            text: String::new(),
+        },
+        ..done(TOOL_ID)
+    });
+    panel.toggle_batch_child(TOOL_ID, 0);
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let dumped =
+        |panel: &MessagesPanel| seg_text(panel, TOOL_ID).contains(code_card::tests::DUMP_FIELD);
+    let call_rows = |panel: &MessagesPanel| {
+        let segment = panel
+            .cache
+            .segments()
+            .iter()
+            .find(|s| s.tool_id.as_deref() == Some(TOOL_ID))
+            .unwrap();
+        let width = panel.viewport_width;
+        let start = segment.chrome(width).content_start();
+        (0..segment.content_height(width))
+            .filter(|row| segment.row_target_at(start + row, width) == Some(NESTED_CALL))
+            .count()
+    };
+    assert!(!dumped(&panel), "{NESTED_DUMP_MSG}");
+
+    for shown in [true, false] {
+        assert!(panel.toggle_expansion_at(batch_row(&panel, NESTED_TREE), area));
+        render(&mut panel, 80, 24);
+        assert_eq!(dumped(&panel), shown, "{NESTED_DUMP_MSG}");
+    }
+
+    let resting = call_rows(&panel);
+    assert!(panel.toggle_expansion_at(batch_row(&panel, NESTED_CALL), area));
+    render(&mut panel, 80, 24);
+    assert_ne!(call_rows(&panel), resting, "{NESTED_CALL_MSG}");
+    assert!(panel.toggle_expansion_at(batch_row(&panel, NESTED_CALL), area));
+    render(&mut panel, 80, 24);
+    assert_eq!(call_rows(&panel), resting, "{NESTED_CALL_MSG}");
+}
+
 /// A `rerank()` row names what it kept on its line rather than its arguments, always shows the
 /// ranked candidates, and switches to the answer it returned.
 #[test]

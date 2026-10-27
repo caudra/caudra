@@ -1312,8 +1312,17 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
             images.extend(shifted_images(body.images, lines.len()));
+            let draws_card = matches!(entry.output, Some(ToolOutput::Code(_)));
             rows.extend((0..body.lines.len()).map(|row| {
-                if let Some(Some(RowTarget::Raw(_))) = body.rows.get(row) {
+                if draws_card
+                    && let Some(Some(inner)) = body.rows.get(row)
+                    && let Some(inner) = inner.inner()
+                {
+                    Some(RowTarget::Inner {
+                        child: index,
+                        target: inner,
+                    })
+                } else if let Some(Some(RowTarget::Raw(_))) = body.rows.get(row) {
                     Some(RowTarget::Raw(index))
                 } else if let Some(Some(RowTarget::Node { tree, node, .. })) = body.rows.get(row) {
                     Some(RowTarget::Node {
@@ -3325,6 +3334,8 @@ pub struct BatchViews {
     nodes: Arc<[(usize, usize, usize)]>,
     /// The children whose decisions a click on their chips opened.
     decided: Arc<[usize]>,
+    /// The views of the card each child draws as its body, by child index in order.
+    inner: Arc<[(usize, BatchViews)]>,
 }
 
 /// The nodes a click moved from where they rest in each of one child's trees, as (tree, node).
@@ -3428,6 +3439,42 @@ impl BatchViews {
         }
     }
 
+    /// What a click on `target` changes. `rests_open` says whether the child an
+    /// [`InnerTarget::Item`] names opens without one.
+    pub fn clicked(&self, target: InnerTarget, rests_open: bool) -> Self {
+        match target {
+            InnerTarget::Item(index) => self.toggled(index, rests_open),
+            InnerTarget::Raw(index) => self.raw_toggled(index),
+            InnerTarget::Node { child, tree, node } => self.node_toggled(child, tree, node),
+        }
+    }
+
+    fn inner(&self, child: usize) -> Self {
+        self.inner
+            .binary_search_by_key(&child, |(index, _)| *index)
+            .map(|found| self.inner[found].1.clone())
+            .unwrap_or_default()
+    }
+
+    /// The same views with those of the card `child` draws as its body changed.
+    pub fn inner_changed(&self, child: usize, change: impl FnOnce(Self) -> Self) -> Self {
+        let changed = change(self.inner(child));
+        let mut inner: Vec<(usize, Self)> = self
+            .inner
+            .iter()
+            .filter(|(index, _)| *index != child)
+            .cloned()
+            .collect();
+        if changed != Self::default() {
+            let at = inner.partition_point(|(index, _)| *index < child);
+            inner.insert(at, (child, changed));
+        }
+        Self {
+            inner: inner.into(),
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn tree_folds(&self, child: usize) -> TreeFolds {
         TreeFolds(
             self.nodes
@@ -3461,6 +3508,31 @@ pub(crate) fn code_child_rests_open(
     entry: &BatchToolEntry,
 ) -> bool {
     rests_open(policy, entry) || (!policy.compact && output.stands_in(index))
+}
+
+/// Whether call `inner` of the `code` run that batch child `child` draws rests open. A run drawn
+/// at its budget already holds its path's one body, so every call under it rests as its row.
+pub(crate) fn nested_child_rests_open(
+    limits: &RenderLimits,
+    entries: &[BatchToolEntry],
+    child: usize,
+    inner: usize,
+) -> bool {
+    let Some(entry) = entries.get(child) else {
+        return false;
+    };
+    let Some(ToolOutput::Code(output)) = entry.output.as_ref() else {
+        return false;
+    };
+    let Some(view) = limits.child(child, entry) else {
+        return false;
+    };
+    !view.body_taken
+        && code_card::entries(output)
+            .get(inner)
+            .is_some_and(|inner_entry| {
+                code_child_rests_open(&view.policy, output, inner, inner_entry)
+            })
 }
 
 /// Whether a child rests whole: a recognised server's answer, which Caudra
@@ -3830,8 +3902,9 @@ impl RenderLimits {
     /// draws whole, bounds nothing, and hands the path on to whatever *it*
     /// nests.
     ///
-    /// The views and the reports name this card's children, so both are
-    /// dropped on the way in or a nested batch would read them as its own.
+    /// The views and the reports name this card's children, so a child gets
+    /// only the views kept for the card it draws, and no reports, or it would
+    /// read its parent's as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
         let whole = always_whole(entry);
         if !whole && self.views.is_folded(index) {
@@ -3882,7 +3955,7 @@ impl RenderLimits {
             body_taken: budget != usize::MAX,
             policy: self.policy.clone(),
             child_scroll: Arc::default(),
-            views: BatchViews::default(),
+            views: self.views.inner(index),
             progress: ChildProgress::default(),
             live: ChildLive::default(),
             started: ChildStarted::default(),
@@ -3931,13 +4004,43 @@ pub enum RowTarget {
         tree: usize,
         node: usize,
     },
+    /// A control of the card `child` draws as its body, a `code` run's call or tree, which
+    /// answers to that child's own views.
+    Inner {
+        child: usize,
+        target: InnerTarget,
+    },
+}
+
+/// A control of a card that folds, opens or switches part of its own body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InnerTarget {
+    Item(usize),
+    Raw(usize),
+    Node {
+        child: usize,
+        tree: usize,
+        node: usize,
+    },
 }
 
 impl RowTarget {
     pub fn index(self) -> usize {
         match self {
             Self::Item(index) | Self::Raw(index) => index,
-            Self::Task { child, .. } | Self::Node { child, .. } => child,
+            Self::Task { child, .. } | Self::Node { child, .. } | Self::Inner { child, .. } => {
+                child
+            }
+        }
+    }
+
+    /// The control this row is, as a card drawn inside another card would name it.
+    pub fn inner(self) -> Option<InnerTarget> {
+        match self {
+            Self::Item(index) => Some(InnerTarget::Item(index)),
+            Self::Raw(index) => Some(InnerTarget::Raw(index)),
+            Self::Node { child, tree, node } => Some(InnerTarget::Node { child, tree, node }),
+            Self::Task { .. } | Self::Inner { .. } => None,
         }
     }
 }
@@ -9095,6 +9198,40 @@ mod tests {
             stands_in.child(0, &entry).map(|child| child.is_expanded()),
             dump_drawn,
         )
+    }
+
+    const NESTED_TARGETS_MSG: &str =
+        "a code run inside a batch names its own calls and trees, not the batch child";
+
+    /// A `code` run drawn inside a batch answers to the views kept for it: its call rows and its
+    /// printed tree are its controls, and a click on the tree's root opens it there.
+    #[test_case(BatchViews::default() => false ; "the_tree_rests_folded")]
+    #[test_case(BatchViews::default().node_toggled(1, 0, json_tree::ROOT) => true ; "a_click_opens_it")]
+    fn a_code_run_in_a_batch_answers_its_own_clicks(inner: BatchViews) -> bool {
+        let entry = BatchToolEntry {
+            output: Some(ToolOutput::Code(code_card::tests::repeating_run())),
+            ..batch_entry(CODE_TOOL_NAME, 0)
+        };
+        let views = BatchViews::new([0]).inner_changed(0, |_| inner);
+        let card = render_batch(&[entry], false, &limits(views));
+        let targets = unique_targets(&card.rows);
+        for target in [
+            InnerTarget::Item(0),
+            InnerTarget::Node {
+                child: 1,
+                tree: 0,
+                node: json_tree::ROOT,
+            },
+        ] {
+            assert!(
+                targets.contains(&RowTarget::Inner { child: 0, target }),
+                "{NESTED_TARGETS_MSG}: {targets:?}"
+            );
+        }
+        card.lines
+            .iter()
+            .map(line_text)
+            .any(|line| line.contains(code_card::tests::DUMP_FIELD))
     }
 
     /// A `memory` write child stays drawn under the default list, while a

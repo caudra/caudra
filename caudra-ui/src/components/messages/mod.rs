@@ -24,7 +24,8 @@ use super::{
     code_card,
     code_view::{
         self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
-        CardPolicy, Disclosure, RowTarget, ScrollSpan, ScrollWindow, SubagentModels,
+        CardPolicy, Disclosure, InnerTarget, RenderLimits, RowTarget, ScrollSpan, ScrollWindow,
+        SubagentModels,
     },
     command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
@@ -4432,12 +4433,12 @@ impl MessagesPanel {
         // rest of the body falls back to.
         if let Some(target) = seg.row_target_at(rel, width) {
             let tool_id = tool_id.to_owned();
-            match target {
-                RowTarget::Raw(index) => self.toggle_batch_raw(&tool_id, index),
-                RowTarget::Node { child, tree, node } => {
-                    self.change_batch_views(&tool_id, |views| views.node_toggled(child, tree, node))
+            match (target, target.inner()) {
+                (RowTarget::Inner { child, target }, _) => {
+                    self.click_inner(&tool_id, child, target);
                 }
-                _ => self.toggle_batch_child(&tool_id, target.index()),
+                (_, Some(target)) => self.click_batch(&tool_id, target),
+                (target, None) => self.toggle_batch_child(&tool_id, target.index()),
             }
             return true;
         }
@@ -4503,8 +4504,27 @@ impl MessagesPanel {
     /// One child opens or folds, which is what the reader asked for, and every
     /// other child stays exactly as it was.
     fn toggle_batch_child(&mut self, tool_id: &str, index: usize) {
-        let rests_open = self.batch_child_rests_open(tool_id, index);
-        self.change_batch_views(tool_id, |views| views.toggled(index, rests_open));
+        self.click_batch(tool_id, InnerTarget::Item(index));
+    }
+
+    fn click_batch(&mut self, tool_id: &str, target: InnerTarget) {
+        let rests_open = matches!(
+            target,
+            InnerTarget::Item(index) if self.batch_child_rests_open(tool_id, index)
+        );
+        self.change_batch_views(tool_id, |views| views.clicked(target, rests_open));
+    }
+
+    /// A click on a control of the card batch child `child` draws, which only
+    /// that child's own views answer to.
+    fn click_inner(&mut self, tool_id: &str, child: usize, target: InnerTarget) {
+        let rests_open = matches!(
+            target,
+            InnerTarget::Item(inner) if self.nested_child_rests_open(tool_id, child, inner)
+        );
+        self.change_batch_views(tool_id, |views| {
+            views.inner_changed(child, |inner| inner.clicked(target, rests_open))
+        });
     }
 
     /// Whether this child opens without a click in the current mode, which is
@@ -4526,9 +4546,18 @@ impl MessagesPanel {
         }
     }
 
-    /// One child's MCP answer switches between its card and its data.
-    fn toggle_batch_raw(&mut self, tool_id: &str, index: usize) {
-        self.change_batch_views(tool_id, |views| views.raw_toggled(index));
+    /// Whether call `inner` of the card batch child `child` draws opens without a click.
+    fn nested_child_rests_open(&self, tool_id: &str, child: usize, inner: usize) -> bool {
+        let Some(ToolOutput::Batch { entries, .. }) = self
+            .tool_card(tool_id)
+            .and_then(|(msg_index, _)| self.messages[msg_index].tool_output.as_deref())
+        else {
+            return false;
+        };
+        let views = self.batch_views.get(tool_id).cloned().unwrap_or_default();
+        let limits = RenderLimits::new(false, usize::MAX, views, self.tool_output_lines)
+            .with_policy(self.policy.clone(), self.child_windows(tool_id));
+        code_view::nested_child_rests_open(&limits, entries, child, inner)
     }
 
     fn change_batch_views(&mut self, tool_id: &str, change: impl FnOnce(BatchViews) -> BatchViews) {
