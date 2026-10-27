@@ -10,7 +10,9 @@
 //! It only labels the card: timeouts and delivery never depend on it.
 
 mod gbdt;
+mod host;
 mod parts;
+mod sleep;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,12 +24,15 @@ use async_lock::OnceCell;
 use caudra_storage::StateDir;
 use caudra_storage::sessions::SessionError;
 use caudra_storage::shell_runs::reading::{Call, NUMBERS, Reading, read};
-use caudra_storage::shell_runs::{MAX_SHELL_RUNS, Prediction, RunOutcome, ShellRun, ShellRuns};
+use caudra_storage::shell_runs::{
+    HostSnapshot, MAX_SHELL_RUNS, Prediction, RunOutcome, ShellRun, ShellRuns,
+};
 
 use crate::ToolOutput;
-use crate::tools::{ToolExecResult, humanize_duration};
+use crate::tools::{Deadline, ToolExecResult, humanize_duration};
 use gbdt::{CLASSES, Estimate, Forest, Sample};
 use parts::Parts;
+use sleep::{Analysis, Timing};
 
 const INSTANT: usize = 0;
 const SECONDS: usize = 1;
@@ -53,6 +58,8 @@ const RETRAIN_EVERY: usize = 500;
 const RETRY_UNTRAINED_EVERY: usize = 50;
 pub const ETA_LABEL: &str = "ETA";
 const APPROXIMATELY: &str = "~";
+const AT_LEAST: &str = "at least ";
+const UNCLASSIFIED_CONFIDENCE: f64 = 0.0;
 const SECONDS_WORD: &str = "seconds";
 const MINUTES_WORD: &str = "minutes";
 
@@ -75,8 +82,89 @@ pub struct Forecast {
 
 struct Guess {
     reading: Reading,
+    host: Option<HostSnapshot>,
     prediction: Option<Prediction>,
     eta: Option<String>,
+}
+
+impl Guess {
+    fn empty(reading: Reading) -> Self {
+        Self {
+            reading,
+            host: None,
+            prediction: None,
+            eta: None,
+        }
+    }
+
+    fn with_remainder(
+        mut self,
+        sleep_ms: u64,
+        remainder_ms: Option<u64>,
+        deadline: Option<Duration>,
+    ) -> Self {
+        self.prediction = remainder_ms
+            .and_then(|remaining| sleep_ms.checked_add(remaining))
+            .map(|total| Prediction {
+                class: u8::try_from(class_of(RunOutcome::Completed, total).unwrap_or(INSTANT))
+                    .unwrap_or_default(),
+                confidence: UNCLASSIFIED_CONFIDENCE,
+                eta_ms: Some(total),
+            });
+        self.with_sleep(Timing::AtLeast(sleep_ms), deadline)
+    }
+
+    fn with_sleep(mut self, timing: Timing, deadline: Option<Duration>) -> Self {
+        let (Timing::Exact(ms) | Timing::AtLeast(ms)) = timing;
+        if deadline.is_some_and(|limit| Duration::from_millis(ms) >= limit) {
+            self.prediction = None;
+            self.eta = None;
+            return self;
+        }
+        match timing {
+            Timing::Exact(ms) => {
+                self.eta = time_label(ms, APPROXIMATELY);
+                self.prediction = Some(Prediction {
+                    class: if ms <= INSTANT_MS {
+                        INSTANT as u8
+                    } else if ms < MINUTES_MS {
+                        SECONDS as u8
+                    } else {
+                        MINUTES as u8
+                    },
+                    confidence: 1.0,
+                    eta_ms: Some(ms),
+                });
+            }
+            Timing::AtLeast(ms) => {
+                let estimate = self
+                    .prediction
+                    .as_ref()
+                    .and_then(|prediction| prediction.eta_ms);
+                if let Some(estimate) = estimate.filter(|estimate| {
+                    *estimate >= ms
+                        && deadline.is_none_or(|limit| Duration::from_millis(*estimate) < limit)
+                }) {
+                    self.eta = time_label(estimate, APPROXIMATELY);
+                } else {
+                    self.prediction = None;
+                    self.eta = time_label(ms, AT_LEAST);
+                }
+            }
+        }
+        self
+    }
+}
+
+fn time_label(ms: u64, prefix: &str) -> Option<String> {
+    (ms > INSTANT_MS).then(|| {
+        let duration = if prefix == AT_LEAST {
+            Duration::from_millis(ms)
+        } else {
+            Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND))
+        };
+        format!("{prefix}{}", humanize_duration(duration))
+    })
 }
 
 /// An estimate as the card says it, such as `ETA ~40s`.
@@ -165,35 +253,33 @@ impl Model {
         self.training = false;
     }
 
-    fn guess(&self, reading: Reading) -> Guess {
-        let Some(trees) = &self.trees else {
-            return Guess {
-                reading,
-                prediction: None,
-                eta: None,
-            };
-        };
+    fn estimate(&self, reading: &Reading) -> Option<Estimate> {
+        let trees = self.trees.as_ref()?;
         let sample = sample(
             &trees.vocabulary,
-            &reading,
+            reading,
             self.parts.features(reading.steps.as_deref()),
         );
-        let estimate = trees.forest.estimate(&sample);
+        Some(trees.forest.estimate(&sample))
+    }
+
+    fn guess(&self, reading: Reading) -> Guess {
+        let Some(estimate) = self.estimate(&reading) else {
+            return Guess::empty(reading);
+        };
         let (class, confidence) = most_likely(&estimate.probabilities);
         let instant = class == INSTANT && confidence >= INSTANT_BAR;
         let time_ms = (!instant).then(|| median_ms(&estimate)).flatten();
         let eta = if instant {
             None
         } else if let Some(ms) = time_ms {
-            (ms > INSTANT_MS).then(|| {
-                let seconds = Duration::from_secs(ms.div_ceil(MILLIS_PER_SECOND));
-                format!("{APPROXIMATELY}{}", humanize_duration(seconds))
-            })
+            time_label(ms, APPROXIMATELY)
         } else {
             class_word(class, confidence).map(str::to_owned)
         };
         Guess {
             reading,
+            host: None,
             prediction: Some(Prediction {
                 class: u8::try_from(class).unwrap_or_default(),
                 confidence,
@@ -238,6 +324,11 @@ fn sample(
     let mut numbers = [0.0; NUMERIC];
     numbers[..NUMBERS].copy_from_slice(&reading.numbers);
     numbers[NUMBERS..].copy_from_slice(&parts);
+    for number in &mut numbers {
+        if *number < 0.0 {
+            *number = f32::NAN;
+        }
+    }
     let mut tokens: Vec<u16> = reading
         .tokens
         .iter()
@@ -288,11 +379,46 @@ impl ShellEta {
         }))
     }
 
-    /// The first call trains the model and waits for it. `None` only when
-    /// the run log could not be read.
-    pub async fn forecast(&self, call: &Call<'_>) -> Option<Forecast> {
-        let model = self.model().await?;
-        let guess = lock(model).guess(read(call));
+    pub async fn forecast(
+        &self,
+        call: &Call<'_>,
+        timeout: Option<Duration>,
+        deadline: Deadline,
+    ) -> Option<Forecast> {
+        let analysis = sleep::analyze(call.command);
+        let reading = read(call);
+        let (guess, remainder_ms) = match self.model().await {
+            Some(model) => {
+                let model = lock(model);
+                match analysis.as_ref().and_then(|analysis| analysis.remainder) {
+                    Some(command) => {
+                        let remainder_ms = model
+                            .estimate(&read(&Call { command, ..*call }))
+                            .and_then(|estimate| median_ms(&estimate));
+                        (Guess::empty(reading), remainder_ms)
+                    }
+                    None => (model.guess(reading), None),
+                }
+            }
+            None if analysis.is_some() => (Guess::empty(reading), None),
+            None => return None,
+        };
+        let limit = [
+            timeout,
+            deadline.remaining().unwrap_or(Some(Duration::ZERO)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let mut guess = match analysis {
+            Some(Analysis {
+                timing: Timing::AtLeast(ms),
+                remainder: Some(_),
+            }) => guess.with_remainder(ms, remainder_ms, limit),
+            Some(Analysis { timing, .. }) => guess.with_sleep(timing, limit),
+            None => guess,
+        };
+        guess.host = host::snapshot();
         Some(Forecast {
             owner: self.clone(),
             guess,
@@ -306,6 +432,7 @@ impl ShellEta {
         lock(model).learn(&guess.reading, outcome, elapsed_ms);
         let run = ShellRun {
             reading: guess.reading,
+            host: guess.host,
             elapsed_ms,
             outcome,
         };

@@ -1665,7 +1665,7 @@ async fn shell_forecast(
         timeout_secs: input.get(SHELL_TIMEOUT_FIELD).and_then(Value::as_f64),
     };
     ctx.cancel
-        .race(shell_eta.forecast(&call))
+        .race(shell_eta.forecast(&call, invocation.shell_timeout(), ctx.deadline))
         .await
         .ok()
         .flatten()
@@ -2303,7 +2303,7 @@ mod tests {
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
-    use crate::tools::{BATCH_TOOL_NAME, OUTPUT_SO_FAR_HEADING};
+    use crate::tools::{BATCH_TOOL_NAME, Deadline, OUTPUT_SO_FAR_HEADING};
     use crate::{
         AgentMode, Envelope, EventSender, SharedBuf, ShellOutput, SnapshotLine, StoredSession,
         TaskCard,
@@ -2671,6 +2671,7 @@ mod tests {
             for _ in 0..SEEDED_RUNS {
                 runs.append(
                     &ShellRun {
+                        host: None,
                         reading: read(&Call {
                             command: SHELL_COMMAND,
                             workdir: None,
@@ -2768,6 +2769,50 @@ mod tests {
                     SEEDED_RUN_MS
                 }
             );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(true, "sleep 30", None, None, Some("ETA ~30s"); "literal_sleep")]
+    #[test_case(false, "sleep 30", None, None, None; "sleep_eta_disabled")]
+    #[test_case(true, "sleep 300", None, None, None; "default_deadline")]
+    #[test_case(true, "sleep 30", Some(10), None, None; "explicit_deadline")]
+    #[test_case(true, "sleep 300", Some(600), None, Some("ETA ~5m"); "longer_deadline")]
+    #[test_case(true, "sleep 30", None, Some(10), None; "caller_deadline")]
+    fn literal_sleep_eta_respects_config_and_deadline(
+        enabled: bool,
+        command: &str,
+        timeout: Option<u64>,
+        caller_deadline: Option<u64>,
+        expected: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let mut fixture = ShellDispatchFixture::named(None, Effect::Allow, SHELL_TOOL).await;
+            fixture.ctx.config.shell_eta = enabled;
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            let mut input = json!({"command": command});
+            if let Some(timeout) = timeout {
+                input[SHELL_TIMEOUT_FIELD] = json!(timeout);
+            }
+            if let Some(seconds) = caller_deadline {
+                fixture.ctx.deadline = Deadline::after(Duration::from_secs(seconds));
+            }
+            let done = fixture.dispatch_input(SHELL_TOOL, &input).await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert_eq!(*fixture.trace.prepared_input.lock().unwrap(), Some(input));
+            let start = fixture
+                .events
+                .try_iter()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::ToolStart(start) => Some(start),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(start.annotation.as_deref(), expected);
+            assert_eq!(fixture.recorded_runs().len(), usize::from(enabled));
             fixture.tasks.shutdown().await.unwrap();
         });
     }

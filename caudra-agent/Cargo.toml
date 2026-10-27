@@ -56,6 +56,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 isahc = { workspace = true }
 libc = { workspace = true }
+sysinfo = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = { workspace = true }
@@ -66,6 +67,8 @@ getrandom = { workspace = true }
 fastrand = { workspace = true }
 tempfile = { workspace = true }
 shell-words = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

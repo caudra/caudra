@@ -94,7 +94,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -940,6 +940,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 41,
         sql: crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
     },
+    Migration {
+        from: 41,
+        to: 42,
+        sql: crate::shell_runs::HOST_COLUMN,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1218,7 +1223,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1240,7 +1245,8 @@ fn full_schema() -> String {
         crate::shell_runs::TABLE,
         crate::background::TRANSCRIPTS,
         crate::engine_decisions::SCREENING_COLUMN,
-        crate::tool_outputs::SAVED_OUTPUTS_SCHEMA
+        crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
+        crate::shell_runs::HOST_COLUMN
     )
 }
 
@@ -7059,6 +7065,8 @@ mod tests {
         PermissionMode, RecordCoverage, Session, StoredSubagentOutcome, TitleSource,
     };
     use crate::shell_history::MAX_SHELL_EXECUTIONS;
+    use crate::shell_runs::reading::{Call, encode, read};
+    use crate::shell_runs::{RunOutcome, ShellRun, ShellRuns};
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
     use crate::usage_ledger::BUCKET_SECONDS;
     use crate::workflow::{
@@ -7198,10 +7206,21 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    macro_rules! shell_host_downgrade {
+        () => {
+            "ALTER TABLE shell_runs DROP COLUMN host;"
+        };
+    }
+    const SHELL_HOST_DOWNGRADE: &str = shell_host_downgrade!();
+    const SHELL_HOST_PREVIOUS_SCHEMA: i64 = 41;
+    const SHELL_HOST_COMMAND: &str = "cargo test";
+    const SHELL_HOST_RECORDED_AT: i64 = 100;
+    const SHELL_HOST_ELAPSED_MS: u64 = 500;
+    const SHELL_HOST_PREDICTION: (u8, f64, i64) = (1, 0.75, 600);
     /// Drops what schema 41 added. Every downgrade below 41 runs it first.
     macro_rules! saved_tool_outputs_downgrade {
         () => {
-            "DROP TABLE saved_tool_outputs;"
+            concat!(shell_host_downgrade!(), "DROP TABLE saved_tool_outputs;")
         };
     }
     const SAVED_TOOL_OUTPUTS_DOWNGRADE: &str = saved_tool_outputs_downgrade!();
@@ -13043,6 +13062,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     #[test_case(BACKGROUND_TRANSCRIPTS_DOWNGRADE, BACKGROUND_TRANSCRIPTS_PREVIOUS_SCHEMA; "background_transcripts_from_thirty_eight")]
     #[test_case(SCREENING_DOWNGRADE, SCREENING_PREVIOUS_SCHEMA; "screening_from_thirty_nine")]
     #[test_case(SAVED_TOOL_OUTPUTS_DOWNGRADE, SAVED_TOOL_OUTPUTS_PREVIOUS_SCHEMA; "saved_tool_outputs_from_forty")]
+    #[test_case(SHELL_HOST_DOWNGRADE, SHELL_HOST_PREVIOUS_SCHEMA; "shell_host_from_forty_one")]
     fn added_tables_migrate_from_the_schema_before_them(downgrade: &str, previous: i64) {
         let (_temp, state) = state_dir();
         let database = SessionDatabase::open_state(&state).unwrap();
@@ -13063,6 +13083,78 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             schema_objects(&fresh),
             "{MIGRATED_MATCHES_FRESH}"
         );
+    }
+
+    #[test_case(0; "completed")]
+    #[test_case(1; "timed_out")]
+    #[test_case(2; "stopped")]
+    fn shell_host_migration_preserves_runs_and_predictions(outcome: i64) {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .execute_batch(SHELL_HOST_DOWNGRADE)
+            .unwrap();
+        let reading = read(&Call {
+            command: SHELL_HOST_COMMAND,
+            cwd: Some(CWD),
+            workdir: None,
+            timeout_secs: None,
+        });
+        let encoded = encode(&reading);
+        database.connection.execute(
+            "INSERT INTO shell_runs \
+             (recorded_at, reading, elapsed_ms, outcome, predicted_class, confidence, predicted_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![SHELL_HOST_RECORDED_AT, encoded, SHELL_HOST_ELAPSED_MS as i64,
+                outcome, SHELL_HOST_PREDICTION.0, SHELL_HOST_PREDICTION.1, SHELL_HOST_PREDICTION.2],
+        ).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", SHELL_HOST_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        let stored = migrated
+            .connection
+            .query_row(
+                "SELECT recorded_at, reading, predicted_class, confidence, predicted_ms, host \
+             FROM shell_runs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        (
+                            row.get::<_, u8>(2)?,
+                            row.get::<_, f64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ),
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (SHELL_HOST_RECORDED_AT, encoded, SHELL_HOST_PREDICTION, None)
+        );
+        let runs = ShellRuns::open(&state).unwrap().newest(2).unwrap();
+        assert_eq!(
+            runs,
+            [ShellRun {
+                reading,
+                host: None,
+                elapsed_ms: SHELL_HOST_ELAPSED_MS,
+                outcome: match outcome {
+                    0 => RunOutcome::Completed,
+                    1 => RunOutcome::TimedOut,
+                    _ => RunOutcome::Stopped,
+                },
+            }]
+        );
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -13994,6 +14086,7 @@ CREATE TABLE subagent_history_items (
                     .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
+                    .replace(crate::shell_runs::HOST_COLUMN, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")
@@ -14112,6 +14205,7 @@ CREATE TABLE subagents (
                     .replace(crate::tool_outputs::SAVED_OUTPUTS_SCHEMA, "")
                     .replace(crate::engine_decisions::SCREENING_COLUMN, "")
                     .replace(crate::background::TRANSCRIPTS, "")
+                    .replace(crate::shell_runs::HOST_COLUMN, "")
                     .replace(crate::shell_runs::TABLE, "")
                     .replace(crate::learning::TRANSCRIPTS, "")
                     .replace(crate::learning::TABLES, "")

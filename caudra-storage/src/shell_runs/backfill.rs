@@ -178,6 +178,7 @@ fn session_runs(
         if let Some(outcome) = measured.outcome() {
             runs.push(ShellRun {
                 reading: call.reading(cwd),
+                host: None,
                 elapsed_ms: measured.duration_ms,
                 outcome,
             });
