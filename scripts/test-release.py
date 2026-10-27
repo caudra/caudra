@@ -1230,8 +1230,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "nix build --no-update-lock-file .#checks.x86_64-linux.git-dep-hashes",
             "nix build --no-update-lock-file .#checks.x86_64-linux.fmt",
             "  nix build --no-update-lock-file --cores 2 -L\n",
+            "            max-jobs = 1\n",
         ):
             self.assertIn(command, nix["build"])
+        swap_commands = (
+            'swapfile="$RUNNER_TEMP/caudra-nix.swap"',
+            'sudo fallocate -l 8G "$swapfile"',
+            'sudo chmod 600 "$swapfile"',
+            'sudo mkswap "$swapfile"',
+            'sudo swapon "$swapfile"',
+            "uses: nixbuild/nix-quick-install-action@v35",
+        )
+        positions = [nix["build"].index(command) for command in swap_commands]
+        self.assertEqual(positions, sorted(positions))
 
     def test_workcell_image_prefetches_both_locked_graphs_before_offline_attribution(
         self,

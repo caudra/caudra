@@ -83,11 +83,19 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Add build swap
+        run: |
+          swapfile="$RUNNER_TEMP/caudra-nix.swap"
+          sudo fallocate -l 8G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
       - uses: nixbuild/nix-quick-install-action@v35
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
+            max-jobs = 1
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v7
         with:
@@ -106,9 +114,6 @@ jobs:
         run: nix build --no-update-lock-file .#checks.x86_64-linux.dummy-src
       - name: Check attribution vendor preparation
         run: nix build --no-update-lock-file .#checks.x86_64-linux.vendor-attribution
-      # The workspace crates build with thin LTO and one codegen unit. At four jobs they peak near
-      # the hosted runner's 16 GB, and the runner stops responding without an error, so the build
-      # takes two cores and logs memory and disk every minute.
       - name: Build
         run: |
           while sleep 60; do
