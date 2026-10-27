@@ -3976,6 +3976,8 @@ fn paste_file_path_triggers_image_load() {
 #[test_case(open_docs_modal, IMAGE_PATH_PASTE ; "path_into_docs")]
 #[test_case(open_logs_modal, ""               ; "clipboard_into_logs")]
 #[test_case(open_docs_modal, ""               ; "clipboard_into_docs")]
+#[test_case(open_help_modal, IMAGE_PATH_PASTE ; "path_into_help")]
+#[test_case(open_help_modal, ""               ; "clipboard_into_help")]
 fn an_image_paste_into_a_modal_stays_out_of_the_composer(open: fn(&mut App), text: &str) {
     let mut app = test_app();
     open(&mut app);
@@ -17714,6 +17716,7 @@ fn session_picker_relocation_keys_request_runtime_preflight(bind: Bind, bulk: bo
     ));
     assert!(!app.session_picker.is_open());
     assert!(!app.session_relocation_picker.is_open());
+    assert!(!app.stream_modal.is_open(), "the picker keeps its F2");
 }
 
 fn open_relocation_picker(app: &mut App) {
@@ -20036,6 +20039,104 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
     );
 }
 
+const ASK_DRAFT: &str = "half a question";
+const COMPOSER_DRAFT: &str = "a message for the agent";
+
+fn press_ask_btw(app: &mut App) {
+    assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
+}
+
+/// `F2` reads nothing until the first question goes, so the answer sees the
+/// conversation as it stands then, and the composer keeps its own draft.
+#[test]
+fn f2_opens_an_empty_btw_that_captures_on_the_first_send() {
+    let mut app = btw_ready_app();
+    app.input_box.set_input(COMPOSER_DRAFT.into());
+
+    press_ask_btw(&mut app);
+    assert!(app.stream_modal.is_open());
+    assert!(!app.stream_modal.is_clarification());
+    assert!(app.stream_modal.headers().is_empty());
+    assert!(app.btw_thread.is_none());
+    assert!(notice_texts(&mut app).is_empty(), "no cutoff before a send");
+
+    app.update(Msg::Paste(BTW_QUESTION.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(
+        app.btw_thread.as_ref().unwrap().pending(),
+        Some(BTW_QUESTION)
+    );
+    assert!(app.stream_modal.is_streaming());
+    assert_eq!(app.stream_modal.headers(), [BTW_HEADER]);
+    assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
+    assert_eq!(app.input_box.buffer.value(), COMPOSER_DRAFT);
+}
+
+#[test]
+fn f2_before_the_prompt_is_captured_flashes_instead_of_opening() {
+    let mut app = test_app();
+
+    press_ask_btw(&mut app);
+
+    assert!(!app.stream_modal.is_open());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::PROMPT_INITIALIZING)
+    );
+}
+
+#[test_case(TaskSource::Live ; "open_task")]
+#[test_case(TaskSource::Finished ; "finished_task")]
+fn f2_in_a_task_chat_asks_about_that_task(source: TaskSource) {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, source, true);
+
+    press_ask_btw(&mut app);
+    app.update(Msg::Paste(BTW_QUESTION.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
+    assert_eq!(chat_notices(&app, 1), [super::btw::BTW_CUTOFF_MARKER]);
+    assert!(chat_notices(&app, 0).is_empty(), "main keeps no marker");
+}
+
+fn ask_draft_typed() -> App {
+    let mut app = btw_ready_app();
+    press_ask_btw(&mut app);
+    app.update(Msg::Paste(ASK_DRAFT.into()));
+    app
+}
+
+/// Esc throws away the thread, never what was typed and not yet sent.
+#[test_case(ask_draft_typed, ASK_DRAFT ; "first_question")]
+#[test_case(btw_awaiting_follow_up, BTW_FOLLOW_UP ; "follow_up")]
+fn an_unsent_btw_question_comes_back_on_the_next_f2(setup: fn() -> App, unsent: &str) {
+    let mut app = setup();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    assert!(!app.stream_modal.is_open());
+    assert!(app.btw_thread.is_none());
+
+    press_ask_btw(&mut app);
+
+    assert_eq!(app.stream_modal.input_text(), unsent);
+    assert!(app.stream_modal.headers().is_empty(), "the thread is gone");
+}
+
+#[test]
+fn a_new_session_forgets_the_unsent_btw_question() {
+    let mut app = ask_draft_typed();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    app.reset_session();
+    press_ask_btw(&mut app);
+
+    assert!(app.stream_modal.is_open());
+    assert!(app.stream_modal.input_text().is_empty());
+}
+
 const CATCHUP_FOCUS: &str = "the migration";
 
 #[test_case("/catchup", "" ; "no_focus")]
@@ -20347,11 +20448,8 @@ fn question_btw_first_composer_owns_keys_and_paste_without_answering(workbench: 
     let history = app.state.session.messages().to_vec();
     let run_id = app.run_id;
 
-    assert_eq!(kb::QUESTION_ASK_BTW.code, KeyCode::F(2));
-    assert!(
-        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
-            .is_empty()
-    );
+    assert_eq!(kb::ASK_BTW.code, KeyCode::F(2));
+    assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
     assert!(app.stream_modal.is_open());
     assert!(app.stream_modal.is_clarification());
     assert!(!app.stream_modal.is_streaming());
@@ -20368,10 +20466,7 @@ fn question_btw_first_composer_owns_keys_and_paste_without_answering(workbench: 
     assert!(!app.stream_modal.is_open());
     assert!(app.stream_modal.is_clarification());
     assert!(app.btw_thread.is_none());
-    assert!(
-        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
-            .is_empty()
-    );
+    assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
     assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     let pending = app.btw_thread.as_ref().unwrap().pending().unwrap();
@@ -20427,7 +20522,7 @@ fn question_btw_back_retains_answer_thread_and_unsent_draft(mouse: bool) {
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
 
-    app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()));
+    app.update(Msg::Key(kb::ASK_BTW.to_key_event()));
     assert!(app.stream_modal.is_open());
     assert_eq!(app.stream_modal.headers(), headers);
     assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP);
@@ -20598,10 +20693,7 @@ fn question_btw_missing_initialization_preserves_the_form() {
     let (mut app, answers) = question_btw_app();
     app.btw_prompt = None;
     let before = rendered_question(&mut app);
-    assert!(
-        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
-            .is_empty()
-    );
+    assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
 
     assert!(!app.stream_modal.is_open());
     assert!(app.btw_thread.is_none());
@@ -23978,6 +24070,7 @@ fn associated_text_updates_the_owning_filter(open: fn(&mut App)) {
 
 #[test_case(open_docs_modal; "docs_search")]
 #[test_case(open_logs_modal; "logs_search")]
+#[test_case(open_help_modal; "help_search")]
 fn associated_logical_shortcut_opens_a_field_without_inserting_its_text(open: fn(&mut App)) {
     let mut app = test_app();
     open(&mut app);
@@ -23987,8 +24080,13 @@ fn associated_logical_shortcut_opens_a_field_without_inserting_its_text(open: fn
     ));
     assert!(!app.docs_modal.text_input_active());
     assert!(!app.logs_modal.text_input_active());
+    assert!(!app.help_modal.text_input_active());
     app.update(associated_key(key(KeyCode::Char('/')), Some("/")));
-    assert!(app.docs_modal.text_input_active() || app.logs_modal.text_input_active());
+    assert!(
+        app.docs_modal.text_input_active()
+            || app.logs_modal.text_input_active()
+            || app.help_modal.text_input_active()
+    );
     app.update(associated_key(key(KeyCode::Null), Some(KEYBOARD_COMMIT)));
     let screen = rendered_visible_text(&mut app);
     assert!(screen.contains(KEYBOARD_COMMIT));
@@ -25187,13 +25285,15 @@ fn non_below_split_reserves_band_and_keeps_status_aligned(dir: caudra_lua::Split
 
 /// Too short to spare a transcript row for a second footer row.
 const SHORT_TERMINAL_ROWS: u16 = 12;
+const MEDIUM_TERMINAL_ROWS: u16 = 24;
 const FOOTER_EDGE_MSG: &str = "the footer must sit on the terminal's bottom edge";
 
 /// Only the terminal's height picks the footer's rows, so nothing the footer
 /// shows can move the composer above it.
-#[test_case(TEST_AREA.height    => 2 ; "a_tall_terminal_splits_it")]
+#[test_case(TEST_AREA.height    => 3 ; "a_tall_terminal_gives_messages_a_row")]
+#[test_case(MEDIUM_TERMINAL_ROWS => 2 ; "a_medium_terminal_splits_it")]
 #[test_case(SHORT_TERMINAL_ROWS => 1 ; "a_short_terminal_keeps_one_row")]
-fn the_footer_takes_two_rows_unless_the_terminal_is_short(rows: u16) -> u16 {
+fn the_footer_rows_follow_the_terminal_height(rows: u16) -> u16 {
     let area = Rect {
         height: rows,
         ..TEST_AREA
@@ -29366,7 +29466,7 @@ mod autopilot {
     }
 
     #[test_case(key(KeyCode::Down), false ; "a_key")]
-    #[test_case(kb::QUESTION_ASK_BTW.to_key_event(), true ; "f2")]
+    #[test_case(kb::ASK_BTW.to_key_event(), true ; "f2")]
     fn the_first_key_takes_the_question_form_from_autopilot(pressed: KeyEvent, asks_btw: bool) {
         let mut app = running_app();
         app.btw_prompt = btw_ready_app().btw_prompt;

@@ -114,7 +114,13 @@ fn write_leader(out: &mut String) {
         "Leader chords are written as two keys below, and every one of them \
          is reachable on any terminal: Caudra ships no `Alt` defaults, \
          because macOS routes Option through the input method and never \
-         reports it as Alt.\n",
+         reports it as Alt.\n\n",
+    );
+    out.push_str(
+        "`F1` lists these bindings. Press `/` there to filter them by key, \
+         action, or section. The list writes modifiers as symbols: `⌃` for \
+         `Ctrl`, `⇧` for `Shift`, `⌥` for `Alt`, and `⌘` for `Super`. The \
+         filter finds a key by either spelling.\n",
     );
 }
 

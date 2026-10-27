@@ -143,7 +143,7 @@ Each key acts on the provider of the selected account. The first `o` on another 
 
 The orders and the strategy are saved to `providers.toml`, which keeps its comments. Moving an account adds entries for the saved accounts the file does not list yet.
 
-With two or more accounts, the status bar shows the account the conversation uses and the quota it has left, as `[auto·personal 41%]`. `auto·` means Auto is selected. The chip takes the warning color below `prefer_below` and the error color below `switch_below`. Click it to open `/accounts`.
+With two or more accounts, the status bar shows the account the conversation uses and the quota it has left, as `[auto·personal 41%]`, beside the spend. `auto·` means Auto is selected. A narrow terminal shortens the chip to the quota alone, as `[41%]`, and drops it before the spend. The chip takes the warning color below `prefer_below` and the error color below `switch_below`. Click it to open `/accounts`.
 
 Every switch adds a row to the transcript with its cause and its cost:
 

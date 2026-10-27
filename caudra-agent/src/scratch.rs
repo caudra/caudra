@@ -14,6 +14,8 @@
 //! model told about a directory that is not there is worse off than a model
 //! told about none.
 
+use std::env;
+use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -56,9 +58,27 @@ struct RemoteScratch {
 /// there is none to name.
 pub fn advertised() -> Option<String> {
     match state() {
-        Scratch::Local => local_root().map(|_| std::env::temp_dir().to_string_lossy().into_owned()),
+        Scratch::Local => local_advertised(),
         Scratch::Remote(remote) => remote.map(|remote| remote.project),
     }
+}
+
+/// The directory on this machine that temporary work goes to, or `None` when
+/// tools run elsewhere. It is the temp directory set at startup, which stays
+/// put when the session moves to another project.
+pub fn local_dir() -> Option<PathBuf> {
+    match state() {
+        Scratch::Local => local_temp_dir(),
+        Scratch::Remote(_) => None,
+    }
+}
+
+fn local_temp_dir() -> Option<PathBuf> {
+    local_root().map(|_| env::temp_dir())
+}
+
+fn local_advertised() -> Option<String> {
+    local_temp_dir().map(|dir| dir.to_string_lossy().into_owned())
 }
 
 /// The root that file-write and read tools are pre-allowed inside.
@@ -82,7 +102,7 @@ pub fn permission_root() -> Option<String> {
 pub fn environment_section() -> String {
     let state = state();
     let Some(path) = (match &state {
-        Scratch::Local => local_root().map(|_| std::env::temp_dir().to_string_lossy().into_owned()),
+        Scratch::Local => local_advertised(),
         Scratch::Remote(remote) => remote.as_ref().map(|remote| remote.project.clone()),
     }) else {
         return String::new();
@@ -300,7 +320,8 @@ mod tests {
 
     use super::{
         ExecRequest, OperationState, OperationStatus, ScratchGuard, WorkspaceSession, advertised,
-        environment_section, permission_root, prepare_remote, remote_scratch_id, setup_command,
+        environment_section, local_dir, permission_root, prepare_remote, remote_scratch_id,
+        setup_command,
     };
 
     const NAMESPACE: &str = "caudra";
@@ -314,6 +335,8 @@ mod tests {
         "the pre-allowed root must contain the advertised directory";
     const NOTHING_ADVERTISED: &str = "a remote path that was not created must not be advertised";
     const NOTHING_ALLOWED: &str = "a directory that was not created must not be pre-allowed";
+    const LOCAL_DIR_IS_TEMP: &str = "locally the scratch directory is the temp directory";
+    const NO_LOCAL_DIR: &str = "with tools on a remote host there is no local scratch directory";
     const NOTHING_IN_THE_BLOCK: &str = "with no usable directory the block must name none";
     const NO_STATUS_POLL: &str = "a terminal execute must not be polled again";
     const LOCAL_CLAIM: &str = "the local block must say temporary files already land there";
@@ -514,6 +537,7 @@ mod tests {
 
         assert_eq!(prepared, None);
         assert_eq!(advertised(), None, "{NOTHING_ADVERTISED}");
+        assert_eq!(local_dir(), None, "{NO_LOCAL_DIR}");
         assert_eq!(permission_root(), None, "{NOTHING_ALLOWED}");
         assert_eq!(environment_section(), "", "{NOTHING_IN_THE_BLOCK}");
     }
@@ -528,6 +552,7 @@ mod tests {
             advertised(),
             Some(std::env::temp_dir().to_string_lossy().into_owned())
         );
+        assert_eq!(local_dir(), Some(std::env::temp_dir()), "{LOCAL_DIR_IS_TEMP}");
         assert_eq!(
             permission_root(),
             Some(

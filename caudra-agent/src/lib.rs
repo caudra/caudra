@@ -120,8 +120,8 @@ pub use types::{
     ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 pub use types::{
-    ReasoningSummary, format_live_duration, format_settled_duration, reasoning_summary,
-    streaming_reasoning_summary, with_context_tokens,
+    ReasoningSummary, counted, format_live_duration, format_settled_duration, reasoning_summary,
+    streaming_reasoning_summary, tally, with_context_tokens,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

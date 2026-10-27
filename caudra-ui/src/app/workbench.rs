@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 
 use caudra_agent::ToolDoneEvent;
 use caudra_agent::permissions::VerifiedLocalSourceLocator;
+use caudra_agent::scratch;
 use caudra_agent::tools::MEMORY_TOOL_NAME;
 use caudra_agent::tools::native::plan::{PlanTarget, PlanWriteResult};
 use caudra_storage::local_documents::{
     DocumentRevision, LocalDocument, LocalDocumentError, LocalDocumentStore,
 };
-use caudra_storage::projects::{project_document_dirs, project_scratch_path};
+use caudra_storage::projects::project_document_dirs;
 use caudra_workbench::{DocumentKey, HostMount, TabLabel};
 use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef};
 
@@ -71,8 +72,9 @@ impl StoredDocument {
 }
 
 /// What the workbench's Caudra section was last worked out for: the session
-/// files its plans, the directory keys its notes and scratch, and a remote
-/// workspace keeps both in a store of its own.
+/// files its plans, the directory keys its notes, and a remote workspace keeps
+/// both in a store of its own. Scratch is the temp directory set at startup,
+/// which none of these move.
 #[derive(PartialEq, Eq)]
 pub(super) struct MountScope {
     session: String,
@@ -211,7 +213,8 @@ impl App {
 
     /// The config directory, then the plans and notes wherever this session
     /// keeps them. A remote workspace's are its store's, which owns their
-    /// names; a local session's are plain folders, beside its scratch.
+    /// names; a local session's are plain folders, beside the scratch
+    /// directory its tools were told to use.
     fn caudra_mounts(&self, store: Option<&LocalDocumentStore>, session: &str) -> Vec<HostMount> {
         let config = caudra_storage::paths::config_dir_path()
             .ok()
@@ -224,9 +227,7 @@ impl App {
             None => {
                 let cwd = Path::new(&self.state.session.cwd);
                 let [plans, notes] = project_document_dirs(&self.storage, cwd);
-                let scratch = project_scratch_path(cwd)
-                    .ok()
-                    .map(|root| mount(SCRATCH_MOUNT, root, false));
+                let scratch = scratch::local_dir().map(|root| mount(SCRATCH_MOUNT, root, false));
                 [
                     mount(PLANS_MOUNT, plans, false),
                     mount(MEMORIES_MOUNT, notes, false),
@@ -604,7 +605,7 @@ mod tests {
     use caudra_storage::StateDir;
     use caudra_storage::local_documents::LocalDocumentStore;
     use caudra_storage::plans::PlanFile;
-    use caudra_storage::projects::{project_document_dirs, project_scratch_path};
+    use caudra_storage::projects::project_document_dirs;
     use caudra_workbench::{Layout as WorkbenchLayout, Workbench, keys as workbench_keys};
     use caudra_workspace::{LocalDocumentRef, MemoryRef};
     use crossterm::event::KeyCode;
@@ -1772,12 +1773,23 @@ mod tests {
         );
     }
 
-    #[test_case(false ; "local")]
-    #[test_case(true ; "remote")]
-    fn the_caudra_section_names_this_sessions_own_directories(remote_session: bool) {
-        let remote = remote();
-        let local = test_app();
-        let app = if remote_session { &remote.app } else { &local };
+    /// Scratch is the temp directory the agent was told about, which stays
+    /// where startup put it when the session moves to another directory.
+    #[test_case(false, false ; "local")]
+    #[test_case(false, true ; "local_after_moving")]
+    #[test_case(true, false ; "remote")]
+    fn the_caudra_section_names_this_sessions_own_directories(remote_session: bool, moved: bool) {
+        let mut remote = remote();
+        let mut local = test_app();
+        let app = if remote_session {
+            &mut remote.app
+        } else {
+            &mut local
+        };
+        let elsewhere = private_tempdir();
+        if moved {
+            app.state.session_mut().cwd = elsewhere.path().to_string_lossy().into_owned();
+        }
         let store = remote_session.then(|| Arc::clone(&remote.store));
         let session = app.state.session.id.to_string();
 
@@ -1793,11 +1805,7 @@ mod tests {
             None => vec![
                 (PLANS_MOUNT, plans, false),
                 (MEMORIES_MOUNT, notes, false),
-                (
-                    SCRATCH_MOUNT,
-                    project_scratch_path(cwd).expect(WRONG_MOUNTS),
-                    false,
-                ),
+                (SCRATCH_MOUNT, std::env::temp_dir(), false),
             ],
         };
         let config = caudra_storage::paths::config_dir_path().expect(WRONG_MOUNTS);

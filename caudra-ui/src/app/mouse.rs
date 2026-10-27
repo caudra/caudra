@@ -1500,6 +1500,12 @@ impl App {
                 }
                 Vec::new()
             }
+            // Stands in for the first folded control, which goes through the
+            // same scope check as if it had been drawn and clicked itself.
+            StatusBarHitTarget::Overflow => match self.status_bar.overflow_target() {
+                Some(target) => self.handle_status_click(StatusBarHit { target, ..hit }),
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }

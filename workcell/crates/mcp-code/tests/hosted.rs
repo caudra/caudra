@@ -44,6 +44,8 @@ const CALLS_BEFORE_RESTORE: usize = 60;
 const FOREVER: Duration = Duration::from_secs(1_000_000);
 /// Short enough to keep the suite fast, long enough to measure.
 const REAL_SLEEP: Duration = Duration::from_millis(50);
+const HOST_MODULE_GUIDANCE: &str = "`gh` is a host module already in scope";
+const IMPORT_GUIDANCE: &str = "Do not retry this import";
 const GATHER_UNIMPORTED: &str =
     "a, b = await asyncio.gather(gh.list(owner='a'), gh.list(owner='b'))\n[a['owner'], b['owner']]";
 
@@ -503,7 +505,48 @@ async fn imported_modules_render_and_cross_host_arguments_as_strings() {
     group.shutdown().await;
 }
 
-#[test_case("import gh", "ModuleNotFoundError" ; "host_namespace_is_not_an_import")]
+#[test_case("import gh", true ; "import_checked")]
+#[test_case("import gh", false ; "import_raised")]
+#[test_case("from executor import gh", true ; "from_another_module_checked")]
+#[test_case("from executor import gh", false ; "from_another_module_raised")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_of_a_host_module_is_dropped_before_it_runs(import: &str, type_check: bool) {
+    let Some(group) = group_with_type_check(type_check).await else {
+        return;
+    };
+    let host = Arc::new(FakeHost::default());
+    let code = format!("{import}\nawait gh.list(owner='x')");
+    let executed = run(&group, &host, &code, None).await;
+    assert_eq!(
+        outcome(&executed),
+        Outcome::Completed,
+        "{:?}",
+        output(&executed)
+    );
+    assert_eq!(executed.repairs, [Repair::Unimported(NAMESPACE.to_owned())]);
+    assert_eq!(host.calls(), ["list"]);
+    group.shutdown().await;
+}
+
+/// `from gh import list` binds something other than a host module, so it is left to fail, but
+/// the failure says the module is in scope rather than telling the caller to give up on it.
+#[test_case(true ; "checked")]
+#[test_case(false ; "raised")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_from_a_host_module_says_it_is_in_scope(type_check: bool) {
+    let Some(group) = group_with_type_check(type_check).await else {
+        return;
+    };
+    let host = Arc::new(FakeHost::default());
+    let executed = run(&group, &host, "from gh import list\nawait list()", None).await;
+    let failed = output(&executed);
+    let diagnostic = failed.diagnostic.as_deref().expect("guidance");
+    assert!(diagnostic.contains(HOST_MODULE_GUIDANCE), "{diagnostic}");
+    assert!(!diagnostic.contains(IMPORT_GUIDANCE), "{diagnostic}");
+    assert!(host.calls().is_empty());
+    group.shutdown().await;
+}
+
 #[test_case("import subprocess", "ModuleNotFoundError" ; "host_python_is_not_available")]
 #[test_case("from pathlib import Path\nPath('/etc/passwd').read_text()", "PermissionError" ; "unmounted_path")]
 #[tokio::test(flavor = "multi_thread")]

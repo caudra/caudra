@@ -115,6 +115,13 @@ const MEMORY_HITS_HEADING: &str = "Notes matching";
 const MEMORY_HIT_BULLET: &str = "- ";
 const MEMORY_HIT_INDENT: &str = "  ";
 pub(crate) const LINE_NOUN: &str = "line";
+const NONE_LEAD: &str = "no ";
+const EMPTY_LABEL: &str = "empty";
+const MATCH_NOUN: &str = "match";
+const MATCHES_NOUN: &str = "matches";
+const FILE_NOUN: &str = "file";
+const ENTRY_NOUN: &str = "entry";
+const ENTRIES_NOUN: &str = "entries";
 const TOOL_OUTPUT_LOADED: &str = "loaded";
 const PEER_SESSION_NOUN: &str = "session";
 const PEER_SESSIONS_EMPTY: &str = "No other live local sessions.";
@@ -1734,12 +1741,27 @@ fn numbered(content: &str) -> String {
         .join("\n")
 }
 
-/// `1 note`, `3 notes`. Small enough to inline everywhere it is needed, and
-/// wrong often enough when it is.
-pub(crate) fn counted(count: usize, noun: &str) -> String {
+/// `no notes`, `1 note`, `3 notes`. Small enough to inline everywhere it is
+/// needed, and wrong often enough when it is.
+pub fn counted(count: usize, noun: &str) -> String {
+    tally(count, noun, &format!("{noun}s"))
+}
+
+/// [`counted`] for a noun whose plural is not its singular plus `s`.
+pub fn tally(count: usize, one: &str, many: &str) -> String {
     match count {
-        1 => format!("{count} {noun}"),
-        _ => format!("{count} {noun}s"),
+        0 => format!("{NONE_LEAD}{many}"),
+        1 => format!("{count} {one}"),
+        _ => format!("{count} {many}"),
+    }
+}
+
+/// `empty` rather than `no entries`: a listing with nothing in it is a fact
+/// about the directory, not a search that came back short.
+fn entries_label(count: usize) -> String {
+    match count {
+        0 => EMPTY_LABEL.to_owned(),
+        _ => tally(count, ENTRY_NOUN, ENTRIES_NOUN),
     }
 }
 
@@ -2236,10 +2258,11 @@ fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize
 /// Lines are what the rest of the annotations count, so a write reports them
 /// too. Sessions written before the line split only carry the byte count.
 fn written_size(byte_count: usize, lines: &[String]) -> String {
-    if lines.is_empty() && byte_count > 0 {
-        return format!("{byte_count} bytes");
+    match (lines.len(), byte_count) {
+        (0, 0) => EMPTY_LABEL.to_owned(),
+        (0, bytes) => format!("{bytes} bytes"),
+        (count, _) => counted(count, LINE_NOUN),
     }
-    counted(lines.len(), LINE_NOUN)
 }
 
 impl ToolOutput {
@@ -2281,7 +2304,9 @@ impl ToolOutput {
                 ..
             } => {
                 let shown = lines.len();
-                let label = if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
+                let label = if *total_lines == 0 && shown == 0 {
+                    EMPTY_LABEL.to_owned()
+                } else if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
                     counted(shown, LINE_NOUN)
                 } else if shown == 0 {
                     format!("0 of {}", counted(*total_lines, LINE_NOUN))
@@ -2307,21 +2332,24 @@ impl ToolOutput {
             )),
             Self::GrepResult { entries, capped } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
-                let files = entries.len();
-                let f = if files == 1 { "file" } else { "files" };
+                let mut found = tally(matches, MATCH_NOUN, MATCHES_NOUN);
+                if matches > 0 {
+                    found = format!("{found} in {}", counted(entries.len(), FILE_NOUN));
+                }
                 let label = match capped {
                     Some(cap) => format!(
-                        "{matches} matches in {files} {f} (capped, {}/{} searched)",
+                        "{found} (capped, {}/{} searched)",
                         cap.files_scanned, cap.files_listed
                     ),
-                    None => format!("{matches} matches in {files} {f}"),
+                    None => found,
                 };
                 Some(with_context_tokens(label, &self.as_display_text(), scale))
             }
-            Self::ReadDir(t) => {
-                let n = t.text.lines().count();
-                Some(with_context_tokens(format!("{n} entries"), &t.text, scale))
-            }
+            Self::ReadDir(t) => Some(with_context_tokens(
+                entries_label(t.text.lines().count()),
+                &t.text,
+                scale,
+            )),
             Self::Index(IndexOutput::File { lines, .. }) => Some(with_context_tokens(
                 counted(lines.len(), LINE_NOUN),
                 &self.as_display_text(),
@@ -2333,9 +2361,9 @@ impl ToolOutput {
                 ..
             }) => {
                 let label = if *truncated {
-                    format!("at least {total_count} entries")
+                    format!("at least {total_count} {ENTRIES_NOUN}")
                 } else {
-                    format!("{total_count} entries")
+                    entries_label(*total_count)
                 };
                 Some(with_context_tokens(label, &self.as_display_text(), scale))
             }
@@ -4770,7 +4798,7 @@ mod tests {
         })
     }
 
-    #[test_case(0, "0 sessions"; "empty")]
+    #[test_case(0, "no sessions"; "empty")]
     #[test_case(1, "1 session"; "one")]
     #[test_case(2, "2 sessions"; "multiple")]
     fn peer_discovery_keeps_model_json_and_human_display_separate(count: usize, annotation: &str) {
@@ -4970,7 +4998,7 @@ mod tests {
         })
     }
 
-    #[test_case(0, "0 topics"; "empty")]
+    #[test_case(0, "no topics"; "empty")]
     #[test_case(2, "2 topics"; "listed")]
     fn peer_topic_directory_reports_counts_and_utc_times(count: usize, annotation: &str) {
         let output = peer_topics(count);
@@ -4996,7 +5024,7 @@ mod tests {
     #[test_case(2, 0, None, "2 messages"; "complete")]
     #[test_case(1, 3, None, "1 message · 3 withheld"; "withheld")]
     #[test_case(2, 0, Some(PEER_CURSOR), "2 messages"; "older")]
-    #[test_case(0, 0, None, "0 messages"; "empty")]
+    #[test_case(0, 0, None, "no messages"; "empty")]
     fn peer_history_marks_stored_text_untrusted_and_reports_what_it_withheld(
         shown: usize,
         withheld: usize,
@@ -5234,10 +5262,13 @@ mod tests {
     /// tokens to report.
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 101, lines: vec![], total_lines: 100, instructions: None }, Some("0 of 100 lines") ; "read_code_offset_past_eof")]
-    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }, Some("0 lines") ; "read_code_empty_file")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }, Some(EMPTY_LABEL) ; "read_code_empty_file")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec!["x".into(); 3] }, Some("3 lines") ; "write_code_lines")]
     #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_falls_back_for_old_sessions")]
-    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some("0 lines") ; "write_code_empty_file")]
+    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 0, lines: vec![] }, Some(EMPTY_LABEL) ; "write_code_empty_file")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![], capped: None }, Some("no matches") ; "grep_found_nothing")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, Some("no matches (capped, 40/900 searched)") ; "grep_capped_and_found_nothing")]
+    #[test_case(ToolOutput::ReadDir(String::new().into()), Some(EMPTY_LABEL) ; "read_dir_empty")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
@@ -5254,9 +5285,11 @@ mod tests {
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, "lines 10–14 of 100" ; "read_code_middle_window")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 96, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, "lines 96–100 of 100" ; "read_code_window_reaches_eof")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 0, instructions: None }, "5 lines" ; "read_code_old_session_without_total")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, "1 matches in 1 file" ; "grep_file_count")]
-    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, "1 matches in 1 file (capped, 40/900 searched)" ; "grep_capped_reports_how_far_it_got")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, "1 match in 1 file" ; "grep_file_count")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit"), GrepMatchGroup::single(2, "hit")] }, GrepFileEntry { path: "b.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: None }, "3 matches in 2 files" ; "grep_plural_counts")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, "1 match in 1 file (capped, 40/900 searched)" ; "grep_capped_reports_how_far_it_got")]
     #[test_case(ToolOutput::ReadDir("a.rs\nb.rs".into()), "2 entries" ; "read_dir")]
+    #[test_case(ToolOutput::ReadDir("a.rs".into()), "1 entry" ; "read_dir_one_entry")]
     fn a_result_the_model_reads_adds_its_tokens(output: ToolOutput, label: &str) {
         let tokens = token_label(estimate_tokens_cached(&output.as_display_text()));
         assert_eq!(
@@ -5344,7 +5377,7 @@ mod tests {
     /// A status call's row names the one task's state; a listing counts them.
     #[test_case(vec![task(RUNNING_STATE)], RUNNING_STATE ; "one_task_names_its_state")]
     #[test_case(vec![task(RUNNING_STATE), task(DONE_STATE)], "2 tasks" ; "a_listing_counts")]
-    #[test_case(Vec::new(), "0 tasks" ; "an_empty_listing_says_so")]
+    #[test_case(Vec::new(), "no tasks" ; "an_empty_listing_says_so")]
     fn a_task_row_says_what_it_found(cards: Vec<TaskCard>, expected: &str) {
         assert_eq!(
             ToolOutput::Tasks(cards)

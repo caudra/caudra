@@ -36,12 +36,26 @@ const GAP: &str = " ";
 /// Below this many terminal rows a line of transcript is worth more than the
 /// abbreviations a second footer row would spare.
 const SPLIT_MIN_TERMINAL_ROWS: u16 = 20;
+/// From this many terminal rows the messages get a row of their own, so an
+/// error or a notice never takes a column from the meters.
+const MESSAGES_MIN_TERMINAL_ROWS: u16 = 30;
+const THREE_ROWS: u16 = 3;
 const SPLIT_ROWS: u16 = 2;
 const SINGLE_ROW: u16 = 1;
 /// The spinner's two columns while nothing spins, so the chips after it hold
 /// still when a turn starts or ends.
 const SPINNER_SLOT_BLANK: &str = "  ";
-const BACKGROUND_WAITING_LABEL: &str = " waiting for background work";
+const BACKGROUND_WAITING_LABEL: &str = "waiting for background work";
+/// The spinner's own style already says what it waits on, so a crowded row
+/// keeps the verb alone.
+const BACKGROUND_WAITING_SHORT_LABEL: &str = "waiting";
+/// Marks where a message was cut. The whole text is in its tooltip.
+const ELLIPSIS: &str = "\u{2026}";
+/// Columns a cut message keeps at least, past which it folds into the
+/// overflow chip instead: fewer say nothing an ellipsis does not.
+const MESSAGE_MIN_WIDTH: usize = 12;
+const OVERFLOW_PREFIX: &str = "[+";
+const OVERFLOW_SUFFIX: &str = "]";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const TASKS_LABEL: &str = "tasks";
 const SHELLS_LABEL: &str = "shell";
@@ -161,6 +175,7 @@ const CLICK_TRUST_REVIEW: &str = "Click to review it";
 const CLICK_AUTOMATIONS: &str = "Click to open automations";
 const CLICK_AUTOPILOT: &str = "Click to open autopilot";
 const CLICK_QUESTIONS: &str = "Click to answer the oldest";
+const CLICK_OVERFLOW: &str = "Click to open the first";
 /// Cells in the context gauge. Each fills in eighths, so the gauge resolves
 /// the window to one part in eighty.
 const GAUGE_CELLS: u8 = 10;
@@ -297,10 +312,13 @@ fn compact_price(value: f64) -> String {
 
 /// Rows the footer takes on a terminal `terminal_rows` tall. Two once there is
 /// room, so what the next message runs with never gives up columns to what the
-/// agent is doing. It depends on nothing else, so a turn starting or a task
-/// spawning never moves the composer.
+/// agent is doing, and three once there is more, so neither gives any up to
+/// what the session has to say. It depends on nothing else, so a turn
+/// starting, a task spawning or a notice arriving never moves the composer.
 pub fn height(terminal_rows: u16) -> u16 {
-    if terminal_rows >= SPLIT_MIN_TERMINAL_ROWS {
+    if terminal_rows >= MESSAGES_MIN_TERMINAL_ROWS {
+        THREE_ROWS
+    } else if terminal_rows >= SPLIT_MIN_TERMINAL_ROWS {
         SPLIT_ROWS
     } else {
         SINGLE_ROW
@@ -334,6 +352,18 @@ pub enum StatusBarHitTarget {
     Automations,
     Autopilot,
     Questions,
+    /// A message cut to fit, which the pointer reads whole.
+    Message(MessageKind),
+    /// `[+N]`, standing in for the messages no column was left for.
+    Overflow,
+}
+
+/// The messages that are plain text, so a cut one needs a hit of its own to
+/// be read whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Error,
+    Flash,
 }
 
 impl StatusBarHitTarget {
@@ -369,7 +399,9 @@ impl StatusBarHitTarget {
             | Self::Decisions
             | Self::ConfigProblems
             | Self::TrustReview
-            | Self::Questions => ChatScope::Any,
+            | Self::Questions
+            | Self::Message(_)
+            | Self::Overflow => ChatScope::Any,
             Self::Mode
             | Self::Model
             | Self::Thinking
@@ -384,7 +416,7 @@ impl StatusBarHitTarget {
     }
 
     pub fn accepts_click(self) -> bool {
-        !matches!(self, Self::ChatName | Self::Cwd)
+        !matches!(self, Self::ChatName | Self::Cwd | Self::Message(_))
     }
 }
 
@@ -565,9 +597,17 @@ enum ContextTier {
     Hidden,
 }
 
+/// `[auto·personal 41%]`, squeezed to `[41%]`, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountSlot {
+    Named,
+    Share,
+    Hidden,
+}
+
 /// One step down the ladder. Every step either abbreviates something or drops
 /// it, so the bar's width falls monotonically and the search terminates.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reduction {
     DropGauge,
     LeafModel,
@@ -579,6 +619,8 @@ enum Reduction {
     ShortPermission,
     DropTransition,
     ShortSpend,
+    ShortAccount,
+    DropAccount,
     DropSpend,
     DropContext,
     DropFast,
@@ -616,6 +658,8 @@ impl Reduction {
             | Self::CompactContext
             | Self::ShortWorkflows
             | Self::ShortSpend
+            | Self::ShortAccount
+            | Self::DropAccount
             | Self::DropSpend
             | Self::DropContext
             | Self::DropWorkflows => Band::Live,
@@ -639,11 +683,12 @@ impl Reduction {
 /// leaves a chip with no word at all.
 ///
 /// A session that mixes payers gives up its smaller figure before it gives up
-/// the price altogether.
+/// the price altogether. The account sits between the two: its quota is the
+/// half of the chip worth keeping, and the price outranks which account pays.
 ///
 /// A split footer walks this same ladder once per row, skipping the rungs of
 /// the other [`Band`], so both layouts give up their chips in one order.
-const LADDER: [Reduction; 17] = [
+const LADDER: [Reduction; 19] = [
     Reduction::DropGauge,
     Reduction::LeafModel,
     Reduction::DropGlobalSpend,
@@ -654,6 +699,8 @@ const LADDER: [Reduction; 17] = [
     Reduction::ShortPermission,
     Reduction::DropTransition,
     Reduction::ShortSpend,
+    Reduction::ShortAccount,
+    Reduction::DropAccount,
     Reduction::DropSpend,
     Reduction::DropContext,
     Reduction::DropFast,
@@ -662,6 +709,11 @@ const LADDER: [Reduction; 17] = [
     Reduction::ChopModel,
     Reduction::DropPermission,
 ];
+
+/// Where a row that shares its columns with the messages stops giving way to
+/// them: the rungs before it are taken before a message is cut, and the ones
+/// from it on only once the messages have what is left.
+const MESSAGES_FLOOR: Reduction = Reduction::DropAccount;
 
 /// The counters and prices, rendered once per frame so walking the ladder is
 /// pure arithmetic over widths the bar already knows. The counter and the money
@@ -808,6 +860,7 @@ struct Fit {
     fast: bool,
     workflows: WorkflowTier,
     permission: PermissionTier,
+    account: AccountSlot,
 }
 
 impl Fit {
@@ -815,6 +868,7 @@ impl Fit {
         spend: true,
         short_spend: false,
         global_spend: true,
+        account: AccountSlot::Named,
         context: ContextTier::Gauge,
         compaction_border: true,
         thinking: ThinkingTier::Full,
@@ -837,6 +891,8 @@ impl Fit {
             Reduction::ShortPermission => self.permission = PermissionTier::Sigil,
             Reduction::DropTransition => self.transition = false,
             Reduction::ShortSpend => self.short_spend = true,
+            Reduction::ShortAccount => self.account = AccountSlot::Share,
+            Reduction::DropAccount => self.account = AccountSlot::Hidden,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropFast => self.fast = false,
@@ -873,7 +929,22 @@ impl Fit {
     }
 
     fn live_width(self, ctx: &StatusBarContext<'_>, spend: &SpendText) -> usize {
-        self.workflow_label(ctx).map_or(0, UnicodeWidthStr::width) + self.spend_width(spend)
+        self.workflow_label(ctx).map_or(0, UnicodeWidthStr::width)
+            + self.spend_width(spend)
+            + self
+                .account_label(ctx)
+                .map_or(0, |label| GAP.width() + label.width())
+    }
+
+    /// The account and its quota, then the quota alone, which is the half of
+    /// the chip that warns. An account without a reading has no shorter form.
+    fn account_label(self, ctx: &StatusBarContext<'_>) -> Option<String> {
+        let chip = ctx.account.as_ref()?;
+        match (self.account, chip.left_percent) {
+            (AccountSlot::Hidden, _) => None,
+            (AccountSlot::Share, Some(left)) => Some(format!("[{left}%]")),
+            (AccountSlot::Named | AccountSlot::Share, _) => Some(account_label(chip)),
+        }
     }
 
     /// Clamped up to the floor so [`Reduction::ChopModel`] can never widen a
@@ -1004,6 +1075,15 @@ pub struct StatusBar {
     /// The hovered control's tooltip as of the last frame, built from the
     /// context that drew it so the box and the chip never disagree.
     hover_tip: Option<(StatusBarHitTarget, Rect, String)>,
+    /// The messages the last frame folded into its overflow chip.
+    folded: Vec<Folded>,
+}
+
+/// A message no column was left for, as the overflow chip's tooltip names it,
+/// with the control a click on the chip stands in for.
+struct Folded {
+    text: String,
+    target: Option<StatusBarHitTarget>,
 }
 
 #[derive(Default)]
@@ -1090,7 +1170,17 @@ impl StatusBar {
             marquee: Marquee::default(),
             automations: AutomationChip::default(),
             hover_tip: None,
+            folded: Vec::new(),
         }
+    }
+
+    /// The control a click on the overflow chip opens: the first folded
+    /// message that answers a click at all.
+    pub fn overflow_target(&self) -> Option<StatusBarHitTarget> {
+        self.folded
+            .iter()
+            .filter_map(|folded| folded.target)
+            .find(|target| target.accepts_click())
     }
 
     pub(crate) fn hover_tip(&self) -> Option<Tip> {
@@ -1208,33 +1298,35 @@ impl StatusBar {
                 StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd | StatusBarHitTarget::Model
             )
         }));
+        self.folded.clear();
         let mut hits = Vec::new();
-        if area.height >= SPLIT_ROWS {
-            let [settings, live] = Layout::vertical([
-                Constraint::Length(SINGLE_ROW),
-                Constraint::Length(SINGLE_ROW),
-            ])
-            .areas(area);
+        if area.height >= THREE_ROWS {
+            let [settings, live, messages] =
+                Layout::vertical([Constraint::Length(SINGLE_ROW); 3]).areas(area);
             self.settings_row(frame, settings, ctx, &mut hits);
-            self.live_row(frame, live, ctx, &mut hits);
+            self.live_row(frame, live, ctx, &mut hits, false);
+            self.messages_row(frame, messages, ctx, &mut hits);
+        } else if area.height == SPLIT_ROWS {
+            let [settings, live] =
+                Layout::vertical([Constraint::Length(SINGLE_ROW); 2]).areas(area);
+            self.settings_row(frame, settings, ctx, &mut hits);
+            self.live_row(frame, live, ctx, &mut hits, true);
         } else {
             self.single_row(frame, area, ctx, &mut hits);
         }
         self.marquee.finish_frame();
         self.hover_tip = ctx.hovered.and_then(|target| {
             let hit = hits.iter().find(|hit| hit.target == target)?;
-            Some((
-                target,
-                hit.area,
-                chip_tip(target, ctx, &self.automations, &self.cwd_branch)?,
-            ))
+            Some((target, hit.area, self.chip_tip(target, ctx)?))
         });
         hits
     }
 
     /// Every chip on one line, for a terminal too short to spare a second row.
     /// The left side is laid out first and the right side fits whatever columns
-    /// it leaves, walking the whole ladder.
+    /// it leaves, walking the whole ladder. The messages get what the right
+    /// side leaves at [`MESSAGES_FLOOR`], so they cut themselves short before
+    /// they cost the model or a meter its last tier.
     fn single_row(
         &mut self,
         frame: &mut Frame,
@@ -1250,40 +1342,23 @@ impl StatusBar {
             left.push(self.spinner_slot(ctx));
         }
         self.push_settings(&mut left, ctx, area.width);
-        push_resume(&mut left, ctx);
         push_goal(&mut left, ctx);
         push_autopilot(&mut left, ctx, area.width);
         push_activity(&mut left, ctx);
         push_automations(&mut left, ctx, &self.automations);
-        if ctx.background_waiting {
-            left.push(Span::styled(
-                BACKGROUND_WAITING_LABEL,
-                theme::current().status_notice,
-            ));
-        }
-        push_retry(&mut left, ctx, Instant::now());
-        push_questions(&mut left, ctx);
-        push_decisions_status(&mut left, ctx);
-        push_account(&mut left, ctx);
-        push_config_problems(&mut left, ctx);
-        push_trust_review(&mut left, ctx);
+        let pair = model_pair(ctx);
+        let floor = floor_fit(None).width(ctx, &SpendText::new(&ctx.stats), pair.as_deref(), None);
+        let messages = self.messages(ctx, right_budget(area.width, &left).saturating_sub(floor));
+        left.append(messages.text);
+        left.append(messages.alerts);
         shorten_mode(&mut left, ctx, area.width, false);
-        let right = match ctx.status {
-            Status::Error { message, .. } => {
-                left.push(error_span(message));
-                Strip::default()
-            }
-            _ => right_side_animated(
-                ctx,
-                &self.cwd_branch,
-                right_budget(area.width, &left),
-                Some(&mut self.marquee),
-                false,
-            ),
-        };
-        if let Some(flash) = self.flash_span() {
-            left.push(flash);
-        }
+        let right = right_side_animated(
+            ctx,
+            &self.cwd_branch,
+            right_budget(area.width, &left),
+            Some(&mut self.marquee),
+            false,
+        );
         draw_row(frame, area, ctx, left, right, hits);
     }
 
@@ -1310,10 +1385,50 @@ impl StatusBar {
         draw_row(frame, area, ctx, left, right, hits);
     }
 
-    /// What the agent is doing and what it has cost. Messages land here too,
-    /// so an error, a backoff or a hovered link never takes a setting's
-    /// columns, and the meters fit whatever the activity and messages leave.
+    /// What the agent is doing and what it has cost. On a footer without a
+    /// messages row the messages land here too, between the two, so an error,
+    /// a backoff or a hovered link never takes a setting's columns. They get
+    /// what the meters leave at [`MESSAGES_FLOOR`], and the meters then fit
+    /// whatever the messages did not use.
     fn live_row(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &StatusBarContext<'_>,
+        hits: &mut Vec<StatusBarHit>,
+        with_messages: bool,
+    ) {
+        if with_messages && self.draw_hint(frame, area, ctx) {
+            return;
+        }
+        let mut activity = Strip::default();
+        activity.push(self.spinner_slot(ctx));
+        push_goal(&mut activity, ctx);
+        push_autopilot(&mut activity, ctx, area.width);
+        push_activity(&mut activity, ctx);
+        push_automations(&mut activity, ctx, &self.automations);
+        let spend = SpendText::new(&ctx.stats);
+        let width = usize::from(area.width);
+        let messages = if with_messages {
+            let floor = floor_fit(Some(Band::Live)).width(ctx, &spend, None, Some(Band::Live));
+            self.messages(ctx, width.saturating_sub(activity.width() + floor))
+        } else {
+            Messages::default()
+        };
+        let budget = width.saturating_sub(activity.width() + messages.width());
+        let (fit, _) = fit_right(ctx, &spend, None, budget, Some(Band::Live));
+        push_workflows(&mut activity, ctx, fit);
+        activity.append(messages.text);
+        activity.append(messages.alerts);
+        let mut meters = Strip::default();
+        push_meters(&mut meters, ctx, fit, &spend);
+        draw_row(frame, area, ctx, activity, meters, hits);
+    }
+
+    /// What the session has to say: what happened on the left, what waits on
+    /// the user on the right. Nothing else shares the row, so the meters
+    /// above never give up a column to it.
+    fn messages_row(
         &mut self,
         frame: &mut Frame,
         area: Rect,
@@ -1323,40 +1438,22 @@ impl StatusBar {
         if self.draw_hint(frame, area, ctx) {
             return;
         }
-        let mut activity = Strip::default();
-        activity.push(self.spinner_slot(ctx));
-        push_goal(&mut activity, ctx);
-        push_autopilot(&mut activity, ctx, area.width);
-        push_activity(&mut activity, ctx);
-        push_automations(&mut activity, ctx, &self.automations);
-        let mut messages = Strip::default();
-        if ctx.background_waiting {
-            messages.push(Span::styled(
-                BACKGROUND_WAITING_LABEL,
-                theme::current().status_notice,
-            ));
-        }
-        push_resume(&mut messages, ctx);
-        push_retry(&mut messages, ctx, Instant::now());
-        if let Status::Error { message, .. } = ctx.status {
-            messages.push(error_span(message));
-        }
-        if let Some(flash) = self.flash_span() {
-            messages.push(flash);
-        }
-        push_questions(&mut messages, ctx);
-        push_decisions_status(&mut messages, ctx);
-        push_account(&mut messages, ctx);
-        push_config_problems(&mut messages, ctx);
-        push_trust_review(&mut messages, ctx);
-        let spend = SpendText::new(&ctx.stats);
-        let budget = usize::from(area.width).saturating_sub(activity.width() + messages.width());
-        let (fit, _) = fit_right(ctx, &spend, None, budget, Some(Band::Live));
-        push_workflows(&mut activity, ctx, fit);
-        activity.append(messages);
-        let mut meters = Strip::default();
-        push_meters(&mut meters, ctx, fit, &spend);
-        draw_row(frame, area, ctx, activity, meters, hits);
+        let messages = self.messages(ctx, usize::from(area.width));
+        draw_row(frame, area, ctx, messages.text, messages.alerts, hits);
+    }
+
+    /// The messages laid out in `budget` columns. What folded is kept for the
+    /// overflow chip's tooltip and click.
+    fn messages<'a>(&mut self, ctx: &StatusBarContext<'a>, budget: usize) -> Messages<'a> {
+        let flash = self.flash.as_ref().map(|(message, ..)| message.clone());
+        let (messages, folded) = lay_out_messages(
+            ctx,
+            notices(ctx, flash, Instant::now()),
+            alerts(ctx),
+            budget,
+        );
+        self.folded = folded;
+        messages
     }
 
     /// A hovered link takes its row whole, unless a flash is already speaking.
@@ -1374,10 +1471,36 @@ impl StatusBar {
         true
     }
 
-    fn flash_span(&self) -> Option<Span<'static>> {
-        self.flash.as_ref().map(|(message, ..)| {
-            Span::styled(format!("{GAP}{message}"), theme::current().status_notice)
-        })
+    /// What a chip means and what a click on it does. The click line appears
+    /// only where the bar takes the click, so a task's footer never promises
+    /// one.
+    fn chip_tip(&self, target: StatusBarHitTarget, ctx: &StatusBarContext<'_>) -> Option<String> {
+        let body = match target {
+            StatusBarHitTarget::Message(MessageKind::Error) => match ctx.status {
+                Status::Error { message, .. } => message.clone(),
+                _ => return None,
+            },
+            StatusBarHitTarget::Message(MessageKind::Flash) => self.flash.as_ref()?.0.clone(),
+            StatusBarHitTarget::Overflow => self
+                .folded
+                .iter()
+                .map(|folded| folded.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => chip_body(target, ctx, &self.automations, &self.cwd_branch)?,
+        };
+        let opens = match target {
+            StatusBarHitTarget::Overflow => self
+                .overflow_target()
+                .is_some_and(|folded| clickable(ctx, folded)),
+            _ => true,
+        };
+        Some(
+            match click_tip(target).filter(|_| opens && clickable(ctx, target)) {
+                Some(click) => format!("{body}\n{click}"),
+                None => body,
+            },
+        )
     }
 
     fn spinner(&self) -> char {
@@ -1581,19 +1704,6 @@ impl<'a> Strip<'a> {
     }
 }
 
-fn push_resume(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
-    if !ctx.auto_scroll {
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::ResumeAutoScroll,
-            [Span::styled(
-                AUTO_SCROLL_PAUSED_LABEL,
-                theme::current().status_dim,
-            )],
-        );
-    }
-}
-
 fn push_goal(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
     if let Some(goal) = ctx.goal {
         let label = format!(
@@ -1676,30 +1786,6 @@ fn push_automations(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, chip: &Au
     );
 }
 
-/// The error and its countdown answer as one control, and under the pointer
-/// the countdown says what a click does instead.
-fn push_retry(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, now: Instant) {
-    let Some(retry) = ctx.retry_info else {
-        return;
-    };
-    let countdown = if clickable(ctx, StatusBarHitTarget::Retry)
-        && ctx.hovered == Some(StatusBarHitTarget::Retry)
-    {
-        RETRY_NOW_LABEL.to_owned()
-    } else {
-        let remaining = format_elapsed(retry.deadline.saturating_duration_since(now).as_secs());
-        format!(" · retrying in {remaining} (#{})", retry.attempt)
-    };
-    strip.chip(
-        ctx,
-        StatusBarHitTarget::Retry,
-        [
-            Span::styled(retry.message.clone(), theme::current().status_retry_error),
-            Span::styled(countdown, theme::current().status_retry_info),
-        ],
-    );
-}
-
 fn push_workflows(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, fit: Fit) {
     if let Some(label) = fit.workflow_label(ctx) {
         strip.padded(
@@ -1740,10 +1826,25 @@ fn push_meters(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, fit: Fit, spen
     if let Some(text) = fit.money_text(spend) {
         strip.padded(ctx, StatusBarHitTarget::Usage, &text, counters);
     }
+    if let (Some(chip), Some(label)) = (&ctx.account, fit.account_label(ctx)) {
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::Account,
+            [Span::styled(label, account_style(ctx, chip))],
+        );
+    }
 }
 
-fn error_span(message: &str) -> Span<'static> {
-    Span::styled(format!("{GAP}{message}"), theme::current().error)
+/// The tiers a row keeps however much the messages beside it have to say:
+/// every rung of `scope` short of [`MESSAGES_FLOOR`] taken.
+fn floor_fit(scope: Option<Band>) -> Fit {
+    let mut fit = Fit::FULL;
+    LADDER
+        .into_iter()
+        .filter(|step| scope.is_none_or(|band| step.band() == band))
+        .take_while(|step| *step != MESSAGES_FLOOR)
+        .for_each(|step| fit.apply(step));
+    fit
 }
 
 /// Respells the mode short when the columns that frees win back a rung past
@@ -1977,19 +2078,19 @@ fn clickable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
 fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
     matches!(
         target,
-        StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd
+        StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd | StatusBarHitTarget::Message(_)
     ) || clickable(ctx, target)
 }
 
-/// What a chip means and what a click on it does. The click line appears only
-/// where the bar takes the click, so a task's footer never promises one.
-fn chip_tip(
+/// What a chip drawn from the context means. The bar's own messages are
+/// [`StatusBar::chip_tip`]'s to word.
+fn chip_body(
     target: StatusBarHitTarget,
     ctx: &StatusBarContext<'_>,
     automations: &AutomationChip,
     cwd_branch: &str,
 ) -> Option<String> {
-    let body = match target {
+    Some(match target {
         StatusBarHitTarget::BackToMain => TIP_BACK_TO_MAIN.to_owned(),
         StatusBarHitTarget::Mode if ctx.bash_input => TIP_BASH.to_owned(),
         StatusBarHitTarget::Mode => format!("{TIP_MODE}{}", ctx.mode.full.trim()),
@@ -2055,10 +2156,7 @@ fn chip_tip(
             ctx.waiting_questions,
             leader::UNANSWERED_QUESTION.label
         ),
-    };
-    Some(match click_tip(target).filter(|_| clickable(ctx, target)) {
-        Some(click) => format!("{body}\n{click}"),
-        None => body,
+        StatusBarHitTarget::Message(_) | StatusBarHitTarget::Overflow => return None,
     })
 }
 
@@ -2082,10 +2180,12 @@ fn click_tip(target: StatusBarHitTarget) -> Option<&'static str> {
         StatusBarHitTarget::Automations => CLICK_AUTOMATIONS,
         StatusBarHitTarget::Autopilot => CLICK_AUTOPILOT,
         StatusBarHitTarget::Questions => CLICK_QUESTIONS,
+        StatusBarHitTarget::Overflow => CLICK_OVERFLOW,
         StatusBarHitTarget::BackToMain
         | StatusBarHitTarget::ChatName
         | StatusBarHitTarget::Cwd
-        | StatusBarHitTarget::ResumeAutoScroll => return None,
+        | StatusBarHitTarget::ResumeAutoScroll
+        | StatusBarHitTarget::Message(_) => return None,
     })
 }
 
@@ -2119,39 +2219,13 @@ fn usage_tip(stats: &UsageStats) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// A control rather than a label: `/decisions` names what the engine last
-/// failed on, so an unreachable endpoint draws as a warning.
-fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if let Some(chip) = &ctx.decisions {
-        let style = match chip.offline {
-            true => theme::current().tool_warning,
-            false => control_style(ctx, StatusBarHitTarget::Decisions),
-        };
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::Decisions,
-            [Span::styled(
-                format!("{DECISIONS_PREFIX}{}{DECISIONS_SUFFIX}", chip.endpoint),
-                style,
-            )],
-        );
-    }
-}
-
 /// A control rather than a label: the click opens `/accounts`. An account
 /// running low draws as a warning, a spent one as an error.
-fn push_account(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if let Some(chip) = &ctx.account {
-        let style = match chip.tier {
-            AccountTier::Healthy => control_style(ctx, StatusBarHitTarget::Account),
-            AccountTier::Low => theme::current().tool_warning,
-            AccountTier::Spent => theme::current().error,
-        };
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::Account,
-            [Span::styled(account_label(chip), style)],
-        );
+fn account_style(ctx: &StatusBarContext<'_>, chip: &AccountChip<'_>) -> Style {
+    match chip.tier {
+        AccountTier::Healthy => control_style(ctx, StatusBarHitTarget::Account),
+        AccountTier::Low => theme::current().tool_warning,
+        AccountTier::Spent => theme::current().error,
     }
 }
 
@@ -2175,32 +2249,6 @@ fn account_tip(chip: &AccountChip<'_>) -> String {
     tip
 }
 
-/// A control rather than a label: the click docks the oldest question.
-fn push_questions(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if ctx.waiting_questions > 0 {
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::Questions,
-            [Span::styled(
-                format!("[{QUESTIONS_MARK} {}]", ctx.waiting_questions),
-                theme::current().tool_warning,
-            )],
-        );
-    }
-}
-
-/// A control rather than a label: the click flashes each file's error and
-/// what the session does without it, which the chip has no room to say.
-fn push_config_problems(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if let Some(label) = config_problems_label(ctx.config_problems) {
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::ConfigProblems,
-            [Span::styled(label, theme::current().error)],
-        );
-    }
-}
-
 fn config_problems_label(problems: &[ConfigProblem]) -> Option<String> {
     match problems {
         [] => None,
@@ -2209,15 +2257,345 @@ fn config_problems_label(problems: &[ConfigProblem]) -> Option<String> {
     }
 }
 
-/// A control rather than a label: the click opens the picker that decides.
-fn push_trust_review(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if let Some(label) = ctx.pending_trust.label() {
-        strip.chip(
-            ctx,
-            StatusBarHitTarget::TrustReview,
-            [Span::styled(label, theme::current().tool_warning)],
-        );
+/// The messages as one budget laid them out: what happened on the left, the
+/// chips that wait on the user on the right.
+#[derive(Default)]
+struct Messages<'a> {
+    text: Strip<'a>,
+    alerts: Strip<'a>,
+}
+
+impl Messages<'_> {
+    fn width(&self) -> usize {
+        self.text.width() + self.alerts.width()
     }
+}
+
+/// One message, and how it gives way once its row runs short.
+struct Notice<'a> {
+    /// The control it draws as, or `None` for plain text.
+    target: Option<StatusBarHitTarget>,
+    text: Cow<'a, str>,
+    style: Style,
+    /// Kept whole when the text is cut, as a retry keeps its countdown.
+    tail: Option<Span<'a>>,
+    give: Give,
+}
+
+/// What a message does once its whole width no longer fits.
+#[derive(Debug, Clone, Copy)]
+enum Give {
+    /// Cut in the middle, so both what happened and the remedy a message ends
+    /// on survive, and drawn as a control that reads it whole under the
+    /// pointer.
+    Cut(StatusBarHitTarget),
+    /// Respelled shorter.
+    Short(&'static str),
+    /// Folded whole: a chip's label is already the least it can say.
+    Fold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Whole,
+    Cut {
+        columns: usize,
+        target: StatusBarHitTarget,
+    },
+    Short(&'static str),
+    Folded,
+}
+
+impl<'a> Notice<'a> {
+    fn new(
+        target: Option<StatusBarHitTarget>,
+        text: impl Into<Cow<'a, str>>,
+        style: Style,
+        give: Give,
+    ) -> Self {
+        Self {
+            target,
+            text: text.into(),
+            style,
+            tail: None,
+            give,
+        }
+    }
+
+    /// An alert: a control whose label is the least it can say.
+    fn chip(target: StatusBarHitTarget, label: impl Into<Cow<'a, str>>, style: Style) -> Self {
+        Self::new(Some(target), label, style, Give::Fold)
+    }
+
+    fn fixed_width(&self) -> usize {
+        GAP.width() + self.tail.as_ref().map_or(0, Span::width)
+    }
+
+    fn width(&self) -> usize {
+        self.fixed_width() + self.text.width()
+    }
+
+    /// The fewest columns it can be drawn in at all.
+    fn min_width(&self) -> usize {
+        let least = match self.give {
+            Give::Cut(_) => self.fixed_width() + MESSAGE_MIN_WIDTH,
+            Give::Short(short) => self.fixed_width() + short.width(),
+            Give::Fold => self.width(),
+        };
+        least.min(self.width())
+    }
+
+    /// Takes the columns it is drawn in out of `room`.
+    fn place(&self, room: &mut usize) -> Placement {
+        let (placement, width) = match self.give {
+            _ if self.width() <= *room => (Placement::Whole, self.width()),
+            Give::Cut(target) if self.min_width() <= *room => (
+                Placement::Cut {
+                    columns: *room - self.fixed_width(),
+                    target,
+                },
+                *room,
+            ),
+            Give::Short(short) if self.min_width() <= *room => {
+                (Placement::Short(short), self.min_width())
+            }
+            Give::Cut(_) | Give::Short(_) | Give::Fold => return Placement::Folded,
+        };
+        *room -= width;
+        placement
+    }
+
+    /// Draws it as placed, or hands it back folded.
+    fn draw(
+        self,
+        strip: &mut Strip<'a>,
+        ctx: &StatusBarContext<'_>,
+        placement: Placement,
+    ) -> Option<Folded> {
+        let (text, target) = match placement {
+            Placement::Whole => (self.text, self.target),
+            Placement::Cut { columns, target } => {
+                (Cow::Owned(clip_middle(&self.text, columns)), Some(target))
+            }
+            Placement::Short(short) => (Cow::Borrowed(short), self.target),
+            Placement::Folded => {
+                let tail = self.tail.as_ref().map_or("", |tail| tail.content.as_ref());
+                return Some(Folded {
+                    text: format!("{}{tail}", self.text),
+                    target: self.target,
+                });
+            }
+        };
+        let spans = std::iter::once(Span::styled(text, self.style)).chain(self.tail);
+        match target {
+            Some(target) => strip.chip(ctx, target, spans),
+            None => {
+                strip.push(Span::raw(GAP));
+                spans.for_each(|span| strip.push(span));
+            }
+        }
+        None
+    }
+}
+
+/// What happened, most urgent first: a failure, a backoff, a flash, then the
+/// states that only explain the spinner or a transcript gone still.
+fn notices<'a>(ctx: &StatusBarContext<'a>, flash: Option<String>, now: Instant) -> Vec<Notice<'a>> {
+    let mut notices = Vec::new();
+    if let Status::Error { message, .. } = ctx.status {
+        notices.push(Notice::new(
+            None,
+            message.as_str(),
+            theme::current().error,
+            Give::Cut(StatusBarHitTarget::Message(MessageKind::Error)),
+        ));
+    }
+    if let Some(retry) = ctx.retry_info {
+        notices.push(retry_notice(ctx, retry, now));
+    }
+    if let Some(flash) = flash {
+        notices.push(Notice::new(
+            None,
+            flash,
+            theme::current().status_notice,
+            Give::Cut(StatusBarHitTarget::Message(MessageKind::Flash)),
+        ));
+    }
+    if ctx.background_waiting {
+        notices.push(Notice::new(
+            None,
+            BACKGROUND_WAITING_LABEL,
+            theme::current().status_notice,
+            Give::Short(BACKGROUND_WAITING_SHORT_LABEL),
+        ));
+    }
+    if !ctx.auto_scroll {
+        notices.push(Notice::chip(
+            StatusBarHitTarget::ResumeAutoScroll,
+            AUTO_SCROLL_PAUSED_LABEL,
+            theme::current().status_dim,
+        ));
+    }
+    notices
+}
+
+/// The error and its countdown answer as one control, and under the pointer
+/// the countdown says what a click does instead. A cut takes the error and
+/// leaves the countdown.
+fn retry_notice<'a>(ctx: &StatusBarContext<'_>, retry: &'a RetryInfo, now: Instant) -> Notice<'a> {
+    let countdown = if clickable(ctx, StatusBarHitTarget::Retry)
+        && ctx.hovered == Some(StatusBarHitTarget::Retry)
+    {
+        RETRY_NOW_LABEL.to_owned()
+    } else {
+        let remaining = format_elapsed(retry.deadline.saturating_duration_since(now).as_secs());
+        format!(" · retrying in {remaining} (#{})", retry.attempt)
+    };
+    Notice {
+        tail: Some(Span::styled(countdown, theme::current().status_retry_info)),
+        ..Notice::new(
+            Some(StatusBarHitTarget::Retry),
+            retry.message.as_str(),
+            theme::current().status_retry_error,
+            Give::Cut(StatusBarHitTarget::Retry),
+        )
+    }
+}
+
+/// What waits on the user, most urgent first: config the session runs
+/// without, config waiting for trust, questions, then the decision endpoint.
+/// Each is a control: the click flashes a file's error, opens the review,
+/// docks the oldest question, or opens `/decisions`.
+fn alerts<'a>(ctx: &StatusBarContext<'a>) -> Vec<Notice<'a>> {
+    let mut alerts = Vec::new();
+    if let Some(label) = config_problems_label(ctx.config_problems) {
+        alerts.push(Notice::chip(
+            StatusBarHitTarget::ConfigProblems,
+            label,
+            theme::current().error,
+        ));
+    }
+    if let Some(label) = ctx.pending_trust.label() {
+        alerts.push(Notice::chip(
+            StatusBarHitTarget::TrustReview,
+            label,
+            theme::current().tool_warning,
+        ));
+    }
+    if ctx.waiting_questions > 0 {
+        alerts.push(Notice::chip(
+            StatusBarHitTarget::Questions,
+            format!("[{QUESTIONS_MARK} {}]", ctx.waiting_questions),
+            theme::current().tool_warning,
+        ));
+    }
+    if let Some(chip) = &ctx.decisions {
+        let style = match chip.offline {
+            true => theme::current().tool_warning,
+            false => control_style(ctx, StatusBarHitTarget::Decisions),
+        };
+        alerts.push(Notice::chip(
+            StatusBarHitTarget::Decisions,
+            format!("{DECISIONS_PREFIX}{}{DECISIONS_SUFFIX}", chip.endpoint),
+            style,
+        ));
+    }
+    alerts
+}
+
+/// Where each side's messages landed.
+struct Placed {
+    notices: Vec<Placement>,
+    alerts: Vec<Placement>,
+}
+
+impl Placed {
+    /// The alerts take their columns first, short of what the most urgent
+    /// notice needs at its narrowest, and the notices fill what is left in
+    /// order: whole, else cut or respelled, else folded.
+    fn new(notices: &[Notice<'_>], alerts: &[Notice<'_>], budget: usize) -> Self {
+        let reserved = notices.first().map_or(0, Notice::min_width).min(budget);
+        let mut room = budget - reserved;
+        let alerts = alerts.iter().map(|alert| alert.place(&mut room)).collect();
+        room += reserved;
+        let notices = notices
+            .iter()
+            .map(|notice| notice.place(&mut room))
+            .collect();
+        Self { notices, alerts }
+    }
+
+    fn folds(&self) -> bool {
+        self.notices
+            .iter()
+            .chain(&self.alerts)
+            .any(|placement| *placement == Placement::Folded)
+    }
+}
+
+/// Lays the messages out in `budget` columns. Once anything folds, `[+N]`
+/// holds its own columns back and the rest is laid out again around it. The
+/// chip is drawn even past a budget too small for it, so a row that had no
+/// room for an error still says one is waiting.
+fn lay_out_messages<'a>(
+    ctx: &StatusBarContext<'_>,
+    notices: Vec<Notice<'a>>,
+    alerts: Vec<Notice<'a>>,
+    budget: usize,
+) -> (Messages<'a>, Vec<Folded>) {
+    let mut placed = Placed::new(&notices, &alerts, budget);
+    let overflow_width = GAP.width() + overflow_label(notices.len() + alerts.len()).width();
+    if placed.folds() {
+        placed = Placed::new(&notices, &alerts, budget.saturating_sub(overflow_width));
+    }
+    let mut messages = Messages::default();
+    let mut folded: Vec<Folded> = notices
+        .into_iter()
+        .zip(placed.notices)
+        .filter_map(|(notice, placement)| notice.draw(&mut messages.text, ctx, placement))
+        .collect();
+    folded.extend(
+        alerts
+            .into_iter()
+            .zip(placed.alerts)
+            .filter_map(|(alert, placement)| alert.draw(&mut messages.alerts, ctx, placement)),
+    );
+    if folded.is_empty() {
+        return (messages, folded);
+    }
+    messages.alerts.chip(
+        ctx,
+        StatusBarHitTarget::Overflow,
+        [Span::styled(
+            overflow_label(folded.len()),
+            control_style(ctx, StatusBarHitTarget::Overflow),
+        )],
+    );
+    (messages, folded)
+}
+
+fn overflow_label(count: usize) -> String {
+    format!("{OVERFLOW_PREFIX}{count}{OVERFLOW_SUFFIX}")
+}
+
+/// `s` in `max_width` columns, its middle given up for an ellipsis.
+fn clip_middle(s: &str, max_width: usize) -> String {
+    let room = max_width.saturating_sub(ELLIPSIS.width());
+    let head = graphemes_within(s.graphemes(true), room.div_ceil(2));
+    let tail = graphemes_within(s.graphemes(true).rev(), room / 2);
+    format!("{}{ELLIPSIS}{}", &s[..head], &s[s.len() - tail..])
+}
+
+/// The bytes the leading `graphemes` fill `columns` with.
+fn graphemes_within<'s>(graphemes: impl Iterator<Item = &'s str>, columns: usize) -> usize {
+    let mut used = 0;
+    graphemes
+        .take_while(|grapheme| {
+            used += grapheme.width();
+            used <= columns
+        })
+        .map(str::len)
+        .sum()
 }
 
 fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Style {
@@ -3618,8 +3996,8 @@ mod tests {
         );
     }
 
-    /// An error ends in the remedy that clears it, so it is never cut short,
-    /// and the columns it takes come out of the live row alone.
+    /// An error ends in the remedy that clears it, so a row with room draws it
+    /// whole, and the columns it takes come out of the live row alone.
     #[test]
     fn an_error_leaves_the_settings_row_whole() {
         let status = Status::error(ERROR_MESSAGE.into());
@@ -5392,15 +5770,13 @@ mod tests {
             ..Default::default()
         }
         .into_ctx();
-        let mut strip = Strip::default();
+        let notice = retry_notice(&ctx, &retry, now + elapsed);
 
-        push_retry(&mut strip, &ctx, now + elapsed);
-
-        let text: String = strip
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
+        let text = format!(
+            "{}{}",
+            notice.text,
+            notice.tail.expect(MISSING_HIT_MSG).content
+        );
         assert!(text.contains(RETRY_MESSAGE));
         assert!(text.contains(&format!(
             "{RETRY_COUNTDOWN_PREFIX} {expected} {RETRY_ATTEMPT_MARK}"
@@ -5603,7 +5979,9 @@ mod tests {
 
     fn tip_for(target: StatusBarHitTarget, fixture: Fixture<'_>) -> String {
         let ctx = fixture.into_ctx();
-        chip_tip(target, &ctx, &AutomationChip::default(), TIP_CWD).expect(TIP_MISSING)
+        StatusBar::new(FLASH_TTL, TIP_CWD, true)
+            .chip_tip(target, &ctx)
+            .expect(TIP_MISSING)
     }
 
     #[test_case(StatusBarHitTarget::Model, true, &[MODEL_ID], Some(CLICK_MODEL); "model_on_main")]
@@ -5747,5 +6125,272 @@ mod tests {
         let tip = bar.hover_tip().expect(TIP_MISSING);
         assert_eq!(tip.key, TipKey::Status(StatusBarHitTarget::Model));
         assert_eq!(tip.anchor, Anchor::Area(hit.area));
+    }
+
+    const MESSAGES_ROW: u16 = 2;
+    const MESSAGES_BAR_WIDTH: u16 = 60;
+    /// Wide enough for the most urgent alert, the questions and `[+N]`, too
+    /// narrow for the trust review and the decisions chip between them.
+    const ALERTS_BAR_WIDTH: u16 = 50;
+    /// Too narrow for the waiting label, wide enough for its verb.
+    const WAITING_BAR_WIDTH: u16 = 20;
+    const LONG_ERROR: &str = "Stream error: the provider closed the connection before \
+        the response finished (/continue resumes the turn)";
+    const INVALID_CONFIG_FILE: &str = "caudra.toml";
+    const INVALID_CONFIG_CHIP: &str = "[caudra.toml invalid]";
+    const QUESTIONS_CHIP: &str = "[? 2]";
+    const FOLDED_CHIP: &str = "[+2]";
+    const ACCOUNT_LEFT: u8 = 41;
+    const FULL_ACCOUNT_CHIP: &str = "[auto\u{b7}personal 41%]";
+    const SHORT_ACCOUNT_CHIP: &str = "[41%]";
+    /// The live row fits the context share, the price and `[41%]`, not the
+    /// account's name.
+    const SHORT_ACCOUNT_WIDTH: u16 = 25;
+    /// The live row fits the context share and the price alone.
+    const NO_ACCOUNT_WIDTH: u16 = 12;
+    const METERS_MOVED_MSG: &str = "a message on its own row moved a meter";
+    const CUT_MISSING_MSG: &str = "a message too long for its row must be cut in the middle";
+    const CUT_TIP_MSG: &str = "a cut message must read whole under the pointer";
+    const URGENT_ALERT_MSG: &str = "the most urgent alert must keep its columns";
+    const FOLDED_MSG: &str = "alerts with no room must fold into a chip that counts them";
+    const FOLDED_TIP_MSG: &str = "the overflow chip must name what it folded";
+    const FOLDED_CLICK_MSG: &str = "a click on the overflow chip must open the first folded alert";
+    const FLOOR_MSG: &str = "a message must not cost a meter its compact tier";
+    const WAITING_SHORT_MSG: &str = "a crowded row must keep the waiting label's verb";
+    const ACCOUNT_TIER_MSG: &str =
+        "the account must give up its name, then itself, before the price";
+
+    #[test_case(19, SINGLE_ROW ; "short")]
+    #[test_case(20, SPLIT_ROWS ; "split")]
+    #[test_case(29, SPLIT_ROWS ; "just_short_of_messages")]
+    #[test_case(30, THREE_ROWS ; "messages")]
+    fn the_footer_grows_a_row_at_each_threshold(terminal_rows: u16, expected: u16) {
+        assert_eq!(height(terminal_rows), expected);
+    }
+
+    #[test]
+    fn messages_on_their_own_row_never_move_a_meter() {
+        let status = Status::error(LONG_ERROR.into());
+        let problems = [config_problem(INVALID_CONFIG_FILE)];
+        let quiet = render_fixture(
+            Fixture {
+                width: MESSAGES_BAR_WIDTH,
+                ..Default::default()
+            },
+            THREE_ROWS,
+        );
+        let loud = render_fixture(
+            Fixture {
+                width: MESSAGES_BAR_WIDTH,
+                status: &status,
+                config_problems: &problems,
+                waiting_questions: 2,
+                decisions: decisions_chip(true),
+                ..Default::default()
+            },
+            THREE_ROWS,
+        );
+
+        assert!(
+            loud.row(MESSAGES_ROW).contains(ELLIPSIS),
+            "{CUT_MISSING_MSG}: {}",
+            loud.row(MESSAGES_ROW)
+        );
+        for row in [SETTINGS_ROW, LIVE_ROW] {
+            assert_eq!(loud.row(row), quiet.row(row), "{METERS_MOVED_MSG}");
+            assert_eq!(loud.hits_on(row), quiet.hits_on(row), "{METERS_MOVED_MSG}");
+        }
+    }
+
+    /// The middle goes, so both what failed and the remedy stay on screen.
+    #[test]
+    fn a_cut_error_keeps_both_ends_and_reads_whole_under_the_pointer() {
+        let status = Status::error(LONG_ERROR.into());
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let target = StatusBarHitTarget::Message(MessageKind::Error);
+        let ctx = Fixture {
+            width: MESSAGES_BAR_WIDTH,
+            status: &status,
+            hovered: Some(target),
+            ..Default::default()
+        }
+        .into_ctx();
+
+        let drawn = draw_bar(&mut bar, &ctx, MESSAGES_BAR_WIDTH, THREE_ROWS);
+        let glyphs = drawn.glyphs(drawn.hit(target));
+
+        let (head, tail) = glyphs.split_once(ELLIPSIS).expect(CUT_MISSING_MSG);
+        assert!(
+            LONG_ERROR.starts_with(head) && LONG_ERROR.ends_with(tail) && !tail.is_empty(),
+            "{CUT_MISSING_MSG}: {glyphs}"
+        );
+        assert_eq!(bar.hover_tip().expect(CUT_TIP_MSG).text, LONG_ERROR);
+    }
+
+    #[test]
+    fn alerts_without_room_fold_into_a_chip_that_counts_them() {
+        let problems = [config_problem(INVALID_CONFIG_FILE)];
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let ctx = Fixture {
+            width: ALERTS_BAR_WIDTH,
+            config_problems: &problems,
+            pending_trust: PendingTrust {
+                permissions: true,
+                mcp: true,
+            },
+            waiting_questions: 2,
+            decisions: decisions_chip(false),
+            hovered: Some(StatusBarHitTarget::Overflow),
+            ..Default::default()
+        }
+        .into_ctx();
+
+        let drawn = draw_bar(&mut bar, &ctx, ALERTS_BAR_WIDTH, THREE_ROWS);
+        let row = drawn.row(MESSAGES_ROW);
+
+        assert!(
+            row.contains(INVALID_CONFIG_CHIP),
+            "{URGENT_ALERT_MSG}: {row}"
+        );
+        assert!(row.contains(QUESTIONS_CHIP), "{FOLDED_MSG}: {row}");
+        assert_eq!(
+            drawn.glyphs(drawn.hit(StatusBarHitTarget::Overflow)),
+            FOLDED_CHIP,
+            "{FOLDED_MSG}: {row}"
+        );
+        let tip = bar.hover_tip().expect(FOLDED_TIP_MSG).text;
+        for folded in [REVIEW_BOTH_LABEL, DECISIONS_CHIP] {
+            assert!(
+                !row.contains(folded) && tip.contains(folded),
+                "{FOLDED_TIP_MSG}: {tip}"
+            );
+        }
+        assert!(tip.ends_with(CLICK_OVERFLOW), "{FOLDED_TIP_MSG}: {tip}");
+        assert_eq!(
+            bar.overflow_target(),
+            Some(StatusBarHitTarget::TrustReview),
+            "{FOLDED_CLICK_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_hovered_link_takes_the_messages_row_only() {
+        let plain = render_fixture(Fixture::default(), THREE_ROWS);
+        let hovering = render_fixture(
+            Fixture {
+                hover_hint: Some(HOVERED_URL),
+                ..Default::default()
+            },
+            THREE_ROWS,
+        );
+
+        assert_eq!(
+            hovering.row(MESSAGES_ROW).trim(),
+            HOVERED_URL,
+            "{HINT_MISSING_MSG}"
+        );
+        for row in [SETTINGS_ROW, LIVE_ROW] {
+            assert_eq!(hovering.row(row), plain.row(row), "{HINT_SPREAD_MSG}");
+            assert_eq!(
+                hovering.hits_on(row),
+                plain.hits_on(row),
+                "{HINT_SPREAD_MSG}"
+            );
+        }
+    }
+
+    /// Without a row of their own the messages share one with the meters, and
+    /// get only what the meters leave at their compact tiers.
+    #[test_case(SPLIT_ROWS ; "split")]
+    #[test_case(SINGLE_ROW ; "single")]
+    fn a_long_error_never_costs_a_meter_its_compact_tier(rows: u16) {
+        let status = Status::error(LONG_ERROR.into());
+        let drawn = render_fixture(
+            Fixture {
+                width: SPLIT_BAR_WIDTH,
+                status: &status,
+                ..Default::default()
+            },
+            rows,
+        );
+        let row = drawn.row(rows - 1);
+
+        assert!(
+            row.contains(PERCENT_MARK) && row.contains(CHAT_COST_TEXT),
+            "{FLOOR_MSG}: {row}"
+        );
+        assert!(
+            drawn
+                .glyphs(drawn.hit(StatusBarHitTarget::Message(MessageKind::Error)))
+                .contains(ELLIPSIS),
+            "{CUT_MISSING_MSG}: {row}"
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_room_for_an_error_still_counts_it() {
+        let status = Status::error(LONG_ERROR.into());
+        let goal = active_goal();
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let ctx = Fixture {
+            width: MESSAGES_BAR_WIDTH,
+            status: &status,
+            goal: Some(&goal),
+            active_tasks: 2,
+            hovered: Some(StatusBarHitTarget::Overflow),
+            ..Default::default()
+        }
+        .into_ctx();
+
+        let drawn = draw_bar(&mut bar, &ctx, MESSAGES_BAR_WIDTH, SINGLE_ROW);
+
+        assert_eq!(
+            drawn.glyphs(drawn.hit(StatusBarHitTarget::Overflow)),
+            overflow_label(1),
+            "{FOLDED_MSG}: {}",
+            drawn.row(SETTINGS_ROW)
+        );
+        assert_eq!(bar.hover_tip().expect(FOLDED_TIP_MSG).text, LONG_ERROR);
+    }
+
+    #[test]
+    fn a_crowded_row_keeps_the_waiting_labels_verb() {
+        let drawn = render_fixture(
+            Fixture {
+                width: WAITING_BAR_WIDTH,
+                background_waiting: true,
+                ..Default::default()
+            },
+            THREE_ROWS,
+        );
+        let row = drawn.row(MESSAGES_ROW);
+
+        assert!(
+            row.contains(BACKGROUND_WAITING_SHORT_LABEL) && !row.contains(BACKGROUND_WAITING_LABEL),
+            "{WAITING_SHORT_MSG}: {row}"
+        );
+    }
+
+    #[test_case(BAR_WIDTH, Some(FULL_ACCOUNT_CHIP) ; "named")]
+    #[test_case(SHORT_ACCOUNT_WIDTH, Some(SHORT_ACCOUNT_CHIP) ; "share")]
+    #[test_case(NO_ACCOUNT_WIDTH, None ; "dropped")]
+    fn the_account_gives_way_before_the_price(width: u16, expected: Option<&str>) {
+        let drawn = render_rows(Fixture {
+            width,
+            account: Some(account_chip(true, Some(ACCOUNT_LEFT), AccountTier::Healthy)),
+            ..Default::default()
+        });
+        let row = drawn.row(LIVE_ROW);
+
+        assert!(row.contains(CHAT_COST_TEXT), "{ACCOUNT_TIER_MSG}: {row}");
+        assert_eq!(
+            drawn
+                .hits_on(LIVE_ROW)
+                .into_iter()
+                .find(|hit| hit.target == StatusBarHitTarget::Account)
+                .map(|hit| drawn.glyphs(hit)),
+            expected.map(str::to_owned),
+            "{ACCOUNT_TIER_MSG}: {row}"
+        );
     }
 }

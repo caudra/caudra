@@ -72,8 +72,8 @@ const MAX_HEIGHT_PERCENT: u16 = 75;
 /// The form wraps the answer box itself, so a painted line is never clipped.
 const UNCLIPPED: usize = usize::MAX;
 const LINE_BREAK: &str = "\n";
-const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
-const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
+const ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask /btw");
+const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask");
 /// Every bar but consent's opens on what `Enter` does, then Ask.
 const ASK_HINT_INDEX: usize = 1;
 const NOTE_HINT: Hint = Hint::bind(key::QUESTION_NOTE, "note");
@@ -488,7 +488,7 @@ impl QuestionForm {
         {
             return QuestionFormAction::CopySelection(text);
         }
-        if key::QUESTION_ASK_BTW.matches(key) && !self.is_consent() {
+        if key::ASK_BTW.matches(key) && !self.is_consent() {
             self.hover = None;
             self.mouse_down = None;
             return QuestionFormAction::AskBtw;
@@ -3066,7 +3066,7 @@ mod tests {
             )
         };
         let before = state(&form);
-        let index = hint_index(&form, key::QUESTION_ASK_BTW);
+        let index = hint_index(&form, key::ASK_BTW);
         let action = if footer {
             let (column, row) = target_cell(&form, FormTarget::Hint(index));
             form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
@@ -3080,7 +3080,7 @@ mod tests {
         } else {
             form.hover = Some(FormTarget::Hint(index));
             form.mouse_down = form.hover;
-            form.handle_key(key::QUESTION_ASK_BTW.to_key_event())
+            form.handle_key(key::ASK_BTW.to_key_event())
         };
         assert!(matches!(action, QuestionFormAction::AskBtw));
         assert_eq!(state(&form), before);
@@ -3155,7 +3155,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             let area = Rect::new(0, 0, width, TERMINAL_HEIGHT);
             terminal.draw(|frame| form.view(frame, area)).unwrap();
-            let index = hint_index(&form, key::QUESTION_ASK_BTW);
+            let index = hint_index(&form, key::ASK_BTW);
             let hit = hit_area(&form, FormTarget::Hint(index));
             let text: String = (hit.x..hit.right())
                 .map(|x| terminal.backend().buffer()[(x, hit.y)].symbol())
@@ -3210,7 +3210,7 @@ mod tests {
         let mut form = QuestionForm::new();
         assert!(form.clarification_context().is_empty());
         assert!(matches!(
-            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            form.handle_key(key::ASK_BTW.to_key_event()),
             QuestionFormAction::Consumed
         ));
     }
@@ -3570,7 +3570,7 @@ mod tests {
         }
         assert!(offers(&form, key::QUESTION_DECLINE).is_some());
         assert!(matches!(
-            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            form.handle_key(key::ASK_BTW.to_key_event()),
             QuestionFormAction::Consumed
         ));
         assert!(matches!(
@@ -3662,7 +3662,7 @@ mod tests {
         form.mode = mode;
         form.editing_note = editing_note;
         assert_eq!(offers(&form, key::ENTER), Some(0));
-        assert_eq!(offers(&form, key::QUESTION_ASK_BTW), Some(ASK_HINT_INDEX));
+        assert_eq!(offers(&form, key::ASK_BTW), Some(ASK_HINT_INDEX));
         let note = offers(&form, key::QUESTION_NOTE);
         assert_eq!(note, (!editing_note).then_some(ASK_HINT_INDEX + 1));
     }
@@ -3671,7 +3671,7 @@ mod tests {
     fn a_server_field_leads_with_enter_too() {
         let form = asked_by_server(vec![note_question()]);
         assert_eq!(offers(&form, key::ENTER), Some(0));
-        assert_eq!(offers(&form, key::QUESTION_ASK_BTW), Some(ASK_HINT_INDEX));
+        assert_eq!(offers(&form, key::ASK_BTW), Some(ASK_HINT_INDEX));
     }
 
     #[test_case(Mode::Selecting ; "selecting")]
@@ -3743,7 +3743,7 @@ mod tests {
     fn asking_keeps_the_open_note() {
         let mut form = noting(vec![question(HEADER, false)]);
         assert!(matches!(
-            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            form.handle_key(key::ASK_BTW.to_key_event()),
             QuestionFormAction::AskBtw
         ));
         assert!(form.editing_note);

@@ -7,6 +7,8 @@ description: "Defaults, precedence, rebinding from Lua."
 
 Leader chords are written as two keys below, and every one of them is reachable on any terminal: Caudra ships no `Alt` defaults, because macOS routes Option through the input method and never reports it as Alt.
 
+`F1` lists these bindings. Press `/` there to filter them by key, action, or section. The list writes modifiers as symbols: `⌃` for `Ctrl`, `⇧` for `Shift`, `⌥` for `Alt`, and `⌘` for `Super`. The filter finds a key by either spelling.
+
 ## Focus
 
 `PageUp`, `PageDown`, `Home`, and `End` act on whatever holds the keyboard. While you are typing they belong to the composer, so `Home` and `End` move the text cursor and the page keys scroll a draft too tall to fit. When the draft fits, a page key scrolls the transcript and hands it the focus, so `Home` and `End` then reach the top and bottom of the chat.
@@ -31,6 +33,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X` | Leader: lists the chords below, then runs the one you press |
 | `F1` / `Ctrl+X ?` | Show keybindings |
 | `F1` | In a modal with a ? on its border: open its docs above it |
+| `F2` | Ask a /btw side question about this chat |
 | `Ctrl+F` | Search this chat or past sessions |
 | `Ctrl+X y` | Copy last reply as markdown |
 | `Ctrl+X r` | Review the last reply |
