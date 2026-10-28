@@ -26,6 +26,7 @@ const HOUR_MS: u64 = 60 * 60 * 1000;
 const LONG_WAIT: Duration = Duration::from_secs(120);
 const SHORT_WAIT: Duration = Duration::from_secs(10);
 const REFUSED: &str = "refused";
+const FREE_USAGE_EXHAUSTED: &str = r#"{"code":"subscription:free-usage-exhausted"}"#;
 const HOME_SLUG: &str = "test-home";
 const AWAY_SLUG: &str = "test-away";
 const HOME_MODEL: &str = "test-home/claude-opus-4-8";
@@ -341,6 +342,104 @@ fn rate_limits_switch_only_when_the_wait_is_long(wait: Duration, expected: Failo
         (failover, harness.last_served()),
         (expected, next.to_owned())
     );
+}
+
+#[test_case(AccountSelection::Auto, None ; "auto_without_retry_after")]
+#[test_case(AccountSelection::Auto, Some(SHORT_WAIT) ; "auto_with_short_retry_after")]
+#[test_case(pinned(PRIMARY), None ; "pinned_without_retry_after")]
+#[test_case(pinned(PRIMARY), Some(SHORT_WAIT) ; "pinned_with_short_retry_after")]
+fn xai_free_usage_exhaustion_routes_despite_healthy_weekly_quota(
+    selection: AccountSelection,
+    retry_after: Option<Duration>,
+) {
+    let pinned = matches!(selection, AccountSelection::Pinned(_));
+    let harness = Harness::on(XAI_SLUG, &[PRIMARY, SECONDARY], selection);
+    harness.state.health.observe(
+        PRIMARY,
+        QuotaSource::Response,
+        vec![QuotaWindow::new(WindowKind::Weekly, HEALTHY_PERCENT, None)],
+        now_millis(),
+    );
+    harness.send(SESSION).unwrap();
+    let error = AgentError::Api {
+        status: STATUS_RATE_LIMITED,
+        message: FREE_USAGE_EXHAUSTED.into(),
+        retry_after,
+    };
+    assert!(!error.is_retryable());
+    let failover = harness.failover(SESSION, &error);
+    let health = harness.state.health.get(PRIMARY);
+    assert_eq!(
+        health.blocked_until,
+        Some(health.observed_at + retry_after.unwrap_or(QUOTA_STALE).as_millis() as u64)
+    );
+    assert_eq!(health.blocked_reason.as_deref(), Some(BLOCKED_RATE_LIMITED));
+    assert_eq!(health.windows[0].used_percent, HEALTHY_PERCENT);
+    assert_eq!(health.windows[0].resets_at, None);
+    if pinned {
+        let Failover::Stay {
+            exhausted: Some(exhaustion),
+        } = failover
+        else {
+            panic!("expected pinned account exhaustion");
+        };
+        assert_eq!(exhaustion.account, PRIMARY);
+        assert_eq!(exhaustion.mode, SelectionMode::Pinned);
+        assert_eq!(
+            exhaustion.until_ms,
+            retry_after.map(|wait| health.observed_at + wait.as_millis() as u64)
+        );
+        assert_eq!(exhaustion.alternatives.len(), 1);
+        assert_eq!(exhaustion.alternatives[0].name, SECONDARY);
+        assert_eq!(harness.served(), vec![PRIMARY]);
+    } else {
+        assert_eq!(failover, Failover::Switched);
+        harness.send(SESSION).unwrap();
+        assert_eq!(harness.served(), vec![PRIMARY, SECONDARY]);
+    }
+}
+
+#[test_case(AccountSelection::Auto ; "auto")]
+#[test_case(pinned(PRIMARY) ; "pinned")]
+fn lone_xai_free_usage_exhaustion_has_no_invented_refill(selection: AccountSelection) {
+    let harness = Harness::on(XAI_SLUG, &[PRIMARY], selection);
+    harness.send(SESSION).unwrap();
+    let error = AgentError::api(STATUS_RATE_LIMITED, FREE_USAGE_EXHAUSTED);
+    let Failover::Stay {
+        exhausted: Some(exhaustion),
+    } = harness.failover(SESSION, &error)
+    else {
+        panic!("expected account exhaustion");
+    };
+    assert_eq!(exhaustion.account, PRIMARY);
+    assert_eq!(exhaustion.until_ms, None);
+    assert!(exhaustion.alternatives.is_empty());
+    assert_eq!(harness.served(), vec![PRIMARY]);
+    let health = harness.state.health.get(PRIMARY);
+    assert_eq!(
+        health.blocked_until,
+        Some(health.observed_at + QUOTA_STALE.as_millis() as u64)
+    );
+    assert!(health.windows.is_empty());
+    assert!(!error.is_retryable());
+}
+
+#[test_case(XAI_SLUG, REFUSED, None ; "ordinary_xai_rate_limit")]
+#[test_case(XAI_SLUG, REFUSED, Some(SHORT_WAIT) ; "ordinary_short_xai_rate_limit")]
+#[test_case(SLUG, FREE_USAGE_EXHAUSTED, None ; "other_provider_without_wait")]
+#[test_case(SLUG, FREE_USAGE_EXHAUSTED, Some(SHORT_WAIT) ; "other_provider_short_wait")]
+fn free_usage_routing_exception_is_scoped(slug: &str, body: &str, retry_after: Option<Duration>) {
+    let harness = Harness::on(slug, &[PRIMARY, SECONDARY], AccountSelection::Auto);
+    harness.send(SESSION).unwrap();
+    let error = AgentError::Api {
+        status: STATUS_RATE_LIMITED,
+        message: body.into(),
+        retry_after,
+    };
+    assert_eq!(harness.failover(SESSION, &error), Failover::STAY);
+    assert_eq!(harness.state.health.get(PRIMARY).blocked_until, None);
+    harness.send(SESSION).unwrap();
+    assert_eq!(harness.last_served(), PRIMARY);
 }
 
 #[test]

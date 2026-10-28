@@ -15,7 +15,9 @@ use crate::components::usage_modal::UsageMouse;
 use crate::components::workflow_card::CardHit;
 use crate::components::{Action, Overlay};
 use crate::inline_image::ImageRef;
-use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
+use crate::selection::{
+    self, ContentRegion, EdgeScroll, LineBreaks, Selection, SelectionState, SelectionZone,
+};
 use caudra_agent::{CommitRef, Mention};
 use caudra_storage::sessions::PermissionMode;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -260,8 +262,18 @@ impl App {
         }
         if self.logs_modal.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            let action = self.logs_modal.handle_mouse(event);
-            self.handle_logs_action(action);
+            // A sweep owns its drag and release, so ending one over a hint or
+            // the level chip copies rather than pressing it.
+            let sweeping =
+                matches!(
+                    event.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                ) && matches!(self.selection_state, Some(SelectionState::Dragging { .. }));
+            if !sweeping {
+                let action = self.logs_modal.handle_mouse(event);
+                self.handle_logs_action(action);
+            }
+            self.sweep_text(event, self.logs_modal.text_area());
             return Vec::new();
         }
         if self.changelog_modal.is_open() && !self.permission_prompt_holds_input() {
@@ -1297,30 +1309,45 @@ impl App {
         sel: &Selection,
         render_chat: usize,
     ) {
-        let text = match sel.zone {
+        if let Some(text) = self.selection_text(buf, sel, render_chat) {
+            self.copy_labelled(&text, SELECTION_COPIED);
+        }
+        self.selection_state = None;
+    }
+
+    pub(super) fn selection_text(
+        &self,
+        buf: &ratatui::buffer::Buffer,
+        sel: &Selection,
+        render_chat: usize,
+    ) -> Option<String> {
+        match sel.zone {
             SelectionZone::Messages => {
                 let msg_area = self.msg_area();
-                self.chats[render_chat].extract_selection_text(sel, msg_area)
+                Some(self.chats[render_chat].extract_selection_text(sel, msg_area))
             }
             // The sweep tracked screen cells only to drive edge scrolling; what
             // it selected is the document's own range.
-            SelectionZone::Input => self.active_input_box().selected_text().unwrap_or_default(),
+            SelectionZone::Input => {
+                Some(self.active_input_box().selected_text().unwrap_or_default())
+            }
             SelectionZone::Overlay => {
-                let scroll = self.scroll_offset(sel.zone);
-                let Some(screen_sel) = sel.to_screen(scroll) else {
-                    self.selection_state = None;
-                    return;
-                };
+                let screen_sel = sel.to_screen(self.scroll_offset(sel.zone))?;
+                // The logs pane wraps its own rows, so only it can say which
+                // of them continue the line above.
+                let line_breaks =
+                    match self.logs_modal.is_open() && sel.area == self.logs_modal.text_area() {
+                        true => self.logs_modal.line_breaks().clone(),
+                        false => LineBreaks::default(),
+                    };
                 let regions = [ContentRegion {
                     area: sel.area,
+                    line_breaks,
                     ..Default::default()
                 }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                Some(selection::extract_selected_text(buf, &screen_sel, &regions))
             }
-        };
-
-        self.copy_labelled(&text, SELECTION_COPIED);
-        self.selection_state = None;
+        }
     }
 
     pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
@@ -1676,6 +1703,38 @@ impl App {
                 Some(actions)
             }
             _ => Some(actions),
+        }
+    }
+
+    /// Text selection for a modal that keeps the rest of its mouse. Only a
+    /// press inside `area` starts a sweep, so its bars and controls never do,
+    /// and a press anywhere else drops the one before it.
+    fn sweep_text(&mut self, event: MouseEvent, area: Rect) {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = area.contains(Position::new(event.column, event.row));
+                self.selection_state = (inside && !caudra_workbench::scroll::touch()).then(|| {
+                    SelectionState::Dragging {
+                        sel: Selection::start(
+                            event.row,
+                            event.column,
+                            area,
+                            SelectionZone::Overlay,
+                            self.scroll_offset(SelectionZone::Overlay),
+                        ),
+                        edge_scroll: None,
+                        last_drag_col: event.column,
+                    }
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.handle_drag(event.row, event.column),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
+                    self.selection_state =
+                        (!sel.is_empty()).then_some(SelectionState::PendingCopy { sel });
+                }
+            }
+            _ => {}
         }
     }
 

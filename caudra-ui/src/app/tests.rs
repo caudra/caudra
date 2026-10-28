@@ -22095,6 +22095,192 @@ fn dragging_picker_row_keeps_overlay_text_selection() {
     ));
 }
 
+mod logs_text_selection {
+    use super::{App, Msg, TEST_AREA, test_app};
+    use crate::selection::{Selection, SelectionState, SelectionZone};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+    use std::slice::from_ref;
+    use tempfile::TempDir;
+
+    const FIRST: &str = "first-record";
+    const SECOND: &str = "second-record";
+    const RECORD_HEADER: &str = "14:22:07.418  INFO   caudra::agent  ";
+    const WORDS: usize = 80;
+    const MANY: usize = 120;
+    const HINT_FILTER: &str = "filter";
+    const MISSING_TEXT: &str = "the logs fixture must render its text";
+    const NOT_SELECTED: &str = "a drag over the log text must schedule a copy";
+    const NO_SELECTION: &str = "a gesture outside the log text must not select";
+
+    fn record(message: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{{"message":"{message}"}},"target":"caudra::agent"}}"#
+        )
+    }
+
+    fn draw(app: &mut App) -> Buffer {
+        let mut terminal =
+            Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn opened(messages: &[String], wrap: bool) -> (App, TempDir, Buffer) {
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<String> = messages.iter().map(|message| record(message)).collect();
+        std::fs::write(
+            caudra_storage::log::file_path(dir.path(), 0),
+            format!("{}\n", lines.join("\n")),
+        )
+        .unwrap();
+        let mut app = test_app();
+        app.logs_modal.open_dir(dir.path());
+        if wrap {
+            app.logs_modal
+                .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        }
+        let buffer = draw(&mut app);
+        (app, dir, buffer)
+    }
+
+    /// Searched inside the modal only, so nothing drawn behind it can match.
+    fn locate(app: &App, buffer: &Buffer, text: &str) -> Position {
+        let area = app.logs_modal.area();
+        let glyphs: Vec<_> = text.chars().map(String::from).collect();
+        (area.top()..area.bottom())
+            .find_map(|row| {
+                let cells: Vec<_> = (area.left()..area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                cells
+                    .windows(glyphs.len())
+                    .position(|cells| cells == glyphs.as_slice())
+                    .map(|column| Position::new(area.left() + column as u16, row))
+            })
+            .expect(MISSING_TEXT)
+    }
+
+    fn send(app: &mut App, kind: MouseEventKind, at: Position) {
+        app.update(Msg::Mouse(MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    fn sweep(app: &mut App, from: Position, to: Position) -> Option<Selection> {
+        send(app, MouseEventKind::Down(MouseButton::Left), from);
+        send(app, MouseEventKind::Drag(MouseButton::Left), to);
+        send(app, MouseEventKind::Up(MouseButton::Left), to);
+        match app.selection_state {
+            Some(SelectionState::PendingCopy { sel }) => Some(sel),
+            _ => None,
+        }
+    }
+
+    fn copied(app: &mut App, from: Position, to: Position) -> String {
+        let sel = sweep(app, from, to).expect(NOT_SELECTED);
+        assert_eq!(sel.zone, SelectionZone::Overlay);
+        assert_eq!(sel.area, app.logs_modal.text_area());
+        let buffer = draw_without_copy(app);
+        app.selection_text(&buffer, &sel, 0).unwrap()
+    }
+
+    /// The frame a copy reads, drawn with the pending copy set aside so the
+    /// test never reaches the real clipboard.
+    fn draw_without_copy(app: &mut App) -> Buffer {
+        let pending = app.selection_state.take();
+        let buffer = draw(app);
+        app.selection_state = pending;
+        buffer
+    }
+
+    #[test]
+    fn a_sweep_across_two_records_copies_each_on_its_own_line() {
+        let (mut app, _dir, buffer) = opened(&[FIRST.to_owned(), SECOND.to_owned()], false);
+        let first = locate(&app, &buffer, FIRST);
+        let second = locate(&app, &buffer, SECOND);
+        let start = Position::new(app.logs_modal.text_area().x, first.y);
+        let end = Position::new(second.x + SECOND.len() as u16 - 1, second.y);
+
+        let text = copied(&mut app, start, end);
+
+        assert_eq!(
+            text,
+            format!("{RECORD_HEADER}{FIRST}\n{RECORD_HEADER}{SECOND}")
+        );
+    }
+
+    #[test]
+    fn a_sweep_across_a_wrapped_record_copies_the_one_line_it_was() {
+        let message = format!("{FIRST} {}", "word ".repeat(WORDS));
+        let (mut app, _dir, buffer) = opened(from_ref(&message), true);
+        let area = app.logs_modal.text_area();
+        let first = locate(&app, &buffer, FIRST);
+        let end = Position::new(area.right() - 1, area.bottom() - 1);
+
+        let text = copied(&mut app, Position::new(area.x, first.y), end);
+
+        assert!(!text.contains('\n'), "a wrap became a line break: {text}");
+        assert_eq!(text, format!("{RECORD_HEADER}{}", message.trim_end()));
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_selects_nothing() {
+        let messages: Vec<String> = (0..MANY).map(|i| format!("line-{i}")).collect();
+        let (mut app, _dir, _) = opened(&messages, false);
+        let area = app.logs_modal.text_area();
+        let bar = area.right();
+
+        let selection = sweep(
+            &mut app,
+            Position::new(bar, area.y),
+            Position::new(bar, area.bottom() - 1),
+        );
+
+        assert!(selection.is_none(), "{NO_SELECTION}");
+        assert!(app.selection_state.is_none(), "{NO_SELECTION}");
+    }
+
+    #[test]
+    fn a_sweep_from_the_footer_selects_nothing() {
+        let (mut app, _dir, _) = opened(&[FIRST.to_owned()], false);
+        let area = app.logs_modal.text_area();
+        let footer = Position::new(area.x, area.bottom() + 1);
+
+        let selection = sweep(&mut app, footer, Position::new(area.x + 4, area.y));
+
+        assert!(selection.is_none(), "{NO_SELECTION}");
+    }
+
+    #[test]
+    fn a_sweep_released_over_a_hint_copies_instead_of_pressing_it() {
+        let (mut app, _dir, buffer) = opened(&[FIRST.to_owned()], false);
+        let first = locate(&app, &buffer, FIRST);
+        let hint = locate(&app, &buffer, HINT_FILTER);
+        assert_eq!(
+            hint.y,
+            app.logs_modal.text_area().bottom(),
+            "{MISSING_TEXT}"
+        );
+
+        let selection = sweep(&mut app, first, hint);
+
+        assert!(selection.is_some(), "{NOT_SELECTED}");
+        assert!(
+            !app.logs_modal.text_input_active(),
+            "the release pressed the hint"
+        );
+    }
+}
+
 mod shell_details_scrollbar {
     use super::{App, Msg, TEST_AREA, buffer_text, test_app};
     use crate::components::shell_modal::{ShellInputs, ShellModalAction};

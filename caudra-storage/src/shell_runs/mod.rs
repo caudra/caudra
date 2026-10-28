@@ -17,7 +17,7 @@ use reading::{Reading, decode, encode};
 pub use host::HostSnapshot;
 
 /// Runs kept, newest first; older ones are pruned on every append.
-pub const MAX_SHELL_RUNS: usize = 20_000;
+pub const MAX_SHELL_RUNS: usize = 100_000;
 const APPEND_OPERATION: &str = "shell run append";
 const ELAPSED_FIELD: &str = "shell_runs.elapsed_ms";
 const OUTCOME_FIELD: &str = "shell_runs.outcome";
@@ -392,6 +392,11 @@ mod tests {
         assert_eq!(kept.len(), MAX_SHELL_RUNS);
         assert_eq!(kept.first().map(|run| run.elapsed_ms), Some(1));
         assert_eq!(kept.last(), Some(&run(last)));
+        let newest = runs.newest(NEWEST).unwrap();
+        assert_eq!(
+            elapsed(&newest),
+            ((last - NEWEST as u64 + 1)..=last).collect::<Vec<_>>()
+        );
         let stored: (u8, f64, i64) = connection
             .query_row(
                 "SELECT predicted_class, confidence, predicted_ms FROM shell_runs \

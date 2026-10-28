@@ -2489,6 +2489,44 @@ mod tests {
     }
 
     #[test]
+    fn xai_weekly_quota_and_observed_restriction_render_separately() {
+        const WEEKLY: &str = "Weekly included credits";
+        const OBSERVED: &str = "grok-4.7 free usage (observed)";
+        const DETAIL: &str = "639471/600000 tokens; exhausted at 2026-10-28T11:23:17Z; rolling 24-hour window, reset time unknown";
+        let usage = ProviderUsage {
+            plan: None,
+            limits: vec![
+                UsageLimit {
+                    label: WEEKLY.into(),
+                    percentage: Some(76),
+                    reset_at: Some(QUOTA_NOW_SECS as u64 * 1000),
+                    detail: None,
+                    window: None,
+                    length_secs: None,
+                },
+                UsageLimit {
+                    label: OBSERVED.into(),
+                    percentage: None,
+                    reset_at: None,
+                    detail: Some(DETAIL.into()),
+                    window: None,
+                    length_secs: None,
+                },
+            ],
+        };
+        let state = UsageFetchState::settled(None, Ok(Some(usage)), quota_now());
+        let lines = quota_text(&state, quota_now());
+        assert!(lines[0].contains(WEEKLY));
+        assert!(lines[0].contains("76% used"));
+        assert!(lines[0].contains("Resets"));
+        assert!(lines[1].contains(OBSERVED));
+        assert!(lines[1].contains(DETAIL));
+        assert!(!lines[1].contains("Resets"));
+        assert!(!lines[1].contains('%'));
+        assert!(lines.iter().all(|line| !line.contains(NO_USAGE_ENDPOINT)));
+    }
+
+    #[test]
     fn quota_ready_lines_include_labels_and_percentages() {
         let theme = crate::theme::current();
         let lines = quota_lines(

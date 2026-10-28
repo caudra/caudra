@@ -115,8 +115,8 @@ Autopilot answers what would otherwise wait for you, so a session keeps working 
 
 - **Engage it with one command.** `/autopilot <goal>` sets a [completion goal](https://caudra.ai/docs/commands/#completion-goals) and engages. Only you can engage it. Scripts, profiles, and the model cannot. `--autopilot` engages the session Caudra starts with.
 - **Answers what would wait for you.** A separate model call, the delegate, answers permission prompts, the `question` tool, questions asked in prose, and a plan that is ready to implement. It never runs tools, and it leaves what it cannot decide safely to you.
-- **Approvals that end with the call.** An approval covers one call and adds no rule. Protected files, `sudo`, and tools that always ask are never approved, and nothing is approved while [content screening](https://caudra.ai/docs/autopilot/#safety) has flagged the session.
-- **Budgets and a log.** An engagement ends after 100 continuations by default, and you can cap its spend and its minutes. `/autopilot log` lists every decision, what the delegate was asked, its reason, and what followed.
+- **Approvals that end with the call.** An approval covers one call and adds no rule. Protected files, `sudo`, and tools that always ask are never approved, and nothing is approved after [content screening](https://caudra.ai/docs/autopilot/#safety) flags a result or cannot screen one in full.
+- **Budgets and a log.** An engagement ends after 100 continuations by default, and you can cap its spend and its minutes. Decision calls count toward that spend. `/autopilot log` lists every decision, what the delegate was asked, its reason, and what followed.
 
 Unattended work needs a running session, for example in tmux or Herdr. Closing it stops background work, and when you [reopen the session](https://caudra.ai/docs/sessions/#resuming-after-a-restart), the main turn and its subagents resume. Shell commands are not run again. When nothing screens fetched pages, engaging autopilot [says so](https://caudra.ai/docs/autopilot/#before-you-leave-it-alone). Autopilot is delegated consent and no security boundary. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
 
@@ -128,9 +128,9 @@ Unattended work needs a running session, for example in tmux or Herdr. Closing i
 
 Caudra asks a decision model small typed questions where a judgement helps. Is this fetched page trying to instruct the agent? Which memory notes matter for this task? The answers screen what reaches the model and put what matters first.
 
-- **Screening that can withhold a result.** [Content screening](https://caudra.ai/docs/configuration/#decisions-features) reads web, MCP, and `code` output for text that tries to instruct the agent. In `advise` mode a flagged result carries a caution. In `enforce` mode the model receives a notice in its place, and you still see the result on its card.
+- **Screening that can withhold a result.** [Content screening](https://caudra.ai/docs/configuration/#decisions-features) reads web, MCP, and `code` output for text that tries to instruct the agent. In `advise` mode a flagged result carries a caution. In `enforce` mode the model receives a notice in its place, and you still see the result on its card. A result that cannot be screened in full is withheld too, and its chip says why, such as `screening timed out`.
 - **Reranking where the agent searches.** Memory search and history search keep the matches judged relevant, best first. `source_code_context` keeps the code rows that fit the task and sends no source text. Compaction keeps the results that matter to the goal, and [output pointers](https://caudra.ai/docs/configuration/#reranking) name omitted lines worth reading.
-- **Advice on every prompt.** [Permission advice](https://caudra.ai/docs/permissions/#decision-engine-advice) adds warnings to a prompt without delaying it. Auto mode turns a flagged call into a prompt, and autopilot approves nothing while screening has flagged the session.
+- **Advice on every prompt.** [Permission advice](https://caudra.ai/docs/permissions/#decision-engine-advice) adds warnings to a prompt without delaying it. Auto mode turns a flagged call into a prompt, and autopilot approves nothing while screening restricts the session.
 - **One endpoint you choose.** Add [TypeSafe Jev, OpenAI Luna, or a server of your own](https://caudra.ai/docs/providers/#decision-endpoints) in `/login`, and switch it in `/model`. A local server on a loopback address needs no key.
 
 Every feature is off until you turn it on in `/decisions`, and each needs an active decision endpoint. `shadow` mode only collects predictions. The transcript shows what each feature changed, and a decision about a tool call shows on its card. Predictions add to deterministic permission rules and can miss risks. `enforce` never grants a permission, and redaction of what is sent is best effort.
@@ -159,9 +159,9 @@ With credit to the ideas in [RTK](https://www.rtk-ai.app/docs/) and [ripwire](ht
 Subagents and long shell commands keep running while the main agent moves on, and their reports wake it when they finish. The input stays open the whole time, so you can queue the next task, guide the current run, or open any subagent and steer it.
 
 - **Subagents in the background.** A [task](https://caudra.ai/docs/sessions/#background-tasks) can run in the background while the main agent works on a separate part. Its report starts the next step at a safe boundary, with no polling.
-- **Shell calls in the background.** A long shell command can keep running in the background and report back when it ends. The footer shows that work is still running, and `/shells` lists each command with an ETA learned on your machine.
+- **Shell calls in the background.** A shell command waits up to 10 minutes. A command still running then [moves to the background](https://caudra.ai/docs/sessions/#execution-policies) without a restart, and the agent gets the output so far. The model can also start a server or a long build in the background at once. `/shells` lists each command with an ETA learned on your machine.
 - **Guide a subagent directly.** Open a running subagent from `/tasks` and type. Your guidance stays visible until the subagent reads it at its next turn boundary. When the subagent is heading the wrong way, `Ctrl+X x` [replaces its current turn](https://caudra.ai/docs/queue/#task-chats) with your message.
-- **Next, Guide, and Replace.** `Enter` queues a prompt for after the current run. `Ctrl+X g` adds guidance before the next model request, and `Ctrl+X x` stops the run and starts yours. Queued prompts stay editable.
+- **Switch models while work runs.** `/model` and `/thinking` act on the chat on screen, including a running or finished task. The request in flight finishes first. A request that waits for a retry, a rate limit, or a spent account [goes out at once on the new model](https://caudra.ai/docs/commands/#switch-models-while-work-runs).
 
 [Background tasks](https://caudra.ai/docs/sessions/#background-tasks) · [More about Background subagents and shell calls](https://caudra.ai/features/background-work/) · Watch: [Guide a running subagent](https://caudra.ai/gallery/#steer), [Work starts while the model writes](https://caudra.ai/gallery/#eager), [Clarify a question with /btw](https://caudra.ai/gallery/#btw), [Answer a question later](https://caudra.ai/gallery/#deferred)
 
@@ -219,29 +219,35 @@ The rest of a modern coding agent ships in the same binary, designed and release
 - **[Herdr and Orca](https://caudra.ai/features/hosts/).** Every session reports its state to the host and opens forks and worktrees in tabs of their own.
 - **[Tools](https://caudra.ai/features/tools/).** File, shell, and web tools whose results say what they left out.
 - **[Models and setup](https://caudra.ai/features/models/).** 17 providers, local models, and the instruction files, skills, and MCP servers you already have.
+- **[Accounts and quota](https://caudra.ai/features/accounts/).** Several subscriptions and keys per provider, and a conversation that moves before the quota runs out.
 - **[Privacy](https://caudra.ai/features/privacy/).** Your history stays on your machine, and telemetry is off unless you run a collector.
 - **[Experimental lab](https://caudra.ai/features/experimental/).** Durable workflows, VM sandboxes, and more, each off until you switch it on.
 
 [Every feature, page by page](https://caudra.ai/features/)
 
 <!-- BEGIN caudra.ai capabilities: generated by `bun run readme:snippet` in caudra/website. Edit there. -->
-## 99 capabilities, designed together.
+## 114 capabilities, designed together.
 
 *Everything in the box*
 
 Each one links to its documentation. Experimental items are marked and stay off until you switch them on.
 
 <details>
-<summary><b>Agents</b> (22)</summary>
+<summary><b>Agents</b> (27)</summary>
 
 - [Steerable subagents](https://caudra.ai/docs/commands/#tasks)
 - [Background tasks and shell jobs](https://caudra.ai/docs/sessions/#background-tasks)
+- [Shell commands that move to the background after 10 minutes](https://caudra.ai/docs/sessions/#execution-policies)
+- [A check on background shells that run long](https://caudra.ai/docs/context/#long-running-background-shells)
+- [Guidance from the main agent to its tasks](https://caudra.ai/docs/sessions/#inspect-and-control-tasks)
+- [Switch the model of a running turn or task](https://caudra.ai/docs/commands/#switch-models-while-work-runs)
 - [Next, Guide, and Replace queue](https://caudra.ai/docs/queue/)
 - [Completion goals with a log of every check](https://caudra.ai/docs/commands/#completion-goals)
 - [Goals that wait for CI and stop when stuck](https://caudra.ai/docs/commands/#completion-goals)
 - [Autopilot toward a goal](https://caudra.ai/docs/autopilot/)
 - [Replace a subagent turn from its chat](https://caudra.ai/docs/queue/#task-chats)
-- [Side questions with `/btw`](https://caudra.ai/docs/commands/#modes-and-toggles)
+- [Side questions with `/btw` and `F2`](https://caudra.ai/docs/commands/#modes-and-toggles)
+- [A summary of the session with `/catchup`](https://caudra.ai/docs/commands/#modes-and-toggles)
 - [Questions you can answer later](https://caudra.ai/docs/sessions/#deferred-questions)
 - [Notes on your answers to the agent](https://caudra.ai/docs/keybindings/#form)
 - [Task cards that list every subagent step](https://caudra.ai/docs/code/#in-the-transcript)
@@ -259,7 +265,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Tools</b> (16)</summary>
+<summary><b>Tools</b> (17)</summary>
 
 - [File read and search, with one editor per model](https://caudra.ai/docs/tools/#file-operations)
 - [File outlines with `file_index`](https://caudra.ai/docs/tools/#file_index)
@@ -277,15 +283,17 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Image generation with a ChatGPT login](https://caudra.ai/docs/code/#image-generation)
 - [Tool-call JSON repair](https://caudra.ai/docs/token-economy/#fewer-round-trips)
 - [Polling and waiting inside snippets](https://caudra.ai/docs/code/#the-python-subset)
+- [Exact decimal arithmetic in Python](https://caudra.ai/docs/code/#the-python-subset)
 
 </details>
 <details>
-<summary><b>Context</b> (12)</summary>
+<summary><b>Context</b> (13)</summary>
 
 - [Instruction files with `AGENTS.md`](https://caudra.ai/docs/context/#instruction-files)
 - [Project memory with summaries](https://caudra.ai/docs/memory/)
 - [Skills from `.claude` and `.agents` folders](https://caudra.ai/docs/skills/#where-skills-live)
 - [pstack engineering skills, off by default](https://caudra.ai/docs/skills/#pstack)
+- [Matt Pocock's skills, off by default](https://caudra.ai/docs/skills/#mattpocock)
 - [`@file` and `#commit` mentions](https://caudra.ai/docs/context/#mention-a-file-with)
 - [Inspect with `/context` and `/projection`](https://caudra.ai/docs/context/#inspect-the-active-window)
 - [Compaction that keeps recent turns](https://caudra.ai/docs/context/#when-the-window-fills)
@@ -297,7 +305,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 
 </details>
 <details>
-<summary><b>Sessions</b> (13)</summary>
+<summary><b>Sessions</b> (18)</summary>
 
 - [Revert conversation, files, or both](https://caudra.ai/docs/sessions/#message-actions)
 - [File changes recorded per call](https://caudra.ai/docs/sessions/#recording)
@@ -307,15 +315,20 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Git worktrees you open and close](https://caudra.ai/docs/worktrees/#closing-a-worktree)
 - [Retention policies and `/storage`](https://caudra.ai/docs/sessions/#retention)
 - [Move sessions between directories](https://caudra.ai/docs/sessions/#moving-sessions-to-another-directory)
-- [Search past sessions with `/search`](https://caudra.ai/docs/sessions/#search-past-sessions)
+- [Search this chat or past sessions with `/search`](https://caudra.ai/docs/sessions/#search-past-sessions)
+- [The model and thinking level behind each message](https://caudra.ai/docs/sessions/#message-actions)
+- [Print runs saved as sessions you can resume](https://caudra.ai/docs/headless/)
 - [Search past conversations from Python](https://caudra.ai/docs/code/#search-past-conversations)
 - [Spend by model and purpose in `/usage`](https://caudra.ai/docs/token-economy/#cache-hit-rate)
+- [Subscription spend beside billed spend](https://caudra.ai/docs/token-economy/#spend-on-a-subscription)
+- [Priced decision calls in `/usage`, goals, and autopilot budgets](https://caudra.ai/docs/providers/#decision-prices)
 - [Opt-in cache warming for the Anthropic API](https://caudra.ai/docs/token-economy/#cache-warming)
 - [Release notes after an update, with `/changelog`](https://caudra.ai/docs/release-notes/)
+- [Update from the banner and restart on the same sessions](https://caudra.ai/docs/configuration/#ui-update-check)
 
 </details>
 <details>
-<summary><b>Interface</b> (11)</summary>
+<summary><b>Interface</b> (14)</summary>
 
 - [Workbench with Git and search](https://caudra.ai/docs/workbench/)
 - [Passage review](https://caudra.ai/docs/review/)
@@ -324,6 +337,9 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Tool calls drawn as they stream](https://caudra.ai/docs/token-economy/#fewer-round-trips)
 - [Token cost on tool cards](https://caudra.ai/docs/token-economy/#watching-it-work)
 - [Draft stash and command palette](https://caudra.ai/docs/commands/#stash)
+- [Commands that list their arguments and complete them](https://caudra.ai/docs/commands/#arguments)
+- [A keybindings list you can filter](https://caudra.ai/docs/keybindings/)
+- [A footer row for errors and notices](https://caudra.ai/docs/quick-start/#first-session)
 - [Edit `caudra.toml` in `/settings`](https://caudra.ai/docs/configuration/)
 - [Paired light and dark themes](https://caudra.ai/docs/configuration/#ui-theme)
 - [Hover tooltips that explain controls](https://caudra.ai/docs/quick-start/#first-session)
@@ -412,7 +428,7 @@ Anthropic · OpenAI · Google · GitHub Copilot · xAI · Mistral · DeepSeek ·
 
 Claude subscription sign-in is experimental. Anthropic's terms limit Pro and Max subscriptions to official clients. Every provider also accepts an API key. See [Providers and sign-in](https://caudra.ai/docs/providers/).
 
-Several accounts per provider, the instruction files, skills, and MCP servers you already have, and a model for each job: [Models and setup](https://caudra.ai/features/models/).
+The instruction files, skills, and MCP servers you already have, and a model for each job: [Models and setup](https://caudra.ai/features/models/). Several subscriptions and keys per provider, with a conversation that moves before the quota runs out: [Accounts and quota](https://caudra.ai/features/accounts/).
 
 ## Before you install
 
@@ -428,7 +444,7 @@ Several accounts per provider, the instruction files, skills, and MCP servers yo
 
 **Where does it come from?** Caudra is an independent fork of [Maki](https://github.com/tontinton/maki). It keeps Maki's native Rust core and adds many features such as completion goals, durable subagents, steering, revert, and the workbench. [Changes from Maki](https://caudra.ai/docs/changes-from-maki/) lists the work in detail.
 
-**How stable is it?** Caudra is in preview and releases often. When an upgrade changes the session database or a config file, it saves a backup first, and older releases may not read the upgraded files. The [release notes](https://caudra.ai/docs/release-notes/) say what each upgrade changes.
+**How stable is it?** Caudra is in preview and releases often. When an upgrade changes the session database or a config file, it saves a backup first, and older releases may not read the upgraded files. Close other Caudra sessions before you start such a release, because the upgrade needs the database to itself. The [release notes](https://caudra.ai/docs/release-notes/) say what each upgrade changes.
 
 **Who builds it?** Thorsten Born builds Caudra and uses it for his own work every day. Ask questions in [GitHub Discussions](https://github.com/caudra/caudra/discussions) and report bugs in [Issues](https://github.com/caudra/caudra/issues).
 
