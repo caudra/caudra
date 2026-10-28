@@ -24,9 +24,7 @@ use async_lock::OnceCell;
 use caudra_storage::StateDir;
 use caudra_storage::sessions::SessionError;
 use caudra_storage::shell_runs::reading::{Call, NUMBERS, Reading, read};
-use caudra_storage::shell_runs::{
-    HostSnapshot, MAX_SHELL_RUNS, Prediction, RunOutcome, ShellRun, ShellRuns,
-};
+use caudra_storage::shell_runs::{HostSnapshot, Prediction, RunOutcome, ShellRun, ShellRuns};
 
 use crate::ToolOutput;
 use crate::tools::{Deadline, ToolExecResult, humanize_duration};
@@ -53,6 +51,7 @@ const NUMERIC: usize = NUMBERS + parts::FEATURES;
 const VOCABULARY: usize = 300;
 /// Labelled and finished runs each needed before the trees are trained.
 pub(crate) const MIN_TRAINING_RUNS: usize = 100;
+const MAX_TRAINING_RUNS: usize = 20_000;
 const RETRAIN_EVERY: usize = 500;
 /// How often an untrained model looks again for enough runs.
 const RETRY_UNTRAINED_EVERY: usize = 50;
@@ -469,7 +468,7 @@ impl ShellEta {
         let dir = self.0.state_dir.clone();
         let started = Instant::now();
         let trained = smol::unblock(move || {
-            let runs = ShellRuns::open(&dir)?.newest(MAX_SHELL_RUNS)?;
+            let runs = ShellRuns::open(&dir)?.newest(MAX_TRAINING_RUNS)?;
             Ok::<_, SessionError>((runs.len(), Model::trained(&runs)))
         })
         .await;

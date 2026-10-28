@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 17 {#v0-2-0-preview-17}
+
+[v0.2.0-preview.17 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.17)
+
+- Keep up to 100,000 shell runs while training ETAs on the newest 20,000.
+
+### Changes
+
+- **More shell history, the same training limit.** Caudra now retains up to 100,000 local shell runs, up from 20,000, preserving more duration and optional CPU measurements for evaluation. ETA models still train on at most the newest 20,000 runs, so retaining more history does not increase the training sample limit. Runs already pruned are not recovered. CPU measurements remain collection-only.
+
 ## Caudra 0.2 Preview 16 {#v0-2-0-preview-16}
 
 [v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)
