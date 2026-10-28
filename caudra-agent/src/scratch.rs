@@ -552,7 +552,11 @@ mod tests {
             advertised(),
             Some(std::env::temp_dir().to_string_lossy().into_owned())
         );
-        assert_eq!(local_dir(), Some(std::env::temp_dir()), "{LOCAL_DIR_IS_TEMP}");
+        assert_eq!(
+            local_dir(),
+            Some(std::env::temp_dir()),
+            "{LOCAL_DIR_IS_TEMP}"
+        );
         assert_eq!(
             permission_root(),
             Some(
