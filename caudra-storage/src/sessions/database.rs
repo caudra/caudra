@@ -19,7 +19,7 @@
 
 use std::array;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, c_int};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
@@ -49,6 +49,7 @@ use rusqlite::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tracing::{field, warn};
 
@@ -1391,6 +1392,18 @@ pub struct SessionCursor {
     logical_bytes: usize,
     root_bytes: usize,
     task_spec_bytes: usize,
+    digests: RowDigests,
+}
+
+type RowDigest = [u8; 32];
+
+/// What the rows a delta save would otherwise rewrite whole held when last
+/// written, so an unchanged stream spec or auxiliary table is not rewritten
+/// under the write lock. `None` auxiliary means unknown and always writes.
+#[derive(Debug, Clone, PartialEq)]
+struct RowDigests {
+    task_specs: HashMap<String, Option<RowDigest>>,
+    auxiliary: Option<RowDigest>,
 }
 
 #[derive(Debug)]
@@ -3421,6 +3434,7 @@ impl SessionDatabase {
             serialized.logical_bytes,
             serialized.root_bytes(),
             serialized.task_spec_bytes(),
+            RowDigests::new(session, &serialized.task_specs),
         ))
     }
 
@@ -4270,6 +4284,7 @@ impl SessionDatabase {
             serialized.logical_bytes,
             serialized.root_bytes(),
             serialized.task_spec_bytes(),
+            RowDigests::new(session, &serialized.task_specs),
         ))
     }
 
@@ -4302,6 +4317,9 @@ impl SessionDatabase {
             subagent_messages.push((id.clone(), payloads));
         }
         let task_specs = serialize_task_specs(&session.subagent_task_specs)?;
+        let digests = RowDigests::new(session, &task_specs);
+        let changed_streams = digests.changed_streams(&cursor.digests).collect::<Vec<_>>();
+        let auxiliary_changed = digests.auxiliary_changed(&cursor.digests);
         let added_bytes = prepared_bytes(&messages, &tool_outputs, &subagent_messages);
         timing.count(
             prepared_rows(&messages, &tool_outputs, &subagent_messages),
@@ -4341,19 +4359,16 @@ impl SessionDatabase {
         for (id, payload) in &tool_outputs {
             insert_tool_output(&transaction, session.id, id, payload)?;
         }
-        upsert_streams(
-            &transaction,
-            session.id,
-            &session.subagent_messages,
-            &task_specs,
-        )?;
+        upsert_streams(&transaction, session.id, changed_streams, &task_specs)?;
         for (id, payloads) in &subagent_messages {
             let start = subagent_starts[id.as_str()];
             for (offset, payload) in payloads.iter().enumerate() {
                 insert_subagent_history(&transaction, session.id, id, start + offset, payload)?;
             }
         }
-        replace_auxiliary(&transaction, session)?;
+        if auxiliary_changed {
+            replace_auxiliary(&transaction, session)?;
+        }
         timing.committing();
         transaction.commit()?;
         drop(timing);
@@ -4370,6 +4385,7 @@ impl SessionDatabase {
             logical_bytes,
             root.bytes(),
             task_specs.values().map(String::len).sum(),
+            digests,
         ))
     }
 
@@ -4861,7 +4877,7 @@ where
         .map(|(key, value)| (key, Arc::new(value)))
         .collect::<HashMap<_, _>>();
     let mut subagent_task_specs = HashMap::new();
-    let mut task_spec_bytes = 0usize;
+    let mut stored_task_specs = HashMap::new();
     let mut stream_ids = Vec::new();
     {
         let mut statement = connection.prepare(
@@ -4873,11 +4889,11 @@ where
             let subagent_id: String = row.get(0)?;
             let task_spec: Option<String> = row.get(1)?;
             if let Some(task_spec) = task_spec {
-                task_spec_bytes = task_spec_bytes.saturating_add(task_spec.len());
                 subagent_task_specs.insert(
                     subagent_id.clone(),
                     deserialize_json(&task_spec, "subagent task spec")?,
                 );
+                stored_task_specs.insert(subagent_id.clone(), task_spec);
             }
             stream_ids.push(subagent_id);
         }
@@ -4978,7 +4994,8 @@ where
         root.write_version,
         root.logical_bytes,
         root.token_usage.len() + root.metadata.len() + root.workspace_binding.len(),
-        task_spec_bytes,
+        stored_task_specs.values().map(String::len).sum(),
+        RowDigests::new(&session, &stored_task_specs),
     );
     // The session no longer holds these, so the next save cannot be a delta:
     // the full rewrite it takes instead drops their rows and their count.
@@ -5114,6 +5131,7 @@ impl SessionCursor {
         logical_bytes: usize,
         root_bytes: usize,
         task_spec_bytes: usize,
+        digests: RowDigests,
     ) -> Self {
         Self {
             session_id: session.id,
@@ -5131,8 +5149,54 @@ impl SessionCursor {
             logical_bytes,
             root_bytes,
             task_spec_bytes,
+            digests,
         }
     }
+}
+
+impl RowDigests {
+    /// `task_specs` is the text the stream rows hold, keyed by stream.
+    fn new<M, U, T>(session: &Session<M, U, T>, task_specs: &HashMap<String, String>) -> Self {
+        Self {
+            task_specs: session
+                .subagent_messages
+                .keys()
+                .map(|id| {
+                    let digest = task_specs
+                        .get(id)
+                        .map(|spec| Sha256::digest(spec.as_bytes()).into());
+                    (id.clone(), digest)
+                })
+                .collect(),
+            auxiliary: auxiliary_digest(session),
+        }
+    }
+
+    fn changed_streams<'a>(&'a self, saved: &RowDigests) -> impl Iterator<Item = &'a String> {
+        self.task_specs
+            .iter()
+            .filter(|(id, digest)| saved.task_specs.get(*id) != Some(digest))
+            .map(|(id, _)| id)
+    }
+
+    fn auxiliary_changed(&self, saved: &RowDigests) -> bool {
+        self.auxiliary.is_none() || self.auxiliary != saved.auxiliary
+    }
+}
+
+/// Map order is unspecified, so usage is sorted before it is encoded.
+fn auxiliary_digest<M, U, T>(session: &Session<M, U, T>) -> Option<RowDigest> {
+    fn sorted(usage: &HashMap<String, StoredTokenUsage>) -> BTreeMap<&String, &StoredTokenUsage> {
+        usage.iter().collect()
+    }
+    let encoded = serde_json::to_vec(&(
+        &session.subagents,
+        sorted(&session.usage_by_model),
+        sorted(&session.usage_by_purpose),
+        &session.tool_usage,
+    ))
+    .ok()?;
+    Some(Sha256::digest(encoded).into())
 }
 
 impl SerializedRoot {
@@ -6877,7 +6941,7 @@ fn insert_children<M, U, T>(
     upsert_streams(
         transaction,
         session.id,
-        &session.subagent_messages,
+        session.subagent_messages.keys(),
         &serialized.task_specs,
     )?;
     for (id, values) in &serialized.subagent_messages {
@@ -6935,15 +6999,15 @@ fn insert_tool_output(
     Ok(())
 }
 
-fn upsert_streams<M>(
+fn upsert_streams<'a>(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
-    streams: &HashMap<String, Arc<Vec<M>>>,
+    streams: impl IntoIterator<Item = &'a String>,
     task_specs: &HashMap<String, String>,
 ) -> Result<(), SessionError> {
     // The parent stream row is durable even when its history is empty, which
     // preserves completed and resumable empty subagents.
-    for id in streams.keys() {
+    for id in streams {
         transaction.execute(
             "INSERT INTO subagent_streams (session_id, subagent_id, task_spec) \
              VALUES (?1, ?2, ?3) \
@@ -10072,6 +10136,110 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             )
             .unwrap();
         assert_eq!(after.rows, report.rows + 1);
+    }
+
+    const STREAM: &str = "stream";
+    const OTHER_STREAM: &str = "other-stream";
+    const SPEC_MODEL: &str = "spec-model";
+    const CHANGED_SPEC_MODEL: &str = "changed-spec-model";
+    const STREAM_WRITES: &str = "streams";
+    const AUXILIARY_WRITES: &str = "auxiliary";
+    const COUNT_ROW_WRITES: &str = "
+        CREATE TEMP TABLE row_writes(target TEXT NOT NULL);
+        CREATE TEMP TRIGGER stream_insert AFTER INSERT ON main.subagent_streams
+            BEGIN INSERT INTO row_writes VALUES ('streams'); END;
+        CREATE TEMP TRIGGER stream_update AFTER UPDATE ON main.subagent_streams
+            BEGIN INSERT INTO row_writes VALUES ('streams'); END;
+        CREATE TEMP TRIGGER subagent_insert AFTER INSERT ON main.subagents
+            BEGIN INSERT INTO row_writes VALUES ('auxiliary'); END;
+        CREATE TEMP TRIGGER tool_usage_insert AFTER INSERT ON main.session_tool_usage
+            BEGIN INSERT INTO row_writes VALUES ('auxiliary'); END;
+    ";
+
+    fn task_spec(model: &str) -> StoredSubagentTaskSpec {
+        serde_json::from_value(json!({ "model": model })).unwrap()
+    }
+
+    fn row_writes(database: &SessionDatabase, target: &str) -> i64 {
+        database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM row_writes WHERE target = ?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn append(session: &mut TestSession) {
+        session.push_message(TestMessage("appended".into()));
+    }
+
+    fn change_spec(session: &mut TestSession) {
+        session.set_subagent_history(
+            STREAM.into(),
+            vec![TestMessage("child".into())],
+            Some(task_spec(CHANGED_SPEC_MODEL)),
+        );
+    }
+
+    fn add_stream(session: &mut TestSession) {
+        session.set_subagent_messages(OTHER_STREAM.into(), Vec::new());
+    }
+
+    fn use_tool(session: &mut TestSession) {
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Ok, 1, 1);
+    }
+
+    #[test_case(append, false, false, false ; "an_append_after_save")]
+    #[test_case(append, true, false, false ; "an_append_after_load")]
+    #[test_case(change_spec, false, true, false ; "a_changed_spec_after_save")]
+    #[test_case(change_spec, true, true, false ; "a_changed_spec_after_load")]
+    #[test_case(add_stream, false, true, false ; "a_new_stream")]
+    #[test_case(use_tool, false, false, true ; "a_tool_usage_change_after_save")]
+    #[test_case(use_tool, true, false, true ; "a_tool_usage_change_after_load")]
+    fn a_delta_save_rewrites_only_changed_stream_and_auxiliary_rows(
+        mutate: fn(&mut TestSession),
+        reload: bool,
+        streams_written: bool,
+        auxiliary_written: bool,
+    ) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage("first".into()));
+        session.set_subagent_history(
+            STREAM.into(),
+            vec![TestMessage("child".into())],
+            Some(task_spec(SPEC_MODEL)),
+        );
+        session.set_subagents(vec![stored_subagent(STREAM, StoredSubagentOutcome::Done)]);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Cancelled, 1, 1);
+        let mut cursor = database.save(&session, None).unwrap();
+        if reload {
+            (session, cursor) = database.load_with_cursor(session.id).unwrap();
+        }
+        database.connection.execute_batch(COUNT_ROW_WRITES).unwrap();
+        mutate(&mut session);
+        let base_write_version = cursor.write_version();
+        database.save(&session, Some(&cursor)).unwrap();
+        assert_eq!(
+            (
+                row_writes(&database, STREAM_WRITES) > 0,
+                row_writes(&database, AUXILIARY_WRITES) > 0,
+            ),
+            (streams_written, auxiliary_written)
+        );
+        assert_eq!(
+            database.write_version(session.id).unwrap(),
+            Some(base_write_version + 1)
+        );
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(loaded.subagent_task_specs(), session.subagent_task_specs());
+        assert_eq!(loaded.subagents(), session.subagents());
+        assert_eq!(loaded.tool_usage(), session.tool_usage());
     }
 
     fn stored_subagent(id: &str, outcome: StoredSubagentOutcome) -> StoredSubagent {
