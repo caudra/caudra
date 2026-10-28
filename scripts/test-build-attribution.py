@@ -1422,6 +1422,65 @@ class AttributionTests(unittest.TestCase):
         with self.assertRaisesRegex(attribution.AttributionError, "revision mismatch"):
             attribution.package_licenses(package, repository, policy)
 
+    def test_locked_objc2_io_kit_supplement_preserves_declaration_and_apache_text(self):
+        repository = Path(__file__).resolve().parent.parent
+        locked = tomllib.loads((repository / "Cargo.lock").read_text())
+        dependency = next(p for p in locked["package"] if p["name"] == "objc2-io-kit")
+        policy = attribution.load_policy(repository)
+        key = dependency["name"] + "@" + dependency["version"]
+        supplement = policy["packages"][key]
+        expression = "Zlib OR Apache-2.0 OR MIT"
+        package = self.package("objc2-io-kit", expression)
+        package.update(
+            version=dependency["version"],
+            source=dependency["source"],
+            checksum=dependency["checksum"],
+        )
+        vcs_path = Path(package["manifest_path"]).parent / ".cargo_vcs_info.json"
+        vcs_path.write_text(json.dumps(supplement["provenance"]["cargo_vcs_info"]))
+        with self.assertRaisesRegex(
+            attribution.AttributionError, "Missing license texts"
+        ):
+            attribution.package_licenses(package, repository, {})
+        found, actual_expression, chosen = attribution.package_licenses(
+            package, repository, policy
+        )
+        self.assertEqual(actual_expression, expression)
+        self.assertEqual(chosen, ["Apache-2.0"])
+        self.assertEqual(
+            [name for _, name in found], sorted(supplement["required_files"])
+        )
+        declaration = next(path for path, name in found if name.endswith("LICENSE.md"))
+        self.assertIn("## Apple SDKs", declaration.read_text())
+        with self.assertRaisesRegex(
+            attribution.AttributionError, "Missing license text evidence"
+        ):
+            attribution.choose_license(expression, declaration.read_text())
+        for field, value, error in (
+            ("version", "unreviewed", "Missing license texts"),
+            ("checksum", "changed", "package checksum mismatch"),
+            ("license", "MIT", "declared-license mismatch"),
+            ("source", "registry+https://unreviewed.invalid", "Missing license texts"),
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(attribution.AttributionError, error),
+            ):
+                attribution.package_licenses(
+                    {**package, field: value}, repository, policy
+                )
+        for field, value in (
+            ("git", {"sha1": "changed"}),
+            ("path_in_vcs", "framework-crates/another-crate"),
+        ):
+            with self.subTest(vcs_field=field):
+                vcs = {**supplement["provenance"]["cargo_vcs_info"], field: value}
+                vcs_path.write_text(json.dumps(vcs))
+                with self.assertRaisesRegex(
+                    attribution.AttributionError, "revision mismatch"
+                ):
+                    attribution.package_licenses(package, repository, policy)
+
     def test_supplement_rejects_changed_line_endings(self):
         package = self.package()
         license_path = self.root / "supplement.txt"

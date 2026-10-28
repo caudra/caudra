@@ -50,6 +50,48 @@
         "verification": "The published archive SHA-256 matches Cargo.lock and all 17 extracted files match the archive. Cargo.toml.orig, README.md and all packaged Rust files match the exact upstream revision. LICENSE is the only upstream legal file; no separate NOTICE or copyright notice was found in the pinned repository or published source."
       }
     },
+    "objc2-io-kit@0.3.2": {
+      "reason": "The published crate omits license texts. The exact upstream root LICENSE.md expressly offers this crate under Zlib OR Apache-2.0 OR MIT and links Apache's canonical license. Preserve that declaration, including its Apple SDK caveat, and the complete linked Apache-2.0 text verbatim; select the offered Apache-2.0 alternative without inventing a copyright notice from author metadata. This is not legal clearance.",
+      "provenance": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15",
+        "declared_license": "Zlib OR Apache-2.0 OR MIT",
+        "cargo_vcs_info": {
+          "git": {
+            "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+          },
+          "path_in_vcs": "framework-crates/objc2-io-kit"
+        }
+      },
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/dependencies/objc2-io-kit-0.3.2/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        },
+        {
+          "path": "THIRD_PARTY_LICENSES/dependencies/objc2-io-kit-0.3.2/LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/dependencies/objc2-io-kit-0.3.2/LICENSE.md",
+        "supplements/THIRD_PARTY_LICENSES/dependencies/objc2-io-kit-0.3.2/LICENSE-APACHE"
+      ],
+      "review_evidence": {
+        "repository": "https://github.com/madsmtm/objc2",
+        "upstream_revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+        "upstream_path": "LICENSE.md",
+        "git_blob_sha1": "540ae4c81adb5f64a9f61e222b688880da24300e",
+        "canonical_license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "manifest_git_blob_sha1": "774b79455be15789cc71bab4ae288cd0dbe74bcd",
+        "manifest_sha256": "b42241619a7ea451537126c0bc45d2a5b44cbbed9984e0818744e1889f425625",
+        "workspace_manifest_git_blob_sha1": "2ebd2c878fc38565ec58ee7593352319344d3c37",
+        "workspace_manifest_sha256": "2a5d4807cb132ce1d3f5b591a760643db49ca835dedefddcbd3087ad962360cd",
+        "generated_repository": "https://github.com/madsmtm/objc2-generated.git",
+        "generated_revision": "4c2d6fb86d17ed4b4b7e68e80994788b60521987",
+        "verification": "The published archive SHA-256 matches Cargo.lock. All 22 original packaged files match the exact upstream revision or its pinned generated submodule's IOKit directory; the remaining three are Cargo's generated manifest, lockfile and VCS metadata. The root LICENSE.md is the only upstream legal file; no separate NOTICE or copyright notice was found in the crate source or generated submodule. The full Apache-2.0 text comes from the explicit link in that declaration, not from SPDX or author metadata. Preserve the upstream Apple SDK licensing caveat without claiming to resolve it."
+      }
+    },
     "caudra-highlight@0.2.0-preview.16": {
       "expression": "Apache-2.0 AND MIT AND MPL-2.0",
       "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. The TLA+, PlusCal and TLC config grammars converted from vscode-tlaplus remain MIT; preserve its upstream license. This aggregate expression does not relicense individual files.",
