@@ -1,4 +1,5 @@
 use std::array;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +12,7 @@ use caudra_providers::{
     AgentError, Billing, Model, ModelSpend, NOT_BILLED_MARK, ProviderUsage, TokenUsage, add_cost,
     format_hit_rate, format_tokens, format_tokens_u64, model_cost,
 };
-use caudra_storage::cache_warming::{EpisodeKind, WarmingSummary};
+use caudra_storage::cache_warming::{EpisodeKind, EpisodeOutcome, WarmingSummary};
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -29,7 +30,7 @@ use crate::components::input::control_tip;
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::tooltip::Tip;
+use crate::components::tooltip::{Tip, TipArea, TipKey, area_tip};
 use crate::components::{ModalScroll, bar_area, hover_style};
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
@@ -91,6 +92,59 @@ const WARMING_HEADER: [&str; 7] = ["mode", "episodes", "warms", "cost", "saved",
 const SHADOW_SUFFIX: &str = " (estimated if enabled)";
 const UNCALIBRATED_NOTE: &str =
     " of estimated savings left out: too few cache hits observed on that model yet";
+const TIP_BASE_IN: &str =
+    "Input tokens sent at full price, neither read from nor written to the cache";
+const TIP_OUT: &str = "Tokens the model wrote";
+const TIP_CACHE_READ: &str =
+    "Prompt tokens served from the provider's cache, billed at a fraction of base input";
+const TIP_CACHE_WRITE: &str =
+    "Prompt tokens written to the cache, billed above base input so later requests can read them";
+const TIP_CACHE: &str =
+    "Cache read plus cache write: prompt tokens read from or written to the provider's cache";
+const TIP_TOTAL: &str = "Base input, output, cache read and cache write together";
+const TIP_TOKENS: &str = "Every token of the row: base input, output, cache read and cache write";
+const TIP_HIT: &str =
+    "Share of prompt tokens read from the cache. — means the provider reported no prompt tokens";
+const TIP_TURNS: &str = "Model requests recorded, each priced when it happened";
+const TIP_COST: &str = "List price of these tokens in USD. ≈ marks what a subscription covered, and — means no price is known";
+const TIP_BILLED: &str = "Billed at API list prices";
+const TIP_COVERED: &str = "What a subscription covered, at API list prices. Nothing was billed";
+const TIP_USED: &str = "Share of this window's quota used, as the provider reports it";
+const TIP_RESETS: &str = "When this window's quota starts over";
+const TIP_QUOTA: &str = "The usage limits of the account in use, as the provider reports them";
+const TIP_REFRESH_AGE: &str = "Asks the provider for its usage limits again\nClick";
+const TIP_ACCOUNTS: &str = "Where each of this provider's accounts stands as of its latest reading. /accounts manages them";
+const TIP_PURPOSE: &str = "Why Caudra called the model: chat is the conversation, the rest is work Caudra did on your behalf";
+const TIP_PER_ACCOUNT: &str =
+    "Turns recorded before Caudra tracked accounts have none and stay out of this list";
+const TIP_PER_PROJECT: &str = "Spend by the directory each session ran in";
+const TIP_SHOW_ALL: &str = "Shows every row of this list";
+const TIP_FOLD: &str = "Folds this list back to its costliest ";
+const TIP_TOGGLE_CLICK: &str = "Click, or press ";
+const TIP_TOGGLE_EVERY: &str = " for every list";
+const TIP_EPHEMERAL: &str =
+    "Spend from --ephemeral runs, which keep no session. Already counted in the totals above";
+const TIP_UNPRICED: &str = "A turn has no price when its model is missing from the price table, so the total understates by an unknown amount";
+const TIP_UNCALIBRATED: &str = "Estimated savings count only once enough cache hits on a model show how often it hits without warming";
+const TIP_WARMING: &str = "Resends a request just before its prompt cache expires, so the next one reads it. While off, rows estimate what it would save";
+const TIP_SHADOW: &str = "What warming would have done had it been on. Nothing was sent";
+/// One per [`WARMING_HEADER`] column.
+const WARMING_TIPS: [&str; 7] = [
+    "When warming runs: while a run waits (running), or also after it ends (idle)",
+    "Waits long enough for the prompt cache to expire, each ending at the next request",
+    "Warm requests sent",
+    "What the warms cost, in USD",
+    "The cache writes the warms avoided, in USD",
+    "Saved minus cost",
+    "Of the requests that came after the cache would have expired, the share that read it",
+];
+const TIP_SAVED: &str = "The cache would have expired, and the next request read it";
+const TIP_MARGINAL: &str = "The next request read the cache near its expiry, where it might have hit without a warm. Never counted as saved";
+const TIP_UNNEEDED: &str = "The next request came before the cache expired, so no warm was needed";
+const TIP_MISSED: &str = "The next request missed the cache although the warms kept it";
+const TIP_LAPSED: &str = "Warming stopped, and the next request came after the cache expired";
+const TIP_UNUSED: &str = "No next request read the prompt: the run ended, the conversation changed, or the session closed";
+const TIP_WROTE: &str = "A warm wrote a new cache entry instead of refreshing the existing one";
 const MINUTE: i64 = 60;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
@@ -221,6 +275,10 @@ pub struct UsageModal {
     title: FooterHits,
     /// What each of `title` does, in the same order.
     title_actions: Vec<TitleAction>,
+    /// Where each explained span of the body landed on screen, and what it says.
+    body_tips: Vec<TipArea>,
+    /// Where the pointer last moved to, `None` after anything but a move.
+    pointer: Option<Position>,
     popup: Rect,
 }
 
@@ -254,6 +312,113 @@ pub(crate) enum UsageMouse {
     Reload,
 }
 
+/// What span `span` of line `row` means, for the box the pointer raises.
+struct SpanTip {
+    row: usize,
+    span: usize,
+    text: Cow<'static, str>,
+}
+
+/// The modal's lines, and the spans among them that explain themselves.
+#[derive(Default)]
+struct Content {
+    lines: Vec<Line<'static>>,
+    tips: Vec<SpanTip>,
+}
+
+impl Content {
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn push_tipped(&mut self, line: TippedLine) {
+        let row = self.lines.len();
+        self.tips.extend(
+            line.tips
+                .into_iter()
+                .map(|(span, text)| SpanTip { row, span, text }),
+        );
+        self.lines.push(Line::from(line.spans));
+    }
+
+    fn tip(&mut self, row: usize, span: usize, text: impl Into<Cow<'static, str>>) {
+        self.tips.push(SpanTip {
+            row,
+            span,
+            text: text.into(),
+        });
+    }
+
+    fn extend(&mut self, other: Content) {
+        let offset = self.lines.len();
+        self.tips.extend(other.tips.into_iter().map(|tip| SpanTip {
+            row: tip.row + offset,
+            ..tip
+        }));
+        self.lines.extend(other.lines);
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+}
+
+/// One line being built, and which of its spans explain themselves.
+#[derive(Default)]
+struct TippedLine {
+    spans: Vec<Span<'static>>,
+    tips: Vec<(usize, Cow<'static, str>)>,
+}
+
+impl TippedLine {
+    fn push(&mut self, span: Span<'static>) -> &mut Self {
+        self.spans.push(span);
+        self
+    }
+
+    fn tipped(&mut self, span: Span<'static>, text: impl Into<Cow<'static, str>>) -> &mut Self {
+        self.tips.push((self.spans.len(), text.into()));
+        self.push(span)
+    }
+
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+}
+
+impl From<Line<'static>> for TippedLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            spans: line.spans,
+            tips: Vec::new(),
+        }
+    }
+}
+
+/// A section heading, explained by `tip` when it has one.
+fn section_heading(
+    text: impl Into<Cow<'static, str>>,
+    tip: Option<&'static str>,
+    theme: &Theme,
+) -> TippedLine {
+    let style = theme.keybind_section;
+    let mut line = TippedLine::default();
+    line.push(Span::styled(PREFIX, style));
+    match tip {
+        Some(tip) => line.tipped(Span::styled(text.into(), style), tip),
+        None => line.push(Span::styled(text.into(), style)),
+    };
+    line
+}
+
+/// A dim note whose text, past the indent, explains itself with `tip`.
+fn tipped_note(text: String, tip: &'static str, style: Style) -> TippedLine {
+    let mut line = TippedLine::default();
+    line.push(Span::styled(PREFIX, style))
+        .tipped(Span::styled(text, style), tip);
+    line
+}
+
 impl UsageModal {
     pub fn new() -> Self {
         Self {
@@ -269,6 +434,8 @@ impl UsageModal {
             toggle_sections: Vec::new(),
             title: FooterHits::default(),
             title_actions: Vec::new(),
+            body_tips: Vec::new(),
+            pointer: None,
             popup: Rect::default(),
         }
     }
@@ -302,6 +469,8 @@ impl UsageModal {
         self.toggles.reset();
         self.title.reset();
         self.expanded.clear();
+        self.body_tips.clear();
+        self.pointer = None;
     }
 
     fn flip_section(&mut self, section: LifetimeSection) {
@@ -352,6 +521,8 @@ impl UsageModal {
         if !self.open {
             return UsageMouse::Ignored;
         }
+        self.pointer =
+            (event.kind == MouseEventKind::Moved).then_some(Position::new(event.column, event.row));
         if let Some(index) = self.title.handle_mouse(*event) {
             match self.title_actions.get(index) {
                 Some(TitleAction::Reload) => return UsageMouse::Reload,
@@ -449,6 +620,24 @@ impl UsageModal {
         line
     }
 
+    /// Mirrors `title_line`, so a tip always explains the gloss drawn beside it.
+    fn title_tip(&self) -> Option<Tip> {
+        self.title.tip(TipKey::TitleHint, |index| {
+            let (meaning, bind) = match self.title_actions.get(index)? {
+                TitleAction::Reload => (TIP_RELOAD.into(), key::REFRESH),
+                TitleAction::Scope => match self.scope {
+                    UsageScope::Session => (TIP_LIFETIME.into(), SCOPE_KEY),
+                    UsageScope::Lifetime => (TIP_SESSION.into(), SCOPE_KEY),
+                },
+                TitleAction::Expand => match self.expanded.is_empty() {
+                    true => (format!("{TIP_MORE}{SLICE_LIMIT}"), EXPAND_KEY),
+                    false => (format!("{TIP_LESS}{SLICE_LIMIT}"), EXPAND_KEY),
+                },
+            };
+            Some(control_tip(&meaning, bind.label))
+        })
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect, ctx: &UsageModalContext) -> Rect {
         if !self.open {
             return Rect::default();
@@ -456,17 +645,18 @@ impl UsageModal {
         grab_scope!("usage_modal", area);
 
         let theme = theme::current();
-        let (mut lines, refresh_row, toggle_rows) = match self.scope {
+        let (mut content, refresh_row, toggle_rows) = match self.scope {
             UsageScope::Session => {
-                let (lines, refresh_row) = build_lines(ctx, self.quota.get(), &theme);
-                (lines, refresh_row, Vec::new())
+                let (content, refresh_row) = build_lines(ctx, self.quota.get(), &theme);
+                (content, refresh_row, Vec::new())
             }
             UsageScope::Lifetime => {
-                let (lines, toggles) = build_lifetime_lines(ctx.lifetime, &self.expanded, &theme);
-                (lines, None, toggles)
+                let (content, toggles) = build_lifetime_lines(ctx.lifetime, &self.expanded, &theme);
+                (content, None, toggles)
             }
         };
-        lines.extend(warming_lines(ctx.warming, &theme));
+        content.extend(warming_lines(ctx.warming, &theme));
+        let Content { mut lines, tips } = content;
 
         let total = lines.len() as u16;
         let modal = Modal {
@@ -489,10 +679,26 @@ impl UsageModal {
         let scroll = self.scroll.offset();
         let pan = self.scroll.pan();
 
+        self.body_tips = tips
+            .into_iter()
+            .filter_map(|tip| {
+                let line = lines.get(tip.row)?;
+                Some(TipArea {
+                    area: span_hit(line, tip.span, tip.row, inner, scroll, pan)?,
+                    text: tip.text.into_owned(),
+                })
+            })
+            .collect();
         let hit = |row: usize| {
-            lines
-                .get(row)
-                .and_then(|line| last_span_hit(line, row, inner, scroll, pan))
+            let line = lines.get(row)?;
+            span_hit(
+                line,
+                line.spans.len().checked_sub(1)?,
+                row,
+                inner,
+                scroll,
+                pan,
+            )
         };
         self.refresh
             .set(refresh_row.and_then(hit).into_iter().collect());
@@ -546,8 +752,8 @@ fn build_lines(
     ctx: &UsageModalContext,
     quota: Option<&UsageFetchState>,
     theme: &crate::theme::Theme,
-) -> (Vec<Line<'static>>, Option<usize>) {
-    let mut lines: Vec<Line> = Vec::new();
+) -> (Content, Option<usize>) {
+    let mut lines = Content::default();
     let mut refresh_row = None;
 
     lines.push(Line::from(Span::styled(
@@ -566,18 +772,23 @@ fn build_lines(
 
     if let Some(state) = quota {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
-            theme.keybind_section,
-        )));
+        lines.push_tipped(section_heading(
+            format!("{} quota", ctx.model.provider_display_name()),
+            Some(TIP_QUOTA),
+            theme,
+        ));
         lines.extend(quota_lines(
             state,
             theme,
             ctx.clock_format,
             Timestamp::now(),
         ));
-        if state.offers_refresh() {
-            refresh_row = lines.len().checked_sub(1);
+        if state.offers_refresh()
+            && let Some(row) = lines.len().checked_sub(1)
+        {
+            refresh_row = Some(row);
+            let age = lines.lines[row].spans.len().saturating_sub(1);
+            lines.tip(row, age, TIP_REFRESH_AGE);
         }
     }
     if ctx.accounts.len() > 1 {
@@ -616,16 +827,24 @@ fn build_lines(
     (lines, refresh_row)
 }
 
-/// Where the last span of `line`, drawn at `row` of an unwrapped paragraph
+/// Where span `span` of `line`, drawn at `row` of an unwrapped paragraph
 /// scrolled to `scroll` and panned to `pan`, landed inside `area`, clipped to
 /// what is visible.
-fn last_span_hit(line: &Line, row: usize, area: Rect, scroll: u16, pan: u16) -> Option<Rect> {
-    let target = line.spans.last()?;
+fn span_hit(
+    line: &Line,
+    span: usize,
+    row: usize,
+    area: Rect,
+    scroll: u16,
+    pan: u16,
+) -> Option<Rect> {
+    let target = line.spans.get(span)?;
     let row = u16::try_from(row).ok()?.checked_sub(scroll)?;
     if row >= area.height {
         return None;
     }
-    let start = u16::try_from(line.width() - target.width()).ok()?;
+    let before: usize = line.spans[..span].iter().map(Span::width).sum();
+    let start = u16::try_from(before).ok()?;
     let end = start.saturating_add(u16::try_from(target.width()).ok()?);
     let left = start.max(pan) - pan;
     let right = end.saturating_sub(pan).min(area.width);
@@ -726,7 +945,7 @@ fn breakdown_table(
     column: &str,
     rows: &[BreakdownRow],
     theme: &crate::theme::Theme,
-) -> Vec<Line<'static>> {
+) -> Content {
     let fg = Style::new().fg(theme.foreground);
     let label_w = rows
         .iter()
@@ -734,6 +953,7 @@ fn breakdown_table(
         .max()
         .unwrap_or(0)
         .max(MODEL_COL_MIN);
+    let label_tip = (column == PURPOSE_COLUMN).then_some(TIP_PURPOSE);
     let cells: Vec<_> = rows.iter().map(breakdown_cells).collect();
     let widths = column_widths(
         &cells,
@@ -747,24 +967,20 @@ fn breakdown_table(
         ],
     );
 
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!("{PREFIX}{heading}"),
-            theme.keybind_section,
-        )),
-        Line::from(header_row(column, label_w, &widths, theme)),
-    ];
-    lines.extend(rows.iter().zip(&cells).map(|(row, cells)| {
-        Line::from(model_row(
+    let mut lines = Content::default();
+    lines.push(Line::default());
+    lines.push_tipped(section_heading(heading.to_owned(), label_tip, theme));
+    lines.push_tipped(header_row(column, label_tip, label_w, &widths, theme));
+    for (row, cells) in rows.iter().zip(&cells) {
+        lines.push(Line::from(model_row(
             row,
             cells,
             &widths,
             label_w,
             fg,
             theme.status_dim,
-        ))
-    }));
+        )));
+    }
     lines
 }
 
@@ -773,47 +989,60 @@ fn build_lifetime_lines(
     lifetime: Option<&LifetimeUsage>,
     expanded: &HashSet<LifetimeSection>,
     theme: &crate::theme::Theme,
-) -> (Vec<Line<'static>>, Vec<(usize, LifetimeSection)>) {
+) -> (Content, Vec<(usize, LifetimeSection)>) {
     let fg = Style::new().fg(theme.foreground);
+    let mut lines = Content::default();
     let Some(lifetime) = lifetime else {
-        return (
-            vec![Line::from(Span::styled(
-                format!("{PREFIX}{LEDGER_UNAVAILABLE}"),
-                theme.status_dim,
-            ))],
-            Vec::new(),
-        );
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}{LEDGER_UNAVAILABLE}"),
+            theme.status_dim,
+        )));
+        return (lines, Vec::new());
     };
     if lifetime.is_empty() {
-        return (
-            vec![Line::from(Span::styled(
-                format!("{PREFIX}{NO_LEDGER}"),
-                theme.status_dim,
-            ))],
-            Vec::new(),
-        );
+        lines.push(Line::from(Span::styled(
+            format!("{PREFIX}{NO_LEDGER}"),
+            theme.status_dim,
+        )));
+        return (lines, Vec::new());
     }
 
     let covered = covered_spend(Some(lifetime.subscription_cost));
-    let totals = vec![
-        Span::raw(PREFIX),
-        Span::styled(
-            format!(
-                "base in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
+    let totals = headline(
+        [
+            (
+                "base in",
                 format_tokens_u64(lifetime.input),
-                format_tokens_u64(lifetime.output),
-                format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
-                format_tokens_u64(lifetime.total_tokens()),
-                format_hit_rate(lifetime.cache_hit_rate()),
-                lifetime.turns(),
+                NUM_COL,
+                TIP_BASE_IN,
             ),
-            fg,
-        ),
-    ];
-    let mut lines = vec![Line::from(Span::styled(
+            ("out", format_tokens_u64(lifetime.output), NUM_COL, TIP_OUT),
+            (
+                "cache",
+                format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
+                NUM_COL,
+                TIP_CACHE,
+            ),
+            (
+                "total",
+                format_tokens_u64(lifetime.total_tokens()),
+                NUM_COL,
+                TIP_TOTAL,
+            ),
+            (
+                "hit",
+                format_hit_rate(lifetime.cache_hit_rate()),
+                RATE_COL,
+                TIP_HIT,
+            ),
+            ("turns", lifetime.turns().to_string(), NUM_COL, TIP_TURNS),
+        ],
+        theme,
+    );
+    lines.push(Line::from(Span::styled(
         format!("{PREFIX}All time"),
         theme.keybind_section,
-    ))];
+    )));
     lines.extend(spend_lines(
         totals,
         Some(lifetime.cost),
@@ -822,56 +1051,66 @@ fn build_lifetime_lines(
         theme,
     ));
     if lifetime.ephemeral_cost > 0.0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{PREFIX}of which ephemeral runs: ${:.2}",
-                lifetime.ephemeral_cost
-            ),
+        lines.push_tipped(tipped_note(
+            format!("of which ephemeral runs: ${:.2}", lifetime.ephemeral_cost),
+            TIP_EPHEMERAL,
             theme.status_dim,
-        )));
+        ));
     }
     if lifetime.unpriced_turns > 0 {
-        lines.push(Line::from(Span::styled(
+        lines.push_tipped(tipped_note(
             format!(
-                "{PREFIX}{} turns had no price, so the total is a floor",
+                "{} turns had no price, so the total is a floor",
                 lifetime.unpriced_turns
             ),
+            TIP_UNPRICED,
             theme.status_dim,
-        )));
+        ));
     }
 
     // A lone provider row only restates the all-time line above it, rate and
     // all, so that fold alone has to earn its heading with a second row.
     // Purposes have no section: there are few enough to always show whole.
     let mut toggles = Vec::new();
-    for (heading, slices, min_rows, section) in [
+    for (heading, tip, slices, min_rows, section) in [
         (
             "Per provider",
+            None,
             &lifetime.by_provider,
             2,
             Some(LifetimeSection::Provider),
         ),
         (
             "Per account",
+            Some(TIP_PER_ACCOUNT),
             &lifetime.by_account,
             2,
             Some(LifetimeSection::Account),
         ),
         (
             "Per model",
+            None,
             &lifetime.by_model,
             1,
             Some(LifetimeSection::Model),
         ),
         (
             "Per project",
+            Some(TIP_PER_PROJECT),
             &lifetime.by_project,
             1,
             Some(LifetimeSection::Project),
         ),
-        ("Per purpose", &lifetime.by_purpose, 1, None),
+        (
+            "Per purpose",
+            Some(TIP_PURPOSE),
+            &lifetime.by_purpose,
+            1,
+            None,
+        ),
         (
             "Per month",
+            None,
             &lifetime.by_month,
             1,
             Some(LifetimeSection::Month),
@@ -881,10 +1120,7 @@ fn build_lifetime_lines(
             continue;
         }
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!("{PREFIX}{heading}"),
-            theme.keybind_section,
-        )));
+        lines.push_tipped(section_heading(heading, tip, theme));
         let section = section.filter(|_| slices.len() > COLLAPSE_ABOVE);
         let shown = match section {
             Some(section) if !expanded.contains(&section) => SLICE_LIMIT,
@@ -893,20 +1129,26 @@ fn build_lifetime_lines(
         lines.extend(slice_rows(&slices[..shown], fg, theme.status_dim));
         if let Some(section) = section {
             toggles.push((lines.len(), section));
-            let label = match slices.len() - shown {
-                0 => SHOW_LESS.to_owned(),
-                hidden => format!("... and {hidden} more"),
+            let (label, meaning) = match slices.len() - shown {
+                0 => (SHOW_LESS.to_owned(), format!("{TIP_FOLD}{SLICE_LIMIT}")),
+                hidden => (format!("... and {hidden} more"), TIP_SHOW_ALL.to_owned()),
             };
-            lines.push(Line::from(vec![
-                Span::raw(PREFIX),
+            let mut line = TippedLine::default();
+            line.push(Span::raw(PREFIX)).tipped(
                 Span::styled(label, theme.status_dim),
-            ]));
+                format!(
+                    "{meaning}\n{TIP_TOGGLE_CLICK}{}{TIP_TOGGLE_EVERY}",
+                    EXPAND_KEY.label
+                ),
+            );
+            lines.push_tipped(line);
         }
     }
     (lines, toggles)
 }
 
-fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>> {
+/// Lifetime rows have no header, so each figure explains its own column.
+fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Content {
     let label_w = slices
         .iter()
         .map(|slice| slice.label.chars().count())
@@ -927,25 +1169,28 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         })
         .collect();
     let [token_w, turns_w, cost_w] = column_widths(&cells, [NUM_COL, TURNS_COL, LIFETIME_COST_COL]);
-    slices
-        .iter()
-        .zip(&cells)
-        .map(|(slice, [tokens, turns, cost])| {
-            Line::from(vec![
-                Span::raw(PREFIX),
-                Span::styled(format!("{:<label_w$}", slice.label), fg),
-                Span::raw(" ".repeat(COL_GAP)),
-                Span::styled(format!("{tokens:>token_w$}"), fg),
-                Span::raw(" ".repeat(COL_GAP)),
+    let gap = || Span::raw(" ".repeat(COL_GAP));
+    let mut lines = Content::default();
+    for (slice, [tokens, turns, cost]) in slices.iter().zip(&cells) {
+        let mut line = TippedLine::default();
+        line.push(Span::raw(PREFIX))
+            .push(Span::styled(format!("{:<label_w$}", slice.label), fg))
+            .push(gap())
+            .tipped(Span::styled(format!("{tokens:>token_w$}"), fg), TIP_TOKENS)
+            .push(gap())
+            .tipped(
                 Span::styled(
                     format!("{:>RATE_COL$}", format_hit_rate(slice.cache_hit_rate())),
                     fg,
                 ),
-                Span::raw(" ".repeat(COL_GAP)),
-                Span::styled(format!("{turns:>turns_w$}"), dim),
-                Span::raw(" ".repeat(COL_GAP)),
-                // A slice can hold both payers, so the column shows what the
-                // work was worth and marks it when none of it was billed.
+                TIP_HIT,
+            )
+            .push(gap())
+            .tipped(Span::styled(format!("{turns:>turns_w$}"), dim), TIP_TURNS)
+            .push(gap())
+            // A slice can hold both payers, so the column shows what the
+            // work was worth and marks it when none of it was billed.
+            .tipped(
                 Span::styled(
                     format!("{cost:>cost_w$}"),
                     if slice.cost == 0.0 && slice.subscription_cost > 0.0 {
@@ -954,19 +1199,19 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
                         fg
                     },
                 ),
-            ])
-        })
-        .collect()
+                TIP_COST,
+            );
+        lines.push_tipped(line);
+    }
+    lines
 }
 
 /// What warming sent and saved, and beside it what it would have done while it
 /// was off. Absent until a conversation has recorded an episode.
-fn warming_lines(
-    summary: Option<&WarmingSummary>,
-    theme: &crate::theme::Theme,
-) -> Vec<Line<'static>> {
+fn warming_lines(summary: Option<&WarmingSummary>, theme: &crate::theme::Theme) -> Content {
+    let mut lines = Content::default();
     let Some(summary) = summary.filter(|summary| !summary.is_empty()) else {
-        return Vec::new();
+        return lines;
     };
     let fg = Style::new().fg(theme.foreground);
     let labels: Vec<String> = summary
@@ -1005,45 +1250,76 @@ fn warming_lines(
         array::from_fn(|index| WARMING_HEADER[index + 1].len()),
     );
     let gap = " ".repeat(COL_GAP);
-    let mut header = format!("{PREFIX}{:<label_w$}", WARMING_HEADER[0]);
-    for (title, width) in WARMING_HEADER[1..].iter().zip(widths) {
-        header.push_str(&format!("{gap}{title:>width$}"));
+    let dim = theme.status_dim;
+    let mut header = TippedLine::default();
+    header.push(Span::styled(PREFIX, dim)).tipped(
+        Span::styled(format!("{:<label_w$}", WARMING_HEADER[0]), dim),
+        WARMING_TIPS[0],
+    );
+    for ((title, width), tip) in WARMING_HEADER[1..]
+        .iter()
+        .zip(widths)
+        .zip(&WARMING_TIPS[1..])
+    {
+        header
+            .push(Span::styled(gap.clone(), dim))
+            .tipped(Span::styled(format!("{title:>width$}"), dim), *tip);
     }
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!("{PREFIX}{WARMING_HEADING}"),
-            theme.keybind_section,
-        )),
-        Line::from(Span::styled(header, theme.status_dim)),
-    ];
-    for ((label, row), totals) in labels.iter().zip(&cells).zip(summary.values()) {
-        let mut text = format!("{PREFIX}{label:<label_w$}");
+    lines.push(Line::default());
+    lines.push_tipped(section_heading(WARMING_HEADING, Some(TIP_WARMING), theme));
+    lines.push_tipped(header);
+    for (((kind, _), totals), (label, row)) in summary.iter().zip(labels.iter().zip(&cells)) {
+        let mut text = String::new();
         for (cell, width) in row.iter().zip(widths) {
             text.push_str(&format!("{gap}{cell:>width$}"));
         }
-        lines.push(Line::from(Span::styled(text, fg)));
-        let outcomes: Vec<String> = totals
-            .outcomes
-            .iter()
-            .map(|(outcome, count)| format!("{} {count}", outcome.as_str()))
-            .collect();
-        lines.push(Line::from(Span::styled(
-            format!("{PREFIX}{PREFIX}{}", outcomes.join(NOTE_SEPARATOR)),
-            theme.status_dim,
-        )));
+        let mut line = TippedLine::default();
+        line.push(Span::styled(PREFIX, fg));
+        let label = Span::styled(format!("{label:<label_w$}"), fg);
+        match kind {
+            EpisodeKind::Real => line.push(label),
+            EpisodeKind::Shadow => line.tipped(label, TIP_SHADOW),
+        };
+        line.push(Span::styled(text, fg));
+        lines.push_tipped(line);
+
+        let mut outcomes = TippedLine::default();
+        outcomes.push(Span::styled(format!("{PREFIX}{PREFIX}"), dim));
+        for (index, (outcome, count)) in totals.outcomes.iter().enumerate() {
+            if index > 0 {
+                outcomes.push(Span::styled(NOTE_SEPARATOR, dim));
+            }
+            outcomes.tipped(
+                Span::styled(format!("{} {count}", outcome.as_str()), dim),
+                outcome_tip(*outcome),
+            );
+        }
+        lines.push_tipped(outcomes);
     }
     let uncalibrated: f64 = summary
         .values()
         .map(|totals| totals.uncalibrated_cost)
         .sum();
     if uncalibrated > 0.0 {
-        lines.push(Line::from(Span::styled(
-            format!("{PREFIX}${uncalibrated:.3}{UNCALIBRATED_NOTE}"),
-            theme.status_dim,
-        )));
+        lines.push_tipped(tipped_note(
+            format!("${uncalibrated:.3}{UNCALIBRATED_NOTE}"),
+            TIP_UNCALIBRATED,
+            dim,
+        ));
     }
     lines
+}
+
+fn outcome_tip(outcome: EpisodeOutcome) -> &'static str {
+    match outcome {
+        EpisodeOutcome::Saved => TIP_SAVED,
+        EpisodeOutcome::Marginal => TIP_MARGINAL,
+        EpisodeOutcome::Unneeded => TIP_UNNEEDED,
+        EpisodeOutcome::Missed => TIP_MISSED,
+        EpisodeOutcome::Lapsed => TIP_LAPSED,
+        EpisodeOutcome::Unused => TIP_UNUSED,
+        EpisodeOutcome::Wrote => TIP_WROTE,
+    }
 }
 
 /// Subscription spend worth reporting: none at all draws nothing, rather than
@@ -1052,44 +1328,44 @@ fn covered_spend(cost: Option<f64>) -> Option<f64> {
     cost.filter(|cost| *cost > 0.0)
 }
 
+/// The totals with the bill beside them, and under it what a subscription
+/// covered beside the legend that explains its mark.
 fn spend_lines(
-    totals: Vec<Span<'static>>,
+    totals: TippedLine,
     billed: Option<f64>,
     covered: Option<f64>,
     decimals: usize,
     theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut legend = subscription_legend(covered, theme);
-    let billed = billed.map(|cost| format!("${cost:.decimals$}"));
-    let covered = covered.map(|cost| format!("{NOT_BILLED_MARK}${cost:.decimals$}"));
+) -> Content {
+    let legend = subscription_legend(covered, theme);
+    let billed = billed.map(|cost| (format!("${cost:.decimals$}"), TIP_BILLED));
+    let covered = covered.map(|cost| (format!("{NOT_BILLED_MARK}${cost:.decimals$}"), TIP_COVERED));
     let amounts: Vec<_> = [billed, covered]
         .into_iter()
         .flatten()
-        .map(|text| Span::styled(text, theme.accent))
+        .map(|(text, tip)| (Span::styled(text, theme.accent), tip))
         .collect();
-    let width = amounts.iter().map(Span::width).max().unwrap_or_default();
-    let mut lines = vec![Line::from(totals)];
-    let offset = lines[0].width().max(
+    let width = amounts
+        .iter()
+        .map(|(amount, _)| amount.width())
+        .max()
+        .unwrap_or_default();
+    let offset = totals.width().max(
         legend
             .as_ref()
             .filter(|_| amounts.len() == 2)
             .map_or(0, Line::width),
     ) + COL_GAP;
-    for (index, amount) in amounts.into_iter().enumerate() {
-        let padding = width - amount.width();
-        if index == 0 {
-            let spacing = offset + padding - lines[0].width();
-            lines[0].spans.push(Span::raw(" ".repeat(spacing)));
-            lines[0].spans.push(amount);
-        } else {
-            let mut line = legend.take().unwrap_or_default();
-            line.spans
-                .push(Span::raw(" ".repeat(offset + padding - line.width())));
-            line.spans.push(amount);
-            lines.push(line);
-        }
+    let mut rows = vec![totals];
+    rows.extend(legend.map(TippedLine::from));
+    for (row, (amount, tip)) in rows.iter_mut().zip(amounts) {
+        let spacing = offset + width - amount.width() - row.width();
+        row.push(Span::raw(" ".repeat(spacing))).tipped(amount, tip);
     }
-    lines.extend(legend);
+    let mut lines = Content::default();
+    for row in rows {
+        lines.push_tipped(row);
+    }
     lines
 }
 
@@ -1102,22 +1378,56 @@ fn subscription_legend(covered: Option<f64>, theme: &Theme) -> Option<Line<'stat
     )))
 }
 
-fn totals_row(total: &TokenUsage, theme: &Theme) -> Vec<Span<'static>> {
-    vec![
-        Span::raw(PREFIX),
-        Span::styled(
-            format!(
-                "base in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7} hit {:<4}",
-                format_tokens(total.input),
-                format_tokens(total.output),
+fn totals_row(total: &TokenUsage, theme: &Theme) -> TippedLine {
+    headline(
+        [
+            ("base in", format_tokens(total.input), NUM_COL, TIP_BASE_IN),
+            ("out", format_tokens(total.output), NUM_COL, TIP_OUT),
+            (
+                "cache read",
                 format_tokens(total.cache_read),
-                format_tokens(total.cache_creation),
-                format_tokens(total.context_tokens()),
-                format_hit_rate(total.cache_hit_rate()),
+                NUM_COL,
+                TIP_CACHE_READ,
             ),
-            Style::new().fg(theme.foreground),
-        ),
-    ]
+            (
+                "cache write",
+                format_tokens(total.cache_creation),
+                NUM_COL,
+                TIP_CACHE_WRITE,
+            ),
+            (
+                "total",
+                format_tokens(total.context_tokens()),
+                NUM_COL,
+                TIP_TOTAL,
+            ),
+            (
+                "hit",
+                format_hit_rate(total.cache_hit_rate()),
+                RATE_COL,
+                TIP_HIT,
+            ),
+        ],
+        theme,
+    )
+}
+
+/// A totals line, one span per `(label, value, width, tip)` field so each
+/// explains itself, spaced exactly as one formatted string would be.
+fn headline<const N: usize>(
+    fields: [(&str, String, usize, &'static str); N],
+    theme: &Theme,
+) -> TippedLine {
+    let fg = Style::new().fg(theme.foreground);
+    let mut line = TippedLine::default();
+    line.push(Span::raw(PREFIX));
+    for (index, (label, value, width, tip)) in fields.into_iter().enumerate() {
+        if index > 0 {
+            line.push(Span::styled(" ", fg));
+        }
+        line.tipped(Span::styled(format!("{label} {value:<width$}"), fg), tip);
+    }
+    line
 }
 
 fn table_tokens(tokens: u64) -> String {
@@ -1163,33 +1473,36 @@ fn breakdown_cells(row: &BreakdownRow) -> [String; 6] {
     ]
 }
 
+/// Each column's title, explained by what it counts.
 fn header_row(
     column: &str,
+    label_tip: Option<&'static str>,
     label_w: usize,
     widths: &[usize; 6],
     theme: &crate::theme::Theme,
-) -> Vec<Span<'static>> {
+) -> TippedLine {
     let [input_w, output_w, read_w, write_w, total_w, cost_w] = *widths;
-    let h = |label: &str, width: usize| Span::styled(format!("{label:>width$}"), theme.status_dim);
-    let gap = || Span::raw(" ".repeat(COL_GAP));
-    vec![
-        Span::raw(PREFIX),
-        Span::styled(format!("{column:label_w$}"), theme.status_dim),
-        gap(),
-        h("base in", input_w),
-        gap(),
-        h("out", output_w),
-        gap(),
-        h("cache read", read_w),
-        gap(),
-        h("cache write", write_w),
-        gap(),
-        h("total", total_w),
-        gap(),
-        Span::styled(format!("{:>RATE_COL$}", "hit"), theme.status_dim),
-        gap(),
-        h("cost", cost_w),
-    ]
+    let dim = theme.status_dim;
+    let mut line = TippedLine::default();
+    line.push(Span::raw(PREFIX));
+    let label = Span::styled(format!("{column:label_w$}"), dim);
+    match label_tip {
+        Some(tip) => line.tipped(label, tip),
+        None => line.push(label),
+    };
+    for (title, width, tip) in [
+        ("base in", input_w, TIP_BASE_IN),
+        ("out", output_w, TIP_OUT),
+        ("cache read", read_w, TIP_CACHE_READ),
+        ("cache write", write_w, TIP_CACHE_WRITE),
+        ("total", total_w, TIP_TOTAL),
+        ("hit", RATE_COL, TIP_HIT),
+        ("cost", cost_w, TIP_COST),
+    ] {
+        line.push(Span::raw(" ".repeat(COL_GAP)))
+            .tipped(Span::styled(format!("{title:>width$}"), dim), tip);
+    }
+    line
 }
 
 fn model_row(
@@ -1235,22 +1548,10 @@ impl crate::components::Overlay for UsageModal {
         Some(DocsTopic::Usage)
     }
 
-    /// Mirrors `title_line`, so a tip always explains the gloss drawn beside it.
+    /// A title control first, then whatever explained span the pointer rests on.
     fn tooltip(&self) -> Option<Tip> {
-        self.title.title_tip(|index| {
-            let (meaning, bind) = match self.title_actions.get(index)? {
-                TitleAction::Reload => (TIP_RELOAD.into(), key::REFRESH),
-                TitleAction::Scope => match self.scope {
-                    UsageScope::Session => (TIP_LIFETIME.into(), SCOPE_KEY),
-                    UsageScope::Lifetime => (TIP_SESSION.into(), SCOPE_KEY),
-                },
-                TitleAction::Expand => match self.expanded.is_empty() {
-                    true => (format!("{TIP_MORE}{SLICE_LIMIT}"), EXPAND_KEY),
-                    false => (format!("{TIP_LESS}{SLICE_LIMIT}"), EXPAND_KEY),
-                },
-            };
-            Some(control_tip(&meaning, bind.label))
-        })
+        self.title_tip()
+            .or_else(|| area_tip(&self.body_tips, self.pointer))
     }
 
     fn is_open(&self) -> bool {
@@ -1269,11 +1570,16 @@ fn quota_lines(
     theme: &crate::theme::Theme,
     clock: ClockFormat,
     now: Timestamp,
-) -> Vec<Line<'static>> {
+) -> Content {
     let dim = theme.status_dim;
     let note = |text: String| Line::from(Span::styled(format!("{PREFIX}{text}"), dim));
+    let alone = |line: Line<'static>| {
+        let mut out = Content::default();
+        out.push(line);
+        out
+    };
     match state {
-        UsageFetchState::Loading { last: None } => vec![note(LOADING.into())],
+        UsageFetchState::Loading { last: None } => alone(note(LOADING.into())),
         UsageFetchState::Loading {
             last: Some(fetched),
         } => {
@@ -1284,7 +1590,7 @@ fn quota_lines(
             )));
             out
         }
-        UsageFetchState::Unsupported => vec![note(NO_USAGE_ENDPOINT.into())],
+        UsageFetchState::Unsupported => alone(note(NO_USAGE_ENDPOINT.into())),
         UsageFetchState::Ready(fetched) => {
             let mut out = limit_lines(&fetched.usage, theme, clock);
             out.push(aged_note(
@@ -1310,7 +1616,7 @@ fn quota_lines(
                 text.push_str(&format!("{NOTE_SEPARATOR}retry {}", retry_wait(wait)));
             }
             let Some(fetched) = last else {
-                return vec![note(text)];
+                return alone(note(text));
             };
             let mut out = limit_lines(&fetched.usage, theme, clock);
             text.push_str(NOTE_SEPARATOR);
@@ -1326,7 +1632,7 @@ fn quota_lines(
 
 /// Where each account stands as of its latest reading, which the quota above
 /// covers for one of them only.
-fn account_lines(accounts: &[AccountStatus], theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+fn account_lines(accounts: &[AccountStatus], theme: &crate::theme::Theme) -> Content {
     let now_ms = u64::try_from(Timestamp::now().as_millisecond()).unwrap_or_default();
     let fg = Style::new().fg(theme.foreground);
     let width = accounts
@@ -1334,27 +1640,23 @@ fn account_lines(accounts: &[AccountStatus], theme: &crate::theme::Theme) -> Vec
         .map(|account| account.name.chars().count())
         .max()
         .unwrap_or_default();
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!("{PREFIX}{ACCOUNTS_TITLE}"),
-            theme.keybind_section,
-        )),
-    ];
-    lines.extend(accounts.iter().map(|account| {
-        Line::from(vec![
+    let mut lines = Content::default();
+    lines.push(Line::default());
+    lines.push_tipped(section_heading(ACCOUNTS_TITLE, Some(TIP_ACCOUNTS), theme));
+    for account in accounts {
+        lines.push(Line::from(vec![
             Span::styled(format!("{PREFIX}{:<width$}", account.name), fg),
             Span::styled(
                 format!("  {}", account_detail(account, now_ms)),
                 theme.status_dim,
             ),
-        ])
-    }));
+        ]));
+    }
     lines
 }
 
 /// The figures' age is the line's last span on its own, which is what
-/// [`refresh_hit`] measures and the pointer marks.
+/// [`span_hit`] measures and the pointer marks.
 fn aged_note(lead: String, age: String, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{PREFIX}{lead}"), style),
@@ -1362,14 +1664,10 @@ fn aged_note(lead: String, age: String, style: Style) -> Line<'static> {
     ])
 }
 
-fn limit_lines(
-    usage: &ProviderUsage,
-    theme: &crate::theme::Theme,
-    clock: ClockFormat,
-) -> Vec<Line<'static>> {
+fn limit_lines(usage: &ProviderUsage, theme: &crate::theme::Theme, clock: ClockFormat) -> Content {
     let fg = Style::new().fg(theme.foreground);
     let dim = theme.status_dim;
-    let mut out = Vec::with_capacity(usage.limits.len() + 2);
+    let mut out = Content::default();
     if let Some(plan) = &usage.plan {
         out.push(Line::from(Span::styled(
             format!("{PREFIX}plan: {plan}"),
@@ -1384,24 +1682,25 @@ fn limit_lines(
         .max()
         .unwrap_or(0);
     for limit in &usage.limits {
-        let mut spans = vec![Span::styled(
+        let mut line = TippedLine::default();
+        line.push(Span::styled(
             format!("{PREFIX}{:<label_w$}", limit.label),
             fg,
-        )];
+        ));
         if let Some(pct) = limit.percentage {
-            spans.push(Span::styled(format!("{pct:>3}%"), theme.accent));
-            spans.push(Span::styled(" used", dim));
+            line.tipped(Span::styled(format!("{pct:>3}%"), theme.accent), TIP_USED)
+                .tipped(Span::styled(" used", dim), TIP_USED);
         }
         if let Some(detail) = &limit.detail {
-            spans.push(Span::styled(format!("  {detail}"), dim));
+            line.push(Span::styled(format!("  {detail}"), dim));
         }
         if let Some(ms) = limit.reset_at {
-            spans.push(Span::styled(
-                format!("  Resets {}", format_reset(ms, &tz, clock)),
-                dim,
-            ));
+            line.tipped(
+                Span::styled(format!("  Resets {}", format_reset(ms, &tz, clock)), dim),
+                TIP_RESETS,
+            );
         }
-        out.push(Line::from(spans));
+        out.push_tipped(line);
     }
     out
 }
@@ -1626,7 +1925,9 @@ mod tests {
     #[test_case(Some(WarmingSummary::new()) ; "empty")]
     fn warming_is_absent_without_episodes(summary: Option<WarmingSummary>) {
         assert!(
-            warming_lines(summary.as_ref(), &crate::theme::current()).is_empty(),
+            warming_lines(summary.as_ref(), &crate::theme::current())
+                .lines
+                .is_empty(),
             "{WARMING_ABSENT}"
         );
     }
@@ -1634,7 +1935,7 @@ mod tests {
     #[test]
     fn warming_rows_tell_real_from_estimated() {
         let summary = warming_summary();
-        let texts = line_texts(&warming_lines(Some(&summary), &crate::theme::current()));
+        let texts = line_texts(&warming_lines(Some(&summary), &crate::theme::current()).lines);
         let row = |label: &str| {
             texts
                 .iter()
@@ -1701,7 +2002,7 @@ mod tests {
         if providers {
             rows = provider_rows(&rows, FOREIGN_PROVIDER);
         }
-        let lines = breakdown_table(PROVIDER_HEADING, PROVIDER_COLUMN, &rows, &theme);
+        let lines = breakdown_table(PROVIDER_HEADING, PROVIDER_COLUMN, &rows, &theme).lines;
         let header = &lines[TABLE_HEADER];
         for line in &lines[TABLE_BODY..] {
             assert_eq!(line.width(), header.width(), "{DECIMAL_ALIGNMENT}");
@@ -1760,7 +2061,7 @@ mod tests {
             ..UsageSlice::default()
         })
         .collect();
-        let lines = slice_rows(&slices, fg, theme.status_dim);
+        let lines = slice_rows(&slices, fg, theme.status_dim).lines;
         let expected_costs = if subscription {
             [" \u{2248}120.646", "   \u{2248}0.002", "\u{2248}1000.000"]
         } else {
@@ -1796,7 +2097,8 @@ mod tests {
         if mixed {
             slices[0].subscription_cost = SUBSCRIPTION_COST;
         }
-        let visible = slice_rows(&slices, Style::new().fg(theme.foreground), theme.status_dim);
+        let visible =
+            slice_rows(&slices, Style::new().fg(theme.foreground), theme.status_dim).lines;
         let wide = UsageSlice {
             label: LONG_MODEL.to_owned(),
             tokens: u64::MAX,
@@ -1810,7 +2112,8 @@ mod tests {
             ..lifetime()
         };
 
-        let (lines, toggles) = build_lifetime_lines(Some(&usage), &HashSet::new(), &theme);
+        let (Content { lines, .. }, toggles) =
+            build_lifetime_lines(Some(&usage), &HashSet::new(), &theme);
 
         let [(toggle, LifetimeSection::Model)] = toggles[..] else {
             panic!("only the model breakdown is long enough to cap: {toggles:?}");
@@ -1860,7 +2163,11 @@ mod tests {
     }
 
     fn lifetime_texts(lifetime: Option<&LifetimeUsage>) -> Vec<String> {
-        line_texts(&build_lifetime_lines(lifetime, &HashSet::new(), &crate::theme::current()).0)
+        line_texts(
+            &build_lifetime_lines(lifetime, &HashSet::new(), &crate::theme::current())
+                .0
+                .lines,
+        )
     }
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -2019,7 +2326,7 @@ mod tests {
             by_model: numbered(LIFETIME_MODEL, COLLAPSE_ABOVE),
             ..lifetime()
         };
-        let (lines, toggles) =
+        let (Content { lines, .. }, toggles) =
             build_lifetime_lines(Some(&usage), &HashSet::new(), &crate::theme::current());
         let texts = line_texts(&lines).join("\n");
         assert!(toggles.is_empty(), "{NONE_HIDDEN}: {texts}");
@@ -2038,7 +2345,7 @@ mod tests {
             by_purpose: numbered(GOAL_PURPOSE, purposes),
             ..lifetime()
         };
-        let (lines, toggles) =
+        let (Content { lines, .. }, toggles) =
             build_lifetime_lines(Some(&usage), &HashSet::new(), &crate::theme::current());
         let texts = line_texts(&lines).join("\n");
         assert!(toggles.is_empty(), "{PURPOSES_WHOLE}: {texts}");
@@ -2114,7 +2421,8 @@ mod tests {
         shown_models(&mut modal, &usage);
 
         modal.handle_key(EXPAND_KEY.to_key_event());
-        let (lines, toggles) = build_lifetime_lines(Some(&usage), &modal.expanded, &theme);
+        let (Content { lines, .. }, toggles) =
+            build_lifetime_lines(Some(&usage), &modal.expanded, &theme);
         assert_eq!(toggles.len(), 2);
         assert!(
             toggles
@@ -2255,7 +2563,7 @@ mod tests {
             accounts: &[],
             warming: None,
         };
-        let rows = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
+        let rows = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0.lines);
 
         let heading = rows
             .iter()
@@ -2370,7 +2678,7 @@ mod tests {
             .unwrap();
         assert_eq!(chat.usage, ALL_BUCKETS);
 
-        let lines = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0);
+        let lines = line_texts(&build_lines(&ctx, None, &crate::theme::current()).0.lines);
         assert_eq!(
             lines.iter().any(|line| line.ends_with(PROVIDER_HEADING)),
             legacy
@@ -2485,7 +2793,7 @@ mod tests {
 
     fn quota_text(state: &UsageFetchState, now: Timestamp) -> Vec<String> {
         let theme = crate::theme::current();
-        lines_text(&quota_lines(state, &theme, ClockFormat::Hour24, now))
+        lines_text(&quota_lines(state, &theme, ClockFormat::Hour24, now).lines)
     }
 
     #[test]
@@ -2534,7 +2842,8 @@ mod tests {
             &theme,
             ClockFormat::Hour24,
             quota_now(),
-        );
+        )
+        .lines;
         assert_eq!(lines.len(), 4);
         assert!(
             lines[0]
@@ -2717,7 +3026,7 @@ mod tests {
             accounts: &[],
             warming: None,
         };
-        line_texts(&build_lines(&ctx, None, &crate::theme::current()).0)
+        line_texts(&build_lines(&ctx, None, &crate::theme::current()).0.lines)
     }
 
     #[test_case(false; "single_provider")]
@@ -2773,7 +3082,7 @@ mod tests {
         let theme = crate::theme::current();
         let total = TokenUsage::from(ALL_BUCKETS);
         let rows = match scope {
-            UsageScope::Session => line_texts(&[Line::from(totals_row(&total, &theme))]),
+            UsageScope::Session => line_texts(&[Line::from(totals_row(&total, &theme).spans)]),
             UsageScope::Lifetime => lifetime_texts(Some(&LifetimeUsage {
                 input: u64::from(total.input),
                 output: u64::from(total.output),
@@ -3462,7 +3771,109 @@ mod tests {
         expected: Option<Rect>,
     ) {
         let line = aged_note(AGE_LEAD.into(), AGE_PHRASE.into(), Style::new());
-        assert_eq!(last_span_hit(&line, row, area, scroll, pan), expected);
+        assert_eq!(
+            span_hit(&line, line.spans.len() - 1, row, area, scroll, pan),
+            expected
+        );
+    }
+
+    /// A span in the middle of a line starts after every span before it, and
+    /// panning clips it like the last one.
+    #[test_case(0, Some(Rect::new(17, 6, 11, 1)) ; "unpanned")]
+    #[test_case(10, Some(Rect::new(10, 6, 8, 1)) ; "panned_into")]
+    #[test_case(18, None ; "panned_past")]
+    fn a_middle_span_hit_starts_after_the_spans_before_it(pan: u16, expected: Option<Rect>) {
+        let line = Line::from(vec![
+            Span::raw(AGE_LEAD),
+            Span::raw(AGE_PHRASE),
+            Span::raw(AGE_LEAD),
+        ]);
+        assert_eq!(span_hit(&line, 1, 1, AGE_AREA, 0, pan), expected);
+    }
+
+    const TIP_OFF_GLYPHS: &str = "a tip must cover the glyphs it explains";
+    const BODY_TIP_MISSING: &str = "the hovered span must raise its tip";
+
+    fn hover(modal: &mut UsageModal, at: Rect) -> Option<Tip> {
+        modal.handle_mouse(&pointer(MouseEventKind::Moved, at));
+        Overlay::tooltip(modal)
+    }
+
+    fn drawn_text(buffer: &Buffer, area: Rect) -> String {
+        area.positions().map(|at| buffer[at].symbol()).collect()
+    }
+
+    /// Every column and figure answers the pointer, and each answer sits on
+    /// the very cells that name it, in the header and in the headline alike.
+    #[test_case(TIP_BASE_IN, BASE_INPUT_LABEL ; "base_input")]
+    #[test_case(TIP_CACHE_READ, "cache read" ; "cache_read")]
+    #[test_case(TIP_HIT, "hit" ; "hit")]
+    #[test_case(TIP_COST, "cost" ; "cost")]
+    fn a_column_explains_itself_where_it_is_drawn(tip: &str, label: &str) {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let buffer = draw_at(&mut modal, WIDE_TERMINAL, &wide_breakdown());
+        let areas: Vec<Rect> = modal
+            .body_tips
+            .iter()
+            .filter(|area| area.text == tip)
+            .map(|area| area.area)
+            .collect();
+
+        assert!(!areas.is_empty(), "{BODY_TIP_MISSING}");
+        for area in &areas {
+            let text = drawn_text(&buffer, *area);
+            assert!(text.trim().starts_with(label), "{TIP_OFF_GLYPHS}: {text:?}");
+        }
+        let shown = hover(&mut modal, areas[0]).expect(BODY_TIP_MISSING);
+        assert_eq!(shown.text, tip);
+    }
+
+    #[test]
+    fn the_quota_age_says_a_click_asks_again() {
+        let mut modal = opened_on(UsageFetchState::Ready(fetched()));
+        draw_at(&mut modal, WIDE_TERMINAL, &HashMap::new());
+        let age = modal.refresh.hit(0);
+
+        let tip = hover(&mut modal, age).expect(BODY_TIP_MISSING);
+
+        assert_eq!(tip.text, TIP_REFRESH_AGE);
+    }
+
+    #[test]
+    fn a_more_line_says_what_its_click_shows() {
+        let usage = long_lifetime();
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        modal.handle_key(SCOPE_KEY.to_key_event());
+        shown_models(&mut modal, &usage);
+        let more = modal.toggles.hit(0);
+
+        let tip = hover(&mut modal, more).expect(BODY_TIP_MISSING);
+
+        assert!(tip.text.starts_with(TIP_SHOW_ALL), "{}", tip.text);
+        assert!(tip.text.ends_with(TIP_TOGGLE_EVERY), "{}", tip.text);
+    }
+
+    /// The headline is drawn one span per figure so each can explain itself,
+    /// and must still read exactly as the one formatted line it replaced.
+    #[test]
+    fn a_split_headline_reads_as_one_formatted_line() {
+        let theme = crate::theme::current();
+        let total = TokenUsage::from(ALL_BUCKETS);
+        let whole = format!(
+            "{PREFIX}base in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7} hit {:<4}",
+            format_tokens(total.input),
+            format_tokens(total.output),
+            format_tokens(total.cache_read),
+            format_tokens(total.cache_creation),
+            format_tokens(total.context_tokens()),
+            format_hit_rate(total.cache_hit_rate()),
+        );
+
+        let split = line_texts(&[Line::from(totals_row(&total, &theme).spans)]);
+
+        assert_eq!(split, [whole]);
     }
 
     #[test]

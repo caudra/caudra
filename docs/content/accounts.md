@@ -139,7 +139,7 @@ In the TUI, a move changes the model of every session, as choosing a model does,
 | `Alt+↑` / `Alt+↓` | Move the account's provider in the order across providers |
 | `Ctrl+R` | Ask each account for a new quota reading |
 
-Each key acts on the provider of the selected account. The first `o` on another provider's account lists the current model's provider first and that provider second.
+Each key acts on the provider of the selected account. The first `o` on another provider's account lists the current model's provider first and that provider second. The footer lists these keys. Click one to press it, or rest the pointer on it to see what it does.
 
 The orders and the strategy are saved to `providers.toml`, which keeps its comments. Moving an account adds entries for the saved accounts the file does not list yet.
 

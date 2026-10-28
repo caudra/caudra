@@ -799,19 +799,22 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     /// The whole label and detail of the row under the pointer, when the row
-    /// was drawn short of either. A row that fits says nothing a box could add.
+    /// was drawn short of either, or what the footer hint under it does. A row
+    /// that fits says nothing a box could add.
     pub(crate) fn tooltip(&self) -> Option<Tip> {
         let state = self.state.as_ref()?;
-        let pointer = state.pointer?;
-        let hit = state
-            .row_hits
-            .iter()
-            .find(|hit| hit.area.contains(pointer))
-            .filter(|hit| hit.clipped)?;
-        Some(Tip {
-            key: TipKey::Row(hit.area),
-            anchor: Anchor::Area(hit.area),
-            text: uncut_text(state.items.get(hit.item_index)?),
+        state.footer.tooltip().or_else(|| {
+            let pointer = state.pointer?;
+            let hit = state
+                .row_hits
+                .iter()
+                .find(|hit| hit.area.contains(pointer))
+                .filter(|hit| hit.clipped)?;
+            Some(Tip {
+                key: TipKey::Row(hit.area),
+                anchor: Anchor::Area(hit.area),
+                text: uncut_text(state.items.get(hit.item_index)?),
+            })
         })
     }
 

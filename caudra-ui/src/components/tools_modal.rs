@@ -18,7 +18,7 @@ use crate::components::input::control_tip;
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::tooltip::Tip;
+use crate::components::tooltip::{Tip, TipKey};
 use crate::components::{ModalScroll, Overlay, bar_area, escape_terminal_controls};
 use crate::theme::{self, Theme};
 
@@ -338,8 +338,9 @@ impl Overlay for ToolsModal {
     }
 
     fn tooltip(&self) -> Option<Tip> {
-        self.title
-            .title_tip(|_| Some(control_tip(self.scope.tip(), key::SCOPE.label)))
+        self.title.tip(TipKey::TitleHint, |_| {
+            Some(control_tip(self.scope.tip(), key::SCOPE.label))
+        })
     }
 
     fn is_open(&self) -> bool {

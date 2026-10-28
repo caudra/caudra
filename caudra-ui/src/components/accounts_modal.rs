@@ -62,6 +62,25 @@ const ORDER_ARROW: &str = " → ";
 const ORDER_HINT: &str = "o adds or drops a provider, Alt+↑↓ moves it.";
 const SAME_PROVIDER: &str =
     "Select another provider's account: o lets Auto move conversations there.";
+/// The group hint for [`MOVE_UP_KEY`] and [`MOVE_DOWN_KEY`].
+const ORDER_KEYS: &str = "Ctrl+↑↓";
+const TIP_USE: &str = "Pins the selected account so every request goes to it. On a signed-out account, signs in again";
+const TIP_AUTO: &str =
+    "Turns on Auto: requests move between this provider's accounts as their quotas run low";
+const TIP_ADD: &str = "Signs in to another account for this provider";
+const TIP_RENAME: &str = "Renames the selected account";
+const TIP_REMOVE: &str =
+    "Signs out of the selected account and removes its providers.toml entry. Asks twice";
+const TIP_ORDER: &str = "Moves the selected account up or down the order Auto tries";
+const TIP_STRATEGY: &str = "Switches Auto between ordered (top to bottom) and paced (the account furthest ahead of its quota)";
+const TIP_ACROSS: &str = "Adds the selected account's provider to the order Auto moves conversations across, or drops it. Alt+↑↓ moves it";
+const TIP_REFRESH: &str = "Asks each subscription for a new quota reading";
+const TIP_CLOSE: &str = "Closes the accounts list";
+const TIP_SAVE_NAME: &str = "Saves the new name";
+const TIP_KEEP_NAME: &str = "Keeps the old name and goes back to the list";
+const TIP_CARD_SELECT: &str = "Moves between the choices";
+const TIP_CARD_CHOOSE: &str = "Takes the highlighted choice";
+const TIP_CARD_WAIT: &str = "Closes the card and lets the request wait for the account to refill";
 
 const AUTO_KEY: Bind = letter('a', "a");
 const ADD_KEY: Bind = letter('n', "n");
@@ -1201,41 +1220,42 @@ fn card_rows(exhaustion: &AccountExhaustion, now_ms: u64, clock: ClockFormat) ->
 
 fn list_footer() -> Vec<Hint> {
     vec![
-        Hint::bind(key::ENTER, "use"),
-        Hint::bind(AUTO_KEY, "auto"),
-        Hint::bind(ADD_KEY, "add"),
-        Hint::bind(RENAME_KEY, "rename"),
-        Hint::bind(REMOVE_KEY, "remove"),
-        Hint::inert("Ctrl+↑↓", "order"),
-        Hint::bind(STRATEGY_KEY, "strategy"),
-        Hint::bind(ORDER_KEY, "across providers"),
-        Hint::bind(key::REFRESH, "refresh"),
-        Hint::bind(key::ESC, "close"),
+        Hint::bind(key::ENTER, "use").tip(TIP_USE),
+        Hint::bind(AUTO_KEY, "auto").tip(TIP_AUTO),
+        Hint::bind(ADD_KEY, "add").tip(TIP_ADD),
+        Hint::bind(RENAME_KEY, "rename").tip(TIP_RENAME),
+        Hint::bind(REMOVE_KEY, "remove").tip(TIP_REMOVE),
+        Hint::inert(ORDER_KEYS, "order").tip(TIP_ORDER),
+        Hint::bind(STRATEGY_KEY, "strategy").tip(TIP_STRATEGY),
+        Hint::bind(ORDER_KEY, "across providers").tip(TIP_ACROSS),
+        Hint::bind(key::REFRESH, "refresh").tip(TIP_REFRESH),
+        Hint::bind(key::ESC, "close").tip(TIP_CLOSE),
     ]
 }
 
 fn rename_footer() -> Vec<Hint> {
     vec![
-        Hint::bind(key::ENTER, "rename"),
-        Hint::bind(key::ESC, "cancel"),
+        Hint::bind(key::ENTER, "rename").tip(TIP_SAVE_NAME),
+        Hint::bind(key::ESC, "cancel").tip(TIP_KEEP_NAME),
     ]
 }
 
 fn card_footer() -> Vec<Hint> {
     vec![
-        Hint::inert("↑↓", "select"),
-        Hint::bind(key::ENTER, "choose"),
-        Hint::bind(key::ESC, "wait"),
+        Hint::inert("↑↓", "select").tip(TIP_CARD_SELECT),
+        Hint::bind(key::ENTER, "choose").tip(TIP_CARD_CHOOSE),
+        Hint::bind(key::ESC, "wait").tip(TIP_CARD_WAIT),
     ]
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use caudra_providers::accounts::{AccountAlternative, WindowKind};
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyEvent, MouseEventKind};
     use test_case::test_case;
 
     use super::*;
+    use crate::components::input::{CLICK_OR_PRESS, PRESS};
 
     const PROVIDER: &str = "anthropic";
     const DISPLAY: &str = "Anthropic";
@@ -1407,6 +1427,64 @@ pub(crate) mod tests {
         let mut modal = AccountsModal::new();
         modal.open(view);
         modal
+    }
+
+    const SCREEN: Rect = Rect::new(0, 0, 200, 30);
+    const HINT_UNEXPLAINED: &str = "every footer hint must say what a click on it does";
+    const HINT_NOT_DRAWN: &str = "the footer hint must be on screen to be hovered";
+
+    #[test_case(list_footer ; "list")]
+    #[test_case(rename_footer ; "rename")]
+    #[test_case(card_footer ; "card")]
+    fn every_footer_hint_explains_itself(footer: fn() -> Vec<Hint>) {
+        for hint in footer() {
+            assert!(hint.has_tip(), "{HINT_UNEXPLAINED}: {}", hint.label());
+        }
+    }
+
+    /// Where `text` was drawn, searched from the bottom up so the footer is
+    /// found before any body line that happens to share a word with it.
+    fn drawn_at(modal: &mut AccountsModal, text: &str) -> Position {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            SCREEN.width,
+            SCREEN.height,
+        ))
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (SCREEN.top()..SCREEN.bottom())
+            .rev()
+            .find_map(|y| {
+                let cells: Vec<char> = (SCREEN.left()..SCREEN.right())
+                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                let at = cells
+                    .windows(text.chars().count())
+                    .position(|window| window.iter().copied().eq(text.chars()))?;
+                Some(Position::new(u16::try_from(at).ok()?, y))
+            })
+            .expect(HINT_NOT_DRAWN)
+    }
+
+    #[test_case("remove", TIP_REMOVE, CLICK_OR_PRESS, REMOVE_KEY.label ; "a_key_says_what_its_click_does")]
+    #[test_case("order", TIP_ORDER, PRESS, ORDER_KEYS ; "a_group_hint_names_its_keys")]
+    fn hovering_a_footer_hint_explains_it(gloss: &str, meaning: &str, how: &str, label: &str) {
+        let mut modal = opened(pool());
+        let at = drawn_at(&mut modal, gloss);
+
+        modal.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let tip = modal.tooltip().expect(HINT_UNEXPLAINED);
+        assert_eq!(tip.text, format!("{meaning}\n{how}{label}"));
     }
 
     #[test]
