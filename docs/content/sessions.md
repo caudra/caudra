@@ -54,6 +54,8 @@ One-shot `--print` always waits: tasks and shell commands have no `background` a
 
 The parent can keep working on a separate scope. When nothing independent remains, it gives a normal final answer explaining what is still pending. Background reports and final outcomes then start another parent run automatically at a safe boundary, even after that answer. The parent checks them against the latest instructions, verifies claims, and continues the original work without asking whether to continue. This works while the session stays open and automatic continuation has not been stopped. There is no need to poll, sleep, or repeat the delegated work.
 
+A finished task keeps its result while the session database is busy, for example when many sessions write at once. Caudra retries the save with a growing delay of up to 30 seconds and delivers the result once, after a save succeeds. The footer shows a retry notice until then. Other save errors still stop background work. A result that an earlier release lost to a busy database is recovered when the session is reopened. See [Resuming after a restart](#resuming-after-a-restart).
+
 The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns. The reminder about a [long-running background shell](/docs/context/#long-running-background-shells) does, like a result.
 
 The footer keeps a differently styled spinner and a `waiting for background work` message while background work or result delivery will wake the main agent. A crowded footer shortens the message to `waiting`. It does not mean a model request is running. Queued next messages and goal checks wait until that work settles and the main agent processes its results. See [Queue and Steering](/docs/queue/) for guide and replace behavior.
@@ -134,6 +136,8 @@ What resumes:
 
 - The main turn, when one was running. It continues from its saved transcript.
 - Every agent task the main chat started, foreground or background. Each task keeps its task ID and continues from the transcript it saved while it ran, at most one second old. A task that ran in the foreground resumes in the background, and its result arrives as a report.
+
+A task that had finished, but whose result was lost to a busy database before this release, is delivered once from its saved transcript. Automatic wakes stopped by that failure are turned back on. Wakes you stopped yourself stay stopped.
 
 Shell commands, questions, and workflow runs are not run again. A command that was running when Caudra stopped gets a result that names the command and its directory and says its outcome is unknown. Processes it detached may still be running.
 
