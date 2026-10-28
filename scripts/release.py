@@ -35,6 +35,7 @@ SEMVER = re.compile(
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION_INHERITANCE_ERROR = "package.version must inherit workspace.package.version"
+HAKARI_CONFIG = Path(".config/hakari.toml")
 NOTES_LIMIT = 64 * 1024
 MANIFEST_LIMIT = 8 * 1024 * 1024
 ATTRIBUTION_LIMIT = 128 * 1024 * 1024
@@ -223,13 +224,25 @@ def assert_release_policy(release: dict, layout: str) -> None:
     )
 
 
+def hakari_package(root: Path) -> str | None:
+    """The package `cargo hakari` generates, whose manifest it owns."""
+    config = root / HAKARI_CONFIG
+    if not config.is_file():
+        return None
+    with config.open("rb") as file:
+        return tomllib.load(file).get("hakari-package")
+
+
 def validate_workspace_versions(root: Path) -> str:
     with (root / "Cargo.toml").open("rb") as manifest:
         workspace = tomllib.load(manifest)["workspace"]
+    generated = hakari_package(root)
     for member in (".", *workspace["members"]):
         path = Path(member) / "Cargo.toml"
         with (root / path).open("rb") as manifest:
             package = tomllib.load(manifest)["package"]
+        if package["name"] == generated:
+            continue
         require(
             package.get("version") == {"workspace": True},
             f"{path.as_posix()}: {VERSION_INHERITANCE_ERROR}",

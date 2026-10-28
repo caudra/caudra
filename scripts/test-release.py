@@ -612,6 +612,30 @@ class ReleaseTests(unittest.TestCase):
     def test_checked_in_workspace_packages_inherit_the_release_version(self):
         RELEASE.validate_workspace_versions(Path(__file__).resolve().parent.parent)
 
+    def test_only_the_hakari_package_may_keep_its_generated_version(self):
+        manifest = self.root / "Cargo.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                '"workcell/crates/tool-contract"]',
+                '"workcell/crates/tool-contract", "workspace-hack"]',
+            )
+        )
+        (self.root / "workspace-hack").mkdir()
+        (self.root / "workspace-hack" / "Cargo.toml").write_text(
+            '[package]\nname = "workspace-hack"\nversion = "0.1.0"\n'
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                f"workspace-hack/Cargo.toml: {RELEASE.VERSION_INHERITANCE_ERROR}"
+            ),
+        ):
+            RELEASE.validate_workspace_versions(self.root)
+        config = self.root / RELEASE.HAKARI_CONFIG
+        config.parent.mkdir()
+        config.write_text('hakari-package = "workspace-hack"\n')
+        self.assertEqual(RELEASE.validate_workspace_versions(self.root), TAG[1:])
+
     def test_source_rejects_independent_package_versions_even_when_labels_match(self):
         for member in (".", "workcell", "workcell/crates/tool-contract"):
             path = Path(member) / "Cargo.toml"
