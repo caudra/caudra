@@ -161,6 +161,9 @@ const WAL_JOURNAL_MODE: &str = "wal";
 const UNKNOWN_WAL_FRAMES: i64 = -1;
 /// Rows one decode worker must have before a second one is worth starting.
 const PARALLEL_DECODE_MIN_ROWS: usize = 256;
+const HISTORY_KIND: &str = "history item";
+const SUBAGENT_HISTORY_KIND: &str = "subagent history item";
+const TOOL_OUTPUT_KIND: &str = "tool output";
 const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
 const OWNER_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
@@ -1516,11 +1519,26 @@ struct SerializedRoot {
 
 struct SerializedSession {
     root: SerializedRoot,
-    messages: Vec<String>,
-    tool_outputs: Vec<(String, String)>,
-    subagent_messages: Vec<(String, Vec<String>)>,
+    messages: Vec<PreparedHistory>,
+    tool_outputs: Vec<(String, PreparedPayload)>,
+    subagent_messages: Vec<(String, Vec<PreparedPayload>)>,
     task_specs: HashMap<String, String>,
     logical_bytes: usize,
+}
+
+/// A child row compressed before `BEGIN IMMEDIATE`, so the write lock covers
+/// only binding. `bytes` is the uncompressed length `byte_count` stores.
+struct PreparedPayload {
+    stored: Vec<u8>,
+    bytes: usize,
+}
+
+/// A main history row with the receipts it implies, read before the
+/// transaction. Receipt validation that needs the database stays inside it.
+struct PreparedHistory {
+    payload: PreparedPayload,
+    workflow_receipt: Option<(String, i64)>,
+    task_event: Option<Value>,
 }
 
 /// A synced pre-commit recovery export. The pending name is versioned and
@@ -4268,45 +4286,25 @@ impl SessionDatabase {
         let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut root = SerializedRoot::new(session)?;
-        let messages = serialize_values(
-            &session.messages[cursor.saved_history_count..],
-            "history item",
-            MAX_PAYLOAD_BYTES,
+        let messages = prepare_history(&session.messages[cursor.saved_history_count..])?;
+        let tool_outputs = prepare_tool_outputs(
+            session
+                .tool_outputs
+                .iter()
+                .filter(|(id, _)| !cursor.saved_tool_ids.contains(*id)),
         )?;
-        let tool_outputs = session
-            .tool_outputs
-            .iter()
-            .filter(|(id, _)| !cursor.saved_tool_ids.contains(*id))
-            .map(|(id, output)| {
-                serialize_json(output.as_ref(), "tool output", MAX_PAYLOAD_BYTES)
-                    .map(|payload| (id.clone(), payload))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut subagent_messages = Vec::new();
+        let mut subagent_starts = HashMap::new();
         for (id, values) in &session.subagent_messages {
             let saved = cursor.saved_subagent_counts.get(id).copied().unwrap_or(0);
-            let payloads =
-                serialize_values(&values[saved..], "subagent history item", MAX_PAYLOAD_BYTES)?;
-            subagent_messages.push((id.clone(), saved, payloads));
+            let payloads = prepare_payloads(&values[saved..], SUBAGENT_HISTORY_KIND)?;
+            subagent_starts.insert(id.as_str(), saved);
+            subagent_messages.push((id.clone(), payloads));
         }
         let task_specs = serialize_task_specs(&session.subagent_task_specs)?;
-        let added_bytes = messages.iter().map(String::len).sum::<usize>()
-            + tool_outputs
-                .iter()
-                .map(|(_, payload)| payload.len())
-                .sum::<usize>()
-            + subagent_messages
-                .iter()
-                .flat_map(|(_, _, values)| values)
-                .map(String::len)
-                .sum::<usize>();
+        let added_bytes = prepared_bytes(&messages, &tool_outputs, &subagent_messages);
         timing.count(
-            messages.len()
-                + tool_outputs.len()
-                + subagent_messages
-                    .iter()
-                    .map(|(_, _, values)| values.len())
-                    .sum::<usize>(),
+            prepared_rows(&messages, &tool_outputs, &subagent_messages),
             added_bytes,
         );
         timing.begin();
@@ -4349,7 +4347,8 @@ impl SessionDatabase {
             &session.subagent_messages,
             &task_specs,
         )?;
-        for (id, start, payloads) in &subagent_messages {
+        for (id, payloads) in &subagent_messages {
+            let start = subagent_starts[id.as_str()];
             for (offset, payload) in payloads.iter().enumerate() {
                 insert_subagent_history(&transaction, session.id, id, start + offset, payload)?;
             }
@@ -5229,35 +5228,19 @@ impl SerializedSession {
         T: Serialize,
     {
         let root = SerializedRoot::new(session)?;
-        let messages = serialize_values(&session.messages, "history item", MAX_PAYLOAD_BYTES)?;
-        let tool_outputs = session
-            .tool_outputs
-            .iter()
-            .map(|(id, output)| {
-                serialize_json(output.as_ref(), "tool output", MAX_PAYLOAD_BYTES)
-                    .map(|payload| (id.clone(), payload))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let messages = prepare_history(&session.messages)?;
+        let tool_outputs = prepare_tool_outputs(session.tool_outputs.iter())?;
         let subagent_messages = session
             .subagent_messages
             .iter()
             .map(|(id, values)| {
-                serialize_values(values, "subagent history item", MAX_PAYLOAD_BYTES)
+                prepare_payloads(values, SUBAGENT_HISTORY_KIND)
                     .map(|payloads| (id.clone(), payloads))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let task_specs = serialize_task_specs(&session.subagent_task_specs)?;
         let logical_bytes = root.bytes()
-            + messages.iter().map(String::len).sum::<usize>()
-            + tool_outputs
-                .iter()
-                .map(|(_, payload)| payload.len())
-                .sum::<usize>()
-            + subagent_messages
-                .iter()
-                .flat_map(|(_, values)| values)
-                .map(String::len)
-                .sum::<usize>()
+            + prepared_bytes(&messages, &tool_outputs, &subagent_messages)
             + task_specs.values().map(String::len).sum::<usize>();
         Ok(Self {
             root,
@@ -5278,14 +5261,106 @@ impl SerializedSession {
     }
 
     fn row_count(&self) -> usize {
-        self.messages.len()
-            + self.tool_outputs.len()
-            + self
-                .subagent_messages
-                .iter()
-                .map(|(_, values)| values.len())
-                .sum::<usize>()
+        prepared_rows(&self.messages, &self.tool_outputs, &self.subagent_messages)
     }
+}
+
+impl PreparedPayload {
+    fn new(payload: &str) -> Result<Self, SessionError> {
+        Ok(Self {
+            stored: compress_payload(payload)?,
+            bytes: payload.len(),
+        })
+    }
+}
+
+impl PreparedHistory {
+    fn new(payload: &str) -> Result<Self, SessionError> {
+        let message: Value = serde_json::from_str(payload).map_err(StorageError::from)?;
+        let workflow_receipt = match message.get("workflow_event").map(|origin| {
+            (
+                origin.get("run_id").and_then(Value::as_str),
+                origin.get("revision").and_then(Value::as_u64),
+            )
+        }) {
+            Some((Some(run_id), Some(revision))) => {
+                validate_identifier("workflow receipt run id", run_id)?;
+                Some((
+                    run_id.to_owned(),
+                    to_i64(revision, "workflow receipt revision")?,
+                ))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            payload: PreparedPayload::new(payload)?,
+            workflow_receipt,
+            task_event: message.get("task_event").is_some().then_some(message),
+        })
+    }
+}
+
+fn prepare_history<M: Serialize>(messages: &[M]) -> Result<Vec<PreparedHistory>, SessionError> {
+    messages
+        .iter()
+        .map(|message| {
+            PreparedHistory::new(&serialize_json(message, HISTORY_KIND, MAX_PAYLOAD_BYTES)?)
+        })
+        .collect()
+}
+
+fn prepare_payloads<T: Serialize>(
+    values: &[T],
+    kind: &'static str,
+) -> Result<Vec<PreparedPayload>, SessionError> {
+    values
+        .iter()
+        .map(|value| PreparedPayload::new(&serialize_json(value, kind, MAX_PAYLOAD_BYTES)?))
+        .collect()
+}
+
+fn prepare_tool_outputs<'a, T: Serialize + 'a>(
+    outputs: impl Iterator<Item = (&'a String, &'a Arc<T>)>,
+) -> Result<Vec<(String, PreparedPayload)>, SessionError> {
+    outputs
+        .map(|(id, output)| {
+            let payload = serialize_json(output.as_ref(), TOOL_OUTPUT_KIND, MAX_PAYLOAD_BYTES)?;
+            Ok((id.clone(), PreparedPayload::new(&payload)?))
+        })
+        .collect()
+}
+
+fn prepared_bytes(
+    messages: &[PreparedHistory],
+    tool_outputs: &[(String, PreparedPayload)],
+    subagent_messages: &[(String, Vec<PreparedPayload>)],
+) -> usize {
+    messages
+        .iter()
+        .map(|message| message.payload.bytes)
+        .sum::<usize>()
+        + tool_outputs
+            .iter()
+            .map(|(_, payload)| payload.bytes)
+            .sum::<usize>()
+        + subagent_messages
+            .iter()
+            .flat_map(|(_, values)| values)
+            .map(|payload| payload.bytes)
+            .sum::<usize>()
+}
+
+fn prepared_rows(
+    messages: &[PreparedHistory],
+    tool_outputs: &[(String, PreparedPayload)],
+    subagent_messages: &[(String, Vec<PreparedPayload>)],
+) -> usize {
+    messages.len()
+        + tool_outputs.len()
+        + subagent_messages
+            .iter()
+            .map(|(_, values)| values.len())
+            .sum::<usize>()
 }
 
 fn create_owner_only(path: &Path) -> Result<(), SessionError> {
@@ -6320,17 +6395,6 @@ fn serialize_task_specs(
         .collect()
 }
 
-fn serialize_values<T: Serialize>(
-    values: &[T],
-    kind: &'static str,
-    maximum: usize,
-) -> Result<Vec<String>, SessionError> {
-    values
-        .iter()
-        .map(|value| serialize_json(value, kind, maximum))
-        .collect()
-}
-
 fn serialize_json<T: Serialize + ?Sized>(
     value: &T,
     kind: &'static str,
@@ -6828,28 +6892,25 @@ fn insert_history(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
     ordinal: usize,
-    payload: &str,
+    history: &PreparedHistory,
 ) -> Result<(), SessionError> {
-    let message: Value = serde_json::from_str(payload).map_err(StorageError::from)?;
-    if let Some(origin) = message.get("workflow_event")
-        && let Some(run_id) = origin.get("run_id").and_then(Value::as_str)
-        && let Some(revision) = origin.get("revision").and_then(Value::as_u64)
-    {
-        validate_identifier("workflow receipt run id", run_id)?;
+    if let Some((run_id, revision)) = &history.workflow_receipt {
         transaction.execute(
             "INSERT OR IGNORE INTO workflow_receipts(session_id, run_id, revision) VALUES (?1, ?2, ?3)",
-            params![session_id.as_bytes().as_slice(), run_id, to_i64(revision, "workflow receipt revision")?],
+            params![session_id.as_bytes().as_slice(), run_id, revision],
         )?;
     }
-    accept_owned_job_event(transaction, session_id, &JobOwner::Main, &message)?;
+    if let Some(message) = &history.task_event {
+        accept_owned_job_event(transaction, session_id, &JobOwner::Main, message)?;
+    }
     transaction.execute(
         "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
             session_id.as_bytes().as_slice(),
             to_i64(ordinal, "history ordinal")?,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "history payload bytes")?
+            history.payload.stored,
+            to_i64(history.payload.bytes, "history payload bytes")?
         ],
     )?;
     Ok(())
@@ -6859,7 +6920,7 @@ fn insert_tool_output(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
     id: &str,
-    payload: &str,
+    payload: &PreparedPayload,
 ) -> Result<(), SessionError> {
     transaction.execute(
         "INSERT INTO tool_outputs (session_id, tool_id, payload, byte_count) \
@@ -6867,8 +6928,8 @@ fn insert_tool_output(
         params![
             session_id.as_bytes().as_slice(),
             id,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "tool output payload bytes")?
+            payload.stored,
+            to_i64(payload.bytes, "tool output payload bytes")?
         ],
     )?;
     Ok(())
@@ -6898,7 +6959,7 @@ fn insert_subagent_history(
     session_id: CaudraId,
     subagent_id: &str,
     ordinal: usize,
-    payload: &str,
+    payload: &PreparedPayload,
 ) -> Result<(), SessionError> {
     transaction.execute(
         "INSERT INTO subagent_history_items \
@@ -6908,8 +6969,8 @@ fn insert_subagent_history(
             session_id.as_bytes().as_slice(),
             subagent_id,
             to_i64(ordinal, "subagent history ordinal")?,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "subagent payload bytes")?
+            payload.stored,
+            to_i64(payload.bytes, "subagent payload bytes")?
         ],
     )?;
     Ok(())
@@ -9143,7 +9204,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .unwrap();
         let message = serde_json::to_string(&checkpoint_shell_message(SHELL_EVENT)).unwrap();
         let transaction = database.connection.transaction().unwrap();
-        let result = insert_history(&transaction, session.id, 0, &message);
+        let result = insert_history(
+            &transaction,
+            session.id,
+            0,
+            &PreparedHistory::new(&message).unwrap(),
+        );
         if child {
             assert!(result.is_err());
             drop(transaction);
