@@ -1584,7 +1584,7 @@ where
     }
 
     /// A change under an existing id is not expressible as an append, so it
-    /// voids the cursors; a new id is a pure append.
+    /// is stamped for the next save to replace; a new id is a pure append.
     pub fn insert_tool_output(&mut self, id: String, output: T) {
         if self
             .tool_outputs

@@ -1053,9 +1053,22 @@ fn take_interrupted(
     let mut work = background.take_restored();
     match project_messages(history) {
         Ok(parent) => {
-            work.recovered = smol::block_on(
-                background.recover_lost_results(&parent, &subagent_history.snapshot()),
-            );
+            let interrupted = work
+                .jobs
+                .iter()
+                .map(|job| job.invocation_id.clone())
+                .collect();
+            work.recovered = smol::block_on(background.recover_lost_results(
+                &parent,
+                &subagent_history.snapshot(),
+                &interrupted,
+            ));
+            work.jobs
+                .retain(|job| !work.recovered.contains(&job.task_id));
+            work.transcripts
+                .retain(|task_id, _| !work.recovered.contains(task_id));
+            work.dangling
+                .retain(|task_id, _| !work.recovered.contains(task_id));
         }
         Err(error) => warn!(%error, "could not read history to recover lost task results"),
     }

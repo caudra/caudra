@@ -1591,16 +1591,19 @@ impl BackgroundTasks {
         .await
     }
 
-    /// Settles agent tasks an earlier build lost to a busy database. It ended
-    /// a task that had finished as interrupted when the result save failed,
-    /// so the result never reached the session. A task qualifies only when
-    /// `histories` holds its finished reply and `parent` never received a
-    /// result for it; the result is rebuilt from that reply, saved, and
-    /// delivered once. Returns the recovered task ids.
+    /// Settles background agent tasks that finished but whose result never
+    /// reached the session. An earlier build ended such a task as interrupted
+    /// when its result save found the database busy, or left it running when
+    /// even that save failed, so this load found it cut off (`interrupted`
+    /// holds those invocations). A task qualifies only when `histories` holds
+    /// its finished reply and `parent` never received a result for it; the
+    /// result is rebuilt from that reply, saved, and delivered once instead
+    /// of the task running again. Returns the recovered task ids.
     pub async fn recover_lost_results(
         &self,
         parent: &[Message],
         histories: &SubagentHistorySnapshot,
+        interrupted: &HashSet<String>,
     ) -> Vec<String> {
         let dir = self.0.dir.clone();
         let session = self.0.session;
@@ -1621,7 +1624,9 @@ impl BackgroundTasks {
             }
         };
         let mut recovered = Vec::new();
-        for record in candidates.into_iter().filter(lost_to_contention) {
+        for record in candidates.into_iter().filter(|record| {
+            lost_to_contention(record) || cut_off_after_finishing(record, interrupted)
+        }) {
             let Some(reply) = finished_reply(&record, parent, histories) else {
                 continue;
             };
@@ -3302,6 +3307,15 @@ fn lost_to_contention(record: &TaskRecord) -> bool {
             })
 }
 
+/// Whether this load found `record`, a background agent task, cut off before
+/// it saved a result. `finished_reply` decides whether it had one.
+fn cut_off_after_finishing(record: &TaskRecord, interrupted: &HashSet<String>) -> bool {
+    record.kind() == JobKind::Agent
+        && record.background
+        && interrupted.contains(&record.invocation_id)
+        && !record.events.iter().any(|event| event.terminal)
+}
+
 /// The finished reply `record`'s task ended with, unless `parent` already
 /// holds a result for it no record event accounts for.
 fn finished_reply(
@@ -3448,7 +3462,7 @@ fn bounded(text: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::mem::replace;
     use std::slice::from_ref;
     use std::sync::{
@@ -3791,18 +3805,37 @@ mod tests {
 
     enum LostResult {
         Finished,
+        CutOff,
         Unfinished,
         OtherFailure,
         AlreadyDelivered,
     }
 
-    fn lost_record(error: &str) -> TaskRecord {
+    fn lost_record(case: &LostResult) -> TaskRecord {
         let mut record = projection_record();
         record.background = true;
         record.receipt_accepted = true;
-        record.state = INTERRUPTED_STATE.into();
-        record.outcome = Some(json!({"error": error}));
+        match case {
+            LostResult::CutOff => record.state = RUNNING_STATE.into(),
+            LostResult::OtherFailure => {
+                record.state = INTERRUPTED_STATE.into();
+                record.outcome = Some(json!({"error": OTHER_FAILURE}));
+            }
+            _ => {
+                record.state = INTERRUPTED_STATE.into();
+                record.outcome = Some(json!({"error": LOST_SAVE}));
+            }
+        }
         record
+    }
+
+    fn interrupted_now(tasks: &BackgroundTasks) -> HashSet<String> {
+        tasks
+            .take_restored()
+            .jobs
+            .into_iter()
+            .map(|job| job.invocation_id)
+            .collect()
     }
 
     fn assistant(content: Vec<ContentBlock>) -> Message {
@@ -3820,6 +3853,7 @@ mod tests {
     }
 
     #[test_case(LostResult::Finished => vec![TASK.to_owned()]; "finished_reply_is_recovered")]
+    #[test_case(LostResult::CutOff => vec![TASK.to_owned()]; "finished_task_left_running_is_recovered")]
     #[test_case(LostResult::Unfinished => Vec::<String>::new(); "unfinished_transcript_is_left_alone")]
     #[test_case(LostResult::OtherFailure => Vec::<String>::new(); "other_failure_is_left_alone")]
     #[test_case(LostResult::AlreadyDelivered => Vec::<String>::new(); "delivered_result_is_left_alone")]
@@ -3827,13 +3861,9 @@ mod tests {
         smol::block_on(async {
             let fixture = Fixture::new().await;
             fixture.tasks.shutdown().await.unwrap();
-            let error = match case {
-                LostResult::OtherFailure => OTHER_FAILURE,
-                _ => LOST_SAVE,
-            };
             SessionDatabase::open_state(&fixture.dir)
                 .unwrap()
-                .save_background_task(fixture.session.id, &lost_record(error))
+                .save_background_task(fixture.session.id, &lost_record(&case))
                 .unwrap();
             let last = match case {
                 LostResult::Unfinished => assistant(vec![ContentBlock::ToolUse {
@@ -3863,7 +3893,9 @@ mod tests {
                 _ => Vec::new(),
             };
             let tasks = reopen(&fixture).await;
-            let recovered = tasks.recover_lost_results(&parent, &histories).await;
+            let recovered = tasks
+                .recover_lost_results(&parent, &histories, &interrupted_now(&tasks))
+                .await;
             let status = tasks.status(TASK).unwrap();
             if recovered.is_empty() {
                 assert_eq!(status.state, INTERRUPTED_STATE);
@@ -3885,7 +3917,7 @@ mod tests {
             let reopened = reopen(&fixture).await;
             assert!(
                 reopened
-                    .recover_lost_results(&parent, &histories)
+                    .recover_lost_results(&parent, &histories, &interrupted_now(&reopened))
                     .await
                     .is_empty()
             );
