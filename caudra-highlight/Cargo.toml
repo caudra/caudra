@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 syntect = { workspace = true }
 tracing = { workspace = true }
 two-face = { workspace = true }
+workspace-hack.workspace = true
 
 [build-dependencies]
 syntect = { workspace = true }

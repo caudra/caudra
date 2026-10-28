@@ -41,6 +41,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 workcell-tool-contract = { workspace = true }
 workcell = { workspace = true, features = ["files-index", "web", "shell", "code-bundled", "source-code-graph-git", "environment", "host-contract", "snapshots"] }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 caudra-decision = { workspace = true }

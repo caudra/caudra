@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tla-checker = { workspace = true }
 unicode-normalization = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 caudra-skillpack = { workspace = true, features = ["checks"] }

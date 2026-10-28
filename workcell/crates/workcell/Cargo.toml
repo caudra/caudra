@@ -37,6 +37,7 @@ workcell-snapshot-store = { workspace = true, optional = true }
 workcell-tool-contract.workspace = true
 workcell-workspace-scm = { workspace = true, optional = true }
 workcell-workspace-snapshot = { workspace = true, optional = true }
+workspace-hack.workspace = true
 
 [lints]
 workspace = true

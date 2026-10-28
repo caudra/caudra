@@ -26,6 +26,7 @@ jiff = { workspace = true }
 globset = { workspace = true }
 url = { workspace = true }
 workcell-tool-contract = { workspace = true }
+workspace-hack.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }

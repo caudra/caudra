@@ -20,7 +20,7 @@ endif
 ifneq ($(SCCACHE),)
 ifeq ($(strip $(foreach variable,$(CARGO_WRAPPER_VARIABLES),$(filter-out undefined,$(origin $(variable))))),)
 export RUSTC_WRAPPER := $(SCCACHE)
-export SCCACHE_CACHE_SIZE ?= 10G
+export SCCACHE_CACHE_SIZE ?= 40G
 export SCCACHE_CLIENT_SIDE ?= 1
 export SCCACHE_DIRECT ?= false
 endif

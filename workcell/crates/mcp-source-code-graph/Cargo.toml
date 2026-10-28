@@ -29,6 +29,7 @@ workcell-source-code-graph.workspace = true
 # filesystem group so there is exactly one confinement implementation in the process.
 workcell-mcp-files = { workspace = true, default-features = false }
 workcell-tool-contract.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

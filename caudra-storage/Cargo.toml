@@ -27,6 +27,7 @@ etcetera = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
+workspace-hack.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }

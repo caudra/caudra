@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 flate2 = { workspace = true }
 jiff = { workspace = true }
 fastrand = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }

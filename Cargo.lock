@@ -918,6 +918,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -940,6 +941,7 @@ dependencies = [
  "tempfile",
  "test-case",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1005,6 +1007,7 @@ dependencies = [
  "tree-sitter-bash",
  "url",
  "workcell-tool-contract",
+ "workspace-hack",
  "yaml_serde",
 ]
 
@@ -1022,6 +1025,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1049,6 +1053,7 @@ dependencies = [
  "tracing",
  "url",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1058,6 +1063,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1077,6 +1083,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1086,6 +1093,7 @@ dependencies = [
  "serde",
  "similar",
  "test-case",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1106,6 +1114,7 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "test-case",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1119,6 +1128,7 @@ dependencies = [
  "strsim",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
  "yaml_serde",
 ]
 
@@ -1128,6 +1138,7 @@ version = "0.2.0-preview.16"
 dependencies = [
  "ratatui",
  "test-case",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1139,6 +1150,7 @@ dependencies = [
  "test-case",
  "tracing",
  "two-face",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1151,6 +1163,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1227,6 +1240,7 @@ dependencies = [
  "tree-sitter-zig",
  "unicode-width",
  "url",
+ "workspace-hack",
  "yaml_serde",
 ]
 
@@ -1237,6 +1251,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1248,6 +1263,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "unicode-width",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1257,6 +1273,7 @@ dependencies = [
  "caudra-skillpack",
  "include_dir",
  "regex",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1277,6 +1294,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1311,6 +1329,7 @@ dependencies = [
  "tracing",
  "url",
  "wait-timeout",
+ "workspace-hack",
  "yaml_serde",
 ]
 
@@ -1322,6 +1341,7 @@ dependencies = [
  "test-case",
  "tracing",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1342,6 +1362,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tla-checker",
  "unicode-normalization",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1366,6 +1387,7 @@ dependencies = [
  "url",
  "uuid",
  "wait-timeout",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1377,6 +1399,7 @@ dependencies = [
  "sha2 0.11.1",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1390,6 +1413,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "test-case",
+ "workspace-hack",
  "yaml_serde",
 ]
 
@@ -1422,6 +1446,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "workspace-hack",
  "zstd",
 ]
 
@@ -1439,6 +1464,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "wait-timeout",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1504,6 +1530,7 @@ dependencies = [
  "url",
  "windows-sys 0.61.2",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1537,6 +1564,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "unicode-width",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1574,6 +1602,7 @@ dependencies = [
  "url",
  "workcell",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1586,6 +1615,7 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1598,6 +1628,7 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10689,6 +10720,7 @@ dependencies = [
  "workcell-tool-contract",
  "workcell-workspace-scm",
  "workcell-workspace-snapshot",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10704,6 +10736,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10714,6 +10747,7 @@ dependencies = [
  "serde_json",
  "test-case",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10751,6 +10785,7 @@ dependencies = [
  "workcell-tool-contract",
  "workcell-workspace-scm",
  "workcell-workspace-snapshot",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10775,6 +10810,7 @@ dependencies = [
  "tree-sitter-typescript",
  "workcell-monty-worker",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10803,6 +10839,7 @@ dependencies = [
  "workcell-host-contract",
  "workcell-source-languages",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10829,6 +10866,7 @@ dependencies = [
  "workcell-host-contract",
  "workcell-output-filter",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10848,6 +10886,7 @@ dependencies = [
  "workcell-mcp-files",
  "workcell-source-code-graph",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10880,6 +10919,7 @@ dependencies = [
  "workcell-net",
  "workcell-source-icons",
  "workcell-tool-contract",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10892,6 +10932,7 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10911,6 +10952,7 @@ dependencies = [
  "tokio-util",
  "url",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10921,6 +10963,7 @@ dependencies = [
  "serde",
  "test-case",
  "toml",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10933,6 +10976,7 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10947,6 +10991,7 @@ dependencies = [
  "test-case",
  "tree-sitter",
  "workcell-source-languages",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -10968,6 +11013,7 @@ dependencies = [
  "url",
  "wiremock",
  "workcell-net",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11013,6 +11059,7 @@ dependencies = [
  "tree-sitter-xml",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11024,6 +11071,7 @@ dependencies = [
  "sha2 0.11.1",
  "test-case",
  "thiserror 2.0.21",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11042,6 +11090,7 @@ dependencies = [
  "uuid",
  "workcell-host-contract",
  "workcell-mcp-files",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11062,6 +11111,128 @@ dependencies = [
  "workcell-host-contract",
  "workcell-mcp-files",
  "workcell-snapshot-store",
+ "workspace-hack",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "aho-corasick",
+ "anstream",
+ "arrayvec",
+ "bit-set 0.11.1",
+ "bit-set 0.8.0",
+ "bit-vec 0.10.1",
+ "bitflags 2.13.2",
+ "bstr",
+ "bytemuck",
+ "byteorder",
+ "castaway",
+ "cbc",
+ "cc",
+ "chrono",
+ "cipher",
+ "clap",
+ "clap_builder",
+ "concurrent-queue",
+ "crc32fast",
+ "crossbeam-utils",
+ "crossterm",
+ "derive_more",
+ "derive_more-impl",
+ "digest 0.11.3",
+ "either",
+ "errno",
+ "event-listener",
+ "event-listener-strategy",
+ "fastrand",
+ "flate2",
+ "flume",
+ "foldhash 0.2.0",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "half",
+ "hashbrown 0.17.1",
+ "hyper",
+ "hyper-util",
+ "icu_properties",
+ "image",
+ "indexmap 2.14.2",
+ "itertools 0.14.0",
+ "jiff",
+ "jiff-core",
+ "libc",
+ "linux-raw-sys",
+ "lock_api 0.4.14",
+ "log",
+ "memchr",
+ "mio",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "objc2",
+ "objc2-core-foundation",
+ "once_cell",
+ "parking_lot 0.12.5",
+ "percent-encoding",
+ "phf_shared 0.11.3",
+ "phf_shared 0.12.1",
+ "portable-atomic",
+ "proc-macro2",
+ "quick-xml 0.42.0",
+ "quote",
+ "rand 0.10.3",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "rustix",
+ "rustls",
+ "schemars 1.2.3",
+ "serde",
+ "serde_core",
+ "serde_derive",
+ "serde_json",
+ "sha2 0.11.1",
+ "simd-adler32",
+ "slab",
+ "smallvec",
+ "socket2",
+ "stable_deref_trait",
+ "strum 0.28.0",
+ "subtle",
+ "syn 2.0.119",
+ "syn 3.0.9",
+ "sync_wrapper",
+ "thin-vec",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml_datetime",
+ "toml_edit",
+ "toml_parser",
+ "toml_writer",
+ "tower",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "url",
+ "uuid",
+ "winapi",
+ "windows-sys 0.61.2",
+ "winnow",
+ "zerocopy",
+ "zlib-rs",
 ]
 
 [[package]]

@@ -42,11 +42,13 @@ Read `Makefile` for more. It requires GNU Make, Bash, and Python 3. On Windows, 
 
 Cargo-compiling targets depend on `code-worker` automatically. `make code-worker` is an optional warmup, not a required bootstrap. Keep build logic in Cargo and Python.
 
-Dev and test builds keep only line tables and no incremental cache. For a debugger, set `CARGO_PROFILE_DEV_DEBUG=2`; to debug into a dep, set `[profile.dev.package.<name>] debug = true`.
+Dev and test builds share one profile, so never add settings under `[profile.test]`: any difference compiles every crate twice. Workspace crates build incrementally with line tables in split debuginfo; dependencies are optimized and cached by `sccache`. Compiling Make targets trim incremental caches to `INCREMENTAL_CACHE_SIZE` (default 10G per target dir; `make incremental-sweep`). For a debugger, set `CARGO_PROFILE_DEV_DEBUG=2`; to debug into a dep, set `[profile.dev.package.<name>] debug = true`.
+
+Every member depends on the hakari-managed `workspace-hack` so `-p` and `--workspace` builds resolve the same dependency features. After changing dependencies, run `cargo hakari generate` and `cargo hakari manage-deps`; a new member gets its line from `manage-deps`.
 
 Make uses `sccache` when it is installed (`scripts/cargo-cache.mk`); `SCCACHE=` opts out. Never share `CARGO_TARGET_DIR` between worktrees.
 
-For long, serial mutation campaigns, optionally enable `CARGO_INCREMENTAL=1` in the runner—not globally. Measure speed and disk use; incremental builds cannot use `sccache`. Use normal settings for baseline/final verification and clean up campaign-created caches. Test narrowly and fail fast, but run remaining relevant tests before declaring survivors.
+For long, serial mutation campaigns, measure speed and disk use, and clean up campaign-created caches. Test narrowly and fail fast, but run remaining relevant tests before declaring survivors.
 
 ## Nix
 

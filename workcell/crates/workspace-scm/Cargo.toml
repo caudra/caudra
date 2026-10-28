@@ -19,6 +19,7 @@ tokio-util.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 workcell-host-contract.workspace = true
 workcell-mcp-files.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -28,6 +28,7 @@ tree-sitter-bash.workspace = true
 workcell-output-filter.workspace = true
 workcell-tool-contract.workspace = true
 workcell-host-contract.workspace = true
+workspace-hack.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true

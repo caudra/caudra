@@ -175,8 +175,9 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-machete
+          tool: cargo-machete,cargo-hakari
       - run: cargo machete
+      - run: make hakari
 
   workcell-native:
     name: Workcell native features

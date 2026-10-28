@@ -69,6 +69,7 @@ tempfile = { workspace = true }
 shell-words = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }

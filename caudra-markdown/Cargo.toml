@@ -12,6 +12,7 @@ rust-version.workspace = true
 caudra-highlight = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }

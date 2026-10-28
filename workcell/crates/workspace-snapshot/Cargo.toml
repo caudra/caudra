@@ -20,6 +20,7 @@ uuid = { workspace = true, features = ["v4"] }
 workcell-host-contract.workspace = true
 workcell-mcp-files.workspace = true
 workcell-snapshot-store.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

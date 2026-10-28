@@ -20,6 +20,7 @@ sha2 = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 workcell-tool-contract.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

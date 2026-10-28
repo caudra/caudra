@@ -12,6 +12,7 @@ rust-version.workspace = true
 isahc = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }

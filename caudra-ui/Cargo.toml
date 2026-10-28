@@ -61,6 +61,7 @@ termini = { workspace = true }
 notify = { workspace = true }
 shell-words = { workspace = true }
 open = { workspace = true }
+workspace-hack.workspace = true
 
 
 [target.'cfg(windows)'.dependencies]

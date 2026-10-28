@@ -20,6 +20,7 @@ lru.workspace = true
 sha2 = { workspace = true, default-features = true }
 tree-sitter.workspace = true
 workcell-source-languages.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

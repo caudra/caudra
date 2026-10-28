@@ -33,6 +33,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-width = { workspace = true }
+workspace-hack.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 getrandom = { workspace = true }

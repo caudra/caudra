@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 similar = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }

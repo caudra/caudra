@@ -14,6 +14,9 @@ keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.99"
 
+[package.metadata.cargo-machete]
+ignored = ["workspace-hack"]
+
 [[bin]]
 name = "caudra"
 path = "src/main.rs"
@@ -57,6 +60,7 @@ open = { workspace = true }
 rpassword = { workspace = true }
 jiff = { workspace = true }
 include_dir = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 caudra-agent = { workspace = true, features = ["test-support"] }
@@ -115,8 +119,13 @@ members = [
   "workcell/crates/workcell-host-contract",
   "workcell/crates/workspace-scm",
   "workcell/crates/workspace-snapshot",
+  "workspace-hack",
 ]
 resolver = "3"
+
+# Every member depends on the hakari-managed workspace-hack only to unify dependency features.
+[workspace.metadata.cargo-machete]
+ignored = ["workspace-hack"]
 
 [workspace.package]
 version = "0.2.0-preview.16"
@@ -129,6 +138,7 @@ repository = "https://github.com/caudra/caudra"
 rust-version = "1.99"
 
 [workspace.dependencies]
+workspace-hack = { path = "workspace-hack" }
 syn = { version = "3.0.9", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
@@ -375,28 +385,31 @@ incremental = false
 debug = true
 strip = "none"
 
-# Dev rebuilds are linker bound, and debug info is most of what the linker
-# chews through. Our crates keep line tables so backtraces still name files
-# and lines; a debugger session sets CARGO_PROFILE_DEV_DEBUG=2. Incremental
-# caches cost more disk than they save in rebuild time across worktrees, and
-# they rule out sccache. The test profile inherits all of this.
+# The test profile inherits all of this and must not override anything: Cargo shares a
+# compiled crate between `dev` and `test` only while their settings match, so any difference
+# builds every crate twice.
+#
+# Our crates keep line tables so backtraces still name files and lines; a debugger session
+# sets CARGO_PROFILE_DEV_DEBUG=2. Unpacked split debuginfo leaves those tables in the object
+# files instead of copying them into every multi-hundred-MiB test binary at link time.
+# Incremental compilation only applies to workspace crates, so dependencies still go through
+# sccache; `scripts/sweep-incremental.py` bounds its cache on disk.
 [profile.dev]
 debug = "line-tables-only"
-incremental = false
+split-debuginfo = "unpacked"
+lto = "off"
 
-# The 600+ dependencies need no debug info at all.
+# The 600+ dependencies need no debug info at all. They rarely change and sccache serves them,
+# so optimizing them costs little and speeds up tests and debug runs.
 [profile.dev.package."*"]
 debug = false
+opt-level = 1
 
 # `cc` reads DEBUG from here and passes -g when it is on, which covers the C
 # and C++ we build from source: OpenSSL, curl, Luau and 38 tree-sitter
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false
-
-[profile.test]
-opt-level = 1
-lto = "off"
 
 # vendor/crossterm is the head of crossterm-rs/crossterm#1030 (3ca5429), which adds VT input on
 # Windows so bracketed paste decodes and a multiline paste no longer submits at the first newline

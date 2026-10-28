@@ -16,7 +16,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
+.PHONY: help code-worker incremental-sweep install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete hakari ci
 
 help:
 	@printf '%s\n' \
@@ -26,6 +26,7 @@ help:
 		'  make install        Install Caudra with the pinned worker' \
 		'  make install-fast   Install using the release-fast profile' \
 		'  make code-worker    Prepare the worker without building Caudra' \
+		'  make incremental-sweep  Trim incremental caches to INCREMENTAL_CACHE_SIZE (default 10G)' \
 		'  make check          Type-check workspace tests' \
 		'  make lint           Run workspace Clippy with warnings denied' \
 		'  make lint-fix       Apply Clippy fixes' \
@@ -46,6 +47,7 @@ help:
 		'  make workcell-check-native  Check native Workcell features' \
 		'  make workcell-doc-test  Run Workcell doctests' \
 		'  make machete        Check unused dependencies' \
+		'  make hakari         Check the workspace-hack is current' \
 		'  make ci             Run local application CI checks' \
 		'Cargo flags: make build ARGS="--release"' \
 		'Program arguments: make run ARGS="-- auth login"' \
@@ -54,32 +56,35 @@ help:
 code-worker:
 	$(PYTHON) scripts/build-code-worker.py
 
-install: code-worker
+incremental-sweep:
+	$(PYTHON) scripts/sweep-incremental.py
+
+install: code-worker incremental-sweep
 	$(CARGO) install --locked --path . --force
 
-install-fast: code-worker
+install-fast: code-worker incremental-sweep
 	$(CARGO) install --locked --path . --force --profile release-fast
 
-build: code-worker
+build: code-worker incremental-sweep
 	$(CARGO) build $(ARGS)
 
-check: code-worker
+check: code-worker incremental-sweep
 	$(CARGO) check --workspace --tests $(ARGS)
 
-run: code-worker
+run: code-worker incremental-sweep
 	$(CARGO) run --package caudra $(ARGS)
 
-test: code-worker
+test: code-worker incremental-sweep
 	WORKCELL_REQUIRE_CODE_WORKER=1 $(CARGO) nextest run --workspace $(ARGS)
 
 test-mcp-servers: export CARGO := $(CARGO)
-test-mcp-servers: code-worker
+test-mcp-servers: code-worker incremental-sweep
 	WORKCELL_REQUIRE_CODE_WORKER=1 $(PYTHON) scripts/mcp-servers.py test $(ARGS)
 
-lint: code-worker
+lint: code-worker incremental-sweep
 	$(CARGO) clippy --all --tests -- -D warnings
 
-lint-fix: code-worker
+lint-fix: code-worker incremental-sweep
 	$(CARGO) clippy --all --tests --fix
 
 fmt-check:
@@ -98,6 +103,7 @@ pylint:
 
 distribution-tests:
 	$(PYTHON) scripts/test-ci-runners.py
+	$(PYTHON) scripts/test-sweep-incremental.py
 	$(PYTHON) scripts/test-time-command.py
 	$(PYTHON) scripts/test-make.py
 	$(PYTHON) scripts/test-build-code-worker.py
@@ -105,13 +111,13 @@ distribution-tests:
 	$(PYTHON) scripts/test-install.py
 	$(PYTHON) scripts/test-release.py
 
-gen-docs: code-worker
+gen-docs: code-worker incremental-sweep
 	$(CARGO) run -p caudra-docgen
 
-gen-docs-check: code-worker
+gen-docs-check: code-worker incremental-sweep
 	$(CARGO) run -p caudra-docgen -- --check
 
-model-watch: code-worker
+model-watch: code-worker incremental-sweep
 	$(CARGO) run -q -p caudra-docgen --bin caudra-model-watch $(ARGS)
 
 sync-pstack:
@@ -120,22 +126,26 @@ sync-pstack:
 sync-mattpocock:
 	$(PYTHON) scripts/sync-skillpack.py mattpocock $(ARGS)
 
-workcell-build: code-worker
+workcell-build: code-worker incremental-sweep
 	$(CARGO) build $(if $(filter --locked,$(ARGS)),,--locked) --package workcell-mcp $(ARGS)
 
-workcell-run: code-worker
+workcell-run: code-worker incremental-sweep
 	$(CARGO) run --locked --package workcell-mcp -- $(ARGS)
 
-workcell-release: code-worker
+workcell-release: code-worker incremental-sweep
 	$(CARGO) build --locked --release --package workcell-mcp
 
-workcell-check-native: code-worker
+workcell-check-native: code-worker incremental-sweep
 	$(MAKE) -C workcell check-native
 
-workcell-doc-test: code-worker
+workcell-doc-test: code-worker incremental-sweep
 	$(CARGO) test --locked --doc --package 'workcell*'
 
 machete:
 	$(CARGO) machete
 
-ci: fmt-check lint pylint distribution-tests workcell-check-native test workcell-doc-test gen-docs-check machete
+hakari:
+	$(CARGO) hakari generate --diff
+	$(CARGO) hakari manage-deps --dry-run
+
+ci: fmt-check lint pylint distribution-tests workcell-check-native test workcell-doc-test gen-docs-check machete hakari

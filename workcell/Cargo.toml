@@ -38,6 +38,7 @@ workcell-mcp-source-code-graph = { workspace = true, features = ["git", "mcp"] }
 workcell-mcp-files = { workspace = true, features = ["index", "mcp"] }
 workcell-mcp-shell = { workspace = true, features = ["mcp"] }
 workcell-mcp-web = { workspace = true, features = ["mcp"] }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

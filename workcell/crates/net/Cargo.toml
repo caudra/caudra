@@ -19,6 +19,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 url = { workspace = true, features = ["serde"] }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

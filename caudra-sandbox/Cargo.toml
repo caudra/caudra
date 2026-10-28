@@ -23,6 +23,7 @@ getrandom.workspace = true
 jiff.workspace = true
 wait-timeout.workspace = true
 libc.workspace = true
+workspace-hack.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true

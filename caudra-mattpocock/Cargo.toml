@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 caudra-skillpack = { workspace = true }
 include_dir = { workspace = true }
+workspace-hack.workspace = true
 
 [dev-dependencies]
 caudra-skillpack = { workspace = true, features = ["checks"] }

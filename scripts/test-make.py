@@ -43,20 +43,22 @@ WRAPPER_VARIABLES = (
 )
 SCCACHE_DEFAULTS = {
     "RUSTC_WRAPPER": "sccache",
-    "SCCACHE_CACHE_SIZE": "10G",
+    "SCCACHE_CACHE_SIZE": "40G",
     "SCCACHE_CLIENT_SIDE": "1",
     "SCCACHE_DIRECT": "false",
 }
 UNCACHED = dict.fromkeys(SCCACHE_DEFAULTS)
 SCCACHE_RAN = "sccache-ran"
+SWEEP = "sweep"
 PROBE = f"""import json, os, sys, tempfile
 from pathlib import Path
 kind, *args = sys.argv[1:]
 worker = Path(os.environ['WORKCELL_BUNDLED_MONTY_WORKER'])
 is_worker = kind == 'python' and args == ['scripts/build-code-worker.py']
+is_sweep = kind == 'python' and args == ['scripts/sweep-incremental.py']
 with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
         dir=os.environ['TEST_RECORDS'], suffix='.json', delete=False) as record:
-    json.dump({{'kind': 'worker' if is_worker else kind,
+    json.dump({{'kind': 'worker' if is_worker else 'sweep' if is_sweep else kind,
         'args': args, 'worker': str(worker),
         'required': os.environ.get('WORKCELL_REQUIRE_CODE_WORKER'),
         'env': {{name: os.environ.get(name) for name in {CACHE_VARIABLES!r}}}}}, record)
@@ -132,11 +134,14 @@ class MakeTests(unittest.TestCase):
             timeout=30,
         )
 
-    def records(self):
+    def all_records(self):
         return [
             json.loads(path.read_text(encoding="utf-8"))
             for path in self.record_dir.iterdir()
         ]
+
+    def records(self):
+        return [record for record in self.all_records() if record["kind"] != SWEEP]
 
     def test_default_help_does_not_build(self):
         result = self.run_make()
@@ -178,6 +183,15 @@ class MakeTests(unittest.TestCase):
                 if target == "test":
                     [cargo] = [r for r in records if r["kind"] == "cargo"]
                     self.assertEqual(cargo["required"], "1")
+
+    def test_compiling_targets_sweep_incremental_caches_once(self):
+        result = self.run_make("-j4", "build", "check", "test", "workcell-build")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sweeps = [r for r in self.all_records() if r["kind"] == SWEEP]
+        self.assertEqual(len(sweeps), 1)
+        result = self.run_make("machete")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(SWEEP, [r["kind"] for r in self.all_records()])
 
     def test_parallel_targets_share_one_completed_worker_preparation(self):
         result = self.run_make("-j4", "build", "check", "test", "workcell-build")

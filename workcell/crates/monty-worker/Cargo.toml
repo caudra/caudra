@@ -12,6 +12,7 @@ flate2.workspace = true
 sha2 = { workspace = true, default-features = true }
 tempfile.workspace = true
 thiserror.workspace = true
+workspace-hack.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

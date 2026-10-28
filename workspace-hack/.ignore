@@ -1,0 +1,2 @@
+# cargo-machete skips ignored files. Every dependency here exists only to unify features.
+Cargo.toml
