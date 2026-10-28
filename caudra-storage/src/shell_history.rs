@@ -169,7 +169,7 @@ impl SessionDatabase {
         Self::validate_len(OUTPUT_KIND, output_bytes, MAX_SHELL_OUTPUT_BYTES)?;
         let created = to_i64(record.created_at_ms, CREATED_FIELD)?;
         let bytes = to_i64(summary.len() + output_bytes, BYTES_FIELD)?;
-        self.runtime_transaction(retry, RUNTIME_SHELL_SAVE, |transaction| {
+        self.runtime_transaction(retry, RUNTIME_SHELL_SAVE, Some(session), |transaction| {
             let saved = transaction.execute(
                 "INSERT INTO shell_executions(session_id, execution_id, created_ms, active, summary, output, bytes) \
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS(SELECT 1 FROM sessions WHERE id = ?1) \
@@ -323,7 +323,7 @@ impl SessionDatabase {
             Ok(interrupted)
         };
         if let Some(retry) = retry {
-            return self.runtime_transaction(retry, RUNTIME_SHELL_INTERRUPT, write);
+            return self.runtime_transaction(retry, RUNTIME_SHELL_INTERRUPT, Some(session), write);
         }
         let transaction =
             Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;

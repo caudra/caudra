@@ -121,6 +121,7 @@ fn immediate<T>(
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
         timing.acquired();
         let value = write(&transaction)?;
+        timing.committing();
         transaction.commit()?;
         Ok(value)
     })

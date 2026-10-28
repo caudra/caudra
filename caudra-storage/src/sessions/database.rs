@@ -105,7 +105,7 @@ const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// A write that waited for, or held, the lock this long is logged with its
 /// pid, so a shared log names who kept other processes' saves waiting.
-const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
+pub const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 const SAVE_FULL_OPERATION: &str = "session full save";
 const SAVE_DELTA_OPERATION: &str = "session delta save";
 const RECREATE_OPERATION: &str = "session recreate";
@@ -1558,44 +1558,103 @@ struct RootRow {
     workspace_cursor_label: Option<String>,
 }
 
-/// How long a write waited for `BEGIN IMMEDIATE` and then held the lock,
-/// logged on drop when either reaches [`SLOW_WRITE_THRESHOLD`].
+/// Where one write spent its time, logged on drop when any phase reaches
+/// [`SLOW_WRITE_THRESHOLD`]: preparing rows before `BEGIN IMMEDIATE`, waiting
+/// for it, running statements, then `COMMIT`. `hold` is statements plus
+/// commit, the time inside the transaction. SQLite runs an automatic
+/// checkpoint after the writer lock is released but before `COMMIT`
+/// returns, so `hold` bounds lock ownership from above rather than proving it.
 pub(crate) struct WriteTiming {
     operation: &'static str,
     session_id: Option<CaudraId>,
+    prepared: Instant,
     started: Instant,
     acquired: Option<Instant>,
+    committing: Option<Instant>,
+    rows: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WritePhases {
+    prepare: Duration,
+    wait: Duration,
+    statements: Duration,
+    commit: Duration,
+}
+
+impl WritePhases {
+    fn hold(&self) -> Duration {
+        self.statements + self.commit
+    }
+
+    fn slowest(&self) -> Duration {
+        self.prepare.max(self.wait).max(self.hold())
+    }
 }
 
 impl WriteTiming {
     pub(crate) fn start(operation: &'static str, session_id: Option<CaudraId>) -> Self {
+        let now = Instant::now();
         Self {
             operation,
             session_id,
-            started: Instant::now(),
+            prepared: now,
+            started: now,
             acquired: None,
+            committing: None,
+            rows: 0,
+            bytes: 0,
         }
+    }
+
+    /// Ends preparation: everything since [`Self::start`] ran before `BEGIN`.
+    pub(crate) fn begin(&mut self) {
+        self.started = Instant::now();
     }
 
     pub(crate) fn acquired(&mut self) {
         self.acquired = Some(Instant::now());
+        self.committing = None;
+    }
+
+    pub(crate) fn committing(&mut self) {
+        self.committing = Some(Instant::now());
+    }
+
+    pub(crate) fn count(&mut self, rows: usize, bytes: usize) {
+        self.rows = rows;
+        self.bytes = bytes;
+    }
+
+    fn phases(&self, finished: Instant) -> WritePhases {
+        let acquired = self.acquired.unwrap_or(finished);
+        let committing = self.committing.unwrap_or(finished).max(acquired);
+        WritePhases {
+            prepare: self.started.duration_since(self.prepared),
+            wait: acquired.duration_since(self.started),
+            statements: committing.duration_since(acquired),
+            commit: finished.duration_since(committing),
+        }
     }
 }
 
 impl Drop for WriteTiming {
     fn drop(&mut self) {
-        let finished = Instant::now();
-        let acquired = self.acquired.unwrap_or(finished);
-        let wait = acquired.duration_since(self.started);
-        let hold = finished.duration_since(acquired);
-        if wait.max(hold) < SLOW_WRITE_THRESHOLD {
+        let phases = self.phases(Instant::now());
+        if phases.slowest() < SLOW_WRITE_THRESHOLD {
             return;
         }
         warn!(
             operation = self.operation,
             session_id = self.session_id.as_ref().map(field::display),
-            wait_ms = wait.as_millis(),
-            hold_ms = hold.as_millis(),
+            prepare_ms = phases.prepare.as_millis(),
+            wait_ms = phases.wait.as_millis(),
+            hold_ms = phases.hold().as_millis(),
+            statements_ms = phases.statements.as_millis(),
+            commit_ms = phases.commit.as_millis(),
+            rows = self.rows,
+            bytes = self.bytes,
             acquired = self.acquired.is_some(),
             pid = std::process::id(),
             "slow session database write"
@@ -1947,10 +2006,11 @@ impl SessionDatabase {
         &self,
         retry: &RuntimeRetry<'_>,
         operation: &'static str,
+        session_id: Option<CaudraId>,
         mut write: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
     ) -> Result<T, SessionError> {
         self.connection.busy_timeout(Duration::ZERO)?;
-        let mut timing = WriteTiming::start(operation, None);
+        let mut timing = WriteTiming::start(operation, session_id);
         retry.run(operation, || {
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -1958,6 +2018,7 @@ impl SessionDatabase {
             let result = (|| {
                 let value = write(&transaction)?;
                 retry.check(operation)?;
+                timing.committing();
                 transaction.commit()?;
                 Ok(value)
             })();
@@ -2945,7 +3006,7 @@ impl SessionDatabase {
             Ok(())
         };
         if let Some(retry) = retry {
-            return self.runtime_transaction(retry, RUNTIME_OWNER_CHECKPOINT, write);
+            return self.runtime_transaction(retry, RUNTIME_OWNER_CHECKPOINT, Some(session), write);
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -3260,13 +3321,15 @@ impl SessionDatabase {
             });
         }
         let deleted_write_version = recreation.deleted_write_version;
+        let mut timing = WriteTiming::start(RECREATE_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut serialized = SerializedSession::new(session)?;
+        timing.count(serialized.row_count(), serialized.logical_bytes);
         // Cleanup performs slow filesystem work outside SQLite. This lock
         // closes the gap between its tombstone check and deletion so a new
         // canonical generation cannot commit until old cleanup has finished.
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
-        let mut timing = WriteTiming::start(RECREATE_OPERATION, Some(session.id));
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3325,7 +3388,9 @@ impl SessionDatabase {
             "DELETE FROM cleanup_jobs WHERE session_id = ?1",
             params![session.id.as_bytes().as_slice()],
         )?;
+        timing.committing();
         transaction.commit()?;
+        drop(timing);
         session
             .base_write_version
             .store(write_version, Ordering::Release);
@@ -4097,8 +4162,10 @@ impl SessionDatabase {
         U: Serialize,
         T: Serialize,
     {
+        let mut timing = WriteTiming::start(SAVE_FULL_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut serialized = SerializedSession::new(session)?;
+        timing.count(serialized.row_count(), serialized.logical_bytes);
         let base_write_version = session.base_write_version.load(Ordering::Acquire);
         let expected = expected_write_version
             .or_else(|| (base_write_version >= 0).then_some(base_write_version));
@@ -4106,7 +4173,7 @@ impl SessionDatabase {
             .map(|expected| self.prepare_archive(session.id, session.messages.len(), expected))
             .transpose()?
             .flatten();
-        let mut timing = WriteTiming::start(SAVE_FULL_OPERATION, Some(session.id));
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4160,6 +4227,7 @@ impl SessionDatabase {
                 ],
             )?;
         }
+        timing.committing();
         transaction.commit()?;
         drop(timing);
         if let Some(mut archive) = archive {
@@ -4197,6 +4265,7 @@ impl SessionDatabase {
         U: Serialize,
         T: Serialize,
     {
+        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut root = SerializedRoot::new(session)?;
         let messages = serialize_values(
@@ -4231,7 +4300,16 @@ impl SessionDatabase {
                 .flat_map(|(_, _, values)| values)
                 .map(String::len)
                 .sum::<usize>();
-        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
+        timing.count(
+            messages.len()
+                + tool_outputs.len()
+                + subagent_messages
+                    .iter()
+                    .map(|(_, _, values)| values.len())
+                    .sum::<usize>(),
+            added_bytes,
+        );
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4277,6 +4355,7 @@ impl SessionDatabase {
             }
         }
         replace_auxiliary(&transaction, session)?;
+        timing.committing();
         transaction.commit()?;
         drop(timing);
         let write_version = cursor.write_version + 1;
@@ -5196,6 +5275,16 @@ impl SerializedSession {
 
     fn task_spec_bytes(&self) -> usize {
         self.task_specs.values().map(String::len).sum()
+    }
+
+    fn row_count(&self) -> usize {
+        self.messages.len()
+            + self.tool_outputs.len()
+            + self
+                .subagent_messages
+                .iter()
+                .map(|(_, values)| values.len())
+                .sum::<usize>()
     }
 }
 
@@ -7742,6 +7831,39 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         SqliteError::SqliteFailure(SqliteErrorCode::new(code), None).into()
     }
 
+    #[test_case(Some(5), Some(12), [2, 3, 7, 8]; "committed")]
+    #[test_case(Some(5), None, [2, 3, 15, 0]; "failed before commit")]
+    #[test_case(None, None, [2, 18, 0, 0]; "never acquired")]
+    fn write_phases_split_the_elapsed_time(
+        acquired_ms: Option<u64>,
+        committing_ms: Option<u64>,
+        [prepare, wait, statements, commit]: [u64; 4],
+    ) {
+        const STARTED_MS: u64 = 2;
+        const FINISHED_MS: u64 = 20;
+        let base = Instant::now();
+        let at = |ms| base + Duration::from_millis(ms);
+        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, None);
+        timing.prepared = base;
+        timing.started = at(STARTED_MS);
+        timing.acquired = acquired_ms.map(at);
+        timing.committing = committing_ms.map(at);
+        let phases = timing.phases(at(FINISHED_MS));
+        assert_eq!(
+            phases,
+            WritePhases {
+                prepare: Duration::from_millis(prepare),
+                wait: Duration::from_millis(wait),
+                statements: Duration::from_millis(statements),
+                commit: Duration::from_millis(commit),
+            }
+        );
+        assert_eq!(
+            phases.prepare + phases.wait + phases.hold(),
+            Duration::from_millis(FINISHED_MS)
+        );
+    }
+
     #[test_case(ffi::SQLITE_BUSY; "busy")]
     #[test_case(ffi::SQLITE_BUSY_SNAPSHOT; "snapshot")]
     #[test_case(ffi::SQLITE_BUSY_RECOVERY; "recovery")]
@@ -8240,7 +8362,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         retry.run_with_clock(
             RUNTIME_OWNER_CHECKPOINT,
             || {
-                database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                     transaction.execute(
                         "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                         params![ARTIFACT_NAME],
@@ -8273,7 +8395,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let retry = RuntimeRetry::new(None, &|| false);
         let attempts = Cell::new(0);
         database
-            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                     params![ARTIFACT_NAME],
@@ -8302,7 +8424,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let is_cancelled = || cancelled.get();
         let retry = RuntimeRetry::new(None, &is_cancelled);
         let result =
-            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                     params![ARTIFACT_NAME],
@@ -8351,7 +8473,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         };
         let retry = RuntimeRetry::new(None, &cancelled);
         database
-            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 attempts.set(attempts.get() + 1);
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
@@ -8405,7 +8527,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let retry = RuntimeRetry::new(None, &|| false);
         let attempts = Cell::new(0);
         let result: Result<(), _> =
-            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 attempts.set(attempts.get() + 1);
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",

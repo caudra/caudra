@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caudra_agent::peers::PeerSession;
 use caudra_storage::account_switches::StoredAccountSwitch;
@@ -33,8 +33,8 @@ use caudra_storage::permission_state::mutation::{
 #[cfg(test)]
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::sessions::{
-    SessionCursor, SessionDatabase, SessionError, SessionRecreation, WAL_RETENTION_LIMIT_BYTES,
-    eager_load_limit,
+    SLOW_WRITE_THRESHOLD, SessionCursor, SessionDatabase, SessionError, SessionRecreation,
+    WAL_RETENTION_LIMIT_BYTES, eager_load_limit,
 };
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::token_calibration::{StoredCalibration, TokenCalibrationStore};
@@ -94,6 +94,7 @@ type PendingCalibrations = Arc<Mutex<HashMap<(String, String), StoredCalibration
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
+pub type SaveAcknowledgment = flume::Receiver<Result<(), SessionError>>;
 pub type PermissionMutationAcknowledgment =
     flume::Receiver<Result<PermissionCommitReceipt, PermissionMutationError>>;
 
@@ -138,9 +139,46 @@ impl PermissionMutationWriter {
 /// drain a save enqueued after it, so the delete unlinked a session the app
 /// had just saved.
 enum Entry {
-    Save(Arc<AppSession>),
-    SaveSync(Arc<AppSession>, SaveCallback),
+    Save(QueuedSave),
     Delete(DeleteCallback),
+}
+
+/// The newest snapshot of a session and everyone waiting for it. A newer
+/// snapshot takes over the waiters of the one it replaces: it is causally
+/// later, so its commit is what makes their state durable.
+struct QueuedSave {
+    session: Arc<AppSession>,
+    waiters: Vec<SaveCallback>,
+    queued: Instant,
+}
+
+impl Entry {
+    fn save(session: Arc<AppSession>, waiter: Option<SaveCallback>) -> Self {
+        Self::Save(QueuedSave {
+            session,
+            waiters: waiter.into_iter().collect(),
+            queued: Instant::now(),
+        })
+    }
+}
+
+impl QueuedSave {
+    fn take_over(&mut self, older: Self) {
+        self.waiters.extend(older.waiters);
+        self.queued = self.queued.min(older.queued);
+    }
+
+    fn resolve(&mut self, result: Result<(), SessionError>) {
+        let Some(last) = self.waiters.pop() else {
+            return;
+        };
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(result.as_ref().map(|&()| ()).map_err(|error| {
+                StorageError::Io(io::Error::other(error.to_string())).into()
+            }));
+        }
+        let _ = last.send(result);
+    }
 }
 
 struct WorkspaceTabsRequest {
@@ -463,7 +501,7 @@ impl StorageWriter {
     }
 
     pub fn send(&self, session: Arc<AppSession>) {
-        self.enqueue(session.id, Entry::Save(session));
+        self.enqueue(session.id, Entry::save(session, None));
     }
 
     /// Hands over the cursor a load produced, so the first save of a resumed
@@ -477,6 +515,16 @@ impl StorageWriter {
     }
 
     pub fn save_sync(&self, session: Arc<AppSession>) -> Result<(), SessionError> {
+        self.save_acked(session)
+            .recv()
+            .unwrap_or_else(|_| Err(writer_gone()))
+    }
+
+    /// Queues `session` here, so it keeps its place among this caller's
+    /// saves, and hands back what its commit reports for someone else to
+    /// wait on.
+    pub fn save_acked(&self, session: Arc<AppSession>) -> SaveAcknowledgment {
+        let (done_tx, done_rx) = flume::bounded(1);
         #[cfg(test)]
         if let Some(error) = self
             .failing_save_sync
@@ -484,12 +532,11 @@ impl StorageWriter {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            return Err(error);
+            let _ = done_tx.send(Err(error));
+            return done_rx;
         }
-        let id = session.id;
-        let (done_tx, done_rx) = flume::bounded(1);
-        self.enqueue(id, Entry::SaveSync(session, done_tx));
-        done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
+        self.enqueue(session.id, Entry::save(session, Some(done_tx)));
+        done_rx
     }
 
     pub fn save_sync_timeout(
@@ -498,7 +545,7 @@ impl StorageWriter {
         timeout: Duration,
     ) -> Result<(), SessionError> {
         let (done_tx, done_rx) = flume::bounded(1);
-        self.enqueue(session.id, Entry::SaveSync(session, done_tx));
+        self.enqueue(session.id, Entry::save(session, Some(done_tx)));
         done_rx.recv_timeout(timeout).map_err(writer_wait_error)?
     }
 
@@ -549,7 +596,7 @@ impl StorageWriter {
     }
 
     fn enqueue(&self, id: CaudraId, entry: Entry) {
-        let superseded = { lock(&self.pending).insert(id, entry) };
+        let superseded = supersede(&mut lock(&self.pending), id, entry);
         if let Some(superseded) = superseded {
             resolve_entry(superseded, Err(superseded_error(id)));
         }
@@ -635,13 +682,27 @@ fn superseded_error(id: CaudraId) -> SessionError {
     .into()
 }
 
+/// Puts `entry` in the session's slot and returns what it displaced and did
+/// not take over: a newer save inherits an older save's waiters, while
+/// anything a delete replaces, or a delete a save replaces, is superseded.
+fn supersede(pending: &mut HashMap<CaudraId, Entry>, id: CaudraId, entry: Entry) -> Option<Entry> {
+    match (pending.remove(&id), entry) {
+        (Some(Entry::Save(older)), Entry::Save(mut newer)) => {
+            newer.take_over(older);
+            pending.insert(id, Entry::Save(newer));
+            None
+        }
+        (previous, entry) => {
+            pending.insert(id, entry);
+            previous
+        }
+    }
+}
+
 fn resolve_entry(entry: Entry, result: Result<(), SessionError>) {
     match entry {
         Entry::Delete(done) => done(result),
-        Entry::SaveSync(_, done) => {
-            let _ = done.send(result);
-        }
-        Entry::Save(_) => {}
+        Entry::Save(mut save) => save.resolve(result),
     }
 }
 
@@ -741,23 +802,29 @@ impl Writer {
         let batch = mem::take(&mut *lock(pending));
         for (id, entry) in batch {
             match entry {
-                Entry::Save(session) => {
-                    let result = self.write(&session);
-                    if result.as_ref().is_err_and(retryable) {
-                        // `checkpoint` never resends an unchanged revision, so
-                        // a dropped snapshot would miss disk for good.
-                        // `or_insert` lets a newer op win; the shutdown flush
-                        // is the last retry.
-                        lock(pending).entry(id).or_insert(Entry::Save(session));
+                Entry::Save(mut save) => {
+                    let waited = save.queued.elapsed();
+                    if waited >= SLOW_WRITE_THRESHOLD {
+                        warn!(
+                            session_id = %id,
+                            queue_ms = waited.as_millis(),
+                            waiters = save.waiters.len(),
+                            "session save waited in the writer queue"
+                        );
                     }
+                    let result = self.write(&save.session);
                     self.mark_changed(&result);
                     self.report(id, &result);
-                }
-                Entry::SaveSync(session, done) => {
-                    let result = self.write(&session);
-                    self.mark_changed(&result);
-                    self.report(id, &result);
-                    let _ = done.send(result);
+                    // A waiter hears the failure and decides for itself; a
+                    // save nobody waits on is retried, because `checkpoint`
+                    // never resends an unchanged revision and a dropped
+                    // snapshot would miss disk for good. A newer op wins; the
+                    // shutdown flush is the last retry.
+                    let retry = save.waiters.is_empty() && result.as_ref().is_err_and(retryable);
+                    save.resolve(result);
+                    if retry {
+                        lock(pending).entry(id).or_insert(Entry::Save(save));
+                    }
                 }
                 Entry::Delete(done) => {
                     let (session_result, recreation) = self.delete(id);
@@ -1264,7 +1331,17 @@ impl Writer {
         let Some(database) = &self.database else {
             return;
         };
-        match database.checkpoint(false) {
+        let started = Instant::now();
+        let checkpointed = database.checkpoint(false);
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_WRITE_THRESHOLD {
+            warn!(
+                checkpoint_ms = elapsed.as_millis(),
+                busy = checkpointed.as_ref().is_ok_and(|result| result.busy),
+                "slow session database passive checkpoint"
+            );
+        }
+        match checkpointed {
             Ok(result) => {
                 tracing::debug!(
                     busy = result.busy,
@@ -1870,11 +1947,29 @@ mod tests {
         assert_writer_error(error, io::ErrorKind::TimedOut, WRITER_TIMEOUT);
         assert!(matches!(
             lock(&writer.pending).get(&id),
-            Some(Entry::SaveSync(..))
+            Some(Entry::Save(save)) if !save.waiters.is_empty()
         ));
         release.send(()).unwrap();
         writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
         assert!(AppSession::load(id, &dir).is_ok());
+    }
+
+    #[test]
+    fn a_superseded_waiter_hears_the_newer_commit() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let release = pause_writer(&writer);
+        let mut session = AppSession::new(MODEL, CWD);
+        let id = session.id;
+        let first = writer.save_acked(Arc::new(session.clone()));
+        session.set_title(TITLE.into());
+        writer.send(Arc::new(session));
+
+        assert!(first.try_recv().is_err());
+        release.send(()).unwrap();
+        first.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+        assert_eq!(AppSession::load(id, &dir).unwrap().title, TITLE);
     }
 
     #[test_case(false; "legacy_save")]
@@ -1939,11 +2034,7 @@ mod tests {
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let pending = Arc::clone(&writer.pending);
         let (done_tx, done_rx) = flume::bounded(1);
-        let entry = if synchronous {
-            Entry::SaveSync(Arc::clone(&session), done_tx)
-        } else {
-            Entry::Save(Arc::clone(&session))
-        };
+        let entry = Entry::save(Arc::clone(&session), synchronous.then_some(done_tx));
         lock(&pending).insert(session.id, entry);
 
         let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
@@ -2049,7 +2140,7 @@ mod tests {
         let id = session.id;
         let (save_tx, save_rx) = flume::bounded(1);
         let (delete_tx, delete_rx) = flume::bounded(1);
-        lock(&pending).insert(id, Entry::SaveSync(session, save_tx));
+        lock(&pending).insert(id, Entry::save(session, Some(save_tx)));
         lock(&pending).insert(
             CaudraId::generate(),
             Entry::Delete(Box::new(move |result| delete_tx.send(result).unwrap())),
@@ -2798,7 +2889,7 @@ mod tests {
         };
 
         lock(&pending).insert(id, Entry::Delete(Box::new(callback)));
-        if let Some(superseded) = lock(&pending).insert(id, Entry::Save(session)) {
+        if let Some(superseded) = supersede(&mut lock(&pending), id, Entry::save(session, None)) {
             resolve_entry(superseded, Err(superseded_error(id)));
         }
 
@@ -2816,14 +2907,14 @@ mod tests {
         let (save_tx, save_rx) = flume::bounded(1);
         let (delete_tx, delete_rx) = flume::bounded(1);
 
-        lock(&pending).insert(id, Entry::SaveSync(Arc::clone(&session), save_tx));
+        lock(&pending).insert(id, Entry::save(Arc::clone(&session), Some(save_tx)));
         let delete = Entry::Delete(Box::new(move |result| {
             let _ = delete_tx.send(result);
         }));
-        if let Some(superseded) = lock(&pending).insert(id, delete) {
+        if let Some(superseded) = supersede(&mut lock(&pending), id, delete) {
             resolve_entry(superseded, Err(superseded_error(id)));
         }
-        if let Some(superseded) = lock(&pending).insert(id, Entry::Save(session)) {
+        if let Some(superseded) = supersede(&mut lock(&pending), id, Entry::save(session, None)) {
             resolve_entry(superseded, Err(superseded_error(id)));
         }
 

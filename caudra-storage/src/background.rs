@@ -600,7 +600,7 @@ impl SessionDatabase {
             return Ok(false);
         }
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
-        self.runtime_transaction(retry, RUNTIME_BACKGROUND_ARCHIVE, |transaction| {
+        self.runtime_transaction(retry, RUNTIME_BACKGROUND_ARCHIVE, Some(session), |transaction| {
             let changed = transaction.execute(
                 "UPDATE background_tasks SET archived = 1 WHERE session_id = ?1 AND invocation_id = ?2 AND payload = ?3",
                 params![session.as_bytes().as_slice(), record.invocation_id, payload],
@@ -689,7 +689,7 @@ impl SessionDatabase {
             Ok(())
         };
         if let Some(retry) = retry {
-            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, write)
+            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, Some(session), write)
         } else {
             let transaction =
                 Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;

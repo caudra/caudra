@@ -423,7 +423,7 @@ impl ToolOutputStore {
     pub fn delete(&self, session_id: CaudraId, id: &ToolOutputId) -> Result<(), ToolOutputError> {
         let retry = runtime_retry();
         let database = SessionDatabase::open_runtime(&self.state_dir, &retry)?;
-        database.runtime_transaction(&retry, DELETE_OPERATION, |transaction| {
+        database.runtime_transaction(&retry, DELETE_OPERATION, Some(session_id), |transaction| {
             transaction.execute(
                 "DELETE FROM saved_tool_outputs WHERE session_id = ?1 AND output_id = ?2",
                 params![session_id.as_bytes().as_slice(), id.as_str()],
@@ -454,7 +454,7 @@ impl ToolOutputStore {
         let payload = compress_payload(text)?;
         let byte_count = to_i64(text.len(), "tool output bytes")?;
         let database = SessionDatabase::open_runtime(&self.state_dir, retry)?;
-        let id = database.runtime_transaction(retry, SAVE_OPERATION, |transaction| {
+        let id = database.runtime_transaction(retry, SAVE_OPERATION, Some(session_id), |transaction| {
             let mut insert = transaction.prepare_cached(
                 "INSERT INTO saved_tool_outputs \
                      (session_id, output_id, created_at, byte_count, payload) \
