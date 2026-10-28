@@ -420,8 +420,8 @@ pub struct StatusBarHit {
 }
 
 pub struct UsageStats {
-    /// The whole session's bill, drawn next to the focused chat's own once
-    /// subagents make the two differ.
+    /// The whole session's bill, drawn instead of the focused chat's own once
+    /// subagents make the two differ. The tooltip names both.
     pub global_cost: Option<f64>,
     pub global_subscription_cost: Option<f64>,
     pub context_size: u32,
@@ -607,7 +607,6 @@ enum AccountSlot {
 enum Reduction {
     DropGauge,
     LeafModel,
-    DropGlobalSpend,
     DropCompactionBorder,
     CompactContext,
     ShortThinking,
@@ -649,7 +648,6 @@ impl Reduction {
             | Self::ChopModel
             | Self::DropPermission => Band::Settings,
             Self::DropGauge
-            | Self::DropGlobalSpend
             | Self::DropCompactionBorder
             | Self::CompactContext
             | Self::ShortWorkflows
@@ -684,10 +682,9 @@ impl Reduction {
 ///
 /// A split footer walks this same ladder once per row, skipping the rungs of
 /// the other [`Band`], so both layouts give up their chips in one order.
-const LADDER: [Reduction; 19] = [
+const LADDER: [Reduction; 18] = [
     Reduction::DropGauge,
     Reduction::LeafModel,
-    Reduction::DropGlobalSpend,
     Reduction::DropCompactionBorder,
     Reduction::CompactContext,
     Reduction::ShortThinking,
@@ -722,8 +719,8 @@ struct SpendText {
     /// in use so the bar says how far off it is rather than only how full it is.
     border: Option<String>,
     over_border: bool,
+    /// The session total once subagents split the bill, else the chat's own.
     spend: Option<SpendFigure>,
-    global: Option<SpendFigure>,
     /// `None` without a window to measure against.
     gauge: Option<Gauge>,
 }
@@ -753,13 +750,13 @@ impl SpendText {
             over_border: stats
                 .compaction_border
                 .is_some_and(|border| stats.context_size >= border),
-            spend: spend(stats.cost, stats.subscription_cost),
-            global: spend(stats.global_cost, stats.global_subscription_cost)
+            spend: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
                 .map(|global| SpendFigure {
                     full: format!("{SESSION_SUM_MARK}{}", global.full),
                     short: format!("{SESSION_SUM_MARK}{}", global.short),
-                }),
+                })
+                .or_else(|| spend(stats.cost, stats.subscription_cost)),
             gauge: Gauge::new(stats),
         }
     }
@@ -847,7 +844,6 @@ fn cells(glyph: char, count: u8) -> String {
 struct Fit {
     spend: bool,
     short_spend: bool,
-    global_spend: bool,
     context: ContextTier,
     compaction_border: bool,
     thinking: ThinkingTier,
@@ -863,7 +859,6 @@ impl Fit {
     const FULL: Self = Self {
         spend: true,
         short_spend: false,
-        global_spend: true,
         account: AccountSlot::Named,
         context: ContextTier::Gauge,
         compaction_border: true,
@@ -879,7 +874,6 @@ impl Fit {
         match step {
             Reduction::DropGauge => self.context = ContextTier::Counts,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
-            Reduction::DropGlobalSpend => self.global_spend = false,
             Reduction::DropCompactionBorder => self.compaction_border = false,
             Reduction::CompactContext => self.context = ContextTier::Percent,
             Reduction::ShortThinking => self.thinking = ThinkingTier::Short,
@@ -1026,24 +1020,14 @@ impl Fit {
         }
     }
 
-    /// Both figures answer the same question, so they are drawn and hit as one
-    /// control rather than as a price with a total stuck to it.
+    /// One figure: the session total once there is one, since the tooltip
+    /// already names the chat's own share of it.
     fn money_text(self, spend: &SpendText) -> Option<Cow<'_, str>> {
-        let chat = spend
+        spend
             .spend
             .as_ref()
             .filter(|_| self.spend)
-            .map(|figure| self.spend_tier(figure));
-        let session = spend
-            .global
-            .as_ref()
-            .filter(|_| self.global_spend)
-            .map(|figure| self.spend_tier(figure));
-        match (chat, session) {
-            (Some(chat), Some(session)) => Some(Cow::Owned(format!(" {chat} {session}"))),
-            (Some(only), None) | (None, Some(only)) => Some(Cow::Owned(format!(" {only}"))),
-            (None, None) => None,
-        }
+            .map(|figure| Cow::Owned(format!(" {}", self.spend_tier(figure))))
     }
 }
 
@@ -2202,11 +2186,16 @@ fn context_tip(stats: &UsageStats) -> String {
 }
 
 fn usage_tip(stats: &UsageStats) -> Option<String> {
-    let chat = spend(stats.cost, stats.subscription_cost)?;
-    let mut lines = vec![format!("{TIP_CHAT_SPEND}{}", chat.full)];
-    let session = spend(stats.global_cost, stats.global_subscription_cost);
-    if let Some(session) = session.as_ref().filter(|_| stats.show_global) {
-        lines.push(format!("{TIP_SESSION_SPEND}{}", session.full));
+    let chat = spend(stats.cost, stats.subscription_cost);
+    let session =
+        spend(stats.global_cost, stats.global_subscription_cost).filter(|_| stats.show_global);
+    let mut lines: Vec<String> = chat
+        .map(|chat| format!("{TIP_CHAT_SPEND}{}", chat.full))
+        .into_iter()
+        .chain(session.map(|session| format!("{TIP_SESSION_SPEND}{}", session.full)))
+        .collect();
+    if lines.is_empty() {
+        return None;
     }
     if lines.iter().any(|line| line.contains(NOT_BILLED_MARK)) {
         lines.push(format!("{NOT_BILLED_MARK}{TIP_NOT_BILLED}"));
@@ -2987,7 +2976,6 @@ mod tests {
     /// the cwd the test bar is drawn in.
     const TOUCHING_SIDES: [&str; 2] = ["][", "]."];
     const TOUCHING_MSG: &str = "a right side that fits exactly ran into the left side";
-    const MONEY_GLYPHS: &str = "$0.25 \u{03a3}$1.5";
     const MISSING_HIT_MSG: &str = "the control was drawn without a hit";
     const FIGURE_HIT_MSG: &str = "a figure's hit must cover its glyphs and no padding";
     const STALE_HIT_MSG: &str = "a hit outlived the figure it was measured on";
@@ -3005,15 +2993,18 @@ mod tests {
     /// [`CHAT_COST`] and [`SESSION_COST`] beside it.
     const COVERED_COSTS: (f64, f64) = (4.5, 9.25);
     const MIXED_CHAT_GLYPHS: &str = "$0.25 \u{2248}$4.5";
-    const MIXED_MONEY_GLYPHS: &str = "$0.25 \u{2248}$4.5 \u{03a3}$1.5 \u{2248}$9.25";
-    const SHORT_MIXED_GLYPHS: &str = "\u{2248}$4.5";
+    const MIXED_SESSION_GLYPHS: &str = "\u{03a3}$1.5 \u{2248}$9.25";
+    const SHORT_MIXED_SESSION_GLYPHS: &str = "\u{03a3}\u{2248}$9.25";
     /// The tooltip names the session in words, so its figure needs no sigma.
     const MIXED_SESSION_TIP: &str = "Whole session: $1.5 \u{2248}$9.25";
-    /// Room for both payers of both figures.
+    /// Room for both payers of the session total.
     const MIXED_WIDE_BUDGET: usize = 160;
     const SHORT_SPEND_MSG: &str =
         "a mixed price must show both payers, then the larger, then nothing";
     const TIP_PAYERS_MSG: &str = "the tooltip must name both payers whatever the bar dropped";
+    const CHAT_FIGURE_SHOWN_MSG: &str = "the bar must not draw the chat's figure beside the sigma";
+    const SESSION_TIP_MISSING_MSG: &str =
+        "a chat that has spent nothing must still name the session total on hover";
     const GOAL_CONDITION: &str = "all focused tests pass";
     const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
     const RETRY_MESSAGE: &str = "Rate limited: rate_limit_error";
@@ -3623,7 +3614,7 @@ mod tests {
     /// columns to a modal. The gauge draws the counter a second time, so the
     /// two are one control.
     #[test_case(StatusBarHitTarget::Context, GAUGE_COUNTS_GLYPHS ; "gauge_and_counter_open_context")]
-    #[test_case(StatusBarHitTarget::Usage, MONEY_GLYPHS    ; "money_opens_usage")]
+    #[test_case(StatusBarHitTarget::Usage, SESSION_COST_TEXT ; "money_opens_usage")]
     #[test_case(StatusBarHitTarget::Workflows, LADDER_WORKFLOW_CHIP ; "workflow_chip_opens_runs")]
     fn a_figure_is_hit_on_its_own_glyphs(target: StatusBarHitTarget, expected: &str) {
         with_ladder_ctx(|ctx| {
@@ -3639,23 +3630,27 @@ mod tests {
         });
     }
 
-    /// The session total sits beside the chat's own price with two columns
-    /// between them. One control covers both, or hovering leaves a gap that
-    /// still answers the click.
+    /// Once subagents split the bill, the bar draws the session total alone and
+    /// leaves the chat's own share to the tooltip.
     #[test]
-    fn the_money_control_covers_both_figures() {
+    fn the_session_total_replaces_the_chats_figure() {
         with_ladder_ctx(|ctx| {
             let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
-            let glyphs = hit_glyphs(&side, StatusBarHitTarget::Usage);
 
-            assert!(glyphs.starts_with(CHAT_COST_TEXT), "{glyphs}");
-            assert!(glyphs.ends_with(SESSION_COST_TEXT), "{glyphs}");
+            assert_eq!(
+                hit_glyphs(&side, StatusBarHitTarget::Usage),
+                SESSION_COST_TEXT
+            );
+            assert!(
+                !side_text(&side).contains(CHAT_COST_TEXT),
+                "{CHAT_FIGURE_SHOWN_MSG}"
+            );
         });
     }
 
-    /// Walking down from a wide bar, a mixed price shows both payers, then the
-    /// larger figure alone, then nothing, and never one of those out of order.
-    /// The hit covers whatever tier is drawn.
+    /// Walking down from a wide bar, a mixed session total shows both payers,
+    /// then the larger figure alone, then nothing, and never one of those out
+    /// of order. The hit covers whatever tier is drawn.
     #[test]
     fn a_mixed_price_gives_up_its_smaller_figure_before_the_price() {
         with_ladder_ctx_spending(None, Some(COVERED_COSTS), |ctx| {
@@ -3674,9 +3669,8 @@ mod tests {
             assert_eq!(
                 seen,
                 [
-                    Some(MIXED_MONEY_GLYPHS.to_owned()),
-                    Some(MIXED_CHAT_GLYPHS.to_owned()),
-                    Some(SHORT_MIXED_GLYPHS.to_owned()),
+                    Some(MIXED_SESSION_GLYPHS.to_owned()),
+                    Some(SHORT_MIXED_SESSION_GLYPHS.to_owned()),
                     None,
                 ],
                 "{SHORT_SPEND_MSG}"
@@ -3693,6 +3687,26 @@ mod tests {
             assert!(tip.contains(MIXED_SESSION_TIP), "{TIP_PAYERS_MSG}: {tip}");
             assert!(tip.contains(TIP_NOT_BILLED), "{TIP_PAYERS_MSG}: {tip}");
         });
+    }
+
+    #[test]
+    fn the_spend_tooltip_names_the_session_for_a_chat_that_spent_nothing() {
+        let stats = UsageStats {
+            global_cost: Some(SESSION_COST),
+            global_subscription_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: None,
+            subscription_cost: None,
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            compaction_border: None,
+            show_global: true,
+        };
+        let tip = usage_tip(&stats).expect(SESSION_TIP_MISSING_MSG);
+
+        assert!(
+            tip.starts_with(TIP_SESSION_SPEND),
+            "{SESSION_TIP_MISSING_MSG}: {tip}"
+        );
     }
 
     /// A figure the ladder dropped must not leave a control behind, or the bar
@@ -3882,7 +3896,7 @@ mod tests {
                 ),
                 (
                     LIVE_ROW,
-                    [LADDER_WORKFLOW_CHIP, GAUGE_COUNTS_GLYPHS, MONEY_GLYPHS].as_slice(),
+                    [LADDER_WORKFLOW_CHIP, GAUGE_COUNTS_GLYPHS, SESSION_COST_TEXT].as_slice(),
                 ),
             ] {
                 for chip in chips {
@@ -4410,7 +4424,8 @@ mod tests {
     /// The sigma is the whole session's bill, and only the session can hand it
     /// over. Pricing the focused chat's counters instead (what the bar used to
     /// do) tells the user a paid session was free, or bills another chat's
-    /// tokens at this model's rates. A lone chat has nothing extra to show.
+    /// tokens at this model's rates. A lone chat has nothing extra to show, and
+    /// once the sigma is drawn the chat's own figure gives way to it.
     #[test_case(Some(SESSION_COST), true  => true  ; "subagents_add_the_session_total")]
     #[test_case(Some(SESSION_COST), false => false ; "single_chat_shows_its_own_cost_only")]
     #[test_case(None,               true  => false ; "unpriced_session_claims_nothing")]
@@ -4419,8 +4434,12 @@ mod tests {
         show_global: bool,
     ) -> bool {
         let text = render(global_cost, show_global, false);
-        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
         let shown = text.matches(SESSION_COST_TEXT).count() == 1;
+        assert_eq!(
+            text.matches(CHAT_COST_TEXT).count(),
+            usize::from(!shown),
+            "{text}"
+        );
         assert_eq!(
             text.contains(SIGMA),
             shown,

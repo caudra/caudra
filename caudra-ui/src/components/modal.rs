@@ -233,11 +233,16 @@ impl FooterHits {
         self.pointer.and_then(|pointer| self.index_at(pointer))
     }
 
-    /// The tooltip of the hovered title control, worded by `text` from its index.
-    pub(crate) fn title_tip(&self, text: impl FnOnce(usize) -> Option<String>) -> Option<Tip> {
+    /// The tooltip of the hovered control, keyed by `key` and worded by `text`
+    /// from its index.
+    pub(crate) fn tip(
+        &self,
+        key: fn(usize) -> TipKey,
+        text: impl FnOnce(usize) -> Option<String>,
+    ) -> Option<Tip> {
         let index = self.hovered()?;
         let area = self.hits.get(index).copied()?;
-        Some(Tip::at(TipKey::TitleHint(index), area, text(index)?))
+        Some(Tip::at(key(index), area, text(index)?))
     }
 
     /// Reports the command a release completed. Press and release must land on

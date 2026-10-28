@@ -6357,9 +6357,9 @@ fn restart_keeps_the_recorded_spend(turns: &[Spent], on_bar: &str, in_usage: &st
 }
 
 /// The sigma the status bar draws once subagents split the bill is the session
-/// total itself, so it cannot drift from what `/usage` sums. The session total
-/// is the first thing a narrow bar sheds, so this asks for a bar wide enough to
-/// still be carrying it.
+/// total itself, so it cannot drift from what `/usage` sums. A narrow bar
+/// sheds its spend slot, so this asks for a bar wide enough to still be
+/// carrying it.
 #[test]
 fn status_bar_sigma_draws_the_session_cost() {
     let mut app = app_with_subagent();
@@ -31221,6 +31221,9 @@ mod goal_log {
     fn enter_on_a_check_that_drew_no_row_keeps_the_log_up() {
         let mut app = test_app();
         app.state.goal.set(GOAL_CONDITION).unwrap();
+        // Saves the session row first, as production does, or the writer may
+        // drop the check below for referencing a session it has not written.
+        app.flush_goal_log();
         record(
             &app,
             check(

@@ -99,6 +99,8 @@ const TIP_NEXT: &str = "Waits until this run and its background work finish";
 const TIP_GUIDE: &str = "Joins this run before its next model request, without stopping it";
 const TIP_REPLACE: &str = "Stops this run and its background work, then sends this instead";
 pub(crate) const CLICK_OR_PRESS: &str = "Click or press ";
+/// For a control the pointer can explain but not press.
+pub(crate) const PRESS: &str = "Press ";
 
 /// What a control means, then the key that does the same without the mouse.
 pub(crate) fn control_tip(meaning: &str, key: &str) -> String {

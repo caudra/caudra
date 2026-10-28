@@ -276,9 +276,11 @@ const HINT_KEY_GAP: &str = " ";
 pub(crate) struct Hint {
     label: &'static str,
     description: &'static str,
-    /// `None` is a group hint such as `↑↓ select`: drawn, never hovered,
-    /// never pressed.
+    /// `None` is a group hint such as `↑↓ select`: drawn and explained, never
+    /// marked, never pressed.
     press: Option<KeyEvent>,
+    /// What the control does, for the box the pointer raises over it.
+    tip: Option<&'static str>,
 }
 
 impl Hint {
@@ -287,6 +289,7 @@ impl Hint {
             label: bind.label,
             description,
             press: Some(bind.to_key_event()),
+            tip: None,
         }
     }
 
@@ -295,6 +298,7 @@ impl Hint {
             label,
             description,
             press: Some(KeyEvent::new(code, KeyModifiers::NONE)),
+            tip: None,
         }
     }
 
@@ -312,7 +316,30 @@ impl Hint {
             label,
             description,
             press: None,
+            tip: None,
         }
+    }
+
+    /// Explains the control when the pointer rests on it.
+    pub(crate) const fn tip(self, meaning: &'static str) -> Self {
+        Self {
+            tip: Some(meaning),
+            ..self
+        }
+    }
+
+    /// The box's text: what the control does, then how to do it.
+    fn tip_text(&self) -> Option<String> {
+        let meaning = self.tip?;
+        Some(match self.press {
+            Some(_) => input::control_tip(meaning, self.label),
+            None => format!("{meaning}\n{}{}", input::PRESS, self.label),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_tip(&self) -> bool {
+        self.tip.is_some()
     }
 
     #[cfg(test)]
@@ -455,6 +482,14 @@ impl HintBar {
         self.hits
             .hovered()
             .filter(|&index| self.hints[index].press.is_some())
+    }
+
+    /// What the hint under the pointer does. A group hint explains itself too:
+    /// it cannot be pressed, but its keys still want saying.
+    pub(crate) fn tooltip(&self) -> Option<tooltip::Tip> {
+        self.hits.tip(tooltip::TipKey::FooterHint, |index| {
+            self.hints.get(index)?.tip_text()
+        })
     }
 }
 
@@ -2677,6 +2712,37 @@ mod tests {
             bar.handle_mouse(bar_mouse(MouseEventKind::Up(MouseButton::Left), close)),
             Some(key::ESC.to_key_event())
         );
+    }
+
+    const HINT_MEANING: &str = "Does what the hint says";
+    const GROUP_HINT: Hint = Hint::inert("↑↓", "select").tip(HINT_MEANING);
+    const HINT_TIP_MISSING: &str = "an explained hint must raise its box";
+
+    /// A group hint cannot be pressed, so its box says which keys to press
+    /// instead; a hint nobody explained raises no box at all.
+    #[test_case(0, Some(input::PRESS) ; "a_group_hint_names_its_keys")]
+    #[test_case(1, Some(input::CLICK_OR_PRESS) ; "a_pressable_hint_offers_the_click")]
+    #[test_case(2, None ; "an_unexplained_hint_stays_quiet")]
+    fn a_hint_bar_explains_the_hint_under_the_pointer(index: usize, how: Option<&str>) {
+        use crossterm::event::MouseEventKind;
+        let hints = vec![GROUP_HINT, HINTS[0].tip(HINT_MEANING), HINTS[1]];
+        let mut bar = HintBar::default();
+        bar.line(HINT_ROW, hints.clone());
+
+        bar.handle_mouse(bar_mouse(MouseEventKind::Moved, bar.hits.hit(index)));
+        let tip = bar.tooltip();
+
+        match how {
+            Some(how) => {
+                let tip = tip.expect(HINT_TIP_MISSING);
+                assert_eq!(tip.key, tooltip::TipKey::FooterHint(index));
+                assert_eq!(
+                    tip.text,
+                    format!("{HINT_MEANING}\n{how}{}", hints[index].label)
+                );
+            }
+            None => assert_eq!(tip, None),
+        }
     }
 
     #[test]

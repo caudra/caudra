@@ -174,7 +174,7 @@ Deleting a session deletes its transcript. The record of what it cost lives in a
 
 Project totals use the exact directory recorded for each turn. [Bulk session migration](/docs/sessions/#moving-sessions-to-another-directory) includes historical project usage by default, with an option to leave it unchanged. Moving one session preserves its own counters without reattributing the shared ledger.
 
-Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, accounts, models, projects, and purposes that cost the most, and a month by month breakdown. Turns recorded before Caudra tracked [accounts](/docs/accounts/) have none and stay out of the account list. Press `g` again to go back. The keys `/usage` takes are listed on its top border, where a click on `Ctrl+R reload`, `g`, or `e` does what the key does.
+Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, accounts, models, projects, and purposes that cost the most, and a month by month breakdown. Turns recorded before Caudra tracked [accounts](/docs/accounts/) have none and stay out of the account list. Press `g` again to go back. The keys `/usage` takes are listed on its top border, where a click on `Ctrl+R reload`, `g`, or `e` does what the key does. Rest the pointer on a column, a figure, a heading, or a note to see what it means.
 
 A long list of providers, models, projects, or months shows the 8 that cost the most and ends in `... and N more`. Click that line to show the rest, and `show less` to fold it again, or press `e` to open or close every list at once. Purposes always show in full.
 

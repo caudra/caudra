@@ -58,6 +58,8 @@ pub(crate) enum TipKey {
     DocsBadge,
     /// A control on the top border of the one modal that is open.
     TitleHint(usize),
+    /// A key hint in the bar along the bottom of the one modal that is open.
+    FooterHint(usize),
 }
 
 /// Where the box hangs from.

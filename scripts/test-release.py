@@ -594,6 +594,21 @@ class ReleaseTests(unittest.TestCase):
                 ):
                     RELEASE.validate_source(repository, ref, sha, self.root)
 
+    def test_persisted_format_changes_stop_validation(self):
+        changed = "session-database changed from 43 to 44"
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr=changed)
+        with (
+            patch.object(RELEASE.subprocess, "run", return_value=failed) as run,
+            self.assertRaisesRegex(ValueError, changed),
+        ):
+            RELEASE.check_persisted_formats()
+        self.assertEqual(
+            run.call_args.args[0][1:], [str(RELEASE.PERSISTED_FORMATS), "check"]
+        )
+        passed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch.object(RELEASE.subprocess, "run", return_value=passed):
+            RELEASE.check_persisted_formats()
+
     def test_checked_in_workspace_packages_inherit_the_release_version(self):
         RELEASE.validate_workspace_versions(Path(__file__).resolve().parent.parent)
 
