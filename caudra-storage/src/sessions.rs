@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use caudra_workspace::PlanRef;
-use rusqlite::Error as SqliteError;
+use rusqlite::{Error as SqliteError, ErrorCode};
 use tracing::warn;
 
 use crate::autopilot::StoredAutopilot;
@@ -56,10 +56,11 @@ pub(crate) use database::{
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
-    SOURCE_CODE_TOOL_RENAMES, SessionCursor, SessionDatabase, SessionOpenEvent, SessionOpenRetry,
-    SLOW_WRITE_THRESHOLD, SessionRecreation, SessionStorageStats, ToolBucket, ToolLedgerEntry, TrimReport, UsageBucket,
-    WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR, WalFrames, describe_open_sessions,
-    eager_load_limit, persistent_session_titles, set_eager_load_limit,
+    SLOW_WRITE_THRESHOLD, SOURCE_CODE_TOOL_RENAMES, SessionCursor, SessionDatabase,
+    SessionOpenEvent, SessionOpenRetry, SessionRecreation, SessionStorageStats, ToolBucket,
+    ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
+    WalFrames, describe_open_sessions, eager_load_limit, persistent_session_titles,
+    set_eager_load_limit,
 };
 pub use lease::{
     INSTANCES_LOCK_FILE, InstanceHold, InstanceLock, SessionLease, hold_instance, open_instances,
@@ -227,6 +228,20 @@ pub enum SessionError {
     ProjectUsageRequiresSource,
     #[error("session relocation requires persistent storage")]
     RelocationUnavailable,
+}
+
+impl SessionError {
+    /// Whether another writer held the database, so the same write can
+    /// succeed once it lets go. Everything else fails the same way again.
+    pub fn is_contention(&self) -> bool {
+        match self {
+            Self::RuntimeContention { .. }
+            | Self::RuntimeDeadline { .. }
+            | Self::SessionOpenContention { .. } => true,
+            Self::Sqlite(source) => source.sqlite_error_code() == Some(ErrorCode::DatabaseBusy),
+            _ => false,
+        }
+    }
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by

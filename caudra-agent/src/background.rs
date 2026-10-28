@@ -1,7 +1,11 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cmp::Reverse;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::future::Future;
 use std::iter::once;
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -21,9 +25,9 @@ use caudra_storage::{
     },
     id::CaudraId,
     now_epoch,
-    sessions::{RuntimeRetry, SessionDatabase},
+    sessions::{RuntimeRetry, SessionDatabase, SessionError},
     shell_history::MAX_SHELL_EXECUTIONS,
-    tool_outputs::{ToolOutputRef, ToolOutputStore},
+    tool_outputs::{ToolOutputError, ToolOutputRef, ToolOutputStore},
 };
 use event_listener::{Event, EventListener};
 use flume::Receiver;
@@ -88,6 +92,10 @@ const INTERRUPTED_STATE: &str = "interrupted";
 const INTERRUPTED_TASK_REQUIRED: &str =
     "only an interrupted managed agent task owned by this session can be resumed";
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+const BUSY_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BUSY_RETRY_MAX: Duration = Duration::from_secs(30);
+const OUTCOME_SAVE: &str = "background outcome save";
+const OUTPUT_SAVE: &str = "could not persist complete task outcome";
 /// Past this a live checkpoint keeps the last one that fit, so a long run
 /// does not rewrite its whole transcript every [`CHECKPOINT_INTERVAL`].
 const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
@@ -262,9 +270,16 @@ struct State {
     /// once the session reopens, rather than cancelled.
     interrupting: bool,
     failure: Option<String>,
+    /// Settled tasks whose terminal save has yet to commit, by invocation.
+    /// Their resident records stay active until it does.
+    terminals: HashMap<String, Terminal>,
     steering: Option<SharedSteering>,
     #[cfg(test)]
     permits: Option<Arc<Semaphore>>,
+    #[cfg(test)]
+    terminal_failures: VecDeque<SessionError>,
+    #[cfg(test)]
+    busy_retry: Option<Duration>,
     #[cfg(test)]
     admission_committed: Option<(flume::Sender<()>, flume::Receiver<()>)>,
     #[cfg(test)]
@@ -318,6 +333,60 @@ impl Drop for DriverGuard {
         drop(state);
         self.tasks.0.changed.notify(usize::MAX);
     }
+}
+
+/// Why a background save failed, and whether the same save can succeed once
+/// the database is free again.
+#[derive(Debug)]
+pub(crate) struct SaveError {
+    message: String,
+    contention: bool,
+}
+
+impl SaveError {
+    fn session(stage: &str, error: &SessionError) -> Self {
+        Self {
+            message: format!("{stage}: {error}"),
+            contention: error.is_contention(),
+        }
+    }
+
+    fn output(error: &ToolOutputError) -> Self {
+        Self {
+            message: format!("{OUTPUT_SAVE}: {error}"),
+            contention: error.is_contention(),
+        }
+    }
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<SaveError> for String {
+    fn from(error: SaveError) -> Self {
+        error.message
+    }
+}
+
+/// A settled task's terminal record, built once so every save attempt
+/// writes the same outcome, output and terminal event.
+#[derive(Clone)]
+struct Terminal {
+    record: TaskRecord,
+    transcript: TranscriptWrite,
+    /// The complete outcome, until a save stores it as task output.
+    output: Option<TerminalOutput>,
+    /// Saves that found the database busy.
+    busy: u32,
+}
+
+#[derive(Clone)]
+struct TerminalOutput {
+    text: String,
+    label: String,
 }
 
 /// A running agent task's steering queue, and what this session's agent put
@@ -646,9 +715,14 @@ impl BackgroundTasks {
                 shutdown: false,
                 interrupting: false,
                 failure: None,
+                terminals: HashMap::new(),
                 steering: None,
                 #[cfg(test)]
                 permits: None,
+                #[cfg(test)]
+                terminal_failures: VecDeque::new(),
+                #[cfg(test)]
+                busy_retry: None,
                 #[cfg(test)]
                 admission_committed: None,
                 #[cfg(test)]
@@ -977,8 +1051,9 @@ impl BackgroundTasks {
     }
 
     async fn persist(&self, record: TaskRecord) -> Result<(), String> {
-        self.persist_record(record, None, TranscriptWrite::Keep)
-            .await
+        Ok(self
+            .persist_record(record, None, TranscriptWrite::Keep)
+            .await?)
     }
 
     /// Saves the running task's transcript into its record at most once per
@@ -1053,7 +1128,7 @@ impl BackgroundTasks {
         mut record: TaskRecord,
         admission: Option<Admission>,
         transcript: TranscriptWrite,
-    ) -> Result<(), String> {
+    ) -> Result<(), SaveError> {
         record.updated_at = now_epoch();
         #[cfg(test)]
         let admission_committed = {
@@ -1072,7 +1147,7 @@ impl BackgroundTasks {
             let stage = if admission.is_some() {
                 "background admission save"
             } else if record.outcome.is_some() {
-                "background outcome save"
+                OUTCOME_SAVE
             } else {
                 "background task save"
             };
@@ -1089,18 +1164,19 @@ impl BackgroundTasks {
                 admission.as_ref().is_some_and(Admission::is_cancelled)
             };
             let retry = RuntimeRetry::new(deadline, &cancelled);
-            let db = SessionDatabase::open_runtime(&dir, &retry)
-                .map_err(|error| format!("{stage} connection setup: {error}"))?;
+            let db = SessionDatabase::open_runtime(&dir, &retry).map_err(|error| {
+                SaveError::session(&format!("{stage} connection setup"), &error)
+            })?;
             #[cfg(test)]
             saving.set(true);
             db.save_background_task_runtime(session, &record, &transcript, &retry)
-                .map_err(|error| format!("{stage}: {error}"))?;
+                .map_err(|error| SaveError::session(stage, &error))?;
             #[cfg(test)]
             if let Some((committed, resume)) = admission_committed {
                 let _ = committed.send(());
                 let _ = resume.recv();
             }
-            Ok::<_, String>(record)
+            Ok::<_, SaveError>(record)
         })
         .await?;
         {
@@ -1280,18 +1356,231 @@ impl BackgroundTasks {
             let cancels = std::mem::take(&mut self.lock().cancels);
             drop(cancels);
             for mut record in records {
-                for event in &mut record.events {
-                    event.suppressed = true;
-                }
-                if record.active() {
-                    record.state = "cancelling".into();
-                }
-                if let Err(error) = self.persist(record).await {
-                    self.lock().failure = Some(error);
+                let invocation = record.invocation_id.clone();
+                let saved = if self.lock().terminals.contains_key(&invocation) {
+                    if self.lock().shutdown {
+                        continue;
+                    }
+                    self.retry_busy(&invocation, || self.save_terminal(&invocation), |_| false)
+                        .await
+                } else {
+                    for event in &mut record.events {
+                        event.suppressed = true;
+                    }
+                    if record.active() {
+                        record.state = "cancelling".into();
+                    }
+                    self.retry_busy(
+                        &invocation,
+                        || self.persist_record(record.clone(), None, TranscriptWrite::Keep),
+                        |_| false,
+                    )
+                    .await
+                };
+                match saved {
+                    Ok(()) => {}
+                    Err(error) if error.contention => {
+                        warn!(
+                            session = %self.0.session,
+                            invocation,
+                            %error,
+                            "shutdown left a task's stop unsaved; the next start continues it"
+                        );
+                    }
+                    Err(error) => self.lock().failure = Some(error.into()),
                 }
             }
         }
         self.join_jobs_inner().await
+    }
+
+    /// Runs `save` until it succeeds or fails for good, waiting out a busy
+    /// database with a capped backoff that ends early once `settled` holds.
+    /// Once a shutdown begins it returns the busy error of the attempt in
+    /// flight, so a busy database never holds up a shutdown.
+    async fn retry_busy<F, Fut>(
+        &self,
+        invocation: &str,
+        mut save: F,
+        settled: impl Fn(&State) -> bool,
+    ) -> Result<(), SaveError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), SaveError>>,
+    {
+        let mut delay = BUSY_RETRY_INITIAL;
+        let mut attempts = 1_u32;
+        loop {
+            let error = match save().await {
+                Ok(()) => {
+                    if attempts > 1 {
+                        info!(
+                            session = %self.0.session,
+                            invocation,
+                            attempts,
+                            "task save succeeded once the database was free"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            if !error.contention || self.lock().shutdown {
+                return Err(error);
+            }
+            warn!(
+                session = %self.0.session,
+                invocation,
+                attempts,
+                delay_ms = delay.as_millis(),
+                %error,
+                "task save found the database busy; retrying"
+            );
+            self.wait_busy_retry(delay, &settled).await;
+            delay = (delay * 2).min(BUSY_RETRY_MAX);
+            attempts += 1;
+        }
+    }
+
+    /// Waits `delay`, or until a shutdown begins or `settled` holds.
+    async fn wait_busy_retry(&self, delay: Duration, settled: &impl Fn(&State) -> bool) {
+        #[cfg(test)]
+        let delay = self.lock().busy_retry.unwrap_or(delay);
+        let shutdown = async {
+            loop {
+                let listener = self.0.changed.listen();
+                {
+                    let state = self.lock();
+                    if state.shutdown || settled(&state) {
+                        return;
+                    }
+                }
+                listener.await;
+            }
+        };
+        async {
+            Timer::after(delay).await;
+        }
+        .or(shutdown)
+        .await;
+    }
+
+    /// Holds `terminal` until a save makes it durable. Called under `gate`,
+    /// so a stop that follows saves it rather than its active record.
+    fn stage_terminal(&self, terminal: Terminal) {
+        self.lock()
+            .terminals
+            .insert(terminal.record.invocation_id.clone(), terminal);
+    }
+
+    /// Saves the terminal record staged for `invocation`, retrying while the
+    /// database is busy. Only a permanent failure is returned: a shutdown
+    /// leaves the record last saved active, for the next start to continue.
+    async fn settle(&self, invocation: &str) -> Result<(), String> {
+        let saved = self
+            .retry_busy(
+                invocation,
+                || async {
+                    let _gate = self.0.gate.lock().await;
+                    self.save_terminal(invocation).await
+                },
+                |state| !state.terminals.contains_key(invocation),
+            )
+            .await;
+        match saved {
+            Ok(()) => Ok(()),
+            Err(error) if error.contention => {
+                warn!(
+                    session = %self.0.session,
+                    invocation,
+                    %error,
+                    "shutdown left a settled task's result unsaved; the next start continues it"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// One save of the terminal record staged for `invocation`, under `gate`.
+    /// A busy database keeps it staged, with the output it already stored.
+    async fn save_terminal(&self, invocation: &str) -> Result<(), SaveError> {
+        let Some(mut terminal) = self.lock().terminals.get(invocation).cloned() else {
+            return Ok(());
+        };
+        let saved = self.write_terminal(&mut terminal).await;
+        {
+            let mut state = self.lock();
+            match &saved {
+                Err(error) if error.contention => {
+                    if let Some(staged) = state.terminals.get_mut(invocation) {
+                        staged.output = terminal.output;
+                        staged.record.output_ref = terminal.record.output_ref;
+                        staged.busy += 1;
+                    }
+                }
+                _ => {
+                    state.terminals.remove(invocation);
+                }
+            }
+        }
+        self.0.changed.notify(usize::MAX);
+        saved
+    }
+
+    async fn write_terminal(&self, terminal: &mut Terminal) -> Result<(), SaveError> {
+        {
+            let state = self.lock();
+            if !state.open || state.generation != terminal.record.generation {
+                for event in &mut terminal.record.events {
+                    event.suppressed = true;
+                }
+            }
+        }
+        if let Some(output) = terminal.output.clone() {
+            terminal.record.output_ref = Some(self.store_output(output).await?);
+            terminal.output = None;
+        }
+        #[cfg(test)]
+        if let Some(error) = self.lock().terminal_failures.pop_front() {
+            return Err(SaveError::session(OUTCOME_SAVE, &error));
+        }
+        self.persist_record(terminal.record.clone(), None, terminal.transcript.clone())
+            .await
+    }
+
+    async fn store_output(&self, output: TerminalOutput) -> Result<ToolOutputRef, SaveError> {
+        let dir = self.0.dir.clone();
+        let session = self.0.session;
+        #[cfg(test)]
+        let save_checked = self.lock().save_checked.clone();
+        smol::unblock(move || {
+            let waiting = || {
+                #[cfg(test)]
+                if let Some(checked) = &save_checked {
+                    let _ = checked.send(());
+                }
+                false
+            };
+            ToolOutputStore::new(dir)
+                .put_named_within(
+                    session,
+                    &output.text,
+                    &output.label,
+                    &RuntimeRetry::new(None, &waiting),
+                )
+                .map_err(|error| SaveError::output(&error))
+        })
+        .await
+    }
+
+    /// Settled tasks whose result save keeps finding the database busy.
+    pub fn pending_terminal_saves(&self) -> usize {
+        self.lock()
+            .terminals
+            .values()
+            .filter(|terminal| terminal.busy > 0)
+            .count()
     }
 
     async fn join_jobs(&self) -> Result<(), String> {
@@ -1449,6 +1738,7 @@ impl BackgroundTasks {
             state.shutdown = true;
             state.open = false;
         }
+        self.0.changed.notify(usize::MAX);
         let result = self.stop().await;
         loop {
             let listener = self.0.changed.listen();
@@ -2458,7 +2748,8 @@ impl BackgroundTasks {
                 let card = TaskStatus::from(&record);
                 let admitted = tasks
                     .persist_record(record, Some(admission.clone()), transcript)
-                    .await;
+                    .await
+                    .map_err(String::from);
                 tasks.lock().admitting.remove(&driver_id);
                 if let Err(error) = admitted {
                     prepared.discard();
@@ -2490,16 +2781,22 @@ impl BackgroundTasks {
                 };
                 drop(stop_checkpoints);
                 checkpoints.await;
-                let _gate = tasks.0.gate.lock().await;
-                let result = tasks
-                    .finish(
-                        &owned,
-                        &driver_id,
-                        outcome,
-                        &reporter,
-                        cancel.is_cancelled(),
-                    )
-                    .await;
+                let staged = {
+                    let _gate = tasks.0.gate.lock().await;
+                    tasks
+                        .finish(
+                            &owned,
+                            &driver_id,
+                            outcome,
+                            &reporter,
+                            cancel.is_cancelled(),
+                        )
+                        .await
+                };
+                let result = match staged {
+                    Ok(()) => tasks.settle(&driver_id).await,
+                    Err(error) => Err(error),
+                };
                 if let Err(error) = result {
                     let mut state = tasks.lock();
                     state.failure = Some(error.clone());
@@ -2605,24 +2902,12 @@ impl BackgroundTasks {
             mark_shutdown_interrupted(&mut record, &mut value);
         }
         let terminal = outcome_text(&value);
-        let dir = self.0.dir.clone();
-        let session = self.0.session;
-        #[cfg(test)]
-        let save_checked = self.lock().save_checked.clone();
-        let (value, reference, transcript) = smol::unblock(move || {
-            let waiting = || {
-                #[cfg(test)]
-                if let Some(checked) = &save_checked {
-                    let _ = checked.send(());
-                }
-                false
-            };
-            let reference =
-                store_outcome(&dir, session, &value, &RuntimeRetry::new(None, &waiting))?;
+        let (value, output, transcript) = smol::unblock(move || {
+            let output = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
             let transcript = messages
                 .map(|messages| serde_json::to_string(&*messages))
                 .transpose();
-            Ok::<_, String>((value, reference, transcript))
+            Ok::<_, String>((value, output, transcript))
         })
         .await?;
         let transcript = match transcript {
@@ -2649,7 +2934,6 @@ impl BackgroundTasks {
             }
             Ok(None) => TranscriptWrite::Keep,
         };
-        record.output_ref = Some(reference);
         record.outcome = Some(value);
         let suppressed = {
             let state = self.lock();
@@ -2673,7 +2957,16 @@ impl BackgroundTasks {
                 wait_nudge: false,
             });
         }
-        self.persist_record(record, None, transcript).await
+        self.stage_terminal(Terminal {
+            record,
+            transcript,
+            output: Some(TerminalOutput {
+                text: output,
+                label: TASK_OUTPUT_LABEL.into(),
+            }),
+            busy: 0,
+        });
+        Ok(())
     }
 }
 
@@ -2817,7 +3110,7 @@ fn store_outcome(
     let serialized = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     ToolOutputStore::new(dir.clone())
         .put_named_within(session, &serialized, TASK_OUTPUT_LABEL, retry)
-        .map_err(|error| format!("could not persist complete task outcome: {error}"))
+        .map_err(|error| SaveError::output(&error).into())
 }
 
 /// The transcript an invocation last saved, if it saved one.
@@ -2976,7 +3269,7 @@ mod tests {
             TaskRecord, TranscriptWrite,
         },
         id::CaudraId,
-        sessions::{RuntimeRetry, SessionDatabase},
+        sessions::{RuntimeRetry, SessionDatabase, SessionError},
         tool_outputs::ToolOutputStore,
     };
     use futures_lite::future::poll_once;
@@ -3054,6 +3347,7 @@ mod tests {
     const RAN_ON_MODEL: &str = "anthropic/claude-sonnet-4-6";
     const RAN_ON_THINKING: &str = "high";
     const GUIDANCE: &str = "Requirements changed: cover src/main.rs too.";
+    const BUSY_OPERATION: &str = "background-test-busy-save";
     pub(super) const ARCHIVE_LIFECYCLE_COUNT: usize = 2;
 
     #[test_case(Some(RAN_ON_THINKING), " Model: anthropic/claude-sonnet-4-6, thinking: high."; "with_thinking")]
@@ -3261,6 +3555,150 @@ mod tests {
                     .background_tasks(fixture.session.id)
                     .unwrap()
                     .is_empty()
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    fn busy() -> SessionError {
+        SessionError::RuntimeDeadline {
+            operation: BUSY_OPERATION,
+        }
+    }
+
+    async fn pending_terminal(tasks: &BackgroundTasks) {
+        loop {
+            let listener = tasks.listen();
+            if tasks.pending_terminal_saves() > 0 {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    fn stored_records(fixture: &Fixture) -> Vec<TaskRecord> {
+        SessionDatabase::open_state(&fixture.dir)
+            .unwrap()
+            .background_tasks(fixture.session.id)
+            .unwrap()
+    }
+
+    #[test_case(1; "one_busy_save")]
+    #[test_case(3; "repeated_busy_saves")]
+    fn a_busy_outcome_save_retries_and_delivers_once(busy_saves: usize) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            {
+                let mut state = fixture.tasks.lock();
+                state.busy_retry = Some(Duration::ZERO);
+                state.terminal_failures = (0..busy_saves).map(|_| busy()).collect();
+            }
+            fixture.responses.send(final_response()).unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            assert!(fixture.tasks.lock().failure.is_none());
+            assert!(fixture.tasks.lock().terminals.is_empty());
+            let stored = stored_records(&fixture);
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert_eq!(stored[0].events.len(), 1);
+            assert_eq!(
+                stored[0].output_ref.as_ref().unwrap().id.as_str(),
+                TASK_OUTPUT_LABEL
+            );
+            fixture.open_receipt().await;
+            let claimed = fixture.tasks.claim_messages().unwrap();
+            let delivered = claimed
+                .iter()
+                .filter_map(|message| message.task_event.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].event_id, stored[0].events[0].event_id);
+            assert!(fixture.tasks.claim_messages().unwrap().is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_permanent_outcome_save_failure_still_latches() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            fixture
+                .tasks
+                .lock()
+                .terminal_failures
+                .push_back(SessionError::RuntimeCancelled {
+                    operation: BUSY_OPERATION,
+                });
+            fixture.responses.send(final_response()).unwrap();
+            let error = fixture.tasks.join_jobs().await.unwrap_err();
+            assert!(error.contains(BUSY_OPERATION), "{error}");
+            assert!(fixture.tasks.lock().terminals.is_empty());
+            assert_eq!(
+                fixture.tasks.status(&fixture.task_id()).unwrap().state,
+                INTERRUPTED_STATE
+            );
+            assert!(stored_records(&fixture)[0].active());
+        });
+    }
+
+    #[test]
+    fn shutdown_during_a_busy_outcome_save_leaves_the_task_active_on_disk() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            {
+                let mut state = fixture.tasks.lock();
+                state.busy_retry = Some(Duration::MAX);
+                state.terminal_failures = [busy(), busy()].into();
+            }
+            fixture.responses.send(final_response()).unwrap();
+            pending_terminal(&fixture.tasks).await;
+            fixture.tasks.shutdown().await.unwrap();
+            assert!(fixture.tasks.lock().failure.is_none());
+            let stored = stored_records(&fixture);
+            assert!(stored[0].active(), "{}", stored[0].state);
+            assert!(stored[0].events.is_empty());
+            let restarted = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            assert!(
+                restarted
+                    .take_restored()
+                    .jobs
+                    .iter()
+                    .any(|job| job.cause == StopCause::Crash)
+            );
+        });
+    }
+
+    #[test]
+    fn a_stop_retries_a_busy_outcome_save_and_keeps_the_result() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            {
+                let mut state = fixture.tasks.lock();
+                state.busy_retry = Some(Duration::MAX);
+                state.terminal_failures.push_back(busy());
+            }
+            fixture.responses.send(final_response()).unwrap();
+            pending_terminal(&fixture.tasks).await;
+            {
+                let mut state = fixture.tasks.lock();
+                state.busy_retry = Some(Duration::ZERO);
+                state.terminal_failures.push_back(busy());
+            }
+            fixture.tasks.stop().await.unwrap();
+            assert!(fixture.tasks.lock().failure.is_none());
+            assert!(fixture.tasks.lock().terminals.is_empty());
+            let stored = stored_records(&fixture);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert!(stored[0].events.iter().all(|event| event.suppressed));
+            assert_eq!(
+                stored[0].output_ref.as_ref().unwrap().id.as_str(),
+                TASK_OUTPUT_LABEL
             );
             fixture.tasks.shutdown().await.unwrap();
         });
@@ -4054,6 +4492,7 @@ mod tests {
                 .finish(&fixture.ctx, INVOCATION, outcome, &reporter, false)
                 .await
                 .unwrap();
+            fixture.tasks.settle(INVOCATION).await.unwrap();
             let status = fixture.tasks.status(TASK).unwrap();
             assert_eq!(status.result_truncated, oversized);
             assert_eq!(status.result_preview.is_some(), oversized);

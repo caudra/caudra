@@ -173,9 +173,12 @@ impl QueuedSave {
             return;
         };
         for waiter in self.waiters.drain(..) {
-            let _ = waiter.send(result.as_ref().map(|&()| ()).map_err(|error| {
-                StorageError::Io(io::Error::other(error.to_string())).into()
-            }));
+            let _ = waiter.send(
+                result
+                    .as_ref()
+                    .map(|&()| ())
+                    .map_err(|error| StorageError::Io(io::Error::other(error.to_string())).into()),
+            );
         }
         let _ = last.send(result);
     }

@@ -103,7 +103,7 @@ pub enum BackgroundLookup<'a> {
 pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(byte_count) FROM background_transcripts WHERE session_id = sessions.id), 0)";
 
 /// What a record's save does to its transcript.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TranscriptWrite {
     Keep,
     /// Replaces it with this JSON array of messages.

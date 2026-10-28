@@ -149,6 +149,9 @@ pub(crate) struct BackgroundDelivery {
     retry: Option<DeliveryRetry>,
     /// The background generation whose halt was already reported.
     halted_generation: Option<u64>,
+    /// Whether a settled task's result save was last seen finding the
+    /// database busy, so the notice shows once per episode.
+    terminal_saves_busy: bool,
 }
 
 impl Default for BackgroundDelivery {
@@ -168,6 +171,7 @@ impl Default for BackgroundDelivery {
             rearm_after_stop: false,
             retry: None,
             halted_generation: None,
+            terminal_saves_busy: false,
         }
     }
 }
@@ -539,6 +543,28 @@ impl App {
             DisplayRole::Notice,
             format!("{DELIVERY_HALTED_NOTICE}: {error}. {DELIVERY_HALTED_RECOVERY}"),
         ));
+    }
+
+    /// Reports once that a settled task's result keeps finding the database
+    /// busy, and once more when its save goes through. Returns whether a
+    /// notice was shown.
+    pub(crate) fn observe_terminal_saves(&mut self) -> bool {
+        let busy = self
+            .background
+            .as_ref()
+            .is_some_and(|background| background.pending_terminal_saves() > 0);
+        if busy == self.background_delivery.terminal_saves_busy {
+            return false;
+        }
+        self.background_delivery.terminal_saves_busy = busy;
+        let notice = if busy {
+            DELIVERY_RETRY_NOTICE
+        } else {
+            DELIVERY_RECOVERED_NOTICE
+        };
+        self.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Notice, notice.into()));
+        true
     }
 
     pub(super) fn delivery_recovered(&mut self) {
