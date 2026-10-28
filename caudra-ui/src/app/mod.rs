@@ -701,6 +701,8 @@ pub struct App {
     background_saved_revision: Option<u64>,
     pub(crate) background_delivery: background_delivery::BackgroundDelivery,
     pub(crate) automatic_wakes_suppressed: bool,
+    /// The site that suppressed automatic wakes, kept with the session.
+    pub(crate) wakes_suppressed_reason: Option<String>,
     pub(crate) queue: MessageQueue,
     queue_editor: Option<queue::QueueEditor>,
     task_queue_selection: Option<(String, QueueItemId)>,
@@ -1036,7 +1038,8 @@ impl App {
             commit_mouse_down: None,
             key_focus: KeyFocus::Composer,
             status: Status::Idle,
-            automatic_wakes_suppressed: state.session.meta.automatic_wakes_suppressed,
+            automatic_wakes_suppressed: tasks::restored_wake_suppression(&state.session.meta).0,
+            wakes_suppressed_reason: tasks::restored_wake_suppression(&state.session.meta).1,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,

@@ -349,7 +349,8 @@ impl AgentHandles {
                     .ok()
             });
         let mut initial_history = initial_history;
-        let interrupted = take_interrupted(background.as_ref(), &mut initial_history);
+        let interrupted =
+            take_interrupted(background.as_ref(), &mut initial_history, &subagent_history);
         let mut handles = spawn_agent_internal(
             flume::unbounded(),
             model_slot,
@@ -680,8 +681,8 @@ impl AgentHandles {
             }
         };
         let mut history = history;
-        let interrupted =
-            (!same_session).then(|| take_interrupted(background.as_ref(), &mut history));
+        let interrupted = (!same_session)
+            .then(|| take_interrupted(background.as_ref(), &mut history, &subagent_history));
         let archived = crate::archived_session_history(&app.state.session);
         let todos = crate::session_todos(&app.state.session, &archived, &history);
         let mut new = spawn_agent_internal(
@@ -1039,14 +1040,25 @@ fn spawn_agent_internal(
 }
 
 /// What the previous process left cut off for a session this loop opens,
-/// with the open calls ending `history` answered for what became of them.
+/// with the open calls ending `history` answered for what became of them,
+/// and the results an earlier build lost to a busy database recovered.
 fn take_interrupted(
     background: Option<&BackgroundTasks>,
     history: &mut Vec<HistoryItem>,
+    subagent_history: &SubagentHistoryStore,
 ) -> (RestoredWork, Vec<DanglingCall>) {
-    let work = background
-        .map(BackgroundTasks::take_restored)
-        .unwrap_or_default();
+    let Some(background) = background else {
+        return (RestoredWork::default(), Vec::new());
+    };
+    let mut work = background.take_restored();
+    match project_messages(history) {
+        Ok(parent) => {
+            work.recovered = smol::block_on(
+                background.recover_lost_results(&parent, &subagent_history.snapshot()),
+            );
+        }
+        Err(error) => warn!(%error, "could not read history to recover lost task results"),
+    }
     let dangling = restart::close_interrupted_items(history, &work);
     (work, dangling)
 }

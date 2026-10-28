@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use async_lock::Semaphore;
 use async_lock::{Mutex as AsyncMutex, MutexGuardArc};
-use caudra_providers::{ContentBlock, HistoryItem, Message, TaskEventOrigin, project_messages};
+use caudra_providers::{
+    ContentBlock, HistoryItem, Message, Role, TaskEventOrigin, project_messages,
+};
 use caudra_storage::{
     StateDir,
     background::{
@@ -39,7 +41,8 @@ use tracing::{info, warn};
 
 use crate::{
     AgentEvent, CancelToken, CancelTrigger, Envelope, EventSender, QueueItemId, Replacement,
-    SharedHistory, SteeringQueue, SubagentTaskSpec, TaskCard, TaskProvenance, Tracked,
+    SharedHistory, SteeringQueue, SubagentHistorySnapshot, SubagentTaskSpec, TaskCard,
+    TaskProvenance, Tracked,
     agent::{
         steering::SharedSteering,
         subagent::{TaskIdentity, TurnSettings},
@@ -96,6 +99,19 @@ const BUSY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const BUSY_RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTCOME_SAVE: &str = "background outcome save";
 const OUTPUT_SAVE: &str = "could not persist complete task outcome";
+/// Marks an outcome rebuilt from the task's finished reply after an earlier
+/// build lost it to a busy database.
+const RECOVERED_FIELD: &str = "recovered";
+/// How many interrupted records a load rechecks for a lost result.
+const MAX_RECOVERY_SCAN: usize = 64;
+/// The saves an earlier build ended a finished task with when they failed.
+const LOST_SAVE_STAGES: [&str; 3] = [OUTCOME_SAVE, "background task save", OUTPUT_SAVE];
+/// How those failures read when another writer held the database.
+const CONTENTION_ERRORS: [&str; 3] = [
+    "database is locked",
+    "SQLite contention exhausted",
+    "storage deadline exceeded",
+];
 /// Past this a live checkpoint keeps the last one that fit, so a long run
 /// does not rewrite its whole transcript every [`CHECKPOINT_INTERVAL`].
 const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
@@ -591,6 +607,7 @@ impl BackgroundTasks {
                         .map_err(|error| error.to_string())?,
                     transcripts: HashMap::new(),
                     dangling: HashMap::new(),
+                    recovered: Vec::new(),
                 };
                 for record in &mut records {
                     let retry = RuntimeRetry::new(None, &|| false);
@@ -1572,6 +1589,124 @@ impl BackgroundTasks {
                 .map_err(|error| SaveError::output(&error))
         })
         .await
+    }
+
+    /// Settles agent tasks an earlier build lost to a busy database. It ended
+    /// a task that had finished as interrupted when the result save failed,
+    /// so the result never reached the session. A task qualifies only when
+    /// `histories` holds its finished reply and `parent` never received a
+    /// result for it; the result is rebuilt from that reply, saved, and
+    /// delivered once. Returns the recovered task ids.
+    pub async fn recover_lost_results(
+        &self,
+        parent: &[Message],
+        histories: &SubagentHistorySnapshot,
+    ) -> Vec<String> {
+        let dir = self.0.dir.clone();
+        let session = self.0.session;
+        let candidates = smol::unblock(move || {
+            let retry = RuntimeRetry::new(None, &|| false);
+            SessionDatabase::open_runtime(&dir, &retry)?.interrupted_background_tasks_runtime(
+                session,
+                MAX_RECOVERY_SCAN,
+                &retry,
+            )
+        })
+        .await;
+        let candidates = match candidates {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warn!(%session, %error, "could not check for task results lost to a busy database");
+                return Vec::new();
+            }
+        };
+        let mut recovered = Vec::new();
+        for record in candidates.into_iter().filter(lost_to_contention) {
+            let Some(reply) = finished_reply(&record, parent, histories) else {
+                continue;
+            };
+            let invocation = record.invocation_id.clone();
+            let task_id = record.task_id.clone();
+            match self.recover(record, reply).await {
+                Ok(()) => {
+                    info!(
+                        %session,
+                        invocation,
+                        task_id,
+                        "recovered a task result an earlier build lost to a busy database"
+                    );
+                    recovered.push(task_id);
+                }
+                Err(error) => warn!(
+                    %session,
+                    invocation,
+                    task_id,
+                    %error,
+                    "could not recover a task result lost to a busy database"
+                ),
+            }
+        }
+        recovered
+    }
+
+    async fn recover(&self, mut record: TaskRecord, reply: String) -> Result<(), String> {
+        let dir = self.0.dir.clone();
+        let session = self.0.session;
+        let invocation = record.invocation_id.clone();
+        let unarchived = invocation.clone();
+        smol::unblock(move || {
+            let retry = RuntimeRetry::new(None, &|| false);
+            SessionDatabase::open_runtime(&dir, &retry)?.unarchive_background_task_runtime(
+                session,
+                &unarchived,
+                &retry,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        let outcome = TaskOutcome {
+            task_id: Some(record.task_id.clone()),
+            mode: None,
+            model: None,
+            thinking: None,
+            success: true,
+            cancelled: false,
+            output: Value::String(reply),
+            error: None,
+            tokens_used: 0,
+            duration_ms: 0,
+            undelivered_guidance: Vec::new(),
+        };
+        let mut value = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+        value[RECOVERED_FIELD] = json!(true);
+        let output = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+        {
+            let _gate = self.0.gate.lock().await;
+            let terminal = outcome_text(&value);
+            record.state = "succeeded".into();
+            record.generation = self.generation();
+            record.outcome = Some(value);
+            record.events.push(TaskEvent {
+                sequence: self.next_sequence(),
+                event_id: CaudraId::generate().to_string(),
+                call_id: invocation.clone(),
+                body: bounded(&terminal, MAX_RESULT_BYTES),
+                terminal: true,
+                accepted: false,
+                suppressed: false,
+                wait_nudge: false,
+            });
+            self.stage_terminal(Terminal {
+                record,
+                transcript: TranscriptWrite::Keep,
+                output: Some(TerminalOutput {
+                    text: output,
+                    label: TASK_OUTPUT_LABEL.into(),
+                }),
+                busy: 0,
+            });
+        }
+        self.settle(&invocation).await
     }
 
     /// Settled tasks whose result save keeps finding the database busy.
@@ -3145,6 +3280,73 @@ fn interruption(record: &TaskRecord) -> Option<StopCause> {
         .map(|_| StopCause::Shutdown)
 }
 
+/// Whether an earlier build ended `record`, a background agent task, as
+/// interrupted only because its result save found the database busy.
+fn lost_to_contention(record: &TaskRecord) -> bool {
+    record.kind() == JobKind::Agent
+        && record.background
+        && record.state == INTERRUPTED_STATE
+        && !record.events.iter().any(|event| event.terminal)
+        && record
+            .outcome
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|outcome| outcome.len() == 1)
+            .and_then(|outcome| outcome.get("error"))
+            .and_then(Value::as_str)
+            .is_some_and(|error| {
+                LOST_SAVE_STAGES
+                    .iter()
+                    .any(|stage| error.starts_with(stage))
+                    && CONTENTION_ERRORS.iter().any(|cause| error.contains(cause))
+            })
+}
+
+/// The finished reply `record`'s task ended with, unless `parent` already
+/// holds a result for it no record event accounts for.
+fn finished_reply(
+    record: &TaskRecord,
+    parent: &[Message],
+    histories: &SubagentHistorySnapshot,
+) -> Option<String> {
+    let delivered = parent
+        .iter()
+        .filter_map(|message| message.task_event.as_ref())
+        .any(|origin| {
+            origin.invocation_id == record.invocation_id
+                && !record
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == origin.event_id)
+        });
+    if delivered {
+        return None;
+    }
+    let last = histories
+        .records()
+        .get(&record.task_id)?
+        .messages()
+        .last()?;
+    if !matches!(last.role, Role::Assistant)
+        || last
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    {
+        return None;
+    }
+    let reply = last
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!reply.trim().is_empty()).then_some(reply)
+}
+
 fn interrupted_job(record: &TaskRecord, cause: StopCause) -> InterruptedJob {
     let card = TaskCard::summary(record);
     let restarts = record
@@ -3286,8 +3488,8 @@ mod tests {
         TaskDelivery, TaskReporter, TaskStatus, deliverable, ran_on,
     };
     use super::{
-        GUIDANCE_CANCELLING, GUIDANCE_SETTLED, GUIDANCE_UNAVAILABLE, UNDELIVERED_GUIDANCE_FIELD,
-        guidance_text, unread_guidance_text,
+        GUIDANCE_CANCELLING, GUIDANCE_SETTLED, GUIDANCE_UNAVAILABLE, RECOVERED_FIELD,
+        UNDELIVERED_GUIDANCE_FIELD, guidance_text, unread_guidance_text,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -3581,6 +3783,115 @@ mod tests {
             .unwrap()
             .background_tasks(fixture.session.id)
             .unwrap()
+    }
+
+    const LOST_SAVE: &str = "background outcome save: record save: SQLite contention exhausted after 30 attempts (30s): database is locked";
+    const OTHER_FAILURE: &str = "background outcome save: record save: disk I/O error";
+    const FOREIGN_EVENT: &str = "event-delivered-elsewhere";
+
+    enum LostResult {
+        Finished,
+        Unfinished,
+        OtherFailure,
+        AlreadyDelivered,
+    }
+
+    fn lost_record(error: &str) -> TaskRecord {
+        let mut record = projection_record();
+        record.background = true;
+        record.receipt_accepted = true;
+        record.state = INTERRUPTED_STATE.into();
+        record.outcome = Some(json!({"error": error}));
+        record
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+            ..Default::default()
+        }
+    }
+
+    async fn reopen(fixture: &Fixture) -> BackgroundTasks {
+        BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+            .await
+            .unwrap()
+    }
+
+    #[test_case(LostResult::Finished => vec![TASK.to_owned()]; "finished_reply_is_recovered")]
+    #[test_case(LostResult::Unfinished => Vec::<String>::new(); "unfinished_transcript_is_left_alone")]
+    #[test_case(LostResult::OtherFailure => Vec::<String>::new(); "other_failure_is_left_alone")]
+    #[test_case(LostResult::AlreadyDelivered => Vec::<String>::new(); "delivered_result_is_left_alone")]
+    fn a_result_lost_to_a_busy_database_is_recovered_once(case: LostResult) -> Vec<String> {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.tasks.shutdown().await.unwrap();
+            let error = match case {
+                LostResult::OtherFailure => OTHER_FAILURE,
+                _ => LOST_SAVE,
+            };
+            SessionDatabase::open_state(&fixture.dir)
+                .unwrap()
+                .save_background_task(fixture.session.id, &lost_record(error))
+                .unwrap();
+            let last = match case {
+                LostResult::Unfinished => assistant(vec![ContentBlock::ToolUse {
+                    id: NEXT_CALL.into(),
+                    name: "read".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                }]),
+                _ => assistant(vec![ContentBlock::Text {
+                    text: RESULT.into(),
+                }]),
+            };
+            let histories = SubagentHistoryStore::seeded(HashMap::from([(
+                TASK.to_owned(),
+                Arc::new(vec![Message::user(PROMPT.into()), last]),
+            )]))
+            .snapshot();
+            let parent = match case {
+                LostResult::AlreadyDelivered => vec![Message {
+                    task_event: Some(TaskEventOrigin {
+                        task_id: TASK.into(),
+                        invocation_id: INVOCATION.into(),
+                        event_id: FOREIGN_EVENT.into(),
+                    }),
+                    ..Message::user(RESULT.into())
+                }],
+                _ => Vec::new(),
+            };
+            let tasks = reopen(&fixture).await;
+            let recovered = tasks.recover_lost_results(&parent, &histories).await;
+            let status = tasks.status(TASK).unwrap();
+            if recovered.is_empty() {
+                assert_eq!(status.state, INTERRUPTED_STATE);
+                assert!(!tasks.has_pending());
+            } else {
+                assert_eq!(status.state, SUCCEEDED);
+                assert_eq!(status.result.as_ref().unwrap()[RECOVERED_FIELD], true);
+                fixture.open_receipt_on(&tasks).await;
+                let claimed = tasks.claim_messages().unwrap();
+                let delivered = claimed
+                    .iter()
+                    .filter(|message| message.task_event.is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(delivered.len(), 1);
+                assert!(delivered[0].first_text_content().unwrap().contains(RESULT));
+                tasks.release_messages(&claimed);
+            }
+            tasks.shutdown().await.unwrap();
+            let reopened = reopen(&fixture).await;
+            assert!(
+                reopened
+                    .recover_lost_results(&parent, &histories)
+                    .await
+                    .is_empty()
+            );
+            reopened.shutdown().await.unwrap();
+            recovered
+        })
     }
 
     #[test_case(1; "one_busy_save")]
@@ -4758,7 +5069,11 @@ mod tests {
         }
 
         async fn open_receipt(&self) {
-            self.tasks.settle_launches(&[receipt(TASK)]).await.unwrap();
+            self.open_receipt_on(&self.tasks).await;
+        }
+
+        async fn open_receipt_on(&self, tasks: &BackgroundTasks) {
+            tasks.settle_launches(&[receipt(TASK)]).await.unwrap();
         }
 
         fn save(&mut self, messages: &[Message]) {

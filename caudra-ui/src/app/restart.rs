@@ -39,6 +39,17 @@ impl App {
         self.interrupted = None;
         self.resume_due = false;
         self.resume_preamble = None;
+        if !work.recovered.is_empty()
+            && self.automatic_wakes_suppressed
+            && self.wakes_suppressed_reason.is_none()
+        {
+            info!(
+                session_id = %self.state.session.id,
+                recovered = ?work.recovered,
+                "resumed automatic wakes an earlier build held after losing task results"
+            );
+            self.automatic_wakes_suppressed = false;
+        }
         self.restore_interrupted_chats(&work);
         let open_run = self.state.session.meta.open_run.as_ref();
         let Some(interruption) =
@@ -269,10 +280,13 @@ mod tests {
     use caudra_providers::TokenUsage;
     use caudra_storage::background::{JobKind, JobOwner};
     use caudra_storage::now_epoch;
-    use caudra_storage::sessions::{StoredOpenRun, StoredQueuedPrompt};
+    use caudra_storage::sessions::{SessionMeta, StoredOpenRun, StoredQueuedPrompt};
     use test_case::test_case;
 
     use super::super::App;
+    use super::super::tasks::{
+        WAKES_SUPPRESSED_RUNTIME_FAILED, WAKES_SUPPRESSED_STOP_REQUESTED, restored_wake_suppression,
+    };
     use super::super::tests::{agent_msg, streaming_app, test_app};
     use crate::components::Action;
 
@@ -370,6 +384,57 @@ mod tests {
         let mut app = reopened(None, work, ResumeInterrupted::Auto);
         assert!(app.interrupted_resume_due());
         assert!(reminded_run(&app.resume_interrupted()));
+    }
+
+    #[test_case(true, None => false; "legacy_suppression_after_a_recovery")]
+    #[test_case(true, Some(WAKES_SUPPRESSED_STOP_REQUESTED) => true; "user_stop_after_a_recovery")]
+    #[test_case(false, None => true; "legacy_suppression_without_a_recovery")]
+    fn a_recovered_result_resumes_only_legacy_suppression(
+        recovered: bool,
+        reason: Option<&str>,
+    ) -> bool {
+        let mut app = test_app();
+        app.automatic_wakes_suppressed = true;
+        app.wakes_suppressed_reason = reason.map(str::to_owned);
+        let work = RestoredWork {
+            recovered: recovered
+                .then(|| SHELL_TASK.to_owned())
+                .into_iter()
+                .collect(),
+            ..RestoredWork::default()
+        };
+        app.restore_interruption(work, Vec::new(), ResumeInterrupted::Off, MAX_AGE_HOURS);
+        app.automatic_wakes_suppressed
+    }
+
+    #[test_case(true, Some(WAKES_SUPPRESSED_RUNTIME_FAILED) => (false, None); "runtime_failure_ends_with_its_runtime")]
+    #[test_case(true, Some(WAKES_SUPPRESSED_STOP_REQUESTED) => (true, Some(WAKES_SUPPRESSED_STOP_REQUESTED.to_owned())); "user_stop_stays")]
+    #[test_case(true, None => (true, None); "legacy_suppression_stays")]
+    #[test_case(false, None => (false, None); "not_suppressed")]
+    fn a_load_keeps_suppression_by_its_reason(
+        suppressed: bool,
+        reason: Option<&str>,
+    ) -> (bool, Option<String>) {
+        let meta = SessionMeta {
+            automatic_wakes_suppressed: suppressed,
+            wakes_suppressed_reason: reason.map(str::to_owned),
+            ..SessionMeta::default()
+        };
+        restored_wake_suppression(&meta)
+    }
+
+    #[test]
+    fn a_user_stop_outranks_a_runtime_failure() {
+        let mut app = test_app();
+        app.suppress_background_wakes(WAKES_SUPPRESSED_RUNTIME_FAILED);
+        app.suppress_background_wakes(WAKES_SUPPRESSED_STOP_REQUESTED);
+        app.suppress_background_wakes(WAKES_SUPPRESSED_RUNTIME_FAILED);
+        assert_eq!(
+            app.wakes_suppressed_reason.as_deref(),
+            Some(WAKES_SUPPRESSED_STOP_REQUESTED)
+        );
+        app.rearm_background();
+        assert_eq!(app.wakes_suppressed_reason, None);
     }
 
     #[test_case(true => false; "a_shutdown_cancel")]

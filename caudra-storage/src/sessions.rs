@@ -636,6 +636,11 @@ pub struct SessionMeta {
     pub autopilot: Option<Box<StoredAutopilot>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub automatic_wakes_suppressed: bool,
+    /// What suppressed automatic wakes, so a load can tell a runtime failure
+    /// the new runtime no longer has from a user's stop. `None` from builds
+    /// that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wakes_suppressed_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
