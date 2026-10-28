@@ -377,6 +377,25 @@ impl LineBreaks {
         }
     }
 
+    /// For a surface that lays out its own rows and already knows how each
+    /// one began.
+    pub(crate) fn from_row_starts(starts: impl IntoIterator<Item = RowStart>) -> Self {
+        let mut line_starts = Vec::new();
+        let mut word_wraps = Vec::new();
+        for (row, start) in starts.into_iter().enumerate() {
+            let row = u16::try_from(row).unwrap_or(u16::MAX);
+            match start {
+                RowStart::Line => set_bit(&mut line_starts, row),
+                RowStart::WordWrap => set_bit(&mut word_wraps, row),
+                RowStart::HardWrap => {}
+            }
+        }
+        Self::Bitmap {
+            line_starts,
+            word_wraps,
+        }
+    }
+
     pub fn is_line_start(&self, row: u16) -> bool {
         match self {
             Self::EveryRow => true,
@@ -390,6 +409,15 @@ impl LineBreaks {
             Self::Bitmap { word_wraps, .. } => get_bit(word_wraps, row),
         }
     }
+}
+
+/// How a painted row relates to the one above it, which is what a copy needs
+/// to put a newline, a space, or nothing between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowStart {
+    Line,
+    WordWrap,
+    HardWrap,
 }
 
 /// One continuation row produced by ratatui's `Wrap { trim: false }`.
