@@ -10,9 +10,9 @@ on:
         required: false
         type: string
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
 
 env:
   CAUDRA_ENABLE_UPDATE_CHECK: "0"

@@ -16,7 +16,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests gen-docs gen-docs-check model-watch sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
+.PHONY: help code-worker install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests formats-lint formats-check gen-docs gen-docs-check model-watch sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete ci
 
 help:
 	@printf '%s\n' \
@@ -35,6 +35,8 @@ help:
 		'  make fmt-check      Check Rust, Lua, and Python formatting' \
 		'  make pylint         Check Python lint and types' \
 		'  make distribution-tests  Test build and distribution helpers' \
+		'  make formats-lint   Check every versioned const is listed in scripts/persisted-formats.toml' \
+		'  make formats-check  Check a patch keeps the persisted formats of its vX.Y.0' \
 		'  make gen-docs       Regenerate canonical documentation' \
 		'  make gen-docs-check Check generated documentation' \
 		'  make model-watch    Report model changes from models.dev (flags via ARGS="-- --since DATE")' \
@@ -104,6 +106,13 @@ distribution-tests:
 	$(PYTHON) scripts/test-build-attribution.py
 	$(PYTHON) scripts/test-install.py
 	$(PYTHON) scripts/test-release.py
+	$(PYTHON) scripts/test-persisted-formats.py
+
+formats-lint:
+	$(PYTHON) scripts/persisted-formats.py lint
+
+formats-check:
+	$(PYTHON) scripts/persisted-formats.py check
 
 gen-docs: code-worker
 	$(CARGO) run -p caudra-docgen
@@ -138,4 +147,4 @@ workcell-doc-test: code-worker
 machete:
 	$(CARGO) machete
 
-ci: fmt-check lint pylint distribution-tests workcell-check-native test workcell-doc-test gen-docs-check machete
+ci: fmt-check lint pylint formats-lint distribution-tests workcell-check-native test workcell-doc-test gen-docs-check machete
