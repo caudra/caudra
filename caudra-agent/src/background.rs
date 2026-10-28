@@ -1522,7 +1522,15 @@ impl BackgroundTasks {
     /// One save of the terminal record staged for `invocation`, under `gate`.
     /// A busy database keeps it staged, with the output it already stored.
     async fn save_terminal(&self, invocation: &str) -> Result<(), SaveError> {
-        let Some(mut terminal) = self.lock().terminals.get(invocation).cloned() else {
+        let Some(mut terminal) = ({
+            let state = self.lock();
+            state.terminals.get(invocation).cloned().map(|mut terminal| {
+                if let Some(resident) = state.records.get(invocation) {
+                    adopt_receipts(&mut terminal.record, resident);
+                }
+                terminal
+            })
+        }) else {
             return Ok(());
         };
         let saved = self.write_terminal(&mut terminal).await;
@@ -3440,6 +3448,19 @@ fn current_event(state: &State, record: &TaskRecord) -> bool {
         && record.state != "cancelling"
 }
 
+/// Carries into a staged terminal record what its resident record gained
+/// while the save waited: an accepted launch receipt or an accepted event.
+/// The terminal save replaces the resident record, so these would be lost.
+fn adopt_receipts(staged: &mut TaskRecord, resident: &TaskRecord) {
+    staged.receipt_accepted |= resident.receipt_accepted;
+    for event in &mut staged.events {
+        event.accepted |= resident
+            .events
+            .iter()
+            .any(|kept| kept.accepted && kept.event_id == event.event_id);
+    }
+}
+
 /// A wait nudge asks about a command still running, so it lapses with the
 /// command, even one a restart left without its terminal event.
 fn deliverable(record: &TaskRecord, event: &TaskEvent) -> bool {
@@ -3499,7 +3520,7 @@ mod tests {
         MAX_INVOCATIONS, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES, RESTART_PENDING_FIELD,
         RETRY_MISMATCH, RUNNING_STATE, SELECTED_HISTORY_MISSING, STALE_INVOCATION, StopCause,
         TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_SETTLING, TRANSCRIPT_UNAVAILABLE, TRANSITION,
-        TaskDelivery, TaskReporter, TaskStatus, deliverable, ran_on,
+        TaskDelivery, TaskReporter, TaskStatus, Terminal, deliverable, ran_on,
     };
     use super::{
         GUIDANCE_CANCELLING, GUIDANCE_SETTLED, GUIDANCE_UNAVAILABLE, RECOVERED_FIELD,
@@ -3924,6 +3945,73 @@ mod tests {
             reopened.shutdown().await.unwrap();
             recovered
         })
+    }
+
+    const STAGED_TERMINAL_EVENT: &str = "event-staged-terminal";
+
+    #[test_case(false; "launch_receipt")]
+    #[test_case(true; "report_receipt")]
+    fn a_receipt_accepted_while_the_terminal_is_staged_survives_its_save(report: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let mut record = projection_record();
+            record.generation = fixture.tasks.generation();
+            record.background = true;
+            record.state = RUNNING_STATE.into();
+            record.receipt_accepted = report;
+            record.events.push(TaskEvent {
+                sequence: 1,
+                event_id: EVENT.into(),
+                call_id: REPORT_CALL.into(),
+                body: REPORT.into(),
+                terminal: false,
+                accepted: false,
+                suppressed: false,
+                wait_nudge: false,
+            });
+            fixture.tasks.persist(record.clone()).await.unwrap();
+            let mut staged = record.clone();
+            staged.state = SUCCEEDED.into();
+            staged.outcome = Some(json!({"output": RESULT}));
+            staged.events.push(TaskEvent {
+                sequence: 2,
+                event_id: STAGED_TERMINAL_EVENT.into(),
+                call_id: INVOCATION.into(),
+                body: RESULT.into(),
+                terminal: true,
+                accepted: false,
+                suppressed: false,
+                wait_nudge: false,
+            });
+            fixture.tasks.stage_terminal(Terminal {
+                record: staged,
+                transcript: TranscriptWrite::Keep,
+                output: None,
+                busy: 0,
+            });
+            record.receipt_accepted = true;
+            record.events[0].accepted = report;
+            fixture.tasks.persist(record).await.unwrap();
+            fixture.tasks.settle(INVOCATION).await.unwrap();
+            let stored = stored_records(&fixture);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert!(stored[0].receipt_accepted);
+            assert_eq!(stored[0].events[0].accepted, report);
+            let delivered = fixture
+                .tasks
+                .claim_messages()
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| message.task_event)
+                .map(|origin| origin.event_id)
+                .collect::<Vec<_>>();
+            let mut expected = vec![STAGED_TERMINAL_EVENT.to_owned()];
+            if !report {
+                expected.insert(0, EVENT.into());
+            }
+            assert_eq!(delivered, expected);
+            fixture.tasks.shutdown().await.unwrap();
+        });
     }
 
     #[test_case(1; "one_busy_save")]
