@@ -42,6 +42,7 @@ const GATEWAY_401: &str = "authentication failed: request was blocked by a gatew
 const GATEWAY_403: &str = "forbidden: request was blocked by a gateway or proxy, check your account and provider settings";
 /// Every credential failure names this command, whichever provider raised it.
 const AUTH_LOGIN_COMMAND: &str = "caudra auth login";
+const FREE_USAGE_EXHAUSTED_CODE: &str = "subscription:free-usage-exhausted";
 
 /// Auth and billing never become healthy by waiting, whatever the body says.
 const NEVER_TRANSIENT_STATUSES: [u16; 3] = [401, 402, 403];
@@ -163,7 +164,7 @@ impl AgentError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        if self.is_context_overflow() {
+        if self.is_context_overflow() || self.is_free_usage_exhausted() {
             return false;
         }
         match self {
@@ -186,6 +187,25 @@ impl AgentError {
             | Self::Rerouted(_)
             | Self::HttpRequest(_) => false,
         }
+    }
+
+    pub(crate) fn is_free_usage_exhausted(&self) -> bool {
+        let Self::Api {
+            status: 429,
+            message,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(message) else {
+            return false;
+        };
+        [value.get("code"), value.pointer("/error/code")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|code| code == FREE_USAGE_EXHAUSTED_CODE)
     }
 
     /// Returns true if the error indicates a context window overflow.
@@ -580,6 +600,10 @@ mod tests {
     const QUOTA_RESET_HEADER: &str = "46800";
     const QUOTA_RESET_BODY: &str = r#"{"error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}"#;
     const QUOTA_RESET_MESSAGE: &str = "rate limited: rate_limit_error: This request would exceed your account's rate limit. Please try again later. (retry after 13h)";
+    const FREE_USAGE_EXHAUSTED_BODY: &str =
+        r#"{"code":"subscription:free-usage-exhausted","message":"Please try again later."}"#;
+    const NESTED_FREE_USAGE_EXHAUSTED_BODY: &str =
+        r#"{"error":{"code":"subscription:free-usage-exhausted"}}"#;
 
     #[test_case(AgentError::api(401, BODY), Some(UserFailure::Auth) ; "rejected_credentials")]
     #[test_case(AgentError::api(401, GATEWAY_HTML), Some(UserFailure::Auth) ; "gateway_rejected_credentials")]
@@ -640,6 +664,61 @@ mod tests {
     #[test_case(401, false ; "unauthorized")]
     fn api_retryable(status: u16, expected: bool) {
         assert_eq!(api(status).is_retryable(), expected);
+    }
+
+    #[test_case(FREE_USAGE_EXHAUSTED_BODY ; "top_level_code")]
+    #[test_case(NESTED_FREE_USAGE_EXHAUSTED_BODY ; "nested_code")]
+    fn free_usage_exhaustion_preserves_response_without_retrying(body: &str) {
+        smol::block_on(async {
+            let response = Response::builder()
+                .status(429)
+                .header(HEADER_RETRY_AFTER, QUOTA_RESET_HEADER)
+                .body(AsyncBody::from(body.to_owned()))
+                .unwrap();
+            let error = AgentError::from_response(response).await;
+            assert!(error.is_free_usage_exhausted());
+            assert!(!error.is_retryable());
+            assert!(!error.is_auth_error());
+            assert!(!error.is_context_overflow());
+            assert_eq!(error.status(), Some(429));
+            assert_eq!(error.retry_after(), Some(QUOTA_RESET));
+            let AgentError::Api { message, .. } = error else {
+                panic!("expected API error");
+            };
+            assert_eq!(message, body);
+        });
+    }
+
+    #[test_case(ANTHROPIC_RATE_LIMIT ; "ordinary_rate_limit")]
+    #[test_case(OPENAI_QUOTA ; "other_quota_code")]
+    #[test_case(FREE_USAGE_EXHAUSTED_CODE ; "plain_text")]
+    #[test_case(r#"{"message":"subscription:free-usage-exhausted"}"# ; "message_only")]
+    #[test_case(r#"{"error":{"message":"subscription:free-usage-exhausted"}}"# ; "nested_message_only")]
+    #[test_case(r#"{"code":"subscription:free-usage-exhausted-extra"}"# ; "code_prefix")]
+    #[test_case(r#"{"code":"SUBSCRIPTION:FREE-USAGE-EXHAUSTED"}"# ; "different_case")]
+    #[test_case(r#"{"type":"subscription:free-usage-exhausted"}"# ; "wrong_field")]
+    #[test_case(r#"{"code":429}"# ; "non_string_code")]
+    #[test_case(r#"{"code":"subscription:free-usage-exhausted""# ; "malformed_json")]
+    fn other_rate_limits_remain_retryable(body: &str) {
+        let error = AgentError::api(429, body);
+        assert!(!error.is_free_usage_exhausted());
+        assert!(error.is_retryable());
+    }
+
+    #[test_case(401, false, true, false ; "auth_unchanged")]
+    #[test_case(413, false, false, true ; "context_overflow_unchanged")]
+    #[test_case(500, true, false, false ; "server_error_unchanged")]
+    fn free_usage_code_requires_rate_limit_status(
+        status: u16,
+        retryable: bool,
+        auth: bool,
+        context_overflow: bool,
+    ) {
+        let error = AgentError::api(status, FREE_USAGE_EXHAUSTED_BODY);
+        assert!(!error.is_free_usage_exhausted());
+        assert_eq!(error.is_retryable(), retryable);
+        assert_eq!(error.is_auth_error(), auth);
+        assert_eq!(error.is_context_overflow(), context_overflow);
     }
 
     #[test_case(400, OVERLOADED_TEXT, true   ; "overloaded_behind_a_400")]

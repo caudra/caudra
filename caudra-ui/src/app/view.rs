@@ -998,6 +998,9 @@ impl App {
                 }
             }
         }
+        if self.logs_modal.is_open() && overlay_rect == self.logs_modal.area() {
+            self.zones.push_overlay(self.logs_modal.text_area());
+        }
 
         // Overlay zone was removed (e.g. dialog closed), drop the dangling selection
         if let Some(ref state) = self.selection_state

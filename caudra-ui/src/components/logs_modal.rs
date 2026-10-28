@@ -32,8 +32,8 @@ use crate::components::{
     format_bytes, hover_style, input_text_style, is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
-use crate::selection::wrap_breaks;
-use crate::theme::Theme;
+use crate::selection::{LineBreaks, RowStart, wrap_breaks};
+use crate::theme::{self, Theme};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const TITLE: &str = " Logs ";
@@ -117,6 +117,9 @@ pub struct LogsModal {
     /// Index into the tail window, not into the file.
     selected: usize,
     view_top: usize,
+    /// Rows of the `view_top` record scrolled off above the pane, so a record
+    /// taller than the pane can still be read to its end.
+    view_skip: usize,
     expanded: bool,
     wrap: bool,
     /// Display columns scrolled off the left. Always zero while wrapping,
@@ -128,8 +131,13 @@ pub struct LogsModal {
     viewport_h: usize,
     popup: Rect,
     body: Rect,
+    /// What a record's height is measured against between frames: the body's
+    /// width at the last paint.
+    width: usize,
     /// Window index per body row, rebuilt each frame.
     rows: Vec<usize>,
+    /// How each body row began, so a copy rejoins what a wrap split.
+    line_breaks: LineBreaks,
     /// Where the level chip sits, so a click can cycle it and a move can light
     /// it up. Recomputed each frame because the footer reflows with the path.
     level_hit: Rect,
@@ -151,6 +159,7 @@ impl LogsModal {
             query_focused: false,
             selected: 0,
             view_top: 0,
+            view_skip: 0,
             expanded: false,
             wrap: false,
             pan: 0,
@@ -160,7 +169,9 @@ impl LogsModal {
             viewport_h: 0,
             popup: Rect::default(),
             body: Rect::default(),
+            width: 0,
             rows: Vec::new(),
+            line_breaks: LineBreaks::default(),
             level_hit: Rect::default(),
             level_hovered: false,
             hints: HintBar::default(),
@@ -179,7 +190,7 @@ impl LogsModal {
         }
     }
 
-    fn open_dir(&mut self, dir: &Path) {
+    pub(crate) fn open_dir(&mut self, dir: &Path) {
         self.reset();
         self.tail = LogTail::open(dir, self.max_files, self.capacity()).ok();
         self.reload();
@@ -203,6 +214,7 @@ impl LogsModal {
         self.popup = Rect::default();
         self.body = Rect::default();
         self.rows = Vec::new();
+        self.line_breaks = LineBreaks::default();
         self.level_hit = Rect::default();
         self.level_hovered = false;
         self.hints.reset();
@@ -210,6 +222,19 @@ impl LogsModal {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub(crate) fn area(&self) -> Rect {
+        self.popup
+    }
+
+    /// Where a drag selects text: the records, never the chrome around them.
+    pub(crate) fn text_area(&self) -> Rect {
+        self.body
+    }
+
+    pub(crate) fn line_breaks(&self) -> &LineBreaks {
+        &self.line_breaks
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
@@ -244,9 +269,8 @@ impl LogsModal {
     }
 
     fn snap_to_end(&mut self) {
-        let len = self.window_len();
-        self.selected = len.saturating_sub(1);
-        self.view_top = len.saturating_sub(self.viewport_h.max(1));
+        self.selected = self.window_len().saturating_sub(1);
+        self.set_position(self.end_position());
     }
 
     /// Returns whether anything changed, so `App::tick` can decide to repaint.
@@ -291,14 +315,17 @@ impl LogsModal {
             KeyCode::Right => self.pan(PAN_STEP),
             KeyCode::Home => self.pan = 0,
             KeyCode::Tab => return self.focus_correlation(),
-            KeyCode::Enter | KeyCode::Char(' ') => self.expanded = !self.expanded,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.expanded = !self.expanded;
+                self.reveal();
+            }
             KeyCode::Char('y') => return self.copy(false),
             KeyCode::Char('Y') => return self.copy(true),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
-            KeyCode::PageUp => self.move_cursor(-self.half_page()),
-            KeyCode::PageDown => self.move_cursor(self.half_page()),
-            _ if key::SCROLL_HALF_UP.matches(event) => self.move_cursor(-self.half_page()),
+            KeyCode::PageUp => self.scroll_view(-self.half_page()),
+            KeyCode::PageDown => self.scroll_view(self.half_page()),
+            _ if key::SCROLL_HALF_UP.matches(event) => self.scroll_view(-self.half_page()),
             _ if key::SCROLL_LINE_UP.matches(event) => self.move_cursor(-1),
             _ if key::SCROLL_LINE_DOWN.matches(event) => self.move_cursor(1),
             _ if key::SCROLL_TOP.matches(event) => self.move_cursor(-(MIN_OVERSCAN as isize)),
@@ -413,29 +440,27 @@ impl LogsModal {
         self.scroll_view(-delta as isize);
     }
 
-    fn max_view_top(&self) -> usize {
-        self.window_len().saturating_sub(self.viewport_h.max(1))
-    }
-
+    /// Rows, not records: a wrapped record is several rows tall, and moving
+    /// the page by whole records would skip what it was meant to show.
     fn scroll_view(&mut self, delta: isize) {
         if delta == 0 {
             return;
         }
         self.expanded = false;
+        self.settle();
+        let rows = delta.unsigned_abs();
         if delta < 0 {
-            let want = delta.unsigned_abs();
-            if self.view_top < want {
-                self.extend_back(want.max(MIN_OVERSCAN));
+            if self.view_top < rows {
+                self.extend_back(rows.max(MIN_OVERSCAN));
             }
-            self.view_top = self.view_top.saturating_sub(want);
+            self.rows_up(rows);
             self.follow = false;
         } else {
-            let want = delta as usize;
-            if self.view_top + want >= self.max_view_top() {
+            if self.view_top + rows + self.viewport_h >= self.window_len() {
                 self.extend_forward();
             }
-            self.view_top = (self.view_top + want).min(self.max_view_top());
-            self.follow = self.view_top >= self.max_view_top() && self.at_end();
+            self.rows_down(rows);
+            self.follow = self.position() >= self.end_position() && self.at_end();
         }
         self.clamp_selection();
     }
@@ -444,15 +469,134 @@ impl LogsModal {
     /// travel, since a distance is what decides whether it has to read further
     /// back in the file.
     fn scroll_view_to(&mut self, top: usize) {
-        self.scroll_view(top as isize - self.view_top as isize);
+        self.scroll_view(top as isize - self.row_offset() as isize);
     }
 
-    /// Keeps the cursor on a visible row, so copying or expanding after a
-    /// wheel acts on something the reader can see.
+    fn rows_up(&mut self, mut rows: usize) {
+        while rows > 0 {
+            if self.view_skip == 0 {
+                if self.view_top == 0 {
+                    return;
+                }
+                self.view_top -= 1;
+                self.view_skip = self.height(self.view_top);
+            }
+            let step = rows.min(self.view_skip);
+            self.view_skip -= step;
+            rows -= step;
+        }
+    }
+
+    fn rows_down(&mut self, mut rows: usize) {
+        let end = self.end_position();
+        while rows > 0 && self.position() < end {
+            let left = self.height(self.view_top) - self.view_skip;
+            if rows < left {
+                self.view_skip += rows;
+                return;
+            }
+            rows -= left;
+            self.view_top += 1;
+            self.view_skip = 0;
+        }
+        self.set_position(self.position().min(end));
+    }
+
+    /// Keeps the cursor on a record with a row on screen, so copying or
+    /// expanding after a wheel acts on something the reader can see, and the
+    /// next frame has no reason to pull the page back to it.
     fn clamp_selection(&mut self) {
-        let last = self.window_len().saturating_sub(1);
-        let bottom = (self.view_top + self.viewport_h.max(1) - 1).min(last);
+        let bottom = self.last_visible();
         self.selected = self.selected.clamp(self.view_top.min(bottom), bottom);
+    }
+
+    /// Rows one record paints. Measuring between frames uses the width last
+    /// drawn, and before the first frame there is none to wrap at, so every
+    /// record counts as one row until then.
+    fn height(&self, index: usize) -> usize {
+        let tall = self.wrap || (self.expanded && index == self.selected);
+        if self.width == 0 || !tall {
+            return 1;
+        }
+        self.record_rows(index, self.width, &theme::current())
+            .len()
+            .max(1)
+    }
+
+    fn position(&self) -> (usize, usize) {
+        (self.view_top, self.view_skip)
+    }
+
+    fn set_position(&mut self, (top, skip): (usize, usize)) {
+        self.view_top = top;
+        self.view_skip = skip;
+    }
+
+    /// Where the page stops: the last row of the window on the bottom row.
+    fn end_position(&self) -> (usize, usize) {
+        match self.window_len() {
+            0 => (0, 0),
+            len => self.top_ending_at(len - 1),
+        }
+    }
+
+    /// The position that puts the last row of record `last` on the bottom
+    /// row, or the top of the window when everything up to it fits.
+    fn top_ending_at(&self, last: usize) -> (usize, usize) {
+        let viewport = self.viewport_h.max(1);
+        let mut used = 0;
+        for index in (0..=last).rev() {
+            used += self.height(index);
+            if used >= viewport {
+                return (index, used - viewport);
+            }
+        }
+        (0, 0)
+    }
+
+    /// The lowest record with a row on screen.
+    fn last_visible(&self) -> usize {
+        let mut used = self.height(self.view_top).saturating_sub(self.view_skip);
+        let mut index = self.view_top;
+        while used < self.viewport_h && index + 1 < self.window_len() {
+            index += 1;
+            used += self.height(index);
+        }
+        index
+    }
+
+    fn row_offset(&self) -> usize {
+        (0..self.view_top)
+            .map(|index| self.height(index))
+            .sum::<usize>()
+            + self.view_skip
+    }
+
+    fn total_rows(&self) -> usize {
+        (0..self.window_len()).map(|index| self.height(index)).sum()
+    }
+
+    /// A wrap, a resize, or a collapse changes how tall records are, which can
+    /// leave the page past its end or inside a row that no longer exists.
+    fn settle(&mut self) {
+        self.view_skip = self
+            .view_skip
+            .min(self.height(self.view_top).saturating_sub(1));
+        self.set_position(self.position().min(self.end_position()));
+    }
+
+    /// Scrolls just far enough to show the whole selected record, or its first
+    /// rows when it is taller than the pane.
+    fn reveal(&mut self) {
+        let start = (self.selected, 0);
+        if start < self.position() || self.height(self.selected) >= self.viewport_h.max(1) {
+            self.set_position(start);
+            return;
+        }
+        let top = self.top_ending_at(self.selected);
+        if top > self.position() {
+            self.set_position(top);
+        }
     }
 
     /// Positive moves toward newer records. Extending the window is the only
@@ -479,6 +623,7 @@ impl LogsModal {
             self.selected = (self.selected + want).min(self.window_len().saturating_sub(1));
             self.follow = self.selected + 1 >= self.window_len() && self.at_end();
         }
+        self.reveal();
     }
 
     fn at_end(&self) -> bool {
@@ -513,6 +658,9 @@ impl LogsModal {
         // A full window evicts from the front by however much it grew past
         // capacity, which shifts every index the cursor holds.
         let evicted = (before + added).saturating_sub(tail.window().len());
+        if self.view_top < evicted {
+            self.view_skip = 0;
+        }
         self.selected = self.selected.saturating_sub(evicted);
         self.view_top = self.view_top.saturating_sub(evicted);
     }
@@ -583,19 +731,20 @@ impl LogsModal {
         let searching = self.query_focused || !self.query.is_empty();
         let chrome = CHROME_ROWS + u16::from(searching);
         let body_height = padded.height.saturating_sub(chrome);
+        self.width = usize::from(padded.width);
         self.resize(usize::from(body_height));
 
         self.body = Rect {
             height: body_height,
             ..padded
         };
-        let width = usize::from(padded.width);
-        self.anchor(width, theme);
+        self.anchor();
         let widest = self.widest_row(theme);
-        self.max_pan = widest.saturating_sub(width);
+        self.max_pan = widest.saturating_sub(self.width);
         self.pan = self.pan.min(self.max_pan);
-        let (lines, rows) = self.body_lines(width, theme);
+        let (lines, rows, line_breaks) = self.body_lines(theme);
         self.rows = rows;
+        self.line_breaks = line_breaks;
         frame.render_widget(
             Paragraph::new(lines).style(Style::new().fg(theme.foreground)),
             self.body,
@@ -626,8 +775,8 @@ impl LogsModal {
         let (line, level) = self.footer_line(theme);
         self.level_hit = hit_rect(footer, level);
         frame.render_widget(Paragraph::new(line), footer);
-        let len = u16::try_from(self.window_len()).unwrap_or(u16::MAX);
-        let offset = u16::try_from(self.view_top).unwrap_or(u16::MAX);
+        let len = u16::try_from(self.total_rows()).unwrap_or(u16::MAX);
+        let offset = u16::try_from(self.row_offset()).unwrap_or(u16::MAX);
         // Against the body, not the whole modal: the search, hint, and status
         // rows do not scroll and must not wear a track.
         self.scrollbar.draw(
@@ -657,25 +806,20 @@ impl LogsModal {
         popup
     }
 
-    /// Record indices cannot say where the top of the pane goes once a record
-    /// can be several rows tall, so the anchor is measured every frame against
-    /// the rows the pane will actually paint.
-    fn anchor(&mut self, width: usize, theme: &Theme) {
-        let len = self.window_len();
-        if len == 0 || self.viewport_h == 0 {
+    /// Following pins the newest row to the bottom. Otherwise the page stays
+    /// where the reader put it, and moves only when the selected record has no
+    /// row left on screen, as after a resize or a wrap.
+    fn anchor(&mut self) {
+        if self.window_len() == 0 || self.viewport_h == 0 {
             return;
         }
-        let last = match self.follow {
-            true => len - 1,
-            false => self.selected.min(len - 1),
-        };
-        if !self.follow && self.selected < self.view_top {
-            self.view_top = self.selected;
+        if self.follow {
+            self.set_position(self.end_position());
             return;
         }
-        let top = self.top_for(last, width, theme);
-        if self.follow || top > self.view_top {
-            self.view_top = top;
+        self.settle();
+        if !(self.view_top..=self.last_visible()).contains(&self.selected) {
+            self.reveal();
         }
     }
 
@@ -711,7 +855,12 @@ impl LogsModal {
 
     /// Every row one record paints. Measuring and drawing both go through this,
     /// so the two can never disagree about how tall a wrapped record is.
-    fn record_rows(&self, index: usize, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    fn record_rows(
+        &self,
+        index: usize,
+        width: usize,
+        theme: &Theme,
+    ) -> Vec<(Line<'static>, RowStart)> {
         self.logical_lines(index, theme)
             .iter()
             .flat_map(|line| lay_out(line, width, self.pan, self.wrap))
@@ -730,26 +879,11 @@ impl LogsModal {
             .unwrap_or(0)
     }
 
-    /// The topmost record that still leaves `last` on screen. Wrapping makes a
-    /// record several rows tall, so this has to be measured rather than counted.
-    fn top_for(&self, last: usize, width: usize, theme: &Theme) -> usize {
-        let mut used = 0;
-        let mut top = last;
-        for index in (0..=last).rev() {
-            let height = self.record_rows(index, width, theme).len().max(1);
-            if used + height > self.viewport_h && used > 0 {
-                break;
-            }
-            used += height;
-            top = index;
-        }
-        top
-    }
-
     /// Also reports the window index behind each screen row, so a click lands
     /// on the record the reader pointed at even when an expansion pushed the
-    /// rows below it down.
-    fn body_lines(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, Vec<usize>) {
+    /// rows below it down, and how each row began, so a copy across a wrap
+    /// comes out as the one line it was.
+    fn body_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, Vec<usize>, LineBreaks) {
         let Some(tail) = &self.tail else {
             return (
                 vec![
@@ -757,29 +891,42 @@ impl LogsModal {
                     Line::from(Span::styled(NO_TAIL_HINT, theme.tool_dim)),
                 ],
                 Vec::new(),
+                LineBreaks::default(),
             );
         };
         if tail.window().is_empty() {
             return (
                 vec![Line::from(Span::styled(NO_MATCHES, theme.status_dim))],
                 Vec::new(),
+                LineBreaks::default(),
             );
         }
 
         let mut lines = Vec::with_capacity(self.viewport_h);
         let mut rows = Vec::with_capacity(self.viewport_h);
+        let mut starts = Vec::with_capacity(self.viewport_h);
         for index in self.view_top..self.window_len() {
             if lines.len() >= self.viewport_h {
                 break;
             }
-            for row in self.record_rows(index, width, theme) {
-                lines.push(row);
+            let skip = match index == self.view_top {
+                true => self.view_skip,
+                false => 0,
+            };
+            for (line, start) in self
+                .record_rows(index, self.width, theme)
+                .into_iter()
+                .skip(skip)
+            {
+                lines.push(line);
                 rows.push(index);
+                starts.push(start);
             }
         }
         lines.truncate(self.viewport_h);
         rows.truncate(self.viewport_h);
-        (lines, rows)
+        starts.truncate(self.viewport_h);
+        (lines, rows, LineBreaks::from_row_starts(starts))
     }
 
     /// The actions a reader can reach from here. Without this row the only way
@@ -945,30 +1092,39 @@ fn display_width(line: &Line<'static>) -> usize {
 /// One logical record laid out for the pane: broken onto as many rows as it
 /// needs, or kept on one row panned `pan` columns to the right. Wrapping uses
 /// the shared break walk, so these rows fall where every other wrapped surface
-/// in the UI puts them.
-fn lay_out(line: &Line<'static>, width: usize, pan: usize, wrap: bool) -> Vec<Line<'static>> {
+/// in the UI puts them. Every cut row keeps the line's own style, which is
+/// what marks the selected record.
+fn lay_out(
+    line: &Line<'static>,
+    width: usize,
+    pan: usize,
+    wrap: bool,
+) -> Vec<(Line<'static>, RowStart)> {
+    if !wrap && pan == 0 {
+        return vec![(line.clone(), RowStart::Line)];
+    }
+    let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+    let cut = |range: Range<usize>| Line::from(slice_spans(&line.spans, range)).style(line.style);
     if !wrap {
-        if pan == 0 {
-            return vec![line.clone()];
-        }
-        let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
         let start = char_at_column(&chars, pan);
-        return vec![Line::from(slice_spans(&line.spans, start..chars.len()))];
+        return vec![(cut(start..chars.len()), RowStart::Line)];
     }
 
-    let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
-    let mut starts = vec![0];
+    let mut starts = vec![(0, RowStart::Line)];
     starts.extend(
         wrap_breaks(&chars, u16::try_from(width).unwrap_or(u16::MAX).max(1))
             .into_iter()
-            .map(|brk| brk.start),
+            .map(|brk| match brk.word {
+                true => (brk.start, RowStart::WordWrap),
+                false => (brk.start, RowStart::HardWrap),
+            }),
     );
     starts
         .iter()
         .enumerate()
-        .map(|(row, &start)| {
-            let end = starts.get(row + 1).copied().unwrap_or(chars.len());
-            Line::from(slice_spans(&line.spans, start..end))
+        .map(|(row, &(start, kind))| {
+            let end = starts.get(row + 1).map_or(chars.len(), |&(next, _)| next);
+            (cut(start..end), kind)
         })
         .collect()
 }
@@ -1159,7 +1315,8 @@ mod tests {
                 width,
                 0,
                 false,
-            )[0],
+            )[0]
+            .0,
         )
     }
 
@@ -1202,7 +1359,7 @@ mod tests {
         assert!(rendered(&full).contains("attempt=3"));
         assert!(display_width(&full) > NARROW);
 
-        let panned = &lay_out(&full, NARROW, 20, false)[0];
+        let panned = &lay_out(&full, NARROW, 20, false)[0].0;
         assert!(
             !rendered(panned).contains("14:22:07"),
             "the pan never moved"
@@ -1217,9 +1374,11 @@ mod tests {
         let rows = lay_out(&full, 40, 0, true);
 
         assert!(rows.len() > 1);
-        assert!(rows.iter().all(|row| display_width(row) <= 40));
-        let joined: String = rows.iter().map(rendered).collect();
+        assert!(rows.iter().all(|(row, _)| display_width(row) <= 40));
+        let joined: String = rows.iter().map(|(row, _)| rendered(row)).collect();
         assert!(joined.contains("attempt=3"), "{joined}");
+        assert_eq!(rows[0].1, RowStart::Line);
+        assert!(rows[1..].iter().all(|(_, start)| *start != RowStart::Line));
     }
 
     #[test]
@@ -1230,13 +1389,27 @@ mod tests {
 
         let styles: Vec<_> = rows
             .iter()
-            .flat_map(|r| r.spans.iter().map(|s| s.style))
+            .flat_map(|(r, _)| r.spans.iter().map(|s| s.style))
             .collect();
         assert!(
             styles
                 .iter()
                 .any(|style| *style == level_style(Level::Warn, &theme)),
             "the level lost its colour on the way through the wrap"
+        );
+    }
+
+    #[test_case(0, true ; "wrapped")]
+    #[test_case(20, false ; "panned")]
+    fn every_cut_row_of_the_selected_record_stays_marked(pan: usize, wrap: bool) {
+        let theme = theme::current();
+        let full = entry_line(&Entry::parse(EVENT), true, &theme);
+
+        let rows = lay_out(&full, 40, pan, wrap);
+
+        assert!(
+            rows.iter().all(|(row, _)| row.style == theme.item_selected),
+            "a cut row lost the selection's highlight"
         );
     }
 
@@ -1264,6 +1437,34 @@ mod tests {
         let out = plain_text(&Entry::parse(WITH_SPAN));
         assert!(out.contains("session_id=s-1"), "{out}");
         assert!(out.contains("caudra.tool_result"), "{out}");
+        assert!(out.contains("tool result"), "{out}");
+    }
+
+    /// `y` copies the record, not the rows it was cut into, so wrapping and
+    /// a narrow pane change nothing about what lands on the clipboard.
+    #[test_case(false ; "unwrapped")]
+    #[test_case(true ; "wrapped")]
+    fn y_copies_the_whole_selected_record_however_it_is_laid_out(wrap: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_with(tmp.path(), &[wrapped_message(0)]);
+        if wrap {
+            modal.handle_key(key(KeyCode::Char('w')));
+        }
+        let _ = drawn(&mut modal);
+
+        let LogsAction::Copy { text, label } = modal.handle_key(key(KeyCode::Char('y'))) else {
+            panic!("y copied nothing");
+        };
+        assert_eq!(label, COPIED);
+        assert!(text.contains(wrapped_message(0).trim_end()), "{text}");
+        assert!(text.contains("caudra::agent"), "{text}");
+
+        let LogsAction::Copy { text, label } = modal.handle_key(key(KeyCode::Char('Y'))) else {
+            panic!("Y copied nothing");
+        };
+        assert_eq!(label, COPIED_RAW);
+        assert!(text.contains(wrapped_message(0).trim_end()), "{text}");
+        assert!(text.starts_with('{'), "{text}");
     }
 
     #[test_case(0, DEFAULT_MAX_FILES ; "zero falls back")]
@@ -1661,6 +1862,207 @@ mod tests {
             out.contains(&format!("line-{}", SEEDED - 1)),
             "following lost the newest record to the fold: {out}"
         );
+    }
+
+    const WRAPPED_WORDS: usize = 60;
+    const TALL_WORDS: usize = 600;
+    const TALL_END: &str = "tall-end-marker";
+    const SHORT_BEFORE: usize = 10;
+    const AFTER_TALL: usize = 3;
+    const WHEEL_ROWS: i32 = 3;
+    const MAX_WHEEL_STEPS: usize = 200;
+    const KEY_STEPS: usize = 12;
+    const SNAPPED_BACK: &str = "the next frame pulled the page back to where it was";
+    const UNREACHABLE: &str = "the end of the tall record never reached the pane";
+
+    fn wrapped_message(index: usize) -> String {
+        format!("wrapped-{index:03} {}", "word ".repeat(WRAPPED_WORDS))
+    }
+
+    fn wrapped_modal(dir: &std::path::Path) -> LogsModal {
+        let messages: Vec<String> = (0..SEEDED).map(wrapped_message).collect();
+        let mut modal = seeded_with(dir, &messages);
+        modal.handle_key(key(KeyCode::Char('w')));
+        let _ = drawn(&mut modal);
+        modal
+    }
+
+    /// One record taller than the pane between short ones, selected and
+    /// revealed, so the pane opens on its first rows.
+    fn tall_modal(dir: &std::path::Path) -> LogsModal {
+        let mut messages: Vec<String> = (0..SHORT_BEFORE).map(|i| format!("line-{i}")).collect();
+        messages.push(format!("{}{TALL_END}", "word ".repeat(TALL_WORDS)));
+        messages.extend((0..AFTER_TALL).map(|i| format!("after-{i}")));
+        let mut modal = seeded_with(dir, &messages);
+        modal.handle_key(key(KeyCode::Char('w')));
+        let _ = drawn(&mut modal);
+        for _ in 0..AFTER_TALL {
+            modal.handle_key(key(KeyCode::Up));
+        }
+        assert_eq!(modal.selected, SHORT_BEFORE);
+        modal
+    }
+
+    #[test]
+    fn the_wheel_moves_a_wrapped_page_and_the_next_frame_keeps_it_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = wrapped_modal(tmp.path());
+        let end = modal.row_offset();
+        assert!(end > 0);
+
+        modal.scroll(WHEEL_ROWS);
+        let _ = drawn(&mut modal);
+        assert_eq!(
+            modal.row_offset(),
+            end - WHEEL_ROWS as usize,
+            "{SNAPPED_BACK}"
+        );
+        assert!(!modal.follow);
+        let _ = drawn(&mut modal);
+        assert_eq!(
+            modal.row_offset(),
+            end - WHEEL_ROWS as usize,
+            "{SNAPPED_BACK}"
+        );
+
+        modal.scroll(-WHEEL_ROWS);
+        let _ = drawn(&mut modal);
+        assert_eq!(modal.row_offset(), end);
+        assert!(modal.follow, "back at the end must follow again");
+    }
+
+    #[test]
+    fn page_keys_move_a_wrapped_page_by_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = wrapped_modal(tmp.path());
+        let end = modal.row_offset();
+
+        modal.handle_key(key(KeyCode::PageUp));
+        let _ = drawn(&mut modal);
+        assert_eq!(
+            modal.row_offset(),
+            end - modal.half_page() as usize,
+            "{SNAPPED_BACK}"
+        );
+
+        modal.handle_key(key(KeyCode::PageDown));
+        let _ = drawn(&mut modal);
+        assert_eq!(modal.row_offset(), end);
+    }
+
+    #[test]
+    fn the_arrow_keys_walk_a_wrapped_list_both_ways() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = wrapped_modal(tmp.path());
+
+        for step in 1..=KEY_STEPS {
+            modal.handle_key(key(KeyCode::Up));
+            let out = drawn(&mut modal);
+            let index = SEEDED - 1 - step;
+            assert_eq!(modal.selected, index);
+            assert!(
+                out.contains(&format!("wrapped-{index:03}")),
+                "{OFF_SCREEN}: {out}"
+            );
+        }
+        for step in (0..KEY_STEPS).rev() {
+            modal.handle_key(key(KeyCode::Down));
+            let out = drawn(&mut modal);
+            let index = SEEDED - 1 - step;
+            assert_eq!(modal.selected, index);
+            assert!(
+                out.contains(&format!("wrapped-{index:03}")),
+                "{OFF_SCREEN}: {out}"
+            );
+        }
+        assert!(modal.follow);
+    }
+
+    #[test]
+    fn a_wrapped_press_on_the_bar_scrolls_by_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = wrapped_modal(tmp.path());
+        assert!(modal.row_offset() > 0);
+
+        let column = modal.body.right() + H_PAD - 1;
+        modal.handle_mouse(wheel(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            modal.body.y,
+        ));
+        let _ = drawn(&mut modal);
+
+        assert_eq!(modal.row_offset(), 0, "{BAR_IGNORED}");
+    }
+
+    #[test]
+    fn a_record_taller_than_the_pane_opens_on_its_first_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = tall_modal(tmp.path());
+
+        let out = drawn(&mut modal);
+
+        assert_eq!(modal.position(), (SHORT_BEFORE, 0));
+        assert!(!out.contains(TALL_END), "{out}");
+    }
+
+    #[test]
+    fn the_wheel_reads_a_record_taller_than_the_pane_to_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = tall_modal(tmp.path());
+        let _ = drawn(&mut modal);
+
+        let reached = (0..MAX_WHEEL_STEPS).any(|_| {
+            modal.scroll(-1);
+            drawn(&mut modal).contains(TALL_END) && modal.selected == SHORT_BEFORE
+        });
+
+        assert!(reached, "{UNREACHABLE}");
+        assert!(
+            modal.view_skip > 0,
+            "the pane never scrolled inside the record"
+        );
+    }
+
+    #[test]
+    fn unwrapping_inside_a_tall_record_leaves_a_valid_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = tall_modal(tmp.path());
+        modal.scroll(-WHEEL_ROWS);
+        let _ = drawn(&mut modal);
+        assert!(modal.view_skip > 0);
+
+        modal.handle_key(key(KeyCode::Char('w')));
+        let out = drawn(&mut modal);
+
+        assert_eq!(modal.view_skip, 0);
+        assert!(
+            (modal.view_top..=modal.last_visible()).contains(&modal.selected),
+            "{OFF_SCREEN}: {out}"
+        );
+    }
+
+    #[test]
+    fn body_rows_say_which_ones_continue_a_wrapped_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = wrapped_modal(tmp.path());
+        let _ = drawn(&mut modal);
+
+        let starts: Vec<bool> = (0..modal.rows.len())
+            .map(|row| modal.line_breaks.is_line_start(row as u16))
+            .collect();
+        let expected: Vec<bool> = modal
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row, index)| match row {
+                0 => modal.view_skip == 0,
+                _ => modal.rows[row - 1] != *index,
+            })
+            .collect();
+
+        assert!(starts.iter().filter(|start| !**start).count() > 0);
+        assert_eq!(starts, expected);
     }
 
     #[test]

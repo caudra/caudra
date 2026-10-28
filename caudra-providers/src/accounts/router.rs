@@ -51,6 +51,7 @@ const STATUS_PAYMENT_REQUIRED: u16 = 402;
 const STATUS_UNAUTHORIZED: u16 = 401;
 const STATUS_FORBIDDEN: u16 = 403;
 const STATUS_NOT_FOUND: u16 = 404;
+const XAI_SLUG: &str = "xai";
 const EVENT_ACCOUNT_SWITCHED: &str = "account_switched";
 const EVENT_ACCOUNT_FAILOVER: &str = "account_failover";
 const EVENT_PROVIDER_REROUTED: &str = "provider_rerouted";
@@ -1038,8 +1039,17 @@ impl Provider for RoutedProvider {
                 Refusal::Auth | Refusal::Model => return Failover::STAY,
             };
             let exhausted = |router: &Self| Failover::Stay {
-                exhausted: until_ms
-                    .map(|until| router.exhaustion(&snapshot, current, &model_id, Some(until))),
+                exhausted: until_ms.map(|until| {
+                    let reset = if router.state.slug == XAI_SLUG
+                        && error.is_free_usage_exhausted()
+                        && error.retry_after().is_none()
+                    {
+                        None
+                    } else {
+                        Some(until)
+                    };
+                    router.exhaustion(&snapshot, current, &model_id, reset)
+                }),
             };
             if pinned {
                 return exhausted(self);
@@ -1127,10 +1137,14 @@ impl RoutedProvider {
     ) -> Option<Refusal> {
         match error.status()? {
             STATUS_RATE_LIMITED => {
-                let wait = match error.retry_after() {
-                    Some(wait) if wait <= MAX_SAME_ACCOUNT_WAIT => return None,
-                    Some(wait) => wait,
-                    None => self.spent_wait(snapshot, current, model_id, now_ms)?,
+                let wait = if self.state.slug == XAI_SLUG && error.is_free_usage_exhausted() {
+                    error.retry_after().unwrap_or(QUOTA_STALE)
+                } else {
+                    match error.retry_after() {
+                        Some(wait) if wait <= MAX_SAME_ACCOUNT_WAIT => return None,
+                        Some(wait) => wait,
+                        None => self.spent_wait(snapshot, current, model_id, now_ms)?,
+                    }
                 };
                 Some(Refusal::RateLimited {
                     until_ms: now_ms.saturating_add(wait.as_millis() as u64),
