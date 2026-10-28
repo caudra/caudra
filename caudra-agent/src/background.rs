@@ -1524,12 +1524,16 @@ impl BackgroundTasks {
     async fn save_terminal(&self, invocation: &str) -> Result<(), SaveError> {
         let Some(mut terminal) = ({
             let state = self.lock();
-            state.terminals.get(invocation).cloned().map(|mut terminal| {
-                if let Some(resident) = state.records.get(invocation) {
-                    adopt_receipts(&mut terminal.record, resident);
-                }
-                terminal
-            })
+            state
+                .terminals
+                .get(invocation)
+                .cloned()
+                .map(|mut terminal| {
+                    if let Some(resident) = state.records.get(invocation) {
+                        adopt_receipts(&mut terminal.record, resident);
+                    }
+                    terminal
+                })
         }) else {
             return Ok(());
         };
