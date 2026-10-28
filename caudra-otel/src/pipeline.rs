@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::{Receiver, Sender};
-use futures_lite::{StreamExt, future, stream};
+use futures_lite::{Stream, StreamExt, future, stream};
 
 use crate::attr::AttrSet;
 use crate::encode::otlp::{LogsPayload, MetricsPayload};
@@ -94,16 +94,23 @@ impl Pipeline {
         }
     }
 
-    /// Runs until every producer is gone or a shutdown arrives. Telemetry is
-    /// polled before shutdown, so by the time a shutdown is seen both queues
-    /// are already empty and the final export cannot miss anything.
-    pub async fn run(mut self, inputs: Inputs) {
+    /// Runs until every producer is gone or a shutdown arrives.
+    pub async fn run(self, inputs: Inputs) {
+        self.run_with_shutdown(&inputs, inputs.shutdown.stream())
+            .await;
+    }
+
+    async fn run_with_shutdown(
+        mut self,
+        inputs: &Inputs,
+        shutdown: impl Stream<Item = Shutdown> + Unpin,
+    ) {
         let mut events = stream::or(
             stream::or(
-                inputs.logs.into_stream().map(Event::Log),
-                inputs.metrics.into_stream().map(Event::Measurement),
+                inputs.logs.stream().map(Event::Log),
+                inputs.metrics.stream().map(Event::Measurement),
             ),
-            inputs.shutdown.into_stream().map(Event::Shutdown),
+            shutdown.map(Event::Shutdown),
         );
 
         let mut metrics_at = Instant::now() + self.metrics_interval;
@@ -111,11 +118,15 @@ impl Pipeline {
 
         loop {
             let deadline = metrics_at.min(logs_at);
-            let event = future::or(events.next(), async {
-                smol::Timer::at(deadline).await;
-                Some(Event::Tick)
-            })
-            .await;
+            let event = if let Ok(request) = inputs.shutdown.try_recv() {
+                Some(Event::Shutdown(request))
+            } else {
+                future::or(events.next(), async {
+                    smol::Timer::at(deadline).await;
+                    Some(Event::Tick)
+                })
+                .await
+            };
 
             match event {
                 None => break,
@@ -141,22 +152,35 @@ impl Pipeline {
                     }
                 }
                 Some(Event::Shutdown(request)) => {
-                    self.flush(request.budget).await;
+                    self.flush(inputs, request.budget).await;
                     let _ = request.done.send(());
                     return;
                 }
             }
         }
-        self.flush(self.metrics_export_timeout.max(self.logs_export_timeout))
-            .await;
+        self.flush(
+            inputs,
+            self.metrics_export_timeout.max(self.logs_export_timeout),
+        )
+        .await;
     }
 
     /// One deadline for the whole flush: whoever is waiting gave us `budget`,
     /// and a per exporter timeout would outlive it several times over.
-    async fn flush(&mut self, budget: Duration) {
+    async fn flush(&mut self, inputs: &Inputs, budget: Duration) {
         let deadline = Instant::now() + budget;
+        let logs = inputs.logs.drain();
+        for measurement in inputs.metrics.drain() {
+            self.registry.record(measurement);
+        }
         self.report_drops();
         self.export_metrics(deadline).await;
+        for record in logs {
+            self.pending.push(record);
+            if self.pending.len() >= self.logs_batch_size {
+                self.export_logs(deadline).await;
+            }
+        }
         self.export_logs(deadline).await;
     }
 
@@ -227,10 +251,12 @@ pub fn now_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::Mutex;
     use std::thread::JoinHandle;
 
     use caudra_config::TelemetryConfig;
+    use test_case::test_case;
 
     use super::*;
     use crate::attr::AttrSet;
@@ -246,6 +272,10 @@ mod tests {
     const BATCH: usize = 2;
     const CAPACITY: usize = 16;
     const FAIL_STATUS: u16 = 500;
+    const QUEUED_RECORDS: usize = BATCH * 2 + 1;
+    const RECORD_ID: &str = "record.id";
+    const EXPORTER_COUNT: usize = 2;
+    const FLUSH_EXPORTS: usize = EXPORTER_COUNT * (1 + QUEUED_RECORDS.div_ceil(BATCH));
 
     #[derive(Default)]
     struct Recorder {
@@ -267,6 +297,32 @@ mod tests {
                 Payload::Logs(p) => self.0.log_batches.lock().unwrap().push(p.records.len()),
             }
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Refilling {
+        fake: Fake,
+        logs: Sender<LogRecord>,
+        metrics: Sender<Measurement>,
+        deadlines: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl Transport for Refilling {
+        fn export<'a>(&'a self, payload: &'a Payload<'a>, deadline: Instant) -> ExportFuture<'a> {
+            let mut deadlines = self.deadlines.lock().unwrap();
+            assert!(deadlines.len() < FLUSH_EXPORTS);
+            deadlines.push(deadline);
+            for _ in 0..BATCH {
+                self.logs.try_send(log_record()).unwrap();
+            }
+            self.metrics
+                .try_send(Measurement {
+                    def: &COMMIT_COUNT,
+                    value: Value::Int(1),
+                    attrs: AttrSet::new(),
+                })
+                .unwrap();
+            self.fake.export(payload, deadline)
         }
     }
 
@@ -293,6 +349,33 @@ mod tests {
         thread: Option<JoinHandle<()>>,
     }
 
+    fn pipeline(exporters: Exporters) -> Pipeline {
+        let mut settings = resolve(&TelemetryConfig::default(), |k| {
+            (k == ENV_ENABLE).then(|| "1".to_string())
+        })
+        .unwrap()
+        .unwrap();
+        settings.metrics_interval = NEVER;
+        settings.logs_interval = NEVER;
+        settings.logs_max_export_batch_size = BATCH;
+        Pipeline::new(
+            &settings,
+            AttrSet::new(),
+            exporters,
+            Arc::new(Dropped::default()),
+            0,
+        )
+    }
+
+    fn log_record() -> LogRecord {
+        LogRecord {
+            time_unix_nano: 1,
+            event_name: EVENT_API_REQUEST,
+            severity: Severity::INFO,
+            attrs: AttrSet::new(),
+        }
+    }
+
     impl Harness {
         fn start() -> Self {
             Self::start_with(|recorder| Exporters {
@@ -302,26 +385,11 @@ mod tests {
         }
 
         fn start_with(exporters: impl FnOnce(&Arc<Recorder>) -> Exporters) -> Self {
-            let mut settings = resolve(&TelemetryConfig::default(), |k| {
-                (k == ENV_ENABLE).then(|| "1".to_string())
-            })
-            .unwrap()
-            .unwrap();
-            settings.metrics_interval = NEVER;
-            settings.logs_interval = NEVER;
-            settings.logs_max_export_batch_size = BATCH;
-
             let recorder = Arc::new(Recorder::default());
             let (metrics_tx, metrics) = flume::bounded(CAPACITY);
             let (logs_tx, logs) = flume::bounded(CAPACITY);
             let (shutdown_tx, shutdown) = flume::bounded(CAPACITY);
-            let pipeline = Pipeline::new(
-                &settings,
-                AttrSet::new(),
-                exporters(&recorder),
-                Arc::new(Dropped::default()),
-                0,
-            );
+            let pipeline = pipeline(exporters(&recorder));
             let thread = std::thread::spawn(move || {
                 smol::block_on(pipeline.run(Inputs {
                     metrics,
@@ -339,14 +407,7 @@ mod tests {
         }
 
         fn log(&self) {
-            self.logs_tx
-                .send(LogRecord {
-                    time_unix_nano: 1,
-                    event_name: EVENT_API_REQUEST,
-                    severity: Severity::INFO,
-                    attrs: AttrSet::new(),
-                })
-                .unwrap();
+            self.logs_tx.send(log_record()).unwrap();
         }
 
         fn commit(&self) {
@@ -435,6 +496,125 @@ mod tests {
         h.shutdown();
         assert_eq!(h.log_batches(), vec![BATCH, 1]);
         assert_eq!(h.metric_batches(), vec![1]);
+    }
+
+    #[test_case(0, &[BATCH, BATCH, 1]; "empty_pending")]
+    #[test_case(1, &[BATCH, BATCH, BATCH]; "partial_batch")]
+    fn shutdown_drains_telemetry_queued_between_polls(pending: usize, batches: &[usize]) {
+        let recorder = Arc::new(Recorder::default());
+        let pipeline = pipeline(Exporters {
+            metrics: vec![Box::new(Fake(Arc::clone(&recorder)))],
+            logs: vec![Box::new(Fake(Arc::clone(&recorder)))],
+        });
+        let (metrics_tx, metrics) = flume::bounded(CAPACITY);
+        let (logs_tx, logs) = flume::bounded(CAPACITY);
+        let (shutdown_tx, shutdown) = flume::bounded(CAPACITY);
+        for _ in 0..pending {
+            logs_tx.try_send(log_record()).unwrap();
+        }
+        let inputs = Inputs {
+            metrics,
+            logs,
+            shutdown,
+        };
+        let (done_tx, done_rx) = flume::bounded(1);
+        let mut request = Some(Shutdown {
+            budget: SHUTDOWN_BUDGET,
+            done: done_tx,
+        });
+        let mut shutdown = inputs.shutdown.stream();
+        let shutdown = stream::poll_fn(|cx| {
+            if let Some(request) = request.take() {
+                for id in 0..QUEUED_RECORDS {
+                    logs_tx.try_send(log_record()).unwrap();
+                    metrics_tx
+                        .try_send(Measurement {
+                            def: &COMMIT_COUNT,
+                            value: Value::Int(1),
+                            attrs: AttrSet::new().with(RECORD_ID, id),
+                        })
+                        .unwrap();
+                }
+                shutdown_tx.try_send(request).unwrap();
+            }
+            Pin::new(&mut shutdown).poll_next(cx)
+        });
+
+        smol::block_on(pipeline.run_with_shutdown(&inputs, shutdown));
+
+        assert_eq!(*recorder.log_batches.lock().unwrap(), batches);
+        assert_eq!(
+            *recorder.metric_batches.lock().unwrap(),
+            vec![QUEUED_RECORDS]
+        );
+        assert!(inputs.logs.is_empty());
+        assert!(inputs.metrics.is_empty());
+        assert_eq!(done_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn shutdown_bounds_refills_and_shares_one_deadline_across_batches_and_exporters() {
+        let recorder = Arc::new(Recorder::default());
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let (metrics_tx, metrics) = flume::bounded(CAPACITY);
+        let (logs_tx, logs) = flume::bounded(CAPACITY);
+        let (shutdown_tx, shutdown) = flume::bounded(CAPACITY);
+        let exporters = || {
+            (0..EXPORTER_COUNT)
+                .map(|_| {
+                    Box::new(Refilling {
+                        fake: Fake(Arc::clone(&recorder)),
+                        logs: logs_tx.clone(),
+                        metrics: metrics_tx.clone(),
+                        deadlines: Arc::clone(&deadlines),
+                    }) as Box<dyn Transport>
+                })
+                .collect()
+        };
+        let pipeline = pipeline(Exporters {
+            metrics: exporters(),
+            logs: exporters(),
+        });
+        for id in 0..QUEUED_RECORDS {
+            logs_tx.try_send(log_record()).unwrap();
+            metrics_tx
+                .try_send(Measurement {
+                    def: &COMMIT_COUNT,
+                    value: Value::Int(1),
+                    attrs: AttrSet::new().with(RECORD_ID, id),
+                })
+                .unwrap();
+        }
+        let (done_tx, done_rx) = flume::bounded(1);
+        shutdown_tx
+            .try_send(Shutdown {
+                budget: SHUTDOWN_BUDGET,
+                done: done_tx,
+            })
+            .unwrap();
+
+        smol::block_on(pipeline.run(Inputs {
+            metrics,
+            logs,
+            shutdown,
+        }));
+
+        assert_eq!(
+            *recorder.log_batches.lock().unwrap(),
+            vec![BATCH, BATCH, BATCH, BATCH, 1, 1]
+        );
+        assert_eq!(
+            *recorder.metric_batches.lock().unwrap(),
+            vec![QUEUED_RECORDS; EXPORTER_COUNT]
+        );
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), FLUSH_EXPORTS);
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+        assert_eq!(logs_tx.len(), FLUSH_EXPORTS * BATCH);
+        assert_eq!(metrics_tx.len(), FLUSH_EXPORTS);
+        assert!(logs_tx.is_disconnected());
+        assert!(metrics_tx.is_disconnected());
+        assert_eq!(done_rx.try_recv(), Ok(()));
     }
 
     #[test]
