@@ -650,23 +650,16 @@ impl App {
             .map_err(|error| DeliveryFailure::Save(error.to_string()))?;
         let messages =
             project_messages(&history).map_err(|error| DeliveryFailure::Save(error.to_string()))?;
-        if self.background_saved_revision != Some(revision) {
-            if let Err(error) = self
-                .storage_writer
-                .save_sync(Arc::clone(&self.state.session))
-            {
-                if final_save {
-                    self.release_background_claims();
-                }
-                return Err(DeliveryFailure::Save(error.to_string()));
-            }
-            self.background_saved_revision = Some(revision);
-        }
+        let saved = (self.background_saved_revision != Some(revision)).then(|| {
+            self.storage_writer
+                .save_acked(Arc::clone(&self.state.session))
+        });
         self.background_delivery.schedule(DeliveryJob {
             key,
             messages,
             background: self.background.clone(),
             workflow,
+            saved,
         });
         Ok(())
     }
