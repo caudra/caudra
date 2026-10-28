@@ -31148,6 +31148,9 @@ mod goal_log {
     fn enter_on_a_check_that_drew_no_row_keeps_the_log_up() {
         let mut app = test_app();
         app.state.goal.set(GOAL_CONDITION).unwrap();
+        // Saves the session row first, as production does, or the writer may
+        // drop the check below for referencing a session it has not written.
+        app.flush_goal_log();
         record(
             &app,
             check(
