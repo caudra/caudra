@@ -11,7 +11,7 @@ mod statements;
 mod syntax;
 mod truthiness;
 
-use std::fmt;
+use std::{fmt, panic, thread};
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -42,6 +42,10 @@ const FENCE: &str = "```";
 const JAVASCRIPT_FENCES: [&str; 4] = ["js", "javascript", "ts", "typescript"];
 const PYTHON_FENCES: [&str; 4] = ["", "python", "py", "python3"];
 const MAX_DEPTH: usize = 128;
+/// Unoptimized, the deepest admitted callback chain takes about 2.2 MiB, more than the 2 MiB a
+/// spawned thread gets by default. Pages are only committed as the recursion reaches them.
+const LOWERING_STACK_BYTES: usize = 8 << 20;
+const LOWERING_THREAD: &str = "javascript-lowering";
 const FIRST_LINE: usize = 1;
 /// Kinds only JavaScript or TypeScript writes, any one of which marks a snippet as JavaScript.
 const EVIDENCE_KINDS: [&str; 11] = [
@@ -165,6 +169,8 @@ pub(crate) enum Construct {
     TooLarge,
     /// Nested deeper than the translator follows.
     TooDeep,
+    /// The system would not start the thread translation runs on.
+    Unstarted,
     /// A construct with no Python form, named as the reader would know it.
     Syntax(String),
     /// A condition on a value whose truthiness differs between the two languages, as written.
@@ -180,6 +186,9 @@ impl fmt::Display for Construct {
             Self::Unparsed => formatter.write_str("JavaScript that does not parse"),
             Self::TooLarge => formatter.write_str("a snippet whose Python is too long"),
             Self::TooDeep => write!(formatter, "nesting deeper than {MAX_DEPTH} levels"),
+            Self::Unstarted => {
+                formatter.write_str("a snippet no translation thread could start for")
+            }
             Self::Syntax(named) => formatter.write_str(named),
             Self::Condition(written) => write!(formatter, "the condition `{written}`"),
             Self::Unawaited(written) => write!(formatter, "`{written}` without `await`"),
@@ -227,8 +236,28 @@ pub(crate) fn translated(code: &str, stubs: &StubIndex) -> Translation<String> {
         });
     }
     admitted(root, &source)?;
+    thread::scope(|scope| {
+        let lowering = thread::Builder::new()
+            .name(LOWERING_THREAD.to_owned())
+            .stack_size(LOWERING_STACK_BYTES)
+            .spawn_scoped(scope, || lowered(root, &source, stubs));
+        match lowering {
+            Ok(lowering) => lowering
+                .join()
+                .unwrap_or_else(|panic| panic::resume_unwind(panic)),
+            Err(_) => Err(Untranslated {
+                construct: Construct::Unstarted,
+                line: FIRST_LINE,
+            }),
+        }
+    })
+}
+
+/// The admitted tree under `root` as Python. Lowering, checking, printing and dropping the
+/// module each recurse once per nesting level, so this runs on its own stack.
+fn lowered(root: Node<'_>, source: &str, stubs: &StubIndex) -> Translation<String> {
     let mut translator = Translator {
-        source: &source,
+        source,
         stubs,
         scopes: Scopes::default(),
         lifted: Vec::new(),
@@ -485,8 +514,8 @@ pub(crate) mod tests {
         assert_eq!(refused(&nested).construct, Construct::TooDeep);
     }
 
-    /// The deepest nesting admission lets through is lowered, printed and parsed again within a
-    /// test thread's stack, which is no larger than the runtime's.
+    /// The deepest nesting admission lets through is lowered, printed and parsed again from a
+    /// caller with a small stack, whatever the optimization level.
     #[test_case(|n| format!("const a = {}1{};", "(".repeat(n), ")".repeat(n)) ; "parentheses")]
     #[test_case(|n| format!("const a = {}1{};", "[".repeat(n), "]".repeat(n)) ; "arrays")]
     #[test_case(|n| format!("const a = {}1{};", "{a: ".repeat(n), "}".repeat(n)) ; "objects")]
