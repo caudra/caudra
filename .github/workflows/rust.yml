@@ -10,9 +10,9 @@ on:
         required: false
         type: string
   push:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,6 +43,10 @@ jobs:
         run: python3 scripts/ci-runners.py >> "$GITHUB_OUTPUT"
         env:
           CAUDRA_RUNNER_PROFILE: ${{ inputs.runner-profile || vars.CAUDRA_RUNNER_PROFILE || 'github' }}
+      - run: python3 scripts/persisted-formats.py lint
+      - name: Keep persisted formats on a release branch
+        if: startsWith(github.base_ref || github.ref_name, 'release/')
+        run: python3 scripts/persisted-formats.py check
       - uses: dorny/paths-filter@v4
         if: inputs.source-sha == ''
         id: filter

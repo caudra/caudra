@@ -1,0 +1,289 @@
+# Every integer `const` whose name holds VERSION or FORMAT, outside tests and
+# vendor/, is listed here. `make formats-lint` fails on one that is missing.
+#
+# Tracked consts version something Caudra persists or exchanges with another
+# running Caudra. A patch release must keep each value of its `vX.Y.0` tag
+# (`make formats-check`). `name` is the stable key the check compares by, so a
+# const can move without counting as a change. `kind` is one of database,
+# config, record, journal, or protocol.
+#
+# Exempt consts carry the reason they cannot break a rollback within a minor.
+
+[[tracked]]
+name = "session-database"
+path = "caudra-storage/src/sessions/database.rs"
+const = "SCHEMA_VERSION"
+kind = "database"
+
+[[tracked]]
+name = "remote-operation-journal"
+path = "caudra-storage/src/remote_operation_journal.rs"
+const = "SCHEMA_VERSION"
+kind = "journal"
+
+[[tracked]]
+name = "history-search-index"
+path = "caudra-storage/src/history_search.rs"
+const = "INDEX_VERSION"
+kind = "database"
+
+[[tracked]]
+name = "session-file"
+path = "caudra-storage/src/sessions.rs"
+const = "SESSION_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "session-log"
+path = "caudra-storage/src/sessions.rs"
+const = "LOG_FORMAT_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "account-credentials"
+path = "caudra-storage/src/accounts/credentials.rs"
+const = "RECORD_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workcell-credential"
+path = "caudra-storage/src/auth.rs"
+const = "WORKCELL_CREDENTIAL_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "sandbox-credential"
+path = "caudra-storage/src/sandbox_auth.rs"
+const = "CREDENTIAL_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "permission-patterns"
+path = "caudra-storage/src/permission_patterns.rs"
+const = "PATTERN_SCHEMA_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "permission-observation"
+path = "caudra-agent/src/permissions/pattern_recognition/observation.rs"
+const = "OBSERVATION_SCHEMA_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "bash-analysis"
+path = "workcell/crates/mcp-shell/src/bash.rs"
+const = "BASH_ANALYSIS_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "shell-run-host"
+path = "caudra-storage/src/shell_runs/host.rs"
+const = "HOST_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "shell-run-reading"
+path = "caudra-storage/src/shell_runs/reading.rs"
+const = "READING_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workspace-binding"
+path = "caudra-storage/src/workspace_binding.rs"
+const = "BINDING_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workspace-authority-identity"
+path = "caudra-workspace/src/identity.rs"
+const = "AUTHORITY_IDENTITY_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "sandbox-store"
+path = "caudra-sandbox/src/store.rs"
+const = "STORE_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "snapshot-store-meta"
+path = "workcell/crates/snapshot-store/src/meta.rs"
+const = "META_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "pstack-stored-roles"
+path = "caudra-pstack/src/roles.rs"
+const = "STORED_ROLES_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workspace-transfer-journal"
+path = "caudra-agent/src/workspace_transfer/journal.rs"
+const = "JOURNAL_VERSION"
+kind = "journal"
+
+[[tracked]]
+name = "workspace-transfer-file-journal"
+path = "caudra-agent/src/workspace_transfer/journal.rs"
+const = "FILE_JOURNAL_VERSION"
+kind = "journal"
+
+[[tracked]]
+name = "workcell-directory-journal"
+path = "caudra-workcell/src/transfer/directory.rs"
+const = "DIRECTORY_JOURNAL_VERSION"
+kind = "journal"
+
+[[tracked]]
+name = "config"
+path = "caudra-config/src/config_file.rs"
+const = "CONFIG_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "permissions-config"
+path = "caudra-config/src/lib.rs"
+const = "PERMISSIONS_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "mcp-config"
+path = "caudra-config/src/mcp.rs"
+const = "MCP_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "providers-config"
+path = "caudra-config/src/providers.rs"
+const = "PROVIDERS_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "sandbox-config"
+path = "caudra-config/src/sandbox.rs"
+const = "SANDBOX_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "workcell-profile-config"
+path = "caudra-config/src/workcell.rs"
+const = "WORKCELL_PROFILE_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "plugin-permissions-manifest"
+path = "caudra-lua/src/plugin_permissions.rs"
+const = "MANIFEST_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "shell-permission-policy"
+path = "workcell/crates/mcp-shell/src/permission.rs"
+const = "POLICY_VERSION"
+kind = "config"
+
+[[tracked]]
+name = "automation-language"
+path = "caudra-automation/src/catalog.rs"
+const = "AUTOMATION_LANGUAGE_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "automation-abi"
+path = "caudra-automation/src/catalog.rs"
+const = "AUTOMATION_ABI_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workflow-language"
+path = "caudra-workflow/src/snapshot.rs"
+const = "WORKFLOW_LANGUAGE_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "workflow-abi"
+path = "caudra-workflow/src/snapshot.rs"
+const = "WORKFLOW_ABI_VERSION"
+kind = "record"
+
+[[tracked]]
+name = "peer-protocol"
+path = "caudra-agent/src/peers.rs"
+const = "PROTOCOL_VERSION"
+kind = "protocol"
+
+[[exempt]]
+path = "caudra-providers/src/providers/catalog.rs"
+const = "CATALOG_CACHE_VERSION"
+reason = "Model catalog cache, refetched when the version differs"
+
+[[exempt]]
+path = "caudra-config/src/config_version.rs"
+const = "FIRST_VERSION"
+reason = "The first version of every config format, never changes"
+
+[[exempt]]
+path = "caudra-agent/src/mcp/protocol.rs"
+const = "UNSUPPORTED_PROTOCOL_VERSION"
+reason = "JSON-RPC error code"
+
+[[exempt]]
+path = "caudra-agent/src/tools/native/image_generate.rs"
+const = "MAX_VERSION"
+reason = "Limit on generated image file name suffixes"
+
+[[exempt]]
+path = "caudra-acp/src/e2e.rs"
+const = "PROTOCOL_VERSION"
+reason = "Test harness, compiled only under cfg(test)"
+
+[[exempt]]
+path = "caudra-otel/src/encode/otlp.rs"
+const = "SCOPE_FIELD_VERSION"
+reason = "OTLP protobuf field number"
+
+[[exempt]]
+path = "caudra-pstack/src/scripts/orch/compat.rs"
+const = "UUID_VERSION_MASK"
+reason = "UUID bit mask"
+
+[[exempt]]
+path = "caudra-pstack/src/scripts/orch/compat.rs"
+const = "UUID_VERSION_BITS"
+reason = "UUID bit pattern"
+
+[[exempt]]
+path = "caudra-pstack/src/scripts/watch_pr/types.rs"
+const = "SCHEMA_VERSION"
+reason = "watch-pr output stream read by the running agent, never stored"
+
+[[exempt]]
+path = "caudra-storage/src/id.rs"
+const = "UUID_VERSION_BYTE"
+reason = "UUID byte offset"
+
+[[exempt]]
+path = "caudra-storage/src/id.rs"
+const = "UUID_VERSION_SHIFT"
+reason = "UUID bit shift"
+
+[[exempt]]
+path = "caudra-storage/src/tool_outputs/text.rs"
+const = "GREP_FORMAT_RESERVE_BYTES"
+reason = "Output size limit"
+
+[[exempt]]
+path = "caudra-ui/src/color_compat.rs"
+const = "VTE_TRUECOLOR_VERSION"
+reason = "Terminal version threshold"
+
+[[exempt]]
+path = "src/cmd/permissions/discover.rs"
+const = "REPORT_VERSION"
+reason = "CLI report printed to stdout, never read back"
+
+[[exempt]]
+path = "workcell/crates/workspace-scm/src/lib.rs"
+const = "MAX_GIT_VERSION_BYTES"
+reason = "Output size limit"

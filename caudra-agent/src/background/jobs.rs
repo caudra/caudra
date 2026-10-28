@@ -17,7 +17,6 @@ use caudra_storage::{
     now_epoch,
     sessions::{RuntimeRetry, SessionDatabase},
     tool_ledger::ToolOutcome,
-    tool_outputs::ToolOutputStore,
 };
 use futures_lite::{FutureExt, future};
 use serde_json::{Value, json};
@@ -26,7 +25,7 @@ use tracing::warn;
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
     MAX_RESULT_BYTES, RUNNING_STATE, STALE_INVOCATION, State, TASK_DURATION_FIELD, TRANSITION,
-    TaskHistoryPage, bounded, deliverable,
+    TaskHistoryPage, Terminal, TerminalOutput, bounded, deliverable,
     shells::{ShellExecutions, ShellLive},
     wait_nudge::{self, WaitNudge},
 };
@@ -732,7 +731,7 @@ impl JobScope {
                     scope.tasks.lock().cancels.remove(&driver_id);
                     drop(gate);
                     let error = match execute_job(execute, cancel, provenance).await {
-                        Ok(_) => error,
+                        Ok(_) => error.into(),
                         Err(cleanup) => {
                             scope.tasks.lock().failure = Some(cleanup.clone());
                             format!("{error}; {cleanup}")
@@ -819,6 +818,17 @@ impl JobScope {
             nudges.await;
         }
         let done = done?;
+        self.stage_terminal(invocation, &cancel, done).await?;
+        self.tasks.settle(invocation).await
+    }
+
+    /// Builds the job's terminal record and stages it for [`BackgroundTasks::settle`].
+    async fn stage_terminal(
+        &self,
+        invocation: &str,
+        cancel: &CancelToken,
+        done: ToolDoneEvent,
+    ) -> Result<(), String> {
         let _gate = self.tasks.0.gate.lock().await;
         let mut record = self.tasks.record(invocation)?;
         record.state = shell_job_state(cancel.is_cancelled(), &done).into();
@@ -826,42 +836,22 @@ impl JobScope {
             event.suppressed |= event.wait_nudge && !event.accepted;
         }
         let terminal = done.composed_model_output();
-        let reference = match done.output_ref {
-            Some(reference) => reference,
-            None => {
-                let dir = self.tasks.0.dir.clone();
-                let session = self.tasks.session_id();
-                let retained = terminal.clone();
-                let label = match &record.payload {
+        let output = match &done.output_ref {
+            Some(reference) => {
+                record.output_ref = Some(reference.clone());
+                None
+            }
+            None => Some(TerminalOutput {
+                text: terminal.clone(),
+                label: match &record.payload {
                     JobPayload::Shell(metadata) => {
                         format!("output-{}", shell_output_label(&metadata.command))
                     }
                     JobPayload::Question(_) => QUESTION_OUTPUT_LABEL.into(),
                     JobPayload::Agent => "output-shell".into(),
-                };
-                #[cfg(test)]
-                let save_checked = self.tasks.lock().save_checked.clone();
-                smol::unblock(move || {
-                    let waiting = || {
-                        #[cfg(test)]
-                        if let Some(checked) = &save_checked {
-                            let _ = checked.send(());
-                        }
-                        false
-                    };
-                    ToolOutputStore::new(dir)
-                        .put_named_within(
-                            session,
-                            &retained,
-                            &label,
-                            &RuntimeRetry::new(None, &waiting),
-                        )
-                        .map_err(|error| error.to_string())
-                })
-                .await?
-            }
+                },
+            }),
         };
-        record.output_ref = Some(reference);
         let output_field = match record.kind() {
             JobKind::Question => QUESTION_OUTCOME_FIELD,
             JobKind::Agent | JobKind::Shell => SHELL_OUTCOME_FIELD,
@@ -884,7 +874,13 @@ impl JobScope {
             suppressed,
             wait_nudge: false,
         });
-        self.tasks.persist(record).await
+        self.tasks.stage_terminal(Terminal {
+            record,
+            transcript: TranscriptWrite::Keep,
+            output,
+            busy: 0,
+        });
+        Ok(())
     }
 
     /// Asks the owner every interval the shell runs whether it is still

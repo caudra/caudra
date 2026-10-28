@@ -32,6 +32,8 @@ const INVALID_JOB_EVENT: &str =
 const RUNTIME_IDENTITY_LOOKUP: &str = "identity lookup";
 const RUNTIME_BACKGROUND_SAVE: &str = "background record save";
 const RUNTIME_BACKGROUND_ARCHIVE: &str = "background archive";
+const RUNTIME_BACKGROUND_UNARCHIVE: &str = "background unarchive";
+const RUNTIME_INTERRUPTED_LOOKUP: &str = "interrupted task lookup";
 const RUNTIME_RECEIPT_LOOKUP: &str = "receipt lookup";
 pub(crate) const TABLES: &str = r#"
 CREATE TABLE background_tasks (
@@ -103,7 +105,7 @@ pub enum BackgroundLookup<'a> {
 pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(byte_count) FROM background_transcripts WHERE session_id = sessions.id), 0)";
 
 /// What a record's save does to its transcript.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TranscriptWrite {
     Keep,
     /// Replaces it with this JSON array of messages.
@@ -337,6 +339,46 @@ impl SessionDatabase {
         retry: &RuntimeRetry<'_>,
     ) -> Result<(), SessionError> {
         self.save_background_task_inner(session, record, transcript, Some(retry))
+    }
+
+    /// Interrupted records whose outcome holds an error, archived or not,
+    /// newest first, so a restore can recheck why each one ended.
+    pub fn interrupted_background_tasks_runtime(
+        &self,
+        session: CaudraId,
+        limit: usize,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<Vec<TaskRecord>, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run(RUNTIME_INTERRUPTED_LOOKUP, || {
+            let mut statement = self.connection().prepare(
+                "SELECT payload FROM background_tasks WHERE session_id = ?1 AND json_extract(payload, '$.state') = 'interrupted' AND json_type(payload, '$.outcome.error') = 'text' ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![session.as_bytes().as_slice(), limit as i64],
+                    |row| row.get::<_, String>(0),
+                )?
+                .map(|row| Self::decode_background_task(&row?))
+                .collect()
+        })
+    }
+
+    /// Returns an archived invocation to the resident set unchanged, so a
+    /// save can settle it again. Returns whether it was archived.
+    pub fn unarchive_background_task_runtime(
+        &self,
+        session: CaudraId,
+        invocation_id: &str,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<bool, SessionError> {
+        self.runtime_transaction(retry, RUNTIME_BACKGROUND_UNARCHIVE, Some(session), |transaction| {
+            let changed = transaction.execute(
+                "UPDATE background_tasks SET archived = 0 WHERE session_id = ?1 AND invocation_id = ?2 AND archived = 1",
+                params![session.as_bytes().as_slice(), invocation_id],
+            )?;
+            Ok(changed == 1)
+        })
     }
 
     pub fn background_transcript_runtime(
@@ -600,7 +642,7 @@ impl SessionDatabase {
             return Ok(false);
         }
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
-        self.runtime_transaction(retry, RUNTIME_BACKGROUND_ARCHIVE, |transaction| {
+        self.runtime_transaction(retry, RUNTIME_BACKGROUND_ARCHIVE, Some(session), |transaction| {
             let changed = transaction.execute(
                 "UPDATE background_tasks SET archived = 1 WHERE session_id = ?1 AND invocation_id = ?2 AND payload = ?3",
                 params![session.as_bytes().as_slice(), record.invocation_id, payload],
@@ -689,7 +731,7 @@ impl SessionDatabase {
             Ok(())
         };
         if let Some(retry) = retry {
-            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, write)
+            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, Some(session), write)
         } else {
             let transaction =
                 Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;

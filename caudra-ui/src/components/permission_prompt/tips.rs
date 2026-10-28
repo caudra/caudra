@@ -17,7 +17,7 @@ use super::step_through::{PageItem, REMEMBER_AS_LISTED, REVIEW_CHOICES, ReviewCh
 use super::view::row_command;
 use super::{Panel, PermissionPrompt, PromptState, PromptTarget};
 use crate::components::counted;
-use crate::components::input::CLICK_OR_PRESS;
+use crate::components::input::{CLICK_OR_PRESS, PRESS};
 use crate::components::permission_scope::view::ScopeView;
 use crate::components::tooltip::{self, Tip, TipArea, TipKey};
 
@@ -44,7 +44,6 @@ pub(super) const COLLAPSED: &str =
 const BATCH_NEW: &str = "an answer; the others are already allowed or always ask.";
 const MORE_REQUEST: &str = "more request";
 const COMMAND: &str = "command";
-const PRESS: &str = "Press ";
 const VISITED: &str = "Visited.";
 const TAB_CLICK: &str = "Click to open its page. Tab and Shift-Tab move between pages.";
 const REVIEW_TAB: &str =

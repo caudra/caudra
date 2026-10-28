@@ -1308,6 +1308,7 @@ mod background_runtime {
     use std::io;
     use std::path::Path;
     use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use arc_swap::ArcSwap;
@@ -1331,7 +1332,7 @@ mod background_runtime {
     };
     use caudra_storage::StorageError;
     use caudra_storage::id::{CaudraId, SessionRef};
-    use caudra_storage::sessions::{PermissionMode, SessionError};
+    use caudra_storage::sessions::{PermissionMode, SessionDatabase, SessionError};
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
     };
@@ -1348,6 +1349,7 @@ mod background_runtime {
     use crate::agent::shared_queue::QueueItem;
     use crate::agent::{AgentHandles, ModelSlot, QueuedMessage, reserve_background_transition};
     use crate::app::SubmitOutcome;
+    use crate::app::background_delivery::DeliveryFailure;
     use crate::app::tasks::TaskActivity;
     use crate::chat::Chat;
     use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
@@ -1363,6 +1365,8 @@ mod background_runtime {
     const TASK: &str = "background-audit";
     const LOCKED_SAVE: &str = "database is locked";
     const RETRY_SITE: &str = "test";
+    const HELD_WRITER_SCOPE: &str = "background-delivery-test";
+    const HELD_WRITER_KEY: &str = "held-writer";
     const SUCCEEDED: &str = "succeeded";
     const REPORT_CALL: &str = "audit-report";
     const REPORT: &str = "The audit found a missing input validation check.";
@@ -2869,10 +2873,23 @@ mod background_runtime {
                 ))));
             let now = Instant::now();
             assert!(
-                !fixture
+                fixture
                     .app
                     .persist_or_retry_background_delivery(final_save, RETRY_SITE, now)
             );
+            let reply = fixture
+                .app
+                .background_delivery
+                .replies
+                .recv_async()
+                .await
+                .unwrap();
+            let failure = fixture.app.apply_delivery_reply(reply).unwrap_err();
+            assert!(
+                matches!(&failure, DeliveryFailure::Save(error) if error.contains(LOCKED_SAVE))
+            );
+            assert_eq!(fixture.app.background_saved_revision, None);
+            fixture.app.delivery_failed(RETRY_SITE, failure, now);
             assert!(!fixture.app.automatic_wakes_suppressed);
             assert_eq!(background.generation(), generation);
             assert!(background.workflow_admission().await.is_ok());
@@ -2882,7 +2899,7 @@ mod background_runtime {
                     .app
                     .persist_or_retry_background_delivery(final_save, RETRY_SITE, now)
             );
-            assert_eq!(fixture.app.background_delivery.jobs_started(), started);
+            assert_eq!(fixture.app.background_delivery.jobs_started(), started + 1);
             let retry_at = fixture.app.background_delivery.retry_at().unwrap();
             assert!(
                 fixture
@@ -2901,6 +2918,62 @@ mod background_runtime {
             }
             assert_eq!(fixture.app.background_delivery.retry_at(), None);
             assert_eq!(background.generation(), generation);
+            assert_eq!(
+                fixture.app.background_saved_revision,
+                Some(fixture.app.state.session.content_revision())
+            );
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "checkpoint")]
+    #[test_case(true; "queue_drained")]
+    fn a_held_writer_does_not_block_background_delivery(final_save: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            fixture.app.background_delivery.invalidate();
+            fixture.app.background_saved_revision = None;
+            let (locked_tx, locked_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let dir = fixture.app.storage.clone();
+            let writer = thread::spawn(move || {
+                SessionDatabase::open_state(&dir)
+                    .unwrap()
+                    .state_update(HELD_WRITER_SCOPE, HELD_WRITER_KEY, |held: &mut bool| {
+                        *held = true;
+                        locked_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+            });
+            locked_rx.recv_async().await.unwrap();
+            fixture.app.persist_background_delivery(final_save).unwrap();
+            assert!(fixture.app.background_delivery.pending());
+            assert!(
+                poll_once(fixture.app.background_delivery.replies.recv_async())
+                    .await
+                    .is_none()
+            );
+            assert_eq!(fixture.app.background_saved_revision, None);
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            while fixture.app.background_delivery.pending() {
+                let reply = fixture
+                    .app
+                    .background_delivery
+                    .replies
+                    .recv_async()
+                    .await
+                    .unwrap();
+                fixture.app.apply_delivery_reply(reply).unwrap();
+            }
+            assert_eq!(
+                fixture.app.background_saved_revision,
+                Some(fixture.app.state.session.content_revision())
+            );
             fixture.close().await;
         }));
     }
@@ -6284,9 +6357,9 @@ fn restart_keeps_the_recorded_spend(turns: &[Spent], on_bar: &str, in_usage: &st
 }
 
 /// The sigma the status bar draws once subagents split the bill is the session
-/// total itself, so it cannot drift from what `/usage` sums. The session total
-/// is the first thing a narrow bar sheds, so this asks for a bar wide enough to
-/// still be carrying it.
+/// total itself, so it cannot drift from what `/usage` sums. A narrow bar
+/// sheds its spend slot, so this asks for a bar wide enough to still be
+/// carrying it.
 #[test]
 fn status_bar_sigma_draws_the_session_cost() {
     let mut app = app_with_subagent();
@@ -31148,6 +31221,9 @@ mod goal_log {
     fn enter_on_a_check_that_drew_no_row_keeps_the_log_up() {
         let mut app = test_app();
         app.state.goal.set(GOAL_CONDITION).unwrap();
+        // Saves the session row first, as production does, or the writer may
+        // drop the check below for referencing a session it has not written.
+        app.flush_goal_log();
         record(
             &app,
             check(

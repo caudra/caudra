@@ -3074,6 +3074,9 @@ impl<'t> EventLoop<'t> {
         dirty |= self.sync_peers();
         dirty |= self.sync_peer_work();
         dirty |= self.start_mailbox_runs();
+        for runtime in &mut self.sessions {
+            dirty |= Dirty::from(runtime.app.observe_terminal_saves());
+        }
         dirty |= self.start_peer_runs();
         for runtime in &self.sessions {
             let ready = runtime.app.status == Status::Idle

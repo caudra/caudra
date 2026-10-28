@@ -192,7 +192,7 @@ nix flake check   # includes the Git dependency hash check
 
 ## Releases
 
-The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each preview gets a new numeric suffix. Release candidates may use `-rc.1` before the final `0.2.0`. Published tags and binaries are never replaced. During the `0.x` line, patches preserve compatibility and breaking changes require a minor bump with migration notes.
+The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each preview gets a new numeric suffix. Release candidates may use `-rc.1` before the final `0.2.0`. Published tags and binaries are never replaced. Versions follow the rules in [Versions and persisted formats](#versions-and-persisted-formats).
 
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
@@ -211,6 +211,21 @@ The website deploys separately. Verified development commits propose a `docs-sou
 After the complete release workflow succeeds, the source automation dispatches the published release identity to the website repository. The website independently verifies the release, successful source run, and exact tag commit before building production inputs. Production uses that release commit, not a newer development pin. Drafts, failed releases, moved tags, and stale automatic release requests cannot promote a preview to production. Self-updates use the installer attached to the selected GitHub Release.
 
 Configure `WEBSITE_APP_ID` and `WEBSITE_APP_PRIVATE_KEY` in the application repository. Install the App only on the website repository with Contents and Pull requests write permissions and Actions read permission. The latter lets the bot verify private website CI before merging. Deploy the website workflow changes before enabling the source automation changes so development pin updates cannot reach the old production-on-main path.
+
+### Versions and persisted formats
+
+Caudra follows SemVer, and the version tells users whether an update can be undone:
+
+- A **patch** (`X.Y.Z`) holds fixes only. It never changes a persisted format: the session database, config files, journals, credential and other stored records, or the protocol between running Caudra processes. Users can update and run `caudra rollback` freely within `X.Y`, and different patches can run side by side.
+- A **minor** (`X.Y.0`) holds features and may migrate data one way. Its notes carry the upgrade alert described in [Release notes](#release-notes).
+- A **major** release, after 1.0, means the user must act.
+- **Prereleases** of `X.Y.0` may migrate between each other. Returning from one to the last stable release means restoring a backup from `backups/`.
+
+`main` always works toward the next minor, as `X.Y.0-preview.N`. Patches come from `release/X.Y`, cut from the `vX.Y.0` tag. A fix lands on `main` first and is copied with `git cherry-pick -x`. After each patch tag, merge `release/X.Y` back into `main` so its release notes come along. On a `Cargo.toml` version conflict, keep the higher version from `main`.
+
+`scripts/persisted-formats.toml` lists every integer `const` whose name holds `VERSION` or `FORMAT`, outside tests and `vendor/`. Each one is either tracked as a persisted format or exempt with a reason. `make formats-lint`, also run by CI, fails on a const that is missing from the list. When you add one, track it if it versions anything Caudra writes to disk or sends to another Caudra process, and exempt it otherwise. `make formats-check` compares the tracked values with `vX.Y.0` and fails when a patch changes, adds or removes one. It runs on pushes and pull requests to `release/**` and when a release tag is validated, and it skips prereleases of `X.Y.0`.
+
+The check only sees version constants. A patch must also not write anything a `vX.Y.0` binary cannot read, such as a new serde field or enum variant that an older build rejects. Reviewers check this by hand.
 
 ### Release notes
 

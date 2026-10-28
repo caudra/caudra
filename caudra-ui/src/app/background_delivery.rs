@@ -18,6 +18,7 @@ use super::tasks::{
 };
 use super::workflow::{WorkflowDelivery, WorkflowDeliveryResult};
 use crate::components::{DisplayMessage, DisplayRole};
+use crate::storage_writer::SaveAcknowledgment;
 
 pub(crate) const STOP_FAILED_ERR: &str =
     "Session work did not stop cleanly; retry Stop before submitting more work";
@@ -30,6 +31,7 @@ pub(crate) const DELIVERY_RECOVERED_NOTICE: &str =
     "Saving background results recovered; automatic continuation resumes.";
 pub(crate) const DELIVERY_HALTED_NOTICE: &str = "Background tasks stopped";
 pub(crate) const DELIVERY_HALTED_RECOVERY: &str = "Restart Caudra to recover.";
+const SAVE_ACK_LOST: &str = "the session save ended without reporting its commit";
 
 /// Why background results did not reach the session. A failed stop leaves
 /// work whose state is unknown, so it stays fail-closed until the user acts;
@@ -124,6 +126,9 @@ pub(super) struct DeliveryJob {
     pub messages: Vec<Message>,
     pub background: Option<BackgroundTasks>,
     pub workflow: WorkflowDelivery,
+    /// The session save this delivery waits on, off the UI thread, before it
+    /// reconciles anything against the saved history.
+    pub saved: Option<SaveAcknowledgment>,
 }
 
 pub(crate) struct DeliveryReply {
@@ -131,6 +136,9 @@ pub(crate) struct DeliveryReply {
     stop: bool,
     key: DeliveryKey,
     messages: Vec<Message>,
+    /// Whether the session save the job waited on committed; `None` when it
+    /// waited on none.
+    saved: Option<bool>,
     result: Result<WorkflowDeliveryResult, String>,
 }
 
@@ -149,6 +157,9 @@ pub(crate) struct BackgroundDelivery {
     retry: Option<DeliveryRetry>,
     /// The background generation whose halt was already reported.
     halted_generation: Option<u64>,
+    /// Whether a settled task's result save was last seen finding the
+    /// database busy, so the notice shows once per episode.
+    terminal_saves_busy: bool,
 }
 
 impl Default for BackgroundDelivery {
@@ -168,6 +179,7 @@ impl Default for BackgroundDelivery {
             rearm_after_stop: false,
             retry: None,
             halted_generation: None,
+            terminal_saves_busy: false,
         }
     }
 }
@@ -250,14 +262,25 @@ impl BackgroundDelivery {
         }
     }
 
-    fn start(&mut self, job: DeliveryJob) {
+    fn start(&mut self, mut job: DeliveryJob) {
         self.sequence += 1;
         let id = self.sequence;
         self.running = Some((id, job.key.clone()));
         let fence = Arc::clone(&self.fence);
         let sender = self.sender.clone();
+        let acknowledgment = job.saved.take();
         self.task = Some(smol::spawn(async move {
+            let mut saved = None;
             let result = async {
+                if let Some(acknowledgment) = acknowledgment {
+                    let committed = acknowledgment
+                        .recv_async()
+                        .await
+                        .map_err(|_| SAVE_ACK_LOST.to_owned())
+                        .and_then(|committed| committed.map_err(|error| error.to_string()));
+                    saved = Some(committed.is_ok());
+                    committed?;
+                }
                 let _parent = if job.key.final_save {
                     Some(fence.parent.lock().await)
                 } else {
@@ -285,6 +308,7 @@ impl BackgroundDelivery {
                 stop: false,
                 key: job.key,
                 messages: job.messages,
+                saved,
                 result,
             });
         }));
@@ -334,6 +358,7 @@ impl BackgroundDelivery {
                 stop: true,
                 key,
                 messages: Vec::new(),
+                saved: None,
                 result: result.map(|()| WorkflowDeliveryResult::default()),
             });
         }));
@@ -403,6 +428,12 @@ impl App {
             .background
             .as_ref()
             .filter(|_| reply.key.session == self.state.session.id);
+        if reply.saved == Some(true) && reply.key.session == self.state.session.id {
+            self.background_saved_revision = Some(
+                self.background_saved_revision
+                    .map_or(reply.key.revision, |saved| saved.max(reply.key.revision)),
+            );
+        }
         if !self.background_delivery.finish(&reply, background) {
             return Ok(());
         }
@@ -429,6 +460,9 @@ impl App {
         let result = match reply.result {
             Ok(result) => result,
             Err(error) if reply.key.revision == current_revision => {
+                if reply.saved == Some(false) && reply.key.final_save {
+                    self.release_background_claims();
+                }
                 return Err(DeliveryFailure::Save(error));
             }
             Err(_) => return Ok(()),
@@ -539,6 +573,28 @@ impl App {
             DisplayRole::Notice,
             format!("{DELIVERY_HALTED_NOTICE}: {error}. {DELIVERY_HALTED_RECOVERY}"),
         ));
+    }
+
+    /// Reports once that a settled task's result keeps finding the database
+    /// busy, and once more when its save goes through. Returns whether a
+    /// notice was shown.
+    pub(crate) fn observe_terminal_saves(&mut self) -> bool {
+        let busy = self
+            .background
+            .as_ref()
+            .is_some_and(|background| background.pending_terminal_saves() > 0);
+        if busy == self.background_delivery.terminal_saves_busy {
+            return false;
+        }
+        self.background_delivery.terminal_saves_busy = busy;
+        let notice = if busy {
+            DELIVERY_RETRY_NOTICE
+        } else {
+            DELIVERY_RECOVERED_NOTICE
+        };
+        self.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Notice, notice.into()));
+        true
     }
 
     pub(super) fn delivery_recovered(&mut self) {
@@ -666,6 +722,7 @@ mod tests {
                 stop: true,
                 key: failed.key.clone(),
                 messages: Vec::new(),
+                saved: None,
                 result: Ok(WorkflowDeliveryResult::default()),
             };
             failed.result = Err(STOP_ERROR.into());
@@ -1059,6 +1116,7 @@ mod tests {
             stop: false,
             key,
             messages: Vec::new(),
+            saved: None,
             result: Err(SAVE_ERROR.into()),
         };
         assert_eq!(

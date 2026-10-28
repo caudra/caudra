@@ -19,7 +19,7 @@
 
 use std::array;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, c_int};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
@@ -49,6 +49,7 @@ use rusqlite::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tracing::{field, warn};
 
@@ -61,7 +62,7 @@ use super::change_stores::{ChangeStores, registered_change_stores, release_every
 use super::lease::{SessionLease, held_sessions};
 use super::progress::{CHECKPOINT_PHASE, MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
-    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionListing,
+    ProjectUsageRelocation, RewriteStamps, SESSION_VERSION, Session, SessionError, SessionListing,
     SessionLocation, SessionMeta, SessionRelocation, SessionRelocationResult, SessionSummary,
     StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage,
     StoredToolUsage, next_epoch,
@@ -105,9 +106,11 @@ const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// A write that waited for, or held, the lock this long is logged with its
 /// pid, so a shared log names who kept other processes' saves waiting.
-const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
+pub const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 const SAVE_FULL_OPERATION: &str = "session full save";
 const SAVE_DELTA_OPERATION: &str = "session delta save";
+const SAVE_TARGETED_OPERATION: &str = "session targeted save";
+const DELETED_BYTES_FIELD: &str = "deleted byte_count";
 const RECREATE_OPERATION: &str = "session recreate";
 const RUNTIME_CONTENTION_BUDGET: Duration = Duration::from_secs(30);
 const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
@@ -161,6 +164,9 @@ const WAL_JOURNAL_MODE: &str = "wal";
 const UNKNOWN_WAL_FRAMES: i64 = -1;
 /// Rows one decode worker must have before a second one is worth starting.
 const PARALLEL_DECODE_MIN_ROWS: usize = 256;
+const HISTORY_KIND: &str = "history item";
+const SUBAGENT_HISTORY_KIND: &str = "subagent history item";
+const TOOL_OUTPUT_KIND: &str = "tool output";
 const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
 const OWNER_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
@@ -1388,6 +1394,27 @@ pub struct SessionCursor {
     logical_bytes: usize,
     root_bytes: usize,
     task_spec_bytes: usize,
+    digests: RowDigests,
+}
+
+type RowDigest = [u8; 32];
+
+/// What a save replaces in place rather than appends since its cursor, read
+/// from the session's rewrite stamps. Empty for a plain delta. The tool
+/// outputs and streams are stored ones whose rows go, replaced or removed.
+struct RewriteTargets {
+    history: bool,
+    tool_outputs: HashSet<String>,
+    streams: HashSet<String>,
+}
+
+/// What the rows a delta save would otherwise rewrite whole held when last
+/// written, so an unchanged stream spec or auxiliary table is not rewritten
+/// under the write lock. `None` auxiliary means unknown and always writes.
+#[derive(Debug, Clone, PartialEq)]
+struct RowDigests {
+    task_specs: HashMap<String, Option<RowDigest>>,
+    auxiliary: Option<RowDigest>,
 }
 
 #[derive(Debug)]
@@ -1516,11 +1543,26 @@ struct SerializedRoot {
 
 struct SerializedSession {
     root: SerializedRoot,
-    messages: Vec<String>,
-    tool_outputs: Vec<(String, String)>,
-    subagent_messages: Vec<(String, Vec<String>)>,
+    messages: Vec<PreparedHistory>,
+    tool_outputs: Vec<(String, PreparedPayload)>,
+    subagent_messages: Vec<(String, Vec<PreparedPayload>)>,
     task_specs: HashMap<String, String>,
     logical_bytes: usize,
+}
+
+/// A child row compressed before `BEGIN IMMEDIATE`, so the write lock covers
+/// only binding. `bytes` is the uncompressed length `byte_count` stores.
+struct PreparedPayload {
+    stored: Vec<u8>,
+    bytes: usize,
+}
+
+/// A main history row with the receipts it implies, read before the
+/// transaction. Receipt validation that needs the database stays inside it.
+struct PreparedHistory {
+    payload: PreparedPayload,
+    workflow_receipt: Option<(String, i64)>,
+    task_event: Option<Value>,
 }
 
 /// A synced pre-commit recovery export. The pending name is versioned and
@@ -1558,44 +1600,103 @@ struct RootRow {
     workspace_cursor_label: Option<String>,
 }
 
-/// How long a write waited for `BEGIN IMMEDIATE` and then held the lock,
-/// logged on drop when either reaches [`SLOW_WRITE_THRESHOLD`].
+/// Where one write spent its time, logged on drop when any phase reaches
+/// [`SLOW_WRITE_THRESHOLD`]: preparing rows before `BEGIN IMMEDIATE`, waiting
+/// for it, running statements, then `COMMIT`. `hold` is statements plus
+/// commit, the time inside the transaction. SQLite runs an automatic
+/// checkpoint after the writer lock is released but before `COMMIT`
+/// returns, so `hold` bounds lock ownership from above rather than proving it.
 pub(crate) struct WriteTiming {
     operation: &'static str,
     session_id: Option<CaudraId>,
+    prepared: Instant,
     started: Instant,
     acquired: Option<Instant>,
+    committing: Option<Instant>,
+    rows: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WritePhases {
+    prepare: Duration,
+    wait: Duration,
+    statements: Duration,
+    commit: Duration,
+}
+
+impl WritePhases {
+    fn hold(&self) -> Duration {
+        self.statements + self.commit
+    }
+
+    fn slowest(&self) -> Duration {
+        self.prepare.max(self.wait).max(self.hold())
+    }
 }
 
 impl WriteTiming {
     pub(crate) fn start(operation: &'static str, session_id: Option<CaudraId>) -> Self {
+        let now = Instant::now();
         Self {
             operation,
             session_id,
-            started: Instant::now(),
+            prepared: now,
+            started: now,
             acquired: None,
+            committing: None,
+            rows: 0,
+            bytes: 0,
         }
+    }
+
+    /// Ends preparation: everything since [`Self::start`] ran before `BEGIN`.
+    pub(crate) fn begin(&mut self) {
+        self.started = Instant::now();
     }
 
     pub(crate) fn acquired(&mut self) {
         self.acquired = Some(Instant::now());
+        self.committing = None;
+    }
+
+    pub(crate) fn committing(&mut self) {
+        self.committing = Some(Instant::now());
+    }
+
+    pub(crate) fn count(&mut self, rows: usize, bytes: usize) {
+        self.rows = rows;
+        self.bytes = bytes;
+    }
+
+    fn phases(&self, finished: Instant) -> WritePhases {
+        let acquired = self.acquired.unwrap_or(finished);
+        let committing = self.committing.unwrap_or(finished).max(acquired);
+        WritePhases {
+            prepare: self.started.duration_since(self.prepared),
+            wait: acquired.duration_since(self.started),
+            statements: committing.duration_since(acquired),
+            commit: finished.duration_since(committing),
+        }
     }
 }
 
 impl Drop for WriteTiming {
     fn drop(&mut self) {
-        let finished = Instant::now();
-        let acquired = self.acquired.unwrap_or(finished);
-        let wait = acquired.duration_since(self.started);
-        let hold = finished.duration_since(acquired);
-        if wait.max(hold) < SLOW_WRITE_THRESHOLD {
+        let phases = self.phases(Instant::now());
+        if phases.slowest() < SLOW_WRITE_THRESHOLD {
             return;
         }
         warn!(
             operation = self.operation,
             session_id = self.session_id.as_ref().map(field::display),
-            wait_ms = wait.as_millis(),
-            hold_ms = hold.as_millis(),
+            prepare_ms = phases.prepare.as_millis(),
+            wait_ms = phases.wait.as_millis(),
+            hold_ms = phases.hold().as_millis(),
+            statements_ms = phases.statements.as_millis(),
+            commit_ms = phases.commit.as_millis(),
+            rows = self.rows,
+            bytes = self.bytes,
             acquired = self.acquired.is_some(),
             pid = std::process::id(),
             "slow session database write"
@@ -1947,10 +2048,11 @@ impl SessionDatabase {
         &self,
         retry: &RuntimeRetry<'_>,
         operation: &'static str,
+        session_id: Option<CaudraId>,
         mut write: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
     ) -> Result<T, SessionError> {
         self.connection.busy_timeout(Duration::ZERO)?;
-        let mut timing = WriteTiming::start(operation, None);
+        let mut timing = WriteTiming::start(operation, session_id);
         retry.run(operation, || {
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -1958,6 +2060,7 @@ impl SessionDatabase {
             let result = (|| {
                 let value = write(&transaction)?;
                 retry.check(operation)?;
+                timing.committing();
                 transaction.commit()?;
                 Ok(value)
             })();
@@ -2945,7 +3048,7 @@ impl SessionDatabase {
             Ok(())
         };
         if let Some(retry) = retry {
-            return self.runtime_transaction(retry, RUNTIME_OWNER_CHECKPOINT, write);
+            return self.runtime_transaction(retry, RUNTIME_OWNER_CHECKPOINT, Some(session), write);
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -3220,25 +3323,12 @@ impl SessionDatabase {
                 });
             }
         }
-        // Epoch and rewrite counters classify append safety in memory; the
+        // Epoch and rewrite stamps classify append safety in memory; the
         // persisted version remains authoritative across processes.
         if let Some(cursor) = cursor
-            && cursor.session_id == session.id
-            && cursor.saved_epoch == session.epoch
-            && cursor.saved_rewrites == session.rewrites
-            && cursor.saved_history_count <= session.messages.len()
-            && cursor
-                .saved_tool_ids
-                .iter()
-                .all(|id| session.tool_outputs.contains_key(id))
-            && cursor.saved_subagent_counts.iter().all(|(id, &count)| {
-                session
-                    .subagent_messages
-                    .get(id)
-                    .is_some_and(|messages| count <= messages.len())
-            })
+            && let Some(targets) = RewriteTargets::since(session, cursor)
         {
-            return self.save_delta(session, cursor);
+            return self.save_changes(session, cursor, &targets);
         }
         self.save_full(session, cursor.map(SessionCursor::write_version))
     }
@@ -3260,13 +3350,15 @@ impl SessionDatabase {
             });
         }
         let deleted_write_version = recreation.deleted_write_version;
+        let mut timing = WriteTiming::start(RECREATE_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut serialized = SerializedSession::new(session)?;
+        timing.count(serialized.row_count(), serialized.logical_bytes);
         // Cleanup performs slow filesystem work outside SQLite. This lock
         // closes the gap between its tombstone check and deletion so a new
         // canonical generation cannot commit until old cleanup has finished.
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
-        let mut timing = WriteTiming::start(RECREATE_OPERATION, Some(session.id));
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3325,7 +3417,9 @@ impl SessionDatabase {
             "DELETE FROM cleanup_jobs WHERE session_id = ?1",
             params![session.id.as_bytes().as_slice()],
         )?;
+        timing.committing();
         transaction.commit()?;
+        drop(timing);
         session
             .base_write_version
             .store(write_version, Ordering::Release);
@@ -3338,6 +3432,7 @@ impl SessionDatabase {
             serialized.logical_bytes,
             serialized.root_bytes(),
             serialized.task_spec_bytes(),
+            RowDigests::new(session, &serialized.task_specs),
         ))
     }
 
@@ -4097,8 +4192,10 @@ impl SessionDatabase {
         U: Serialize,
         T: Serialize,
     {
+        let mut timing = WriteTiming::start(SAVE_FULL_OPERATION, Some(session.id));
         validate_scalars(session)?;
         let mut serialized = SerializedSession::new(session)?;
+        timing.count(serialized.row_count(), serialized.logical_bytes);
         let base_write_version = session.base_write_version.load(Ordering::Acquire);
         let expected = expected_write_version
             .or_else(|| (base_write_version >= 0).then_some(base_write_version));
@@ -4106,7 +4203,7 @@ impl SessionDatabase {
             .map(|expected| self.prepare_archive(session.id, session.messages.len(), expected))
             .transpose()?
             .flatten();
-        let mut timing = WriteTiming::start(SAVE_FULL_OPERATION, Some(session.id));
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4148,29 +4245,13 @@ impl SessionDatabase {
         };
         insert_children(&transaction, session, &serialized)?;
         if let Some(archive) = &archive {
-            transaction.execute(
-                "INSERT INTO pending_archives \
-                 (session_id, expected_write_version, pending_name, byte_count) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    archive.session_id.as_bytes().as_slice(),
-                    archive.expected_write_version,
-                    &archive.pending_name,
-                    to_i64(archive.bytes, "pending archive bytes")?
-                ],
-            )?;
+            register_archive(&transaction, archive)?;
         }
+        timing.committing();
         transaction.commit()?;
         drop(timing);
-        if let Some(mut archive) = archive {
-            archive.cleanup_on_drop = false;
-            if let Err(error) =
-                self.finalize_registered_archive(archive.session_id, &archive.pending_name)
-            {
-                warn!(%error, session_id = %session.id, "archive publication deferred to startup reconciliation");
-            } else if let Err(error) = self.reconcile_pending_archives() {
-                warn!(%error, session_id = %session.id, "later pending archives remain for reconciliation");
-            }
+        if let Some(archive) = archive {
+            self.publish_archive(archive);
         }
         session
             .base_write_version
@@ -4184,62 +4265,82 @@ impl SessionDatabase {
             serialized.logical_bytes,
             serialized.root_bytes(),
             serialized.task_spec_bytes(),
+            RowDigests::new(session, &serialized.task_specs),
         ))
     }
 
-    fn save_delta<M, U, T>(
+    /// Appends what is new since `cursor` and replaces only what `targets`
+    /// names, in one transaction under the same version check as a full save.
+    fn save_changes<M, U, T>(
         &mut self,
         session: &Session<M, U, T>,
         cursor: &SessionCursor,
+        targets: &RewriteTargets,
     ) -> Result<SessionCursor, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
     {
+        let operation = if targets.is_empty() {
+            SAVE_DELTA_OPERATION
+        } else {
+            SAVE_TARGETED_OPERATION
+        };
+        let mut timing = WriteTiming::start(operation, Some(session.id));
         validate_scalars(session)?;
         let mut root = SerializedRoot::new(session)?;
-        let messages = serialize_values(
-            &session.messages[cursor.saved_history_count..],
-            "history item",
-            MAX_PAYLOAD_BYTES,
-        )?;
-        let tool_outputs = session
-            .tool_outputs
-            .iter()
-            .filter(|(id, _)| !cursor.saved_tool_ids.contains(*id))
-            .map(|(id, output)| {
-                serialize_json(output.as_ref(), "tool output", MAX_PAYLOAD_BYTES)
-                    .map(|payload| (id.clone(), payload))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let history_start = if targets.history {
+            0
+        } else {
+            cursor.saved_history_count
+        };
+        let messages = prepare_history(&session.messages[history_start..])?;
+        let tool_outputs = prepare_tool_outputs(session.tool_outputs.iter().filter(|(id, _)| {
+            !cursor.saved_tool_ids.contains(*id) || targets.tool_outputs.contains(*id)
+        }))?;
         let mut subagent_messages = Vec::new();
+        let mut subagent_starts = HashMap::new();
         for (id, values) in &session.subagent_messages {
-            let saved = cursor.saved_subagent_counts.get(id).copied().unwrap_or(0);
-            let payloads =
-                serialize_values(&values[saved..], "subagent history item", MAX_PAYLOAD_BYTES)?;
-            subagent_messages.push((id.clone(), saved, payloads));
+            let saved = if targets.streams.contains(id) {
+                0
+            } else {
+                cursor.saved_subagent_counts.get(id).copied().unwrap_or(0)
+            };
+            let payloads = prepare_payloads(&values[saved..], SUBAGENT_HISTORY_KIND)?;
+            subagent_starts.insert(id.as_str(), saved);
+            subagent_messages.push((id.clone(), payloads));
         }
         let task_specs = serialize_task_specs(&session.subagent_task_specs)?;
-        let added_bytes = messages.iter().map(String::len).sum::<usize>()
-            + tool_outputs
-                .iter()
-                .map(|(_, payload)| payload.len())
-                .sum::<usize>()
-            + subagent_messages
-                .iter()
-                .flat_map(|(_, _, values)| values)
-                .map(String::len)
-                .sum::<usize>();
-        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
+        let digests = RowDigests::new(session, &task_specs);
+        let changed_streams = digests.changed_streams(&cursor.digests).collect::<Vec<_>>();
+        let auxiliary_changed = digests.auxiliary_changed(&cursor.digests);
+        let added_bytes = prepared_bytes(&messages, &tool_outputs, &subagent_messages);
+        timing.count(
+            prepared_rows(&messages, &tool_outputs, &subagent_messages),
+            added_bytes,
+        );
+        let archive = if targets.history {
+            self.prepare_archive(session.id, session.messages.len(), cursor.write_version)?
+        } else {
+            None
+        };
+        timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         timing.acquired();
         root.fence_permissions(&transaction, session.id)?;
+        let removed_bytes = if targets.is_empty() {
+            0
+        } else {
+            ensure_write_version(&transaction, session.id, cursor.write_version)?;
+            delete_targets(&transaction, session, targets)?
+        };
         let logical_bytes = cursor
             .logical_bytes
             .checked_sub(cursor.root_bytes + cursor.task_spec_bytes)
+            .and_then(|bytes| bytes.checked_sub(removed_bytes))
             .and_then(|bytes| bytes.checked_add(root.bytes()))
             .and_then(|bytes| bytes.checked_add(task_specs.values().map(String::len).sum()))
             .and_then(|bytes| bytes.checked_add(added_bytes))
@@ -4255,30 +4356,30 @@ impl SessionDatabase {
             cursor.write_version,
         )?;
         for (offset, payload) in messages.iter().enumerate() {
-            insert_history(
-                &transaction,
-                session.id,
-                cursor.saved_history_count + offset,
-                payload,
-            )?;
+            insert_history(&transaction, session.id, history_start + offset, payload)?;
         }
         for (id, payload) in &tool_outputs {
             insert_tool_output(&transaction, session.id, id, payload)?;
         }
-        upsert_streams(
-            &transaction,
-            session.id,
-            &session.subagent_messages,
-            &task_specs,
-        )?;
-        for (id, start, payloads) in &subagent_messages {
+        upsert_streams(&transaction, session.id, changed_streams, &task_specs)?;
+        for (id, payloads) in &subagent_messages {
+            let start = subagent_starts[id.as_str()];
             for (offset, payload) in payloads.iter().enumerate() {
                 insert_subagent_history(&transaction, session.id, id, start + offset, payload)?;
             }
         }
-        replace_auxiliary(&transaction, session)?;
+        if auxiliary_changed {
+            replace_auxiliary(&transaction, session)?;
+        }
+        if let Some(archive) = &archive {
+            register_archive(&transaction, archive)?;
+        }
+        timing.committing();
         transaction.commit()?;
         drop(timing);
+        if let Some(archive) = archive {
+            self.publish_archive(archive);
+        }
         let write_version = cursor.write_version + 1;
         session
             .base_write_version
@@ -4292,7 +4393,20 @@ impl SessionDatabase {
             logical_bytes,
             root.bytes(),
             task_specs.values().map(String::len).sum(),
+            digests,
         ))
+    }
+
+    /// The archive's row committed with the rewrite, so its pending file is
+    /// now the final export; a failure here leaves it to reconciliation.
+    fn publish_archive(&mut self, mut archive: PreparedArchive) {
+        archive.cleanup_on_drop = false;
+        let session_id = archive.session_id;
+        if let Err(error) = self.finalize_registered_archive(session_id, &archive.pending_name) {
+            warn!(%error, %session_id, "archive publication deferred to startup reconciliation");
+        } else if let Err(error) = self.reconcile_pending_archives() {
+            warn!(%error, %session_id, "later pending archives remain for reconciliation");
+        }
     }
 
     fn prepare_archive(
@@ -4783,7 +4897,7 @@ where
         .map(|(key, value)| (key, Arc::new(value)))
         .collect::<HashMap<_, _>>();
     let mut subagent_task_specs = HashMap::new();
-    let mut task_spec_bytes = 0usize;
+    let mut stored_task_specs = HashMap::new();
     let mut stream_ids = Vec::new();
     {
         let mut statement = connection.prepare(
@@ -4795,11 +4909,11 @@ where
             let subagent_id: String = row.get(0)?;
             let task_spec: Option<String> = row.get(1)?;
             if let Some(task_spec) = task_spec {
-                task_spec_bytes = task_spec_bytes.saturating_add(task_spec.len());
                 subagent_task_specs.insert(
                     subagent_id.clone(),
                     deserialize_json(&task_spec, "subagent task spec")?,
                 );
+                stored_task_specs.insert(subagent_id.clone(), task_spec);
             }
             stream_ids.push(subagent_id);
         }
@@ -4891,6 +5005,7 @@ where
         messages_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        rewritten: RewriteStamps::default(),
         base_write_version: AtomicI64::new(root.write_version),
         write_version,
         forked_outputs: None,
@@ -4900,7 +5015,8 @@ where
         root.write_version,
         root.logical_bytes,
         root.token_usage.len() + root.metadata.len() + root.workspace_binding.len(),
-        task_spec_bytes,
+        stored_task_specs.values().map(String::len).sum(),
+        RowDigests::new(&session, &stored_task_specs),
     );
     // The session no longer holds these, so the next save cannot be a delta:
     // the full rewrite it takes instead drops their rows and their count.
@@ -5036,6 +5152,7 @@ impl SessionCursor {
         logical_bytes: usize,
         root_bytes: usize,
         task_spec_bytes: usize,
+        digests: RowDigests,
     ) -> Self {
         Self {
             session_id: session.id,
@@ -5053,8 +5170,98 @@ impl SessionCursor {
             logical_bytes,
             root_bytes,
             task_spec_bytes,
+            digests,
         }
     }
+}
+
+impl RewriteTargets {
+    /// `None` when the stamps cannot be read against `cursor`: its clock is
+    /// another lineage's, or ahead of this session's. A full save follows.
+    fn since<M, U, T>(session: &Session<M, U, T>, cursor: &SessionCursor) -> Option<Self> {
+        let tick = cursor.saved_rewrites;
+        if session.rewrites != tick && (session.rewrites < tick || !cursor.shares_lineage(session))
+        {
+            return None;
+        }
+        let stamped =
+            |stamps: &HashMap<String, u64>, id: &str| stamps.get(id).is_some_and(|at| *at > tick);
+        let rewritten = &session.rewritten;
+        Some(Self {
+            history: session.epoch != cursor.saved_epoch
+                || rewritten.history > tick
+                || cursor.saved_history_count > session.messages.len(),
+            tool_outputs: cursor
+                .saved_tool_ids
+                .iter()
+                .filter(|id| {
+                    !session.tool_outputs.contains_key(*id) || stamped(&rewritten.tool_outputs, id)
+                })
+                .cloned()
+                .collect(),
+            streams: cursor
+                .saved_subagent_counts
+                .iter()
+                .filter(|(id, count)| {
+                    session
+                        .subagent_messages
+                        .get(*id)
+                        .is_none_or(|messages| **count > messages.len())
+                        || stamped(&rewritten.streams, id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.history && self.tool_outputs.is_empty() && self.streams.is_empty()
+    }
+}
+
+impl RowDigests {
+    /// `task_specs` is the text the stream rows hold, keyed by stream.
+    fn new<M, U, T>(session: &Session<M, U, T>, task_specs: &HashMap<String, String>) -> Self {
+        Self {
+            task_specs: session
+                .subagent_messages
+                .keys()
+                .map(|id| {
+                    let digest = task_specs
+                        .get(id)
+                        .map(|spec| Sha256::digest(spec.as_bytes()).into());
+                    (id.clone(), digest)
+                })
+                .collect(),
+            auxiliary: auxiliary_digest(session),
+        }
+    }
+
+    fn changed_streams<'a>(&'a self, saved: &RowDigests) -> impl Iterator<Item = &'a String> {
+        self.task_specs
+            .iter()
+            .filter(|(id, digest)| saved.task_specs.get(*id) != Some(digest))
+            .map(|(id, _)| id)
+    }
+
+    fn auxiliary_changed(&self, saved: &RowDigests) -> bool {
+        self.auxiliary.is_none() || self.auxiliary != saved.auxiliary
+    }
+}
+
+/// Map order is unspecified, so usage is sorted before it is encoded.
+fn auxiliary_digest<M, U, T>(session: &Session<M, U, T>) -> Option<RowDigest> {
+    fn sorted(usage: &HashMap<String, StoredTokenUsage>) -> BTreeMap<&String, &StoredTokenUsage> {
+        usage.iter().collect()
+    }
+    let encoded = serde_json::to_vec(&(
+        &session.subagents,
+        sorted(&session.usage_by_model),
+        sorted(&session.usage_by_purpose),
+        &session.tool_usage,
+    ))
+    .ok()?;
+    Some(Sha256::digest(encoded).into())
 }
 
 impl SerializedRoot {
@@ -5150,35 +5357,19 @@ impl SerializedSession {
         T: Serialize,
     {
         let root = SerializedRoot::new(session)?;
-        let messages = serialize_values(&session.messages, "history item", MAX_PAYLOAD_BYTES)?;
-        let tool_outputs = session
-            .tool_outputs
-            .iter()
-            .map(|(id, output)| {
-                serialize_json(output.as_ref(), "tool output", MAX_PAYLOAD_BYTES)
-                    .map(|payload| (id.clone(), payload))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let messages = prepare_history(&session.messages)?;
+        let tool_outputs = prepare_tool_outputs(session.tool_outputs.iter())?;
         let subagent_messages = session
             .subagent_messages
             .iter()
             .map(|(id, values)| {
-                serialize_values(values, "subagent history item", MAX_PAYLOAD_BYTES)
+                prepare_payloads(values, SUBAGENT_HISTORY_KIND)
                     .map(|payloads| (id.clone(), payloads))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let task_specs = serialize_task_specs(&session.subagent_task_specs)?;
         let logical_bytes = root.bytes()
-            + messages.iter().map(String::len).sum::<usize>()
-            + tool_outputs
-                .iter()
-                .map(|(_, payload)| payload.len())
-                .sum::<usize>()
-            + subagent_messages
-                .iter()
-                .flat_map(|(_, values)| values)
-                .map(String::len)
-                .sum::<usize>()
+            + prepared_bytes(&messages, &tool_outputs, &subagent_messages)
             + task_specs.values().map(String::len).sum::<usize>();
         Ok(Self {
             root,
@@ -5197,6 +5388,108 @@ impl SerializedSession {
     fn task_spec_bytes(&self) -> usize {
         self.task_specs.values().map(String::len).sum()
     }
+
+    fn row_count(&self) -> usize {
+        prepared_rows(&self.messages, &self.tool_outputs, &self.subagent_messages)
+    }
+}
+
+impl PreparedPayload {
+    fn new(payload: &str) -> Result<Self, SessionError> {
+        Ok(Self {
+            stored: compress_payload(payload)?,
+            bytes: payload.len(),
+        })
+    }
+}
+
+impl PreparedHistory {
+    fn new(payload: &str) -> Result<Self, SessionError> {
+        let message: Value = serde_json::from_str(payload).map_err(StorageError::from)?;
+        let workflow_receipt = match message.get("workflow_event").map(|origin| {
+            (
+                origin.get("run_id").and_then(Value::as_str),
+                origin.get("revision").and_then(Value::as_u64),
+            )
+        }) {
+            Some((Some(run_id), Some(revision))) => {
+                validate_identifier("workflow receipt run id", run_id)?;
+                Some((
+                    run_id.to_owned(),
+                    to_i64(revision, "workflow receipt revision")?,
+                ))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            payload: PreparedPayload::new(payload)?,
+            workflow_receipt,
+            task_event: message.get("task_event").is_some().then_some(message),
+        })
+    }
+}
+
+fn prepare_history<M: Serialize>(messages: &[M]) -> Result<Vec<PreparedHistory>, SessionError> {
+    messages
+        .iter()
+        .map(|message| {
+            PreparedHistory::new(&serialize_json(message, HISTORY_KIND, MAX_PAYLOAD_BYTES)?)
+        })
+        .collect()
+}
+
+fn prepare_payloads<T: Serialize>(
+    values: &[T],
+    kind: &'static str,
+) -> Result<Vec<PreparedPayload>, SessionError> {
+    values
+        .iter()
+        .map(|value| PreparedPayload::new(&serialize_json(value, kind, MAX_PAYLOAD_BYTES)?))
+        .collect()
+}
+
+fn prepare_tool_outputs<'a, T: Serialize + 'a>(
+    outputs: impl Iterator<Item = (&'a String, &'a Arc<T>)>,
+) -> Result<Vec<(String, PreparedPayload)>, SessionError> {
+    outputs
+        .map(|(id, output)| {
+            let payload = serialize_json(output.as_ref(), TOOL_OUTPUT_KIND, MAX_PAYLOAD_BYTES)?;
+            Ok((id.clone(), PreparedPayload::new(&payload)?))
+        })
+        .collect()
+}
+
+fn prepared_bytes(
+    messages: &[PreparedHistory],
+    tool_outputs: &[(String, PreparedPayload)],
+    subagent_messages: &[(String, Vec<PreparedPayload>)],
+) -> usize {
+    messages
+        .iter()
+        .map(|message| message.payload.bytes)
+        .sum::<usize>()
+        + tool_outputs
+            .iter()
+            .map(|(_, payload)| payload.bytes)
+            .sum::<usize>()
+        + subagent_messages
+            .iter()
+            .flat_map(|(_, values)| values)
+            .map(|payload| payload.bytes)
+            .sum::<usize>()
+}
+
+fn prepared_rows(
+    messages: &[PreparedHistory],
+    tool_outputs: &[(String, PreparedPayload)],
+    subagent_messages: &[(String, Vec<PreparedPayload>)],
+) -> usize {
+    messages.len()
+        + tool_outputs.len()
+        + subagent_messages
+            .iter()
+            .map(|(_, values)| values.len())
+            .sum::<usize>()
 }
 
 fn create_owner_only(path: &Path) -> Result<(), SessionError> {
@@ -6231,17 +6524,6 @@ fn serialize_task_specs(
         .collect()
 }
 
-fn serialize_values<T: Serialize>(
-    values: &[T],
-    kind: &'static str,
-    maximum: usize,
-) -> Result<Vec<String>, SessionError> {
-    values
-        .iter()
-        .map(|value| serialize_json(value, kind, maximum))
-        .collect()
-}
-
 fn serialize_json<T: Serialize + ?Sized>(
     value: &T,
     kind: &'static str,
@@ -6642,6 +6924,79 @@ pub(super) fn directory_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+fn register_archive(
+    transaction: &Transaction<'_>,
+    archive: &PreparedArchive,
+) -> Result<(), SessionError> {
+    transaction.execute(
+        "INSERT INTO pending_archives \
+         (session_id, expected_write_version, pending_name, byte_count) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            archive.session_id.as_bytes().as_slice(),
+            archive.expected_write_version,
+            &archive.pending_name,
+            to_i64(archive.bytes, "pending archive bytes")?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Deletes the stored rows `targets` replaces or removes, returning their
+/// logical bytes. A stream the session no longer has loses its row too.
+fn delete_targets<M, U, T>(
+    transaction: &Transaction<'_>,
+    session: &Session<M, U, T>,
+    targets: &RewriteTargets,
+) -> Result<usize, SessionError> {
+    let id = session.id.as_bytes();
+    let mut removed = 0usize;
+    if targets.history {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM main_history_items WHERE session_id = ?1 RETURNING byte_count",
+            params![id.as_slice()],
+        )?;
+    }
+    for tool_id in &targets.tool_outputs {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM tool_outputs WHERE session_id = ?1 AND tool_id = ?2 \
+             RETURNING byte_count",
+            params![id.as_slice(), tool_id],
+        )?;
+    }
+    for stream in &targets.streams {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM subagent_history_items WHERE session_id = ?1 AND subagent_id = ?2 \
+             RETURNING byte_count",
+            params![id.as_slice(), stream],
+        )?;
+        if !session.subagent_messages.contains_key(stream) {
+            transaction.execute(
+                "DELETE FROM subagent_streams WHERE session_id = ?1 AND subagent_id = ?2",
+                params![id.as_slice(), stream],
+            )?;
+        }
+    }
+    Ok(removed)
+}
+
+fn deleted_bytes(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<usize, SessionError> {
+    let mut statement = transaction.prepare_cached(sql)?;
+    let mut rows = statement.query(params)?;
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        bytes = bytes.saturating_add(from_i64_usize(row.get(0)?, DELETED_BYTES_FIELD)?);
+    }
+    Ok(bytes)
+}
+
 fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), SessionError> {
     for table in [
         "main_history_items",
@@ -6724,7 +7079,7 @@ fn insert_children<M, U, T>(
     upsert_streams(
         transaction,
         session.id,
-        &session.subagent_messages,
+        session.subagent_messages.keys(),
         &serialized.task_specs,
     )?;
     for (id, values) in &serialized.subagent_messages {
@@ -6739,28 +7094,25 @@ fn insert_history(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
     ordinal: usize,
-    payload: &str,
+    history: &PreparedHistory,
 ) -> Result<(), SessionError> {
-    let message: Value = serde_json::from_str(payload).map_err(StorageError::from)?;
-    if let Some(origin) = message.get("workflow_event")
-        && let Some(run_id) = origin.get("run_id").and_then(Value::as_str)
-        && let Some(revision) = origin.get("revision").and_then(Value::as_u64)
-    {
-        validate_identifier("workflow receipt run id", run_id)?;
+    if let Some((run_id, revision)) = &history.workflow_receipt {
         transaction.execute(
             "INSERT OR IGNORE INTO workflow_receipts(session_id, run_id, revision) VALUES (?1, ?2, ?3)",
-            params![session_id.as_bytes().as_slice(), run_id, to_i64(revision, "workflow receipt revision")?],
+            params![session_id.as_bytes().as_slice(), run_id, revision],
         )?;
     }
-    accept_owned_job_event(transaction, session_id, &JobOwner::Main, &message)?;
+    if let Some(message) = &history.task_event {
+        accept_owned_job_event(transaction, session_id, &JobOwner::Main, message)?;
+    }
     transaction.execute(
         "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
             session_id.as_bytes().as_slice(),
             to_i64(ordinal, "history ordinal")?,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "history payload bytes")?
+            history.payload.stored,
+            to_i64(history.payload.bytes, "history payload bytes")?
         ],
     )?;
     Ok(())
@@ -6770,7 +7122,7 @@ fn insert_tool_output(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
     id: &str,
-    payload: &str,
+    payload: &PreparedPayload,
 ) -> Result<(), SessionError> {
     transaction.execute(
         "INSERT INTO tool_outputs (session_id, tool_id, payload, byte_count) \
@@ -6778,22 +7130,22 @@ fn insert_tool_output(
         params![
             session_id.as_bytes().as_slice(),
             id,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "tool output payload bytes")?
+            payload.stored,
+            to_i64(payload.bytes, "tool output payload bytes")?
         ],
     )?;
     Ok(())
 }
 
-fn upsert_streams<M>(
+fn upsert_streams<'a>(
     transaction: &Transaction<'_>,
     session_id: CaudraId,
-    streams: &HashMap<String, Arc<Vec<M>>>,
+    streams: impl IntoIterator<Item = &'a String>,
     task_specs: &HashMap<String, String>,
 ) -> Result<(), SessionError> {
     // The parent stream row is durable even when its history is empty, which
     // preserves completed and resumable empty subagents.
-    for id in streams.keys() {
+    for id in streams {
         transaction.execute(
             "INSERT INTO subagent_streams (session_id, subagent_id, task_spec) \
              VALUES (?1, ?2, ?3) \
@@ -6809,7 +7161,7 @@ fn insert_subagent_history(
     session_id: CaudraId,
     subagent_id: &str,
     ordinal: usize,
-    payload: &str,
+    payload: &PreparedPayload,
 ) -> Result<(), SessionError> {
     transaction.execute(
         "INSERT INTO subagent_history_items \
@@ -6819,8 +7171,8 @@ fn insert_subagent_history(
             session_id.as_bytes().as_slice(),
             subagent_id,
             to_i64(ordinal, "subagent history ordinal")?,
-            compress_payload(payload)?,
-            to_i64(payload.len(), "subagent payload bytes")?
+            payload.stored,
+            to_i64(payload.bytes, "subagent payload bytes")?
         ],
     )?;
     Ok(())
@@ -7742,6 +8094,39 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         SqliteError::SqliteFailure(SqliteErrorCode::new(code), None).into()
     }
 
+    #[test_case(Some(5), Some(12), [2, 3, 7, 8]; "committed")]
+    #[test_case(Some(5), None, [2, 3, 15, 0]; "failed before commit")]
+    #[test_case(None, None, [2, 18, 0, 0]; "never acquired")]
+    fn write_phases_split_the_elapsed_time(
+        acquired_ms: Option<u64>,
+        committing_ms: Option<u64>,
+        [prepare, wait, statements, commit]: [u64; 4],
+    ) {
+        const STARTED_MS: u64 = 2;
+        const FINISHED_MS: u64 = 20;
+        let base = Instant::now();
+        let at = |ms| base + Duration::from_millis(ms);
+        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, None);
+        timing.prepared = base;
+        timing.started = at(STARTED_MS);
+        timing.acquired = acquired_ms.map(at);
+        timing.committing = committing_ms.map(at);
+        let phases = timing.phases(at(FINISHED_MS));
+        assert_eq!(
+            phases,
+            WritePhases {
+                prepare: Duration::from_millis(prepare),
+                wait: Duration::from_millis(wait),
+                statements: Duration::from_millis(statements),
+                commit: Duration::from_millis(commit),
+            }
+        );
+        assert_eq!(
+            phases.prepare + phases.wait + phases.hold(),
+            Duration::from_millis(FINISHED_MS)
+        );
+    }
+
     #[test_case(ffi::SQLITE_BUSY; "busy")]
     #[test_case(ffi::SQLITE_BUSY_SNAPSHOT; "snapshot")]
     #[test_case(ffi::SQLITE_BUSY_RECOVERY; "recovery")]
@@ -8240,7 +8625,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         retry.run_with_clock(
             RUNTIME_OWNER_CHECKPOINT,
             || {
-                database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                     transaction.execute(
                         "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                         params![ARTIFACT_NAME],
@@ -8273,7 +8658,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let retry = RuntimeRetry::new(None, &|| false);
         let attempts = Cell::new(0);
         database
-            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                     params![ARTIFACT_NAME],
@@ -8302,7 +8687,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let is_cancelled = || cancelled.get();
         let retry = RuntimeRetry::new(None, &is_cancelled);
         let result =
-            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
                     params![ARTIFACT_NAME],
@@ -8351,7 +8736,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         };
         let retry = RuntimeRetry::new(None, &cancelled);
         database
-            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 attempts.set(attempts.get() + 1);
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
@@ -8405,7 +8790,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let retry = RuntimeRetry::new(None, &|| false);
         let attempts = Cell::new(0);
         let result: Result<(), _> =
-            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, None, |transaction| {
                 attempts.set(attempts.get() + 1);
                 transaction.execute(
                     "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
@@ -9021,7 +9406,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .unwrap();
         let message = serde_json::to_string(&checkpoint_shell_message(SHELL_EVENT)).unwrap();
         let transaction = database.connection.transaction().unwrap();
-        let result = insert_history(&transaction, session.id, 0, &message);
+        let result = insert_history(
+            &transaction,
+            session.id,
+            0,
+            &PreparedHistory::new(&message).unwrap(),
+        );
         if child {
             assert!(result.is_err());
             drop(transaction);
@@ -9884,6 +10274,303 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             )
             .unwrap();
         assert_eq!(after.rows, report.rows + 1);
+    }
+
+    const STREAM: &str = "stream";
+    const OTHER_STREAM: &str = "other-stream";
+    const SPEC_MODEL: &str = "spec-model";
+    const CHANGED_SPEC_MODEL: &str = "changed-spec-model";
+    const STREAM_WRITES: &str = "streams";
+    const AUXILIARY_WRITES: &str = "auxiliary";
+    const COUNT_ROW_WRITES: &str = "
+        CREATE TEMP TABLE row_writes(target TEXT NOT NULL);
+        CREATE TEMP TRIGGER stream_insert AFTER INSERT ON main.subagent_streams
+            BEGIN INSERT INTO row_writes VALUES ('streams'); END;
+        CREATE TEMP TRIGGER stream_update AFTER UPDATE ON main.subagent_streams
+            BEGIN INSERT INTO row_writes VALUES ('streams'); END;
+        CREATE TEMP TRIGGER subagent_insert AFTER INSERT ON main.subagents
+            BEGIN INSERT INTO row_writes VALUES ('auxiliary'); END;
+        CREATE TEMP TRIGGER tool_usage_insert AFTER INSERT ON main.session_tool_usage
+            BEGIN INSERT INTO row_writes VALUES ('auxiliary'); END;
+    ";
+
+    fn task_spec(model: &str) -> StoredSubagentTaskSpec {
+        serde_json::from_value(json!({ "model": model })).unwrap()
+    }
+
+    fn row_writes(database: &SessionDatabase, target: &str) -> i64 {
+        database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM row_writes WHERE target = ?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn append(session: &mut TestSession) {
+        session.push_message(TestMessage("appended".into()));
+    }
+
+    fn change_spec(session: &mut TestSession) {
+        session.set_subagent_history(
+            STREAM.into(),
+            vec![TestMessage("child".into())],
+            Some(task_spec(CHANGED_SPEC_MODEL)),
+        );
+    }
+
+    fn add_stream(session: &mut TestSession) {
+        session.set_subagent_messages(OTHER_STREAM.into(), Vec::new());
+    }
+
+    fn use_tool(session: &mut TestSession) {
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Ok, 1, 1);
+    }
+
+    #[test_case(append, false, false, false ; "an_append_after_save")]
+    #[test_case(append, true, false, false ; "an_append_after_load")]
+    #[test_case(change_spec, false, true, false ; "a_changed_spec_after_save")]
+    #[test_case(change_spec, true, true, false ; "a_changed_spec_after_load")]
+    #[test_case(add_stream, false, true, false ; "a_new_stream")]
+    #[test_case(use_tool, false, false, true ; "a_tool_usage_change_after_save")]
+    #[test_case(use_tool, true, false, true ; "a_tool_usage_change_after_load")]
+    fn a_delta_save_rewrites_only_changed_stream_and_auxiliary_rows(
+        mutate: fn(&mut TestSession),
+        reload: bool,
+        streams_written: bool,
+        auxiliary_written: bool,
+    ) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage("first".into()));
+        session.set_subagent_history(
+            STREAM.into(),
+            vec![TestMessage("child".into())],
+            Some(task_spec(SPEC_MODEL)),
+        );
+        session.set_subagents(vec![stored_subagent(STREAM, StoredSubagentOutcome::Done)]);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Cancelled, 1, 1);
+        let mut cursor = database.save(&session, None).unwrap();
+        if reload {
+            (session, cursor) = database.load_with_cursor(session.id).unwrap();
+        }
+        database.connection.execute_batch(COUNT_ROW_WRITES).unwrap();
+        mutate(&mut session);
+        let base_write_version = cursor.write_version();
+        database.save(&session, Some(&cursor)).unwrap();
+        assert_eq!(
+            (
+                row_writes(&database, STREAM_WRITES) > 0,
+                row_writes(&database, AUXILIARY_WRITES) > 0,
+            ),
+            (streams_written, auxiliary_written)
+        );
+        assert_eq!(
+            database.write_version(session.id).unwrap(),
+            Some(base_write_version + 1)
+        );
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(loaded.subagent_task_specs(), session.subagent_task_specs());
+        assert_eq!(loaded.subagents(), session.subagents());
+        assert_eq!(loaded.tool_usage(), session.tool_usage());
+    }
+
+    const CALL_A: &str = "call-a";
+    const CALL_B: &str = "call-b";
+    const ORPHAN_OUTPUT: &str = "orphan";
+    const ORPHAN_STREAM: &str = "orphan-stream";
+    const SWITCHED_MODEL: &str = "switched-model";
+    const SWITCHED_CWD: &str = "/switched";
+    const COUNT_HISTORY_DELETES: &str = "
+        CREATE TEMP TABLE history_deletes(n INTEGER NOT NULL);
+        CREATE TEMP TRIGGER history_delete AFTER DELETE ON main.main_history_items
+            BEGIN INSERT INTO history_deletes VALUES (1); END;
+    ";
+
+    fn messages(texts: &[&str]) -> Vec<TestMessage> {
+        texts
+            .iter()
+            .map(|text| TestMessage((*text).into()))
+            .collect()
+    }
+
+    fn rewritable_session(database: &mut SessionDatabase) -> (TestSession, SessionCursor) {
+        let mut session = TestSession::new(MODEL, CWD);
+        for message in messages(&[CALL_A, CALL_B]) {
+            session.push_message(message);
+        }
+        for id in [CALL_A, CALL_B, ORPHAN_OUTPUT] {
+            session.insert_tool_output(id.into(), json!({ "output": id }));
+        }
+        session.set_subagent_history(
+            CALL_B.into(),
+            messages(&["child-1", "child-2"]),
+            Some(task_spec(SPEC_MODEL)),
+        );
+        session.set_subagent_messages(ORPHAN_STREAM.into(), messages(&["orphan-child"]));
+        session.set_subagents(vec![stored_subagent(CALL_B, StoredSubagentOutcome::Done)]);
+        let cursor = database.save(&session, None).unwrap();
+        (session, cursor)
+    }
+
+    fn prune(session: &mut TestSession) {
+        session.prune_orphans(|message| vec![message.0.clone()]);
+    }
+
+    fn compact(session: &mut TestSession) {
+        session.replace_messages(messages(&[CALL_B]));
+    }
+
+    fn replace_output(session: &mut TestSession) {
+        session.insert_tool_output(CALL_A.into(), json!("replaced"));
+    }
+
+    fn rewrite_stream(session: &mut TestSession) {
+        session.set_subagent_messages(CALL_B.into(), messages(&["child-1-edited"]));
+    }
+
+    fn readd_after_prune(session: &mut TestSession) {
+        prune(session);
+        session.insert_tool_output(ORPHAN_OUTPUT.into(), json!("again"));
+        session.set_subagent_messages(ORPHAN_STREAM.into(), messages(&["readded"]));
+    }
+
+    fn switch_model(session: &mut TestSession) {
+        session.set_model(SWITCHED_MODEL.into());
+    }
+
+    fn switch_cwd(session: &mut TestSession) {
+        session.set_cwd(SWITCHED_CWD.into());
+    }
+
+    fn stored_rows(database: &SessionDatabase, id: CaudraId) -> Vec<String> {
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT CAST(ordinal AS TEXT), payload, byte_count FROM main_history_items \
+             WHERE session_id = ?1 ORDER BY ordinal",
+            "SELECT tool_id, payload, byte_count FROM tool_outputs \
+             WHERE session_id = ?1 ORDER BY tool_id",
+            "SELECT subagent_id || '/' || ordinal, payload, byte_count FROM subagent_history_items \
+             WHERE session_id = ?1 ORDER BY subagent_id, ordinal",
+        ] {
+            let mut statement = database.connection.prepare(sql).unwrap();
+            let mut query = statement.query(params![id.as_bytes().as_slice()]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                let key: String = row.get(0).unwrap();
+                let payload = decompress_payload(&row.get::<_, Vec<u8>>(1).unwrap(), "payload");
+                let bytes: i64 = row.get(2).unwrap();
+                rows.push(format!("{key}={}:{bytes}", payload.unwrap()));
+            }
+        }
+        for sql in [
+            "SELECT subagent_id || '=' || coalesce(task_spec, '') FROM subagent_streams \
+             WHERE session_id = ?1 ORDER BY subagent_id",
+            "SELECT tool_use_id FROM subagents WHERE session_id = ?1 ORDER BY ordinal",
+            "SELECT cwd || ':' || model || ':' || logical_bytes || ':' || history_item_count \
+             || ':' || tool_output_count || ':' || subagent_item_count FROM sessions WHERE id = ?1",
+        ] {
+            let mut statement = database.connection.prepare(sql).unwrap();
+            let mut query = statement.query(params![id.as_bytes().as_slice()]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                rows.push(row.get(0).unwrap());
+            }
+        }
+        rows
+    }
+
+    #[test_case(compact, true ; "a_compaction")]
+    #[test_case(replace_output, false ; "a_replaced_tool_output")]
+    #[test_case(rewrite_stream, false ; "a_rewritten_subagent_stream")]
+    #[test_case(prune, false ; "removed_outputs_and_streams")]
+    #[test_case(readd_after_prune, false ; "outputs_and_streams_readded_after_removal")]
+    #[test_case(switch_model, false ; "a_model_switch")]
+    #[test_case(switch_cwd, false ; "a_cwd_switch")]
+    fn a_targeted_save_stores_what_a_full_save_would(
+        mutate: fn(&mut TestSession),
+        history_rewritten: bool,
+    ) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        database
+            .connection
+            .execute_batch(COUNT_HISTORY_DELETES)
+            .unwrap();
+        mutate(&mut session);
+
+        database.save(&session, Some(&cursor)).unwrap();
+
+        let history_deletes: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM history_deletes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_deletes > 0, history_rewritten);
+        let targeted = stored_rows(&database, session.id);
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.tool_outputs, session.tool_outputs);
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(loaded.subagent_task_specs(), session.subagent_task_specs());
+        assert_eq!(
+            (loaded.model, loaded.cwd),
+            (session.model.clone(), session.cwd.clone())
+        );
+        database.save(&session, None).unwrap();
+        assert_eq!(targeted, stored_rows(&database, session.id));
+    }
+
+    #[test]
+    fn a_targeted_compaction_archives_the_longer_history() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        compact(&mut session);
+
+        database.save(&session, Some(&cursor)).unwrap();
+
+        let archive_dir = state
+            .path()
+            .join(super::super::SESSIONS_DIR)
+            .join(super::super::ARCHIVE_DIR)
+            .join(session.id.to_string());
+        assert_eq!(fs::read_dir(archive_dir).unwrap().count(), 1);
+        let pending: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM pending_archives", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test_case(replace_output ; "a_replaced_tool_output")]
+    #[test_case(prune ; "removed_outputs_and_streams")]
+    fn a_targeted_save_still_detects_a_concurrent_writer(mutate: fn(&mut TestSession)) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        mutate(&mut session);
+        database
+            .connection
+            .execute(
+                "UPDATE sessions SET write_version = write_version + 1 WHERE id = ?1",
+                params![session.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let before = stored_rows(&database, session.id);
+
+        let error = database.save(&session, Some(&cursor)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::ConcurrentSessionWriter { .. }
+        ));
+        assert_eq!(stored_rows(&database, session.id), before);
     }
 
     fn stored_subagent(id: &str, outcome: StoredSubagentOutcome) -> StoredSubagent {

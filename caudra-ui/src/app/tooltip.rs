@@ -191,6 +191,7 @@ mod tests {
     };
     use super::{ChordTopic, TIP_DOCS, TIP_PLAN, TIP_TASKS};
     use crate::app::{App, Msg};
+    use crate::components::accounts_modal;
     use crate::components::docs_link::DocsTopic;
     use crate::components::input::CLICK_OR_PRESS;
     use crate::components::keybindings::{key as kb, leader};
@@ -613,6 +614,43 @@ mod tests {
         let tip = app.tooltip_candidate().expect(SHOWN);
         assert_eq!(tip.key, TipKey::TitleHint(0), "{WRONG_TIP}");
         assert!(row_of(&rows, CLICK_OR_PRESS).is_some(), "{SHOWN}");
+    }
+
+    const ACCOUNTS_FOOTER_HINT: &str = "Enter use";
+    const USAGE_HEADLINE_FIELD: &str = "base in";
+    /// Enough of a tip's opening to find it on screen before the box wraps it.
+    const TIP_OPENING_CHARS: usize = 12;
+
+    /// One cell of `text` where the open modal drew it.
+    fn drawn(app: &mut App, text: &str) -> Rect {
+        let rows = screen(app, WIDE);
+        let y = row_of(&rows, text).expect(CONTROL_MISSING);
+        let byte = rows[y].find(text).expect(CONTROL_MISSING);
+        let x = rows[y][..byte].chars().count();
+        Rect::new(x as u16, y as u16, 1, 1)
+    }
+
+    fn accounts_footer_hint(app: &mut App) -> Rect {
+        app.accounts_modal.open(accounts_modal::tests::pool());
+        drawn(app, ACCOUNTS_FOOTER_HINT)
+    }
+
+    fn usage_headline_field(app: &mut App) -> Rect {
+        app.usage_modal.toggle();
+        drawn(app, USAGE_HEADLINE_FIELD)
+    }
+
+    #[test_case(accounts_footer_hint ; "accounts_footer")]
+    #[test_case(usage_headline_field ; "usage_body")]
+    fn a_modal_explains_what_the_pointer_rests_on(open: fn(&mut App) -> Rect) {
+        let mut app = app_without_splash();
+        let at = open(&mut app);
+
+        let rows = rest_at(&mut app, WIDE, at);
+
+        let tip = app.tooltip_candidate().expect(SHOWN);
+        let opening: String = tip.text.chars().take(TIP_OPENING_CHARS).collect();
+        assert!(row_of(&rows, &opening).is_some(), "{SHOWN}: {}", tip.text);
     }
 
     #[test]

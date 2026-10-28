@@ -15,6 +15,7 @@ use std::sync::Arc;
 use caudra_providers::{RequestOptions, project_messages};
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::SessionMeta;
 use caudra_terminal_host::status::PaneSubagent;
 use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
@@ -40,6 +41,18 @@ pub(crate) const WAKES_SUPPRESSED_RUN_ERROR: &str = "run_error";
 pub(crate) const WAKES_SUPPRESSED_STOP_REQUESTED: &str = "stop_requested";
 pub(crate) const WAKES_SUPPRESSED_STOP_FAILED: &str = "stop_failed";
 pub(crate) const WAKES_SUPPRESSED_RUNTIME_FAILED: &str = "runtime_failed";
+
+/// Whether `meta`'s wake suppression outlives a load, and why. A runtime
+/// failure ended with the runtime that had it, so a fresh one starts with
+/// wakes on; a user's stop and a reason older builds never kept stay.
+pub(crate) fn restored_wake_suppression(meta: &SessionMeta) -> (bool, Option<String>) {
+    let kept = meta.automatic_wakes_suppressed
+        && meta.wakes_suppressed_reason.as_deref() != Some(WAKES_SUPPRESSED_RUNTIME_FAILED);
+    (
+        kept,
+        kept.then(|| meta.wakes_suppressed_reason.clone()).flatten(),
+    )
+}
 const MILLIS_PER_SECOND: u64 = 1_000;
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const TASK_NOUN: &str = "task";
@@ -581,6 +594,7 @@ impl App {
     pub(crate) fn rearm_background(&mut self) {
         let ready = self.background_delivery.rearm();
         self.automatic_wakes_suppressed = false;
+        self.wakes_suppressed_reason = None;
         if ready && let Some(background) = &self.background {
             background.rearm();
         }
@@ -594,6 +608,11 @@ impl App {
             "background wakes suppressed"
         );
         self.background_delivery.invalidate();
+        if !self.automatic_wakes_suppressed
+            || self.wakes_suppressed_reason.as_deref() == Some(WAKES_SUPPRESSED_RUNTIME_FAILED)
+        {
+            self.wakes_suppressed_reason = Some(site.into());
+        }
         self.automatic_wakes_suppressed = true;
         if let Some(background) = &self.background {
             background.suppress_wakes();
@@ -650,23 +669,16 @@ impl App {
             .map_err(|error| DeliveryFailure::Save(error.to_string()))?;
         let messages =
             project_messages(&history).map_err(|error| DeliveryFailure::Save(error.to_string()))?;
-        if self.background_saved_revision != Some(revision) {
-            if let Err(error) = self
-                .storage_writer
-                .save_sync(Arc::clone(&self.state.session))
-            {
-                if final_save {
-                    self.release_background_claims();
-                }
-                return Err(DeliveryFailure::Save(error.to_string()));
-            }
-            self.background_saved_revision = Some(revision);
-        }
+        let saved = (self.background_saved_revision != Some(revision)).then(|| {
+            self.storage_writer
+                .save_acked(Arc::clone(&self.state.session))
+        });
         self.background_delivery.schedule(DeliveryJob {
             key,
             messages,
             background: self.background.clone(),
             workflow,
+            saved,
         });
         Ok(())
     }

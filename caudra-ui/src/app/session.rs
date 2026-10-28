@@ -53,6 +53,7 @@ use super::permission_editor::{
     ConversationPermissions, PERMISSION_WORKER_BUSY, attach_session_permissions,
 };
 use super::session_state::SessionState;
+use super::tasks::restored_wake_suppression;
 use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
 /// The shortest gap between two writes that carry only UI state.
@@ -564,6 +565,10 @@ impl App {
             autopilot: self.stored_autopilot(),
             automatic_wakes_suppressed: self.automatic_wakes_suppressed
                 || peer.as_ref().is_some_and(PeerSession::wakes_suppressed),
+            wakes_suppressed_reason: self
+                .automatic_wakes_suppressed
+                .then(|| self.wakes_suppressed_reason.clone())
+                .flatten(),
             permission_mode: self.permissions.persisted_mode(),
             peer_controls: peer
                 .map(|peer| peer.controls())
@@ -1007,7 +1012,11 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.automatic_wakes_suppressed |= self.state.session.meta.automatic_wakes_suppressed;
+        let (suppressed, reason) = restored_wake_suppression(&self.state.session.meta);
+        if suppressed && !self.automatic_wakes_suppressed {
+            self.wakes_suppressed_reason = reason;
+        }
+        self.automatic_wakes_suppressed |= suppressed;
         if !self.conversation_permissions.is_published() {
             self.permissions.load_structured_conversation_rules(
                 self.state.session.meta.structured_permission_rules.clone(),
@@ -1149,7 +1158,10 @@ impl App {
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         self.state.session = Arc::new(prepared.session);
         self.restore_autopilot(self.state.autopilot.limits());
-        self.automatic_wakes_suppressed = self.state.session.meta.automatic_wakes_suppressed;
+        (
+            self.automatic_wakes_suppressed,
+            self.wakes_suppressed_reason,
+        ) = restored_wake_suppression(&self.state.session.meta);
         // After the swap: a remote plan document is filed under the session id
         // that will own it, and the retiring session must not be handed one.
         if self.state.mode == Mode::Plan {
@@ -1700,8 +1712,14 @@ impl App {
                 deferred
             }
         };
-        let automatic_wakes_suppressed = session.meta.automatic_wakes_suppressed
-            || (session.id == self.state.session.id && self.automatic_wakes_suppressed);
+        let (stored_suppression, stored_reason) = restored_wake_suppression(&session.meta);
+        let kept_suppression =
+            session.id == self.state.session.id && self.automatic_wakes_suppressed;
+        let automatic_wakes_suppressed = stored_suppression || kept_suppression;
+        let wakes_suppressed_reason = match kept_suppression {
+            true => self.wakes_suppressed_reason.clone(),
+            false => stored_reason,
+        };
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
         self.suspend_permission_editor();
@@ -1728,6 +1746,7 @@ impl App {
         }
         self.reset_ui_chrome();
         self.automatic_wakes_suppressed = automatic_wakes_suppressed;
+        self.wakes_suppressed_reason = wakes_suppressed_reason;
         progress.phase(LoadPhase::Transcript);
         self.restore_display();
 

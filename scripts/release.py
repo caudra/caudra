@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -56,6 +57,7 @@ PAGE_HEADING = re.compile(r"^#{1,2}\s")
 HIGHLIGHTS = re.compile(r"^- ")
 COMPACT_MARKER = b"CAUDRA-ATTRIBUTION compact-v2\n"
 GRAPH_IDENTITY = ("name", "package", "version", "default_features")
+PERSISTED_FORMATS = ROOT / "scripts/persisted-formats.py"
 
 
 def require(condition: bool, message: str) -> None:
@@ -250,6 +252,20 @@ def validate_source(repository: str, ref: str, sha: str, root: Path) -> str:
     ).strip()
     require(head == sha, "Checkout does not match the release commit")
     return tag
+
+
+def check_persisted_formats() -> None:
+    """A patch release keeps every persisted format of its minor's `vX.Y.0`."""
+    result = subprocess.run(
+        [sys.executable, str(PERSISTED_FORMATS), "check"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(
+        result.returncode == 0,
+        f"Persisted-format check failed:\n{result.stderr.strip()}",
+    )
 
 
 def gh(*arguments: str) -> str:
@@ -710,6 +726,7 @@ def main() -> None:
     )
     release_notes(tag, layout)
     if arguments.command == "validate":
+        check_persisted_formats()
         release = existing_draft(tag, sha)
         if release is not None:
             assert_release_policy(release, layout)
