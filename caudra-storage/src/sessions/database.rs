@@ -62,7 +62,7 @@ use super::change_stores::{ChangeStores, registered_change_stores, release_every
 use super::lease::{SessionLease, held_sessions};
 use super::progress::{CHECKPOINT_PHASE, MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
-    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionListing,
+    ProjectUsageRelocation, RewriteStamps, SESSION_VERSION, Session, SessionError, SessionListing,
     SessionLocation, SessionMeta, SessionRelocation, SessionRelocationResult, SessionSummary,
     StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage,
     StoredToolUsage, next_epoch,
@@ -109,6 +109,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 const SAVE_FULL_OPERATION: &str = "session full save";
 const SAVE_DELTA_OPERATION: &str = "session delta save";
+const SAVE_TARGETED_OPERATION: &str = "session targeted save";
+const DELETED_BYTES_FIELD: &str = "deleted byte_count";
 const RECREATE_OPERATION: &str = "session recreate";
 const RUNTIME_CONTENTION_BUDGET: Duration = Duration::from_secs(30);
 const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
@@ -1396,6 +1398,15 @@ pub struct SessionCursor {
 }
 
 type RowDigest = [u8; 32];
+
+/// What a save replaces in place rather than appends since its cursor, read
+/// from the session's rewrite stamps. Empty for a plain delta. The tool
+/// outputs and streams are stored ones whose rows go, replaced or removed.
+struct RewriteTargets {
+    history: bool,
+    tool_outputs: HashSet<String>,
+    streams: HashSet<String>,
+}
 
 /// What the rows a delta save would otherwise rewrite whole held when last
 /// written, so an unchanged stream spec or auxiliary table is not rewritten
@@ -3312,25 +3323,12 @@ impl SessionDatabase {
                 });
             }
         }
-        // Epoch and rewrite counters classify append safety in memory; the
+        // Epoch and rewrite stamps classify append safety in memory; the
         // persisted version remains authoritative across processes.
         if let Some(cursor) = cursor
-            && cursor.session_id == session.id
-            && cursor.saved_epoch == session.epoch
-            && cursor.saved_rewrites == session.rewrites
-            && cursor.saved_history_count <= session.messages.len()
-            && cursor
-                .saved_tool_ids
-                .iter()
-                .all(|id| session.tool_outputs.contains_key(id))
-            && cursor.saved_subagent_counts.iter().all(|(id, &count)| {
-                session
-                    .subagent_messages
-                    .get(id)
-                    .is_some_and(|messages| count <= messages.len())
-            })
+            && let Some(targets) = RewriteTargets::since(session, cursor)
         {
-            return self.save_delta(session, cursor);
+            return self.save_changes(session, cursor, &targets);
         }
         self.save_full(session, cursor.map(SessionCursor::write_version))
     }
@@ -4247,30 +4245,13 @@ impl SessionDatabase {
         };
         insert_children(&transaction, session, &serialized)?;
         if let Some(archive) = &archive {
-            transaction.execute(
-                "INSERT INTO pending_archives \
-                 (session_id, expected_write_version, pending_name, byte_count) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    archive.session_id.as_bytes().as_slice(),
-                    archive.expected_write_version,
-                    &archive.pending_name,
-                    to_i64(archive.bytes, "pending archive bytes")?
-                ],
-            )?;
+            register_archive(&transaction, archive)?;
         }
         timing.committing();
         transaction.commit()?;
         drop(timing);
-        if let Some(mut archive) = archive {
-            archive.cleanup_on_drop = false;
-            if let Err(error) =
-                self.finalize_registered_archive(archive.session_id, &archive.pending_name)
-            {
-                warn!(%error, session_id = %session.id, "archive publication deferred to startup reconciliation");
-            } else if let Err(error) = self.reconcile_pending_archives() {
-                warn!(%error, session_id = %session.id, "later pending archives remain for reconciliation");
-            }
+        if let Some(archive) = archive {
+            self.publish_archive(archive);
         }
         session
             .base_write_version
@@ -4288,30 +4269,44 @@ impl SessionDatabase {
         ))
     }
 
-    fn save_delta<M, U, T>(
+    /// Appends what is new since `cursor` and replaces only what `targets`
+    /// names, in one transaction under the same version check as a full save.
+    fn save_changes<M, U, T>(
         &mut self,
         session: &Session<M, U, T>,
         cursor: &SessionCursor,
+        targets: &RewriteTargets,
     ) -> Result<SessionCursor, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
     {
-        let mut timing = WriteTiming::start(SAVE_DELTA_OPERATION, Some(session.id));
+        let operation = if targets.is_empty() {
+            SAVE_DELTA_OPERATION
+        } else {
+            SAVE_TARGETED_OPERATION
+        };
+        let mut timing = WriteTiming::start(operation, Some(session.id));
         validate_scalars(session)?;
         let mut root = SerializedRoot::new(session)?;
-        let messages = prepare_history(&session.messages[cursor.saved_history_count..])?;
-        let tool_outputs = prepare_tool_outputs(
-            session
-                .tool_outputs
-                .iter()
-                .filter(|(id, _)| !cursor.saved_tool_ids.contains(*id)),
-        )?;
+        let history_start = if targets.history {
+            0
+        } else {
+            cursor.saved_history_count
+        };
+        let messages = prepare_history(&session.messages[history_start..])?;
+        let tool_outputs = prepare_tool_outputs(session.tool_outputs.iter().filter(|(id, _)| {
+            !cursor.saved_tool_ids.contains(*id) || targets.tool_outputs.contains(*id)
+        }))?;
         let mut subagent_messages = Vec::new();
         let mut subagent_starts = HashMap::new();
         for (id, values) in &session.subagent_messages {
-            let saved = cursor.saved_subagent_counts.get(id).copied().unwrap_or(0);
+            let saved = if targets.streams.contains(id) {
+                0
+            } else {
+                cursor.saved_subagent_counts.get(id).copied().unwrap_or(0)
+            };
             let payloads = prepare_payloads(&values[saved..], SUBAGENT_HISTORY_KIND)?;
             subagent_starts.insert(id.as_str(), saved);
             subagent_messages.push((id.clone(), payloads));
@@ -4325,15 +4320,27 @@ impl SessionDatabase {
             prepared_rows(&messages, &tool_outputs, &subagent_messages),
             added_bytes,
         );
+        let archive = if targets.history {
+            self.prepare_archive(session.id, session.messages.len(), cursor.write_version)?
+        } else {
+            None
+        };
         timing.begin();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         timing.acquired();
         root.fence_permissions(&transaction, session.id)?;
+        let removed_bytes = if targets.is_empty() {
+            0
+        } else {
+            ensure_write_version(&transaction, session.id, cursor.write_version)?;
+            delete_targets(&transaction, session, targets)?
+        };
         let logical_bytes = cursor
             .logical_bytes
             .checked_sub(cursor.root_bytes + cursor.task_spec_bytes)
+            .and_then(|bytes| bytes.checked_sub(removed_bytes))
             .and_then(|bytes| bytes.checked_add(root.bytes()))
             .and_then(|bytes| bytes.checked_add(task_specs.values().map(String::len).sum()))
             .and_then(|bytes| bytes.checked_add(added_bytes))
@@ -4349,12 +4356,7 @@ impl SessionDatabase {
             cursor.write_version,
         )?;
         for (offset, payload) in messages.iter().enumerate() {
-            insert_history(
-                &transaction,
-                session.id,
-                cursor.saved_history_count + offset,
-                payload,
-            )?;
+            insert_history(&transaction, session.id, history_start + offset, payload)?;
         }
         for (id, payload) in &tool_outputs {
             insert_tool_output(&transaction, session.id, id, payload)?;
@@ -4369,9 +4371,15 @@ impl SessionDatabase {
         if auxiliary_changed {
             replace_auxiliary(&transaction, session)?;
         }
+        if let Some(archive) = &archive {
+            register_archive(&transaction, archive)?;
+        }
         timing.committing();
         transaction.commit()?;
         drop(timing);
+        if let Some(archive) = archive {
+            self.publish_archive(archive);
+        }
         let write_version = cursor.write_version + 1;
         session
             .base_write_version
@@ -4387,6 +4395,18 @@ impl SessionDatabase {
             task_specs.values().map(String::len).sum(),
             digests,
         ))
+    }
+
+    /// The archive's row committed with the rewrite, so its pending file is
+    /// now the final export; a failure here leaves it to reconciliation.
+    fn publish_archive(&mut self, mut archive: PreparedArchive) {
+        archive.cleanup_on_drop = false;
+        let session_id = archive.session_id;
+        if let Err(error) = self.finalize_registered_archive(session_id, &archive.pending_name) {
+            warn!(%error, %session_id, "archive publication deferred to startup reconciliation");
+        } else if let Err(error) = self.reconcile_pending_archives() {
+            warn!(%error, %session_id, "later pending archives remain for reconciliation");
+        }
     }
 
     fn prepare_archive(
@@ -4985,6 +5005,7 @@ where
         messages_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
+        rewritten: RewriteStamps::default(),
         base_write_version: AtomicI64::new(root.write_version),
         write_version,
         forked_outputs: None,
@@ -5151,6 +5172,50 @@ impl SessionCursor {
             task_spec_bytes,
             digests,
         }
+    }
+}
+
+impl RewriteTargets {
+    /// `None` when the stamps cannot be read against `cursor`: its clock is
+    /// another lineage's, or ahead of this session's. A full save follows.
+    fn since<M, U, T>(session: &Session<M, U, T>, cursor: &SessionCursor) -> Option<Self> {
+        let tick = cursor.saved_rewrites;
+        if session.rewrites != tick && (session.rewrites < tick || !cursor.shares_lineage(session))
+        {
+            return None;
+        }
+        let stamped =
+            |stamps: &HashMap<String, u64>, id: &str| stamps.get(id).is_some_and(|at| *at > tick);
+        let rewritten = &session.rewritten;
+        Some(Self {
+            history: session.epoch != cursor.saved_epoch
+                || rewritten.history > tick
+                || cursor.saved_history_count > session.messages.len(),
+            tool_outputs: cursor
+                .saved_tool_ids
+                .iter()
+                .filter(|id| {
+                    !session.tool_outputs.contains_key(*id) || stamped(&rewritten.tool_outputs, id)
+                })
+                .cloned()
+                .collect(),
+            streams: cursor
+                .saved_subagent_counts
+                .iter()
+                .filter(|(id, count)| {
+                    session
+                        .subagent_messages
+                        .get(*id)
+                        .is_none_or(|messages| **count > messages.len())
+                        || stamped(&rewritten.streams, id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.history && self.tool_outputs.is_empty() && self.streams.is_empty()
     }
 }
 
@@ -6857,6 +6922,79 @@ pub(super) fn directory_bytes(path: &Path) -> u64 {
         .flatten()
         .map(|entry| directory_bytes(&entry.path()))
         .sum()
+}
+
+fn register_archive(
+    transaction: &Transaction<'_>,
+    archive: &PreparedArchive,
+) -> Result<(), SessionError> {
+    transaction.execute(
+        "INSERT INTO pending_archives \
+         (session_id, expected_write_version, pending_name, byte_count) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            archive.session_id.as_bytes().as_slice(),
+            archive.expected_write_version,
+            &archive.pending_name,
+            to_i64(archive.bytes, "pending archive bytes")?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Deletes the stored rows `targets` replaces or removes, returning their
+/// logical bytes. A stream the session no longer has loses its row too.
+fn delete_targets<M, U, T>(
+    transaction: &Transaction<'_>,
+    session: &Session<M, U, T>,
+    targets: &RewriteTargets,
+) -> Result<usize, SessionError> {
+    let id = session.id.as_bytes();
+    let mut removed = 0usize;
+    if targets.history {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM main_history_items WHERE session_id = ?1 RETURNING byte_count",
+            params![id.as_slice()],
+        )?;
+    }
+    for tool_id in &targets.tool_outputs {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM tool_outputs WHERE session_id = ?1 AND tool_id = ?2 \
+             RETURNING byte_count",
+            params![id.as_slice(), tool_id],
+        )?;
+    }
+    for stream in &targets.streams {
+        removed += deleted_bytes(
+            transaction,
+            "DELETE FROM subagent_history_items WHERE session_id = ?1 AND subagent_id = ?2 \
+             RETURNING byte_count",
+            params![id.as_slice(), stream],
+        )?;
+        if !session.subagent_messages.contains_key(stream) {
+            transaction.execute(
+                "DELETE FROM subagent_streams WHERE session_id = ?1 AND subagent_id = ?2",
+                params![id.as_slice(), stream],
+            )?;
+        }
+    }
+    Ok(removed)
+}
+
+fn deleted_bytes(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<usize, SessionError> {
+    let mut statement = transaction.prepare_cached(sql)?;
+    let mut rows = statement.query(params)?;
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        bytes = bytes.saturating_add(from_i64_usize(row.get(0)?, DELETED_BYTES_FIELD)?);
+    }
+    Ok(bytes)
 }
 
 fn clear_children(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), SessionError> {
@@ -10240,6 +10378,199 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(loaded.subagent_task_specs(), session.subagent_task_specs());
         assert_eq!(loaded.subagents(), session.subagents());
         assert_eq!(loaded.tool_usage(), session.tool_usage());
+    }
+
+    const CALL_A: &str = "call-a";
+    const CALL_B: &str = "call-b";
+    const ORPHAN_OUTPUT: &str = "orphan";
+    const ORPHAN_STREAM: &str = "orphan-stream";
+    const SWITCHED_MODEL: &str = "switched-model";
+    const SWITCHED_CWD: &str = "/switched";
+    const COUNT_HISTORY_DELETES: &str = "
+        CREATE TEMP TABLE history_deletes(n INTEGER NOT NULL);
+        CREATE TEMP TRIGGER history_delete AFTER DELETE ON main.main_history_items
+            BEGIN INSERT INTO history_deletes VALUES (1); END;
+    ";
+
+    fn messages(texts: &[&str]) -> Vec<TestMessage> {
+        texts
+            .iter()
+            .map(|text| TestMessage((*text).into()))
+            .collect()
+    }
+
+    fn rewritable_session(database: &mut SessionDatabase) -> (TestSession, SessionCursor) {
+        let mut session = TestSession::new(MODEL, CWD);
+        for message in messages(&[CALL_A, CALL_B]) {
+            session.push_message(message);
+        }
+        for id in [CALL_A, CALL_B, ORPHAN_OUTPUT] {
+            session.insert_tool_output(id.into(), json!({ "output": id }));
+        }
+        session.set_subagent_history(
+            CALL_B.into(),
+            messages(&["child-1", "child-2"]),
+            Some(task_spec(SPEC_MODEL)),
+        );
+        session.set_subagent_messages(ORPHAN_STREAM.into(), messages(&["orphan-child"]));
+        session.set_subagents(vec![stored_subagent(CALL_B, StoredSubagentOutcome::Done)]);
+        let cursor = database.save(&session, None).unwrap();
+        (session, cursor)
+    }
+
+    fn prune(session: &mut TestSession) {
+        session.prune_orphans(|message| vec![message.0.clone()]);
+    }
+
+    fn compact(session: &mut TestSession) {
+        session.replace_messages(messages(&[CALL_B]));
+    }
+
+    fn replace_output(session: &mut TestSession) {
+        session.insert_tool_output(CALL_A.into(), json!("replaced"));
+    }
+
+    fn rewrite_stream(session: &mut TestSession) {
+        session.set_subagent_messages(CALL_B.into(), messages(&["child-1-edited"]));
+    }
+
+    fn readd_after_prune(session: &mut TestSession) {
+        prune(session);
+        session.insert_tool_output(ORPHAN_OUTPUT.into(), json!("again"));
+        session.set_subagent_messages(ORPHAN_STREAM.into(), messages(&["readded"]));
+    }
+
+    fn switch_model(session: &mut TestSession) {
+        session.set_model(SWITCHED_MODEL.into());
+    }
+
+    fn switch_cwd(session: &mut TestSession) {
+        session.set_cwd(SWITCHED_CWD.into());
+    }
+
+    fn stored_rows(database: &SessionDatabase, id: CaudraId) -> Vec<String> {
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT CAST(ordinal AS TEXT), payload, byte_count FROM main_history_items \
+             WHERE session_id = ?1 ORDER BY ordinal",
+            "SELECT tool_id, payload, byte_count FROM tool_outputs \
+             WHERE session_id = ?1 ORDER BY tool_id",
+            "SELECT subagent_id || '/' || ordinal, payload, byte_count FROM subagent_history_items \
+             WHERE session_id = ?1 ORDER BY subagent_id, ordinal",
+        ] {
+            let mut statement = database.connection.prepare(sql).unwrap();
+            let mut query = statement.query(params![id.as_bytes().as_slice()]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                let key: String = row.get(0).unwrap();
+                let payload = decompress_payload(&row.get::<_, Vec<u8>>(1).unwrap(), "payload");
+                let bytes: i64 = row.get(2).unwrap();
+                rows.push(format!("{key}={}:{bytes}", payload.unwrap()));
+            }
+        }
+        for sql in [
+            "SELECT subagent_id || '=' || coalesce(task_spec, '') FROM subagent_streams \
+             WHERE session_id = ?1 ORDER BY subagent_id",
+            "SELECT tool_use_id FROM subagents WHERE session_id = ?1 ORDER BY ordinal",
+            "SELECT cwd || ':' || model || ':' || logical_bytes || ':' || history_item_count \
+             || ':' || tool_output_count || ':' || subagent_item_count FROM sessions WHERE id = ?1",
+        ] {
+            let mut statement = database.connection.prepare(sql).unwrap();
+            let mut query = statement.query(params![id.as_bytes().as_slice()]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                rows.push(row.get(0).unwrap());
+            }
+        }
+        rows
+    }
+
+    #[test_case(compact, true ; "a_compaction")]
+    #[test_case(replace_output, false ; "a_replaced_tool_output")]
+    #[test_case(rewrite_stream, false ; "a_rewritten_subagent_stream")]
+    #[test_case(prune, false ; "removed_outputs_and_streams")]
+    #[test_case(readd_after_prune, false ; "outputs_and_streams_readded_after_removal")]
+    #[test_case(switch_model, false ; "a_model_switch")]
+    #[test_case(switch_cwd, false ; "a_cwd_switch")]
+    fn a_targeted_save_stores_what_a_full_save_would(
+        mutate: fn(&mut TestSession),
+        history_rewritten: bool,
+    ) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        database
+            .connection
+            .execute_batch(COUNT_HISTORY_DELETES)
+            .unwrap();
+        mutate(&mut session);
+
+        database.save(&session, Some(&cursor)).unwrap();
+
+        let history_deletes: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM history_deletes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_deletes > 0, history_rewritten);
+        let targeted = stored_rows(&database, session.id);
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.tool_outputs, session.tool_outputs);
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(loaded.subagent_task_specs(), session.subagent_task_specs());
+        assert_eq!(
+            (loaded.model, loaded.cwd),
+            (session.model.clone(), session.cwd.clone())
+        );
+        database.save(&session, None).unwrap();
+        assert_eq!(targeted, stored_rows(&database, session.id));
+    }
+
+    #[test]
+    fn a_targeted_compaction_archives_the_longer_history() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        compact(&mut session);
+
+        database.save(&session, Some(&cursor)).unwrap();
+
+        let archive_dir = state
+            .path()
+            .join(super::super::SESSIONS_DIR)
+            .join(super::super::ARCHIVE_DIR)
+            .join(session.id.to_string());
+        assert_eq!(fs::read_dir(archive_dir).unwrap().count(), 1);
+        let pending: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM pending_archives", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test_case(replace_output ; "a_replaced_tool_output")]
+    #[test_case(prune ; "removed_outputs_and_streams")]
+    fn a_targeted_save_still_detects_a_concurrent_writer(mutate: fn(&mut TestSession)) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut session, cursor) = rewritable_session(&mut database);
+        mutate(&mut session);
+        database
+            .connection
+            .execute(
+                "UPDATE sessions SET write_version = write_version + 1 WHERE id = ?1",
+                params![session.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let before = stored_rows(&database, session.id);
+
+        let error = database.save(&session, Some(&cursor)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::ConcurrentSessionWriter { .. }
+        ));
+        assert_eq!(stored_rows(&database, session.id), before);
     }
 
     fn stored_subagent(id: &str, outcome: StoredSubagentOutcome) -> StoredSubagent {

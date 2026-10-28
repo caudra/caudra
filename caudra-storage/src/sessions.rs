@@ -772,8 +772,7 @@ impl<M> Default for HistorySnapshot<M> {
 /// The conversation collections are private so every change goes through a
 /// mutator that classifies itself: `revision` says "this needs writing",
 /// `epoch` says append cursors are void, and `rewrites` identifies replacement
-/// of existing canonical values. `cwd` and `model` go through setters because
-/// changing either also invalidates append classification.
+/// of existing canonical values, stamping each target it replaced.
 ///
 /// [`SessionMeta`] is the part the owner mirrors from its own live state and
 /// hands over whole on every checkpoint. Whatever the session maintains itself
@@ -831,12 +830,16 @@ pub struct Session<M, U, T> {
     /// it changes, every append cursor into the log is void.
     #[serde(skip, default = "next_epoch")]
     epoch: u64,
-    /// Bumped when this session rewrites a collection in place (replaced
-    /// messages, tool outputs or subagent histories). Kept apart from
-    /// `epoch` so `set_history` adopting a producer's snapshot can never
+    /// A clock ticked when this session rewrites a collection in place
+    /// (replaced messages, tool outputs or subagent histories). Kept apart
+    /// from `epoch` so `set_history` adopting a producer's snapshot can never
     /// erase a locally minted void: cursor validity is the pair.
     #[serde(skip)]
     rewrites: u64,
+    /// The `rewrites` tick at which each target was last replaced, so a save
+    /// replaces only what changed since its cursor.
+    #[serde(skip)]
+    rewritten: RewriteStamps,
     /// Frozen expected database version for this snapshot. Clones capture the
     /// latest committed value from the shared atomic, while a clone already in
     /// flight keeps its base so a later commit makes that snapshot stale.
@@ -850,6 +853,15 @@ pub struct Session<M, U, T> {
     /// stores the fork copies them in its own transaction.
     #[serde(skip)]
     forked_outputs: Option<Arc<ForkedOutputs>>,
+}
+
+/// Removing a tool output or stream stamps it too: one re-added under the same
+/// id is a replacement, not an append.
+#[derive(Debug, Clone, Default)]
+struct RewriteStamps {
+    history: u64,
+    tool_outputs: HashMap<String, u64>,
+    streams: HashMap<String, u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -885,6 +897,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             messages_revision: self.messages_revision,
             epoch: self.epoch,
             rewrites: self.rewrites,
+            rewritten: self.rewritten.clone(),
             base_write_version: AtomicI64::new(write_version),
             write_version: Arc::clone(&self.write_version),
             forked_outputs: self.forked_outputs.clone(),
@@ -1370,6 +1383,7 @@ where
             messages_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
+            rewritten: RewriteStamps::default(),
             base_write_version: AtomicI64::new(-1),
             write_version: new_write_version(),
             forked_outputs: None,
@@ -1448,12 +1462,13 @@ where
         self.revision += 1;
     }
 
-    /// Every append cursor into the log is void from here on. Counted in
-    /// `rewrites`, which snapshot adoption never touches, so a same-frame
-    /// `set_history` cannot erase the void before the writer sees it.
-    fn rewrite(&mut self) {
+    /// Ticks `rewrites`, which snapshot adoption never touches, so a
+    /// same-frame `set_history` cannot erase the void before the writer sees
+    /// it. Returns the tick to stamp the replaced target with.
+    fn rewrite(&mut self) -> u64 {
         self.rewrites += 1;
         self.touch();
+        self.rewrites
     }
 
     /// [`Self::rewrite`] for local changes to `messages`: they also leave the
@@ -1463,7 +1478,7 @@ where
     fn rewrite_messages(&mut self) {
         self.epoch = next_epoch();
         self.messages_revision += 1;
-        self.rewrite();
+        self.rewritten.history = self.rewrite();
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -1493,7 +1508,7 @@ where
         if append_only {
             self.touch();
         } else {
-            self.rewrite();
+            self.rewritten.history = self.rewrite();
         }
     }
 
@@ -1571,8 +1586,13 @@ where
     /// A change under an existing id is not expressible as an append, so it
     /// voids the cursors; a new id is a pure append.
     pub fn insert_tool_output(&mut self, id: String, output: T) {
-        if self.tool_outputs.insert(id, Arc::new(output)).is_some() {
-            self.rewrite();
+        if self
+            .tool_outputs
+            .insert(id.clone(), Arc::new(output))
+            .is_some()
+        {
+            let tick = self.rewrite();
+            self.rewritten.tool_outputs.insert(id, tick);
         } else {
             self.touch();
         }
@@ -1609,7 +1629,7 @@ where
         let spec_changed = previous_spec != spec.as_ref();
         self.subagent_messages.insert(id.clone(), Arc::new(msgs));
         if let Some(spec) = spec {
-            self.subagent_task_specs.insert(id, spec);
+            self.subagent_task_specs.insert(id.clone(), spec);
         } else {
             self.subagent_task_specs.remove(&id);
         }
@@ -1619,7 +1639,8 @@ where
         if append_only {
             self.touch();
         } else {
-            self.rewrite();
+            let tick = self.rewrite();
+            self.rewritten.streams.insert(id, tick);
         }
     }
 
@@ -1730,14 +1751,13 @@ where
         self.touch();
     }
 
-    /// Header field: appends never rewrite the header, so the change voids
-    /// the cursors to force a full rewrite.
+    /// Header field: every save writes the session row whole.
     pub fn set_cwd(&mut self, cwd: String) {
         if self.cwd == cwd {
             return;
         }
         self.cwd = cwd;
-        self.rewrite();
+        self.touch();
     }
 
     /// Header field, see [`Self::set_cwd`].
@@ -1746,7 +1766,7 @@ where
             return;
         }
         self.model = model;
-        self.rewrite();
+        self.touch();
     }
 
     pub fn usage_by_purpose(&self) -> &HashMap<String, StoredTokenUsage> {
@@ -1815,8 +1835,16 @@ where
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
+        let tick = self.rewrite();
         let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        let streams = &mut self.rewritten.streams;
+        self.subagent_messages.retain(|id, _| {
+            let keep = main_ids.contains(id);
+            if !keep {
+                streams.insert(id.clone(), tick);
+            }
+            keep
+        });
         self.subagent_task_specs
             .retain(|id, _| self.subagent_messages.contains_key(id));
         self.subagents
@@ -1829,8 +1857,14 @@ where
             .flat_map(&tool_ids)
             .chain(main_ids)
             .collect();
-        self.tool_outputs.retain(|id, _| live.contains(id));
-        self.rewrite();
+        let outputs = &mut self.rewritten.tool_outputs;
+        self.tool_outputs.retain(|id, _| {
+            let keep = live.contains(id);
+            if !keep {
+                outputs.insert(id.clone(), tick);
+            }
+            keep
+        });
     }
 
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
