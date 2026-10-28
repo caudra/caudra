@@ -1,6 +1,7 @@
 pub mod auth;
 pub(crate) mod catalog;
 mod platform;
+mod usage;
 
 pub use platform::Xai;
 

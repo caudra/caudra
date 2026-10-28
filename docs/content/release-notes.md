@@ -7,6 +7,13 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 17 {#v0-2-0-preview-17}
+
+[v0.2.0-preview.17 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.17)
+
+- **xAI subscription quotas in `/usage`.** Shows included-credit usage and its reset time, plus prepaid and on-demand balances when reported. Free-tier rolling 24-hour restrictions appear after a refused request, with the observed token counts and timestamp. These observations do not claim an exact reset time and clear after a successful request for that model or after 24 hours.
+- **Stop retrying exhausted xAI free usage.** A free-usage exhaustion response no longer triggers repeated short retries. Automatic account selection can switch to another eligible account. Pinned accounts remain pinned and report the restriction.
+
 ## Caudra 0.2 Preview 16 {#v0-2-0-preview-16}
 
 [v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)

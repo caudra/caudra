@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use caudra_storage::auth::now_millis;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use tracing::{debug, info};
 
@@ -10,19 +13,30 @@ use crate::accounts::{AccountCredential, AccountSecret};
 use crate::error::{DETAIL_CAP, provider_detail};
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
-use crate::providers::oauth::AccountStore;
+use crate::providers::oauth::{AccountStore, jwt_claims};
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit,
 };
 
-use super::{auth, catalog};
+use super::{auth, catalog, usage};
 
 const UPGRADE_REQUIRED: u16 = 426;
 const VERSION_REFUSED: &str = "xAI's Grok CLI proxy refused client version";
 const PROXY_SAID: &str = "The proxy said:";
+const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const ROLLING_DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const TOKEN_COUNTS_MARKER: &str = "tokens (actual/limit): ";
+const BILLING_ACCOUNT_CHANGED: &str =
+    "xAI account changed while fetching usage; refresh usage again";
+
+struct ObservedQuota {
+    at: u64,
+    limit: UsageLimit,
+}
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "xai",
@@ -38,6 +52,7 @@ pub struct Xai {
     oauth: AtomicBool,
     store: Option<AccountStore>,
     system_prefix: Option<String>,
+    observed_quotas: Mutex<BTreeMap<String, ObservedQuota>>,
 }
 
 impl Xai {
@@ -48,6 +63,7 @@ impl Xai {
             oauth: AtomicBool::new(account.is_oauth()),
             store: AccountStore::for_account(account)?,
             system_prefix: None,
+            observed_quotas: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -58,6 +74,7 @@ impl Xai {
             oauth: AtomicBool::new(false),
             store: None,
             system_prefix: None,
+            observed_quotas: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -84,9 +101,7 @@ impl Xai {
         let tokens =
             smol::unblock(move || auth::refresh_from_storage(&store, &rejected_accesses)).await?;
         let resolved = auth::build_oauth_resolved(&tokens);
-        let mut current = self.auth.lock().unwrap();
-        if *current != resolved {
-            *current = resolved;
+        if self.install_auth(resolved) {
             info!(
                 target: target::PROVIDER,
                 event = crate::auth_events::REFRESHED,
@@ -122,10 +137,88 @@ impl Xai {
     }
 
     fn install_secret(&self, secret: &AccountSecret) -> Result<(), AgentError> {
-        *self.auth.lock().unwrap() = auth::account_auth(secret)?;
+        self.install_auth(auth::account_auth(secret)?);
         self.oauth
             .store(matches!(secret, AccountSecret::OAuth(_)), Ordering::Relaxed);
         Ok(())
+    }
+
+    fn install_auth(&self, resolved: ResolvedAuth) -> bool {
+        let mut current = self.auth.lock().unwrap();
+        if *current == resolved {
+            return false;
+        }
+        if !same_identity(&current, &resolved) {
+            self.observed_quotas.lock().unwrap().clear();
+        }
+        *current = resolved;
+        true
+    }
+
+    fn observe_result<T>(
+        &self,
+        model: &str,
+        result: &Result<T, AgentError>,
+        at: u64,
+        auth: &ResolvedAuth,
+    ) {
+        let current = self.auth.lock().unwrap();
+        if !same_identity(&current, auth) {
+            return;
+        }
+        let mut observed = self.observed_quotas.lock().unwrap();
+        observed.retain(|_, quota| at.saturating_sub(quota.at) < ROLLING_DAY_MS);
+        match result {
+            Ok(_) => {
+                observed.remove(model);
+            }
+            Err(error) if error.is_free_usage_exhausted() => {
+                observed.insert(model.to_owned(), observed_quota(model, error, at));
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn append_observed_quotas(
+        &self,
+        usage: &mut ProviderUsage,
+        now: u64,
+        auth: &ResolvedAuth,
+    ) -> Result<(), AgentError> {
+        let current = self.auth.lock().unwrap();
+        if !same_identity(&current, auth) {
+            return Err(AgentError::Config {
+                message: BILLING_ACCOUNT_CHANGED.into(),
+            });
+        }
+        let mut observed = self.observed_quotas.lock().unwrap();
+        observed.retain(|_, quota| now.saturating_sub(quota.at) < ROLLING_DAY_MS);
+        usage
+            .limits
+            .extend(observed.values().map(|quota| quota.limit.clone()));
+        Ok(())
+    }
+
+    async fn fetch_usage_at(&self, url: &str) -> Result<Option<ProviderUsage>, AgentError> {
+        if !self.is_oauth() {
+            return Ok(None);
+        }
+        let (mut usage, auth) = self
+            .with_oauth_retry(|| async {
+                let mut auth = self.current_auth();
+                if let Some(subject) = bearer_token(&auth)
+                    .and_then(|token| jwt_claims(&token))
+                    .and_then(|claims| claims.get("sub")?.as_str().map(str::to_owned))
+                    .filter(|subject| !subject.is_empty())
+                {
+                    auth.headers.push(("x-userid".into(), subject));
+                }
+                let response = self.compat.get_text(&auth, url).await?;
+                Ok((usage::parse_usage(&response)?, auth))
+            })
+            .await?;
+        self.append_observed_quotas(&mut usage, now_millis(), &auth)?;
+        Ok(Some(usage))
     }
 
     /// What one attempt posts with `auth`, for the send and the dry run alike:
@@ -249,7 +342,7 @@ impl Provider for Xai {
                         .await;
                 }
                 auth.headers.extend(proxy_request_headers(model, cache_key));
-                responses::do_stream(
+                let result = responses::do_stream(
                     self.compat.client(),
                     model,
                     &wire,
@@ -258,7 +351,9 @@ impl Provider for Xai {
                     self.compat.stream_timeout(),
                 )
                 .await
-                .map_err(explain_version_gate)
+                .map_err(explain_version_gate);
+                self.observe_result(&model.id, &result, now_millis(), &auth);
+                result
             })
             .await
         })
@@ -315,7 +410,7 @@ impl Provider for Xai {
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
-        Box::pin(async { Ok(None) })
+        Box::pin(self.fetch_usage_at(BILLING_URL))
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -353,6 +448,65 @@ impl Provider for Xai {
     }
 }
 
+fn same_identity(left: &ResolvedAuth, right: &ResolvedAuth) -> bool {
+    let left = bearer_token(left);
+    let right = bearer_token(right);
+    if left == right {
+        return true;
+    }
+    let claims = |token: Option<String>| token.and_then(|token| jwt_claims(&token));
+    let (Some(left), Some(right)) = (claims(left), claims(right)) else {
+        return false;
+    };
+    left.get("sub")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| !subject.is_empty())
+        && ["sub", "iss", "principal_id", "principal_type"]
+            .iter()
+            .all(|key| left.get(key) == right.get(key))
+}
+
+fn observed_quota(model: &str, error: &AgentError, at: u64) -> ObservedQuota {
+    let counts = match error {
+        AgentError::Api { message, .. } => serde_json::from_str::<Value>(message)
+            .ok()
+            .and_then(|body| {
+                let detail = body.get("error")?;
+                let detail = detail
+                    .as_str()
+                    .or_else(|| detail.get("message")?.as_str())?;
+                let (_, counts) = detail.split_once(TOKEN_COUNTS_MARKER)?;
+                let (used, limit) = counts.split_once('/')?;
+                let used = used.parse::<u64>().ok()?;
+                let limit = limit
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                let limit = limit.parse::<u64>().ok().filter(|limit| *limit > 0)?;
+                Some(format!("{used}/{limit} tokens; "))
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let timestamp = i64::try_from(at)
+        .ok()
+        .and_then(|at| Timestamp::from_millisecond(at).ok())
+        .map_or_else(|| at.to_string(), |timestamp| timestamp.to_string());
+    ObservedQuota {
+        at,
+        limit: UsageLimit {
+            label: format!("{model} free usage (observed)"),
+            percentage: None,
+            reset_at: None,
+            detail: Some(format!(
+                "{counts}exhausted at {timestamp}; rolling 24-hour window, reset time unknown"
+            )),
+            window: None,
+            length_secs: None,
+        },
+    }
+}
+
 fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
     auth.headers.iter().find_map(|(key, value)| {
         if !key.eq_ignore_ascii_case("authorization") {
@@ -367,7 +521,11 @@ fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use caudra_storage::auth::OAuthTokens;
+    use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+    use smol::net::TcpListener;
     use test_case::test_case;
 
     use super::*;
@@ -387,6 +545,12 @@ mod tests {
     const VERSION_GATE_DETAIL: &str =
         "Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later.";
     const VERSION_GATE_BODY: &str = r#"{"error":"Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later."}"#;
+    const QUOTA_BODY: &str = r#"{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.7 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 639471/600000. Upgrade for higher limits."}"#;
+    const QUOTA_MODEL: &str = "grok-4.7";
+    const OBSERVED_AT: u64 = 1_793_186_597_760;
+    const BILLING_BODY: &str = r#"{"config":{"creditUsagePercent":76,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-11-03T19:07:54Z"}}}"#;
+    const SUBJECT: &str = "quota-test-subject";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn provider_with_login() -> Xai {
         let tokens = OAuthTokens {
@@ -526,6 +690,195 @@ mod tests {
             headers: vec![("authorization".into(), "Bearer tok-123".into())],
         };
         assert_eq!(bearer_token(&auth).as_deref(), Some("tok-123"));
+    }
+
+    fn quota_error() -> Result<(), AgentError> {
+        Err(AgentError::api(429, QUOTA_BODY))
+    }
+
+    fn observed_limits(provider: &Xai, now: u64) -> Vec<UsageLimit> {
+        let mut usage = ProviderUsage {
+            plan: None,
+            limits: Vec::new(),
+        };
+        provider
+            .append_observed_quotas(&mut usage, now, &provider.current_auth())
+            .unwrap();
+        usage.limits
+    }
+
+    #[test]
+    fn exhausted_quota_is_an_observation_not_a_reset_or_routing_window() {
+        let provider = provider_with_login();
+        provider.observe_result(
+            QUOTA_MODEL,
+            &quota_error(),
+            OBSERVED_AT,
+            &provider.current_auth(),
+        );
+        let limits = observed_limits(&provider, OBSERVED_AT);
+        assert_eq!(limits.len(), 1);
+        let limit = &limits[0];
+        assert!(limit.label.contains(QUOTA_MODEL));
+        let detail = limit.detail.as_deref().unwrap();
+        assert!(detail.contains("639471/600000 tokens"));
+        assert!(detail.contains("2026-10-28T"));
+        assert!(detail.contains("reset time unknown"));
+        assert_eq!(limit.percentage, None);
+        assert_eq!(limit.reset_at, None);
+        assert!(limit.quota_window().is_none());
+        assert!(observed_limits(&provider_with_login(), OBSERVED_AT).is_empty());
+    }
+
+    #[test]
+    fn observations_expire_and_success_clears_only_the_matching_model() {
+        let provider = provider_with_login();
+        let auth = provider.current_auth();
+        provider.observe_result(QUOTA_MODEL, &quota_error(), OBSERVED_AT, &auth);
+        provider.observe_result("grok-4.6", &Ok(()), OBSERVED_AT, &auth);
+        provider.observe_result(
+            QUOTA_MODEL,
+            &Err::<(), _>(AgentError::api(500, "unavailable")),
+            OBSERVED_AT,
+            &auth,
+        );
+        assert_eq!(observed_limits(&provider, OBSERVED_AT).len(), 1);
+        provider.observe_result(QUOTA_MODEL, &Ok(()), OBSERVED_AT, &auth);
+        assert!(observed_limits(&provider, OBSERVED_AT).is_empty());
+        provider.observe_result(QUOTA_MODEL, &quota_error(), OBSERVED_AT, &auth);
+        assert!(observed_limits(&provider, OBSERVED_AT + ROLLING_DAY_MS).is_empty());
+    }
+
+    #[test]
+    fn api_key_usage_never_contacts_subscription_billing() {
+        assert!(
+            smol::block_on(provider_with_key().fetch_usage_at("not a URL"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn refreshed_identity_keeps_observations_but_replaced_identity_clears_them() {
+        let provider = provider_with_login();
+        let login = |subject: &str, expires: u64| {
+            ResolvedAuth::bearer(&crate::providers::oauth::unsigned_jwt(&json!({
+                "sub": subject, "exp": expires,
+            })))
+        };
+        let original = login(SUBJECT, 1);
+        provider.install_auth(original.clone());
+        provider.observe_result(QUOTA_MODEL, &quota_error(), OBSERVED_AT, &original);
+        provider.install_auth(login(SUBJECT, 2));
+        assert_eq!(observed_limits(&provider, OBSERVED_AT).len(), 1);
+        provider.install_auth(login("replacement", 2));
+        assert!(observed_limits(&provider, OBSERVED_AT).is_empty());
+        provider.observe_result(QUOTA_MODEL, &quota_error(), OBSERVED_AT, &original);
+        assert!(observed_limits(&provider, OBSERVED_AT).is_empty());
+        let replacement = provider.current_auth();
+        provider.observe_result(QUOTA_MODEL, &quota_error(), OBSERVED_AT, &replacement);
+        provider.observe_result(QUOTA_MODEL, &Ok(()), OBSERVED_AT, &original);
+        assert_eq!(observed_limits(&provider, OBSERVED_AT).len(), 1);
+        let mut usage = ProviderUsage {
+            plan: None,
+            limits: Vec::new(),
+        };
+        assert_eq!(
+            provider
+                .append_observed_quotas(&mut usage, OBSERVED_AT, &original)
+                .unwrap_err()
+                .to_string(),
+            BILLING_ACCOUNT_CHANGED
+        );
+        assert!(usage.limits.is_empty());
+    }
+
+    #[test_case(200, BILLING_BODY, false ; "billing_success")]
+    #[test_case(401, "{}", false ; "auth_error")]
+    #[test_case(429, QUOTA_BODY, false ; "quota_error")]
+    #[test_case(500, "{}", false ; "server_error")]
+    #[test_case(200, "not json", false ; "malformed_response")]
+    #[test_case(200, BILLING_BODY, true ; "replaced_account_rejects_inflight_billing")]
+    fn oauth_usage_fetches_billing_with_account_headers(
+        status: u16,
+        body: &str,
+        replace_identity: bool,
+    ) {
+        smol::block_on(smol::future::or(
+            async {
+                let provider = provider_with_login();
+                let token = crate::providers::oauth::unsigned_jwt(&json!({"sub": SUBJECT}));
+                provider
+                    .auth
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .retain(|(name, _)| name != "authorization");
+                provider
+                    .auth
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .push(("authorization".into(), format!("Bearer {token}")));
+                provider.observe_result(
+                    QUOTA_MODEL,
+                    &quota_error(),
+                    now_millis(),
+                    &provider.current_auth(),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!(
+                    "http://{}/v1/billing?format=credits",
+                    listener.local_addr().unwrap()
+                );
+                let server = async {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 4096];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0 && request.len() < 65536);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    if replace_identity {
+                        provider.install_auth(ResolvedAuth::bearer("replacement-account-token"));
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    String::from_utf8(request).unwrap().to_ascii_lowercase()
+                };
+                let (result, request) = futures::join!(provider.fetch_usage_at(&url), server);
+                assert!(request.starts_with("get /v1/billing?format=credits "));
+                assert!(request.contains(&format!(
+                    "authorization: bearer {}",
+                    token.to_ascii_lowercase()
+                )));
+                assert!(request.contains(&format!("x-userid: {SUBJECT}")));
+                assert!(request.contains("x-xai-token-auth: xai-grok-cli"));
+                if replace_identity {
+                    assert_eq!(result.unwrap_err().to_string(), BILLING_ACCOUNT_CHANGED);
+                } else if status == 200 && body == BILLING_BODY {
+                    let usage = result.unwrap().unwrap();
+                    assert_eq!(usage.limits[0].percentage, Some(76));
+                    assert!(
+                        usage
+                            .limits
+                            .iter()
+                            .any(|limit| limit.label.contains("observed"))
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.status(), (status != 200).then_some(status));
+                }
+            },
+            async {
+                smol::Timer::after(TEST_TIMEOUT).await;
+                panic!("billing mock request timed out");
+            },
+        ));
     }
 
     #[test]
