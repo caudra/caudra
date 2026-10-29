@@ -42,6 +42,7 @@ const TIER_SEPARATOR: &str = "; ";
 const NO_DIFFERENCES: &str = "No differences.";
 const NEW_MODELS_HEADING: &str = "## New models\n";
 const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `caudra-providers/src/decision_pricing.rs` when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
+const RETIRED_HEADING: &str = "## Retired, remove from the table\n\nPast the shutdown day of their availability row, so every list already leaves them out. Delete each entry and its row.\n";
 const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `ACCEPTED` as `Field::Unlisted` with the reason.\n";
 const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
 const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
@@ -68,12 +69,14 @@ const COPILOT_OUTPUT: &str = "GitHub publishes no output limit (https://docs.git
 const LEAD_NOT_SOURCE: &str = "models.dev is a lead, not a source: confirm every row on the provider's own model card, pricing, or deprecation page before changing a table. A divergence that is deliberate goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs` with the value shown here and the reason.";
 
 /// What a finding is about. Each one is a column of a table entry, except
-/// [`Field::Unlisted`] (models.dev has a model no table names) and
+/// [`Field::Unlisted`] (models.dev has a model no table names),
+/// [`Field::Retired`] (a table entry is past its shutdown day) and
 /// [`Field::Missing`] (a table names a model models.dev does not list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Field {
     Unlisted,
     Status,
+    Retired,
     Input,
     Output,
     CacheRead,
@@ -89,6 +92,7 @@ impl Field {
         match self {
             Self::Unlisted => "unlisted",
             Self::Status => "status",
+            Self::Retired => "retired",
             Self::Input => "input $/MTok",
             Self::Output => "output $/MTok",
             Self::CacheRead => "cache read $/MTok",
@@ -628,6 +632,15 @@ fn table_findings(
         .iter()
         .flat_map(|entry| {
             let primary = entry.prefixes.first().copied().unwrap_or_default();
+            if let Some(shutdown) = shut_down_by(manifest, entry, today) {
+                return vec![Finding {
+                    provider: manifest.slug,
+                    model: primary.to_owned(),
+                    field: Field::Retired,
+                    ours: shutdown.to_string(),
+                    catalog: NOT_LISTED.to_owned(),
+                }];
+            }
             match listed.and_then(|models| find_listing(entry, models)) {
                 Some((id, listing)) => entry_findings(manifest, entry, id, listing, today),
                 None => vec![Finding {
@@ -640,6 +653,14 @@ fn table_findings(
             }
         })
         .collect()
+}
+
+/// The day `entry` left the lists, once `today` has reached it.
+fn shut_down_by(manifest: &ProviderManifest, entry: &ModelEntry, today: Date) -> Option<Date> {
+    manifest
+        .availability(entry)
+        .and_then(|row| row.during.until)
+        .filter(|until| *until <= today)
 }
 
 /// The catalog's listing of `entry`: one of its prefixes exactly, else a dated
@@ -677,15 +698,20 @@ fn entry_findings(
         catalog,
     };
     let mut findings = Vec::new();
-    if listed.listing.status.as_deref() == Some(DEPRECATED) {
+    // A shutdown day already on the table is handled: the entry leaves the
+    // lists by itself, and the report says when to delete it.
+    let scheduled = manifest
+        .availability(entry)
+        .is_some_and(|row| row.during.until.is_some());
+    if listed.listing.status.as_deref() == Some(DEPRECATED) && !scheduled {
         findings.push(finding(
             Field::Status,
             NOT_LISTED.to_owned(),
             DEPRECATED.to_owned(),
         ));
     }
-    let pricing = match manifest.price_change(entry) {
-        Some(change) if change.from <= today => &change.pricing,
+    let pricing = match manifest.price_period(entry) {
+        Some(period) if period.during.contains_day(today) => &period.pricing,
         _ => &entry.pricing,
     };
     if let Some(cost) = &listed.model.cost {
@@ -933,6 +959,20 @@ impl Audit {
             }
             writeln!(f)?;
         }
+        let retired = self.section(&[Field::Retired]);
+        if !retired.is_empty() {
+            writeln!(f, "{RETIRED_HEADING}")?;
+            writeln!(f, "| Provider | Model | Shut down |")?;
+            writeln!(f, "|---|---|---|")?;
+            for finding in retired {
+                writeln!(
+                    f,
+                    "| {} | `{}` | {} |",
+                    finding.provider, finding.model, finding.ours
+                )?;
+            }
+            writeln!(f)?;
+        }
         let deprecated = self.section(&[Field::Status]);
         if !deprecated.is_empty() {
             writeln!(f, "## Deprecated\n")?;
@@ -1048,6 +1088,12 @@ mod tests {
         "an unlisted model must name no table prefix, and every other field must name one";
     const NO_REASON: &str = "an acceptance needs a reason";
     const COPILOT: &str = "copilot";
+    const COPILOT_CATALOG: &str = "github-copilot";
+    const RETIRING: &str = "claude-opus-5";
+    const LAST_DAY_BEFORE_SHUTDOWN: Date = date(2026, 11, 15);
+    const SHUTDOWN_DAY: Date = date(2026, 11, 16);
+    const SCHEDULED: &str =
+        "a shutdown the table schedules reports once its day has come, and only as retired";
     const OPENAI: &str = "openai";
     const COPILOT_UNTIERED: &str = "gpt-6-luna";
     const TOTAL_WINDOW: &str = "gpt-5.2";
@@ -1274,28 +1320,64 @@ mod tests {
         is_alias(id, prefix)
     }
 
-    /// models.dev already prints the announced price. Before the change's
-    /// date the table's current price is what bills, so they differ.
-    #[test_case(true ; "a_change_in_force_is_compared")]
-    #[test_case(false ; "a_pending_change_is_not")]
-    fn a_price_change_counts_from_its_date(in_force: bool) {
-        let change = ManifestRegistry::get(GOOGLE)
+    /// models.dev already prints the announced price. Before the period's
+    /// first day the table's current price is what bills, so they differ.
+    #[test_case(true ; "a_period_in_force_is_compared")]
+    #[test_case(false ; "a_pending_period_is_not")]
+    fn a_price_period_counts_from_its_date(in_force: bool) {
+        let period = ManifestRegistry::get(GOOGLE)
             .unwrap()
-            .price_changes
+            .price_periods
             .first()
             .unwrap();
-        let mut model = faithful(entry(GOOGLE, change.prefix), change.prefix);
-        model["cost"]["input"] = serde_json::json!(change.pricing.input);
-        let json = catalog(GOOGLE, serde_json::json!({ change.prefix: model }));
+        let from = period.during.from.unwrap();
+        let mut model = faithful(entry(GOOGLE, period.prefix), period.prefix);
+        model["cost"]["input"] = serde_json::json!(period.pricing.input);
+        let json = catalog(GOOGLE, serde_json::json!({ period.prefix: model }));
         let today = if in_force {
-            change.from
+            from
         } else {
-            change.from.yesterday().unwrap()
+            from.yesterday().unwrap()
         };
         let audit = audit_with(&json, today, SINCE, &[]).unwrap();
         assert_eq!(
-            fields_of(&audit, GOOGLE, change.prefix).contains(&Field::Input),
+            fields_of(&audit, GOOGLE, period.prefix).contains(&Field::Input),
             !in_force
+        );
+    }
+
+    fn deprecated_opus_5() -> String {
+        let mut model = faithful(entry(COPILOT, RETIRING), RETIRING);
+        model["status"] = serde_json::json!(DEPRECATED);
+        catalog(COPILOT_CATALOG, serde_json::json!({ RETIRING: model }))
+    }
+
+    /// An entry with a shutdown day is handled until that day, and from it on
+    /// the report asks for nothing but deleting the entry.
+    #[test_case(LAST_DAY_BEFORE_SHUTDOWN, &[] ; "a_scheduled_shutdown_is_not_a_finding")]
+    #[test_case(SHUTDOWN_DAY, &[Field::Retired] ; "past_the_shutdown_only_the_retirement_reports")]
+    fn a_dated_shutdown_settles_the_deprecation(today: Date, expected: &[Field]) {
+        let audit = audit_with(&deprecated_opus_5(), today, SINCE, ACCEPTED).unwrap();
+        let fields = fields_of(&audit, COPILOT, RETIRING);
+        assert!(!fields.contains(&Field::Status), "{SCHEDULED}");
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| **field == Field::Retired)
+                .copied()
+                .collect::<Vec<_>>(),
+            expected,
+            "{SCHEDULED}"
+        );
+        let report = audit.to_string();
+        let section = report
+            .split(RETIRED_HEADING)
+            .nth(1)
+            .and_then(|rest| rest.split(SECTION_START).next());
+        assert_eq!(
+            section.is_some_and(|rows| rows.contains(RETIRING)),
+            !expected.is_empty(),
+            "{SCHEDULED}"
         );
     }
 

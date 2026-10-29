@@ -1,17 +1,34 @@
 //! The release notes under `release-notes/`, one `<version>.md` file per release, as Caudra shows them after an
-//! update and in `/changelog`. The same files are the GitHub release bodies, and the release pipeline adds the
-//! install and update steps there, so a file holds only what changed: a bullet list of highlights, alerts for
-//! anything a user must do, and `###` groups.
+//! update, in `/changelog`, and on the Release notes docs page they build. The same files are the GitHub release
+//! bodies, and the release pipeline adds the install and update steps there, so a file holds only what changed: a
+//! bullet list of highlights, alerts for anything a user must do, and `###` groups.
 
 use std::cmp::Ordering;
+use std::fmt::Write;
 
 use semver::Version;
 
-use crate::SourceError;
 use crate::markdown::{Fences, atx_heading};
 use crate::slug::slugify;
+use crate::{SITE_DOCS_URL, SourceError};
 
 pub const RELEASES_URL: &str = "https://github.com/caudra/caudra/releases/tag/";
+/// The docs page the notes make, built from the files rather than checked in, so branches that each add notes
+/// do not collide in it.
+pub const RELEASE_NOTES_PAGE: &str = "release-notes.md";
+const PAGE_TITLE: &str = "Release notes";
+const PAGE_DESCRIPTION: &str = "What changed in each Caudra release, newest first.";
+const PAGE_INTRO: &str = "\
+Each release lists what changed, newest first. After an update, the first interactive start shows the notes for \
+every release since the one you ran before. Run `/changelog` to read them again, or `/changelog all` for every \
+release. [`ui.changelog_on_update`](/docs/configuration/#ui-changelog-on-update) turns the automatic view off.
+
+To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run \
+[`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds \
+the downloads.
+";
+/// Links into the docs stay on whichever site shows the page, as in the hand-written pages.
+const RELATIVE_DOCS_LINK: &str = "](/docs/";
 const GITHUB_LINK: &str = " on GitHub";
 const NOTES_EXTENSION: &str = ".md";
 const TAG_PREFIX: &str = "v";
@@ -81,6 +98,28 @@ impl ReleaseNotes {
 
     pub fn releases(&self) -> &[Release] {
         &self.releases
+    }
+
+    /// The Release notes docs page, [`RELEASE_NOTES_PAGE`]: every release under a heading whose id is its
+    /// [`Release::anchor`], with links into the docs made relative.
+    pub fn page(&self) -> String {
+        let site_link = format!("]({SITE_DOCS_URL}");
+        let mut page = format!(
+            "---\ntitle: {}\ndescription: {}\n---\n\n{PAGE_INTRO}",
+            serde_json::to_string(PAGE_TITLE).expect("title string"),
+            serde_json::to_string(PAGE_DESCRIPTION).expect("description string"),
+        );
+        for release in &self.releases {
+            write!(
+                page,
+                "\n## {} {{#{}}}\n\n{}",
+                release.title,
+                release.anchor(),
+                release.body().replace(&site_link, RELATIVE_DOCS_LINK)
+            )
+            .expect("writing to a String");
+        }
+        page
     }
 
     /// The releases a user updating from `since` to `current` has not seen: newer than `since`, up to and
@@ -250,15 +289,13 @@ fn alert(line: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
     use semver::Version;
     use test_case::test_case;
 
     use super::{HIGHLIGHT_MARKER, QUOTE, Release, ReleaseNotes, title};
     use crate::fixture::leak;
     use crate::markdown::{Fences, code_span};
+    use crate::site;
 
     const LEAD: &str = "- A change.\n\n";
     const PREVIEW_3: &str = "0.2.0-preview.3";
@@ -270,7 +307,6 @@ mod tests {
     const ALERT_ERROR: &str = "unknown alert";
     const NAME_ERROR: &str = "<version>.md";
     const DUPLICATE_ERROR: &str = "duplicate notes";
-    const NOTES_DIR: &str = "../release-notes";
     const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
     const DRAFTS_AHEAD: usize = 1;
     const MAX_HIGHLIGHTS: usize = 8;
@@ -286,6 +322,21 @@ mod tests {
     const LONG_BULLET_ERROR: &str = "bullet too long";
     const BANNED_MARK_ERROR: &str = "banned mark";
     const CONTRACTION_ERROR: &str = "contraction";
+    const OLDER: (&str, &str) = (
+        "0.2.0-preview.3.md",
+        "- Preview 3 fixes things.\n\n### Fixes\n\n- **A fix.** Details.\n",
+    );
+    const NEWER: (&str, &str) = (
+        "0.2.0-preview.4.md",
+        "- Preview 4 adds things, see [Permissions](https://caudra.ai/docs/permissions/#modes).\n\n> [!IMPORTANT]\n> **Restart.** Now.\n\n### Features\n\n- **A feature.** Details.\n",
+    );
+    const NEWER_HEADING: &str = "## Caudra 0.2 Preview 4 {#v0-2-0-preview-4}";
+    const OLDER_HEADING: &str = "## Caudra 0.2 Preview 3 {#v0-2-0-preview-3}";
+    const PAGE_GITHUB_LINK: &str = "[v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)";
+    const RELATIVE_LINK: &str = "[Permissions](/docs/permissions/#modes)";
+    const ALERT: &str = "> **Important**\n>\n> **Restart.** Now.";
+    const FRONT_MATTER: &str = "---\ntitle: \"Release notes\"\n";
+    const ABSOLUTE_DOCS_LINK: &str = "](https://caudra.ai/docs/";
 
     fn notes(versions: &[&str]) -> ReleaseNotes {
         ReleaseNotes::parse(versions.iter().map(|version| {
@@ -379,25 +430,8 @@ mod tests {
         title(&Version::parse(version).unwrap())
     }
 
-    /// Every file in `release-notes/`, read from disk, as its name and text.
-    fn checked_in_files() -> Vec<(&'static str, &'static str)> {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(NOTES_DIR);
-        let files = fs::read_dir(&directory)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (
-                    leak(entry.file_name().into_string().unwrap()),
-                    leak(fs::read_to_string(entry.path()).unwrap()),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(!files.is_empty(), "{}", directory.display());
-        files
-    }
-
     fn checked_in_notes() -> ReleaseNotes {
-        ReleaseNotes::parse(checked_in_files()).unwrap()
+        ReleaseNotes::parse(site::release_notes()).unwrap()
     }
 
     /// A line as prose: what it says outside its code spans.
@@ -493,7 +527,7 @@ mod tests {
 
     #[test]
     fn checked_in_notes_stay_focused() {
-        let problems = checked_in_files()
+        let problems = site::release_notes()
             .into_iter()
             .flat_map(|(path, text)| {
                 focus_problems(text)
@@ -562,5 +596,34 @@ mod tests {
             "[v0.2.0-preview.4 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.4)\n\n- A change."
         ));
         assert_eq!(release.anchor(), "v0-2-0-preview-4");
+    }
+
+    fn page() -> String {
+        ReleaseNotes::parse([OLDER, NEWER]).unwrap().page()
+    }
+
+    #[test_case(FRONT_MATTER ; "front_matter")]
+    #[test_case(NEWER_HEADING ; "explicit_id")]
+    #[test_case(PAGE_GITHUB_LINK ; "github_link_stays_absolute")]
+    #[test_case(RELATIVE_LINK ; "docs_link_becomes_relative")]
+    #[test_case(ALERT ; "alert_becomes_a_bold_label")]
+    fn the_page_holds(expected: &str) {
+        let page = page();
+        assert!(page.contains(expected), "{page}");
+    }
+
+    #[test]
+    fn the_page_lists_releases_newest_first() {
+        let page = page();
+        let newer = page.find(NEWER_HEADING).unwrap();
+        let older = page.find(OLDER_HEADING).unwrap();
+        assert!(newer < older, "{page}");
+    }
+
+    #[test]
+    fn the_page_has_no_absolute_docs_link_and_ends_with_one_newline() {
+        let page = page();
+        assert!(!page.contains(ABSOLUTE_DOCS_LINK), "{page}");
+        assert!(page.ends_with('\n') && !page.ends_with("\n\n"), "{page:?}");
     }
 }

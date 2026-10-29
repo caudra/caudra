@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 
 use caudra_storage::thinking::ReasoningOptions;
+use jiff::Timestamp;
 
 use crate::model::{
     ModelEntry, ModelFacts, ModelFamily, ModelGeneration, ModelPricing, ModelPurpose,
 };
-use crate::pricing::{PriceChange, PricingSchedule};
+use crate::pricing::{Period, PricePeriod, PricingSchedule};
 use crate::providers::catalog::CatalogMetaView;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
@@ -34,9 +35,12 @@ pub struct ProviderManifest {
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
-    /// Prices this provider has announced for later dates, at most one per
-    /// model prefix. Empty for everyone whose list price is not about to move.
-    pub price_changes: &'static [PriceChange],
+    /// Rates this provider sets for a span of days, at most one per entry.
+    /// Empty for everyone whose list price is not about to move.
+    pub price_periods: &'static [PricePeriod],
+    /// When the entries a provider is retiring or has not opened yet are
+    /// offered, at most one per entry. An entry without a row always is.
+    pub availability: &'static [Availability],
     /// This provider's id in the models.dev catalog, where it differs from the
     /// caudra slug. `None` for providers the catalog has no entry for: local
     /// runtimes and gateways that route somewhere else.
@@ -53,12 +57,53 @@ impl ProviderManifest {
         crate::providers::catalog::model_meta_if_available(self.catalog_slug?, model_id)
     }
 
-    /// The announced change to `entry`'s rates, whether or not it applies yet.
-    pub fn price_change(&self, entry: &ModelEntry) -> Option<&'static PriceChange> {
-        self.price_changes
+    /// The dated rates of `entry`, whether or not they are in force.
+    pub fn price_period(&self, entry: &ModelEntry) -> Option<&'static PricePeriod> {
+        self.price_periods
             .iter()
-            .find(|change| entry.prefixes.contains(&change.prefix))
+            .find(|period| entry.prefixes.contains(&period.prefix))
     }
+
+    /// When `entry` is offered, if the provider dates it.
+    pub fn availability(&self, entry: &ModelEntry) -> Option<&'static Availability> {
+        self.availability
+            .iter()
+            .find(|row| entry.prefixes.contains(&row.prefix))
+    }
+
+    pub fn is_listed_at(&self, entry: &ModelEntry, at: Timestamp) -> bool {
+        self.availability(entry)
+            .is_none_or(|row| row.during.contains(at))
+    }
+
+    /// The entries model lists and lane defaults offer at `at`, in table order.
+    pub fn listed_models_at(
+        &self,
+        at: Timestamp,
+    ) -> impl Iterator<Item = &'static ModelEntry> + use<> {
+        let manifest = *self;
+        manifest
+            .models
+            .iter()
+            .filter(move |entry| manifest.is_listed_at(entry, at))
+    }
+
+    /// [`Self::listed_models_at`] now.
+    pub fn listed_models(&self) -> impl Iterator<Item = &'static ModelEntry> + use<> {
+        self.listed_models_at(Timestamp::now())
+    }
+}
+
+/// When a provider offers a model, for one it is retiring (`Period::until` its
+/// shutdown day) or has not opened yet. Outside `during` the entry leaves model
+/// lists and lane defaults, so a later `default: true` entry takes its lane over
+/// by itself. An explicit id still resolves and prices as before, so stored
+/// sessions and configs keep their costs.
+#[derive(Debug)]
+pub struct Availability {
+    /// Any prefix of the `ModelEntry` this dates.
+    pub prefix: &'static str,
+    pub during: Period,
 }
 
 /// An entry the catalog has not classified carries an empty ladder, which must
@@ -94,7 +139,8 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: true,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: anthropic::AVAILABILITY,
     catalog_slug: Some("anthropic"),
 };
 
@@ -110,7 +156,8 @@ const OPENAI: ProviderManifest = ProviderManifest {
     generations: openai::generations(),
     serves_fast_mode: true,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: openai::AVAILABILITY,
     catalog_slug: Some("openai"),
 };
 
@@ -126,7 +173,8 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: google::PRICE_CHANGES,
+    price_periods: google::PRICE_PERIODS,
+    availability: &[],
     catalog_slug: Some("google"),
 };
 
@@ -142,7 +190,8 @@ const COPILOT: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: copilot::AVAILABILITY,
     catalog_slug: Some("github-copilot"),
 };
 
@@ -166,7 +215,8 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: None,
 };
 
@@ -182,7 +232,8 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: None,
 };
 
@@ -198,7 +249,8 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: mistral::PRICE_CHANGES,
+    price_periods: mistral::PRICE_PERIODS,
+    availability: mistral::AVAILABILITY,
     catalog_slug: Some("mistral"),
 };
 
@@ -214,7 +266,8 @@ const ZAI: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("zai"),
 };
 
@@ -230,7 +283,8 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: Some(&deepseek::PEAK_HOURS),
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("deepseek"),
 };
 
@@ -246,7 +300,8 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("openrouter"),
 };
 
@@ -262,7 +317,8 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("synthetic"),
 };
 
@@ -278,7 +334,8 @@ const TENSORX: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("tensorx"),
 };
 
@@ -294,7 +351,8 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("opencode"),
 };
 
@@ -310,7 +368,8 @@ const XAI: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("xai"),
 };
 
@@ -326,7 +385,8 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: Some("opencode-go"),
 };
 
@@ -342,7 +402,8 @@ const APERTURE: ProviderManifest = ProviderManifest {
     generations: &[],
     serves_fast_mode: false,
     pricing_schedule: None,
-    price_changes: &[],
+    price_periods: &[],
+    availability: &[],
     catalog_slug: None,
 };
 
@@ -435,10 +496,10 @@ impl ManifestRegistry {
         manifest: &ProviderManifest,
         purpose: ModelPurpose,
         line: Option<&ModelGeneration>,
+        at: Timestamp,
     ) -> Vec<&'static str> {
         let mut entries: Vec<_> = manifest
-            .models
-            .iter()
+            .listed_models_at(at)
             .filter(|entry| entry.class() == purpose)
             .collect();
         // Stable, so table order still decides within each group: the anchor's
@@ -464,9 +525,22 @@ impl ManifestRegistry {
         slug: &str,
         purpose: ModelPurpose,
     ) -> Option<&'static ModelEntry> {
-        Self::model_supply_manifest(slug)?
-            .models
-            .iter()
+        Self::default_from_manifest(
+            Self::model_supply_manifest(slug)?,
+            purpose,
+            Timestamp::now(),
+        )
+    }
+
+    /// The first listed default of the lane in table order, so a successor
+    /// marked `default` after a retiring one takes over on its shutdown day.
+    pub(crate) fn default_from_manifest(
+        manifest: &ProviderManifest,
+        purpose: ModelPurpose,
+        at: Timestamp,
+    ) -> Option<&'static ModelEntry> {
+        manifest
+            .listed_models_at(at)
             .find(|entry| entry.default && entry.class() == purpose)
     }
 
@@ -493,7 +567,7 @@ impl ManifestRegistry {
             return Vec::new();
         };
         let line = Self::generation_of(manifest, anchor_id);
-        Self::prefixes_from_manifest(manifest, purpose, line)
+        Self::prefixes_from_manifest(manifest, purpose, line, Timestamp::now())
     }
 }
 
@@ -513,6 +587,42 @@ mod tests {
         "a model the static table does not tier must still bill the catalog's tiers";
     const EMPTY_LADDER_IS_NOT_AN_ANSWER: &str =
         "an unclassified catalog entry must not outrank the static ladder";
+    const SURVEYED: &str = "2026-10-29T12:00:00Z";
+    const COPILOT_SLUG: &str = "copilot";
+    const OPUS_5: &str = "claude-opus-5";
+    const OPUS_4_8: &str = "claude-opus-4.8";
+    const LAST_DAY_OF_OPUS_5: &str = "2026-11-15T23:59:59Z";
+    const OPUS_5_RETIRED: &str = "2026-11-16T00:00:00Z";
+    const RETIRED_LEAVES_LISTS: &str =
+        "a model past its shutdown day must leave the lane candidates and the listings";
+
+    fn surveyed() -> Timestamp {
+        instant(SURVEYED)
+    }
+
+    fn instant(text: &str) -> Timestamp {
+        text.parse().expect("an RFC 3339 instant")
+    }
+
+    /// The day before its shutdown a model is still a candidate, and from the
+    /// day on it is gone while its sibling prefix that stays is not.
+    #[test_case(LAST_DAY_OF_OPUS_5, true ; "listed_until_the_day")]
+    #[test_case(OPUS_5_RETIRED, false    ; "gone_on_the_day")]
+    fn a_retired_model_leaves_the_lane_candidates(at: &str, listed: bool) {
+        let manifest = ManifestRegistry::get(COPILOT_SLUG).unwrap();
+        let candidates = ManifestRegistry::prefixes_from_manifest(
+            manifest,
+            ModelPurpose::Best,
+            None,
+            instant(at),
+        );
+        assert_eq!(
+            candidates.contains(&OPUS_5),
+            listed,
+            "{RETIRED_LEAVES_LISTS}"
+        );
+        assert!(candidates.contains(&OPUS_4_8), "{RETIRED_LEAVES_LISTS}");
+    }
 
     fn meta_with(reasoning_options: ReasoningOptions, tiers: Vec<PricingTier>) -> CatalogMetaView {
         CatalogMetaView {
@@ -620,8 +730,12 @@ mod tests {
         )
         .unwrap();
         let facts = ManifestRegistry::facts_from_manifest(manifest, "gpt-5.4-nano");
-        let candidates =
-            ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
+        let candidates = ManifestRegistry::prefixes_from_manifest(
+            manifest,
+            ModelPurpose::Fast,
+            None,
+            surveyed(),
+        );
 
         assert_eq!(manifest.slug, "openai");
         assert_eq!(
@@ -643,9 +757,19 @@ mod tests {
     #[test]
     fn a_line_reorders_the_candidates_without_dropping_any() {
         let manifest = ManifestRegistry::get("openai").unwrap();
-        let wide = ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
-        let lined =
-            ManifestRegistry::prefixes_for_purpose("openai", ModelPurpose::Fast, "gpt-5.6-sol");
+        let wide = ManifestRegistry::prefixes_from_manifest(
+            manifest,
+            ModelPurpose::Fast,
+            None,
+            surveyed(),
+        );
+        let line = ManifestRegistry::generation_of(manifest, "gpt-5.6-sol");
+        let lined = ManifestRegistry::prefixes_from_manifest(
+            manifest,
+            ModelPurpose::Fast,
+            line,
+            surveyed(),
+        );
 
         assert_eq!(lined.first().copied(), Some("gpt-5.6-luna"));
         assert_eq!(wide.first().copied(), Some("gpt-6-luna"));

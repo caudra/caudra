@@ -97,7 +97,7 @@ Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `
 |---------|--------|-------------------------------|---------|
 | Fast | **claude-haiku-5-5** (default) | $0.10 / $0.50 | 372K ctx / 128K out |
 | Small | claude-haiku-4-5 | $1.00 / $5.00 | 200K ctx / 64K out |
-|  | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
+|  | claude-sonnet-4-5 (retires 2026-11-30) | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 128K out |
 |  | claude-sonnet-5-5 | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 372K ctx / 128K out |
@@ -142,7 +142,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 |---------|--------|-------------------------------|---------|
 | Fast | **gpt-6-luna** (gpt-6 default) | $0.10 / $0.50 | 372K ctx / 128K out |
 | Fast | **gpt-5.6-luna** (gpt-5.6 default) | $0.20 / $1.20 | 372K ctx / 128K out |
-| Small | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| Small | gpt-5.4-nano (retires 2027-04-01) | $0.20 / $1.25 | 400K ctx / 128K out |
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Best | **gpt-6-astra** (gpt-6 default) | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | gpt-6.1-sol | $2.00 / $10.00 | 372K ctx / 128K out |
@@ -156,9 +156,9 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 |  | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 |  | gpt-5.4-pro | $30.00 / $180.00 | 1050K ctx / 128K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
-|  | o3-pro | $20.00 / $80.00 | 200K ctx / 100K out |
-|  | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
-|  | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+|  | o3-pro (retires 2026-12-11) | $20.00 / $80.00 | 200K ctx / 100K out |
+|  | o3 (retires 2026-12-11) | $2.00 / $8.00 | 200K ctx / 100K out |
+|  | gpt-5.3-codex (retires 2027-04-01) | $1.75 / $14.00 | 400K ctx / 128K out |
 |  | gpt-5.2-pro | $21.00 / $168.00 | 400K ctx / 128K out |
 |  | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
 
@@ -209,10 +209,11 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 |  | gpt-6.1-terra | $1.00 / $5.00 | 200K ctx / 100K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |
-|  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |
+|  | gpt-5.6-terra (retires 2026-11-16) | $2.00 / $12.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
-|  | claude-opus-5.5 | $4.00 / $20.00 | 200K ctx / 128K out |
-| Best | **claude-opus-5, claude-opus-4.8** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
+| Best | **claude-opus-5** (default, retires 2026-11-16) | $5.00 / $25.00 | 200K ctx / 64K out |
+| Best | **claude-opus-5.5** (default) | $4.00 / $20.00 | 200K ctx / 128K out |
+|  | claude-opus-4.8 | $5.00 / $25.00 | 200K ctx / 64K out |
 |  | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
 |  | claude-fable-5.1 | $10.00 / $50.00 | 200K ctx / 100K out |
 |  | gpt-6-astra | $10.00 / $50.00 | 200K ctx / 100K out |
@@ -220,7 +221,7 @@ A Google AI Pro or Ultra plan covers AI Studio in the browser. Google bills API 
 |  | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
 |  | grok-4.7 | $2.00 / $6.00 | 200K ctx / 100K out |
 
-Routing defaults: gpt-5.6-luna (Fast), claude-opus-5 (Best)
+Routing defaults: gpt-5.6-luna (Fast), claude-opus-5 (Best) until 2026-11-16, then claude-opus-5.5 (Best)
 
 Run `caudra auth login copilot` to sign in with GitHub. Caudra prints a URL and a one-time code, opens the browser when it can, and waits until you approve the code on GitHub. The login uses the same public GitHub OAuth app as OpenCode and asks only for the `read:user` scope. GitHub issues a token that does not expire, so there is no refresh. When GitHub revokes it, run the login again.
 
@@ -238,7 +239,7 @@ Copilot Enterprise is a separate provider, so a GitHub Enterprise account and a 
 
 Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
 
-The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-5.6-terra`. Your organization's policy decides which of them your account can use.
+The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-6.1-terra`. Your organization's policy decides which of them your account can use.
 
 ### Ollama
 
@@ -269,7 +270,7 @@ Connects to any OpenAI-compatible `/v1` endpoint. Set `LLAMA_CPP_HOST` to your s
 |  | mistral-large-4 | $0.68 / $2.09, then $1.36 / $4.18 from 2026-10-20 | 1000K ctx |
 |  | mistral-large-latest, mistral-large-2512 | $0.50 / $1.50 | 262K ctx |
 |  | glm-5-3, zai-glm-5-3, zai-glm-5, zai-glm-latest | $1.40 / $4.40 | 1000K ctx |
-|  | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+|  | glm-5-2, zai-glm-5-2 (retires 2026-10-31) | $1.40 / $4.40 | 1000K ctx |
 |  | deepseek-v4-1-flash-1017 | $0.30 / $1.20 | 1000K ctx |
 |  | mistral-small-latest, mistral-small-2603 | $0.15 / $0.60 | 262K ctx |
 

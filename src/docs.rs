@@ -1,16 +1,22 @@
 //! The user docs under `docs/content`. They are embedded here rather than in `caudra-docs`, so editing a
-//! page rebuilds this crate alone and not every crate that reads the docs.
+//! page rebuilds this crate alone and not every crate that reads the docs. The Release notes page is built from
+//! the embedded release notes, not checked in.
 
 use std::sync::LazyLock;
 
 use caudra_agent::tools::native::skill::BuiltinSkill;
-use caudra_docs::{Library, NAME, SKILL_DESCRIPTION};
+use caudra_docs::{Library, NAME, RELEASE_NOTES_PAGE, SKILL_DESCRIPTION};
 use include_dir::{Dir, File, include_dir};
+
+use crate::release_notes;
 
 const NAVIGATION: &str = include_str!("../docs/navigation.json");
 static CONTENT: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/docs/content");
+static RELEASE_NOTES: LazyLock<String> = LazyLock::new(|| release_notes::notes().page());
 static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
-    Library::parse(markdown_files(&CONTENT), NAVIGATION).expect("valid embedded documentation")
+    let mut files = markdown_files(&CONTENT);
+    files.push((RELEASE_NOTES_PAGE, RELEASE_NOTES.as_str()));
+    Library::parse(files, NAVIGATION).expect("valid embedded documentation")
 });
 
 /// Parsed on first use, so a session that never opens the docs never pays for them.
@@ -51,7 +57,9 @@ mod tests {
     fn embedded_docs_hold_every_page() {
         let slugs: Vec<&str> = library().pages().iter().map(|page| page.slug).collect();
         assert!(
-            slugs.contains(&"quick-start") && slugs.contains(&"lua-api"),
+            slugs.contains(&"quick-start")
+                && slugs.contains(&"lua-api")
+                && slugs.contains(&"release-notes"),
             "{slugs:?}"
         );
         assert!(library().load("/permissions#plan-mode").is_ok());

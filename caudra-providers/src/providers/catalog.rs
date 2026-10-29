@@ -1305,7 +1305,7 @@ mod tests {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing: ModelPricing::default(),
-            price_change: None,
+            dated_rates: None,
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,

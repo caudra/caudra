@@ -14,7 +14,7 @@ use tracing::warn;
 
 use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
-use crate::pricing::PriceChange;
+use crate::pricing::{Period, PricePeriod};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -76,10 +76,10 @@ const FLASH_LIST_PRICE: ModelPricing = ModelPricing {
 
 /// Introductory rates Google ends on a set day, from
 /// <https://ai.google.dev/gemini-api/docs/pricing>.
-pub(crate) const PRICE_CHANGES: &[PriceChange] = &[
-    PriceChange {
+pub(crate) const PRICE_PERIODS: &[PricePeriod] = &[
+    PricePeriod {
         prefix: ARGON,
-        from: civil::date(2026, 12, 1),
+        during: Period::from(civil::date(2026, 12, 1)),
         pricing: ModelPricing {
             input: 4.00,
             output: 20.00,
@@ -89,14 +89,14 @@ pub(crate) const PRICE_CHANGES: &[PriceChange] = &[
             tiers: ModelPricing::UNTIERED,
         },
     },
-    PriceChange {
+    PricePeriod {
         prefix: FLASH_3_8,
-        from: civil::date(2027, 1, 1),
+        during: Period::from(civil::date(2027, 1, 1)),
         pricing: FLASH_LIST_PRICE,
     },
-    PriceChange {
+    PricePeriod {
         prefix: FLASH_3_6,
-        from: civil::date(2027, 1, 1),
+        during: Period::from(civil::date(2027, 1, 1)),
         pricing: FLASH_LIST_PRICE,
     },
 ];
@@ -949,7 +949,7 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
-            price_change: None,
+            dated_rates: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,

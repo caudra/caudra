@@ -5,8 +5,9 @@ use jiff::civil;
 use serde_json::{Value, json};
 
 use crate::accounts::AccountCredential;
+use crate::manifest::Availability;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
-use crate::pricing::PriceChange;
+use crate::pricing::{Period, PricePeriod};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -16,13 +17,14 @@ use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
 const LARGE_4: &str = "mistral-large-4";
+const GLM_5_2: &str = "glm-5-2";
 
 /// Mistral Large 4 launched on 2026-10-06 at half price "for 2 weeks"
 /// (docs.mistral.ai/getting-started/changelog), so list price from 2026-10-20,
 /// as <https://docs.mistral.ai/models/mistral-large-4-0> quotes it.
-pub(crate) const PRICE_CHANGES: &[PriceChange] = &[PriceChange {
+pub(crate) const PRICE_PERIODS: &[PricePeriod] = &[PricePeriod {
     prefix: LARGE_4,
-    from: civil::date(2026, 10, 20),
+    during: Period::from(civil::date(2026, 10, 20)),
     pricing: ModelPricing {
         input: 1.36,
         output: 4.18,
@@ -31,6 +33,12 @@ pub(crate) const PRICE_CHANGES: &[PriceChange] = &[PriceChange {
         fast: None,
         tiers: ModelPricing::UNTIERED,
     },
+}];
+
+/// Shutdowns from <https://docs.mistral.ai/getting-started/changelog/>.
+pub(crate) const AVAILABILITY: &[Availability] = &[Availability {
+    prefix: GLM_5_2,
+    during: Period::until(civil::date(2026, 10, 31)),
 }];
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -171,7 +179,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
-            prefixes: &["glm-5-2", "zai-glm-5-2"],
+            prefixes: &[GLM_5_2, "zai-glm-5-2"],
             small: false,
             family: ModelFamily::Glm,
             vision: false,

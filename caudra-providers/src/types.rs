@@ -2792,7 +2792,7 @@ mod tests {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing: crate::model::ModelPricing::default(),
-            price_change: None,
+            dated_rates: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 200_000,

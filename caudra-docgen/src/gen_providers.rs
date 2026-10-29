@@ -135,7 +135,7 @@ const COPILOT_ENTERPRISE_NOTE: &str = r#"Copilot Enterprise is a separate provid
 
 Caudra sends requests to `https://copilot-api.<host>` and never falls back to public GitHub. This follows the endpoint scheme OpenCode uses for GitHub Enterprise Cloud with data residency. Other deployments may not serve Copilot there. For CI, set `GH_COPILOT_ENTERPRISE_TOKEN` and `GH_COPILOT_ENTERPRISE_HOST` together. The token variable alone is an error, never a public GitHub token.
 
-The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-5.6-terra`. Your organization's policy decides which of them your account can use."#;
+The models are the ones Copilot lists above, under `copilot-enterprise/`, such as `copilot-enterprise/gpt-6.1-terra`. Your organization's policy decides which of them your account can use."#;
 
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Caudra hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/caudra/providers.toml`:
 
@@ -572,19 +572,36 @@ fn format_rate(rate: f64) -> String {
     format!("${trimmed}")
 }
 
-/// Today's rates, then any announced change with its date. Reads no clock, so
-/// the page renders the same whenever it is generated.
+/// The table's rates with any price period around them, in date order. Reads
+/// no clock, so the page renders the same whenever it is generated.
 fn format_pricing(entry: &ModelEntry, manifest: &ProviderManifest) -> String {
     let rates = |pricing: &ModelPricing| format!("${:.2} / ${:.2}", pricing.input, pricing.output);
-    match manifest.price_change(entry) {
-        Some(change) => format!(
-            "{}, then {} from {}",
-            rates(&entry.pricing),
-            rates(&change.pricing),
-            change.from
-        ),
-        None => rates(&entry.pricing),
+    let table = rates(&entry.pricing);
+    let Some(period) = manifest.price_period(entry) else {
+        return table;
+    };
+    let dated = rates(&period.pricing);
+    match (period.during.from, period.during.until) {
+        (Some(from), None) => format!("{table}, then {dated} from {from}"),
+        (None, Some(until)) => format!("{dated} until {until}, then {table}"),
+        (Some(from), Some(until)) => {
+            format!("{table}, then {dated} from {from} until {until}, then {table}")
+        }
+        (None, None) => dated,
     }
+}
+
+/// When a dated entry is offered, such as `retires 2026-11-16`.
+fn format_availability(entry: &ModelEntry, manifest: &ProviderManifest) -> Option<String> {
+    let during = manifest.availability(entry)?.during;
+    let dates: Vec<String> = [
+        during.from.map(|from| format!("available from {from}")),
+        during.until.map(|until| format!("retires {until}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!dates.is_empty()).then(|| dates.join(", "))
 }
 
 fn format_context(entry: &ModelEntry) -> String {
@@ -745,6 +762,22 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
 
     for entry in by_lane() {
         let names = entry.prefixes.join(", ");
+        let tags: Vec<String> = [
+            match (entry.default, line_of(entry)) {
+                (false, _) => None,
+                (true, None) => Some("default".to_owned()),
+                (true, Some(line)) => Some(format!("{line} default")),
+            },
+            format_availability(entry, manifest),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let names = if entry.default {
+            format!("**{names}**")
+        } else {
+            names
+        };
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} |",
@@ -753,10 +786,10 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
                 .marker()
                 .map(ModelMarker::label)
                 .unwrap_or_default(),
-            match (entry.default, line_of(entry)) {
-                (false, _) => names,
-                (true, None) => format!("**{names}** (default)"),
-                (true, Some(line)) => format!("**{names}** ({line} default)"),
+            if tags.is_empty() {
+                names
+            } else {
+                format!("{names} ({})", tags.join(", "))
             },
             format_pricing(entry, manifest),
             format_context(entry),
@@ -766,14 +799,25 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
     // The first default per lane in table order, which is the answer
     // `find_default_for_purpose` gives a session with no model to read a line
     // from. Tables are ordered newest line first, so that is the newest line.
+    // A default that retires hands the lane to the next one on its day.
     let wide: Vec<String> = [true, false]
         .into_iter()
         .filter_map(|small| {
-            entries
+            let mut defaults = entries
                 .iter()
-                .find(|entry| entry.small == small && entry.default)
+                .filter(move |entry| entry.small == small && entry.default);
+            let mut current = defaults.next()?;
+            let mut answer = label(current)?;
+            while let Some(until) = manifest
+                .availability(current)
+                .and_then(|row| row.during.until)
+                && let Some(next) = defaults.next()
+            {
+                let _ = write!(answer, " until {until}, then {}", label(next)?);
+                current = next;
+            }
+            Some(answer)
         })
-        .filter_map(label)
         .collect();
 
     if !wide.is_empty() {
@@ -940,27 +984,89 @@ mod tests {
     use caudra_config::interpolation::{self, Lookup};
     use caudra_config::migration;
     use caudra_config::providers::{PROVIDERS_FORMAT, ProvidersConfig};
-    use caudra_providers::manifest::ManifestRegistry;
-    use caudra_providers::model::ModelEntry;
+    use caudra_providers::manifest::{Availability, ManifestRegistry, ProviderManifest};
+    use caudra_providers::model::{ModelEntry, ModelPricing};
+    use caudra_providers::pricing::{Period, PricePeriod};
+    use jiff::civil::{Date, date};
     use test_case::test_case;
 
-    use super::{format_pricing, providers_toml_section};
+    use super::{format_availability, format_pricing, providers_toml_section, write_model_table};
     use crate::gen_regions::reference;
 
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
     const DECISION_HEADER: &str = "[decisions.";
+    const COPILOT_HANDOVER: &str =
+        "claude-opus-5 (Best) until 2026-11-16, then claude-opus-5.5 (Best)";
 
-    #[test_case("gemini-4-argon", "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
-    #[test_case("gemini-3.5-flash-lite", "$0.30 / $2.50"                               ; "a_steady_price_stands_alone")]
-    fn pricing_shows_an_announced_change_with_its_date(prefix: &str, expected: &str) {
-        let google = ManifestRegistry::get("google").unwrap();
-        let entry: &ModelEntry = google
+    const ARGON: &str = "gemini-4-argon";
+    const STEADY: &str = "gemini-3.5-flash-lite";
+    const PERIOD_RATES: ModelPricing = ModelPricing {
+        input: 4.00,
+        output: 20.00,
+        ..ModelPricing::ZERO
+    };
+    const DECEMBER: Date = date(2026, 12, 1);
+    const JANUARY: Date = date(2027, 1, 1);
+
+    fn google_entry(prefix: &str) -> &'static ModelEntry {
+        ManifestRegistry::get("google")
+            .unwrap()
             .models
             .iter()
             .find(|entry| entry.prefixes.contains(&prefix))
-            .unwrap();
-        assert_eq!(format_pricing(entry, google), expected);
+            .unwrap()
+    }
+
+    #[test_case(ARGON, "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
+    #[test_case(STEADY, "$0.30 / $2.50"                                     ; "a_steady_price_stands_alone")]
+    fn pricing_shows_an_announced_change_with_its_date(prefix: &str, expected: &str) {
+        let google = ManifestRegistry::get("google").unwrap();
+        assert_eq!(format_pricing(google_entry(prefix), google), expected);
+    }
+
+    #[test_case(Period::from(DECEMBER), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01" ; "from_follows_the_table")]
+    #[test_case(Period::until(DECEMBER), "$4.00 / $20.00 until 2026-12-01, then $0.30 / $2.50" ; "until_leads_the_table")]
+    #[test_case(Period::between(DECEMBER, JANUARY), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01 until 2027-01-01, then $0.30 / $2.50" ; "between_returns_to_the_table")]
+    fn pricing_reads_a_period_in_date_order(during: Period, expected: &str) {
+        let periods: &'static [PricePeriod] = Box::leak(Box::new([PricePeriod {
+            prefix: STEADY,
+            during,
+            pricing: PERIOD_RATES,
+        }]));
+        let manifest = ProviderManifest {
+            price_periods: periods,
+            ..*ManifestRegistry::get("google").unwrap()
+        };
+        assert_eq!(format_pricing(google_entry(STEADY), &manifest), expected);
+    }
+
+    #[test_case(Period::until(DECEMBER), Some("retires 2026-12-01")                                   ; "a_shutdown")]
+    #[test_case(Period::from(DECEMBER), Some("available from 2026-12-01")                             ; "an_opening")]
+    #[test_case(Period::between(DECEMBER, JANUARY), Some("available from 2026-12-01, retires 2027-01-01") ; "both")]
+    fn availability_reads_its_dates(during: Period, expected: Option<&str>) {
+        let rows: &'static [Availability] = Box::leak(Box::new([Availability {
+            prefix: STEADY,
+            during,
+        }]));
+        let manifest = ProviderManifest {
+            availability: rows,
+            ..*ManifestRegistry::get("google").unwrap()
+        };
+        assert_eq!(
+            format_availability(google_entry(STEADY), &manifest).as_deref(),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_retiring_default_hands_its_lane_over_in_the_routing_line() {
+        let mut out = String::new();
+        write_model_table(&mut out, ManifestRegistry::get("copilot").unwrap());
+        assert!(
+            out.contains(COPILOT_HANDOVER),
+            "{COPILOT_HANDOVER} missing from:\n{out}"
+        );
     }
 
     #[test]

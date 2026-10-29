@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flume::Sender;
+use jiff::Timestamp;
 use serde_json::Value;
 use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
@@ -16,6 +17,7 @@ use caudra_storage::StateDir;
 use caudra_storage::thinking::{self, StoredThinking};
 
 use crate::accounts::{AccountCredential, Failover, RoutedAccount, RoutedProvider};
+use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPurpose, TokenUsage};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
@@ -728,20 +730,25 @@ fn register_listed_models(slug: &str, models: Vec<ModelInfo>) -> Vec<String> {
     specs
 }
 
+/// `slug/prefix` for every prefix of the entries `manifest` lists at `at`, so
+/// a model past its shutdown day drops out of every list built from a table.
+fn static_specs(manifest: &ProviderManifest, at: Timestamp) -> Vec<String> {
+    manifest
+        .listed_models_at(at)
+        .flat_map(|entry| entry.prefixes)
+        .map(|prefix| format!("{}/{prefix}", manifest.slug))
+        .collect()
+}
+
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
 /// the catalog has warmed in the background.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
+    let mut specs: Vec<String> = ManifestRegistry::builtins()
         .iter()
         .filter(|m| provider_available_offline(m.slug))
-        .flat_map(|m| {
-            m.models
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{}/{}", m.slug, p))
-        })
+        .flat_map(|m| static_specs(m, Timestamp::now()))
         .collect();
     for slug in dynamic::discovered_slugs() {
         specs.extend(dynamic::dynamic_model_specs_for(slug));
@@ -811,7 +818,7 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for manifest in crate::manifest::ManifestRegistry::builtins() {
+    for manifest in ManifestRegistry::builtins() {
         let slug = manifest.slug;
         let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
             warn!(provider = slug, "failed to create provider, skipping");
@@ -823,12 +830,9 @@ pub async fn fetch_all_models(
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     let mut specs = register_listed_models(slug, models);
-                    for entry in manifest.models {
-                        for prefix in entry.prefixes {
-                            let spec = format!("{slug}/{prefix}");
-                            if !specs.contains(&spec) {
-                                specs.push(spec);
-                            }
+                    for spec in static_specs(manifest, Timestamp::now()) {
+                        if !specs.contains(&spec) {
+                            specs.push(spec);
                         }
                     }
                     ModelBatch {
@@ -837,12 +841,7 @@ pub async fn fetch_all_models(
                     }
                 }
                 Err(e) => {
-                    let fallback: Vec<String> = manifest
-                        .models
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{slug}/{p}"))
-                        .collect();
+                    let fallback = static_specs(manifest, Timestamp::now());
                     // A catalog-backed provider ships no static models, so
                     // promising a fallback it does not have would send the user
                     // looking for models that were never there.
@@ -980,6 +979,28 @@ mod tests {
 
     const LISTED_ONCE: &str =
         "a model both declared and discovered must reach the picker once, not twice";
+    const LAST_DAY_OF_OPUS_5: &str = "2026-11-15T23:59:59Z";
+    const OPUS_5_RETIRED: &str = "2026-11-16T00:00:00Z";
+    const RETIRING_SPEC: &str = "copilot/claude-opus-5";
+    const STAYING_SPEC: &str = "copilot/claude-opus-4.8";
+    const RETIRED_LEAVES_THE_LIST: &str =
+        "a model past its shutdown day must leave the static listing, and only that model";
+
+    #[test_case(LAST_DAY_OF_OPUS_5, true ; "listed_until_the_day")]
+    #[test_case(OPUS_5_RETIRED, false    ; "gone_on_the_day")]
+    fn a_static_listing_drops_a_retired_model(at: &str, listed: bool) {
+        let manifest = ManifestRegistry::get(copilot::PUBLIC_SLUG).unwrap();
+        let specs = static_specs(manifest, at.parse().unwrap());
+        assert_eq!(
+            specs.iter().any(|spec| spec == RETIRING_SPEC),
+            listed,
+            "{RETIRED_LEAVES_THE_LIST}"
+        );
+        assert!(
+            specs.iter().any(|spec| spec == STAYING_SPEC),
+            "{RETIRED_LEAVES_THE_LIST}"
+        );
+    }
     const DISCOVERED_SLUG: &str = "test-dynamic-model-registry";
     const TEST_MODEL: &str = "anthropic/claude-opus-4-8";
     const LEGACY_THINKING: StateKey = StateKey {

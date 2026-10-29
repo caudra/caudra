@@ -20,7 +20,9 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub use index::SearchReport;
-pub use release_notes::{RELEASES_URL, Release, ReleaseNotes, ReleaseNotesSource};
+pub use release_notes::{
+    RELEASE_NOTES_PAGE, RELEASES_URL, Release, ReleaseNotes, ReleaseNotesSource,
+};
 pub use search::{Correction, Hit, Search, SearchIndex};
 
 pub const NAME: &str = "caudra-docs";
@@ -468,17 +470,39 @@ pub(crate) mod site {
     use std::path::{Path, PathBuf};
     use std::sync::LazyLock;
 
-    use super::Library;
     use super::fixture::leak;
+    use super::{Library, RELEASE_NOTES_PAGE, ReleaseNotes};
 
     const CONTENT_DIR: &str = "../docs/content";
+    const NOTES_DIR: &str = "../release-notes";
 
-    /// The real docs, read from disk so the tests always see the current files.
+    /// Every file in `release-notes/`, read from disk, as its name and text.
+    pub(crate) fn release_notes() -> Vec<(&'static str, &'static str)> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(NOTES_DIR);
+        let files = fs::read_dir(&directory)
+            .expect("release notes directory")
+            .map(|entry| {
+                let entry = entry.expect("release notes entry");
+                (
+                    leak(entry.file_name().into_string().expect("UTF-8 file name")),
+                    leak(fs::read_to_string(entry.path()).expect("release notes file")),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!files.is_empty(), "{}", directory.display());
+        files
+    }
+
+    /// The real docs, read from disk so the tests always see the current files, with the Release notes page
+    /// built from them as the binary builds it.
     pub(crate) fn library() -> &'static Library {
         static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
             let navigation = fs::read_to_string(content_dir().join("../navigation.json"))
                 .expect("docs navigation");
-            Library::parse(files(), &navigation).expect("valid docs sources")
+            let notes = ReleaseNotes::parse(release_notes()).expect("valid release notes");
+            let mut files = files();
+            files.push((RELEASE_NOTES_PAGE, leak(notes.page())));
+            Library::parse(files, &navigation).expect("valid docs sources")
         });
         &LIBRARY
     }
@@ -517,7 +541,10 @@ mod tests {
     use test_case::test_case;
 
     use super::fixture::{leak, library};
-    use super::{DocsError, Library, NAVIGATION_FILE, Page, SITE_DOCS_URL, Target, site};
+    use super::{
+        DocsError, Library, NAVIGATION_FILE, Page, RELEASE_NOTES_PAGE, SITE_DOCS_URL, Target,
+        page_slug, site,
+    };
 
     const EXAMPLES_DIR: &str = "../examples";
     const ALPHA: &str = "# Alpha\n\nIntro text.\n\n## Shell timeout\n\nThe shell stops.\n\n### Details {#details}\n\nMore detail.\n\n```bash\n## Not a heading\n```\n\n## Tables\n\n| a | b |\n";
@@ -719,6 +746,7 @@ mod tests {
                 ));
             }
         }
+        on_disk.push(page_slug(RELEASE_NOTES_PAGE).expect("release notes slug"));
         on_disk.sort_unstable();
         let mut parsed: Vec<&str> = site::library()
             .pages()

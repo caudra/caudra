@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::accounts::{AccountCredential, WindowKind};
+use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
@@ -142,8 +143,9 @@ fn coding_plan_context_window(model_id: &str) -> Option<u32> {
 /// widen the candidates but never decide entitlement: `is_codex_model` does.
 /// Drawing on it anyway means a new `-codex` release needs no edit here.
 fn coding_plan_models() -> Vec<ModelInfo> {
-    let statics = super::models()
-        .iter()
+    let statics = ManifestRegistry::get(CONFIG.slug)
+        .into_iter()
+        .flat_map(ProviderManifest::listed_models)
         .flat_map(|e| e.prefixes.iter().copied());
     let catalog = catalog::model_ids_if_available(CONFIG.slug);
     let mut ids: Vec<String> = statics

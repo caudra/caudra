@@ -33,6 +33,7 @@ INPUTS = (
     "docs/content/index.md",
     "docs/navigation.json",
     "docs/examples/config.example.toml",
+    "release-notes/0.2.0.md",
     "install.sh",
     "install.ps1",
 )
@@ -346,10 +347,19 @@ class UpdateTests(unittest.TestCase):
                 "docs/content/nested/page.md",
                 "docs/content/page.mdx",
                 "docs/examples/not-an-example.toml",
+                "release-notes/nested/0.2.0.md",
+                "release-notes/0.2.0.txt",
             )
         ]
         self.update()
         self.assertEqual(self.website.mutations, [])
+
+    def test_release_notes_change_alone_advances_the_pin(self):
+        notes = INPUTS.index("release-notes/0.2.0.md")
+        self.source.trees[NEW] = copy.deepcopy(self.source.trees[OLD])
+        self.source.trees[NEW][notes] = entry(INPUTS[notes], NEW)
+        self.update()
+        self.assertIn(INPUTS[notes], self.website.prs[0]["body"])
 
     def reverted_source(self):
         self.source.main = REVERT
