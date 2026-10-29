@@ -11,7 +11,7 @@ use crate::{
 const FORMAT_MESSAGE: &str = "unsupported model-file format; expected 1";
 const SLUG_MESSAGE: &str = "provider slug must be unique";
 const PREFIX_MESSAGE: &str = "model prefix must be unique within its provider";
-const DEFAULT_MESSAGE: &str = "at most one undated default is allowed per size lane";
+const DEFAULT_MESSAGE: &str = "at most one undated default is allowed per generation and size lane";
 const PERIOD_MESSAGE: &str = "period from must be before until";
 const TIER_MESSAGE: &str = "tier thresholds must be strictly ascending";
 const PRICE_MESSAGE: &str = "price must be finite and non-negative";
@@ -22,6 +22,7 @@ const URL_MESSAGE: &str = "catalog API must use HTTPS or HTTP to loopback";
 const ENV_MESSAGE: &str = "environment name must match ^[A-Z0-9][A-Z0-9_]*$";
 const PROVIDER_COUNT_MESSAGE: &str = "provider count must not exceed 1000";
 const CATALOG_COUNT_MESSAGE: &str = "catalog model count must not exceed 50000";
+const MODELS_FROM_MESSAGE: &str = "models_from must be expanded before publishing";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{pointer}: {message}")]
@@ -77,6 +78,9 @@ pub fn validate(snapshot: &Snapshot) -> Result<(), Vec<Issue>> {
 }
 
 fn validate_provider(provider: &Provider, path: &str, issues: &mut Vec<Issue>) {
+    if provider.models_from.is_some() {
+        issue(issues, &format!("{path}/models_from"), MODELS_FROM_MESSAGE);
+    }
     tokens(
         provider.fallback_context_window,
         &format!("{path}/fallback_context_window"),
@@ -93,7 +97,7 @@ fn validate_provider(provider: &Provider, path: &str, issues: &mut Vec<Issue>) {
         );
     }
     let mut prefixes = HashSet::new();
-    let mut defaults = [false; 2];
+    let mut defaults = HashSet::new();
     for (index, model) in provider.models.iter().enumerate() {
         let model_path = format!("{path}/models/{index}");
         for (index, prefix) in model.prefixes.iter().enumerate() {
@@ -110,11 +114,24 @@ fn validate_provider(provider: &Provider, path: &str, issues: &mut Vec<Issue>) {
             .iter()
             .any(|availability| model.prefixes.contains(&availability.prefix));
         if model.default && !dated {
-            let lane = usize::from(model.small);
-            if defaults[lane] {
+            let generation = provider
+                .generations
+                .iter()
+                .enumerate()
+                .flat_map(|(index, generation)| {
+                    generation.members.iter().map(move |member| (index, member))
+                })
+                .filter(|(_, member)| {
+                    model
+                        .prefixes
+                        .iter()
+                        .any(|prefix| prefix.starts_with(member.as_str()))
+                })
+                .max_by_key(|(_, member)| member.len())
+                .map(|(index, _)| index);
+            if !defaults.insert((generation, model.small)) {
                 issue(issues, &format!("{model_path}/default"), DEFAULT_MESSAGE);
             }
-            defaults[lane] = true;
         }
         tokens(
             model.context_window,
@@ -327,8 +344,9 @@ mod tests {
 
     use super::{
         CATALOG_COUNT_MESSAGE, DEFAULT_MESSAGE, ENV_MESSAGE, FORMAT_MESSAGE, GENERATION_MESSAGE,
-        Issue, PERIOD_MESSAGE, PREFIX_MESSAGE, PRICE_MESSAGE, PROVIDER_COUNT_MESSAGE,
-        REFERENCE_MESSAGE, SLUG_MESSAGE, TIER_MESSAGE, TOKEN_MESSAGE, URL_MESSAGE, validate,
+        Issue, MODELS_FROM_MESSAGE, PERIOD_MESSAGE, PREFIX_MESSAGE, PRICE_MESSAGE,
+        PROVIDER_COUNT_MESSAGE, REFERENCE_MESSAGE, SLUG_MESSAGE, TIER_MESSAGE, TOKEN_MESSAGE,
+        URL_MESSAGE, validate,
     };
     use crate::{
         Availability, CatalogModel, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Period,
@@ -351,6 +369,7 @@ mod tests {
     }
 
     #[test_case("/format", json!(2), "/format", FORMAT_MESSAGE; "format")]
+    #[test_case("/providers/0/models_from", json!("other"), "/providers/0/models_from", MODELS_FROM_MESSAGE; "unexpanded_models_from")]
     #[test_case("/providers/0/price_periods/0/during/until", json!("2026-01-01"), PERIOD_POINTER, PERIOD_MESSAGE; "empty_period")]
     #[test_case("/providers/0/price_periods/0/during/until", json!("2025-01-01"), PERIOD_POINTER, PERIOD_MESSAGE; "reversed_period")]
     #[test_case("/providers/0/generations/0/members", json!([]), "/providers/0/generations/0/members", GENERATION_MESSAGE; "empty_generation")]
@@ -369,7 +388,11 @@ mod tests {
         message: &str,
     ) {
         let mut snapshot = serde_json::to_value(fixture()).unwrap();
-        *snapshot.pointer_mut(target).unwrap() = value;
+        if target == "/providers/0/models_from" {
+            snapshot["providers"][0]["models_from"] = value;
+        } else {
+            *snapshot.pointer_mut(target).unwrap() = value;
+        }
         assert_issue(&serde_json::from_value(snapshot).unwrap(), pointer, message);
     }
 
@@ -436,6 +459,7 @@ mod tests {
         provider.models[0].small = small;
         let mut successor = provider.models[0].clone();
         successor.prefixes = vec!["successor".to_owned()];
+        provider.generations[0].members.push("successor".to_owned());
         provider.models.push(successor);
         assert_issue(&snapshot, DEFAULT_POINTER, DEFAULT_MESSAGE);
     }
@@ -450,6 +474,8 @@ mod tests {
         if retiring {
             provider.availability.push(Availability {
                 prefix: "model-a".to_owned(),
+                note: None,
+                source: None,
                 during: Period {
                     from: None,
                     until: Some("2026-12-01".parse().unwrap()),
@@ -459,6 +485,20 @@ mod tests {
             successor.small = true;
         }
         provider.models.push(successor);
+        assert_eq!(validate(&snapshot), Ok(()));
+    }
+
+    #[test]
+    fn distinct_generations_can_each_declare_a_default() {
+        let mut snapshot = fixture();
+        let provider = &mut snapshot.payload.providers[0];
+        let mut entry = provider.models[0].clone();
+        entry.prefixes = vec!["next-model".to_owned()];
+        provider.models.push(entry);
+        provider.generations.push(crate::Generation {
+            label: "Next".to_owned(),
+            members: vec!["next-".to_owned()],
+        });
         assert_eq!(validate(&snapshot), Ok(()));
     }
 
@@ -497,6 +537,8 @@ mod tests {
             (
                 Availability {
                     prefix: "model-a".to_owned(),
+                    note: None,
+                    source: None,
                     during: Period {
                         from: Some(date),
                         until: Some(date),
@@ -509,6 +551,8 @@ mod tests {
             (
                 Availability {
                     prefix: "missing".to_owned(),
+                    note: None,
+                    source: None,
                     during: Period::default(),
                 },
                 "/providers/0/availability/0/prefix",

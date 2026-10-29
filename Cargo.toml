@@ -193,6 +193,7 @@ workcell-workspace-scm = { path = "workcell/crates/workspace-scm" }
 workcell-workspace-snapshot = { path = "workcell/crates/workspace-snapshot" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
 semver = "1.0.28"
 rusqlite = { version = "0.41", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
 bs58 = "0.5"

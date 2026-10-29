@@ -2,6 +2,9 @@
 //! Only same-version tooling uses [`Snapshot::hash_matches`], since newer fields may be ignored.
 
 mod catalog;
+#[cfg(feature = "cli")]
+pub mod cli;
+pub mod repo;
 pub mod sign;
 mod validate;
 mod wire;
@@ -14,7 +17,7 @@ use thiserror::Error;
 
 pub use catalog::{
     CatalogCost, CatalogCostTier, CatalogLimits, CatalogModalities, CatalogModel, CatalogProvider,
-    CatalogShape, CatalogTierBoundary,
+    CatalogShape, CatalogTierBoundary, import_models_dev,
 };
 pub use validate::{Issue, validate};
 pub use wire::{
@@ -28,6 +31,11 @@ pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROVIDERS: usize = 1000;
 pub const MAX_CATALOG_MODELS: usize = 50_000;
 pub const MAX_TOKENS: u32 = 100_000_000;
+pub const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
+pub const BLOCKED_CATALOG_PROVIDERS: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
+pub const SUPPORTED_REQUIREMENTS: &[&str] = &[];
+/// Production publishing is not set up until the operator supplies a trusted public key.
+pub const TRUSTED_KEYS: &[[u8; 32]] = &[];
 
 #[derive(Debug, Error)]
 pub enum ParseError {

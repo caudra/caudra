@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use caudra_config::providers::{builtin_provider, resolve_api_key_env};
+use caudra_models::{ALLOWED_NPM, BLOCKED_CATALOG_PROVIDERS};
 use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
@@ -43,8 +44,6 @@ const CATALOG_NOT_LOADED: &str = "the models.dev catalog has not loaded yet; sen
 const PROVIDER_NOT_RESOLVED: &str =
     "this provider resolves from the models.dev catalog on its first send; send a message first";
 
-const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
-
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
@@ -61,8 +60,6 @@ const CATALOG_CACHE_VERSION: u32 = 2;
 const FALLBACK_CATALOG_CONTEXT: u32 = 128_000;
 const FALLBACK_CATALOG_OUTPUT: u32 = 64_000;
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
-
-const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
 const FREE_MODELS_OPT_IN: &str = "providers.opencode.enable_free_models = true";
 
@@ -377,7 +374,7 @@ impl CatalogData {
                 debug!(npm = %provider.npm, "skipping provider: unsupported npm package");
                 continue;
             }
-            if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id.as_str()) {
+            if BLOCKED_CATALOG_PROVIDERS.contains(&provider_id.as_str()) {
                 debug!(
                     provider = &provider_id,
                     "skipping providers from the catalog"

@@ -48,6 +48,8 @@ pub struct Provider {
     pub catalog_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_schedule: Option<PricingSchedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_from: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generations: Vec<Generation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -60,6 +62,8 @@ pub struct Provider {
     pub requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,6 +168,10 @@ pub struct PricePeriod {
     pub prefix: String,
     pub during: Period,
     pub pricing: Pricing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +179,10 @@ pub struct PricePeriod {
 pub struct Availability {
     pub prefix: String,
     pub during: Period,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

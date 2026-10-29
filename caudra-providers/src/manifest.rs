@@ -48,6 +48,10 @@ pub struct ProviderManifest {
 }
 
 impl ProviderManifest {
+    pub fn window_excludes_output(&self, entry: &ModelEntry) -> bool {
+        anthropic::shared::declares_input_budget(self.slug, entry)
+    }
+
     /// What models.dev publishes about this model. Never triggers a fetch, so a
     /// cold catalog simply leaves every decision to the static table and
     /// discovery. Returned whole rather than field by field because each lookup

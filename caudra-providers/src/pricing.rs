@@ -46,6 +46,14 @@ pub struct PricingWindow {
 }
 
 impl PricingWindow {
+    pub const fn start(&self) -> u8 {
+        self.start
+    }
+
+    pub const fn end(&self) -> u8 {
+        self.end
+    }
+
     /// `hours(22, 2)` wraps past midnight. Every window is a `const`, so a typo
     /// here is a build error rather than a mispriced turn.
     pub const fn hours(start: u8, end: u8) -> Self {
@@ -72,6 +80,14 @@ impl fmt::Display for PricingWindow {
 }
 
 impl PricingSchedule {
+    pub const fn windows(&self) -> &'static [PricingWindow] {
+        self.windows
+    }
+
+    pub const fn multiplier(&self) -> f64 {
+        self.multiplier
+    }
+
     pub const fn new(windows: &'static [PricingWindow], multiplier: f64) -> Self {
         assert!(
             !windows.is_empty(),

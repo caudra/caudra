@@ -82,14 +82,14 @@ fn parse_key(pkcs8: &[u8]) -> Result<Ed25519KeyPair, SignatureError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use test_case::test_case;
 
     use super::{Signature, SignatureError, key_id, keygen, sign, verify};
 
-    const TEST_SIGNING_KEY_PKCS8_B64: &str = "MFMCAQEwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9goSMDIQDXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==";
-    const TEST_PUBLIC_KEY_B64: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+    pub(crate) const TEST_SIGNING_KEY_PKCS8_B64: &str = "MFMCAQEwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9goSMDIQDXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==";
+    pub(crate) const TEST_PUBLIC_KEY_B64: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
     const TEST_KEY_ID: &str = "21fe31dfa154a261";
     const EMPTY_SIGNATURE_B64: &str =
         "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw==";
