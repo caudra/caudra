@@ -143,7 +143,7 @@ Shell commands, questions, and workflow runs are not run again. A command that w
 
 Each resumed agent first reads a reminder titled "Resumed after interruption". It lists what was cut off and asks the agent to check what the interrupted work changed, such as files, git status, and detached processes, before it carries on. A task's reminder lists its own interrupted jobs, which the task continues itself. When the main chat had already ended its turn and was waiting on tasks, it reads the reminder with the first report a resumed task sends.
 
-The transcript shows a "Resumed after interruption" row naming what resumed, for example `main turn, 2 tasks`. Press `Esc` to stop it like any other turn.
+The main chat's reminder shows as one row naming what resumed, for example `Resumed after interruption: main turn, 2 tasks`. Click it to read the full reminder the agent got. The row shows even when `[ui] show_reminders` is off. With that setting on, the default, an `[Interrupted: Caudra shut down]` row above it marks where the shutdown cut the turn off. Both rows stay after you reopen the session. Press `Esc` to stop the resumed turn like any other turn.
 
 `[agent] resume_interrupted` in `caudra.toml` sets the behavior:
 
