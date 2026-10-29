@@ -114,7 +114,7 @@ pub(super) struct Shared {
     /// under this lock.
     pub(super) outbox: Mutex<Outbox>,
     pub(super) clock: Arc<dyn Clock>,
-    directories: AutomationDirs,
+    pub(super) directories: AutomationDirs,
     state: ArcSwap<AutomationState>,
     events: flume::Sender<AutomationEvent>,
     receiver: flume::Receiver<AutomationEvent>,

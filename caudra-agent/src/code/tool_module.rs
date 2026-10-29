@@ -219,7 +219,7 @@ Answers are the runtime's own records as dicts.",
             signature: "list() -> dict[str, Any]",
             awaited: true,
             read_first: false,
-            page: "Returns `{\"automations\", \"project_dir\", \"user_dir\"}`: every automation this session can arm, with its scope (`project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack), availability, status, triggers, args and warnings, and files that cannot load with the reason, then the directories scripts go in.",
+            page: "Returns `{\"automations\", \"session_dir\", \"project_dir\", \"user_dir\"}`. Each automation has its scope (`session`, `project`, `user`, or `bundled`), availability, status, triggers, args and warnings. Files that cannot load include the reason. The directories are the resolved locations for scripts. `session_dir` is absent when tools run remotely. Bundled scripts ship with Caudra through an enabled provider such as pstack.",
         },
         MemberDoc {
             name: "validate",

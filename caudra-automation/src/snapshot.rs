@@ -783,6 +783,16 @@ mod tests {
         assert!(state.find("missing").is_none());
     }
 
+    #[test_case(Scope::Session; "session")]
+    #[test_case(Scope::Project; "project")]
+    #[test_case(Scope::User; "user")]
+    #[test_case(Scope::Bundled; "bundled")]
+    fn snapshot_keeps_its_scope(scope: Scope) {
+        let mut snapshot = automation(NAME, Some(ArmOrigin::Manual));
+        snapshot.scope = scope;
+        round_trip(&snapshot);
+    }
+
     #[test]
     fn the_mirror_round_trips() {
         let mut session = controls(vec![NOW - 1], 20);

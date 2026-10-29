@@ -30,7 +30,7 @@ use crate::types::{TextOutput, ToolOutput, counted};
 pub const DESCRIPTION: &str = "Inspect and manage this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
 
 Actions:
-- `list`: every automation this session can arm, with its scope (`project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack, overridden by a script of the same name), availability, status, triggers, args and warnings, files that cannot load with the reason, and the two directories scripts go in, as resolved for this machine and build.
+- `list`: every automation this session can arm, with its scope (`session`, `project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack, overridden by a script of the same name), availability, status, triggers, args and warnings, files that cannot load with the reason, and the resolved script directories. The structured result includes `session_dir`, `project_dir` and `user_dir`; `session_dir` is absent when tools run remotely.
 - `validate`: parse the header of `name`, compile the script, check the args its body reads, and run the body once per trigger against a canned event, performing nothing.
 - `history`: this session's newest firings with their status, only one automation's when you pass `name`, at most `limit` (20 by default, at most 50). Pass `fire_id` to see one firing's event and its actions, log lines included, with its error and state patch.
 
@@ -52,6 +52,7 @@ const FIRE_ID_FIELD: &str = "fire_id";
 const LIMIT_FIELD: &str = "limit";
 const AUTOMATIONS_FIELD: &str = "automations";
 const PROJECT_DIR_FIELD: &str = "project_dir";
+const SESSION_DIR_FIELD: &str = "session_dir";
 const USER_DIR_FIELD: &str = "user_dir";
 const ACTION_LIST: &str = "list";
 const ACTION_VALIDATE: &str = "validate";
@@ -60,6 +61,8 @@ const ACTION_ARM: &str = "arm";
 const ACTION_DISARM: &str = "disarm";
 const ACTION_DELETE: &str = "delete";
 const READ_SCOPE: &str = "read";
+const SESSION_DELETE_SCOPE: &str = "delete-session";
+const SESSION_DISARM_SCOPE: &str = "disarm-session";
 const ACTIONS: &[&str] = &[
     ACTION_LIST,
     ACTION_VALIDATE,
@@ -94,6 +97,7 @@ const WARNING_LABEL: &str = "warning: ";
 const HIDES_LABEL: &str = "hides the script of the same name in: ";
 const PROJECT_DIR_LABEL: &str = "Project scripts (arming requires trust in the reviewed digest): ";
 const USER_DIR_LABEL: &str = "User scripts (trusted as written): ";
+const SESSION_DIR_LABEL: &str = "Session scripts (trusted as written): ";
 const NO_PROJECT_DIR: &str = "Project scripts: none, this session has no local project directory.";
 const NO_USER_DIR: &str = "User scripts: none, no user config directory resolves.";
 const ARM_HINT: &str = "Use automation.arm(name, args) to arm a validated script. Caudra asks for \
@@ -204,6 +208,7 @@ struct AutomationCall {
 struct ReviewedCall {
     snapshot: AutomationSnapshot,
     input: Value,
+    scope: String,
 }
 
 impl AutomationCall {
@@ -228,6 +233,9 @@ impl ToolInvocation for AutomationCall {
 
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(async {
+            if let Some(reviewed) = self.reviewed.get() {
+                return Some(PermissionScopes::single(reviewed.scope.clone()));
+            }
             Some(PermissionScopes::single(self.mutation().map_or_else(
                 || READ_SCOPE.to_owned(),
                 |(action, name)| format!("{action}:{name}"),
@@ -287,7 +295,17 @@ impl ToolInvocation for AutomationCall {
             {
                 input["trust"] = Value::String(format!("trusts digest {}", snapshot.digest));
             }
-            let _ = self.reviewed.set(ReviewedCall { snapshot, input });
+            let scope_action = match (action, snapshot.scope) {
+                (ACTION_DELETE, Scope::Session) => SESSION_DELETE_SCOPE,
+                (ACTION_DISARM, Scope::Session) => SESSION_DISARM_SCOPE,
+                _ => action,
+            };
+            let scope = format!("{scope_action}:{name}");
+            let _ = self.reviewed.set(ReviewedCall {
+                snapshot,
+                input,
+                scope,
+            });
             Ok(None)
         })
     }
@@ -402,11 +420,15 @@ fn render(
         Ok(AutomationResponse::Automations(automations)) => {
             let directories = handle.directories();
             if let Some(hosted) = hosted {
-                hosted.offer(json!({
+                let mut output = json!({
                     AUTOMATIONS_FIELD: automations,
                     PROJECT_DIR_FIELD: directories.project,
                     USER_DIR_FIELD: directories.user,
-                }));
+                });
+                if let Some(dir) = &directories.session {
+                    output[SESSION_DIR_FIELD] = json!(dir);
+                }
+                hosted.offer(output);
             }
             summarized(
                 render_list(&automations, directories),
@@ -463,6 +485,9 @@ fn render_list(automations: &[AutomationSnapshot], directories: &AutomationDirs)
     }
     for automation in automations {
         automation_lines(automation, &mut lines);
+    }
+    if let Some(dir) = &directories.session {
+        lines.push(format!("{SESSION_DIR_LABEL}{}", dir.display()));
     }
     lines.push(directory_line(
         directories.project.as_deref(),
@@ -761,17 +786,24 @@ fn error(failure: ToolFailure, message: String) -> ToolExecResult {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use caudra_automation::args::ArgType;
     use caudra_automation::catalog::{STEM_MISMATCH, Scope};
     use caudra_automation::host::ActionKind;
     use caudra_automation::meta::TriggerKind;
     use caudra_automation::snapshot::{ActionStatus, ArmOrigin, FiringStatus};
+    use caudra_storage::StateDir;
+    use caudra_storage::automation::session_dir;
     use caudra_storage::id::SessionRef;
     use serde_json::json;
     use test_case::test_case;
 
     use super::*;
     use crate::AgentMode;
+    use crate::automation::manager::AutomationRuntime;
     use crate::automation::testing::{AutomationFixture, until};
     use crate::tools::test_support::stub_ctx;
 
@@ -807,6 +839,11 @@ mod tests {
     const EVENT_CAPPED: &str = "the event must be capped before the answer is";
     const PATCH_CAPPED: &str = "the state patch must be capped before the answer is";
     const ANSWER_BOUNDED: &str = "an answer must stay within 32 KiB and say it was cut";
+    const SESSION_DIRECTORY: &str = "a local session exposes its automation directory";
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const MODE_MASK: u32 = 0o777;
 
     async fn run(input: Value, ctx: &ToolContext) -> ToolExecResult {
         AutomationTool.parse(&input).unwrap().execute(ctx).await
@@ -890,8 +927,180 @@ mod tests {
         assert!(!scopes.plan_scoped);
     }
 
+    #[test_case(false, false; "local")]
+    #[test_case(false, true; "ephemeral")]
+    #[test_case(true, false; "remote")]
+    fn list_advertises_and_creates_only_a_local_session_directory(remote: bool, ephemeral: bool) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let dir = session_dir(fixture.state_dir(), fixture.session_id());
+            let mut deps = fixture.deps(fixture.session_id(), &[]);
+            deps.remote = remote;
+            if ephemeral {
+                deps.state_dir =
+                    StateDir::split(fixture.state_dir().path().to_path_buf(), fixture.project());
+                assert_ne!(
+                    session_dir(&deps.state_dir, fixture.session_id()),
+                    session_dir(
+                        &StateDir::from_path(deps.state_dir.persistent_path().to_path_buf()),
+                        fixture.session_id()
+                    )
+                );
+            }
+            let runtime = AutomationRuntime::spawn(deps).await.unwrap();
+            assert!(!dir.exists());
+            let mut ctx = session_ctx(&fixture);
+            let hosted = HostedCall::new(AUTOMATION_TOOL_NAME, ACTION_LIST.into());
+            ctx.hosted = Some(hosted.clone());
+            let (is_error, text) = execute(json!({ACTION_FIELD: ACTION_LIST}), &ctx).await;
+            assert!(!is_error, "{text}");
+            let output = hosted.take().unwrap();
+            assert_eq!(
+                output.get(SESSION_DIR_FIELD),
+                (!remote).then(|| json!(&dir)).as_ref()
+            );
+            assert_eq!(text.contains(SESSION_DIR_LABEL), !remote);
+            assert_eq!(dir.is_dir(), !remote);
+            if !remote {
+                #[cfg(unix)]
+                for path in [&dir, dir.parent().unwrap()] {
+                    assert_eq!(
+                        fs::metadata(path).unwrap().permissions().mode() & MODE_MASK,
+                        PRIVATE_DIRECTORY_MODE
+                    );
+                }
+                fixture.script(&dir, GREETER, IDLE_TRIGGER, QUIET_BODY);
+                execute(json!({ACTION_FIELD: ACTION_LIST}), &ctx).await;
+                assert_eq!(
+                    runtime.handle().state().find(GREETER).unwrap().scope,
+                    Scope::Session
+                );
+            }
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case((); "session_lifecycle")]
+    fn session_scripts_rescan_on_resume_and_are_not_shared_with_a_new_session(_: ()) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let dir = session_dir(fixture.state_dir(), fixture.session_id());
+            fixture.script(&dir, GREETER, IDLE_TRIGGER, QUIET_BODY);
+            let runtime = fixture.spawn(&[GREETER]).await;
+            let handle = runtime.handle();
+            until(&handle, |state| {
+                state
+                    .find(GREETER)
+                    .is_some_and(|script| script.armed.is_some())
+            })
+            .await;
+            let original = handle.state().find(GREETER).unwrap().clone();
+            runtime.shutdown().await;
+            fixture.script(&dir, GREETER, IDLE_TRIGGER, &format!("{QUIET_BODY}\n"));
+            let resumed = fixture.spawn(&[]).await;
+            let resumed_handle = resumed.handle();
+            until(&resumed_handle, |state| {
+                state
+                    .find(GREETER)
+                    .is_some_and(|script| script.armed.is_some())
+            })
+            .await;
+            let state = resumed_handle.state();
+            let restored = state.find(GREETER).unwrap();
+            assert_eq!(restored.scope, Scope::Session);
+            assert_eq!(restored.armed, original.armed);
+            assert_ne!(restored.digest, original.digest);
+            let other = fixture.spawn_session(fixture.other_session(), &[]).await;
+            let other_handle = other.handle();
+            assert_eq!(
+                other_handle.request(AutomationRequest::List).await.unwrap(),
+                AutomationResponse::Automations(Vec::new())
+            );
+            let other_dir = other_handle
+                .directories()
+                .session
+                .as_ref()
+                .expect(SESSION_DIRECTORY);
+            assert_ne!(other_dir, &dir);
+            assert_eq!(fs::read_dir(other_dir).unwrap().count(), 0);
+            other.shutdown().await;
+            resumed.shutdown().await;
+        });
+    }
+
+    #[test_case(Scope::Session, ACTION_DELETE, SESSION_DELETE_SCOPE; "session_delete")]
+    #[test_case(Scope::Session, ACTION_DISARM, SESSION_DISARM_SCOPE; "session_disarm")]
+    #[test_case(Scope::Session, ACTION_ARM, ACTION_ARM; "session_arm")]
+    #[test_case(Scope::Project, ACTION_DELETE, ACTION_DELETE; "project_delete")]
+    #[test_case(Scope::Project, ACTION_DISARM, ACTION_DISARM; "project_disarm")]
+    #[test_case(Scope::User, ACTION_DELETE, ACTION_DELETE; "user_delete")]
+    #[test_case(Scope::User, ACTION_DISARM, ACTION_DISARM; "user_disarm")]
+    fn cleanup_scopes_come_only_from_the_reviewed_script(scope: Scope, action: &str, prefix: &str) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let dir = match scope {
+                Scope::Session => session_dir(fixture.state_dir(), fixture.session_id()),
+                Scope::Project => fixture.project_scripts(),
+                Scope::User => fixture.user_scripts(),
+                Scope::Bundled => unreachable!(),
+            };
+            fixture.script(&dir, GREETER, IDLE_TRIGGER, QUIET_BODY);
+            let runtime = fixture.spawn(&[]).await;
+            let ctx = session_ctx(&fixture);
+            let call = AutomationTool
+                .parse(&json!({ACTION_FIELD: action, NAME_FIELD: GREETER}))
+                .unwrap();
+            assert_eq!(
+                call.permission_scopes().await.unwrap().scopes,
+                [format!("{action}:{GREETER}")]
+            );
+            call.preflight(&ctx).await.unwrap();
+            assert_eq!(
+                call.permission_scopes().await.unwrap().scopes,
+                [format!("{prefix}:{GREETER}")]
+            );
+            assert_eq!(call.permission_input().unwrap()["scope"], json!(scope));
+            let result = call.execute(&ctx).await;
+            assert!(!result.is_error, "{}", text_of(result));
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(ACTION_DELETE; "delete")]
+    #[test_case(ACTION_DISARM; "disarm")]
+    fn reviewed_session_cleanup_cannot_switch_to_a_same_name_project_script(action: &str) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let dir = session_dir(fixture.state_dir(), fixture.session_id());
+            let path = fixture.script(&dir, GREETER, IDLE_TRIGGER, QUIET_BODY);
+            let project = fixture.script(
+                &fixture.project_scripts(),
+                GREETER,
+                IDLE_TRIGGER,
+                QUIET_BODY,
+            );
+            let runtime = fixture.spawn(&[]).await;
+            let ctx = session_ctx(&fixture);
+            let input = json!({ACTION_FIELD: action, NAME_FIELD: GREETER});
+            let call = AutomationTool.parse(&input).unwrap();
+            call.preflight(&ctx).await.unwrap();
+            fs::remove_file(path).unwrap();
+            let result = call.execute(&ctx).await;
+            assert!(result.is_error);
+            assert_eq!(result.failure, Some(ToolFailure::InvalidInput));
+            assert!(project.is_file());
+            let project_call = AutomationTool.parse(&input).unwrap();
+            project_call.preflight(&ctx).await.unwrap();
+            assert_eq!(
+                project_call.permission_scopes().await.unwrap().scopes,
+                [format!("{action}:{GREETER}")]
+            );
+            runtime.shutdown().await;
+        });
+    }
+
     #[test]
-    fn list_shows_availability_args_and_both_directories() {
+    fn list_shows_availability_args_and_all_directories() {
         smol::block_on(async {
             let fixture = AutomationFixture::default();
             let user = fixture.user_scripts();
@@ -944,6 +1153,11 @@ mod tests {
                 assert!(text.contains(&expected), "{expected:?} in {text}");
             }
             let directories = handle.directories();
+            let session_dir = directories.session.as_ref().expect(SESSION_DIRECTORY);
+            assert!(
+                text.contains(&format!("{SESSION_DIR_LABEL}{}", session_dir.display())),
+                "{text}"
+            );
             let project_dir = directories.project.as_ref().expect(BOTH_DIRS);
             let user_dir = directories.user.as_ref().expect(BOTH_DIRS);
             assert!(

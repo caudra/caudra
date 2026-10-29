@@ -161,6 +161,8 @@ pub(super) fn builtin_rules(cwd: &Path, state_dir: Option<&StateDir>) -> Vec<Per
     }
     rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
     rules.push(allow("automation", "read"));
+    rules.push(allow("automation", "delete-session:*"));
+    rules.push(allow("automation", "disarm-session:*"));
     rules
 }
 
@@ -2290,10 +2292,13 @@ mod tests {
     }
 
     #[test_case("read", true; "reads_are_allowed")]
+    #[test_case("delete-session:x", true; "session_delete_is_allowed")]
+    #[test_case("disarm-session:x", true; "session_disarm_is_allowed")]
+    #[test_case("arm-session:x", false; "session_arm_is_not_allowed")]
     #[test_case("arm:x", false; "arm_asks")]
     #[test_case("disarm:x", false; "disarm_asks")]
     #[test_case("delete:x", false; "delete_asks")]
-    fn automation_builtin_only_allows_reads(scope: &str, allowed: bool) {
+    fn automation_builtin_allows_reads_and_session_cleanup(scope: &str, allowed: bool) {
         let manager = mgr_with(PermissionsConfig::default(), PathBuf::from(SHELL_WORKDIR));
         let request = legacy_request(&manager, ToolKey::native("automation"), &[scope]);
         assert_eq!(allows_without_prompt(&manager, &request), allowed);
@@ -2314,6 +2319,24 @@ mod tests {
         );
         let request = legacy_request(&manager, ToolKey::native("automation"), &[scope]);
         assert_eq!(allows_without_prompt(&manager, &request), allowed);
+    }
+
+    #[test_case("delete-session:x", Effect::Deny; "delete_deny")]
+    #[test_case("delete-session:x", Effect::Ask; "delete_ask")]
+    #[test_case("disarm-session:x", Effect::Deny; "disarm_deny")]
+    #[test_case("disarm-session:x", Effect::Ask; "disarm_ask")]
+    fn configured_rules_override_session_automation_cleanup(scope: &str, effect: Effect) {
+        let manager = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::native("automation"),
+                scope: Some(scope.into()),
+                effect,
+            }]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+        let request = legacy_request(&manager, ToolKey::native("automation"), &[scope]);
+        assert!(!allows_without_prompt(&manager, &request));
+        assert_eq!(denied_by_rule(&manager, &request), effect == Effect::Deny);
     }
 
     #[test]

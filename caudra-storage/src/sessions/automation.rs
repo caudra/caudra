@@ -13,16 +13,17 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::StorageError;
 use crate::id::CaudraId;
-use crate::sessions::{SessionDatabase, SessionError, from_i64, id_from_row, to_i64};
+use crate::sessions::{SESSIONS_DIR, SessionDatabase, SessionError, from_i64, id_from_row, to_i64};
 use crate::workflow::{UnknownVariant, parse_column, text_enum};
+use crate::{StateDir, StorageError};
 
 /// What one firing stores in full across its event, action bodies and state
 /// patch. Past it, each further body keeps a [`PREVIEW_BYTES`] preview.
@@ -67,14 +68,17 @@ const WAITING_STATUSES: &str = "('queued', 'deferred')";
 const KEEPING_STATUSES: &str = "('completed', 'skipped')";
 const SUPERSEDED_TRIGGERS: &str = "('armed', 'idle', 'needs_input', 'schedule')";
 
-/// The scopes a binding's CHECK allows: `v36` before bundled scripts, then
-/// `current`.
+pub(crate) const SESSION_AUTOMATIONS_DIR: &str = "automations";
+
 macro_rules! binding_scopes {
     (v36) => {
         "'user', 'project'"
     };
-    (current) => {
+    (v44) => {
         "'user', 'project', 'bundled'"
+    };
+    (current) => {
+        "'user', 'project', 'bundled', 'session'"
     };
 }
 pub(crate) use binding_scopes;
@@ -148,7 +152,7 @@ FROM "#,
 pub(crate) use rebuild_bindings;
 
 macro_rules! tables {
-    ($scopes:ident) => {
+    ($scopes:ident, $actions:ident) => {
         concat!(
             $crate::automation::bindings_table!($scopes),
             r#"
@@ -201,11 +205,31 @@ CREATE TABLE automation_firings (
 CREATE INDEX automation_firings_by_automation ON automation_firings(session_id, automation, queued_ms);
 CREATE INDEX automation_firings_pending ON automation_firings(session_id, queued_ms)
     WHERE status IN ('queued', 'deferred', 'running');
+"#,
+            $crate::automation::actions_table!($actions)
+        )
+    };
+}
 
+macro_rules! action_kinds {
+    (v44) => {
+        "'message', 'set_goal', 'notify', 'http', 'reply', 'send', 'publish', 'broadcast', 'start_workflow', 'pause', 'log'"
+    };
+    (current) => {
+        concat!($crate::automation::action_kinds!(v44), ", 'done'")
+    };
+}
+pub(crate) use action_kinds;
+
+macro_rules! actions_table {
+    ($kinds:ident) => {
+        concat!(r#"
 CREATE TABLE automation_actions (
     fire_id       TEXT NOT NULL REFERENCES automation_firings(fire_id) ON DELETE CASCADE,
     seq           INTEGER NOT NULL CHECK(seq >= 0),
-    kind          TEXT NOT NULL CHECK(kind IN ('message', 'set_goal', 'notify', 'http', 'reply', 'send', 'publish', 'broadcast', 'start_workflow', 'pause', 'log')),
+    kind          TEXT NOT NULL CHECK(kind IN ("#,
+            $crate::automation::action_kinds!($kinds),
+            r#")),
     source_line   INTEGER,
     source_column INTEGER,
     request_hash  TEXT NOT NULL,
@@ -238,18 +262,48 @@ CREATE INDEX automation_actions_queued ON automation_actions(fire_id, seq) WHERE
     };
 }
 
+pub(crate) use actions_table;
+
+macro_rules! rebuild_actions {
+    ($kinds:ident, $previous:literal) => {
+        concat!(
+            "DROP INDEX automation_actions_queued;\nALTER TABLE automation_actions RENAME TO ",
+            $previous,
+            ";\n",
+            $crate::automation::actions_table!($kinds),
+            r#"
+INSERT INTO automation_actions (
+    fire_id, seq, kind, source_line, source_column, request_hash, request_cut, status, result_cut,
+    error, target, delivery, expires_ms, turn_outcome, turn_cost, started_ms, finished_ms,
+    delivered_ms, request, result
+)
+SELECT fire_id, seq, kind, source_line, source_column, request_hash, request_cut, status, result_cut,
+    error, target, delivery, expires_ms, turn_outcome, turn_cost, started_ms, finished_ms,
+    delivered_ms, request, result
+FROM "#,
+            $previous,
+            ";\nDROP TABLE ",
+            $previous,
+            ";\n"
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use rebuild_actions;
+
 /// The bindings of every automation a session armed, the script versions its
 /// firings ran, the firings, and the actions each took. Small columns come
 /// before the bodies so reading a row's status or `bytes` never walks its
 /// overflow pages. Byte bounds live in this module rather than in CHECKs, so
 /// raising one needs no table rebuild.
-pub(crate) const TABLES: &str = tables!(current);
-/// [`TABLES`] as schema 21 created them, before bundled scripts. Only that
-/// step still does: the schema 37 step rebuilds the bindings as [`TABLES`]
-/// has them.
-pub(crate) const TABLES_V21: &str = tables!(v36);
-pub(crate) const BUNDLED_SCOPE_MIGRATION: &str =
-    rebuild_bindings!(current, "automation_bindings_v36");
+pub(crate) const TABLES: &str = tables!(current, current);
+/// The original CHECKs, widened by the schema 37 and 45 rebuilds.
+pub(crate) const TABLES_V21: &str = tables!(v36, v44);
+pub(crate) const BUNDLED_SCOPE_MIGRATION: &str = rebuild_bindings!(v44, "automation_bindings_v36");
+pub(crate) const SESSION_SCOPE_MIGRATION: &str = concat!(
+    rebuild_bindings!(current, "automation_bindings_v44"),
+    rebuild_actions!(current, "automation_actions_v44")
+);
 /// Per-session automation row bytes, as a scalar over the `sessions` alias.
 pub(crate) const SESSION_AUTOMATION_BYTES: &str = "coalesce((SELECT sum(bytes) \
         FROM automation_bindings WHERE session_id = sessions.id), 0) \
@@ -277,6 +331,7 @@ const ACTION_SUMMARY_WIDTH: usize = 19;
 
 text_enum! {
     AutomationScope as "automation scope" {
+        Session = "session",
         User = "user",
         Project = "project",
         Bundled = "bundled",
@@ -366,6 +421,14 @@ text_enum! {
         Next = "next",
         Guide = "guide",
     }
+}
+
+pub fn session_dir(state_dir: &StateDir, session_id: CaudraId) -> PathBuf {
+    state_dir
+        .path()
+        .join(SESSIONS_DIR)
+        .join(session_id.to_string())
+        .join(SESSION_AUTOMATIONS_DIR)
 }
 
 impl AutomationFiringStatus {
@@ -2518,6 +2581,7 @@ mod tests {
     }
 
     #[test_case(AutomationScope::User; "user")]
+    #[test_case(AutomationScope::Session; "session")]
     #[test_case(AutomationScope::Project; "project")]
     #[test_case(AutomationScope::Bundled; "bundled")]
     fn a_binding_keeps_its_scope(scope: AutomationScope) {

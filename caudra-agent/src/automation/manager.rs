@@ -46,7 +46,7 @@ use caudra_storage::StateDir;
 use caudra_storage::automation::{
     AutomationActionEnd, AutomationEventSeen, AutomationFiringEnd, AutomationRelease,
     FiringError as StoredFiringError, MAX_HISTORY_SESSIONS, NewAutomationAction,
-    NewAutomationFiring, StateCommit,
+    NewAutomationFiring, StateCommit, session_dir,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths::config_dir;
@@ -431,6 +431,7 @@ impl Manager {
         });
         let user_config_dir = deps.user_config_dir.or_else(|| config_dir().ok());
         let directories = AutomationDirs::resolve(
+            (!deps.remote).then(|| session_dir(&deps.state_dir, deps.session_id)),
             (!deps.remote).then_some(deps.cwd.as_path()),
             user_config_dir.as_deref(),
         );
@@ -871,6 +872,11 @@ impl Manager {
                     .map(|job| Answered::Later(Box::new(job)));
             }
             AutomationRequest::List => {
+                if let Some(dir) = &self.shared.directories.session {
+                    self.state_dir
+                        .ensure_subdir(dir)
+                        .map_err(|error| AutomationError::Storage(error.to_string()))?;
+                }
                 self.rescan();
                 Ok(AutomationResponse::Automations(self.publish_all()))
             }
@@ -1210,6 +1216,7 @@ impl Manager {
 
     async fn delete(&mut self, name: &str) -> Result<AutomationResponse, AutomationError> {
         let directories = AutomationDirs::resolve(
+            self.shared.directories.session.clone(),
             (!self.remote).then_some(self.cwd.as_path()),
             self.user_config_dir.as_deref(),
         );
@@ -2937,6 +2944,7 @@ impl Manager {
         } else {
             Catalog::scan_with(
                 &self.state_dir,
+                self.shared.directories.session.as_deref(),
                 &self.cwd,
                 self.user_config_dir.as_deref(),
                 bundled,

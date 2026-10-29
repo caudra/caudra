@@ -112,6 +112,7 @@ pub(super) fn action_text(kind: ActionKind) -> &'static str {
 
 pub(super) fn scope_text(scope: Scope) -> &'static str {
     match scope {
+        Scope::Session => "session",
         Scope::User => "user",
         Scope::Project => "project",
         Scope::Bundled => "bundled",
