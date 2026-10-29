@@ -98,7 +98,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 45;
+const SCHEMA_VERSION: i64 = 46;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -990,6 +990,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 45,
         sql: crate::automation::SESSION_SCOPE_MIGRATION,
     },
+    Migration {
+        from: 45,
+        to: 46,
+        sql: crate::memory_nudges::TABLES,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1268,7 +1273,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{USAGE_NO_COST_ESTIMATE_COLUMNS}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{USAGE_NO_COST_ESTIMATE_COLUMNS}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1291,7 +1296,8 @@ fn full_schema() -> String {
         crate::background::TRANSCRIPTS,
         crate::engine_decisions::SCREENING_COLUMN,
         crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
-        crate::shell_runs::HOST_COLUMN
+        crate::shell_runs::HOST_COLUMN,
+        crate::memory_nudges::TABLES
     )
 }
 
@@ -7866,9 +7872,17 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    macro_rules! memory_nudges_downgrade {
+        () => {
+            "DROP TABLE memory_nudges;"
+        };
+    }
+    const MEMORY_NUDGES_DOWNGRADE: &str = memory_nudges_downgrade!();
+    const MEMORY_NUDGES_PREVIOUS_SCHEMA: i64 = 45;
     macro_rules! session_scope_downgrade {
         () => {
             concat!(
+                memory_nudges_downgrade!(),
                 crate::automation::rebuild_bindings!(v44, "automation_bindings_v45"),
                 crate::automation::rebuild_actions!(v44, "automation_actions_v45")
             )
@@ -14866,6 +14880,35 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             backup
                 .execute(change_kind, params![DONE_ACTION, RELOCATION_FIRING])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_nudges_migration_adds_the_table_and_keeps_the_rest() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(MEMORY_NUDGES_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", MEMORY_NUDGES_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.id, session.id);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
         );
     }
 

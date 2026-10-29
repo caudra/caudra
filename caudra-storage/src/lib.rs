@@ -33,6 +33,7 @@ pub mod log;
 pub mod mcp_trust;
 pub mod media;
 pub mod memory_journal;
+pub mod memory_nudges;
 pub mod messages;
 pub mod model;
 pub mod paths;
