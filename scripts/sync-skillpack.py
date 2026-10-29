@@ -27,7 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKS = {"pstack": "caudra-pstack", "mattpocock": "caudra-mattpocock"}
+PACKS = {
+    "pstack": "caudra-pstack",
+    "mattpocock": "caudra-mattpocock",
+    "emil": "caudra-emil",
+}
 PACK_FILE = "pack.json"
 MANIFEST_FILE = "upstream.json"
 TRANSLATIONS_FILE = "translations.json"
