@@ -38,6 +38,12 @@ pub const BACKLOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const IDLE_GRACE: Duration = Duration::from_secs(60);
 pub const BOOTSTRAP_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_RUNS_PER_DAY: usize = 8;
+/// While a project has no memory notes, the learner runs after this many
+/// typed messages and [`BACKLOG_INTERVAL`] apart, so the first notes come
+/// early and later sessions have examples to follow.
+pub const EMPTY_MEMORY_USER_MESSAGES: usize = 3;
+/// How many runs a day may take the empty-memory pace.
+pub const EMPTY_MEMORY_RUNS_PER_DAY: usize = 2;
 /// History this recent is left for the next run, so a turn still being
 /// written is never read half done.
 pub const SETTLE: Duration = Duration::from_secs(60);
@@ -59,6 +65,19 @@ const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// Items one run reads, oldest first; the rest wait for the next.
 const TIMELINE_LIMIT: usize = 20_000;
 
+/// Whether a project's learner takes the empty-memory pace.
+fn early(empty_memory: bool, runs_today: usize) -> bool {
+    empty_memory && runs_today < EMPTY_MEMORY_RUNS_PER_DAY
+}
+
+/// How many typed messages a run waits for.
+pub fn min_user_messages(empty_memory: bool, runs_today: usize) -> usize {
+    match early(empty_memory, runs_today) {
+        true => EMPTY_MEMORY_USER_MESSAGES,
+        false => MIN_USER_MESSAGES,
+    }
+}
+
 /// Why a project's learner waits rather than runs, `None` when it may run.
 /// A forced run skips the spacing between runs but never a pause or the
 /// daily cap.
@@ -68,6 +87,7 @@ pub fn waiting(
     runs_today: usize,
     now_ms: i64,
     forced: bool,
+    empty_memory: bool,
 ) -> Option<&'static str> {
     if project.is_some_and(|project| project.paused) {
         return Some(PAUSED);
@@ -77,6 +97,7 @@ pub fn waiting(
     }
     let spacing = match last.map(|run| run.outcome.as_str()) {
         Some(PARTIAL) => BACKLOG_INTERVAL,
+        _ if early(empty_memory, runs_today) => BACKLOG_INTERVAL,
         _ => MIN_INTERVAL,
     };
     let recent = last.is_some_and(|run| now_ms - run.started_ms < millis(spacing));
@@ -251,17 +272,29 @@ impl Shared {
         let project = self.project.label.clone();
         let now = now_ms();
         let store = self.store().await?;
-        let (state, last, runs_today) = {
+        let memory = self.memory();
+        let (state, last, runs_today, empty_memory) = {
             let project = project.clone();
             smol::unblock(move || {
                 let state = store.project(&project)?;
                 let last = store.runs(&project, 1)?.into_iter().next();
                 let today = store.runs_since(&project, now - millis(DAY))?;
-                Ok::<_, LearnError>((state, last, today))
+                let empty = match memory {
+                    Some(memory) => memory.live_count()? == 0,
+                    None => false,
+                };
+                Ok::<_, LearnError>((state, last, today, empty))
             })
             .await?
         };
-        if let Some(reason) = waiting(state.as_ref(), last.as_ref(), runs_today, now, forced) {
+        if let Some(reason) = waiting(
+            state.as_ref(),
+            last.as_ref(),
+            runs_today,
+            now,
+            forced,
+            empty_memory,
+        ) {
             debug!(%project, reason, "continual learning waits");
             return Ok(());
         }
@@ -292,7 +325,7 @@ impl Shared {
                 .await?
         };
         let typed = digest::authored_messages(&items);
-        if typed < MIN_USER_MESSAGES && !forced {
+        if typed < min_user_messages(empty_memory, runs_today) && !forced {
             debug!(%project, typed, "continual learning waits for more messages");
             return Ok(());
         }
@@ -312,7 +345,7 @@ impl Shared {
         };
         let mut digest = Digest::build(&items, window_end);
         digest.truncated |= window_end < unsigned(until);
-        info!(%project, run = begun.id, typed, exchanges = digest.exchanges, truncated = digest.truncated, "continual learning run started");
+        info!(%project, run = begun.id, typed, empty_memory, exchanges = digest.exchanges, truncated = digest.truncated, "continual learning run started");
         let finished = match digest.exchanges {
             0 => FinishedRun {
                 outcome: LEARNED.to_owned(),
@@ -343,14 +376,18 @@ impl Shared {
         Ok(())
     }
 
+    /// The project's memory, when the learner may write to it.
+    fn memory(&self) -> Option<Arc<MemoryStore>> {
+        self.deps
+            .memory
+            .clone()
+            .filter(|_| self.deps.targets.contains(&LearningTarget::Memory))
+    }
+
     /// Runs the learner on `digest` and applies what passes.
     async fn learn(&self, run_id: i64, digest: &Digest, scope: &HistoryScope) -> FinishedRun {
         let files = self.files().await;
-        let memory = self
-            .deps
-            .memory
-            .clone()
-            .filter(|_| self.deps.targets.contains(&LearningTarget::Memory));
+        let memory = self.memory();
         let memory_view = match &memory {
             Some(memory) => {
                 let memory = Arc::clone(memory);
@@ -569,20 +606,38 @@ mod tests {
         }
     }
 
-    #[test_case(None, 0, false => None ; "a_first_run")]
-    #[test_case(Some((LEARNED, Duration::from_secs(60))), 1, false => Some(TOO_SOON) ; "right_after_a_run")]
-    #[test_case(Some((LEARNED, Duration::from_secs(60))), 1, true => None ; "forced_right_after_a_run")]
-    #[test_case(Some((LEARNED, MIN_INTERVAL)), 1, false => None ; "once_the_interval_passed")]
-    #[test_case(Some((PARTIAL, BACKLOG_INTERVAL)), 1, false => None ; "a_backlog_sooner")]
-    #[test_case(Some((FAILED, BACKLOG_INTERVAL)), 1, false => Some(TOO_SOON) ; "a_failure_waits_the_full_interval")]
-    #[test_case(Some((LEARNED, MIN_INTERVAL)), MAX_RUNS_PER_DAY, true => Some(DAILY_CAP) ; "the_daily_cap_holds_when_forced")]
+    #[test_case(None, 0, false, false => None ; "a_first_run")]
+    #[test_case(Some((LEARNED, Duration::from_secs(60))), 1, false, false => Some(TOO_SOON) ; "right_after_a_run")]
+    #[test_case(Some((LEARNED, Duration::from_secs(60))), 1, true, false => None ; "forced_right_after_a_run")]
+    #[test_case(Some((LEARNED, MIN_INTERVAL)), 1, false, false => None ; "once_the_interval_passed")]
+    #[test_case(Some((PARTIAL, BACKLOG_INTERVAL)), 1, false, false => None ; "a_backlog_sooner")]
+    #[test_case(Some((FAILED, BACKLOG_INTERVAL)), 1, false, false => Some(TOO_SOON) ; "a_failure_waits_the_full_interval")]
+    #[test_case(Some((LEARNED, MIN_INTERVAL)), MAX_RUNS_PER_DAY, true, false => Some(DAILY_CAP) ; "the_daily_cap_holds_when_forced")]
+    #[test_case(Some((LEARNED, BACKLOG_INTERVAL)), 1, false, true => None ; "empty_memory_sooner")]
+    #[test_case(Some((LEARNED, BACKLOG_INTERVAL)), EMPTY_MEMORY_RUNS_PER_DAY, false, true => Some(TOO_SOON) ; "empty_memory_pace_runs_out_for_the_day")]
+    #[test_case(Some((LEARNED, MIN_INTERVAL)), MAX_RUNS_PER_DAY, false, true => Some(DAILY_CAP) ; "empty_memory_keeps_the_daily_cap")]
     fn when_a_learner_runs(
         previous: Option<(&str, Duration)>,
         runs_today: usize,
         forced: bool,
+        empty_memory: bool,
     ) -> Option<&'static str> {
         let last = previous.map(|(outcome, ago)| last(outcome, ago));
-        waiting(None, last.as_ref(), runs_today, NOW_MS, forced)
+        waiting(
+            None,
+            last.as_ref(),
+            runs_today,
+            NOW_MS,
+            forced,
+            empty_memory,
+        )
+    }
+
+    #[test_case(false, 0 => MIN_USER_MESSAGES ; "notes_exist")]
+    #[test_case(true, 0 => EMPTY_MEMORY_USER_MESSAGES ; "no_notes")]
+    #[test_case(true, EMPTY_MEMORY_RUNS_PER_DAY => MIN_USER_MESSAGES ; "no_notes_after_the_early_runs")]
+    fn how_many_messages_a_run_waits_for(empty_memory: bool, runs_today: usize) -> usize {
+        min_user_messages(empty_memory, runs_today)
     }
 
     #[test]
@@ -591,6 +646,9 @@ mod tests {
             paused: true,
             ..LearningProject::default()
         };
-        assert_eq!(waiting(Some(&paused), None, 0, NOW_MS, true), Some(PAUSED));
+        assert_eq!(
+            waiting(Some(&paused), None, 0, NOW_MS, true, true),
+            Some(PAUSED)
+        );
     }
 }
