@@ -1044,6 +1044,9 @@ mod tests {
         window_excludes_output: false,
         unsupported: None,
         reasoning_options: None,
+        api: None,
+        plan_context_window: None,
+        supports_thinking: None,
     };
     const MANIFEST: ProviderManifest = ProviderManifest {
         slug: "test",

@@ -595,6 +595,7 @@ mod tests {
         Model {
             model_revision: crate::model_data::current().revision,
             manifest: crate::manifest::ManifestRegistry::get("xai"),
+            entry: None,
             id: "grok-4.6".into(),
             provider: "xai".into(),
             family: ModelFamily::Generic,

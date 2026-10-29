@@ -26,9 +26,6 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
 };
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-/// The models that take `reasoning_effort`, from
-/// <https://docs.z.ai/guides/overview/migrate-to-glm-new>.
-const THINKING_MODELS: &[&str] = &["glm-5.2", "glm-5.3"];
 
 #[derive(Deserialize)]
 struct QuotaResponse {
@@ -249,8 +246,11 @@ impl Provider for Zai {
 }
 
 pub(crate) fn adjust_model(model: &mut Model) {
-    if THINKING_MODELS.contains(&model.id.as_str()) {
-        model.thinking_override = Some(ThinkingSupport::Yes);
+    if let Some(supports) = model
+        .exact_entry()
+        .and_then(|entry| entry.supports_thinking)
+    {
+        model.thinking_override = ThinkingSupport::from_flags(Some(supports), false);
     }
 }
 
@@ -259,6 +259,7 @@ mod tests {
     use super::*;
     use crate::manifest::ManifestRegistry;
     use crate::model::lookup_entry;
+    use crate::model_data::edit_model;
     use test_case::test_case;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[
@@ -266,6 +267,27 @@ mod tests {
         {"type":"TOKENS_LIMIT","unit":6,"percentage":4,"nextResetTime":1778262784969},
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
+    const THINKING_ID: &str = "glm-5.1";
+    const THINKING_SPEC: &str = "zai/glm-5.1";
+    const THINKING_NEAR_MATCH: &str = "zai/glm-5.1-preview";
+
+    #[test_case(None, false; "default")]
+    #[test_case(Some(false), false; "disabled")]
+    #[test_case(Some(true), true; "enabled")]
+    fn data_alone_changes_exact_id_thinking_support(supports: Option<bool>, expected: bool) {
+        let mut old = Model::from_spec(THINKING_SPEC).unwrap();
+        edit_model("zai", THINKING_ID, |entry| {
+            entry.supports_thinking = supports
+        });
+        let mut model = Model::from_spec(THINKING_SPEC).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.supports_thinking(), expected);
+        adjust_model(&mut old);
+        assert!(!old.supports_thinking());
+        let mut near_match = Model::from_spec(THINKING_NEAR_MATCH).unwrap();
+        adjust_model(&mut near_match);
+        assert!(!near_match.supports_thinking());
+    }
 
     #[test_case("glm-4.7-flashx", 0.07, 0.01, 0.40, false ; "paid_flashx")]
     #[test_case("glm-4.7-flash", 0.00, 0.00, 0.00, true ; "free_flash")]

@@ -21,7 +21,7 @@ pub use catalog::{
 };
 pub use validate::{Issue, validate};
 pub use wire::{
-    Availability, DecisionModel, Family, FastPricing, Generation, ModelEntry, Payload, Period,
+    Api, Availability, DecisionModel, Family, FastPricing, Generation, ModelEntry, Payload, Period,
     PricePeriod, Pricing, PricingSchedule, PricingWindow, Provider, ReasoningOption, Snapshot,
     Tier,
 };

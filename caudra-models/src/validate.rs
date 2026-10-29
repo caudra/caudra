@@ -157,6 +157,9 @@ fn validate_provider(provider: &Provider, path: &str, issues: &mut Vec<Issue>) {
         if let Some(value) = model.max_output_tokens {
             tokens(value, &format!("{model_path}/max_output_tokens"), issues);
         }
+        if let Some(value) = model.plan_context_window {
+            tokens(value, &format!("{model_path}/plan_context_window"), issues);
+        }
         validate_pricing(&model.pricing, &format!("{model_path}/pricing"), issues);
     }
     for (index, period) in provider.price_periods.iter().enumerate() {
@@ -373,6 +376,17 @@ mod tests {
     const DEFAULT_POINTER: &str = "/providers/0/models/1/default";
     const PRICE_POINTER: &str = "/providers/0/models/0/pricing/input";
     const DISPLAY_MESSAGE: &str = "/format: unsupported model-file format; expected 1";
+
+    #[test]
+    fn plan_window_obeys_token_bounds() {
+        let mut snapshot = fixture();
+        snapshot.payload.providers[0].models[0].plan_context_window = Some(MAX_TOKENS + 1);
+        assert_issue(
+            &snapshot,
+            "/providers/0/models/0/plan_context_window",
+            TOKEN_MESSAGE,
+        );
+    }
 
     fn assert_issue(snapshot: &Snapshot, pointer: &str, message: &str) {
         assert_eq!(

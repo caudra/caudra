@@ -161,6 +161,9 @@ fn model(value: wire::ModelEntry) -> ModelEntry {
         max_output_tokens: value.max_output_tokens,
         context_window: value.context_window,
         window_excludes_output: value.window_excludes_output,
+        api: value.api,
+        plan_context_window: value.plan_context_window,
+        supports_thinking: value.supports_thinking,
         unsupported,
         reasoning_options: value.reasoning_options.map(|options| {
             &*Box::leak(

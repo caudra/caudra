@@ -86,6 +86,12 @@ pub struct ModelEntry {
     pub window_excludes_output: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_options: Option<Vec<ReasoningOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<Api>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +240,33 @@ impl<'de> Deserialize<'de> for Family {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Api {
+    ChatCompletions,
+    Responses,
+    Unknown(String),
+}
+
+impl Serialize for Api {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::Unknown(value) => value,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Api {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "chat_completions" => Self::ChatCompletions,
+            "responses" => Self::Responses,
+            value => Self::Unknown(value.to_owned()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningOption {
@@ -297,7 +330,13 @@ impl Provider {
 
 impl ModelEntry {
     pub fn unsupported_reason(&self, supported: &[&str]) -> Option<String> {
-        unsupported_reason(&self.family, &self.requires, supported)
+        unsupported_reason(&self.family, &self.requires, supported).or_else(|| {
+            if let Some(Api::Unknown(api)) = &self.api {
+                Some(format!("API {api:?} needs a newer Caudra"))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -317,7 +356,21 @@ mod schema {
 
     use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 
-    use super::{Family, ReasoningOption};
+    use super::{Api, Family, ReasoningOption};
+
+    impl JsonSchema for Api {
+        fn schema_name() -> Cow<'static, str> {
+            "Api".into()
+        }
+
+        fn json_schema(_: &mut SchemaGenerator) -> Schema {
+            json_schema!({
+                "type": "string",
+                "description": "Known APIs are chat_completions and responses. Other strings require a newer Caudra.",
+                "examples": ["chat_completions", "responses"]
+            })
+        }
+    }
 
     impl JsonSchema for Family {
         fn schema_name() -> Cow<'static, str> {
@@ -360,11 +413,28 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{Family, ModelEntry, ReasoningOption};
+    use super::{Api, Family, ModelEntry, ReasoningOption};
     use crate::{parse_bounded, tests::fixture};
 
     const FAMILY_MESSAGE: &str = "family \"future\" needs a newer Caudra";
     const REQUIREMENT_MESSAGE: &str = "requirement \"future\" needs a newer Caudra";
+    const API_MESSAGE: &str = "API \"future\" needs a newer Caudra";
+
+    #[test_case("chat_completions", Api::ChatCompletions; "chat")]
+    #[test_case("responses", Api::Responses; "responses")]
+    #[test_case("future", Api::Unknown("future".to_owned()); "unknown")]
+    fn apis_round_trip_and_classify_support(text: &str, expected: Api) {
+        let value = json!(text);
+        let api: Api = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(api, expected);
+        assert_eq!(serde_json::to_value(&api).unwrap(), value);
+        let mut model = fixture().payload.providers.remove(0).models.remove(0);
+        model.api = Some(api);
+        assert_eq!(
+            model.unsupported_reason(&[]).as_deref(),
+            matches!(expected, Api::Unknown(_)).then_some(API_MESSAGE)
+        );
+    }
 
     #[test_case("claude", Family::Claude; "claude")]
     #[test_case("generic", Family::Generic; "generic")]
@@ -465,7 +535,15 @@ mod tests {
         let mut model = fixture().payload.providers.remove(0).models.remove(0);
         model.reasoning_options = None;
         let absent = serde_json::to_value(&model).unwrap();
-        for field in ["note", "source", "requires", "reasoning_options"] {
+        for field in [
+            "note",
+            "source",
+            "requires",
+            "reasoning_options",
+            "api",
+            "plan_context_window",
+            "supports_thinking",
+        ] {
             assert!(absent.get(field).is_none());
         }
         model.reasoning_options = Some(Vec::new());
@@ -480,6 +558,10 @@ mod tests {
     fn generated_model_schema_describes_open_enums() {
         let schema = serde_json::to_value(schema_for!(ModelEntry)).unwrap();
         let family = &schema["$defs"]["Family"];
+        let api = &schema["$defs"]["Api"];
+        assert_eq!(api["type"], json!("string"));
+        assert!(api.get("enum").is_none());
+        assert_eq!(api["examples"], json!(["chat_completions", "responses"]));
         assert_eq!(family["type"], json!("string"));
         assert!(family.get("enum").is_none());
         assert_eq!(

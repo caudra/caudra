@@ -394,6 +394,7 @@ mod tests {
         Model {
             model_revision: crate::model_data::current().revision,
             manifest: crate::manifest::ManifestRegistry::get("anthropic"),
+            entry: None,
             id: id.into(),
             provider: Arc::from("anthropic"),
             family: ModelFamily::Claude,

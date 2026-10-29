@@ -911,6 +911,7 @@ mod tests {
         Model {
             model_revision: crate::model_data::current().revision,
             manifest: None,
+            entry: None,
             id: id.into(),
             provider: Arc::from(OPENCODE_GO),
             family: ModelFamily::Generic,

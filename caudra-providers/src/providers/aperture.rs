@@ -473,7 +473,11 @@ fn adjust_metadata_with_overrides(model: &mut Model, overrides: &Overrides) {
         if let Some(kind) = routed_kind(provider_id, &ov) {
             let model_id = model_id.to_owned();
             let full_id = std::mem::replace(&mut model.id, model_id);
+            let full_entry = model.entry;
+            model.entry = manifest_for_kind(kind)
+                .and_then(|manifest| lookup_entry(manifest.models, &model.id).ok());
             adjust_model_metadata(kind, model);
+            model.entry = full_entry;
             model.id = full_id;
         }
     }
@@ -562,7 +566,11 @@ impl Provider for Aperture {
                     self.system_prefix.clone(),
                 );
                 let full_id = std::mem::replace(&mut model.id, model_id);
+                let full_entry = model.entry;
+                model.entry = manifest_for_kind(kind)
+                    .and_then(|manifest| lookup_entry(manifest.models, &model.id).ok());
                 routed.adjust_model(model);
+                model.entry = full_entry;
                 model.id = full_id;
             }
         }
@@ -582,6 +590,7 @@ mod tests {
     use super::*;
     use crate::ReasoningTransport;
     use crate::model::ModelFamily;
+    use crate::model_data::edit_model;
     use serde_json::json;
     use test_case::test_case;
 
@@ -977,6 +986,29 @@ mod tests {
             ThinkingSupport::from_flags(Some(kind_supports_thinking(kind)), false)
         );
         assert_eq!(model.supports_thinking(), kind_supports_thinking(kind));
+    }
+
+    #[test_case(false, false; "provider_off")]
+    #[test_case(false, true; "provider_on")]
+    #[test_case(true, false; "inspection_off")]
+    #[test_case(true, true; "inspection_on")]
+    fn routed_thinking_follows_data_without_replacing_gateway_identity(
+        inspection: bool,
+        supports: bool,
+    ) {
+        const ID: &str = "glm-5.1";
+        const SPEC: &str = "aperture/zai/glm-5.1";
+        edit_model("zai", ID, |entry| entry.supports_thinking = Some(supports));
+        let mut model = Model::from_spec(SPEC).unwrap();
+        if inspection {
+            adjust_metadata_with_overrides(&mut model, &Overrides::new());
+        } else {
+            Aperture::with_auth_and_overrides(test_auth(), Timeouts::default(), Overrides::new())
+                .adjust_model(&mut model);
+        }
+        assert_eq!(model.supports_thinking(), supports);
+        assert_eq!(model.spec(), SPEC);
+        assert!(model.entry.is_none());
     }
 
     #[test]

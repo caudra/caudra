@@ -11,20 +11,35 @@ use std::process::{Command, ExitCode};
 use std::sync::Arc;
 
 use caudra_agent::permissions::canonical_json_sha256;
+use caudra_providers::accounts::{AccountCredential, AccountSecret, CredentialSource};
 use caudra_providers::decision_pricing::{self, decision_cost};
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::pricing::Period;
+use caudra_providers::provider::ProviderKind;
 use caudra_providers::{
-    FastPricing, Model, ModelEntry, ModelGeneration, ModelMarker, ModelPricing, ModelPurpose,
-    ProviderData, ReasoningOption, ReasoningOptions, StaticReasoningOption, TokenUsage,
-    catalog_providers, model_ids, model_meta,
+    CacheKey, FastPricing, Message, Model, ModelEntry, ModelGeneration, ModelMarker, ModelPricing,
+    ModelPurpose, ProviderData, ReasoningOption, ReasoningOptions, RequestOptions,
+    StaticReasoningOption, ThinkingConfig, Timeouts, TokenUsage, catalog_providers, model_ids,
+    model_meta,
 };
+use caudra_storage::accounts::{AccountId, AccountIdentity, AccountName};
+use caudra_storage::auth::OAuthTokens;
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 
 const SANDBOX_FLAG: &str = "--sandbox";
-const USAGE: &str = "usage: caudra-models-parity [--sandbox DIR]";
+const USAGE: &str = "usage: caudra-models-parity [--sandbox DIR] [--requests]";
+const REQUESTS_FLAG: &str = "--requests";
+const REQUESTS_ENV: &str = "CAUDRA_MODELS_PARITY_REQUESTS";
+const PROBE_CREDENTIAL: &str = "parity-not-a-credential";
+const PROBE_ACCOUNT: &str = "parity";
+const PROBE_SYSTEM: &str = "Reply briefly.";
+const PROBE_MESSAGE: &str = "Hello.";
+const PROBE_CACHE_KEY: &str = "parity-cache";
+const PROBE_SUFFIXES: [&str; 3] = ["", "-preview", "-2026-10-29"];
+const REQUEST_PROVIDERS: [(&str, ProviderKind); 2] =
+    [("openai", ProviderKind::OpenAi), ("zai", ProviderKind::Zai)];
 const DEFAULT_SANDBOX: &str = "caudra-models-parity";
 /// Proves a sandbox is ours to wipe before a rerun removes it.
 const SANDBOX_MARKER: &str = ".caudra-models-parity";
@@ -97,21 +112,27 @@ const SHORT_HASH_LEN: usize = 16;
 
 struct Options {
     sandbox: PathBuf,
+    requests: bool,
 }
 
 fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options> {
     let mut sandbox = None;
+    let mut requests = false;
     while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| eyre!("{flag} needs a value\n{USAGE}"))?;
         match flag.as_str() {
-            SANDBOX_FLAG => sandbox = Some(PathBuf::from(value)),
+            SANDBOX_FLAG => {
+                sandbox = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| eyre!("{flag} needs a value\n{USAGE}"))?,
+                ));
+            }
+            REQUESTS_FLAG => requests = true,
             _ => bail!("unknown flag {flag}\n{USAGE}"),
         }
     }
     Ok(Options {
         sandbox: sandbox.unwrap_or_else(|| env::temp_dir().join(DEFAULT_SANDBOX)),
+        requests,
     })
 }
 
@@ -140,6 +161,9 @@ fn run_sandboxed() -> Result<()> {
         .env_clear()
         .env(CHILD_ENV, "1")
         .env(NAMESPACE_ENV, NAMESPACE);
+    if options.requests {
+        child.env(REQUESTS_ENV, "1");
+    }
     for (var, dir) in SANDBOX_DIRS {
         let path = options.sandbox.join(dir);
         fs::create_dir_all(&path)?;
@@ -158,6 +182,9 @@ fn run_sandboxed() -> Result<()> {
 }
 
 fn dump() -> Result<String> {
+    if env::var_os(REQUESTS_ENV).is_some() {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&requests()?)?));
+    }
     let catalog_providers = catalog_providers();
     if catalog_providers.is_empty() {
         bail!("the snapshot catalog is empty");
@@ -183,6 +210,97 @@ fn dump() -> Result<String> {
         "catalog": catalog(catalog_providers, &dates),
     });
     Ok(format!("{}\n", serde_json::to_string_pretty(&document)?))
+}
+
+fn requests() -> Result<Value> {
+    let mut dump = Map::new();
+    for (slug, kind) in REQUEST_PROVIDERS {
+        let manifest = ManifestRegistry::get(slug).ok_or_else(|| eyre!("missing {slug}"))?;
+        let mut ids: Vec<String> = manifest
+            .models
+            .iter()
+            .flat_map(|entry| entry.prefixes)
+            .flat_map(|id| PROBE_SUFFIXES.map(|suffix| format!("{id}{suffix}")))
+            .chain(model_ids(manifest.catalog_slug.unwrap_or(slug)))
+            .collect();
+        if kind == ProviderKind::OpenAi {
+            ids.push("gpt-future-codex".into());
+        }
+        ids.sort();
+        ids.dedup();
+        for oauth in [false, true] {
+            if oauth && kind != ProviderKind::OpenAi {
+                continue;
+            }
+            let secret = if oauth {
+                AccountSecret::OAuth(OAuthTokens {
+                    access: PROBE_CREDENTIAL.into(),
+                    refresh: PROBE_CREDENTIAL.into(),
+                    expires: u64::MAX,
+                    account_id: None,
+                })
+            } else {
+                AccountSecret::ApiKey {
+                    key: PROBE_CREDENTIAL.into(),
+                    host: None,
+                }
+            };
+            let account = AccountCredential {
+                id: AccountId::new(slug, AccountName::new(PROBE_ACCOUNT)?),
+                secret,
+                source: CredentialSource::Config,
+                identity: AccountIdentity::default(),
+            };
+            let provider = kind.create(&account, Timeouts::default())?;
+            let mut models = Map::new();
+            for id in &ids {
+                let mut model = Model::from_spec(&format!("{slug}/{id}"))?;
+                provider.adjust_model(&mut model);
+                let mut turns = Vec::new();
+                for thinking in [
+                    ThinkingConfig::Off,
+                    ThinkingConfig::Adaptive,
+                    ThinkingConfig::Effort("high".into()),
+                ] {
+                    let wire = provider.wire_request(
+                        &model,
+                        &[Message::user(PROBE_MESSAGE.into())],
+                        PROBE_SYSTEM,
+                        &Value::Null,
+                        &RequestOptions {
+                            thinking,
+                            ..Default::default()
+                        },
+                        Some(&CacheKey::task(None, PROBE_CACHE_KEY)),
+                    )?;
+                    turns.push(json!({ "url": wire.url, "body": wire.body }));
+                }
+                models.insert(id.clone(), json!({
+                    "context_window": model.context_window,
+                    "window_excludes_output": model.window_excludes_output,
+                    "supports_thinking": model.supports_thinking(),
+                    "reasoning_transport": format!("{:?}", provider.reasoning_transport(&model)),
+                    "turns": turns,
+                }));
+            }
+            let listing = if oauth {
+                Some(
+                    smol::block_on(provider.list_models())?
+                        .into_iter()
+                        .map(|model| model.id)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+            let auth = if oauth { "oauth" } else { "api_key" };
+            dump.insert(
+                format!("{slug}/{auth}"),
+                json!({ "models": models, "listing": listing }),
+            );
+        }
+    }
+    Ok(Value::Object(dump))
 }
 
 fn provider(manifest: &ProviderManifest, dates: &[(&str, Timestamp)]) -> Value {
@@ -541,6 +659,10 @@ fn catalog(mut providers: Vec<ProviderData>, dates: &[(&str, Timestamp)]) -> Val
 }
 
 fn main() -> ExitCode {
+    if env::args().any(|arg| arg == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let result = match env::var_os(CHILD_ENV) {
         Some(_) => dump().map(|document| print!("{document}")),
         None => run_sandboxed(),

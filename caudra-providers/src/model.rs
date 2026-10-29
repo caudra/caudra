@@ -11,6 +11,7 @@ use std::sync::Arc;
 use caudra_config::ModelPolicy;
 pub use caudra_config::providers::ModelPurpose;
 use caudra_config::providers::{ModelFields, UnknownPurpose};
+use caudra_models::Api;
 use caudra_storage::sessions::{StoredTokenUsage, cache_hit_rate};
 use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
@@ -338,6 +339,9 @@ pub struct ModelEntry {
     /// Corrects the catalog where it describes the model rather than the
     /// request caudra sends. `None` defers to discovery and models.dev.
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
+    pub api: Option<Api>,
+    pub plan_context_window: Option<u32>,
+    pub supports_thinking: Option<bool>,
 }
 
 /// A release line, so a routing lane can answer inside the line the user is
@@ -453,6 +457,7 @@ impl Billing {
 pub struct Model {
     pub model_revision: u64,
     pub manifest: Option<&'static ProviderManifest>,
+    pub entry: Option<&'static ModelEntry>,
     pub id: String,
     pub provider: Arc<str>,
     pub family: ModelFamily,
@@ -623,6 +628,7 @@ impl Model {
         let mut model = Self {
             model_revision: crate::model_data::current().revision,
             manifest: Some(manifest),
+            entry: static_entry,
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family,
@@ -676,6 +682,7 @@ impl Model {
         Self {
             model_revision: crate::model_data::current().revision,
             manifest: None,
+            entry: None,
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family: ModelFamily::Generic,
@@ -711,6 +718,11 @@ impl Model {
             Some(fields) if self.reasoning_options.is_empty() => fields.reasoning_options(),
             _ => self.reasoning_options.clone(),
         }
+    }
+
+    pub(crate) fn exact_entry(&self) -> Option<&'static ModelEntry> {
+        self.entry
+            .filter(|entry| entry.prefixes.contains(&self.id.as_str()))
     }
 
     pub fn supports_thinking(&self) -> bool {
@@ -1067,6 +1079,12 @@ impl Model {
         }
 
         if let Some(model) = dynamic::lookup_model(slug, model_id) {
+            if let Some(reason) = model.entry.and_then(|entry| entry.unsupported) {
+                return Err(ModelError::NeedsNewerCaudra {
+                    model: spec.to_owned(),
+                    reason,
+                });
+            }
             return Ok(model);
         }
 
@@ -2302,6 +2320,9 @@ mod tests {
         window_excludes_output: false,
         unsupported: None,
         reasoning_options: None,
+        api: None,
+        plan_context_window: None,
+        supports_thinking: None,
     }];
     /// One date the suite never reaches and one long gone, so the real clock
     /// that `from_base` reads cannot move the answer.

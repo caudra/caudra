@@ -1,8 +1,8 @@
 {
   "$schema": "schema.json",
   "format": 1,
-  "updated_at": "2026-10-29T12:00:00Z",
-  "content_sha256": "bb9b02cb29c70feb249a30d933b36b1c367559b94f1e4a5e3d57cc19371e5964",
+  "updated_at": "2026-10-29T17:32:35.211466379Z",
+  "content_sha256": "88db35136db2617fcaa770571c57e30db5685acdd06aa86abb955118f8a6a719",
   "providers": [
     {
       "slug": "anthropic",
@@ -564,6 +564,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\ngpt-6-astra and gpt-6.1-sol reason unconditionally, so they drop the `none`\nthe gpt-5.6 ladder offers while keeping the rungs above it."
         },
         {
@@ -616,6 +617,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all."
         },
         {
@@ -667,6 +669,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\ngpt-6-astra and gpt-6.1-sol reason unconditionally, so they drop the `none`\nthe gpt-5.6 ladder offers while keeping the rungs above it."
         },
         {
@@ -719,6 +722,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all."
         },
         {
@@ -771,6 +775,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all."
         },
         {
@@ -823,6 +828,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all."
         },
         {
@@ -875,6 +881,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all."
         },
         {
@@ -928,6 +935,7 @@
               ]
             }
           ],
+          "plan_context_window": 372000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nWorking window for the long-context OpenAI models, gpt-5.6 and gpt-6.\nDeliberately below what the API accepts — gpt-6 advertises 1,050,000 —\nbecause the window is what caudra fills before compacting, and cost and\nlatency scale with it.\n\nLevels these models declare, matching the models.dev catalog. Kept in the\ntable so a cold catalog still resolves an effort correctly, and so the Codex\nplan models the catalog has not reached resolve at all.\n\nOpenAI's promotional rate, offered through at least 2026-11-21."
         },
         {
@@ -986,7 +994,8 @@
                 "xhigh"
               ]
             }
-          ]
+          ],
+          "plan_context_window": 272000
         },
         {
           "prefixes": [
@@ -1057,6 +1066,7 @@
               ]
             }
           ],
+          "api": "responses",
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nThe gpt-5 pro models start at `medium`, per each model page."
         },
         {
@@ -1096,6 +1106,7 @@
               ]
             }
           ],
+          "plan_context_window": 272000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate."
         },
         {
@@ -1133,6 +1144,7 @@
               ]
             }
           ],
+          "api": "responses",
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate.\n\nThe gpt-5 pro models start at `medium`, per each model page."
         },
         {
@@ -1172,6 +1184,7 @@
               ]
             }
           ],
+          "plan_context_window": 272000,
           "note": "A request whose prompt runs past this many tokens bills in full at twice\nthe input and cache rates and one and a half times the output rate. The\nwide window sits above it, so the last stretch before compaction always\npays the long rate."
         },
         {
@@ -1200,6 +1213,7 @@
               ]
             }
           ],
+          "api": "responses",
           "note": "Shuts down 2026-12-11 (https://developers.openai.com/api/docs/deprecations).\n\nThe o-series predates the explicit opt-out, so it always reasons.",
           "source": "https://developers.openai.com/api/docs/deprecations"
         },
@@ -1286,6 +1300,7 @@
               ]
             }
           ],
+          "api": "responses",
           "note": "The gpt-5 pro models start at `medium`, per each model page."
         },
         {
@@ -1315,7 +1330,8 @@
                 "xhigh"
               ]
             }
-          ]
+          ],
+          "plan_context_window": 272000
         }
       ],
       "availability": [
@@ -3413,7 +3429,8 @@
             "cache_read": 0.26
           },
           "max_output_tokens": 131072,
-          "context_window": 1000000
+          "context_window": 1000000,
+          "supports_thinking": true
         },
         {
           "prefixes": [
@@ -3430,7 +3447,8 @@
             "cache_read": 0.26
           },
           "max_output_tokens": 131072,
-          "context_window": 1000000
+          "context_window": 1000000,
+          "supports_thinking": true
         },
         {
           "prefixes": [

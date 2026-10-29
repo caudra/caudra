@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use caudra_models::Api;
 use caudra_storage::auth::OAuthTokens;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
@@ -32,39 +33,10 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "OpenAI",
 };
 
-// Non-codex models OpenAI offers for subscription usage via the Coding Plan.
-// Codex models are matched by their `-codex` substring in
-// `coding_plan_context_window`, so they never need listing here.
-pub(crate) const PLAN_MODELS: &[&str] = &[
-    "gpt-6-astra",
-    "gpt-6.1-sol",
-    "gpt-6.1-terra",
-    "gpt-6-sol",
-    "gpt-6-luna",
-    "gpt-5.6-luna",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-    "gpt-5.6",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.2",
-];
-
-/// Models the platform serves on the Responses API alone, matched by prefix
-/// so their dated snapshots route too. No page says the plan serves them, so
-/// they stay out of `PLAN_MODELS` and the coding-plan listing.
-const RESPONSES_ONLY_MODELS: &[&str] = &["gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.2-pro", "o3-pro"];
-
 /// Families that accept an explicit `prompt_cache_breakpoint`; earlier models
 /// are implicit-only and reject the field.
 const EXPLICIT_CACHE_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-", "gpt-6.1-"];
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
-/// Plan window for the long-context families, gpt-5.6 and gpt-6. Neither is
-/// published; `adjust_model` clamps to the smaller of this and the model's own
-/// window, so this only ever narrows what the static table already declared.
-const WIDE_PLAN_CONTEXT_WINDOW: u32 = 372_000;
-const WIDE_PLAN_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-", "gpt-6.1-"];
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// The header the Codex backend derives cache affinity from; Codex CLI sends
 /// its thread id here alongside the body's `prompt_cache_key`.
@@ -90,15 +62,15 @@ struct AuthState {
     oauth_tokens: Option<OAuthTokens>,
 }
 
-fn is_codex_model(model_id: &str) -> bool {
-    coding_plan_context_window(model_id).is_some()
+fn is_codex_model(model: &Model) -> bool {
+    coding_plan_context_window(model).is_some()
 }
 
-fn uses_responses(model_id: &str) -> bool {
-    is_codex_model(model_id)
-        || RESPONSES_ONLY_MODELS
-            .iter()
-            .any(|family| model_id.starts_with(family))
+fn uses_responses(model: &Model) -> bool {
+    is_codex_model(model)
+        || model
+            .entry
+            .is_some_and(|entry| entry.api == Some(Api::Responses))
 }
 
 /// Asks for the priority tier when fast mode is on. `supports_fast()` is
@@ -120,22 +92,13 @@ fn supports_explicit_cache(model_id: &str) -> bool {
 // Codex models match by substring so future releases route without a registry
 // edit; the named non-codex plans match exactly to avoid catching near-misses
 // like `gpt-5.6-terra-preview`.
-fn coding_plan_context_window(model_id: &str) -> Option<u32> {
-    if model_id.contains("-codex") {
+fn coding_plan_context_window(model: &Model) -> Option<u32> {
+    if model.id.contains("-codex") {
         return Some(CODEX_PLAN_CONTEXT_WINDOW);
     }
-    if !PLAN_MODELS.contains(&model_id) {
-        return None;
-    }
-    let wide = model_id == "gpt-5.6"
-        || WIDE_PLAN_FAMILIES
-            .iter()
-            .any(|family| model_id.starts_with(family));
-    Some(if wide {
-        WIDE_PLAN_CONTEXT_WINDOW
-    } else {
-        CODEX_PLAN_CONTEXT_WINDOW
-    })
+    model
+        .exact_entry()
+        .and_then(|entry| entry.plan_context_window)
 }
 
 /// Models an OAuth session may run. The subscription sells a different set to
@@ -151,7 +114,10 @@ fn coding_plan_models() -> Vec<ModelInfo> {
     let mut ids: Vec<String> = statics
         .map(str::to_string)
         .chain(catalog)
-        .filter(|id| is_codex_model(id))
+        .filter(|id| {
+            Model::from_spec(&format!("{}/{id}", CONFIG.slug))
+                .is_ok_and(|model| is_codex_model(&model))
+        })
         .collect();
     ids.sort();
     ids.dedup();
@@ -482,7 +448,7 @@ impl OpenAi {
     ) -> Result<WireRequest, AgentError> {
         let mut buf = String::new();
         let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
-        if uses_responses(&model.id) {
+        if uses_responses(model) {
             return Ok(WireRequest::post(
                 super::responses::responses_url(auth)?,
                 responses_body(oauth, model, messages, system, tools, opts, cache_key),
@@ -623,7 +589,7 @@ impl Provider for OpenAi {
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let responses = uses_responses(&model.id);
+            let responses = uses_responses(model);
             let stream_timeout = self.compat.stream_timeout();
             self.with_oauth_stream_retry(responses, event_tx, |auth, oauth, attempt_tx| {
                 let wire = self.request(
@@ -662,7 +628,7 @@ impl Provider for OpenAi {
         cache_key: Option<&CacheKey>,
     ) -> Result<WireRequest, AgentError> {
         let snapshot = self.auth_snapshot();
-        let auth = self.request_auth(&snapshot, uses_responses(&model.id));
+        let auth = self.request_auth(&snapshot, uses_responses(model));
         self.request(
             snapshot.oauth_tokens.is_some(),
             &auth,
@@ -676,7 +642,7 @@ impl Provider for OpenAi {
     }
 
     fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
-        if uses_responses(&model.id) {
+        if uses_responses(model) {
             crate::ReasoningTransport::OpenAiResponses
         } else {
             crate::ReasoningTransport::OpenAiChatCompletions
@@ -762,7 +728,7 @@ impl Provider for OpenAi {
             .entry(model.id.clone())
             .or_insert(model.context_window);
         if self.is_oauth()
-            && let Some(plan_context_window) = coding_plan_context_window(&model.id)
+            && let Some(plan_context_window) = coding_plan_context_window(model)
         {
             // The plan windows are `total - max_output_tokens`, so the output
             // allowance sits on top rather than inside them. That holds only
@@ -786,6 +752,8 @@ mod tests {
     use super::super::responses::{self, RESPONSES_PATH};
     use super::*;
     use crate::ThinkingConfig;
+    use crate::model::ModelError;
+    use crate::model_data::edit_model;
     use crate::providers::Timeouts;
     use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
@@ -799,8 +767,12 @@ mod tests {
     const TEST_BASE_URL: &str = "https://api.openai.test/v1";
     const CODEX_MODEL: &str = "openai/gpt-5.3-codex";
     const CHAT_MODEL: &str = "openai/gpt-4.1";
-    const MISSING_PLAN_MODEL: &str =
-        "a model named in PLAN_MODELS must reach the coding-plan listing";
+    const CHAT_ID: &str = "gpt-4.1";
+    const RESPONSES_MODEL: &str = "openai/o3-pro";
+    const RESPONSES_ID: &str = "o3-pro";
+    const DATA_PLAN_WINDOW: u32 = 64_000;
+    const UNKNOWN_API: &str = "future";
+    const MISSING_PLAN_MODEL: &str = "a curated plan model must reach the coding-plan listing";
     const UNENTITLED_PLAN_MODEL: &str =
         "the coding-plan listing offered a model the subscription cannot run";
     const DUPLICATE_PLAN_MODEL: &str =
@@ -854,7 +826,9 @@ mod tests {
     #[test_case("gpt-5.6-sol")]
     #[test_case("gpt-5.6")]
     fn named_plan_models_use_coding_plan(model_id: &str) {
-        assert!(is_codex_model(model_id));
+        assert!(is_codex_model(
+            &Model::from_spec(&format!("openai/{model_id}")).unwrap()
+        ));
     }
 
     #[test_case("gpt-6-astra", true)]
@@ -923,6 +897,71 @@ mod tests {
         provider
     }
 
+    #[test_case(None, CHAT_COMPLETIONS_PATH; "default_chat")]
+    #[test_case(Some(Api::ChatCompletions), CHAT_COMPLETIONS_PATH; "explicit_chat")]
+    #[test_case(Some(Api::Responses), RESPONSES_PATH; "responses")]
+    fn data_alone_selects_the_api(api: Option<Api>, path: &str) {
+        let old = Model::from_spec(RESPONSES_MODEL).unwrap();
+        edit_model(CONFIG.slug, RESPONSES_ID, |entry| entry.api = api);
+        let model = Model::from_spec(RESPONSES_MODEL).unwrap();
+        let provider = provider_with_login(false);
+        let request = |model: &Model| {
+            provider
+                .wire_request(
+                    model,
+                    &[],
+                    SYSTEM_PROMPT,
+                    &Value::Null,
+                    &RequestOptions::default(),
+                    None,
+                )
+                .unwrap()
+        };
+        assert_eq!(request(&model).url, format!("{TEST_BASE_URL}{path}"));
+        assert_eq!(
+            request(&old).url,
+            format!("{TEST_BASE_URL}{RESPONSES_PATH}")
+        );
+    }
+
+    #[test_case(None; "not_entitled")]
+    #[test_case(Some(DATA_PLAN_WINDOW); "entitled")]
+    fn data_alone_sets_plan_entitlement_and_window(window: Option<u32>) {
+        let old = Model::from_spec(CHAT_MODEL).unwrap();
+        edit_model(CONFIG.slug, CHAT_ID, |entry| {
+            entry.plan_context_window = window
+        });
+        let mut model = Model::from_spec(CHAT_MODEL).unwrap();
+        let baseline_window = model.context_window;
+        let provider = provider_with_login(true);
+        provider.adjust_model(&mut model);
+        assert_eq!(model.context_window, window.unwrap_or(baseline_window));
+        assert_eq!(model.window_excludes_output, window.is_some());
+        assert_eq!(
+            coding_plan_models().iter().any(|model| model.id == CHAT_ID),
+            window.is_some()
+        );
+        assert_eq!(uses_responses(&model), window.is_some());
+        assert!(!uses_responses(&old));
+    }
+
+    #[test]
+    fn an_unknown_api_hides_the_entry_and_refuses_resolution() {
+        edit_model(CONFIG.slug, RESPONSES_ID, |entry| {
+            entry.api = Some(Api::Unknown(UNKNOWN_API.into()));
+        });
+        assert!(matches!(
+            Model::from_spec(RESPONSES_MODEL),
+            Err(ModelError::NeedsNewerCaudra { .. })
+        ));
+        assert!(
+            !ManifestRegistry::get(CONFIG.slug)
+                .unwrap()
+                .listed_models()
+                .any(|entry| entry.prefixes.contains(&RESPONSES_ID))
+        );
+    }
+
     /// A login runs Codex models on the Codex backend, a key runs them on the
     /// platform, and everything else speaks Chat Completions.
     #[test_case(CODEX_MODEL, false, TEST_BASE_URL, RESPONSES_PATH ; "a_key_posts_codex_models_to_the_platform")]
@@ -972,7 +1011,8 @@ mod tests {
     #[test_case("gpt-5.5-pro", None ; "responses_only_pro_is_not_a_plan_model")]
     #[test_case("o3-pro", None ; "o3_pro_is_not_a_plan_model")]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
-        assert_eq!(coding_plan_context_window(model_id), expected);
+        let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
+        assert_eq!(coding_plan_context_window(&model), expected);
     }
 
     /// The OAuth listing draws on models.dev to pick up releases the static
@@ -987,7 +1027,8 @@ mod tests {
             "{MISSING_PLAN_MODEL}"
         );
         assert!(
-            ids.iter().all(|id| is_codex_model(id)),
+            ids.iter()
+                .all(|id| is_codex_model(&Model::from_spec(&format!("openai/{id}")).unwrap())),
             "{UNENTITLED_PLAN_MODEL}"
         );
         assert!(
@@ -1039,7 +1080,7 @@ mod tests {
         provider.adjust_model(&mut model);
         assert_eq!(
             model.context_window,
-            baseline_context_window.min(coding_plan_context_window(&model.id).unwrap())
+            baseline_context_window.min(coding_plan_context_window(&model).unwrap())
         );
         assert!(model.window_excludes_output);
 
@@ -1108,7 +1149,8 @@ mod tests {
 
     #[test]
     fn every_plan_model_declares_its_levels() {
-        for model_id in PLAN_MODELS {
+        for info in coding_plan_models() {
+            let model_id = info.id;
             let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
             assert!(
                 !model.reasoning_options().efforts().is_empty(),
