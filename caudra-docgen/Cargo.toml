@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "caudra-model-watch"
 path = "src/bin/model_watch.rs"
 
+[[bin]]
+name = "caudra-models-parity"
+path = "src/bin/models_parity.rs"
+
 [dependencies]
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
