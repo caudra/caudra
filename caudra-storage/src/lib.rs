@@ -46,6 +46,8 @@ pub mod prompt_stash;
 pub mod remote_operation_journal;
 pub mod retention;
 pub mod sandbox_auth;
+#[path = "sessions/secrets.rs"]
+pub mod secrets;
 pub mod sessions;
 pub mod shell_history;
 pub mod shell_runs;
@@ -266,6 +268,8 @@ pub enum StorageError {
     InvalidProviderAuth(String),
     #[error("invalid Workcell credential: {0}")]
     InvalidWorkcellCredential(String),
+    #[error("invalid secret: {0}")]
+    InvalidSecret(String),
     #[error(transparent)]
     InvalidName(#[from] auth::NameError),
     #[error(transparent)]

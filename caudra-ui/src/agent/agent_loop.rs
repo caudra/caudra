@@ -33,6 +33,7 @@ use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
 use caudra_agent::remote_project_context::RemoteProjectContext;
+use caudra_agent::secrets::{SecretVaults, SessionSecrets};
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::execution::{configure_declared, execution_slots};
@@ -421,6 +422,8 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: Option<SessionRef>,
+    /// The session's secrets, held for the loop's life so its runs share one vault.
+    secrets: Option<SessionSecrets>,
     mailbox: Option<SessionMailbox>,
     timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
@@ -541,6 +544,10 @@ impl AgentLoop {
                 cwd: template::env_vars().apply("{cwd}").into_owned(),
             },
         );
+        let secrets = session_id
+            .as_ref()
+            .zip(tool_output_store.as_ref())
+            .map(|(session, outputs)| SecretVaults::for_session(outputs.state_dir(), session.id()));
         Self {
             model_slot,
             effective_model_slot,
@@ -577,6 +584,7 @@ impl AgentLoop {
             answer_rx,
             queue,
             session_id,
+            secrets,
             mailbox,
             timeouts,
             lua_handle,
@@ -1305,6 +1313,7 @@ impl AgentLoop {
             tool_output_store: self.tool_output_store.clone(),
             permissions: Arc::clone(&self.permissions),
             session_id: self.session_id.clone(),
+            secrets: self.secrets.clone(),
             cache_key: self.session_id.as_ref().map(CacheKey::session),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),

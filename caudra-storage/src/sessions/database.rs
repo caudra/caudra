@@ -188,11 +188,16 @@ const CHANGE_RECORDS_CLEANUP: &str = "change_records";
 const LEGACY_SNAPSHOT_CLEANUP: &str = "snapshot";
 const ARTIFACT_CLEANUP_KINDS: [&str; 3] = ["archive", CHANGE_RECORDS_CLEANUP, "workflow_scratch"];
 const SESSION_AUTOMATIONS_CLEANUP: &str = "session_automations";
-const DELETION_CLEANUP_KINDS: [&str; 4] = [
+const SESSION_SECRETS_CLEANUP: &str = "session_secrets";
+/// Kinds that belong to the session itself, so trimming it keeps them.
+const DELETION_ONLY_CLEANUP_KINDS: [&str; 2] =
+    [SESSION_AUTOMATIONS_CLEANUP, SESSION_SECRETS_CLEANUP];
+const DELETION_CLEANUP_KINDS: [&str; 5] = [
     "archive",
     CHANGE_RECORDS_CLEANUP,
     "workflow_scratch",
     SESSION_AUTOMATIONS_CLEANUP,
+    SESSION_SECRETS_CLEANUP,
 ];
 const NO_CHANGE_STORES: &str =
     "this process cannot reach the change stores; a Caudra session or storage command will";
@@ -4132,7 +4137,9 @@ impl SessionDatabase {
             .optional()?;
         Ok(match guard {
             Some((true, _)) => CleanupGuard::Deleted,
-            Some((false, true)) if kind != SESSION_AUTOMATIONS_CLEANUP => CleanupGuard::Trimmed,
+            Some((false, true)) if !DELETION_ONLY_CLEANUP_KINDS.contains(&kind) => {
+                CleanupGuard::Trimmed
+            }
             Some((false, true)) => CleanupGuard::Stale,
             Some((false, false)) | None => CleanupGuard::Stale,
         })
@@ -4166,6 +4173,11 @@ impl SessionDatabase {
                 &self.state_dir,
                 &[super::SESSIONS_DIR, &id.to_string()],
                 crate::automation::SESSION_AUTOMATIONS_DIR,
+            ),
+            SESSION_SECRETS_CLEANUP => remove_state_directory(
+                &self.state_dir,
+                &[super::SESSIONS_DIR, &id.to_string()],
+                crate::secrets::SESSION_SECRETS_DIR,
             ),
             CHANGE_RECORDS_CLEANUP => match &self.change_stores {
                 Some(stores) => release_everywhere(stores.as_ref(), &self.state_dir, id),
@@ -7706,6 +7718,7 @@ mod tests {
     use crate::backups::BACKUPS_DIR;
     use crate::id::{UUID_VARIANT_BYTE, UUID_VERSION_BYTE};
     use crate::permission_state::StructuredPermissionEffect;
+    use crate::secrets::session_secrets_dir;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
     use crate::sessions::sweep::LEGACY_SNAPSHOT_DIRS;
     use crate::sessions::{
@@ -16437,14 +16450,19 @@ CREATE TABLE subagents (
         database.save(&session, Some(&cursor)).unwrap();
     }
 
-    #[test_case(false; "deletion_removes_scripts")]
-    #[test_case(true; "trim_keeps_scripts")]
-    fn session_automation_cleanup_is_deletion_only(trim: bool) {
+    #[test_case(session_dir, false; "deletion_removes_scripts")]
+    #[test_case(session_dir, true; "trim_keeps_scripts")]
+    #[test_case(session_secrets_dir, false; "deletion_removes_secrets")]
+    #[test_case(session_secrets_dir, true; "trim_keeps_secrets")]
+    fn session_owned_cleanup_is_deletion_only(
+        directory: fn(&StateDir, CaudraId) -> PathBuf,
+        trim: bool,
+    ) {
         let (_temp, state) = state_dir();
         let mut database = SessionDatabase::open_state(&state).unwrap();
         let session = TestSession::new(MODEL, CWD);
         database.save(&session, None).unwrap();
-        let directory = session_dir(&state, session.id);
+        let directory = directory(&state, session.id);
         state.ensure_subdir(&directory).unwrap();
         let script = directory.join(ARTIFACT_NAME);
         fs::write(&script, CHANGE_RECORD_DATA).unwrap();

@@ -80,6 +80,7 @@ use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
 use crate::restart::is_resume_nudge;
+use crate::secrets::SessionSecrets;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
@@ -384,6 +385,8 @@ pub struct AgentParams {
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// The session tree's secrets: the root session's vault, which subagents share.
+    pub secrets: Option<SessionSecrets>,
     /// What the provider routes this conversation's prompt cache by. The
     /// session for the main agent, session-plus-task for a subagent.
     pub cache_key: Option<CacheKey>,
@@ -519,6 +522,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    secrets: Option<SessionSecrets>,
     cache_key: Option<CacheKey>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
@@ -696,6 +700,7 @@ impl<'h> Agent<'h> {
             home_model: None,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            secrets: params.secrets,
             tool_output_store: params.tool_output_store,
             cache_key: params.cache_key,
             workspace_session: params.workspace_session,
@@ -4159,6 +4164,7 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             plan: self.plan.clone(),
             session_id: self.session_id.clone(),
+            secrets: self.secrets.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
             host_cwd: self.host_cwd.clone(),
@@ -7841,6 +7847,7 @@ mod tests {
                 Arc::default(),
             )),
             session_id: None,
+            secrets: None,
             cache_key: None,
             workspace_session: None,
             remote_project_context: None,

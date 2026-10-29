@@ -1986,6 +1986,7 @@ fn build(
             tool_output_store: ctx.tool_output_store.clone(),
             permissions: Arc::clone(&ctx.permissions),
             session_id: ctx.session_id.clone(),
+            secrets: ctx.secrets.clone(),
             cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),

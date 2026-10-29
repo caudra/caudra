@@ -45,6 +45,7 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::PromptProfileCatalog;
+use crate::secrets::SessionSecrets;
 use crate::subagent_history::{
     SubagentHistoryLease, SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpecCandidate,
 };
@@ -639,6 +640,7 @@ pub struct WorkflowHostContext {
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_output_lines: ToolOutputLines,
     pub session_id: Option<SessionRef>,
+    pub secrets: Option<SessionSecrets>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     /// The directory Caudra itself runs in. Set only in a sandbox session,
@@ -701,6 +703,7 @@ impl WorkflowHostContext {
             tool_output_store: params.tool_output_store.clone(),
             tool_output_lines: params.tool_output_lines,
             session_id: params.session_id.clone(),
+            secrets: params.secrets.clone(),
             workspace_session: params.workspace_session.clone(),
             remote_project_context: params.remote_project_context.clone(),
             host_cwd: params.host_cwd.clone(),
@@ -744,6 +747,7 @@ impl WorkflowHostContext {
             tool_output_store: ctx.tool_output_store.clone(),
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
+            secrets: ctx.secrets.clone(),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),
             host_cwd: ctx.host_cwd.clone(),
@@ -802,6 +806,7 @@ impl WorkflowHostContext {
             mode,
             plan: self.plan.clone(),
             session_id: self.session_id.clone(),
+            secrets: self.secrets.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
             host_cwd: self.host_cwd.clone(),
