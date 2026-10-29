@@ -24,6 +24,8 @@ const IMAGE_UNAVAILABLE: &str = "image is unavailable: it needs a ChatGPT subscr
 const HOST_UNAVAILABLE: &str = "host is unavailable: the profile or `disabled_tools` turns off the `execution` tool group, or this session's Workcell does not offer it";
 const WORKFLOW_DISABLED: &str = "workflow is unavailable: the profile or `disabled_tools` turns off the `delegation` tool group";
 const AUTOMATION_DISABLED: &str = "automation is unavailable: the profile or `disabled_tools` turns off the `delegation` tool group";
+pub(crate) const READ_ONLY_UNAVAILABLE: &str =
+    "is unavailable in read-only mode, because each of its calls changes something";
 
 /// One member of a tool-backed module: the tool's `action` it stands for, if the tool has several,
 /// and its parameters in positional order, each passed as the tool's field of the same name.
@@ -262,7 +264,7 @@ Answers are the runtime's own records as dicts.",
 /// A tool-backed module as one run sees it: the tool's availability is taken when the run starts.
 pub struct ToolModule {
     backing: &'static ToolBacking,
-    unavailable: Option<&'static str>,
+    unavailable: Option<String>,
 }
 
 impl ToolModule {
@@ -299,9 +301,17 @@ impl ToolModule {
         runtime: bool,
     ) -> Self {
         let available = runtime && ctx.tool_available(backing.tool);
+        let hidden_by_read_only = ctx.policy().is_read_only()
+            && ctx
+                .registry
+                .get(backing.tool)
+                .is_some_and(|entry| !entry.is_visible_in_read_only());
         Self {
             backing,
-            unavailable: (!available).then_some(reason),
+            unavailable: (!available).then(|| match hidden_by_read_only {
+                true => format!("{} {READ_ONLY_UNAVAILABLE}", backing.doc.namespace),
+                false => reason.to_owned(),
+            }),
         }
     }
 }
@@ -312,7 +322,7 @@ impl HostModule for ToolModule {
     }
 
     fn unavailable(&self) -> Option<String> {
-        self.unavailable.map(str::to_owned)
+        self.unavailable.clone()
     }
 
     fn prepare(&self, _ctx: &ToolContext, call: ScriptCall) -> Prepared {
