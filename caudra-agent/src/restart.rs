@@ -75,7 +75,7 @@ pub struct RestoredWork {
     pub transcripts: HashMap<String, Arc<Vec<Message>>>,
     /// The calls each of those transcripts left open, by task_id.
     pub dangling: HashMap<String, Vec<DanglingCall>>,
-    /// Tasks whose finished result an earlier build lost to a busy database,
+    /// Tasks whose finished result an earlier build lost to a failed save,
     /// recovered on this load, by task_id.
     pub recovered: Vec<String>,
 }

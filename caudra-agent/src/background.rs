@@ -23,7 +23,8 @@ use caudra_storage::{
     StateDir,
     background::{
         BackgroundCursor, BackgroundLookup, JobKind, JobOwner, JobPayload, MAX_HISTORY_PAGE,
-        MAX_INVOCATIONS, MAX_REPORTS, MAX_TRANSCRIPT_BYTES, TaskEvent, TaskRecord, TranscriptWrite,
+        MAX_INVOCATIONS, MAX_REPORTS, MAX_STORED_TRANSCRIPT_BYTES, StoredTranscript, TaskEvent,
+        TaskRecord, TranscriptWrite,
     },
     id::CaudraId,
     now_epoch,
@@ -100,18 +101,23 @@ const BUSY_RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTCOME_SAVE: &str = "background outcome save";
 const OUTPUT_SAVE: &str = "could not persist complete task outcome";
 /// Marks an outcome rebuilt from the task's finished reply after an earlier
-/// build lost it to a busy database.
+/// build lost it to a failed save.
 const RECOVERED_FIELD: &str = "recovered";
 /// How many interrupted records a load rechecks for a lost result.
 const MAX_RECOVERY_SCAN: usize = 64;
 /// The saves an earlier build ended a finished task with when they failed.
 const LOST_SAVE_STAGES: [&str; 3] = [OUTCOME_SAVE, "background task save", OUTPUT_SAVE];
-/// How those failures read when another writer held the database.
-const CONTENTION_ERRORS: [&str; 3] = [
+/// How those failures read when another writer held the database, or when
+/// SQLite refused a transcript too large for its row.
+const LOST_SAVE_CAUSES: [&str; 4] = [
     "database is locked",
     "SQLite contention exhausted",
     "storage deadline exceeded",
+    "string or blob too big",
 ];
+/// Where a task request keeps its `output_schema`.
+const REQUEST_SCHEMA_FIELD: &str = "schema";
+const REQUEST_CALL_ID_FIELD: &str = "call_id";
 /// Past this a live checkpoint keeps the last one that fit, so a long run
 /// does not rewrite its whole transcript every [`CHECKPOINT_INTERVAL`].
 const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
@@ -305,7 +311,7 @@ struct State {
     #[cfg(test)]
     save_checked: Option<flume::Sender<()>>,
     #[cfg(test)]
-    transcript_max_bytes: Option<usize>,
+    transcript_max_stored: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -619,18 +625,24 @@ impl BackgroundTasks {
                             .find(|job| job.invocation_id == record.invocation_id)
                     {
                         let task_id = job.task_id.clone();
-                        let (transcript, dangling, write) =
-                            close_checkpoint_calls(&db, session, record, &restored, &retry)
-                                .unwrap_or_else(|error| {
-                                    warn!(
-                                        %session,
-                                        %task_id,
-                                        invocation = %record.invocation_id,
-                                        %error,
-                                        "interrupted task transcript unavailable"
-                                    );
-                                    (Vec::new(), Vec::new(), TranscriptWrite::Keep)
-                                });
+                        let (transcript, dangling, write) = close_checkpoint_calls(
+                            &db,
+                            session,
+                            record,
+                            &restored,
+                            &retry,
+                            MAX_STORED_TRANSCRIPT_BYTES,
+                        )
+                        .unwrap_or_else(|error| {
+                            warn!(
+                                %session,
+                                %task_id,
+                                invocation = %record.invocation_id,
+                                %error,
+                                "interrupted task transcript unavailable"
+                            );
+                            (Vec::new(), Vec::new(), TranscriptWrite::Keep)
+                        });
                         transcript_write = write;
                         if !dangling.is_empty() {
                             restored.dangling.insert(task_id.clone(), dangling);
@@ -749,7 +761,7 @@ impl BackgroundTasks {
                 #[cfg(test)]
                 save_checked: None,
                 #[cfg(test)]
-                transcript_max_bytes: None,
+                transcript_max_stored: None,
             }),
         })))
     }
@@ -1037,12 +1049,12 @@ impl BackgroundTasks {
         .await
     }
 
-    fn max_transcript_bytes(&self) -> usize {
+    fn max_stored_transcript(&self) -> usize {
         #[cfg(test)]
-        if let Some(max_bytes) = self.lock().transcript_max_bytes {
-            return max_bytes;
+        if let Some(max_stored) = self.lock().transcript_max_stored {
+            return max_stored;
         }
-        MAX_TRANSCRIPT_BYTES
+        MAX_STORED_TRANSCRIPT_BYTES
     }
 
     /// Why this runtime stopped for good, if it did. Only a respawn clears it.
@@ -1124,6 +1136,12 @@ impl BackgroundTasks {
             );
             return;
         }
+        let max_stored = self.max_stored_transcript();
+        let invocation_id = invocation.to_owned();
+        let fitted = smol::unblock(move || fit_transcript(&history, max_stored, &invocation_id));
+        let Some(stored) = fitted.await else {
+            return;
+        };
         let _gate = self.0.gate.lock().await;
         let record = {
             let state = self.lock();
@@ -1133,7 +1151,7 @@ impl BackgroundTasks {
             }
         };
         if let Err(error) = self
-            .persist_record(record, None, TranscriptWrite::Save(history))
+            .persist_record(record, None, TranscriptWrite::Save(stored))
             .await
         {
             warn!(invocation, %error, "task checkpoint save failed");
@@ -1605,12 +1623,15 @@ impl BackgroundTasks {
 
     /// Settles background agent tasks that finished but whose result never
     /// reached the session. An earlier build ended such a task as interrupted
-    /// when its result save found the database busy, or left it running when
-    /// even that save failed, so this load found it cut off (`interrupted`
-    /// holds those invocations). A task qualifies only when `histories` holds
-    /// its finished reply and `parent` never received a result for it; the
-    /// result is rebuilt from that reply, saved, and delivered once instead
-    /// of the task running again. Returns the recovered task ids.
+    /// when its result save found the database busy or its transcript too
+    /// large for SQLite, or left it running when even that save failed, so
+    /// this load found it cut off (`interrupted` holds those invocations). A
+    /// task qualifies only when `histories` holds its finished reply and
+    /// `parent` never received a result for it; the result is rebuilt from
+    /// that reply, saved, and delivered once instead of the task running
+    /// again. The saved transcript goes, since it is at best a checkpoint from
+    /// before the run finished, and continuing reads the session's copy.
+    /// Returns the recovered task ids.
     pub async fn recover_lost_results(
         &self,
         parent: &[Message],
@@ -1621,25 +1642,38 @@ impl BackgroundTasks {
         let session = self.0.session;
         let candidates = smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            SessionDatabase::open_runtime(&dir, &retry)?.interrupted_background_tasks_runtime(
-                session,
-                MAX_RECOVERY_SCAN,
-                &retry,
-            )
+            let db = SessionDatabase::open_runtime(&dir, &retry)?;
+            db.interrupted_background_tasks_runtime(session, MAX_RECOVERY_SCAN, &retry)?
+                .into_iter()
+                .map(|record| {
+                    let latest = db.background_lookup_runtime(
+                        session,
+                        BackgroundLookup::Task {
+                            task_id: &record.task_id,
+                            version: None,
+                        },
+                        &retry,
+                    )?;
+                    let superseded =
+                        latest.is_some_and(|latest| latest.invocation_id != record.invocation_id);
+                    Ok((record, superseded))
+                })
+                .collect::<Result<Vec<_>, SessionError>>()
         })
         .await;
         let candidates = match candidates {
             Ok(candidates) => candidates,
             Err(error) => {
-                warn!(%session, %error, "could not check for task results lost to a busy database");
+                warn!(%session, %error, "could not check for task results lost to a failed save");
                 return Vec::new();
             }
         };
         let mut recovered = Vec::new();
-        for record in candidates.into_iter().filter(|record| {
-            lost_to_contention(record) || cut_off_after_finishing(record, interrupted)
-        }) {
-            let Some(reply) = finished_reply(&record, parent, histories) else {
+        for (record, superseded) in candidates
+            .into_iter()
+            .filter(|(record, _)| lost_save(record) || cut_off_after_finishing(record, interrupted))
+        {
+            let Some(reply) = finished_reply(&record, parent, histories, superseded) else {
                 continue;
             };
             let invocation = record.invocation_id.clone();
@@ -1650,7 +1684,7 @@ impl BackgroundTasks {
                         %session,
                         invocation,
                         task_id,
-                        "recovered a task result an earlier build lost to a busy database"
+                        "recovered a task result an earlier build lost to a failed save"
                     );
                     recovered.push(task_id);
                 }
@@ -1659,7 +1693,7 @@ impl BackgroundTasks {
                     invocation,
                     task_id,
                     %error,
-                    "could not recover a task result lost to a busy database"
+                    "could not recover a task result lost to a failed save"
                 ),
             }
         }
@@ -1715,7 +1749,7 @@ impl BackgroundTasks {
             });
             self.stage_terminal(Terminal {
                 record,
-                transcript: TranscriptWrite::Keep,
+                transcript: TranscriptWrite::Remove,
                 output: Some(TerminalOutput {
                     text: output,
                     label: TASK_OUTPUT_LABEL.into(),
@@ -2836,7 +2870,13 @@ impl BackgroundTasks {
         let transcript = if history.is_null() {
             TranscriptWrite::Keep
         } else {
-            TranscriptWrite::Save(history.to_string())
+            let max_stored = self.max_stored_transcript();
+            let invocation = invocation.clone();
+            smol::unblock(move || {
+                fit_transcript(&history.to_string(), max_stored, &invocation)
+                    .map_or(TranscriptWrite::Remove, TranscriptWrite::Save)
+            })
+            .await
         };
         if let Err(error) = admission.check() {
             prepared.discard();
@@ -3054,38 +3094,26 @@ impl BackgroundTasks {
             mark_shutdown_interrupted(&mut record, &mut value);
         }
         let terminal = outcome_text(&value);
+        let max_stored = self.max_stored_transcript();
+        let invocation_id = invocation.to_owned();
         let (value, output, transcript) = smol::unblock(move || {
             let output = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-            let transcript = messages
-                .map(|messages| serde_json::to_string(&*messages))
-                .transpose();
+            let transcript = match messages.map(|messages| serde_json::to_string(&*messages)) {
+                None => TranscriptWrite::Keep,
+                Some(Ok(text)) => fit_transcript(&text, max_stored, &invocation_id)
+                    .map_or(TranscriptWrite::Remove, TranscriptWrite::Save),
+                Some(Err(error)) => {
+                    warn!(
+                        invocation = invocation_id,
+                        %error,
+                        "task settled without its transcript: unreadable"
+                    );
+                    TranscriptWrite::Remove
+                }
+            };
             Ok::<_, String>((value, output, transcript))
         })
         .await?;
-        let transcript = match transcript {
-            Ok(Some(transcript)) if transcript.len() <= self.max_transcript_bytes() => {
-                TranscriptWrite::Save(transcript)
-            }
-            Ok(Some(transcript)) => {
-                warn!(
-                    invocation,
-                    task_id = %record.task_id,
-                    bytes = transcript.len(),
-                    "task settled without its transcript: too large to keep"
-                );
-                TranscriptWrite::Remove
-            }
-            Err(error) => {
-                warn!(
-                    invocation,
-                    task_id = %record.task_id,
-                    %error,
-                    "task settled without its transcript: unreadable"
-                );
-                TranscriptWrite::Remove
-            }
-            Ok(None) => TranscriptWrite::Keep,
-        };
         record.outcome = Some(value);
         let suppressed = {
             let state = self.lock();
@@ -3298,8 +3326,8 @@ fn interruption(record: &TaskRecord) -> Option<StopCause> {
 }
 
 /// Whether an earlier build ended `record`, a background agent task, as
-/// interrupted only because its result save found the database busy.
-fn lost_to_contention(record: &TaskRecord) -> bool {
+/// interrupted only because its result save failed.
+fn lost_save(record: &TaskRecord) -> bool {
     record.kind() == JobKind::Agent
         && record.background
         && record.state == INTERRUPTED_STATE
@@ -3315,7 +3343,7 @@ fn lost_to_contention(record: &TaskRecord) -> bool {
                 LOST_SAVE_STAGES
                     .iter()
                     .any(|stage| error.starts_with(stage))
-                    && CONTENTION_ERRORS.iter().any(|cause| error.contains(cause))
+                    && LOST_SAVE_CAUSES.iter().any(|cause| error.contains(cause))
             })
 }
 
@@ -3329,12 +3357,24 @@ fn cut_off_after_finishing(record: &TaskRecord, interrupted: &HashSet<String>) -
 }
 
 /// The finished reply `record`'s task ended with, unless `parent` already
-/// holds a result for it no record event accounts for.
+/// holds a result for it no record event accounts for. Only the history of
+/// `record`'s own run counts: its version must be the call that launched
+/// `record`, or, when the version is unknown, no later run of the task may
+/// exist (`superseded`). A task that owed a structured result never
+/// qualifies, since its plain reply was never checked against the schema.
 fn finished_reply(
     record: &TaskRecord,
     parent: &[Message],
     histories: &SubagentHistorySnapshot,
+    superseded: bool,
 ) -> Option<String> {
+    if record
+        .request
+        .get(REQUEST_SCHEMA_FIELD)
+        .is_some_and(|schema| !schema.is_null())
+    {
+        return None;
+    }
     let delivered = parent
         .iter()
         .filter_map(|message| message.task_event.as_ref())
@@ -3348,11 +3388,19 @@ fn finished_reply(
     if delivered {
         return None;
     }
-    let last = histories
-        .records()
-        .get(&record.task_id)?
-        .messages()
-        .last()?;
+    let history = histories.records().get(&record.task_id)?;
+    let launched_by = record
+        .request
+        .get(REQUEST_CALL_ID_FIELD)
+        .and_then(Value::as_str);
+    let own_run = match history.version_id() {
+        Some(version) => launched_by == Some(version),
+        None => !superseded,
+    };
+    if !own_run {
+        return None;
+    }
+    let last = history.messages().last()?;
     if !matches!(last.role, Role::Assistant)
         || last
             .content
@@ -3404,6 +3452,7 @@ fn close_checkpoint_calls(
     record: &TaskRecord,
     restored: &RestoredWork,
     retry: &RuntimeRetry<'_>,
+    max_stored: usize,
 ) -> Result<(Vec<Message>, Vec<DanglingCall>, TranscriptWrite), String> {
     let Some(mut messages) = load_transcript(db, session, &record.invocation_id, retry)? else {
         return Ok((Vec::new(), Vec::new(), TranscriptWrite::Keep));
@@ -3412,9 +3461,20 @@ fn close_checkpoint_calls(
     let write = if dangling.is_empty() {
         TranscriptWrite::Keep
     } else {
-        TranscriptWrite::Save(serde_json::to_string(&messages).map_err(|error| error.to_string())?)
+        let text = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+        fit_transcript(&text, max_stored, &record.invocation_id)
+            .map_or(TranscriptWrite::Remove, TranscriptWrite::Save)
     };
     Ok((messages, dangling, write))
+}
+
+/// The stored form of `text`, or `None` with a warning when its row could not
+/// hold it, so the task's transcript is dropped rather than its whole save.
+/// Continuing the task then reads the session's copy of its history.
+fn fit_transcript(text: &str, max_stored: usize, invocation: &str) -> Option<StoredTranscript> {
+    StoredTranscript::within(text, max_stored)
+        .inspect_err(|error| warn!(invocation, %error, "task transcript too large to store"))
+        .ok()
 }
 
 /// Ends `record` as cut off by a shutdown, for the next restore to report.
@@ -3506,8 +3566,8 @@ mod tests {
     use caudra_storage::{
         StateDir,
         background::{
-            BackgroundLookup, JobKind, JobOwner, JobPayload, MAX_RECORD_BYTES, TaskEvent,
-            TaskRecord, TranscriptWrite,
+            BackgroundLookup, JobKind, JobOwner, JobPayload, MAX_RECORD_BYTES,
+            MAX_STORED_TRANSCRIPT_BYTES, StoredTranscript, TaskEvent, TaskRecord, TranscriptWrite,
         },
         id::CaudraId,
         sessions::{RuntimeRetry, SessionDatabase, SessionError},
@@ -3524,7 +3584,8 @@ mod tests {
         MAX_INVOCATIONS, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES, RESTART_PENDING_FIELD,
         RETRY_MISMATCH, RUNNING_STATE, SELECTED_HISTORY_MISSING, STALE_INVOCATION, StopCause,
         TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_SETTLING, TRANSCRIPT_UNAVAILABLE, TRANSITION,
-        TaskDelivery, TaskReporter, TaskStatus, Terminal, deliverable, ran_on,
+        TaskDelivery, TaskReporter, TaskStatus, Terminal, close_checkpoint_calls, deliverable,
+        ran_on,
     };
     use super::{
         GUIDANCE_CANCELLING, GUIDANCE_SETTLED, GUIDANCE_UNAVAILABLE, RECOVERED_FIELD,
@@ -3540,6 +3601,7 @@ mod tests {
             task_runner::{TaskOutcome, TaskRequest},
         },
         background_reminder::RuntimeHealth,
+        restart::RestoredWork,
         tools::{
             DEADLINE_EXCEEDED, Deadline, ToolContext,
             native::{self, task_control::TaskControl},
@@ -3571,6 +3633,11 @@ mod tests {
     const FULL_OUTCOME_TAIL: &str = "full-task-outcome-tail-after-preview";
     const REWOUND_CALL: &str = "background-test-rewound";
     const MISSING_VERSION: &str = "background-test-unavailable-version";
+    /// Smaller than any real transcript compresses to, so every save of one
+    /// finds it too large for its row.
+    const TINY_STORED_TRANSCRIPT: usize = 64;
+    const PERMANENT_FAILURE_FIELD: &str = "background test record";
+    const PERMANENT_FAILURE_REASON: &str = "a fault no retry can clear";
     const SECOND_PROMPT: &str = "Second branch instructions, not present before rewind.";
     const REWOUND_PROMPT: &str = "Continue from the selected earlier transcript.";
     const OTHER_PROFILE: &str = "different-profile";
@@ -3826,14 +3893,21 @@ mod tests {
 
     const LOST_SAVE: &str = "background outcome save: record save: SQLite contention exhausted after 30 attempts (30s): database is locked";
     const OTHER_FAILURE: &str = "background outcome save: record save: disk I/O error";
+    const TOO_BIG_SAVE: &str = "background outcome save: string or blob too big";
     const FOREIGN_EVENT: &str = "event-delivered-elsewhere";
+    const OTHER_RUN_CALL: &str = "background-test-other-run";
+    const STALE_CHECKPOINT: &str = r#"["checkpoint from before the run finished"]"#;
 
     enum LostResult {
         Finished,
         CutOff,
+        TooBig,
         Unfinished,
         OtherFailure,
         AlreadyDelivered,
+        OtherRunsHistory,
+        Superseded,
+        Structured,
     }
 
     fn lost_record(case: &LostResult) -> TaskRecord {
@@ -3845,6 +3919,15 @@ mod tests {
             LostResult::OtherFailure => {
                 record.state = INTERRUPTED_STATE.into();
                 record.outcome = Some(json!({"error": OTHER_FAILURE}));
+            }
+            LostResult::TooBig => {
+                record.state = INTERRUPTED_STATE.into();
+                record.outcome = Some(json!({"error": TOO_BIG_SAVE}));
+            }
+            LostResult::Structured => {
+                record.state = INTERRUPTED_STATE.into();
+                record.outcome = Some(json!({"error": LOST_SAVE}));
+                record.request["schema"] = json!({"type": "object"});
             }
             _ => {
                 record.state = INTERRUPTED_STATE.into();
@@ -3879,17 +3962,36 @@ mod tests {
 
     #[test_case(LostResult::Finished => vec![TASK.to_owned()]; "finished_reply_is_recovered")]
     #[test_case(LostResult::CutOff => vec![TASK.to_owned()]; "finished_task_left_running_is_recovered")]
+    #[test_case(LostResult::TooBig => vec![TASK.to_owned()]; "result_lost_to_an_oversized_transcript_is_recovered")]
     #[test_case(LostResult::Unfinished => Vec::<String>::new(); "unfinished_transcript_is_left_alone")]
     #[test_case(LostResult::OtherFailure => Vec::<String>::new(); "other_failure_is_left_alone")]
     #[test_case(LostResult::AlreadyDelivered => Vec::<String>::new(); "delivered_result_is_left_alone")]
-    fn a_result_lost_to_a_busy_database_is_recovered_once(case: LostResult) -> Vec<String> {
+    #[test_case(LostResult::OtherRunsHistory => Vec::<String>::new(); "another_runs_history_is_left_alone")]
+    #[test_case(LostResult::Superseded => Vec::<String>::new(); "unversioned_history_after_a_later_run_is_left_alone")]
+    #[test_case(LostResult::Structured => Vec::<String>::new(); "unchecked_structured_reply_is_left_alone")]
+    fn a_result_lost_to_a_failed_save_is_recovered_once(case: LostResult) -> Vec<String> {
         smol::block_on(async {
             let fixture = Fixture::new().await;
             fixture.tasks.shutdown().await.unwrap();
-            SessionDatabase::open_state(&fixture.dir)
-                .unwrap()
-                .save_background_task(fixture.session.id, &lost_record(&case))
+            let database = SessionDatabase::open_state(&fixture.dir).unwrap();
+            let retry = RuntimeRetry::new(None, &|| false);
+            database
+                .save_background_task_runtime(
+                    fixture.session.id,
+                    &lost_record(&case),
+                    &TranscriptWrite::Save(StoredTranscript::new(STALE_CHECKPOINT).unwrap()),
+                    &retry,
+                )
                 .unwrap();
+            if let LostResult::Superseded = case {
+                let mut later = lost_record(&LostResult::OtherFailure);
+                later.invocation_id = NEXT_INVOCATION.into();
+                later.sequence += 1;
+                later.request["call_id"] = json!(OTHER_RUN_CALL);
+                database
+                    .save_background_task(fixture.session.id, &later)
+                    .unwrap();
+            }
             let last = match case {
                 LostResult::Unfinished => assistant(vec![ContentBlock::ToolUse {
                     id: NEXT_CALL.into(),
@@ -3901,10 +4003,20 @@ mod tests {
                     text: RESULT.into(),
                 }]),
             };
-            let histories = SubagentHistoryStore::seeded(HashMap::from([(
-                TASK.to_owned(),
-                Arc::new(vec![Message::user(PROMPT.into()), last]),
-            )]))
+            let versions = match case {
+                LostResult::OtherRunsHistory => {
+                    HashMap::from([(TASK.to_owned(), OTHER_RUN_CALL.to_owned())])
+                }
+                _ => HashMap::new(),
+            };
+            let histories = SubagentHistoryStore::seeded_with_versions(
+                HashMap::from([(
+                    TASK.to_owned(),
+                    Arc::new(vec![Message::user(PROMPT.into()), last]),
+                )]),
+                HashMap::new(),
+                versions,
+            )
             .snapshot();
             let parent = match case {
                 LostResult::AlreadyDelivered => vec![Message {
@@ -3928,6 +4040,12 @@ mod tests {
             } else {
                 assert_eq!(status.state, SUCCEEDED);
                 assert_eq!(status.result.as_ref().unwrap()[RECOVERED_FIELD], true);
+                assert_eq!(
+                    database
+                        .background_transcript(fixture.session.id, INVOCATION)
+                        .unwrap(),
+                    None
+                );
                 fixture.open_receipt_on(&tasks).await;
                 let claimed = tasks.claim_messages().unwrap();
                 let delivered = claimed
@@ -4106,6 +4224,91 @@ mod tests {
                     .any(|job| job.cause == StopCause::Crash)
             );
         });
+    }
+
+    #[test]
+    fn a_permanent_outcome_save_failure_still_stops_background_tasks() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            fixture
+                .tasks
+                .lock()
+                .terminal_failures
+                .push_back(SessionError::CorruptDatabaseValue {
+                    field: PERMANENT_FAILURE_FIELD,
+                    reason: PERMANENT_FAILURE_REASON.into(),
+                });
+            fixture.responses.send(final_response()).unwrap();
+            loop {
+                let listener = fixture.tasks.listen();
+                if fixture.tasks.failure().is_some() {
+                    break;
+                }
+                listener.await;
+            }
+            assert!(
+                fixture
+                    .tasks
+                    .failure()
+                    .unwrap()
+                    .contains(PERMANENT_FAILURE_REASON)
+            );
+            assert!(
+                fixture
+                    .tasks
+                    .shutdown()
+                    .await
+                    .unwrap_err()
+                    .contains(PERMANENT_FAILURE_REASON)
+            );
+        });
+    }
+
+    #[test_case(TINY_STORED_TRANSCRIPT => false; "too_large_for_its_row_is_dropped")]
+    #[test_case(MAX_STORED_TRANSCRIPT_BYTES => true; "fitting_its_row_is_saved")]
+    fn a_restored_transcript_is_closed_and_kept_only_while_its_row_holds_it(
+        max_stored: usize,
+    ) -> bool {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.tasks.shutdown().await.unwrap();
+            let open_call = assistant(vec![ContentBlock::ToolUse {
+                id: NEXT_CALL.into(),
+                name: "read".into(),
+                input: json!({}),
+                thought_signature: None,
+            }]);
+            let checkpoint = vec![Message::user(PROMPT.into()), open_call];
+            let record = projection_record();
+            let database = SessionDatabase::open_state(&fixture.dir).unwrap();
+            let retry = RuntimeRetry::new(None, &|| false);
+            database
+                .save_background_task_runtime(
+                    fixture.session.id,
+                    &record,
+                    &TranscriptWrite::Save(
+                        StoredTranscript::new(&serde_json::to_string(&checkpoint).unwrap())
+                            .unwrap(),
+                    ),
+                    &retry,
+                )
+                .unwrap();
+
+            let (closed, dangling, write) = close_checkpoint_calls(
+                &database,
+                fixture.session.id,
+                &record,
+                &RestoredWork::default(),
+                &retry,
+                max_stored,
+            )
+            .unwrap();
+
+            assert_eq!(closed.len(), checkpoint.len() + 1);
+            assert_eq!(dangling.len(), 1);
+            matches!(write, TranscriptWrite::Save(_))
+        })
     }
 
     #[test]
@@ -6900,12 +7103,11 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_too_large_to_keep_settles_without_it_and_continues_from_the_session() {
+    fn a_transcript_too_large_to_store_settles_without_it_and_continues_from_the_session() {
         smol::block_on(async {
             let mut fixture = Fixture::new().await;
-            fixture.tasks.lock().transcript_max_bytes = Some(MAX_RECORD_BYTES);
+            fixture.tasks.lock().transcript_max_stored = Some(TINY_STORED_TRANSCRIPT);
             let record = settle_oversized(&mut fixture).await;
-            fixture.tasks.lock().transcript_max_bytes = None;
             let task_id = record.task_id.clone();
             assert!(
                 fixture
@@ -6916,15 +7118,26 @@ mod tests {
                     .is_none()
             );
             let session_copy = session_transcript(&fixture.ctx, &task_id);
-            fixture
+            let TaskDelivery::Background(card) = fixture
                 .tasks
                 .execute(&fixture.ctx, continuation(&task_id), true)
                 .await
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("expected background admission")
+            };
             fixture.started.recv_async().await.unwrap();
             assert_eq!(
                 wire(&session_transcript(&fixture.ctx, &task_id)),
                 wire(&session_copy)
+            );
+            assert!(
+                fixture
+                    .tasks
+                    .transcript(&card.invocation_id)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             assert_eq!(fixture.tasks.failure(), None);
             fixture.tasks.shutdown().await.unwrap();
@@ -6976,7 +7189,10 @@ mod tests {
                 .persist_record(
                     record,
                     None,
-                    TranscriptWrite::Save(serde_json::to_string(&transcript).unwrap()),
+                    TranscriptWrite::Save(
+                        StoredTranscript::new(&serde_json::to_string(&transcript).unwrap())
+                            .unwrap(),
+                    ),
                 )
                 .await
                 .unwrap();

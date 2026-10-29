@@ -5771,7 +5771,7 @@ mod tests {
         StopReason, StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::autopilot::{AutopilotBudget, StoredAutopilot};
-    use caudra_storage::background::{TaskRecord, TranscriptWrite};
+    use caudra_storage::background::{StoredTranscript, TaskRecord, TranscriptWrite};
     use caudra_storage::engine_decisions::StoredDecisionAnchor;
     use caudra_storage::goal_log::{GoalEnd, GoalEvaluationOutcome};
     use caudra_storage::permission_state::PermissionRuleRecord;
@@ -6776,7 +6776,10 @@ mod tests {
                             events: Vec::new(),
                         },
                         &TranscriptWrite::Save(
-                            serde_json::to_string(&[Message::user(call.into())]).unwrap(),
+                            StoredTranscript::new(
+                                &serde_json::to_string(&[Message::user(call.into())]).unwrap(),
+                            )
+                            .unwrap(),
                         ),
                         &RuntimeRetry::new(None, &|| false),
                     )

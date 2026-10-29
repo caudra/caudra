@@ -7,6 +7,16 @@ Each release lists what changed, newest first. After an update, the first intera
 
 To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run [`caudra update`](/docs/cli/#caudra-update-caudra-rollback). Each release links to its GitHub page, which holds the downloads.
 
+## Caudra 0.2 Preview 17 {#v0-2-0-preview-17}
+
+[v0.2.0-preview.17 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.17)
+
+- A task whose transcript is too large to save no longer stops every background task, and a result lost that way is delivered after a restart.
+
+### Fixes
+
+- **Large task transcripts.** A task whose transcript grew past what the session database can hold, such as one that generated many images, stopped all background tasks with `string or blob too big` until Caudra restarted. Its result is now saved and delivered without the transcript, and continuing the task picks up from the session's own copy of its history. After you update, restart Caudra once to deliver a result already lost to this error.
+
 ## Caudra 0.2 Preview 16 {#v0-2-0-preview-16}
 
 [v0.2.0-preview.16 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.16)

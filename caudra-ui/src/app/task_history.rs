@@ -431,7 +431,7 @@ mod tests {
     use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus, ToolOutput};
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::{
-        background::{MAX_HISTORY_PAGE, TaskRecord, TranscriptWrite},
+        background::{MAX_HISTORY_PAGE, StoredTranscript, TaskRecord, TranscriptWrite},
         sessions::{RuntimeRetry, SessionDatabase},
     };
     use futures_lite::future::yield_now;
@@ -515,7 +515,9 @@ mod tests {
                 .save_background_task_runtime(
                     app.state.session.id,
                     &record,
-                    &TranscriptWrite::Save(json!(history).to_string()),
+                    &TranscriptWrite::Save(
+                        StoredTranscript::new(&json!(history).to_string()).unwrap(),
+                    ),
                     &RuntimeRetry::new(None, &|| false),
                 )
                 .unwrap();

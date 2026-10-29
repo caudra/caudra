@@ -47,11 +47,9 @@ pub mod sweep;
 #[path = "sessions/types.rs"]
 mod types;
 
-#[cfg(test)]
-pub(crate) use database::MAX_SQLITE_VALUE_BYTES;
 pub(crate) use database::{
-    AFTER_SEPARATOR, WriteTiming, compress_payload, decompress_payload, deserialize_json, from_i64,
-    from_i64_usize, id_from_row, to_i64,
+    AFTER_SEPARATOR, MAX_SQLITE_VALUE_BYTES, WriteTiming, compress_payload, decompress_payload,
+    deserialize_json, from_i64, from_i64_usize, id_from_row, to_i64,
 };
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,

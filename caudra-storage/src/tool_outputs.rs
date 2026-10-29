@@ -772,7 +772,7 @@ mod tests {
 
     use super::legacy::LEGACY_OUTPUT_DIR;
     use super::*;
-    use crate::background::{TaskRecord, TranscriptWrite};
+    use crate::background::{StoredTranscript, TaskRecord, TranscriptWrite};
     use crate::sessions::{MAX_SQLITE_VALUE_BYTES, Session, SessionLease};
 
     const TEST_MAX_BYTES: usize = 1024 * 1024;
@@ -1352,7 +1352,7 @@ mod tests {
         });
         let transcript = json!([{"role": "user", "output_ref": referenced.clone()}]).to_string();
         let transcript = if in_transcript {
-            TranscriptWrite::Save(transcript)
+            TranscriptWrite::Save(StoredTranscript::new(&transcript).unwrap())
         } else {
             record["output_ref"] = json!(referenced);
             TranscriptWrite::Keep

@@ -4,12 +4,14 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::{
     StorageError,
     id::CaudraId,
     sessions::{
-        RuntimeRetry, SessionDatabase, SessionError, compress_payload, decompress_payload,
+        MAX_SQLITE_VALUE_BYTES, RuntimeRetry, SessionDatabase, SessionError, compress_payload,
+        decompress_payload,
         progress::{MIGRATION, MigrationEvent},
     },
     tool_outputs::ToolOutputRef,
@@ -23,6 +25,13 @@ pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
 /// One task's transcript, kept beside its record so it never counts against
 /// the record's size or the session's resident budget.
 pub const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
+/// Room a transcript row needs beside its blob: both keys, the byte count and
+/// the record header, all far smaller than this.
+const TRANSCRIPT_ROW_RESERVE_BYTES: usize = 1024 * 1024;
+/// The largest compressed transcript a row can hold under the connection's
+/// `SQLITE_LIMIT_LENGTH`, which bounds a whole row as well as each value.
+pub const MAX_STORED_TRANSCRIPT_BYTES: usize =
+    MAX_SQLITE_VALUE_BYTES as usize - TRANSCRIPT_ROW_RESERVE_BYTES;
 const TRANSCRIPTS_TABLE: &str = "background_transcripts";
 const TRANSCRIPT_FIELD: &str = "background transcript";
 const RUNTIME_TRANSCRIPT_LOAD: &str = "background transcript load";
@@ -109,8 +118,55 @@ pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM backgro
 pub enum TranscriptWrite {
     Keep,
     /// Replaces it with this JSON array of messages.
-    Save(String),
+    Save(StoredTranscript),
     Remove,
+}
+
+/// A transcript compressed into the form its row stores, which only exists
+/// when that form fits the row, so a save can never be refused for its size.
+#[derive(Debug, Clone)]
+pub struct StoredTranscript {
+    compressed: Vec<u8>,
+    len: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum StoredTranscriptError {
+    #[error("transcript is {len} bytes, over the {max} a task may keep")]
+    TooLong { len: usize, max: usize },
+    #[error("transcript of {len} bytes compresses to {stored}, over the {max} a row can hold")]
+    TooLarge {
+        len: usize,
+        stored: usize,
+        max: usize,
+    },
+    #[error(transparent)]
+    Compression(#[from] SessionError),
+}
+
+impl StoredTranscript {
+    pub fn new(text: &str) -> Result<Self, StoredTranscriptError> {
+        Self::within(text, MAX_STORED_TRANSCRIPT_BYTES)
+    }
+
+    pub fn within(text: &str, max_stored: usize) -> Result<Self, StoredTranscriptError> {
+        let len = text.len();
+        if len > MAX_TRANSCRIPT_BYTES {
+            return Err(StoredTranscriptError::TooLong {
+                len,
+                max: MAX_TRANSCRIPT_BYTES,
+            });
+        }
+        let compressed = compress_payload(text)?;
+        if compressed.len() > max_stored {
+            return Err(StoredTranscriptError::TooLarge {
+                len,
+                stored: compressed.len(),
+                max: max_stored,
+            });
+        }
+        Ok(Self { compressed, len })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,10 +727,7 @@ impl SessionDatabase {
         Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
         let transcript = match transcript {
             TranscriptWrite::Keep => None,
-            TranscriptWrite::Save(text) => {
-                Self::validate_len(TRANSCRIPT_FIELD, text.len(), MAX_TRANSCRIPT_BYTES)?;
-                Some(Some((compress_payload(text)?, text.len())))
-            }
+            TranscriptWrite::Save(stored) => Some(Some((&stored.compressed, stored.len))),
             TranscriptWrite::Remove => Some(None),
         };
         let last_sequence = sql_integer(
@@ -866,7 +919,7 @@ pub(crate) fn protects_session(
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{ErrorCode, Transaction, TransactionBehavior};
+    use rusqlite::{ErrorCode, Transaction, TransactionBehavior, params};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use std::cell::{Cell, RefCell};
@@ -875,14 +928,16 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        JobKind, JobOwner, JobPayload, ShellJobMetadata, TaskEvent, TaskRecord, TranscriptWrite,
-        accept_owned_job_event,
+        JobKind, JobOwner, JobPayload, MAX_STORED_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_BYTES,
+        ShellJobMetadata, StoredTranscript, StoredTranscriptError, TaskEvent, TaskRecord,
+        TranscriptWrite, accept_owned_job_event,
     };
     use crate::{
         StateDir,
         id::CaudraId,
         sessions::{
-            RuntimeRetry, Session, SessionDatabase, SessionError, SessionLease, TitleSource,
+            MAX_SQLITE_VALUE_BYTES, RuntimeRetry, Session, SessionDatabase, SessionError,
+            SessionLease, TitleSource,
             progress::{MIGRATION, MigrationEvent},
         },
         tool_outputs::{ToolOutputStore, UNREFERENCED_OUTPUT_GRACE},
@@ -897,6 +952,11 @@ mod tests {
     const OTHER_CHILD: &str = "other-child-invocation";
     const LEGACY_HISTORY: &str = r#"["legacy"]"#;
     const EVERY_TASK_COUNTED: &str = "the transcript move must count every task it moves";
+    const NOISE_ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const SMALL_ROW_BYTES: usize = 4096;
+    const SMALL_TRANSCRIPT_BYTES: usize = 2 * SMALL_ROW_BYTES;
+    const LONG_INVOCATION_BYTES: usize = 1024;
 
     #[derive(Clone, Serialize, Deserialize)]
     struct TestMessage {
@@ -943,6 +1003,71 @@ mod tests {
         }
     }
 
+    /// Base64-like text that compresses no better than inline image data.
+    fn noise(len: usize) -> String {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                NOISE_ALPHABET[(state % NOISE_ALPHABET.len() as u64) as usize] as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_transcript_that_compresses_past_its_row_is_refused() {
+        let refused = StoredTranscript::within(&noise(SMALL_TRANSCRIPT_BYTES), SMALL_ROW_BYTES);
+
+        assert!(matches!(
+            refused,
+            Err(StoredTranscriptError::TooLarge { len: SMALL_TRANSCRIPT_BYTES, stored, max: SMALL_ROW_BYTES })
+                if stored > SMALL_ROW_BYTES
+        ));
+    }
+
+    #[test]
+    fn a_transcript_longer_than_its_row_that_compresses_into_it_is_kept() {
+        let text = "x".repeat(SMALL_TRANSCRIPT_BYTES);
+
+        assert!(StoredTranscript::within(&text, SMALL_ROW_BYTES).is_ok());
+    }
+
+    #[test]
+    fn a_transcript_past_what_a_task_may_keep_is_refused_before_compressing() {
+        let text = "x".repeat(MAX_TRANSCRIPT_BYTES + 1);
+
+        assert!(matches!(
+            StoredTranscript::new(&text),
+            Err(StoredTranscriptError::TooLong { len, max: MAX_TRANSCRIPT_BYTES })
+                if len == MAX_TRANSCRIPT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn the_largest_stored_transcript_fits_its_row_under_the_connection_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let mut task = record();
+        task.invocation_id = "i".repeat(LONG_INVOCATION_BYTES);
+        database.save_background_task(session.id, &task).unwrap();
+        let insert = |bytes: usize| {
+            database.connection().execute(
+                "INSERT OR REPLACE INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4)",
+                params![session.id.as_bytes().as_slice(), task.invocation_id, vec![0_u8; bytes], bytes as i64],
+            )
+        };
+
+        insert(MAX_STORED_TRANSCRIPT_BYTES).unwrap();
+        let refused = insert(MAX_SQLITE_VALUE_BYTES as usize + 1).unwrap_err();
+
+        assert_eq!(refused.sqlite_error_code(), Some(ErrorCode::TooBig));
+    }
+
     #[test]
     fn a_transcript_larger_than_any_record_is_kept_beside_it_and_goes_with_it() {
         let temp = tempfile::tempdir().unwrap();
@@ -962,12 +1087,17 @@ mod tests {
         };
 
         assert_eq!(
-            saved(TranscriptWrite::Save(transcript.clone())).as_ref(),
+            saved(TranscriptWrite::Save(
+                StoredTranscript::new(&transcript).unwrap()
+            ))
+            .as_ref(),
             Some(&transcript)
         );
         assert_eq!(saved(TranscriptWrite::Keep).as_ref(), Some(&transcript));
         assert_eq!(saved(TranscriptWrite::Remove), None);
-        saved(TranscriptWrite::Save(transcript.clone()));
+        saved(TranscriptWrite::Save(
+            StoredTranscript::new(&transcript).unwrap(),
+        ));
         database
             .connection()
             .execute(
@@ -1048,7 +1178,9 @@ mod tests {
                 .save_background_task_runtime(
                     session.id,
                     &task,
-                    &TranscriptWrite::Save(json!([index]).to_string()),
+                    &TranscriptWrite::Save(
+                        StoredTranscript::new(&json!([index]).to_string()).unwrap(),
+                    ),
                     &retry,
                 )
                 .unwrap();
@@ -1539,7 +1671,7 @@ mod tests {
                 db.connection()
                     .execute(
                         "INSERT INTO subagent_streams(session_id, subagent_id) VALUES (?1, ?2)",
-                        rusqlite::params![session.id.as_bytes().as_slice(), TASK],
+                        params![session.id.as_bytes().as_slice(), TASK],
                     )
                     .unwrap();
             } else {
