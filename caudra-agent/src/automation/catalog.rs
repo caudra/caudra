@@ -16,6 +16,8 @@ use caudra_automation::meta::{
     AutomationMeta, BROADCAST, MAX_SOURCE_BYTES, META_VARIABLE, MessagingCaps, Trigger,
     TriggerKind, parse_meta,
 };
+use caudra_automation::request::AutomationError;
+use caudra_automation::snapshot::AutomationSnapshot;
 use caudra_config::{Feature, FeatureFlags};
 use caudra_storage::digest_trust::TrustDomain;
 use caudra_storage::paths::{config_dir, user_config_dir};
@@ -33,6 +35,12 @@ pub(crate) const SCRIPT_EXTENSION: &str = "rhai";
 const TRUST_DOMAIN: TrustDomain = TrustDomain::Automation;
 const NOT_UTF8: &str = "source is not valid UTF-8";
 const NOT_A_DIRECTORY: &str = "is not a real directory";
+pub(super) const BUNDLED_DELETE: &str = "bundled scripts cannot be deleted";
+pub(super) const REGULAR_DELETE: &str = "only regular files can be deleted, not symlinks";
+pub(super) const OUTSIDE_DELETE: &str = "the file is outside its automation directory";
+pub(super) const DELETE_CHANGED: &str = "the script changed before deletion; review it again";
+pub(super) const REVIEW_CHANGED: &str =
+    "the script's scope or path changed after review; review it again";
 const NEEDS_FEATURE: &str = "needs";
 pub const UNAVAILABLE_IN_SDK: &str = "is unavailable in SDK sessions";
 const MESSAGING_FIELD: &str = "messaging";
@@ -199,6 +207,75 @@ impl Catalog {
 
     pub fn resolve(&self, name: &str) -> Result<ResolvedAutomation, CatalogError> {
         self.lookup(name).cloned()
+    }
+
+    pub(super) fn check_reviewed(
+        reviewed: &AutomationSnapshot,
+        entry: &AutomationSnapshot,
+    ) -> Result<(), CatalogError> {
+        if entry.scope != reviewed.scope || entry.path != reviewed.path {
+            return Err(CatalogError::Invalid {
+                name: reviewed.name.clone(),
+                path: entry.path.clone(),
+                reason: REVIEW_CHANGED.to_owned(),
+            });
+        }
+        if entry.digest != reviewed.digest {
+            return Err(CatalogError::Changed {
+                name: reviewed.name.clone(),
+                path: entry.path.clone(),
+                expected: reviewed.digest.clone(),
+                actual: entry.digest.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_path(
+        &self,
+        name: &str,
+        directories: &AutomationDirs,
+    ) -> Result<PathBuf, AutomationError> {
+        let (scope, path) = if let Some(resolved) = self.find(name) {
+            (resolved.entry.scope, &resolved.entry.path)
+        } else if let Some(invalid) = self.invalid.iter().find(|entry| entry.name == name) {
+            (invalid.scope, &invalid.path)
+        } else {
+            return Err(AutomationError::UnknownAutomation {
+                name: name.to_owned(),
+            });
+        };
+        let refuse = |reason: String| AutomationError::DeleteRefused {
+            name: name.to_owned(),
+            reason,
+        };
+        let directory = match scope {
+            Scope::Project => directories.project.as_deref(),
+            Scope::User => directories.user.as_deref(),
+            Scope::Bundled => return Err(refuse(BUNDLED_DELETE.to_owned())),
+        }
+        .ok_or_else(|| refuse(OUTSIDE_DELETE.to_owned()))?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| refuse(error.to_string()))?;
+        if !metadata.file_type().is_file() {
+            return Err(refuse(REGULAR_DELETE.to_owned()));
+        }
+        if let Some(resolved) = self.find(name) {
+            let bytes = read_bounded_regular_file(path, MAX_SOURCE_BYTES)
+                .map_err(|error| refuse(error.to_string()))?;
+            if digest_of(&bytes) != resolved.entry.digest {
+                return Err(refuse(DELETE_CHANGED.to_owned()));
+            }
+        }
+        let directory = directory
+            .canonicalize()
+            .map_err(|error| refuse(error.to_string()))?;
+        let path = path
+            .canonicalize()
+            .map_err(|error| refuse(error.to_string()))?;
+        if path.parent() != Some(directory.as_path()) {
+            return Err(refuse(OUTSIDE_DELETE.to_owned()));
+        }
+        Ok(path)
     }
 
     /// One loadable script per name, the project scope's first.
@@ -695,6 +772,40 @@ mod tests {
 
     fn file_name(name: &str) -> String {
         format!("{name}.{SCRIPT_EXTENSION}")
+    }
+
+    #[test_case(Scope::Project; "project")]
+    #[test_case(Scope::User; "user")]
+    fn deletion_requires_the_resolved_directory_and_unchanged_file(scope: Scope) {
+        let fixture = Fixture::new();
+        fixture.place(scope, NAME, &script(NAME, ARMED));
+        let catalog = fixture.scan(FeatureFlags::NONE);
+        let path = catalog.resolve(NAME).unwrap().entry.path;
+        let directories = AutomationDirs::resolve(Some(&fixture.project), Some(&fixture.config));
+        assert_eq!(
+            catalog.delete_path(NAME, &directories).unwrap(),
+            path.canonicalize().unwrap()
+        );
+        let wrong = AutomationDirs {
+            project: Some(fixture.project.clone()),
+            user: Some(fixture.config.clone()),
+        };
+        assert_eq!(
+            catalog.delete_path(NAME, &wrong),
+            Err(AutomationError::DeleteRefused {
+                name: NAME.into(),
+                reason: OUTSIDE_DELETE.into()
+            })
+        );
+        fs::write(&path, format!("{} ", script(NAME, ARMED))).unwrap();
+        assert_eq!(
+            catalog.delete_path(NAME, &directories),
+            Err(AutomationError::DeleteRefused {
+                name: NAME.into(),
+                reason: DELETE_CHANGED.into()
+            })
+        );
+        assert!(path.is_file());
     }
 
     fn bundled(name: &str, source: &str) -> BundledAutomation {

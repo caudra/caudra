@@ -102,7 +102,7 @@ The agent writes to the project directory when the plan belongs to the repositor
 
 It needs `experimental.automations`. With automations on, it is on by default. It is the complete authoring guide for [automations](/docs/automations/#write-one): where a script goes and which scope to choose, the header and its triggers, every event field and host function, how untrusted text and state behave, the limits and how to end a loop, the parts of Rhai that trip people up, complete worked scripts, and a table of common mistakes with their fixes. The worked scripts are the examples Caudra's own test suite replays against scripted events, so they cannot drift from the engine.
 
-The agent validates the script with [`automation.validate()`](/docs/code/#tools-reached-from-code) and ends its turn with the line that arms it. A project script still needs your trust in `/automations`, and only you can arm a script.
+The agent validates the script with [`automation.validate()`](/docs/code/#tools-reached-from-code) and can arm it with `automation.arm(name, args)`. Caudra asks for permission unless a rule, YOLO or autopilot approves. Approval also trusts an untrusted project script's exact reviewed digest. The agent tells you what it armed and with which args. See [Write one](/docs/automations/#write-one) for disarming, deleting and permission scopes.
 
 ### caudra-plugin-dev
 

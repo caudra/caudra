@@ -72,7 +72,9 @@ use options::{
 pub use presentation::{
     AutoNote, AutopilotNote, EngineFlag, PromptReason, update_presentation_coverage,
 };
-use presentation::{action_summary, listed_commands, presentation_for, safe_summary};
+use presentation::{
+    action_summary, automation_review, listed_commands, presentation_for, safe_summary,
+};
 pub use resources::filesystem_permission_resource;
 #[cfg(test)]
 use resources::filesystem_resource_flags;
@@ -497,6 +499,10 @@ impl PermissionRequest {
     /// tool's own summary.
     pub fn with_action(mut self, action: &str) -> Self {
         self.presentation.action = action_summary(action);
+        if let Some(review) = automation_review(&self.tool, &self.input) {
+            self.presentation.action.push('\n');
+            self.presentation.action.push_str(&review);
+        }
         self
     }
     #[allow(clippy::too_many_arguments)]
@@ -525,7 +531,10 @@ impl PermissionRequest {
             authority,
             mcp.as_ref().is_some_and(|facts| facts.read_only),
         );
-        let presentation = presentation_for(&tool, &risk, &resources, mcp.as_ref());
+        let mut presentation = presentation_for(&tool, &risk, &resources, mcp.as_ref());
+        if let Some(review) = automation_review(&tool, &input) {
+            presentation.action = review;
+        }
         Self {
             id,
             tool,

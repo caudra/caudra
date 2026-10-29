@@ -63,7 +63,7 @@ The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-
 
 A bundled script has no file. Its path in the inspector reads `builtin:<provider>/<name>.rhai`, and `o` has nothing to open. It appears while its feature is on and goes when the feature is turned off. A bundled script that is armed when its feature goes off keeps running until the session restarts, and the resumed session disarms it and keeps its args, as it does for a deleted file. Bundled scripts cannot use `arm: "always"`.
 
-A project script arms only after you trust it. Select it in `/automations` and press `t`, which shows the digest you approve. The digest is SHA-256 over the exact bytes together with the automation language and host ABI versions, so changing one byte makes the script untrusted again until you review it. Neither the model nor a script can grant trust.
+A project script arms only after its digest is trusted. Select it in `/automations` and press `t`, which shows the digest you approve. Approving the agent's `automation.arm` request also trusts the exact digest shown in its permission prompt. The digest is SHA-256 over the exact bytes together with the automation language and host ABI versions, so changing one byte makes the script untrusted again. A script cannot grant trust or arm another script.
 
 ## Write one
 
@@ -92,7 +92,11 @@ The header is the first statement, `let meta = #{ … };`. Caudra reads it witho
 
 The body is ordinary Rhai that runs top to bottom once per firing, with `event`, `state`, `args`, and `meta` in scope. Conditions are plain `if` statements. `skip(reason)` ends a firing without acting and records why, and `return` ends it early. Actions are calls to host functions.
 
-The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and gives you the line that arms it. Only you can trust and arm it.
+The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and arms it with `automation.arm(name, args)`.
+
+Arming, disarming and deleting through the agent follow your permission rules. Ask mode prompts unless an allow rule covers the call. YOLO approves after deny rules, and autopilot can decide the prompt. The prompt shows the action, name, scope, path, digest, triggers, args, and network, secrets, messaging and workflow capabilities. An untrusted project script also shows `trusts digest`, so approval grants trust to those exact bytes. A script changed during approval is refused. Plan mode refuses these changes. `automation.list`, `.validate` and `.history` never prompt.
+
+`automation.disarm(name)` stops the automation in this session and drops its queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular project or user file, and rescans the catalog. Bundled scripts and symlinks cannot be deleted. Other open sessions keep their armed source until disarmed or restarted, even if a catalog rescan no longer finds its file. Permission scopes are `read`, `arm:<name>`, `disarm:<name>` and `delete:<name>`, so an allow rule for `automation` with scope `arm:*` covers arming only.
 
 ### Triggers
 

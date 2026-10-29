@@ -90,6 +90,9 @@ static AUTOMATION: ToolBacking = ToolBacking {
         action("list", &[]),
         action("validate", &["name"]),
         action("history", &["name", "fire_id", "limit"]),
+        action("arm", &["name", "args"]),
+        action("disarm", &["name"]),
+        action("delete", &["name"]),
     ],
 };
 
@@ -207,8 +210,8 @@ run[\"status\"], run.get(\"result\")\n\
 
 pub static AUTOMATION_DOC: ModuleDoc = ModuleDoc {
     namespace: AUTOMATION_MODULE,
-    summary: "`automation`: read this session's automations (Rhai scripts reacting to session events); `automation.list`, `.validate`, `.history`.",
-    page: "automation: this session's automations, short Rhai scripts that react to events such as the session going idle, a goal finishing or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one. Nothing here changes the runtime: trusting, arming and choosing args belong to the user (`/automations arm NAME {json}`).\n\
+    summary: "`automation`: inspect and manage this session's automations (Rhai scripts reacting to session events); `automation.list`, `.validate`, `.history`, `.arm`, `.disarm`, `.delete`.",
+    page: "automation: this session's automations, short Rhai scripts that react to events such as the session going idle, a goal finishing or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one. Reads never prompt. Arm, disarm and delete require permission unless a rule, YOLO or autopilot approves. They are unavailable in Plan mode. Approval to arm also trusts an untrusted project script's exact reviewed digest. Tell the user what you armed.\n\
 Answers are the runtime's own records as dicts.",
     members: &[
         MemberDoc {
@@ -231,6 +234,27 @@ Answers are the runtime's own records as dicts.",
             awaited: true,
             read_first: false,
             page: "This session's newest firings with their status, only `name`'s when given, at most `limit` (20 by default, at most 50). With `fire_id`, one firing's event and actions, log lines included, with its error and state patch.",
+        },
+        MemberDoc {
+            name: "arm",
+            signature: "arm(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]",
+            awaited: true,
+            read_first: false,
+            page: "Arms or re-arms a validated script in this session. Omit args to reuse stored args or defaults. The permission prompt shows its scope, path, digest, triggers, args and capabilities. Approval also trusts an untrusted project script's reviewed digest. A changed script is refused. Returns its automation snapshot.",
+        },
+        MemberDoc {
+            name: "disarm",
+            signature: "disarm(name: str) -> dict[str, Any]",
+            awaited: true,
+            read_first: false,
+            page: "Disarms the automation in this session and drops queued firings and deliveries, after permission approval. Returns its automation snapshot.",
+        },
+        MemberDoc {
+            name: "delete",
+            signature: "delete(name: str) -> Any",
+            awaited: true,
+            read_first: false,
+            page: "Disarms the automation in this session, removes its project or user script file, and rescans, after permission approval. Refuses bundled scripts and symlinks. Other open sessions keep their bindings.",
         },
     ],
 };
