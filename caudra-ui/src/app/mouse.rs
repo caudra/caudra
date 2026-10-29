@@ -232,6 +232,10 @@ impl App {
                     self.continue_btw(question);
                     return Vec::new();
                 }
+                StreamAction::Clear => {
+                    self.clear_btw_thread();
+                    return Vec::new();
+                }
             }
         }
         if self.workbench.is_open()
@@ -594,7 +598,7 @@ impl App {
             ) {
                 return actions;
             }
-        } else if self.plan_form_in_view() {
+        } else if self.plan_form_takes_input() {
             let action = self.plan_form.handle_mouse(event);
             if action != crate::components::plan_form::PlanFormAction::Passthrough {
                 self.clear_control_hovers();

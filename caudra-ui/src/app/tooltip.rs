@@ -71,9 +71,15 @@ impl App {
             _ => self
                 .overlays()
                 .into_iter()
-                .filter(|overlay| overlay.is_open())
+                .filter(|overlay| overlay.is_open() && !self.docked_under_btw(*overlay))
                 .find_map(Overlay::tooltip),
         }
+    }
+
+    /// A docked form stays drawn under an open `/btw`, which takes its
+    /// pointer, so the form has nothing to explain until the modal closes.
+    fn docked_under_btw(&self, overlay: &dyn Overlay) -> bool {
+        self.stream_modal.is_open() && !overlay.is_modal()
     }
 
     fn docs_badge_tip(&self) -> Option<Tip> {
@@ -93,6 +99,7 @@ impl App {
     fn surface_tip(&self) -> Option<Tip> {
         self.commit_popup
             .tooltip()
+            .or_else(|| self.plan_form_tip())
             .or_else(|| self.active_input_box().hover_tip())
             .or_else(|| self.composer_hint_tip())
             .or_else(|| self.queue_tip())
@@ -101,6 +108,12 @@ impl App {
             .or_else(|| self.update_text_tip())
             .or_else(|| self.status_bar_tip())
             .or_else(|| self.chats[self.active_chat].hover_tip())
+    }
+
+    fn plan_form_tip(&self) -> Option<Tip> {
+        self.plan_form_takes_input()
+            .then(|| self.plan_form.tooltip())
+            .flatten()
     }
 
     /// The bar builds its tip for whatever it drew hovered, so a hover the app
@@ -186,8 +199,8 @@ mod tests {
     use crossterm::event::MouseButton;
 
     use super::super::tests::{
-        announced, app_with_finished_subagent, app_with_todos, app_without_splash, mouse_event,
-        test_app, type_and_submit,
+        announced, app_with_finished_subagent, app_with_todos, app_without_splash, btw_plan_app,
+        btw_ready_app, mouse_event, open_question, plan_app, test_app, type_and_submit,
     };
     use super::{ChordTopic, TIP_DOCS, TIP_PLAN, TIP_TASKS};
     use crate::app::{App, Msg};
@@ -672,5 +685,71 @@ mod tests {
         );
         assert_eq!(topic, DocsTopic::Usage);
         assert!(row_of(&rows, TIP_DOCS).is_some(), "{SHOWN}");
+    }
+
+    const UNDER_BTW: &str = "a docked form under /btw must leave the tooltip to the modal";
+
+    /// Every control the plan form's footer drew, in order.
+    fn plan_footer(app: &App) -> Vec<Rect> {
+        (0..)
+            .map(|index| app.plan_form.footer_hit(index))
+            .take_while(|hit| !hit.is_empty())
+            .collect()
+    }
+
+    #[test_case(WIDE ; "wide")]
+    #[test_case(MEDIUM ; "medium")]
+    fn every_plan_form_control_explains_itself(size: (u16, u16)) {
+        let mut app = plan_app();
+        let _ = screen(&mut app, size);
+        let controls = plan_footer(&app);
+        assert!(!controls.is_empty(), "{CONTROL_MISSING}");
+
+        for (index, control) in controls.into_iter().enumerate() {
+            let rows = rest_at(&mut app, size, control);
+            let tip = app.tooltip_candidate().expect(SHOWN);
+            assert_eq!(tip.key, TipKey::FooterHint(index), "{WRONG_TIP}");
+            let opening: String = tip.text.chars().take(TIP_OPENING_CHARS).collect();
+            assert!(row_of(&rows, &opening).is_some(), "{SHOWN}: {}", tip.text);
+        }
+    }
+
+    fn plan_form_tip_spot(app: &mut App) -> Rect {
+        let _ = screen(app, WIDE);
+        plan_footer(app).first().copied().expect(CONTROL_MISSING)
+    }
+
+    fn question_form_tip_spot(app: &mut App) -> Rect {
+        open_question(app);
+        let rows = screen(app, WIDE);
+        let hint = kb::ENTER.label;
+        let y = rows
+            .iter()
+            .rposition(|row| row.contains(hint))
+            .expect(CONTROL_MISSING);
+        let byte = rows[y].rfind(hint).expect(CONTROL_MISSING);
+        let x = rows[y][..byte].chars().count();
+        Rect::new(x as u16, y as u16, 1, 1)
+    }
+
+    /// The modal is opened directly, so the form keeps its hover: the tooltip
+    /// must leave the form alone however the modal came up over it.
+    #[test_case(btw_plan_app, plan_form_tip_spot, App::open_btw_prompt ; "plan_form")]
+    #[test_case(btw_ready_app, question_form_tip_spot, App::open_question_btw ; "question_form")]
+    fn a_btw_takes_the_tooltip_from_the_form_under_it(
+        build: fn() -> App,
+        spot: fn(&mut App) -> Rect,
+        ask: fn(&mut App),
+    ) {
+        let mut app = build();
+        let control = spot(&mut app);
+        let _ = rest_at(&mut app, WIDE, control);
+        let form_tip = tip_text(&app).expect(SHOWN);
+
+        ask(&mut app);
+        assert!(app.stream_modal.is_open(), "{CONTROL_MISSING}");
+        let _ = rest_at(&mut app, WIDE, control);
+
+        assert_ne!(tip_text(&app), Some(form_tip), "{UNDER_BTW}");
     }
 }

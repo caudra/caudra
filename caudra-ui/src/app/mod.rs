@@ -775,9 +775,12 @@ pub struct App {
     /// Every finished task's transcript, which a `/btw` over a task reads once
     /// the task is no longer open.
     pub(crate) subagent_history: Option<SubagentHistoryStore>,
-    /// The `/btw` thread behind the stream modal, alive exactly as long as it
-    /// is; `/extract` shares the modal and never has one.
+    /// The `/btw` thread behind the stream modal while it is open; `/extract`
+    /// shares the modal and never has one.
     pub(super) btw_thread: Option<btw::BtwThread>,
+    /// Threads whose modal was closed, by the task whose conversation each
+    /// reads (`None` for the main one), until cleared or the session changes.
+    pub(super) parked_btw: HashMap<Option<String>, btw::ParkedBtw>,
     pub(crate) context_store: Option<ContextStore>,
     pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
     /// The main run's picks and backoff wake, while an agent loop serves it.
@@ -1105,6 +1108,7 @@ impl App {
             btw_prompt: None,
             subagent_history: None,
             btw_thread: None,
+            parked_btw: HashMap::new(),
             context_store: None,
             effective_model_slot: None,
             main_control: None,
@@ -1629,11 +1633,12 @@ impl App {
         self.is_main_chat() && self.plan_form_active()
     }
 
-    /// The form stays up while the plan is open in the workbench, but the
-    /// workbench is what the reader is looking at. A form that kept the keys
-    /// from behind it would implement the plan on the Enter meant for the text.
+    /// The form stays up while the plan is open in the workbench or a `/btw`
+    /// is asked over it, but that is what the reader is looking at. A form
+    /// that kept the keys from behind it would implement the plan on the Enter
+    /// meant for the text.
     fn plan_form_takes_input(&self) -> bool {
-        self.plan_form_in_view() && !self.workbench.is_open()
+        self.plan_form_in_view() && !self.workbench.is_open() && !self.stream_modal.is_open()
     }
 
     /// Reconciles the session to a model it was handed. Every live session is
@@ -2741,6 +2746,7 @@ impl App {
                 StreamAction::Copy(text) => self.copy_to_clipboard(&text),
                 StreamAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
                 StreamAction::Submit(question) => self.continue_btw(question),
+                StreamAction::Clear => self.clear_btw_thread(),
             }
             return Some(vec![]);
         }
@@ -7926,7 +7932,7 @@ impl App {
             && !self.stream_modal.is_open()
             && !self.stream_modal.is_clarification()
         {
-            self.end_btw_thread();
+            self.end_btw_thread(true);
             return Dirty::YES;
         }
         dirty
@@ -7950,7 +7956,9 @@ impl App {
             spend.billing,
         );
         self.record_external_spend(spend.usage, spend.cost, spend.billing, spend.purpose);
-        self.settle_btw(done.answer);
+        if matches!(spend.purpose, LedgerPurpose::Btw) {
+            self.settle_btw(done.answer);
+        }
         true
     }
 
@@ -8208,6 +8216,10 @@ impl App {
             }
             PlanFormAction::OpenEditor => {
                 self.open_plan();
+                vec![]
+            }
+            PlanFormAction::AskBtw => {
+                self.open_btw_prompt();
                 vec![]
             }
             PlanFormAction::Implement => self.implement_plan(false),

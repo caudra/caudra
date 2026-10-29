@@ -148,7 +148,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate options |
-| `F2` | Ask /btw about a pending question without answering it |
+| `F2` | Ask /btw about a pending question or plan without answering it |
 | `F3` | Decline an MCP server's request |
 | `F4` | Answer the question later, or show the next waiting question |
 | `F5` | Write a note for the agent that goes with your answers |
