@@ -21061,6 +21061,68 @@ fn a_btw_thread_catches_up_with_a_conversation_that_moved_on(new_epoch: bool) {
     assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
 }
 
+/// A `/btw` that reopens a kept thread but cannot catch it up leaves its
+/// question in the window's composer rather than dropping it.
+#[test]
+fn a_btw_question_that_cannot_catch_up_stays_in_the_composer() {
+    let (mut app, _script) = btw_answered_and_closed();
+    advance_main_history(&mut app, false);
+    app.btw_prompt = None;
+
+    app.start_btw(BTW_SECOND_QUESTION.into());
+
+    assert!(app.btw.is_open());
+    assert_eq!(btw_input(&app), BTW_SECOND_QUESTION);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::PROMPT_INITIALIZING)
+    );
+}
+
+/// A kept task thread whose conversation cannot be read for a moment is
+/// still kept, and reopens once the conversation is back.
+#[test]
+fn a_kept_btw_thread_outlives_an_unreadable_conversation() {
+    let mut app = focused_task_btw_app();
+    let live = task_btw_source(&mut app, TaskSource::Live, true);
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    drop(live);
+
+    ask_aside(&mut app, &format!("/btw {BTW_FOLLOW_UP}"));
+    assert!(!app.btw.is_open());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::TASK_HISTORY_UNAVAILABLE)
+    );
+
+    let _live = task_btw_source(&mut app, TaskSource::Live, true);
+    press_ask_btw(&mut app);
+    assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
+}
+
+/// Interrupting an answer puts the question queued behind it back in the
+/// composer, so it never goes out on its own later.
+#[test]
+fn interrupting_a_btw_answer_unqueues_the_question_behind_it() {
+    let (mut app, _script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    for c in BTW_FOLLOW_UP.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(btw_input(&app), "", "the question is held");
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let _ = app.tick();
+
+    assert!(app.btw.is_open());
+    assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
+    assert_eq!(btw_input(&app), BTW_FOLLOW_UP);
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 0);
+}
+
 #[test]
 fn closing_mid_answer_keeps_the_thread_without_the_stopped_question() {
     let mut app = btw_ready_app();
@@ -21355,6 +21417,7 @@ fn catchup_in_a_task_chat_summarizes_that_task() {
 const BTW_QUESTION: &str = "why sqlite?";
 const BTW_ANSWER: &str = "it ships in the binary";
 const BTW_FOLLOW_UP: &str = "and postgres?";
+const BTW_SECOND_QUESTION: &str = "and duckdb?";
 const BTW_FOLLOW_UP_TRIMMED: &str = "and postgre";
 const BTW_CHORD_SWALLOWED: &str = "an editing chord at /btw must edit the follow-up field";
 const BTW_SYSTEM: &str = "system";

@@ -501,8 +501,11 @@ impl Overlay for Btw {
 }
 
 /// Answers `question` over `messages` on the agent loop, in a context built
-/// for this run alone. What the stored media of a restored session only
-/// references is loaded first, off the UI thread, so it goes out attached.
+/// for this run alone. Building it changes nothing in the session: it
+/// refreshes no remote workspace and resolves no model for the mode, since
+/// the prefix names the provider and model. What the stored media of a
+/// restored session only references is loaded first, off the UI thread, so
+/// it goes out attached.
 async fn ask_aside(
     host: Arc<WorkflowHostContext>,
     prefix: Arc<RequestPrefix>,
@@ -515,12 +518,10 @@ async fn ask_aside(
     caudra_agent::load_stored_media(&mut messages, &store).await;
     let mut history = History::new(messages);
     let call_id = CaudraId::generate().to_string();
-    let done = match crate::agent::task_context(&host, None, cancel, events, &call_id).await {
-        Ok(ctx) => run_aside(&ctx, &prefix, &mut history, question)
-            .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error),
-    };
+    let ctx = host.chat_context(cancel, events, &call_id);
+    let done = run_aside(&ctx, call_id, &prefix, &mut history, question)
+        .await
+        .map_err(|error| error.to_string());
     (history.as_slice().to_vec(), done)
 }
 
@@ -580,9 +581,13 @@ impl App {
         self.close_btw();
         self.autoscroll = None;
         self.selection_state = None;
-        if !self.resume_btw(task.clone()) {
-            let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
-            self.btw.side = Some(SideQuestion::new(task, window));
+        match self.resume_btw(task.clone()) {
+            Ok(true) => {}
+            Ok(false) => {
+                let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
+                self.btw.side = Some(SideQuestion::new(task, window));
+            }
+            Err(error) => self.status_bar.flash(error),
         }
     }
 
@@ -679,16 +684,20 @@ impl App {
 
     /// Reopens what `task`'s conversation kept, if it kept anything. A
     /// thread whose conversation has moved on says so and gets no transcript
-    /// marker until its next question catches it up.
-    fn resume_btw(&mut self, task: Option<String>) -> bool {
+    /// marker until its next question catches it up. One whose conversation
+    /// can no longer be read stays kept, and the reason is the error.
+    fn resume_btw(&mut self, task: Option<String>) -> Result<bool, String> {
         let Some(mut side) = self.btw.parked.remove(&task) else {
-            return false;
+            return Ok(false);
         };
         let current = match &side.thread {
             None => true,
             Some(thread) => match self.btw_source(task.as_deref()) {
                 Ok(source) => source.mark() == thread.mark,
-                Err(_) => return false,
+                Err(error) => {
+                    self.btw.parked.insert(task, side);
+                    return Err(error);
+                }
             },
         };
         side.window.open();
@@ -700,7 +709,7 @@ impl App {
         if marked {
             self.mark_btw_cutoff(task.as_deref());
         }
-        true
+        Ok(true)
     }
 
     /// Moves the open thread onto its conversation as it stands now, if that
@@ -856,8 +865,12 @@ impl App {
         }
     }
 
+    /// Asks `question`, which waits in an open window's composer when it
+    /// cannot be asked yet.
     pub(crate) fn start_btw(&mut self, question: String) {
-        self.open_btw(question.clone(), question, |_| true);
+        if !self.open_btw(question.clone(), question.clone(), |_| true) {
+            self.restore_btw_draft(&question);
+        }
     }
 
     /// A `/btw` with a canned question, headed by a short label rather than
@@ -882,18 +895,30 @@ impl App {
     /// Asks `question` in the thread the focused conversation kept, caught
     /// up with it, or in a new one. `answerable` says whether the thread's
     /// view of the conversation gives the question anything to answer from.
-    fn open_btw(&mut self, header: String, question: String, answerable: fn(&BtwThread) -> bool) {
+    /// False, with the reason flashed, when it was not asked.
+    fn open_btw(
+        &mut self,
+        header: String,
+        question: String,
+        answerable: fn(&BtwThread) -> bool,
+    ) -> bool {
         let task = self.active_subagent_id().map(str::to_owned);
         self.close_extract();
         self.close_btw();
-        let resumed = self.resume_btw(task.clone());
+        let resumed = match self.resume_btw(task.clone()) {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                self.status_bar.flash(error);
+                return false;
+            }
+        };
         if resumed && self.btw.thread_mut().is_some() {
             if !self.catch_up_btw_thread() {
-                return;
+                return false;
             }
         } else {
             let Some(thread) = self.capture_btw_thread(task.as_deref()) else {
-                return;
+                return false;
             };
             if !resumed {
                 let window = self.btw_window(TITLE, SideFooter::FollowUp);
@@ -902,7 +927,7 @@ impl App {
             self.install_btw_thread(thread);
         }
         let Some(thread) = self.btw.thread_mut() else {
-            return;
+            return false;
         };
         if !answerable(thread) {
             self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
@@ -910,10 +935,11 @@ impl App {
                 self.close_btw();
                 self.btw.parked.remove(&task);
             }
-            return;
+            return false;
         }
         thread.ask(question);
         self.stream_btw_answer(header);
+        true
     }
 
     /// Asks the next question over the same thread, so it stays one cached
@@ -1142,8 +1168,12 @@ impl App {
     }
 
     /// Stops the live run and says so where it was cut, unless it already
-    /// finished, which settles as it would have on the next tick.
+    /// finished, which settles as it would have on the next tick. Either
+    /// way the question queued behind it goes back to the composer unsent.
     pub(super) fn stop_btw_run(&mut self) {
+        if let Some(side) = self.btw.side.as_mut() {
+            side.window.unqueue();
+        }
         let _ = self.poll_btw_run();
         let Some(mut run) = self.btw.run.take() else {
             return;

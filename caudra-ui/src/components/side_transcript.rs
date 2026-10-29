@@ -504,16 +504,20 @@ impl SideTranscript {
         (!text.is_empty()).then_some(text)
     }
 
-    /// The question queued behind a live run, with whatever was typed after
-    /// it, so neither is lost when the window closes.
-    fn take_unsent(&mut self) -> Option<String> {
-        let queued = self.queued.take()?;
+    /// Puts the question queued behind a live run back in the composer,
+    /// ahead of whatever was typed after it, so a run that stops or a window
+    /// that closes loses neither and sends nothing on its own.
+    pub fn unqueue(&mut self) {
+        let Some(queued) = self.queued.take() else {
+            return;
+        };
         let draft = self.input.text();
-        Some(if draft.trim().is_empty() || draft.trim() == queued {
+        let unsent = if draft.trim().is_empty() || draft.trim() == queued {
             queued
         } else {
             format!("{queued}{DRAFT_SEPARATOR}{draft}")
-        })
+        };
+        self.input.set_text(&unsent);
     }
 
     /// An armed scroll card under the pointer takes the wheel first, as in
@@ -809,9 +813,7 @@ impl Overlay for SideTranscript {
     /// Hides the window and keeps what it shows: the chat, and what was left
     /// unsent as the composer's draft.
     fn close(&mut self) {
-        if let Some(unsent) = self.take_unsent() {
-            self.input.set_text(&unsent);
-        }
+        self.unqueue();
         self.open = false;
         self.chat.clear_hover();
         self.chat.disarm_card();

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use async_lock::Mutex as AsyncMutex;
 use caudra_config::CODE_TOOL_NAME;
 use caudra_providers::Model;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -17,19 +18,19 @@ use super::{Agent, AgentParams, AgentRunParams, History};
 use crate::cancel::CancelTrigger;
 use crate::context::RequestPrefix;
 use crate::tools::{
-    AUTOMATION_TOOL_NAME, BATCH_TOOL_NAME, EXECUTION_ENVIRONMENT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
-    FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
-    SKILL_TOOL_NAME, SOURCE_CODE_CONTEXT_TOOL_NAME, SOURCE_CODE_REFS_TOOL_NAME,
-    TOOL_OUTPUT_TOOL_NAME, ToolContext, ToolFilter, VIEW_IMAGE_TOOL_NAME, WEBFETCH_TOOL_NAME,
-    WEBSEARCH_TOOL_NAME,
+    AUTOMATION_TOOL_NAME, BATCH_TOOL_NAME, FILE_GLOB_TOOL_NAME, FILE_GREP_TOOL_NAME,
+    FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME,
+    SOURCE_CODE_CONTEXT_TOOL_NAME, SOURCE_CODE_REFS_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, ToolContext,
+    ToolFilter, VIEW_IMAGE_TOOL_NAME, WEBFETCH_TOOL_NAME, WEBSEARCH_TOOL_NAME,
 };
 use crate::types::{AgentEvent, Envelope};
 use crate::{AgentError, AgentInput, AgentMode, DoneReason};
 
 /// What a side question may call. Each call is also held to read-only
 /// effects when it runs, so `shell` and `code` reach only their reads. The
-/// last two are never declared: `code`'s `host` and `automation` modules call
-/// them.
+/// last is never declared: `code`'s `automation` module calls it. The `host`
+/// module's `execution_environment` is not here: its probes can refresh
+/// credentials or run sudo policy hooks, so it is no pure read.
 pub const ASIDE_TOOLS: &[&str] = &[
     FILE_READ_TOOL_NAME,
     FILE_GLOB_TOOL_NAME,
@@ -45,12 +46,13 @@ pub const ASIDE_TOOLS: &[&str] = &[
     BATCH_TOOL_NAME,
     TOOL_OUTPUT_TOOL_NAME,
     VIEW_IMAGE_TOOL_NAME,
-    EXECUTION_ENVIRONMENT_TOOL_NAME,
     AUTOMATION_TOOL_NAME,
 ];
-/// Tool calls one side question may make before it is stopped.
+/// Tool calls one side question may make before it is stopped, each call a
+/// `code` snippet makes on the host among them.
 pub const MAX_ASIDE_TOOL_CALLS: usize = 25;
-/// Input and output tokens one side question may spend before it is stopped.
+/// Tokens one side question may spend, as [`RunBudget`] counts them, before
+/// it is stopped.
 pub const MAX_ASIDE_TOKENS: u64 = 200_000;
 /// Restated whenever the side history does not already end on it, as the
 /// mode contract of the run. It carries the contract's heading, so it stands
@@ -61,8 +63,8 @@ asking a side question beside the conversation, not continuing it. Answer that q
 things up, but you cannot change files or any other state.\n\
 - The workspace is read as it is now, which may differ from what the conversation above saw.\n\
 - Nothing here enters the main conversation.\n</system-reminder>";
-const ASIDE_BUDGET: RunBudget = RunBudget::new(MAX_ASIDE_TOOL_CALLS, MAX_ASIDE_TOKENS);
-const ASIDE_ROOT: &str = "aside";
+const ASIDE_BUDGET: RunBudget =
+    RunBudget::counting_host_calls(MAX_ASIDE_TOOL_CALLS, MAX_ASIDE_TOKENS);
 
 #[derive(Debug, Error)]
 pub enum AsideError {
@@ -77,24 +79,30 @@ pub enum AsideError {
 ///
 /// `ctx` is the session's, built for this run: its event sender receives
 /// every event the run sends, and cancelling its token stops the run. The
-/// request goes out as `prefix` sends it, byte for byte under its cache key.
+/// run's calls are rooted at `root`. The request goes out as `prefix` sends
+/// it, byte for byte under its cache key.
+///
+/// Nobody answers the run. Its answer channel is closed, so a re-auth or a
+/// server's question ends at once rather than taking an answer meant for
+/// the conversation. Approvals reach the permission manager, not this
+/// channel.
 ///
 /// Each request's spend reaches the sender once as
 /// [`AgentEvent::ModelUsage`] under [`LedgerPurpose::Btw`], as it happens,
 /// so a run that later fails or is cancelled is still billed. Its
-/// `TurnComplete` carries the same purpose and is for display only.
+/// `TurnComplete` carries the same purpose and is for display only. A cap
+/// stops the run only while it would go on: an answer that went past one
+/// is still the answer.
 pub async fn run_aside(
     ctx: &ToolContext,
+    root: String,
     prefix: &RequestPrefix,
     history: &mut History,
     question: String,
 ) -> Result<DoneReason, AsideError> {
     let (agent_tx, agent_rx) = flume::unbounded();
     let (stop, cancel) = ctx.cancel.child();
-    let root = ctx
-        .root_tool_use_id
-        .clone()
-        .unwrap_or_else(|| ASIDE_ROOT.to_owned());
+    let (_, unanswered) = flume::unbounded();
     let params = AgentParams {
         cache_key: prefix.cache_key.clone(),
         tool_filter: aside_filter(ctx, &prefix.model),
@@ -123,10 +131,8 @@ pub async fn run_aside(
     )
     .with_mcp(ctx.mcp.clone())
     .with_cancel(cancel)
-    .with_auto_compact(false);
-    if let Some(responses) = &ctx.user_response_rx {
-        agent = agent.with_user_response_rx(Arc::clone(responses));
-    }
+    .with_auto_compact(false)
+    .with_user_response_rx(Arc::new(AsyncMutex::new(unanswered)));
     let input = AgentInput {
         message: question,
         mode: AgentMode::ReadOnly,
@@ -151,8 +157,14 @@ pub async fn run_aside(
     };
     let relay = async {
         while let Ok(envelope) = agent_rx.recv_async().await {
+            let answered = matches!(
+                &envelope.event,
+                AgentEvent::TurnComplete(turn) if !turn.message.has_tool_calls()
+            );
             watch.take(envelope).await;
-            watch.stop_if_over();
+            if !answered {
+                watch.stop_if_over();
+            }
         }
         future::pending().await
     };
@@ -160,9 +172,10 @@ pub async fn run_aside(
     while let Ok(envelope) = agent_rx.try_recv() {
         watch.take(envelope).await;
     }
+    let finished = matches!(done, Ok(reason) if reason != DoneReason::Cancelled);
     match watch.overrun {
-        Some(overrun) => Err(AsideError::OverBudget(overrun)),
-        None => Ok(done?),
+        Some(overrun) if !finished => Err(AsideError::OverBudget(overrun)),
+        _ => Ok(done?),
     }
 }
 
@@ -207,16 +220,18 @@ impl Watch {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use caudra_config::decisions::DecisionsConfig;
     use caudra_config::{AgentConfig, DefaultEffect, FeatureFlags, PermissionsConfig};
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
         CacheKey, ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role,
         StopReason, StreamResponse, TokenUsage,
     };
+    use caudra_storage::StateDir;
     use serde_json::{Map, Value, json};
     use test_case::test_case;
 
@@ -230,6 +245,7 @@ mod tests {
     };
     use crate::code::tool_module::READ_ONLY_UNAVAILABLE;
     use crate::context::{ContextKey, ContextStore};
+    use crate::decisions::Decisions;
     use crate::mcp::recognised_stub_session;
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::prompt::TASK_MODE_MARKER;
@@ -242,8 +258,9 @@ mod tests {
     };
     use crate::tools::test_support::NamedMock;
     use crate::tools::{
-        DescriptionContext, FILE_EDIT_TOOL_NAME, FILE_WRITE_TOOL_NAME, FileReadTracker,
-        READ_ONLY_TOOL_RESTRICTED, TASK_TOOL_NAME, ToolEffect, interpreter_ctx,
+        DescriptionContext, EXECUTION_ENVIRONMENT_TOOL_NAME, FILE_EDIT_TOOL_NAME,
+        FILE_WRITE_TOOL_NAME, FileReadTracker, READ_ONLY_TOOL_RESTRICTED, TASK_TOOL_NAME,
+        ToolEffect, interpreter_ctx,
     };
     use crate::types::ToolOutput;
     use crate::{Envelope, EventSender};
@@ -275,9 +292,17 @@ mod tests {
     const SNIPPET: &str = "await stub.lookup()";
     const ENVIRONMENT_METHOD: &str = "environment";
     const GENERATE_METHOD: &str = "generate";
+    const ROOT: &str = "aside-call";
+    const MAIN_ANSWER: &str = "an answer the main chat is owed";
+    const AUTH_ERROR_STATUS: u16 = 401;
+    const AUTH_ERROR_MESSAGE: &str = "expired";
+    const DECISION_PROVIDER: &str = "decider";
+    const DECISION_MODEL: &str = "decider-1";
+    const DECISION_TOKENS: u32 = 12;
+    const ONE_TURN: u32 = 1;
     const MOCKS: &[(&str, ToolEffect, bool)] = &[
         (FILE_READ_TOOL_NAME, ToolEffect::ReadOnly, false),
-        (EXECUTION_ENVIRONMENT_TOOL_NAME, ToolEffect::ReadOnly, false),
+        (EXECUTION_ENVIRONMENT_TOOL_NAME, ToolEffect::Mutating, false),
         (FILE_GREP_TOOL_NAME, ToolEffect::ReadOnly, false),
         (FILE_WRITE_TOOL_NAME, ToolEffect::Mutating, false),
         (FILE_EDIT_TOOL_NAME, ToolEffect::Mutating, false),
@@ -294,7 +319,7 @@ mod tests {
     /// Answers each request with the next scripted response after yielding
     /// once, so the events of the turn before reach the relay first.
     struct ScriptedProvider {
-        responses: Mutex<VecDeque<StreamResponse>>,
+        responses: Mutex<VecDeque<Result<StreamResponse, AgentError>>>,
         requests: Arc<Mutex<Vec<Request>>>,
     }
 
@@ -317,12 +342,11 @@ mod tests {
                     messages: messages.to_vec(),
                 });
                 future::yield_now().await;
-                Ok(self
-                    .responses
+                self.responses
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .expect("a scripted response"))
+                    .expect("a scripted response")
             })
         }
 
@@ -399,27 +423,41 @@ mod tests {
         }
     }
 
-    /// Runs any snippet as one `namespace.method()` call and returns what it
-    /// answered.
-    struct OneCallRunner {
+    /// Runs any snippet as `times` `namespace.method()` calls in turn and
+    /// returns what the last answered.
+    struct CallingRunner {
         namespace: &'static str,
         method: &'static str,
+        times: usize,
     }
 
-    impl ScriptRunner for OneCallRunner {
+    impl CallingRunner {
+        fn once(namespace: &'static str, method: &'static str) -> Self {
+            Self {
+                namespace,
+                method,
+                times: 1,
+            }
+        }
+    }
+
+    impl ScriptRunner for CallingRunner {
         fn run(&self, run: ScriptRun) -> RunFuture {
-            let (namespace, method) = (self.namespace, self.method);
+            let (namespace, method, times) = (self.namespace, self.method, self.times);
             Box::pin(async move {
-                let invocation = run.host.call(ScriptCall {
-                    namespace: Some(namespace.to_owned()),
-                    name: method.to_owned(),
-                    args: Vec::new(),
-                    kwargs: Map::new(),
-                });
-                let reply = match invocation {
-                    ScriptInvocation::Ready(reply) => reply,
-                    ScriptInvocation::Deferred(future) => future.await,
-                };
+                let mut reply = Ok(Value::Null);
+                for _ in 0..times {
+                    let invocation = run.host.call(ScriptCall {
+                        namespace: Some(namespace.to_owned()),
+                        name: method.to_owned(),
+                        args: Vec::new(),
+                        kwargs: Map::new(),
+                    });
+                    reply = match invocation {
+                        ScriptInvocation::Ready(reply) => reply,
+                        ScriptInvocation::Deferred(future) => future.await,
+                    };
+                }
                 ScriptOutcome {
                     output: Some(ScriptOutput {
                         result: reply.unwrap_or_else(|error| Value::from(error.message)),
@@ -441,6 +479,13 @@ mod tests {
 
     impl Fixture {
         fn new(responses: Vec<StreamResponse>, mode: PermissionMode) -> Self {
+            Self::replying(responses.into_iter().map(Ok).collect(), mode)
+        }
+
+        fn replying(
+            replies: VecDeque<Result<StreamResponse, AgentError>>,
+            mode: PermissionMode,
+        ) -> Self {
             let (tx, events) = flume::unbounded();
             let permissions = Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig {
@@ -477,7 +522,7 @@ mod tests {
             );
             let requests = Arc::default();
             let provider = Arc::new(ScriptedProvider {
-                responses: Mutex::new(responses.into()),
+                responses: Mutex::new(replies),
                 requests: Arc::clone(&requests),
             });
             Self {
@@ -489,7 +534,13 @@ mod tests {
         }
 
         fn ask(&self, history: &mut History, question: &str) -> Result<DoneReason, AsideError> {
-            let asked = run_aside(&self.ctx, &self.prefix, history, question.to_owned());
+            let asked = run_aside(
+                &self.ctx,
+                ROOT.to_owned(),
+                &self.prefix,
+                history,
+                question.to_owned(),
+            );
             assert_send(&asked);
             smol::block_on(asked)
         }
@@ -717,10 +768,10 @@ mod tests {
     #[test_case(true, true ; "a_read_only_mcp_call_runs")]
     #[test_case(false, false ; "a_writing_mcp_call_is_refused")]
     fn code_reaches_only_read_only_host_calls(annotated_read_only: bool, runs: bool) {
-        install(Arc::new(OneCallRunner {
-            namespace: LOOKUP_NAMESPACE,
-            method: LOOKUP_METHOD,
-        }));
+        install(Arc::new(CallingRunner::once(
+            LOOKUP_NAMESPACE,
+            LOOKUP_METHOD,
+        )));
         let mut fixture = Fixture::new(
             calling(CODE_TOOL_NAME, json!({"code": SNIPPET}), 0),
             PermissionMode::Yolo,
@@ -755,14 +806,12 @@ mod tests {
         assert!(!content.contains(LOOKUP_RESULT), "{content}");
     }
 
-    #[test_case(HOST_MODULE, ENVIRONMENT_METHOD, RAN ; "host_environment_runs")]
-    #[test_case(IMAGE_MODULE, GENERATE_METHOD, READ_ONLY_UNAVAILABLE ; "image_generate_is_refused")]
-    fn code_modules_reach_only_their_reads(
-        namespace: &'static str,
-        method: &'static str,
-        expected: &str,
-    ) {
-        install(Arc::new(OneCallRunner { namespace, method }));
+    /// The host's environment is no pure read: its probes can refresh
+    /// credentials, so it is refused like a write.
+    #[test_case(HOST_MODULE, ENVIRONMENT_METHOD ; "host_environment_is_refused")]
+    #[test_case(IMAGE_MODULE, GENERATE_METHOD ; "image_generate_is_refused")]
+    fn code_modules_that_only_change_are_refused(namespace: &'static str, method: &'static str) {
+        install(Arc::new(CallingRunner::once(namespace, method)));
         let fixture = Fixture::new(
             calling(CODE_TOOL_NAME, json!({"code": SNIPPET}), 0),
             PermissionMode::Yolo,
@@ -770,7 +819,8 @@ mod tests {
         let mut history = forked();
         fixture.ask(&mut history, QUESTION).unwrap();
         let (content, _) = result(&history);
-        assert!(content.contains(expected), "{content}");
+        assert!(content.contains(READ_ONLY_UNAVAILABLE), "{content}");
+        assert!(!content.contains(RAN), "{content}");
     }
 
     #[test]
@@ -825,11 +875,10 @@ mod tests {
     }
 
     #[test]
-    fn the_token_cap_stops_the_run_and_still_bills_it() {
-        let fixture = Fixture::new(
-            calling(FILE_READ_TOOL_NAME, json!({}), OVER_BUDGET),
-            PermissionMode::Ask,
-        );
+    fn the_token_cap_stops_a_run_that_would_go_on_and_still_bills_it() {
+        let mut responses = calling(FILE_READ_TOOL_NAME, json!({}), 0);
+        responses[0].usage.output = OVER_BUDGET;
+        let fixture = Fixture::new(responses, PermissionMode::Ask);
         let mut history = forked();
         let error = fixture.ask(&mut history, QUESTION).unwrap_err();
         assert!(
@@ -843,5 +892,171 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn an_answer_that_went_past_the_token_cap_is_still_the_answer() {
+        let mut spent = answer();
+        spent.usage.output = OVER_BUDGET;
+        let fixture = Fixture::new(vec![spent], PermissionMode::Ask);
+        let mut history = forked();
+        assert_eq!(
+            fixture.ask(&mut history, QUESTION).unwrap(),
+            DoneReason::EndTurn
+        );
+        assert_eq!(texts(history.as_slice()).last().unwrap(), ANSWER);
+    }
+
+    /// The conversation's prompt is what the side question was handed, so a
+    /// cold cache spends none of its budget.
+    #[test]
+    fn the_forked_prompt_spends_none_of_the_budget() {
+        let mut responses = calling(FILE_READ_TOOL_NAME, json!({}), OVER_BUDGET);
+        responses[0].usage.cache_creation = OVER_BUDGET;
+        let fixture = Fixture::new(responses, PermissionMode::Ask);
+        let mut history = forked();
+        assert_eq!(
+            fixture.ask(&mut history, QUESTION).unwrap(),
+            DoneReason::EndTurn
+        );
+    }
+
+    #[test]
+    fn each_host_call_of_a_snippet_counts_toward_the_call_cap() {
+        install(Arc::new(CallingRunner {
+            namespace: LOOKUP_NAMESPACE,
+            method: LOOKUP_METHOD,
+            times: MAX_ASIDE_TOOL_CALLS,
+        }));
+        let mut fixture = Fixture::new(
+            calling(CODE_TOOL_NAME, json!({"code": SNIPPET}), 0),
+            PermissionMode::Yolo,
+        );
+        fixture.ctx.mcp = Some(recognised_stub_session(
+            LOOKUP_SERVER,
+            &[(LOOKUP_TOOL, true)],
+            json!({"content": [{"type": "text", "text": LOOKUP_RESULT}]}),
+        ));
+        let mut history = forked();
+        let error = fixture.ask(&mut history, QUESTION).unwrap_err();
+        assert!(
+            matches!(error, AsideError::OverBudget(Overrun::ToolCalls)),
+            "{error}"
+        );
+    }
+
+    /// A re-auth reads the answer channel. The side question's own is
+    /// closed, so it ends at once and the main chat's answer stays queued.
+    #[test]
+    fn a_side_question_never_takes_an_answer_meant_for_the_main_chat() {
+        let mut fixture = Fixture::replying(
+            VecDeque::from([
+                Err(AgentError::api(AUTH_ERROR_STATUS, AUTH_ERROR_MESSAGE)),
+                Ok(answer()),
+            ]),
+            PermissionMode::Ask,
+        );
+        let (answers, main) = flume::unbounded();
+        answers.send(MAIN_ANSWER.to_owned()).unwrap();
+        fixture.ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(main.clone())));
+        let mut history = forked();
+
+        let done = fixture.ask(&mut history, QUESTION);
+
+        assert!(
+            !matches!(done, Ok(DoneReason::EndTurn)),
+            "the run must end unanswered"
+        );
+        assert_eq!(main.try_recv().as_deref(), Ok(MAIN_ANSWER));
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+    }
+
+    /// Decision spend queues on the permission manager the side question
+    /// shares with the conversation, which books it, so none of it shows as
+    /// the side question's.
+    #[test]
+    fn the_conversations_decision_spend_stays_queued() {
+        let state = tempfile::tempdir().unwrap();
+        let decisions = Decisions::new(
+            DecisionsConfig::default(),
+            &StateDir::from_path(state.path().to_owned()),
+        )
+        .unwrap();
+        decisions.queue_spend(
+            DECISION_PROVIDER,
+            DECISION_MODEL,
+            TokenUsage {
+                input: DECISION_TOKENS,
+                ..TokenUsage::default()
+            },
+        );
+        let fixture = Fixture::new(vec![answer()], PermissionMode::Ask);
+        fixture
+            .ctx
+            .permissions
+            .set_decisions(Some(decisions.clone()));
+        let mut history = forked();
+        fixture.ask(&mut history, QUESTION).unwrap();
+
+        assert!(!fixture.events().iter().any(|event| matches!(
+            event,
+            AgentEvent::ModelUsage {
+                purpose: LedgerPurpose::Decision,
+                ..
+            }
+        )));
+        assert_eq!(decisions.take_spend().len(), 1);
+    }
+
+    /// Whether every call in `messages` has its result in the message after it.
+    fn paired(messages: &[Message]) -> bool {
+        messages.iter().enumerate().all(|(index, message)| {
+            let answered: HashSet<&str> = messages
+                .get(index + 1)
+                .into_iter()
+                .flat_map(|next| &next.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            message.tool_uses().all(|(id, _, _)| answered.contains(id))
+        })
+    }
+
+    fn over_the_cap_calling() -> Fixture {
+        let mut responses = calling(FILE_READ_TOOL_NAME, json!({}), 0);
+        responses[0].usage.output = OVER_BUDGET;
+        Fixture::new(responses, PermissionMode::Ask)
+    }
+
+    fn out_of_turns() -> Fixture {
+        let mut fixture = Fixture::new(
+            vec![
+                calling(FILE_READ_TOOL_NAME, json!({}), 0).remove(0),
+                answer(),
+                answer(),
+            ],
+            PermissionMode::Ask,
+        );
+        fixture.ctx.config.max_turns = Some(ONE_TURN);
+        fixture
+    }
+
+    /// An answer that ended short of its turn is kept, and the follow-up
+    /// after it still sends every call with its result.
+    #[test_case(over_the_cap_calling ; "token_cap_after_a_call")]
+    #[test_case(out_of_turns ; "max_turns_after_a_call")]
+    fn a_follow_up_after_an_unfinished_answer_sends_every_call_paired(setup: fn() -> Fixture) {
+        let fixture = setup();
+        let mut history = forked();
+        let ended = fixture.ask(&mut history, QUESTION);
+        assert!(!matches!(ended, Ok(DoneReason::EndTurn)), "{ended:?}");
+        fixture.ask(&mut history, FOLLOW_UP).unwrap();
+
+        let requests = fixture.requests.lock().unwrap();
+        let follow_up = &requests.last().unwrap().messages;
+        assert!(paired(follow_up), "{follow_up:?}");
+        assert!(texts(follow_up).iter().any(|text| text == FOLLOW_UP));
     }
 }

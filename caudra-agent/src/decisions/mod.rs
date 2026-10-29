@@ -583,6 +583,11 @@ impl Decisions {
         self.spend().take()
     }
 
+    #[cfg(test)]
+    pub(crate) fn queue_spend(&self, provider: &str, model: &str, usage: TokenUsage) {
+        self.spend().add(provider, model, usage, None);
+    }
+
     /// Books this service's spend where `previous` booked its own, so a session that
     /// switches engines keeps what the old one's calls spent, even those still lingering.
     pub fn inherit_spend(&self, previous: &Self) {

@@ -771,17 +771,16 @@ impl WorkflowHostContext {
         events: EventSender,
         call_id: &str,
     ) -> Result<ToolContext, String> {
-        let mode = (self.mode)();
-        let (chat_provider, chat_model) = (self.model)();
-        let (provider, model) = if mode.is_planning() {
-            crate::agent::resolve_model_for_purpose(
+        let mut ctx = self.chat_context(cancel, events, call_id);
+        if ctx.mode.is_planning() {
+            let (provider, model) = crate::agent::resolve_model_for_purpose(
                 crate::agent::ModelRoute {
-                    provider: &chat_provider,
-                    model: &chat_model,
+                    provider: &ctx.chat_provider,
+                    model: &ctx.chat_model,
                 },
                 crate::agent::ModelRoute {
-                    provider: &chat_provider,
-                    model: &chat_model,
+                    provider: &ctx.chat_provider,
+                    model: &ctx.chat_model,
                 },
                 ModelPurpose::Plan,
                 None,
@@ -789,13 +788,26 @@ impl WorkflowHostContext {
                 &self.model_policy,
             )
             .await
-            .map_err(|error| error.user_message())?
-        } else {
-            (Arc::clone(&chat_provider), Model::clone(&chat_model))
-        };
-        Ok(ToolContext {
-            provider,
-            model: Arc::new(model),
+            .map_err(|error| error.user_message())?;
+            ctx.provider = provider;
+            ctx.model = Arc::new(model);
+        }
+        Ok(ctx)
+    }
+
+    /// [`Self::tool_context`] on the chat model in every mode, for a run
+    /// whose request already names its provider and model.
+    pub fn chat_context(
+        &self,
+        cancel: CancelToken,
+        events: EventSender,
+        call_id: &str,
+    ) -> ToolContext {
+        let mode = (self.mode)();
+        let (chat_provider, chat_model) = (self.model)();
+        ToolContext {
+            provider: Arc::clone(&chat_provider),
+            model: Arc::clone(&chat_model),
             chat_provider,
             chat_model,
             event_tx: events,
@@ -850,7 +862,7 @@ impl WorkflowHostContext {
             steering_order: Vec::new(),
             speculative: None,
             decision_focus: None,
-        })
+        }
     }
 }
 
@@ -1617,6 +1629,35 @@ mod tests {
             assert_eq!(ctx.chat_model.id, CURRENT_CHAT_ID);
             assert!(Arc::ptr_eq(&ctx.provider, &ctx.chat_provider));
         });
+    }
+
+    /// A run whose request names its own model, such as a side question,
+    /// keeps the mode's tool rules without a model for the mode.
+    #[test]
+    fn a_chat_context_keeps_the_plan_mode_on_the_chat_model() {
+        let planning = AgentMode::Plan(PLAN_PATH.into());
+        let base = stub_ctx_with(&planning, None, Some(CALL_ID));
+        let model: ModelResolver = Arc::new({
+            let provider = Arc::clone(&base.provider);
+            let model = Arc::clone(&base.model);
+            move || (Arc::clone(&provider), Arc::clone(&model))
+        });
+        let host = WorkflowHostContext::from_tool_context(
+            &base,
+            model,
+            Arc::new(move || planning.clone()),
+            Arc::new(CancelMap::new()),
+        );
+
+        let ctx = host.chat_context(
+            CancelToken::none(),
+            EventSender::new(flume::unbounded().0, 0),
+            CALL_ID,
+        );
+
+        assert!(matches!(ctx.mode, AgentMode::Plan(_)));
+        assert_eq!(ctx.model.id, base.model.id);
+        assert_eq!(ctx.root_tool_use_id.as_deref(), Some(CALL_ID));
     }
 
     /// What a caller launches reads the plan the caller works on, captured

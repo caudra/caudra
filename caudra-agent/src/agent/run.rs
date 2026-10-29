@@ -681,6 +681,10 @@ pub struct Agent<'h> {
     /// Provider requests since the last recall, which spaces the recalls the
     /// agent starts on its own.
     requests_since_recall: usize,
+    /// Whether this run books the decision spend its permission manager
+    /// queues. One continuing another conversation's prefix leaves it to that
+    /// conversation, so its usage holds only its own requests.
+    books_decision_spend: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -689,17 +693,12 @@ impl<'h> Agent<'h> {
     }
 
     /// Sends `run.tools` byte for byte, for a run that continues another
-    /// conversation's cached prefix. Nothing is stripped or reconfigured for
-    /// this run, so a declared tool it may not use is refused at dispatch.
+    /// conversation's cached prefix, whose tools are fixed. Nothing is
+    /// stripped or reconfigured for this run, so a declared tool it may not
+    /// use is refused at dispatch. The run goes on beside that conversation,
+    /// which books the decision spend they share.
     pub fn new_verbatim(params: AgentParams, run: AgentRunParams<'h>) -> Self {
-        Self::build(
-            params,
-            AgentRunParams {
-                tools_fixed: true,
-                ..run
-            },
-            true,
-        )
+        Self::build(params, run, true)
     }
 
     fn build(mut params: AgentParams, mut run: AgentRunParams<'h>, verbatim: bool) -> Self {
@@ -836,6 +835,7 @@ impl<'h> Agent<'h> {
             work_reminded: None,
             memory_store: run.memory_store,
             requests_since_recall: 0,
+            books_decision_spend: !verbatim,
         }
     }
 
@@ -4193,7 +4193,11 @@ impl<'h> Agent<'h> {
     /// the queue it shares with its parent, and the runtime books its report as the
     /// subagent's.
     fn drain_decision_spend(&self) {
-        let Some(decisions) = self.permissions.decisions() else {
+        let Some(decisions) = self
+            .permissions
+            .decisions()
+            .filter(|_| self.books_decision_spend)
+        else {
             return;
         };
         for ((provider, model), spent) in decisions.take_spend() {
@@ -5352,6 +5356,7 @@ mod tests {
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
     use caudra_storage::goal_log::GoalLogWrite;
+    use caudra_storage::sessions::SessionLease;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, PlanRef, ProjectIdentity, ProjectKey,
         ResourceId, ResourceRevision, SourceTrustAnchor, WorkspacePath,
@@ -5376,15 +5381,17 @@ mod tests {
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
     use crate::tools::native::batch::BatchTool;
+    use crate::tools::native::peers;
     use crate::tools::native::tests::tempdir;
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::NamedMock;
     use crate::tools::{
-        CODE_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool,
+        CODE_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect,
+        audited_local_tool, local_tool,
     };
     use crate::types::{TodoPriority, TodoStatus};
-    use crate::{Envelope, QueueItemId};
+    use crate::{Envelope, QueueItemId, StoredSession};
 
     const AUTH_ERROR_STATUS: u16 = 401;
     const REFRESHED_SYSTEM: &str = "fresh system prefix";
@@ -7987,6 +7994,78 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    const DECLARING_SESSION_MODEL: &str = "test-model";
+
+    fn declared_with_peers() -> Value {
+        Value::Array(
+            [SHELL_TOOL_NAME, TASK_TOOL_NAME, peers::TOOL_NAMES[0]]
+                .iter()
+                .map(|name| {
+                    json!({
+                        "name": name,
+                        "description": name,
+                        "input_schema": {"type": "object", "properties": {}},
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// A side question continuing a run's cached prefix sends what
+    /// `request_tools` gives, so that must be what the run sends itself: no
+    /// peer tools without peers, and guidance for the background work it has.
+    #[test]
+    fn request_tools_are_the_tools_the_run_sends() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = StateDir::from_path(temp.path().to_owned());
+            let mut session =
+                StoredSession::new(DECLARING_SESSION_MODEL, temp.path().to_str().unwrap());
+            session.save(&dir).unwrap();
+            let _lease = SessionLease::acquire(&dir, session.id).unwrap();
+            let tasks = BackgroundTasks::spawn(dir, session.id).await.unwrap();
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let sent = Arc::clone(&provider.captured_tools);
+            let mut params = None;
+            let mut unused = History::new(Vec::new());
+            drop(make_agent_configured(provider, &mut unused, |configured| {
+                configured.background = Some(tasks.clone());
+                params = Some(configured.clone());
+            }));
+            let params = params.unwrap();
+            let mut expected = declared_with_peers();
+            params.request_tools(&mut expected);
+            assert_ne!(expected, declared_with_peers());
+
+            let mut history = History::new(Vec::new());
+            let (raw_tx, _events) = flume::unbounded();
+            let mut agent = Agent::new(
+                params,
+                AgentRunParams {
+                    history: &mut history,
+                    system: String::new(),
+                    environment: None,
+                    instructions: None,
+                    memory: None,
+                    configuration: None,
+                    mode_notice: None,
+                    event_tx: EventSender::new(raw_tx, 0),
+                    tools: declared_with_peers(),
+                    tools_fixed: true,
+                    memory_store: None,
+                },
+            );
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            assert_eq!(sent.lock().unwrap().as_slice(), [expected]);
+            tasks.shutdown().await.unwrap();
+        });
     }
 
     fn default_input() -> AgentInput {

@@ -30,7 +30,8 @@ use crate::types::{AgentEvent, EventSender};
 
 /// Tool calls one run may make before it is stopped.
 pub const MAX_TOOL_CALLS: usize = 40;
-/// Input and output tokens one run may spend before it is stopped.
+/// Tokens one run may spend, as [`RunBudget`] counts them, before it is
+/// stopped.
 pub const MAX_TOKENS: u64 = 300_000;
 const BUDGET: RunBudget = RunBudget::new(MAX_TOOL_CALLS, MAX_TOKENS);
 pub const TOO_MANY_CALLS: &str = "the learner made too many tool calls";
