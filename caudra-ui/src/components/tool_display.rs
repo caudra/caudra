@@ -3220,11 +3220,21 @@ pub fn build_tool_lines(
     let msg = projected.as_ref().unwrap_or(msg);
     let job = shell_job(msg.tool_output.as_deref());
     let tool_name = msg.role.tool_name().unwrap_or("?");
+    let indicator = Indicator::resolve(status, msg.tool_output.as_deref());
+    let follows = |progress: &&ToolProgress| {
+        follows_progress(progress, indicator, rctx.compact, expansion.is_some())
+    };
     let (mut header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
-    if expansion.is_some() && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Tasks(_))) {
+    // A settled job is named by the heading atop its body. A live one's body
+    // follows the subagent's activity and scrolls that heading away, so the
+    // header keeps the title.
+    if expansion.is_some()
+        && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Tasks(_)))
+        && msg.progress.as_ref().filter(follows).is_none()
+    {
         header = "";
     }
     let report_title = report_header(tool_name, header, msg.tool_raw_input.as_deref());
@@ -3251,11 +3261,7 @@ pub fn build_tool_lines(
     if !decisions.is_empty() {
         limits.decisions = card_decisions::children(decisions, call_id);
     }
-    let mut b = ToolLineBuilder::new(
-        rctx.width,
-        Indicator::resolve(status, msg.tool_output.as_deref()),
-        limits,
-    );
+    let mut b = ToolLineBuilder::new(rctx.width, indicator, limits);
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
     let model = rctx.subagent_models.cards.get(call_id).map(String::as_str);
@@ -3309,27 +3315,21 @@ pub fn build_tool_lines(
     if rctx.decisions_open {
         b.push_decisions(card_decisions::about(decisions, call_id));
     }
-    let progress_body = msg
-        .progress
-        .as_ref()
-        .filter(|progress| {
-            (b.is_in_progress() || progress.is_live()) && (!rctx.compact || expansion.is_some())
-        })
-        .map(|progress| {
-            if b.is_in_progress() {
-                b.body_indent = ACTIVITY_BODY_INDENT;
-                b.limits.width = b.body_width();
-            }
-            let window = b
-                .limits
-                .scroll
-                .or_else(|| b.limits.policy.window(tool_name, 0, true));
-            if window.is_some() {
-                b.limits.scroll = None;
-                b.limits.budget = usize::MAX;
-            }
-            (progress, b.lines.len(), window)
-        });
+    let progress_body = msg.progress.as_ref().filter(follows).map(|progress| {
+        if b.is_in_progress() {
+            b.body_indent = ACTIVITY_BODY_INDENT;
+            b.limits.width = b.body_width();
+        }
+        let window = b
+            .limits
+            .scroll
+            .or_else(|| b.limits.policy.window(tool_name, 0, true));
+        if window.is_some() {
+            b.limits.scroll = None;
+            b.limits.budget = usize::MAX;
+        }
+        (progress, b.lines.len(), window)
+    });
     if let Some(progress) = msg.progress.as_ref().filter(|_| progress_body.is_none()) {
         if rctx.compact {
             b.append_progress(progress);
@@ -3489,6 +3489,17 @@ pub fn build_tool_lines(
         script_input.or_else(|| msg.tool_input.clone()),
         msg.tool_output.clone(),
     )
+}
+
+/// Whether the card's body is the subagent's activity, drawn under whatever
+/// output the call has so far.
+fn follows_progress(
+    progress: &ToolProgress,
+    indicator: Indicator,
+    compact: bool,
+    open: bool,
+) -> bool {
+    (indicator == Indicator::InProgress || progress.is_live()) && (!compact || open)
 }
 
 fn project_task_output(
@@ -7391,6 +7402,66 @@ mod tests {
                 highlighted.lines.iter().map(line_text).collect::<Vec<_>>(),
                 rows[request.region.range.clone()],
                 "{RECEIPT_GUTTER_MSG}"
+            );
+        }
+    }
+
+    const TASK_TITLE: &str = "Find the auth middleware";
+    const TITLE_IN_HEADER_MSG: &str = "an open task card names its job in the header while the \
+                                       body follows the subagent, and in the body's heading once \
+                                       it settles";
+
+    #[test_case(true; "running")]
+    #[test_case(false; "settled")]
+    fn an_open_running_task_keeps_its_title_in_the_header(running: bool) {
+        let task: TaskCard = serde_json::from_value(serde_json::json!({
+            "task_id": "titled-task", "invocation_id": "invocation", "call_id": "t1",
+            "root_call_id": "t1", "label": TASK_TITLE,
+            "state": if running { RECEIPT_RUNNING } else { RECEIPT_SUCCEEDED },
+            "mode": "build", "background": false, "generation": 1,
+            "created_at": 1, "updated_at": 2
+        }))
+        .expect(TITLE_IN_HEADER_MSG);
+        let mut msg = task_msg(String::new());
+        msg.text = TASK_TITLE.into();
+        msg.tool_output = Some(Arc::new(ToolOutput::Tasks(vec![task])));
+        let mut progress = retained_task_progress();
+        if !running {
+            progress.settle();
+        }
+        msg.progress = Some(progress);
+        let status = match running {
+            true => ToolStatus::InProgress,
+            false => ToolStatus::Success,
+        };
+        let following = ScrollWindow {
+            height: HISTORY_WINDOW as usize,
+            offset: 0,
+            follow: true,
+        };
+        let tl = build_tool_lines(
+            &msg,
+            status,
+            &scroll_rctx(HISTORY_WIDTH, HISTORY_WINDOW, following),
+            Some(Disclosure::default()),
+        );
+        let header = line_text(&tl.lines[0]);
+        assert_eq!(
+            header.contains(TASK_TITLE),
+            running,
+            "{TITLE_IN_HEADER_MSG}: {header}"
+        );
+        assert!(
+            header.contains(HISTORY_HEADER_TALLY),
+            "{TITLE_IN_HEADER_MSG}: {header}"
+        );
+        if !running {
+            assert!(
+                tl.lines[1..]
+                    .iter()
+                    .any(|line| line_text(line).contains(TASK_TITLE)),
+                "{TITLE_IN_HEADER_MSG}: {}",
+                lines_text(&tl)
             );
         }
     }
