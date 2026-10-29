@@ -142,6 +142,10 @@ A call the header does not allow, untrusted text in `message()` or `set_goal()`,
 
 `done(reason)` returns `()` without ending the firing. Its required reason may be untrusted text and appears in history. The first call counts toward the firing's action ceiling, but bypasses `cooldown` and `max_per_hour`. Repeated calls do nothing and keep the first reason. Re-arming enables the automation again with its state intact.
 
+Messages wait until their firing finishes. When `done()` applies, the delivered message tells the model that the automation disarmed itself and quotes its reason as data. Failed or stopped firings deliver their queued messages without that notice.
+
+Before the next model request, a bounded `# Automations` reminder lists armed scripts with their scopes and triggers. It explains changes made outside the agent's automation tool, including user controls, self-disarms, startup arming, pauses, restore failures, and session moves. Unchanged sessions add no reminder, except after compaction. Sessions that have not used automations add none.
+
 ### Compare local Git branches
 
 `git_compare("main")` discovers the repository from the session's working directory and compares HEAD with `refs/heads/main`. It returns `()` outside a repository or when that branch is missing. The query never fetches or changes files.

@@ -101,6 +101,8 @@ pub struct QueuedDelivery {
     pub item: OutboxItem,
     pub request: Value,
     pub request_cut: bool,
+    pub finished: bool,
+    pub done_reason: Option<String>,
 }
 
 /// Whose firings a trace read may return.
@@ -537,6 +539,8 @@ impl AutomationStore {
                         },
                         request,
                         request_cut: action.request_cut,
+                        finished: row.finished,
+                        done_reason: row.done_reason,
                     })
                 })
                 .collect()

@@ -369,6 +369,7 @@ pub struct DryRunDetail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReason {
+    FiringUnfinished,
     Paused,
     HumanPromptQueued,
     ModalOpen,

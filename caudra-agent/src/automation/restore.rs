@@ -82,7 +82,7 @@ pub(super) fn requeue(
 /// The outbox item a stored delivery returns as, or why it cannot.
 pub(super) fn returned(delivery: &QueuedDelivery) -> Result<Pending, &'static str> {
     let item = &delivery.item;
-    Pending::from_journal(
+    let mut pending = Pending::from_journal(
         &item.automation,
         &item.fire_id,
         item.seq,
@@ -94,7 +94,11 @@ pub(super) fn returned(delivery: &QueuedDelivery) -> Result<Pending, &'static st
         REQUEST_CUT
     } else {
         UNREADABLE_REQUEST
-    })
+    })?;
+    if delivery.finished {
+        pending.finish(delivery.done_reason.clone());
+    }
+    Ok(pending)
 }
 
 #[cfg(test)]
@@ -317,6 +321,8 @@ mod tests {
             },
             request: if cut { json!(TEXT) } else { request },
             request_cut: cut,
+            finished: true,
+            done_reason: None,
         };
 
         let returned = returned(&delivery).map(|pending| pending.item.summary);

@@ -29406,6 +29406,7 @@ pub(crate) mod automation_runtime {
             seq: 0,
             text: COURIER_MESSAGE.into(),
             attach: None,
+            done_reason: None,
             goal: Some(GoalClaim {
                 condition: GOAL.into(),
                 continuation_limit: Some(CONTINUATION_LIMIT),

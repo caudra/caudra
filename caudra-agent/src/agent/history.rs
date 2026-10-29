@@ -309,11 +309,19 @@ impl History {
     /// or in the reply, so a resume drops it and the model picks the loop back
     /// up instead of answering the cancellation.
     ///
+    /// `keep_shutdown` leaves a shutdown marker in place, for a resume that
+    /// brings its own reminder of the interruption: the marker then stays the
+    /// transcript's record of where the shutdown cut the turn off.
+    ///
     /// No epoch bump, unlike [`Self::truncate`]: the epoch marks a wholesale
     /// swap of the conversation, and this is the exact inverse of the append
     /// that added the marker.
-    pub(crate) fn drop_run_marker(&mut self) -> bool {
-        if !self.messages.last().is_some_and(is_run_marker) {
+    pub(crate) fn drop_run_marker(&mut self, keep_shutdown: bool) -> bool {
+        let droppable = self.messages.last().is_some_and(|last| {
+            is_run_marker(last)
+                && !(keep_shutdown && last.first_text_content() == Some(SHUTDOWN_MARKER))
+        });
+        if !droppable {
             return false;
         }
         let item_len = item_len_for_message_count(self.active_items(), self.messages.len() - 1);
@@ -790,9 +798,10 @@ fn is_productive_response(m: &Message) -> bool {
             ))
 }
 
-/// The markers a run leaves behind when it ends without a reply: a cancel, or a failure that
-/// killed the turn. Both exist only so the transcript ends on a user message, and both are
-/// dropped by a resume so the model picks the loop back up.
+/// The markers a run leaves behind when it ends without a reply: a cancel, a shutdown, or a
+/// failure that killed the turn. They exist so the transcript ends on a user message, and a
+/// resume drops them so the model picks the loop back up, except a shutdown marker followed
+/// by the resume's own reminder of the interruption.
 ///
 /// Role and `display_text` are part of the shape here too: a user who types the marker text
 /// verbatim wrote a real message, and a resume must not eat it.
@@ -1243,7 +1252,7 @@ mod tests {
         ]);
 
         assert!(sanitize_failed_history(&mut history, 1, FAILURE).is_some());
-        assert!(history.drop_run_marker());
+        assert!(history.drop_run_marker(false));
 
         assert_eq!(history.len(), 3);
         assert!(matches!(
@@ -1285,7 +1294,7 @@ mod tests {
         let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
 
         assert!(sanitize_failed_history(&mut history, 1, FAILURE).is_some());
-        assert!(history.drop_run_marker());
+        assert!(history.drop_run_marker(false));
 
         let last = history.as_slice().last().unwrap();
         assert_eq!(extract_error_ids(last), ["t1"]);
@@ -1516,13 +1525,24 @@ mod tests {
         let mut history = History::new(messages).with_mirror(Arc::clone(&mirror));
         let epoch = mirror.load().epoch;
 
-        assert_eq!(history.drop_run_marker(), expected);
+        assert_eq!(history.drop_run_marker(false), expected);
 
         let expected_len = len - usize::from(expected);
         assert_eq!(history.len(), expected_len);
         let snap = mirror.load();
         assert_eq!(snap.epoch, epoch, "dropping the marker is not a swap");
         assert_eq!(snapshot_messages(&snap).len(), expected_len);
+    }
+
+    #[test_case(SHUTDOWN_MARKER, true => false; "reminded_resume_keeps_the_shutdown")]
+    #[test_case(SHUTDOWN_MARKER, false => true; "bare_resume_drops_the_shutdown")]
+    #[test_case(CANCEL_MARKER, true => true; "a_cancel_is_dropped_regardless")]
+    fn only_a_reminded_resume_keeps_the_shutdown_marker(marker: &str, keep_shutdown: bool) -> bool {
+        let mut history = History::new(vec![
+            Message::user(GO.into()),
+            Message::synthetic(marker.into()),
+        ]);
+        history.drop_run_marker(keep_shutdown)
     }
 
     /// Cancelling inside a tool call is what a resume has to land on: dropping
@@ -1533,7 +1553,7 @@ mod tests {
         let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
 
         sanitize_cancelled_history(&mut history, 0);
-        assert!(history.drop_run_marker());
+        assert!(history.drop_run_marker(false));
 
         assert_eq!(history.len(), 3);
         let last = history.as_slice().last().unwrap();

@@ -159,6 +159,9 @@ impl PreparedCompaction {
         if self.had_background || session.had_context(history) {
             session.refresh(history, event_tx, config.background_reminder_turns, true);
         }
+        if let Some(automation) = session.automation {
+            automation.refresh_reminder(history, event_tx, true);
+        }
         Ok(self.spend)
     }
 }

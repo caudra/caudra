@@ -12,7 +12,8 @@ use caudra_storage::sessions::StoredOpenRun;
 use caudra_storage::shell_history::ShellExecutionRecord;
 use serde::Serialize;
 
-const NUDGE_OPEN: &str = "<system-reminder>\n# Resumed after interruption\n";
+const NUDGE_OPEN: &str = "<system-reminder>\n# Resumed after interruption";
+const HEADING_DETAIL_SEPARATOR: &str = ": ";
 const NUDGE_CLOSE: &str = "</system-reminder>";
 const RECONCILE: &str = "Before you continue, reconcile: check what the interrupted work changed (files, git status, processes that may still run detached), and rerun only what is safe to repeat. Then carry on with the task.";
 const CRASHED: &str = "Caudra stopped unexpectedly (a crash or a kill)";
@@ -199,13 +200,20 @@ impl Interruption {
     }
 
     /// The main chat's reminder. `resuming` is whether the main-owned tasks
-    /// are restarted with it.
+    /// are restarted with it, and then its heading names what resumed, since
+    /// the transcript shows that heading as the resume's own row.
     pub fn main_nudge(&self, resuming: bool) -> Option<String> {
         if self.main == MainState::Idle {
             return None;
         }
         let lines = agent_lines(&self.dangling, &self.work, &JobOwner::Main, resuming);
-        nudge(self.cause, self.main == MainState::Working, &lines)
+        let summary = resuming.then(|| self.summary());
+        nudge(
+            self.cause,
+            self.main == MainState::Working,
+            &lines,
+            summary.as_deref(),
+        )
     }
 
     /// The prompt a restarted task continues with: the calls its transcript
@@ -220,7 +228,7 @@ impl Interruption {
             .get(&job.task_id)
             .map_or(&[][..], Vec::as_slice);
         let lines = agent_lines(dangling, &self.work, &owner, false);
-        nudge(job.cause, true, &lines).unwrap_or_default()
+        nudge(job.cause, true, &lines, None).unwrap_or_default()
     }
 
     /// What a resume picks back up, in a few words: "main turn, 2 tasks".
@@ -437,13 +445,30 @@ pub fn job_line(job: &InterruptedJob, resumed: bool) -> String {
     }
 }
 
-/// The reminder a resumed agent reads first. `None` when nothing it owned was
-/// cut off and it was not working either.
-pub fn nudge(cause: StopCause, working: bool, lines: &[String]) -> Option<String> {
+/// Whether `text` is the reminder [`nudge`] writes.
+pub fn is_resume_nudge(text: &str) -> bool {
+    text.strip_prefix(NUDGE_OPEN)
+        .is_some_and(|rest| rest.starts_with('\n') || rest.starts_with(HEADING_DETAIL_SEPARATOR))
+}
+
+/// The reminder a resumed agent reads first, its heading followed by
+/// `detail` when there is one. `None` when nothing it owned was cut off and
+/// it was not working either.
+pub fn nudge(
+    cause: StopCause,
+    working: bool,
+    lines: &[String],
+    detail: Option<&str>,
+) -> Option<String> {
     if !working && lines.is_empty() {
         return None;
     }
     let mut text = String::from(NUDGE_OPEN);
+    if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
+        text.push_str(HEADING_DETAIL_SEPARATOR);
+        text.push_str(detail);
+    }
+    text.push('\n');
     let stopped = match cause {
         StopCause::Crash => CRASHED,
         StopCause::Shutdown => SHUT_DOWN,
@@ -505,6 +530,8 @@ mod tests {
     const TASK_ID: &str = "brave-otter";
     const COMMAND: &str = "cargo test";
     const WORKDIR: &str = "/repo";
+    const BARE_HEADING: &str = "# Resumed after interruption";
+    const RESUMED_HEADING: &str = "# Resumed after interruption: main turn, 1 task";
 
     fn job(kind: JobKind, owner: JobOwner, background: bool, cause: StopCause) -> InterruptedJob {
         InterruptedJob {
@@ -633,7 +660,36 @@ mod tests {
     #[test_case(false, &["x"] => true; "waiting_with_items_nudges")]
     fn nudge_appears_only_with_something_to_say(working: bool, lines: &[&str]) -> bool {
         let lines: Vec<String> = lines.iter().map(|line| (*line).into()).collect();
-        nudge(StopCause::Crash, working, &lines).is_some()
+        nudge(StopCause::Crash, working, &lines, None).is_some()
+    }
+
+    #[test_case(true => Some(RESUMED_HEADING.to_owned()); "resuming_names_what_resumed")]
+    #[test_case(false => Some(BARE_HEADING.to_owned()); "held_reminder_is_bare")]
+    fn the_main_heading_names_what_resumed(resuming: bool) -> Option<String> {
+        let run = StoredOpenRun {
+            started_at: 0,
+            resume_attempts: 0,
+            shut_down_at: None,
+        };
+        let interruption = Interruption::new(work(), Vec::new(), Some(&run), 0).unwrap();
+        let nudge = interruption.main_nudge(resuming)?;
+        assert!(is_resume_nudge(&nudge));
+        nudge.lines().nth(1).map(str::to_owned)
+    }
+
+    #[test]
+    fn a_task_heading_stays_bare() {
+        let interruption = Interruption::new(work(), Vec::new(), None, 0).unwrap();
+        let nudge = interruption.task_nudge(&interruption.work.jobs[0]);
+        assert!(is_resume_nudge(&nudge));
+        assert_eq!(nudge.lines().nth(1), Some(BARE_HEADING));
+    }
+
+    #[test_case("<system-reminder>\n# Background work\n</system-reminder>"; "another_reminder")]
+    #[test_case("<system-reminder>\n# Resumed after interruptions\n</system-reminder>"; "a_longer_heading")]
+    #[test_case("# Resumed after interruption\n"; "untagged_text")]
+    fn other_text_is_no_resume_nudge(text: &str) {
+        assert!(!is_resume_nudge(text));
     }
 
     #[test_case(true, JobOwner::Main => MainState::Working; "open_run")]

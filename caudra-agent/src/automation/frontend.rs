@@ -373,7 +373,9 @@ pub fn wake_origin(woken: bool, workflow_messages: usize, background_messages: u
 /// session itself is stale by the time the caller asks, and the claim checks it again.
 pub fn deliverable(item: &OutboxItem, now: i64) -> bool {
     match item.wait {
-        Some(WaitReason::Paused | WaitReason::UnattendedCap { .. }) => false,
+        Some(
+            WaitReason::FiringUnfinished | WaitReason::Paused | WaitReason::UnattendedCap { .. },
+        ) => false,
         Some(WaitReason::TurnRateFull { until } | WaitReason::Backoff { until }) => now >= until,
         _ => true,
     }
@@ -566,6 +568,7 @@ mod tests {
 
     #[test_case(None, true ; "nothing_holds_it")]
     #[test_case(Some(WaitReason::Busy), true ; "a_stale_session_wait")]
+    #[test_case(Some(WaitReason::FiringUnfinished), false ; "firing_unfinished")]
     #[test_case(Some(WaitReason::Paused), false ; "paused")]
     #[test_case(Some(WaitReason::UnattendedCap { cap: 1 }), false ; "unattended_cap")]
     #[test_case(Some(WaitReason::TurnRateFull { until: LATER }), false ; "turn_rate_full")]

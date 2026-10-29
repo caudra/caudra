@@ -79,6 +79,8 @@ use crate::memory::store::MemoryStore;
 use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
+use crate::prompt::AUTOMATIONS_MARKER;
+use crate::restart::is_resume_nudge;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
@@ -1016,7 +1018,11 @@ impl<'h> Agent<'h> {
         }
         if inputs.last().is_some_and(|input| input.resume) {
             let prompted = inputs.iter().any(|input| !input.preamble.is_empty());
-            self.prepare_resume(prompted);
+            let reminded = inputs
+                .iter()
+                .flat_map(|input| &input.preamble)
+                .any(|message| message.first_text_content().is_some_and(is_resume_nudge));
+            self.prepare_resume(prompted, reminded);
         }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
@@ -1213,9 +1219,11 @@ impl<'h> Agent<'h> {
     /// back on the tool result the loop stopped at; when the reply itself was
     /// cut there is no such seam, and an assistant tail would go out as a
     /// prefill, which providers reject once reasoning is on. A `prompted`
-    /// resume brings its own message to answer, so it needs no seam.
-    fn prepare_resume(&mut self, prompted: bool) {
-        self.history.drop_run_marker();
+    /// resume brings its own message to answer, so it needs no seam. One
+    /// `reminded` of the interruption keeps a shutdown marker ahead of that
+    /// reminder, as the record of where the shutdown cut the turn off.
+    fn prepare_resume(&mut self, prompted: bool, reminded: bool) {
+        self.history.drop_run_marker(reminded);
         if !prompted
             && self
                 .history
@@ -1561,7 +1569,7 @@ impl<'h> Agent<'h> {
         if !autopilot.is_engaged() {
             return Err(error);
         }
-        self.prepare_resume(false);
+        self.prepare_resume(false, false);
         let wake = autopilot.sleep(delay);
         let nudged = self.retry_now.listen();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
@@ -2453,6 +2461,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             }
             .refresh(
                 self.history,
@@ -2462,6 +2471,9 @@ impl<'h> Agent<'h> {
             );
             self.history.as_slice().iter().any(|message| {
                 message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                    || message
+                        .user_text()
+                        .is_some_and(|text| text.contains(AUTOMATIONS_MARKER))
             }) && self.preflight_context().await?
         } else {
             false
@@ -4426,6 +4438,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             },
         )?;
         self.measured = None;
@@ -5279,6 +5292,7 @@ mod tests {
     };
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
+    use crate::restart::{StopCause, nudge};
     use crate::tools::native::batch::BatchTool;
     use crate::tools::native::tests::tempdir;
     use crate::tools::native::todo_write::TodoWrite;
@@ -6512,6 +6526,8 @@ mod tests {
     const GO: &str = "go";
     const RESUME_TOOL_ID: &str = "t1";
     const RESUME_DROPPED_ONLY_MARKER: &str = "a resume drops the cancel marker and nothing else";
+    const RESUMED_SUMMARY: &str = "main turn";
+    const MARKER_SENT_AS_SAVED: &str = "the request and the saved history must agree on the marker";
     const TITLE_PROMPT: &str = "add refresh token support";
     const MODEL_TITLE: &str = "Refresh token support";
     const TITLE_MUST_SURVIVE: &str = "a title is asked for at the start of a turn and answers after it, so the turn ending must not cancel it";
@@ -10232,6 +10248,66 @@ mod tests {
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             );
         });
+    }
+
+    #[test_case(SHUTDOWN_MARKER, Some(true) => true; "a_reminded_resume_keeps_the_shutdown")]
+    #[test_case(SHUTDOWN_MARKER, Some(false) => false; "another_preamble_drops_the_shutdown")]
+    #[test_case(SHUTDOWN_MARKER, None => false; "an_unprompted_resume_drops_the_shutdown")]
+    #[test_case(CANCEL_MARKER, Some(true) => false; "a_reminded_resume_drops_a_cancel")]
+    fn a_resume_keeps_the_shutdown_marker_only_beside_its_reminder(
+        marker: &str,
+        reminded: Option<bool>,
+    ) -> bool {
+        smol::block_on(async {
+            let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
+            let mut history = History::new(vec![
+                Message::user(GO.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        RESUME_TOOL_ID,
+                        "read",
+                        serde_json::json!({}),
+                    )],
+                    ..Default::default()
+                },
+            ]);
+            if marker == SHUTDOWN_MARKER {
+                sanitize_shutdown_history(&mut history, 0);
+            } else {
+                sanitize_cancelled_history(&mut history, 0);
+            }
+            let (mut agent, _event_rx) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+            let mut input = resume_input();
+            input.preamble.extend(reminded.map(|reminded| {
+                let text = match reminded {
+                    true => nudge(StopCause::Shutdown, true, &[], Some(RESUMED_SUMMARY)).unwrap(),
+                    false => GO.to_owned(),
+                };
+                Message::synthetic(text)
+            }));
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let carries_marker = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(marker))
+            };
+            let sent = carries_marker(&captured.lock().unwrap());
+            assert_eq!(
+                sent,
+                carries_marker(history.as_slice()),
+                "{MARKER_SENT_AS_SAVED}"
+            );
+            sent
+        })
     }
 
     /// An assistant tail has no seam to resume from, and a prefill breaks once

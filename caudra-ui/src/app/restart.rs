@@ -100,7 +100,9 @@ impl App {
 
     /// Restarts the tasks the main chat started, then the main turn itself
     /// when one was running. A main chat that was only waiting gets its
-    /// reminder with the first report a restarted task sends.
+    /// reminder with the first report a restarted task sends. The reminder's
+    /// row names what resumed, so the notice saying it shows only while the
+    /// reminder is held back.
     pub(crate) fn resume_interrupted(&mut self) -> Vec<Action> {
         self.resume_due = false;
         let Some(interruption) = self.interrupted.take() else {
@@ -110,9 +112,9 @@ impl App {
         for job in &jobs {
             self.restart_task(job, interruption.task_nudge(job));
         }
-        self.notice(format!("{RESUMED_NOTICE}{}", interruption.summary()));
         let nudge = interruption.main_nudge(true).map(Message::synthetic);
-        match interruption.main {
+        let reminds = nudge.is_some();
+        let actions = match interruption.main {
             MainState::Working => {
                 let mut input = self.continuation_input();
                 input.resume = true;
@@ -131,7 +133,11 @@ impl App {
                     None => Vec::new(),
                 }
             }
+        };
+        if !reminds || actions.is_empty() {
+            self.notice(format!("{RESUMED_NOTICE}{}", interruption.summary()));
         }
+        actions
     }
 
     /// Records a main run as open, so a session that reopens with it still
@@ -288,11 +294,13 @@ mod tests {
         WAKES_SUPPRESSED_RUNTIME_FAILED, WAKES_SUPPRESSED_STOP_REQUESTED, restored_wake_suppression,
     };
     use super::super::tests::{agent_msg, streaming_app, test_app};
-    use crate::components::Action;
+    use super::RESUMED_NOTICE;
+    use crate::components::{Action, DisplayRole};
 
     const MAX_AGE_HOURS: u64 = 24;
     const RESUME_HEADING: &str = "Resumed after interruption";
     const SHELL_TASK: &str = "shell-1";
+    const MAIN_TASK: &str = "brave-otter";
     const QUEUED_PROMPT: &str = "queued before the restart";
     const QUEUED_RUN_OPENS: &str = "a run the queue starts must be open, so a crash resumes it";
     const HELD_LEAVES_RESUME: &str = "held prompts must not hold back the resume";
@@ -322,6 +330,18 @@ mod tests {
             cause: StopCause::Crash,
             restarts: 0,
             stopped_at: now_epoch(),
+        }
+    }
+
+    fn main_task() -> InterruptedJob {
+        InterruptedJob {
+            task_id: MAIN_TASK.into(),
+            invocation_id: MAIN_TASK.into(),
+            call_id: MAIN_TASK.into(),
+            kind: JobKind::Agent,
+            background: true,
+            label: MAIN_TASK.into(),
+            ..shell_job()
         }
     }
 
@@ -366,6 +386,31 @@ mod tests {
             .map(|run| run.resume_attempts);
         assert_eq!(attempts, Some(1));
         assert!(!app.interrupted_resume_due());
+    }
+
+    fn resumed_notices(app: &mut App) -> usize {
+        let chat = app.main_chat();
+        (0..chat.message_count())
+            .filter_map(|index| chat.message_at(index))
+            .filter(|message| {
+                message.role == DisplayRole::Notice && message.text.starts_with(RESUMED_NOTICE)
+            })
+            .count()
+    }
+
+    #[test_case(Some(0), Vec::new() => 0; "a_resumed_turn_shows_its_reminder_instead")]
+    #[test_case(None, vec![main_task()] => 1; "a_reminder_held_for_restarted_tasks_leaves_the_notice")]
+    fn the_resume_notice_shows_only_while_the_reminder_waits(
+        open_run: Option<u32>,
+        jobs: Vec<InterruptedJob>,
+    ) -> usize {
+        let work = RestoredWork {
+            jobs,
+            ..RestoredWork::default()
+        };
+        let mut app = reopened(open_run, work, ResumeInterrupted::Auto);
+        app.resume_interrupted();
+        resumed_notices(&mut app)
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use caudra_providers::{AssistantTextState, HistoryItemKind, Message, StandingReminderKind};
 
+use crate::automation::handle::AutomationHandle;
 use crate::{
     AgentEvent, EventSender, History,
     background::{BackgroundTasks, JobScope},
@@ -24,6 +25,7 @@ pub struct BackgroundReminderContext<'a> {
     pub background: Option<&'a BackgroundTasks>,
     pub jobs: Option<&'a JobScope>,
     pub workflow: Option<&'a WorkflowHandle>,
+    pub automation: Option<&'a AutomationHandle>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -116,6 +118,9 @@ impl BackgroundReminderContext<'_> {
         turns: u32,
         force: bool,
     ) {
+        if !force && let Some(automation) = self.automation {
+            automation.refresh_reminder(history, event_tx, force);
+        }
         let (tasks, workflows) = self.snapshots();
         if let Some(message) = reminder(history, tasks.as_ref(), workflows.as_ref(), turns, force) {
             let text = message.first_text_content().unwrap_or_default().to_owned();
@@ -131,7 +136,7 @@ impl BackgroundReminderContext<'_> {
     }
 }
 
-fn quote(value: &str, maximum: usize) -> String {
+pub(crate) fn quote(value: &str, maximum: usize) -> String {
     let mut result = String::from("\"");
     for character in value.chars() {
         let escaped = match character {

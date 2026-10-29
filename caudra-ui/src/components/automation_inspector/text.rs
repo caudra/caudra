@@ -17,6 +17,7 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 const MILLIS_UNIT: &str = "ms";
 const AGO_SUFFIX: &str = " ago";
 const IN_PREFIX: &str = "in ";
+pub(super) const FIRING_WAIT: &str = "waiting for the firing to finish";
 pub(super) const PAUSED_WAIT: &str = "automations are paused";
 pub(super) const PROMPT_WAIT: &str = "a human prompt is queued";
 pub(super) const MODAL_WAIT: &str = "a modal is open";
@@ -68,6 +69,7 @@ pub(super) fn moment(at: i64, now: i64) -> String {
 
 pub(super) fn wait_text(reason: WaitReason, now: i64) -> String {
     match reason {
+        WaitReason::FiringUnfinished => FIRING_WAIT.to_owned(),
         WaitReason::Paused => PAUSED_WAIT.to_owned(),
         WaitReason::HumanPromptQueued => PROMPT_WAIT.to_owned(),
         WaitReason::ModalOpen => MODAL_WAIT.to_owned(),
@@ -210,6 +212,7 @@ mod tests {
     const BEHIND: &str = "5m00s ago";
     const CAP: u32 = 12;
 
+    #[test_case(WaitReason::FiringUnfinished, FIRING_WAIT; "firing_unfinished")]
     #[test_case(WaitReason::Paused, PAUSED_WAIT; "paused")]
     #[test_case(WaitReason::HumanPromptQueued, PROMPT_WAIT; "human_prompt_queued")]
     #[test_case(WaitReason::ModalOpen, MODAL_WAIT; "modal_open")]
