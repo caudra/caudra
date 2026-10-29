@@ -40,7 +40,6 @@ use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
 };
-use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::tools_modal::ToolsScope;
 use crate::components::usage_modal::{SCOPE_KEY, UsageScope};
 use crate::components::{
@@ -5220,10 +5219,7 @@ fn reset_session_clears_plan() {
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
-    let (_tx, rx) = flume::bounded::<StreamEvent>(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .open(" /btw ", "q".into(), StreamFooter::FollowUp, rx, trigger);
+    let (_tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::NewSession(_)));
     assert_eq!(app.status, Status::Idle);
@@ -5239,7 +5235,7 @@ fn reset_session_clears_plan() {
     assert!(app.chat_index.is_empty());
     assert!(app.queue.focus().is_none());
     assert!(!app.help_modal.is_open());
-    assert!(!app.stream_modal.is_open());
+    assert!(!app.extract.is_open());
 }
 
 #[test]
@@ -20967,7 +20963,6 @@ fn an_unsent_btw_question_comes_back_on_the_next_f2(setup: fn() -> App, unsent: 
 
 const BTW_THREAD_KEPT: &str = "a closed /btw thread must come back with what it showed";
 const MAIN_MOVED_ON: &str = "the agent kept working";
-const EXTRACT_REQUEST: &str = "Extracting the plan";
 
 fn btw_answered_and_closed() -> (App, BtwScript) {
     let (mut app, script) = btw_awaiting_follow_up();
@@ -21122,28 +21117,11 @@ fn only_a_session_change_forgets_a_closed_btw_thread(new_session: bool) {
 fn an_extract_neither_shows_nor_feeds_the_kept_btw_thread() {
     let (mut app, _script) = btw_awaiting_follow_up();
     app.close_btw();
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal.open(
-        " /extract ",
-        EXTRACT_REQUEST.into(),
-        StreamFooter::Copy,
-        rx,
-        trigger,
-    );
-    assert_eq!(app.stream_modal.headers(), [EXTRACT_REQUEST]);
-    tx.send(StreamEvent::Done(StreamDone {
-        usage: StreamUsage {
-            usage: TokenUsage::default(),
-            cost: None,
-            billing: Billing::Api,
-            model: EXTRACT_REQUEST.into(),
-            provider: TEST_PROVIDER.into(),
-            purpose: LedgerPurpose::Extract,
-        },
-        answer: Some(BTW_ANSWER.into()),
-    }))
-    .unwrap();
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    assert!(!app.btw.is_open() && app.extract.is_open());
+    for event in extract_answer(BTW_ANSWER, TokenUsage::default(), None) {
+        tx.send(event).unwrap();
+    }
     let _ = app.tick();
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
@@ -22098,33 +22076,87 @@ fn extract_on_a_session_without_user_turns_flashes_instead_of_opening() {
         home: None,
     };
     app.start_extract(caudra_providers::Timeouts::default(), &chat);
-    assert!(!app.stream_modal.is_open());
+    assert!(!app.extract.is_open());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
         super::extract::NOTHING_TO_EXTRACT
     );
 }
 
-/// `y` hands the list to the clipboard and leaves the modal open, so the user
-/// can keep reading or copy again once more of it has streamed.
+const EXTRACT_TURNS: usize = 2;
+const EXTRACT_ANSWERS: usize = 1;
+const EXTRACT_MODEL: &str = "extract-model";
+const EXTRACT_SPEC: &str = "fast/extract-model";
+const EXTRACT_LIST: &str = "- ship it on friday";
+const EXTRACT_FAILED: &str = "the extractor is down";
+const EXTRACT_COST: f64 = 0.05;
+const EXTRACT_INPUT_TOKENS: u32 = 300;
+const EXTRACT_OUTPUT_TOKENS: u32 = 60;
+const EXTRACT_REQUESTS: u32 = 1;
+const EXTRACT_STILL_RUNNING: &str = "the extraction must have stopped";
+
+/// What an extraction that wrote `text` reports, in order.
+fn extract_answer(text: &str, usage: TokenUsage, cost: Option<f64>) -> [AgentEvent; 3] {
+    [
+        AgentEvent::TextDelta { text: text.into() },
+        AgentEvent::ModelUsage {
+            usage,
+            cost,
+            billing: Billing::Api,
+            provider: TEST_PROVIDER.into(),
+            model: EXTRACT_MODEL.into(),
+            purpose: LedgerPurpose::Extract,
+            account: None,
+        },
+        AgentEvent::Done {
+            usage,
+            num_turns: EXTRACT_REQUESTS,
+            reason: DoneReason::EndTurn,
+        },
+    ]
+}
+
+fn extract_usage() -> TokenUsage {
+    TokenUsage {
+        input: EXTRACT_INPUT_TOKENS,
+        output: EXTRACT_OUTPUT_TOKENS,
+        ..Default::default()
+    }
+}
+
+/// The text of every message the `/extract` window shows in `role`.
+fn extract_texts(app: &App, role: DisplayRole) -> Vec<String> {
+    let chat = app.extract.window().expect("the extract window").chat();
+    (0..chat.message_count())
+        .filter_map(|i| chat.message_at(i))
+        .filter(|m| m.role == role)
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+/// `y` hands the list to the clipboard and leaves the window open, so the
+/// user can keep reading or copy again once more of it has streamed.
 #[test]
-fn extract_modal_copy_keeps_the_modal_open() {
+fn extract_copy_keeps_the_window_open() {
     let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal.open(
-        " /extract ",
-        "Extracting…".into(),
-        StreamFooter::Copy,
-        rx,
-        trigger,
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    tx.send(AgentEvent::TextDelta {
+        text: EXTRACT_LIST.into(),
+    })
+    .unwrap();
+    assert_eq!(app.tick_extract(), Dirty::YES);
+    assert_eq!(
+        app.extract
+            .window()
+            .and_then(SideTranscript::text)
+            .as_deref(),
+        Some(EXTRACT_LIST),
+        "what streamed so far is what a copy takes"
     );
-    tx.send(StreamEvent::TextDelta("- ship it".into())).unwrap();
-    assert_eq!(app.stream_modal.poll(), Dirty::YES);
 
     let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
     assert!(actions.is_empty());
-    assert!(app.stream_modal.is_open());
+    assert!(app.extract.is_open());
     assert!(
         app.status_bar.flash_text().is_some(),
         "the copy reports its outcome in the status bar"
@@ -22132,40 +22164,21 @@ fn extract_modal_copy_keeps_the_modal_open() {
 }
 
 #[test]
-fn extract_usage_settles_under_the_extract_purpose() {
-    const EXTRACT_MODEL: &str = "extract-model";
-    const EXTRACT_COST: f64 = 0.05;
+fn extract_usage_settles_once_under_the_extract_purpose() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     app.chats[0].context_size = 1000;
 
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal.open(
-        " /extract ",
-        "Extracting…".into(),
-        StreamFooter::Copy,
-        rx,
-        trigger,
-    );
-    tx.send(StreamEvent::Done(StreamDone {
-        usage: StreamUsage {
-            usage: TokenUsage {
-                input: 300,
-                output: 60,
-                ..Default::default()
-            },
-            cost: Some(EXTRACT_COST),
-            billing: Billing::Api,
-            model: EXTRACT_MODEL.into(),
-            provider: TEST_PROVIDER.into(),
-            purpose: LedgerPurpose::Extract,
-        },
-        answer: None,
-    }))
-    .unwrap();
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    for event in extract_answer(EXTRACT_LIST, extract_usage(), Some(EXTRACT_COST)) {
+        tx.send(event).unwrap();
+    }
+    let _ = app.tick();
+    let _ = app.tick();
+    assert!(!app.extract.is_running(), "{EXTRACT_STILL_RUNNING}");
+    app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
 
-    assert_eq!(app.state.token_usage.input, 300);
+    assert_eq!(app.state.token_usage.input, EXTRACT_INPUT_TOKENS);
     assert_eq!(app.state.cost, Some(EXTRACT_COST));
     assert_eq!(
         app.chats[0].context_size, 1000,
@@ -22177,6 +22190,109 @@ fn extract_usage_settles_under_the_extract_purpose() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].purpose, LedgerPurpose::Extract.storage_name());
     assert_eq!(rows[0].cost, EXTRACT_COST);
+}
+
+#[test]
+fn the_extract_header_names_the_model_once_it_is_resolved() {
+    let mut app = test_app();
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    let [waiting] = extract_texts(&app, DisplayRole::Notice).try_into().unwrap();
+    assert!(!waiting.contains(EXTRACT_SPEC), "{waiting}");
+
+    tx.send(AgentEvent::MessageStarted {
+        id: CaudraId::generate(),
+        model: EXTRACT_SPEC.into(),
+        thinking: None,
+    })
+    .unwrap();
+    let _ = app.tick();
+
+    let [named] = extract_texts(&app, DisplayRole::Notice).try_into().unwrap();
+    assert!(
+        named.contains(&format!(" with {EXTRACT_SPEC}")),
+        "the header replaces itself once the model is known: {named}"
+    );
+}
+
+#[test_case(key(KeyCode::Esc) ; "esc")]
+#[test_case(key(KeyCode::Enter) ; "enter")]
+#[test_case(ctrl(KeyCode::Char('c')) ; "ctrl_c_when_done")]
+fn closing_the_extract_window_drops_its_request(close: KeyEvent) {
+    let mut app = test_app();
+    let (tx, cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    if close.modifiers.contains(KeyModifiers::CONTROL) {
+        for event in extract_answer(EXTRACT_LIST, extract_usage(), None) {
+            tx.send(event).unwrap();
+        }
+        let _ = app.tick();
+    }
+
+    app.update(Msg::Key(close));
+
+    assert!(!app.extract.is_open());
+    assert!(cancel.is_cancelled());
+    assert!(
+        tx.send(AgentEvent::TextDelta {
+            text: EXTRACT_LIST.into()
+        })
+        .is_err(),
+        "a closed window reads nothing more"
+    );
+}
+
+/// A spend that landed before the window closed is still billed.
+#[test]
+fn closing_the_extract_window_bills_what_already_arrived() {
+    let mut app = test_app();
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    for event in extract_answer(EXTRACT_LIST, extract_usage(), Some(EXTRACT_COST)) {
+        tx.send(event).unwrap();
+    }
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.extract.is_open());
+    assert_eq!(app.state.token_usage.input, EXTRACT_INPUT_TOKENS);
+    assert_eq!(app.state.cost, Some(EXTRACT_COST));
+}
+
+#[test]
+fn ctrl_c_stops_the_extraction_and_keeps_what_streamed() {
+    let mut app = test_app();
+    let (tx, cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    tx.send(AgentEvent::TextDelta {
+        text: EXTRACT_LIST.into(),
+    })
+    .unwrap();
+    let _ = app.tick();
+
+    app.update(Msg::Key(ctrl(KeyCode::Char('c'))));
+
+    assert!(cancel.is_cancelled());
+    assert!(app.extract.is_open());
+    assert!(!app.extract.is_running(), "{EXTRACT_STILL_RUNNING}");
+    assert_eq!(
+        app.extract
+            .window()
+            .and_then(SideTranscript::text)
+            .as_deref(),
+        Some(EXTRACT_LIST)
+    );
+}
+
+#[test]
+fn a_failed_extraction_says_why_in_the_window() {
+    let mut app = test_app();
+    let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+    tx.send(AgentEvent::Error {
+        message: EXTRACT_FAILED.into(),
+    })
+    .unwrap();
+    let _ = app.tick();
+
+    assert_eq!(extract_texts(&app, DisplayRole::Error), [EXTRACT_FAILED]);
+    assert!(!app.extract.is_running(), "{EXTRACT_STILL_RUNNING}");
+    assert!(app.extract.is_open());
 }
 
 #[test]
@@ -27384,19 +27500,10 @@ fn pane_status_float_attention(needs_input: bool, expected: PaneState) {
     );
 }
 
-#[test_case(StreamFooter::FollowUp; "follow_up")]
-#[test_case(StreamFooter::Close; "close")]
-fn pane_status_stream_modal_is_working(footer: StreamFooter) {
+#[test]
+fn pane_status_extract_is_working() {
     let mut app = test_app();
-    let (_sender, receiver) = flume::bounded(1);
-    let (trigger, _cancel) = CancelToken::new();
-    app.stream_modal.open(
-        QUESTION_HEADER,
-        QUESTION_TEXT.into(),
-        footer,
-        receiver,
-        trigger,
-    );
+    let (_tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
     assert_eq!(app.status, Status::Idle);
     assert_eq!(
         app.pane_status().state,
@@ -32139,9 +32246,9 @@ mod theme_colours {
     use unicode_width::UnicodeWidthStr;
 
     use super::{
-        App, BuiltinAction, DisplaySource, Mode, Msg, PeerView, ReviewTarget, Status,
-        StatusBarHitTarget, StreamEvent, StreamFooter, TRANSCRIPT_LINES, chord, click_status, cmd,
-        commit_popup_at, fill_transcript, mention_popup_at, open_autopilot_log,
+        AgentEvent, App, BuiltinAction, DisplaySource, EXTRACT_ANSWERS, EXTRACT_TURNS, Mode, Msg,
+        PeerView, ReviewTarget, Status, StatusBarHitTarget, TRANSCRIPT_LINES, chord, click_status,
+        cmd, commit_popup_at, fill_transcript, mention_popup_at, open_autopilot_log,
         open_changelog_modal, open_command_modal, open_context_modal, open_decisions_modal,
         open_docs_modal, open_goal_panel, open_help_modal, open_logs_modal, open_model_picker,
         open_permission_test_editor, open_permission_test_leader, open_projection_modal,
@@ -32176,7 +32283,6 @@ mod theme_colours {
     const MENTION_QUERY: &str = "@";
     const COMMIT_SIGIL: &str = "#";
     const COMMIT_QUERY: &str = "#a1b2";
-    const STREAM_TITLE: &str = " /btw ";
     const STREAM_QUESTION: &str = "why sqlite?";
     const STREAM_ANSWER: &str = "Because it is one file.";
     const REVIEW_TEXT: &str = "A sentence to review.";
@@ -32370,9 +32476,9 @@ mod theme_colours {
             shown: |app| app.autopilot_panel.is_open(),
         },
         Surface {
-            name: "stream_modal",
-            open: |app, _| open_stream(app),
-            shown: |app| app.stream_modal.is_open(),
+            name: "extract",
+            open: |app, _| open_extract(app),
+            shown: |app| app.extract.is_open(),
         },
         Surface {
             name: "btw",
@@ -32668,18 +32774,12 @@ mod theme_colours {
         );
     }
 
-    fn open_stream(app: &mut App) {
-        let (tx, rx) = flume::unbounded();
-        let (trigger, _cancel) = caudra_agent::CancelToken::new();
-        app.stream_modal.open(
-            STREAM_TITLE,
-            STREAM_QUESTION.into(),
-            StreamFooter::FollowUp,
-            rx,
-            trigger,
-        );
-        tx.send(StreamEvent::TextDelta(STREAM_ANSWER.into()))
-            .unwrap();
+    fn open_extract(app: &mut App) {
+        let (tx, _cancel) = app.open_extract(EXTRACT_TURNS, EXTRACT_ANSWERS);
+        tx.send(AgentEvent::TextDelta {
+            text: STREAM_ANSWER.into(),
+        })
+        .unwrap();
     }
 
     fn open_btw(app: &mut App) {

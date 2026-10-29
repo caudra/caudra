@@ -528,7 +528,7 @@ impl App {
             self.flash(PROMPT_INITIALIZING.into());
             return;
         }
-        self.close_stream_modal();
+        self.close_extract();
         if self.btw.is_clarifying() {
             let _ = self.poll_btw_run();
         } else {
@@ -560,7 +560,7 @@ impl App {
             self.flash(PROMPT_INITIALIZING.into());
             return;
         }
-        self.close_stream_modal();
+        self.close_extract();
         self.close_btw();
         self.autoscroll = None;
         self.selection_state = None;
@@ -868,7 +868,7 @@ impl App {
     /// view of the conversation gives the question anything to answer from.
     fn open_btw(&mut self, header: String, question: String, answerable: fn(&BtwThread) -> bool) {
         let task = self.active_subagent_id().map(str::to_owned);
-        self.close_stream_modal();
+        self.close_extract();
         self.close_btw();
         let resumed = self.resume_btw(task.clone());
         if resumed && self.btw.thread_mut().is_some() {

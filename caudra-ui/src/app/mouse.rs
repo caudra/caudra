@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use crate::components::audit_log::PanelTab;
 use crate::components::command::ChatScope;
-use crate::components::document_view::COPIED_SELECTION;
 use crate::components::help_modal::HelpMouse;
 use crate::components::input::{ChordHint, InputHit, image_chip_label};
 use crate::components::paste_editor::PasteEditorAction;
@@ -10,7 +9,6 @@ use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::settings_modal::SettingsAction;
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
-use crate::components::stream_modal::StreamAction;
 use crate::components::usage_modal::UsageMouse;
 use crate::components::workflow_card::CardHit;
 use crate::components::{Action, Overlay};
@@ -215,20 +213,10 @@ impl App {
         {
             return actions;
         }
-        if self.stream_modal.is_open() && !self.permission_prompt_holds_input() {
+        if self.extract.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
-            match self.stream_modal.handle_mouse(&event) {
-                StreamAction::Ignored => {}
-                StreamAction::Consumed => return Vec::new(),
-                StreamAction::Copy(text) => {
-                    self.copy_to_clipboard(&text);
-                    return Vec::new();
-                }
-                StreamAction::CopySelection(text) => {
-                    self.copy_labelled(&text, COPIED_SELECTION);
-                    return Vec::new();
-                }
-                StreamAction::Submit(_) | StreamAction::Clear => return Vec::new(),
+            if self.handle_extract_mouse(event) {
+                return Vec::new();
             }
         }
         if self.btw.is_open() && !self.permission_prompt_holds_input() {
@@ -238,7 +226,7 @@ impl App {
             }
         }
         if self.workbench.is_open()
-            && !self.stream_modal.is_open()
+            && !self.extract.is_open()
             && !self.btw.is_open()
             && !self.permission_prompt_holds_input()
         {
@@ -631,7 +619,7 @@ impl App {
         // drew: a drag that selected text releases as a selection rather than
         // pressing whatever it ended over.
         if self.question_form.is_open()
-            && !self.stream_modal.is_open()
+            && !self.extract.is_open()
             && !self.btw.is_open()
             && !self.permission_prompt_holds_input()
             && !(event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection())
@@ -1130,8 +1118,7 @@ impl App {
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.
-        if self.stream_modal.is_open() || self.btw.is_open() || self.permission_prompt_holds_input()
-        {
+        if self.extract.is_open() || self.btw.is_open() || self.permission_prompt_holds_input() {
             self.scroll_at(column, row, delta);
             self.clear_selection_unless_pending_copy();
             return;
@@ -1603,8 +1590,8 @@ impl App {
             return Some(Vec::new());
         }
 
-        dismiss!(self.stream_modal, {
-            self.stream_modal.dismiss();
+        dismiss!(self.extract, {
+            self.close_extract();
             Vec::new()
         });
         dismiss!(self.btw, {

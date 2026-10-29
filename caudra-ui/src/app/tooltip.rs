@@ -79,7 +79,7 @@ impl App {
     /// A docked form stays drawn under an open `/btw`, which takes its
     /// pointer, so the form has nothing to explain until the modal closes.
     fn docked_under_btw(&self, overlay: &dyn Overlay) -> bool {
-        (self.stream_modal.is_open() || self.btw.is_open()) && !overlay.is_modal()
+        (self.extract.is_open() || self.btw.is_open()) && !overlay.is_modal()
     }
 
     fn docs_badge_tip(&self) -> Option<Tip> {

@@ -4,7 +4,7 @@ use crate::provenance::Provenance;
 use crate::theme;
 
 use caudra_markdown::render::Renderer;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -60,7 +60,6 @@ impl StreamingCache {
     /// Returns `true` when the cache was repopulated. The caller passes a
     /// renderer so the highlighter/table-width state persists across calls
     /// for a stable streamed view.
-    #[cfg(test)]
     fn get_or_update(
         &mut self,
         renderer: &mut Renderer,
@@ -69,25 +68,6 @@ impl StreamingCache {
         text_style: Style,
         prefix_style: Style,
         width: u16,
-    ) -> bool {
-        self.get_or_update_with_links(
-            renderer,
-            visible,
-            prefix,
-            (text_style, prefix_style),
-            width,
-            true,
-        )
-    }
-
-    fn get_or_update_with_links(
-        &mut self,
-        renderer: &mut Renderer,
-        visible: &str,
-        prefix: &str,
-        styles: (Style, Style),
-        width: u16,
-        interactive_links: bool,
     ) -> bool {
         let theme_gen = theme::generation();
         let key = CacheKey::for_text(visible, width, theme_gen);
@@ -101,16 +81,7 @@ impl StreamingCache {
         // and the provenance ranges then index the same normalized string.
         let source: Arc<str> = caudra_markdown::close_open_tail(&text).as_ref().into();
         let semantic = renderer.render(&source, width, theme_gen);
-        let mut painted = paint_semantic(&semantic, prefix, styles.0, styles.1);
-        if !interactive_links {
-            for (line, links) in painted.lines.iter_mut().zip(&mut painted.links.rows) {
-                for (span, target) in line.spans.iter_mut().zip(links) {
-                    if target.take().is_some() {
-                        span.style = span.style.remove_modifier(Modifier::UNDERLINED);
-                    }
-                }
-            }
-        }
+        let painted = paint_semantic(&semantic, prefix, text_style, prefix_style);
         self.provenance = Some(Provenance::new(source, painted.provenance));
         self.lines = painted.lines;
         self.links = painted.links;
@@ -126,7 +97,6 @@ pub(crate) struct StreamingContent {
     prefix: &'static str,
     text_style: Style,
     prefix_style: Style,
-    interactive_links: bool,
     wrap_paragraphs: bool,
 }
 
@@ -137,25 +107,6 @@ impl StreamingContent {
         prefix_style: Style,
         ms_per_char: u64,
     ) -> Self {
-        Self::with_interactive_links(prefix, text_style, prefix_style, ms_per_char, true)
-    }
-
-    pub fn new_noninteractive(
-        prefix: &'static str,
-        text_style: Style,
-        prefix_style: Style,
-        ms_per_char: u64,
-    ) -> Self {
-        Self::with_interactive_links(prefix, text_style, prefix_style, ms_per_char, false)
-    }
-
-    fn with_interactive_links(
-        prefix: &'static str,
-        text_style: Style,
-        prefix_style: Style,
-        ms_per_char: u64,
-        interactive_links: bool,
-    ) -> Self {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
@@ -163,7 +114,6 @@ impl StreamingContent {
             prefix,
             text_style,
             prefix_style,
-            interactive_links,
             wrap_paragraphs: false,
         }
     }
@@ -218,6 +168,7 @@ impl StreamingContent {
         self.cache.invalidate();
     }
 
+    #[cfg(test)]
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
         self.update_render(width);
         &self.cache.lines
@@ -236,16 +187,15 @@ impl StreamingContent {
             prefix,
             text_style,
             prefix_style,
-            interactive_links,
             ..
         } = self;
-        cache.get_or_update_with_links(
+        cache.get_or_update(
             renderer,
             typewriter.visible(),
             prefix,
-            (*text_style, *prefix_style),
+            *text_style,
+            *prefix_style,
             width,
-            *interactive_links,
         )
     }
 
@@ -258,13 +208,13 @@ impl StreamingContent {
     }
 
     pub fn update_render_from(&mut self, visible: String, width: u16) -> bool {
-        self.cache.get_or_update_with_links(
+        self.cache.get_or_update(
             &mut self.renderer,
             &visible,
             self.prefix,
-            (self.text_style, self.prefix_style),
+            self.text_style,
+            self.prefix_style,
             width,
-            self.interactive_links,
         )
     }
 
@@ -437,22 +387,6 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(content.link_at(80, 0, 4), None);
-    }
-
-    #[test]
-    fn noninteractive_stream_does_not_style_links_as_clickable() {
-        let mut content =
-            StreamingContent::new_noninteractive("", Style::default(), Style::default(), 0);
-        content.set_buffer("[docs](https://example.com)");
-        let lines = content.render_lines(80);
-        let docs = lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "docs")
-            .expect("link label");
-
-        assert!(!docs.style.add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(content.link_at(80, 0, 0), None);
     }
 
     const SYNTAX: [char; 3] = ['*', '[', ']'];

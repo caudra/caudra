@@ -36,63 +36,60 @@ const PERCENT: u16 = 90;
 const LINE_UP: i32 = 1;
 /// The spinner and the clock, kept out of the scroll region so the wait is
 /// always visible.
-pub(crate) const STATUS_ROW: u16 = 1;
+const STATUS_ROW: u16 = 1;
 /// The input line, kept out of the scroll region so a long thread never
 /// scrolls the prompt away.
-pub(crate) const INPUT_ROW: u16 = 1;
-pub(crate) const FOOTER_ROW: u16 = 1;
-pub(crate) const INPUT_PREFIX: &str = "> ";
-pub(crate) const COPY_LABEL: &str = "y";
-pub(crate) const CTRL_COPY_LABEL: &str = "⌃Y";
-pub(crate) const SEND_LABEL: &str = "Enter";
-pub(crate) const CLEAR_LABEL: &str = key::CLEAR_BTW.label;
+const INPUT_ROW: u16 = 1;
+const FOOTER_ROW: u16 = 1;
+const INPUT_PREFIX: &str = "> ";
+const COPY_LABEL: &str = "y";
+const CTRL_COPY_LABEL: &str = "⌃Y";
+const SEND_LABEL: &str = "Enter";
+const CLEAR_LABEL: &str = key::CLEAR_BTW.label;
 const SCROLL_LABEL: &str = "\u{2191}\u{2193}";
 const ENDS_LABEL: &str = "Home/End";
-pub(crate) const COPY_HINT: &str = " Copy";
-pub(crate) const CLOSE_HINT: &str = " Close";
+const COPY_HINT: &str = " Copy";
+const CLOSE_HINT: &str = " Close";
 const OBSERVE_CLOSE_HINT: &str = " back";
 const SCROLL_HINT: &str = " scroll";
 const ENDS_HINT: &str = " top/bottom";
-pub(crate) const SEND_HINT: &str = " Send a follow-up";
+const SEND_HINT: &str = " Send a follow-up";
 /// While an answer is still streaming the key does not send: the thread is
 /// one question deep at a time, so what it takes is held until the answer is
 /// in.
-pub(crate) const QUEUE_HINT: &str = " Queue a follow-up";
-pub(crate) const BACK_HINT: &str = " Back to questions";
-pub(crate) const COMPACT_BACK_HINT: &str = " Back";
-pub(crate) const INITIAL_SEND_HINT: &str = " Send";
-pub(crate) const COMPACT_SEND_HINT: &str = " Follow-up";
-pub(crate) const COMPACT_QUEUE_HINT: &str = " Queue";
-pub(crate) const CLEAR_HINT: &str = " Clear";
-pub(crate) const FOOTER_GAP: &str = "   ";
-pub(crate) const COMPACT_FOOTER_GAP: &str = " ";
-pub(crate) const WAITING_PLACEHOLDER: &str = "waiting for the answer…";
-pub(crate) const QUEUED_PREFIX: &str = "queued: ";
-pub(crate) const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
-pub(crate) const ASK_PLACEHOLDER: &str = "Ask about this conversation…";
-pub(crate) const DRAFT_SEPARATOR: &str = " | ";
-pub(crate) const TOKENS_IN: &str = " in";
-pub(crate) const TOKENS_CACHED: &str = " cached";
-pub(crate) const TOKENS_OUT: &str = " out";
-pub(crate) const SUMMARY_SEPARATOR: &str = " · ";
+const QUEUE_HINT: &str = " Queue a follow-up";
+const BACK_HINT: &str = " Back to questions";
+const COMPACT_BACK_HINT: &str = " Back";
+const INITIAL_SEND_HINT: &str = " Send";
+const COMPACT_SEND_HINT: &str = " Follow-up";
+const COMPACT_QUEUE_HINT: &str = " Queue";
+const CLEAR_HINT: &str = " Clear";
+const FOOTER_GAP: &str = "   ";
+const COMPACT_FOOTER_GAP: &str = " ";
+const WAITING_PLACEHOLDER: &str = "waiting for the answer…";
+const QUEUED_PREFIX: &str = "queued: ";
+const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
+const ASK_PLACEHOLDER: &str = "Ask about this conversation…";
+const DRAFT_SEPARATOR: &str = " | ";
+const TOKENS_IN: &str = " in";
+const TOKENS_CACHED: &str = " cached";
+const TOKENS_OUT: &str = " out";
+const SUMMARY_SEPARATOR: &str = " · ";
 /// Drawn under the last answer a thread kept from before the conversation it
 /// reads moved on, so the reader knows the next answer sees more than it did.
 pub(crate) const MOVED_ON_NOTE: &str =
     "The conversation moved on since this answer. The next question reads it as it stands now.";
 
-pub(crate) const TIP_SEND: &str = "Ask the next question in this thread. While an answer is still \
+const TIP_SEND: &str = "Ask the next question in this thread. While an answer is still \
 streaming, the question waits until it is in";
-pub(crate) const TIP_ASK: &str =
-    "Ask about the conversation so far. No tool runs and nothing enters history";
-pub(crate) const TIP_CLARIFY: &str = "Ask about these choices. Nothing is answered or submitted";
-pub(crate) const TIP_COPY: &str =
-    "Copy the selection, or the whole answer when nothing is selected";
-pub(crate) const TIP_CLOSE: &str = "Close this window";
-pub(crate) const TIP_KEEP: &str = "Close this side thread. It is kept until you clear it or the \
+const TIP_ASK: &str = "Ask about the conversation so far. No tool runs and nothing enters history";
+const TIP_CLARIFY: &str = "Ask about these choices. Nothing is answered or submitted";
+const TIP_COPY: &str = "Copy the selection, or the whole answer when nothing is selected";
+const TIP_CLOSE: &str = "Close this window";
+const TIP_KEEP: &str = "Close this side thread. It is kept until you clear it or the \
 session changes, and F2 or /btw reopens it";
-pub(crate) const TIP_BACK: &str = "Return to the question form, unchanged";
-pub(crate) const TIP_CLEAR: &str =
-    "Forget this side thread and start an empty one. Nothing in it is kept";
+const TIP_BACK: &str = "Return to the question form, unchanged";
+const TIP_CLEAR: &str = "Forget this side thread and start an empty one. Nothing in it is kept";
 
 const CLOSE_CONTROL: Control = Control::command(ESC_LABEL, CLOSE_HINT, TIP_CLOSE, Command::Close);
 const CTRL_COPY_CONTROL: Control =
@@ -132,10 +129,6 @@ pub(crate) enum SideFooter {
     /// Read only: the keys scroll, Esc closes.
     Observe,
     /// `y` copies the answer; Enter, Space, or Esc closes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "/extract moves onto this window next")
-    )]
     Copy,
     /// A composer takes the keys: Enter sends a follow-up, or queues it while
     /// a run is live, Esc closes and keeps the thread, the clear chord
@@ -227,7 +220,7 @@ pub(crate) enum SideAction {
 
 /// What an exchange cost: how long it took, then the prompt, cached and output
 /// tokens when the provider reported them.
-pub(crate) fn usage_summary(settled: Duration, usage: Option<TokenUsage>) -> String {
+fn usage_summary(settled: Duration, usage: Option<TokenUsage>) -> String {
     let mut summary = format_settled_duration(settled);
     let Some(usage) = usage else {
         return summary;

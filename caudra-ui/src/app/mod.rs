@@ -142,7 +142,6 @@ use crate::components::status_bar::{
     PendingTrust, StatusBar, StatusBarHit, StatusBarHitTarget, context_share, model_leaf,
 };
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
-use crate::components::stream_modal::{StreamAction, StreamModal};
 use crate::components::system_prompt_modal::{SystemPromptAction, SystemPromptModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
@@ -568,7 +567,7 @@ pub struct App {
     pub(super) tool_stats: Option<ToolStats>,
     pub(super) goal_panel: GoalPanel,
     pub(super) autopilot_panel: AutopilotPanel,
-    pub(super) stream_modal: StreamModal,
+    pub(super) extract: extract::Extract,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     history_search: search::HistorySearchRun,
@@ -876,7 +875,6 @@ impl App {
             ui_config.default_mode.into(),
         );
         let view = caudra_storage::view::read(&storage).unwrap_or_default();
-        let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let status_bar = StatusBar::new(flash, &state.session.cwd, workspace_session.is_some());
         let mut input_box = InputBox::new(
@@ -958,7 +956,7 @@ impl App {
             tool_stats: None,
             goal_panel: GoalPanel::default(),
             autopilot_panel: AutopilotPanel::default(),
-            stream_modal: StreamModal::new(typewriter),
+            extract: extract::Extract::default(),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             history_search: search::HistorySearchRun::default(),
@@ -1634,7 +1632,7 @@ impl App {
     fn plan_form_takes_input(&self) -> bool {
         self.plan_form_in_view()
             && !self.workbench.is_open()
-            && !self.stream_modal.is_open()
+            && !self.extract.is_open()
             && !self.btw.is_open()
     }
 
@@ -1936,8 +1934,7 @@ impl App {
                     self.peer_manager.handle_paste(&text);
                     return vec![];
                 }
-                if self.stream_modal.is_open() {
-                    self.stream_modal.handle_paste(&text);
+                if self.extract.is_open() {
                     return vec![];
                 }
                 if self.btw.is_open() {
@@ -2194,8 +2191,8 @@ impl App {
             }
             return None;
         }
-        if self.stream_modal.is_open() {
-            self.stream_modal.scroll(delta);
+        if self.extract.is_open() {
+            self.extract.scroll_at(pos, delta);
             return None;
         }
         if self.btw.contains(pos) {
@@ -2744,17 +2741,9 @@ impl App {
             );
         }
 
-        if self.stream_modal.is_open() {
-            keyboard_text!(stream_modal, self.stream_modal.text_input_active());
-            guard_repeat!(self.stream_modal.text_input_active());
-            match self.stream_modal.handle_key(key) {
-                StreamAction::Ignored
-                | StreamAction::Consumed
-                | StreamAction::Submit(_)
-                | StreamAction::Clear => {}
-                StreamAction::Copy(text) => self.copy_to_clipboard(&text),
-                StreamAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
-            }
+        if self.extract.is_open() {
+            guard_repeat!(false);
+            self.handle_extract_key(key);
             return Some(vec![]);
         }
 
@@ -7065,7 +7054,7 @@ impl App {
             &self.projection_modal,
             &self.goal_panel,
             &self.autopilot_panel,
-            &self.stream_modal,
+            &self.extract,
             &self.btw,
             &self.float_mgr,
             &self.search_modal,
@@ -7125,7 +7114,7 @@ impl App {
             &mut self.projection_modal,
             &mut self.goal_panel,
             &mut self.autopilot_panel,
-            &mut self.stream_modal,
+            &mut self.extract,
             &mut self.btw,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -7312,7 +7301,7 @@ impl App {
         self.status == Status::Streaming
             || self.chats.iter().any(|chat| chat.retry().is_some())
             || self.restoring.load(Ordering::Relaxed)
-            || self.stream_modal.is_streaming()
+            || self.extract.is_running()
             || self.btw.is_running()
     }
 
@@ -7393,7 +7382,7 @@ impl App {
         self.shelve_deferred_question();
         self.pending_plan_submission = None;
         self.suspend_permission_editor();
-        self.close_stream_modal();
+        self.close_extract();
         self.close_btw();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
         self.settings.parked = None;
@@ -7466,7 +7455,7 @@ impl App {
             | self.tick_autoscroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
-            | self.tick_stream_modal()
+            | self.tick_extract()
             | self.tick_btw()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
@@ -7930,28 +7919,6 @@ impl App {
         }
     }
 
-    pub(super) fn close_stream_modal(&mut self) {
-        let _ = self.tick_stream_modal();
-        self.stream_modal.close();
-    }
-
-    fn tick_stream_modal(&mut self) -> Dirty {
-        let dirty = self.stream_modal.poll();
-        if let Some(done) = self.stream_modal.take_done() {
-            let spend = done.usage;
-            self.settle_side_spend(
-                &spend.provider,
-                None,
-                &spend.model,
-                spend.purpose,
-                spend.usage,
-                spend.cost,
-                spend.billing,
-            );
-        }
-        dirty
-    }
-
     /// A side request (`/btw`, `/extract`) spends real tokens outside any
     /// turn, so it settles into the same ledger as compaction and the goal
     /// evaluator. It deliberately leaves `context_size` alone: the request
@@ -8086,9 +8053,6 @@ impl App {
             return;
         }
         if self.float_mgr.handle_paste(text) {
-            return;
-        }
-        if self.stream_modal.handle_paste(text) {
             return;
         }
         if self.btw.handle_text(text, true) {
