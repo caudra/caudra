@@ -20,7 +20,7 @@ use crate::manifest::{
     ManifestRegistry, ProviderManifest, catalog_pricing, catalog_reasoning_options,
 };
 use crate::model_registry::{self, Binding};
-use crate::pricing::{PriceChange, rates_in_force};
+use crate::pricing::DatedRates;
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::{DOCUMENT_TOKENS_PER_PAGE, ThinkingFields};
 
@@ -463,9 +463,10 @@ pub struct Model {
     /// Caudra can encode documents in.
     pub supports_pdf: bool,
     pub pricing: ModelPricing,
-    /// A change to `pricing` that is still ahead, carried only while the rates
-    /// came from the static table. Turns billed from its date on pay its rates.
-    pub price_change: Option<&'static PriceChange>,
+    /// The table's rates on both sides of a price period with an edge still
+    /// ahead, carried only while the rates came from the static table. Each
+    /// turn bills the side it ends on.
+    pub dated_rates: Option<DatedRates>,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
@@ -534,28 +535,25 @@ impl Model {
         let catalog = catalog.as_ref();
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let catalog_pricing = catalog_pricing(catalog);
-        let static_rates = static_entry.map(|entry| {
-            rates_in_force(
-                &entry.pricing,
-                manifest.price_change(entry),
-                Timestamp::now(),
-            )
+        let now = Timestamp::now();
+        let dated_rates = static_entry.and_then(|entry| {
+            Some(DatedRates {
+                period: manifest.price_period(entry)?,
+                otherwise: &entry.pricing,
+            })
         });
+        let static_rates =
+            static_entry.map(|entry| dated_rates.map_or(&entry.pricing, |dated| dated.at(now)));
         // Base rates come from the first source that has any: what the provider
         // just reported, then the static table, then the catalog. Tiers resolve
         // on their own, from the first source that states any, because a
         // listing that reports base rates alone (xAI's) says nothing about what
         // a long prompt costs.
-        let sources = [
-            discovered_pricing,
-            static_rates.map(|(pricing, _)| pricing),
-            catalog_pricing.as_ref(),
-        ];
-        // An announced change belongs to the table's rates, so it only rides
-        // along while those are the ones billed.
-        let price_change = static_rates
-            .filter(|_| discovered_pricing.is_none())
-            .and_then(|(_, pending)| pending);
+        let sources = [discovered_pricing, static_rates, catalog_pricing.as_ref()];
+        // Dated rates belong to the table's, so they only ride along while
+        // those are the ones billed and an edge can still move them.
+        let dated_rates = dated_rates
+            .filter(|dated| discovered_pricing.is_none() && dated.period.during.moves_after(now));
         let tiers = sources
             .into_iter()
             .flatten()
@@ -625,7 +623,7 @@ impl Model {
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
             pricing,
-            price_change,
+            dated_rates,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             context_window,
@@ -683,7 +681,7 @@ impl Model {
                 fast: None,
                 tiers: Cow::Owned(meta.pricing_tiers),
             },
-            price_change: None,
+            dated_rates: None,
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
@@ -801,8 +799,8 @@ impl Model {
 
     /// What the provider charges right now, so it is only ever correct for a
     /// turn that just finished: under a
-    /// [`PricingSchedule`](crate::pricing::PricingSchedule) or a pending
-    /// [`PriceChange`] the answer moves with the clock. Anything historical
+    /// [`PricingSchedule`](crate::pricing::PricingSchedule) or
+    /// [`DatedRates`] the answer moves with the clock. Anything historical
     /// wants [`Self::list_cost`].
     ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
@@ -811,15 +809,15 @@ impl Model {
         self.billed_cost_at(usage, fast, Timestamp::now())
     }
 
-    /// [`Self::billed_cost`] for a turn that finished at `at`, under the
-    /// announced price change once its date has come.
+    /// [`Self::billed_cost`] for a turn that finished at `at`, at the side of
+    /// any price period it ended on.
     pub(crate) fn billed_cost_at(
         &self,
         usage: &TokenUsage,
         fast: bool,
         at: Timestamp,
     ) -> Option<f64> {
-        let (pricing, _) = rates_in_force(&self.pricing, self.price_change, at);
+        let pricing = self.dated_rates.map_or(&self.pricing, |dated| dated.at(at));
         let cost = (!pricing.is_zero()).then(|| usage.cost(pricing, fast))?;
         let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
         Some(schedule.map_or(cost, |s| cost * s.multiplier_at(at)))
@@ -1269,6 +1267,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::{Period, PricePeriod};
     use crate::providers::copilot;
     use caudra_storage::StateDir;
     use jiff::civil;
@@ -1506,12 +1505,12 @@ mod tests {
 
     #[test]
     fn resolve_takes_an_allowed_curated_alternative() {
-        let policy = policy(&["openai/gpt-5.4-nano"], &[]);
+        let policy = policy(&["openai/gpt-5.4-mini"], &[]);
         let chat = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
 
         let model = Model::resolve(ModelPurpose::Fast, &chat, &policy).unwrap();
 
-        assert_eq!(model.spec(), "openai/gpt-5.4-nano");
+        assert_eq!(model.spec(), "openai/gpt-5.4-mini");
     }
 
     /// Every rule ends at the conversation model, which the user already chose,
@@ -1937,6 +1936,15 @@ mod tests {
         }
     }
 
+    /// A default its provider retires hands the lane to the next one, so only
+    /// the defaults that last count towards a lane's single answer.
+    fn lasting_default(manifest: &ProviderManifest, entry: &ModelEntry) -> bool {
+        entry.default
+            && manifest
+                .availability(entry)
+                .is_none_or(|row| row.during.until.is_none())
+    }
+
     /// Provider-wide, a lane still needs exactly one answer: the first default
     /// in table order, which is what `curated_default` takes on a cold start.
     #[test]
@@ -1952,7 +1960,7 @@ mod tests {
                 let count = manifest
                     .models
                     .iter()
-                    .filter(|entry| entry.class() == purpose && entry.default)
+                    .filter(|entry| entry.class() == purpose && lasting_default(manifest, entry))
                     .count();
                 let lines = manifest.generations.len().max(1);
                 assert_eq!(
@@ -1980,7 +1988,10 @@ mod tests {
                     if members.is_empty() {
                         continue;
                     }
-                    let count = members.iter().filter(|entry| entry.default).count();
+                    let count = members
+                        .iter()
+                        .filter(|entry| lasting_default(manifest, entry))
+                        .count();
                     assert_eq!(
                         count, 1,
                         "{}/{}/{purpose}: expected exactly 1 default, found {count}",
@@ -2312,9 +2323,9 @@ mod tests {
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
-    const PRICE_CHANGE_MODEL: &str = "test-price-change-model";
+    const PRICE_PERIOD_MODEL: &str = "test-price-period-model";
     const TABLE_INPUT_RATE: f64 = 1.0;
-    const CHANGED_INPUT_RATE: f64 = 2.0;
+    const PERIOD_INPUT_RATE: f64 = 2.0;
     const DISCOVERED_INPUT_RATE: f64 = 5.0;
     const fn input_only(input: f64) -> ModelPricing {
         ModelPricing {
@@ -2326,8 +2337,8 @@ mod tests {
             tiers: ModelPricing::UNTIERED,
         }
     }
-    const PRICE_CHANGE_ENTRIES: &[ModelEntry] = &[ModelEntry {
-        prefixes: &[PRICE_CHANGE_MODEL],
+    const PRICE_PERIOD_ENTRIES: &[ModelEntry] = &[ModelEntry {
+        prefixes: &[PRICE_PERIOD_MODEL],
         small: false,
         family: ModelFamily::Generic,
         vision: false,
@@ -2339,99 +2350,169 @@ mod tests {
     }];
     /// One date the suite never reaches and one long gone, so the real clock
     /// that `from_base` reads cannot move the answer.
-    const AHEAD: &[PriceChange] = &[PriceChange {
-        prefix: PRICE_CHANGE_MODEL,
-        from: civil::date(9999, 1, 1),
-        pricing: input_only(CHANGED_INPUT_RATE),
-    }];
-    const PASSED: &[PriceChange] = &[PriceChange {
-        prefix: PRICE_CHANGE_MODEL,
-        from: civil::date(2000, 1, 1),
-        pricing: input_only(CHANGED_INPUT_RATE),
-    }];
-    const CHANGE_RIDES_ON_THE_TABLE: &str =
-        "an announced price belongs to the table's rates and to nothing a provider reported";
+    const NEVER_REACHED: civil::Date = civil::date(9999, 1, 1);
+    const LONG_GONE: civil::Date = civil::date(2000, 1, 1);
+    const fn period_rates(during: Period) -> [PricePeriod; 1] {
+        [PricePeriod {
+            prefix: PRICE_PERIOD_MODEL,
+            during,
+            pricing: input_only(PERIOD_INPUT_RATE),
+        }]
+    }
+    const RAISE_AHEAD: &[PricePeriod] = &period_rates(Period::from(NEVER_REACHED));
+    const RAISE_PASSED: &[PricePeriod] = &period_rates(Period::from(LONG_GONE));
+    const PROMO_RUNNING: &[PricePeriod] = &period_rates(Period::until(NEVER_REACHED));
+    const PROMO_ENDED: &[PricePeriod] = &period_rates(Period::until(LONG_GONE));
+    const PERIOD_RIDES_ON_THE_TABLE: &str =
+        "dated rates belong to the table's rates and to nothing a provider reported";
 
-    /// A change still ahead travels with the table's rates, one that has come
-    /// replaces them, and rates a provider reported owe the table nothing.
-    #[test_case("test-price-change-ahead", AHEAD, None, TABLE_INPUT_RATE, true       ; "ahead_rides_along")]
-    #[test_case("test-price-change-passed", PASSED, None, CHANGED_INPUT_RATE, false  ; "passed_replaces_the_table")]
-    #[test_case("test-price-change-listed", AHEAD, Some(DISCOVERED_INPUT_RATE), DISCOVERED_INPUT_RATE, false ; "discovery_drops_it")]
-    fn a_price_change_follows_the_table_rates(
+    /// Rates are whichever side of the period today sits on. They ride along
+    /// while an edge is ahead, and rates a provider reported owe the table
+    /// nothing.
+    #[test_case("test-price-period-ahead", RAISE_AHEAD, None, TABLE_INPUT_RATE, true        ; "a_raise_ahead_rides_along")]
+    #[test_case("test-price-period-passed", RAISE_PASSED, None, PERIOD_INPUT_RATE, false    ; "a_raise_passed_replaces_the_table")]
+    #[test_case("test-price-period-promo", PROMO_RUNNING, None, PERIOD_INPUT_RATE, true     ; "a_running_promotion_rides_along")]
+    #[test_case("test-price-period-ended", PROMO_ENDED, None, TABLE_INPUT_RATE, false       ; "an_ended_promotion_leaves_the_table")]
+    #[test_case("test-price-period-listed", RAISE_AHEAD, Some(DISCOVERED_INPUT_RATE), DISCOVERED_INPUT_RATE, false ; "discovery_drops_it")]
+    fn a_price_period_follows_the_table_rates(
         slug: &'static str,
-        changes: &'static [PriceChange],
+        periods: &'static [PricePeriod],
         discovered_rate: Option<f64>,
         expected_rate: f64,
-        expected_pending: bool,
+        expected_carried: bool,
     ) {
         model_registry::set_known_models(
             slug,
             vec![ModelInfo {
                 pricing: discovered_rate.map(input_only),
-                ..ModelInfo::id_only(PRICE_CHANGE_MODEL.to_string())
+                ..ModelInfo::id_only(PRICE_PERIOD_MODEL.to_string())
             }],
         );
         let manifest = ProviderManifest {
             slug,
-            models: PRICE_CHANGE_ENTRIES,
-            price_changes: changes,
+            models: PRICE_PERIOD_ENTRIES,
+            price_periods: periods,
             pricing_schedule: None,
             catalog_slug: None,
             ..*ManifestRegistry::get("google").unwrap()
         };
 
-        let model = Model::from_base(&manifest, slug, PRICE_CHANGE_MODEL);
+        let model = Model::from_base(&manifest, slug, PRICE_PERIOD_MODEL);
 
         assert_eq!(
             model.pricing.input, expected_rate,
-            "{CHANGE_RIDES_ON_THE_TABLE}"
+            "{PERIOD_RIDES_ON_THE_TABLE}"
         );
         assert_eq!(
-            model.price_change.is_some(),
-            expected_pending,
-            "{CHANGE_RIDES_ON_THE_TABLE}"
+            model.dated_rates.is_some(),
+            expected_carried,
+            "{PERIOD_RIDES_ON_THE_TABLE}"
         );
     }
 
-    /// A change in the wrong table, on the wrong prefix, or one that repeats
-    /// the rates it replaces bills nothing different and only looks handled.
+    /// Every entry `prefix` names in `manifest`.
+    fn entries_named<'a>(manifest: &'a ProviderManifest, prefix: &str) -> Vec<&'a ModelEntry> {
+        manifest
+            .models
+            .iter()
+            .filter(|entry| entry.prefixes.contains(&prefix))
+            .collect()
+    }
+
+    fn assert_dated_once(manifest: &ProviderManifest, prefixes: &[&str], period: Period) {
+        for prefix in prefixes {
+            let named = entries_named(manifest, prefix);
+            let [entry] = named[..] else {
+                panic!(
+                    "{} names {} entries for {prefix}",
+                    manifest.slug,
+                    named.len()
+                );
+            };
+            let rows = prefixes
+                .iter()
+                .filter(|other| entry.prefixes.contains(other))
+                .count();
+            assert_eq!(rows, 1, "{} dates {prefix}'s entry twice", manifest.slug);
+        }
+        if let (Some(from), Some(until)) = (period.from, period.until) {
+            assert!(
+                from < until,
+                "{}: {from} is not before {until}",
+                manifest.slug
+            );
+        }
+    }
+
+    /// A row in the wrong table, on the wrong prefix, twice for one entry, or
+    /// one that repeats the rates it replaces changes nothing and only looks
+    /// handled.
     #[test]
-    fn every_price_change_names_one_entry_and_moves_its_rates() {
+    fn every_dated_row_names_one_entry_and_changes_it() {
         let rates = |p: &ModelPricing| (p.input, p.output, p.cache_write, p.cache_read);
         for manifest in ManifestRegistry::builtins() {
-            for change in manifest.price_changes {
-                let named: Vec<&ModelEntry> = manifest
-                    .models
-                    .iter()
-                    .filter(|entry| entry.prefixes.contains(&change.prefix))
-                    .collect();
-                let [entry] = named[..] else {
-                    panic!(
-                        "{} names {} entries for {}",
-                        manifest.slug,
-                        named.len(),
-                        change.prefix
-                    );
-                };
-                let repeats = manifest
-                    .price_changes
-                    .iter()
-                    .filter(|other| other.prefix == change.prefix)
-                    .count();
-                assert_eq!(
-                    repeats, 1,
-                    "{} changes {} twice",
-                    manifest.slug, change.prefix
-                );
+            let priced: Vec<&str> = manifest.price_periods.iter().map(|p| p.prefix).collect();
+            for period in manifest.price_periods {
+                assert_dated_once(manifest, &priced, period.during);
+                let entry = entries_named(manifest, period.prefix)[0];
                 assert_ne!(
                     rates(&entry.pricing),
-                    rates(&change.pricing),
-                    "{}/{} changes to the rates it has",
+                    rates(&period.pricing),
+                    "{}/{} sets the rates it has",
                     manifest.slug,
-                    change.prefix
+                    period.prefix
+                );
+            }
+            let dated: Vec<&str> = manifest.availability.iter().map(|a| a.prefix).collect();
+            for row in manifest.availability {
+                assert_dated_once(manifest, &dated, row.during);
+                assert_ne!(
+                    row.during,
+                    Period {
+                        from: None,
+                        until: None
+                    },
+                    "{}/{} is dated with no date",
+                    manifest.slug,
+                    row.prefix
                 );
             }
         }
+    }
+
+    const RETIRED_PROVIDER: &str = "copilot";
+    const RETIRED_ID: &str = "claude-opus-5";
+    const RETIRED_ON: &str = "2026-11-16T00:00:00Z";
+    /// Copilot's Opus 5 rates for [`ONE_MILLION_TOKENS`] input and output.
+    const RETIRED_LIST_PRICE: f64 = 5.00 + 25.00;
+    const ONE_MILLION_TOKENS: u32 = 1_000_000;
+    const RETIRED_STILL_RESOLVES: &str =
+        "a retired model leaves lists only: an explicit id keeps its entry and its price";
+
+    #[test]
+    fn a_retired_model_still_resolves_with_its_price() {
+        let manifest = ManifestRegistry::get(RETIRED_PROVIDER).unwrap();
+        let entry = lookup_entry(manifest.models, RETIRED_ID).unwrap();
+        let retired: Timestamp = RETIRED_ON.parse().unwrap();
+        assert!(!manifest.is_listed_at(entry, retired));
+
+        let model = Model::from_spec(&format!("{RETIRED_PROVIDER}/{RETIRED_ID}"))
+            .expect(RETIRED_STILL_RESOLVES);
+        let usage = TokenUsage {
+            input: ONE_MILLION_TOKENS,
+            output: ONE_MILLION_TOKENS,
+            ..Default::default()
+        };
+        assert_eq!(
+            model.list_cost(&usage, false),
+            Some(RETIRED_LIST_PRICE),
+            "{RETIRED_STILL_RESOLVES}"
+        );
+        assert_eq!(
+            Model::class_of(RETIRED_PROVIDER, RETIRED_ID),
+            Some(ModelPurpose::Best),
+            "{RETIRED_STILL_RESOLVES}"
+        );
     }
 
     /// A schedule hung on the wrong manifest silently doubles every turn of a

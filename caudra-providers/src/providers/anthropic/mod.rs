@@ -16,12 +16,15 @@ use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::config::Configurable;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use jiff::civil;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::accounts::{AccountCredential, AccountSecret, QuotaWindow, WindowKind, quota};
+use crate::manifest::Availability;
 use crate::model::{Model, TokenUsage};
+use crate::pricing::Period;
 use crate::provider::{BoxFuture, CacheWarm, Provider, WireRequest};
 use crate::providers::oauth::AccountStore;
 use crate::types::{THINKING_ADAPTIVE, THINKING_BUDGET};
@@ -82,6 +85,12 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
 });
 
 pub(crate) use shared::models;
+
+/// Shutdowns from <https://platform.claude.com/docs/en/about-claude/model-deprecations>.
+pub(crate) const AVAILABILITY: &[Availability] = &[Availability {
+    prefix: "claude-sonnet-4-5",
+    during: Period::until(civil::date(2026, 11, 30)),
+}];
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
 /// `supports_fast()` here rather than trusting `opts.fast` alone, so a stale UI

@@ -7,10 +7,14 @@ pub use platform::OpenAi;
 
 use std::borrow::Cow;
 
+use jiff::civil;
+
+use crate::manifest::Availability;
 use crate::model::{
     FastPricing, ModelEntry, ModelFamily, ModelGeneration, ModelPricing, PricingTier,
     StaticReasoningOption,
 };
+use crate::pricing::Period;
 
 pub(crate) const SETUP_MODEL_SPEC: &str = "openai/gpt-6.1-sol";
 
@@ -25,6 +29,26 @@ const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// wide window sits above it, so the last stretch before compaction always
 /// pays the long rate.
 pub(crate) const LONG_CONTEXT_ABOVE: u32 = 272_000;
+
+/// Shutdowns from <https://developers.openai.com/api/docs/deprecations>.
+pub(crate) const AVAILABILITY: &[Availability] = &[
+    Availability {
+        prefix: "o3",
+        during: Period::until(civil::date(2026, 12, 11)),
+    },
+    Availability {
+        prefix: "o3-pro",
+        during: Period::until(civil::date(2026, 12, 11)),
+    },
+    Availability {
+        prefix: "gpt-5.3-codex",
+        during: Period::until(civil::date(2027, 4, 1)),
+    },
+    Availability {
+        prefix: "gpt-5.4-nano",
+        during: Period::until(civil::date(2027, 4, 1)),
+    },
+];
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "openai",

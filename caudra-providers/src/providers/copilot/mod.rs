@@ -6,6 +6,7 @@ use std::time::Duration;
 use flume::Sender;
 use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use jiff::civil;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -14,10 +15,12 @@ use super::anthropic::{self, shared};
 use super::openai::responses;
 use super::openai_compat;
 use crate::accounts::AccountCredential;
+use crate::manifest::Availability;
 use crate::model::{
     Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, StaticReasoningOption,
     lookup_entry,
 };
+use crate::pricing::Period;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
@@ -42,7 +45,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: DEFAULT_API_ENDPOINT,
     default_api_key_env: PUBLIC_TOKEN_ENV,
-    default_model: "copilot/gpt-5.6-terra",
+    default_model: "copilot/gpt-6.1-terra",
     plans: None,
     login_url: Some("https://github.com/settings/copilot"),
     needs_url: false,
@@ -53,7 +56,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: "",
     default_api_key_env: ENTERPRISE_TOKEN_ENV,
-    default_model: "copilot-enterprise/gpt-5.6-terra",
+    default_model: "copilot-enterprise/gpt-6.1-terra",
     plans: None,
     login_url: None,
     needs_url: false,
@@ -109,6 +112,18 @@ const CLAUDE_BUDGET: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetT
     max: Some(32_000),
 }];
 const GEMINI_MAX_OUTPUT: u32 = 65_536;
+const OPUS_5: &str = "claude-opus-5";
+const GPT_5_6_TERRA: &str = "gpt-5.6-terra";
+/// Opus 5 and Opus 4.8 bill alike. Only Opus 5 retires: annual-plan
+/// subscribers keep Opus 4.8.
+const OPUS_5_PRICE: ModelPricing = ModelPricing {
+    input: 5.00,
+    output: 25.00,
+    cache_write: 6.25,
+    cache_read: 0.50,
+    fast: None,
+    tiers: ModelPricing::UNTIERED,
+};
 const GEMINI_FLASH_PROMO: ModelPricing = ModelPricing {
     input: 0.75,
     output: 3.75,
@@ -117,6 +132,18 @@ const GEMINI_FLASH_PROMO: ModelPricing = ModelPricing {
     fast: None,
     tiers: ModelPricing::UNTIERED,
 };
+
+/// Shutdowns from <https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/>.
+pub(crate) const AVAILABILITY: &[Availability] = &[
+    Availability {
+        prefix: OPUS_5,
+        during: Period::until(civil::date(2026, 11, 16)),
+    },
+    Availability {
+        prefix: GPT_5_6_TERRA,
+        during: Period::until(civil::date(2026, 11, 16)),
+    },
+];
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
@@ -406,7 +433,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_WITH_MAX),
         },
         ModelEntry {
-            prefixes: &["gpt-5.6-terra"],
+            prefixes: &[GPT_5_6_TERRA],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
@@ -442,11 +469,22 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_XHIGH_NO_NONE),
         },
         ModelEntry {
+            prefixes: &[OPUS_5],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: true,
+            pricing: OPUS_5_PRICE,
+            max_output_tokens: Some(64_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
+        ModelEntry {
             prefixes: &["claude-opus-5.5"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
-            default: false,
+            default: true,
             pricing: ModelPricing {
                 input: 4.00,
                 output: 20.00,
@@ -460,19 +498,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
-            prefixes: &["claude-opus-5", "claude-opus-4.8"],
+            prefixes: &["claude-opus-4.8"],
             small: false,
             family: ModelFamily::Generic,
             vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
+            default: false,
+            pricing: OPUS_5_PRICE,
             max_output_tokens: Some(64_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
@@ -1330,11 +1361,15 @@ mod tests {
 
     use super::*;
     use crate::TokenUsage;
+    use crate::manifest::ManifestRegistry;
+    use crate::model::ModelPurpose;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::providers::{ResolvedAuth, Timeouts};
     use test_case::test_case;
 
     const OPUS_CACHE_WRITE: f64 = 6.25;
+    const LAST_DAY_OF_OPUS_5: &str = "2026-11-15T23:59:59Z";
+    const OPUS_5_RETIRED: &str = "2026-11-16T00:00:00Z";
     const TEST_TOKEN: &str = "copilot-test-token";
     const TEST_SPEC: &str = "copilot/gpt-5.4-nano";
     const OTHER_MODEL_ID: &str = "grok-4.6";
@@ -1584,15 +1619,19 @@ mod tests {
         assert_eq!(model.model_info().supports_thinking, Some(expected));
     }
 
-    #[test_case(true, "gpt-5.6-luna"; "small defaults to luna")]
-    #[test_case(false, "claude-opus-5"; "non_small_defaults_to_opus")]
-    fn manifest_has_exactly_one_default_per_lane(small: bool, expected_prefix: &str) {
-        let defaults: Vec<_> = models()
-            .iter()
-            .filter(|entry| entry.default && entry.small == small)
-            .collect();
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].prefixes[0], expected_prefix);
+    #[test_case(ModelPurpose::Fast, LAST_DAY_OF_OPUS_5, "gpt-5.6-luna"    ; "small_defaults_to_luna")]
+    #[test_case(ModelPurpose::Best, LAST_DAY_OF_OPUS_5, OPUS_5            ; "non_small_defaults_to_opus_5")]
+    #[test_case(ModelPurpose::Best, OPUS_5_RETIRED, "claude-opus-5.5"     ; "opus_5_5_takes_over_when_opus_5_retires")]
+    fn the_lane_default_hands_over_on_the_shutdown_day(
+        purpose: ModelPurpose,
+        at: &str,
+        expected_prefix: &str,
+    ) {
+        let manifest = ManifestRegistry::get(PUBLIC_SLUG).unwrap();
+        let default =
+            ManifestRegistry::default_from_manifest(manifest, purpose, at.parse().unwrap())
+                .unwrap();
+        assert_eq!(default.prefixes[0], expected_prefix);
     }
 
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]

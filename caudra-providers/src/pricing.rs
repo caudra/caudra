@@ -112,36 +112,93 @@ impl fmt::Display for PricingSchedule {
     }
 }
 
-/// A price the provider has announced for a later date, such as the end of an
-/// introductory rate. The model table quotes today's price. From `from` at
-/// 00:00 UTC every turn bills at `pricing`, tiers included, so a build shipped
-/// during a promotion stays right after it ends. Providers name a day without
-/// a timezone, so a turn near midnight may land a day off.
-#[derive(Debug)]
-pub struct PriceChange {
-    /// The `ModelEntry` prefix whose rates change.
-    pub prefix: &'static str,
-    pub from: Date,
-    pub pricing: ModelPricing,
+/// Whole UTC days `from <= day < until`, open on either end left `None`.
+/// `until` is the first day the period no longer covers: a promotion "through
+/// November 30" is `until(2026-12-01)`, and a shutdown "on November 16" is
+/// `until(2026-11-16)`. Each edge falls at 00:00 UTC. Providers name a day
+/// without a timezone, so an instant near midnight may land a day off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Period {
+    pub from: Option<Date>,
+    pub until: Option<Date>,
 }
 
-impl PriceChange {
-    pub(crate) fn applies_at(&self, at: Timestamp) -> bool {
-        at.to_zoned(TimeZone::UTC).date() >= self.from
+impl Period {
+    pub const fn from(day: Date) -> Self {
+        Self {
+            from: Some(day),
+            until: None,
+        }
+    }
+
+    pub const fn until(day: Date) -> Self {
+        Self {
+            from: None,
+            until: Some(day),
+        }
+    }
+
+    /// `from` must come before `until`. jiff compares no dates in a `const`,
+    /// so a test holds every table to it instead.
+    pub const fn between(from: Date, until: Date) -> Self {
+        Self {
+            from: Some(from),
+            until: Some(until),
+        }
+    }
+
+    pub fn contains(&self, at: Timestamp) -> bool {
+        self.contains_day(utc_day(at))
+    }
+
+    pub fn contains_day(&self, day: Date) -> bool {
+        self.from.is_none_or(|from| from <= day) && self.until.is_none_or(|until| day < until)
+    }
+
+    /// Whether an edge still lies after `at`, so what the period decides can
+    /// still change.
+    pub(crate) fn moves_after(&self, at: Timestamp) -> bool {
+        let day = utc_day(at);
+        [self.from, self.until]
+            .into_iter()
+            .flatten()
+            .any(|edge| edge > day)
     }
 }
 
-/// The rates in force at `at`: `base` until `change` applies, then the
-/// change's. Also returns the change while it is still ahead, so whoever
-/// holds the rates can switch over later.
-pub(crate) fn rates_in_force<'a>(
-    base: &'a ModelPricing,
-    change: Option<&'static PriceChange>,
-    at: Timestamp,
-) -> (&'a ModelPricing, Option<&'static PriceChange>) {
-    match change {
-        Some(change) if change.applies_at(at) => (&change.pricing, None),
-        pending => (base, pending),
+fn utc_day(at: Timestamp) -> Date {
+    at.to_zoned(TimeZone::UTC).date()
+}
+
+/// Rates a provider sets for a span of days: a list price that starts on a
+/// date (`Period::from`), an introductory price that ends on one
+/// (`Period::until`), or both. Inside `during` every turn bills at `pricing`,
+/// tiers included, and outside it at the entry's own rates, so a build shipped
+/// before either edge stays right after it.
+#[derive(Debug)]
+pub struct PricePeriod {
+    /// The `ModelEntry` prefix whose rates the period sets.
+    pub prefix: &'static str,
+    pub during: Period,
+    pub pricing: ModelPricing,
+}
+
+/// An entry's rates on both sides of its [`PricePeriod`]. A model billed from
+/// the static table carries them while an edge is still ahead, so each turn
+/// pays the side it ends on.
+#[derive(Debug, Clone, Copy)]
+pub struct DatedRates {
+    pub period: &'static PricePeriod,
+    pub otherwise: &'static ModelPricing,
+}
+
+impl DatedRates {
+    pub(crate) fn at(&self, at: Timestamp) -> &'static ModelPricing {
+        if self.period.during.contains(at) {
+            &self.period.pricing
+        } else {
+            self.otherwise
+        }
     }
 }
 
@@ -348,7 +405,7 @@ mod tests {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
-            price_change: None,
+            dated_rates: None,
             discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
@@ -416,66 +473,104 @@ mod tests {
     const FIRST_SECOND_OF: &str = "2026-12-01T00:00:00Z";
     /// 04:30 UTC on the first, still the evening before in New York.
     const EVENING_BEFORE_IN_NEW_YORK: &str = "2026-11-30T23:30:00-05:00";
+    const LAST_SECOND_OF_DECEMBER: &str = "2026-12-31T23:59:59Z";
+    const FIRST_SECOND_OF_JANUARY: &str = "2027-01-01T00:00:00Z";
     const LONG_AFTER: &str = "2027-06-01T12:00:00Z";
-    static CHANGE: PriceChange = PriceChange {
-        prefix: CURRENT,
-        from: civil::date(2026, 12, 1),
-        pricing: ModelPricing {
-            input: CHANGED_INPUT_RATE,
-            output: 0.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-            fast: None,
-            tiers: ModelPricing::UNTIERED,
-        },
+    const DECEMBER: Date = civil::date(2026, 12, 1);
+    const JANUARY: Date = civil::date(2027, 1, 1);
+    const FROM_DECEMBER: Period = Period::from(DECEMBER);
+    const UNTIL_DECEMBER: Period = Period::until(DECEMBER);
+    const DECEMBER_ONLY: Period = Period::between(DECEMBER, JANUARY);
+    const ALWAYS: Period = Period {
+        from: None,
+        until: None,
     };
+    const CHANGED_RATES: ModelPricing = ModelPricing {
+        input: CHANGED_INPUT_RATE,
+        ..ModelPricing::ZERO
+    };
+    static TABLE_RATES: ModelPricing = ModelPricing {
+        input: INPUT_RATE,
+        ..ModelPricing::ZERO
+    };
+    static RAISED_FROM_DECEMBER: PricePeriod = PricePeriod {
+        prefix: CURRENT,
+        during: FROM_DECEMBER,
+        pricing: CHANGED_RATES,
+    };
+    static PROMO_UNTIL_DECEMBER: PricePeriod = PricePeriod {
+        prefix: CURRENT,
+        during: UNTIL_DECEMBER,
+        pricing: CHANGED_RATES,
+    };
+    static DECEMBER_RATE: PricePeriod = PricePeriod {
+        prefix: CURRENT,
+        during: DECEMBER_ONLY,
+        pricing: CHANGED_RATES,
+    };
+    const HISTORY_IGNORES_THE_CLOCK: &str = "re-pricing history must not depend on the clock";
 
     fn instant(text: &str) -> Timestamp {
         text.parse().expect("an RFC 3339 instant")
     }
 
-    #[test_case(LAST_SECOND_BEFORE, false        ; "last_second_before_the_day")]
-    #[test_case(FIRST_SECOND_OF, true            ; "first_second_of_the_day")]
-    #[test_case(EVENING_BEFORE_IN_NEW_YORK, true ; "the_day_is_read_in_utc")]
-    #[test_case(LONG_AFTER, true                 ; "long_after")]
-    fn a_change_applies_from_midnight_utc(at: &str, expected: bool) {
-        assert_eq!(CHANGE.applies_at(instant(at)), expected);
+    #[test_case(FROM_DECEMBER, LAST_SECOND_BEFORE, false         ; "from_excludes_the_day_before")]
+    #[test_case(FROM_DECEMBER, FIRST_SECOND_OF, true             ; "from_includes_its_day")]
+    #[test_case(FROM_DECEMBER, EVENING_BEFORE_IN_NEW_YORK, true  ; "the_day_is_read_in_utc")]
+    #[test_case(FROM_DECEMBER, LONG_AFTER, true                  ; "from_never_ends")]
+    #[test_case(UNTIL_DECEMBER, LAST_SECOND_BEFORE, true         ; "until_includes_the_day_before")]
+    #[test_case(UNTIL_DECEMBER, FIRST_SECOND_OF, false           ; "until_excludes_its_day")]
+    #[test_case(DECEMBER_ONLY, LAST_SECOND_BEFORE, false         ; "between_starts_on_from")]
+    #[test_case(DECEMBER_ONLY, FIRST_SECOND_OF, true             ; "between_includes_from")]
+    #[test_case(DECEMBER_ONLY, LAST_SECOND_OF_DECEMBER, true     ; "between_includes_the_day_before_until")]
+    #[test_case(DECEMBER_ONLY, FIRST_SECOND_OF_JANUARY, false    ; "between_excludes_until")]
+    #[test_case(ALWAYS, LONG_AFTER, true                         ; "open_on_both_ends")]
+    fn a_period_covers_whole_utc_days(period: Period, at: &str, expected: bool) {
+        assert_eq!(period.contains(instant(at)), expected);
     }
 
-    /// A model built before the date keeps the old rates on it, so the switch
-    /// has to happen when a turn is billed.
-    #[test_case(LAST_SECOND_BEFORE, Some(LIST_PRICE)      ; "before_bills_the_table")]
-    #[test_case(FIRST_SECOND_OF, Some(CHANGED_LIST_PRICE) ; "from_the_day_bills_the_change")]
-    fn a_turn_bills_the_rates_in_force_when_it_ends(at: &str, expected: Option<f64>) {
+    #[test_case(FROM_DECEMBER, LAST_SECOND_BEFORE, true        ; "from_still_ahead")]
+    #[test_case(FROM_DECEMBER, FIRST_SECOND_OF, false          ; "from_reached")]
+    #[test_case(DECEMBER_ONLY, FIRST_SECOND_OF, true           ; "until_still_ahead")]
+    #[test_case(DECEMBER_ONLY, FIRST_SECOND_OF_JANUARY, false  ; "both_edges_passed")]
+    #[test_case(ALWAYS, LAST_SECOND_BEFORE, false              ; "no_edges")]
+    fn a_period_moves_while_an_edge_is_ahead(period: Period, at: &str, expected: bool) {
+        assert_eq!(period.moves_after(instant(at)), expected);
+    }
+
+    /// A model built before an edge keeps the rates it was built with, so the
+    /// switch, and the switch back, happen when a turn is billed.
+    #[test_case(&RAISED_FROM_DECEMBER, LAST_SECOND_BEFORE, LIST_PRICE         ; "from_bills_the_table_before")]
+    #[test_case(&RAISED_FROM_DECEMBER, FIRST_SECOND_OF, CHANGED_LIST_PRICE    ; "from_bills_the_period_on_its_day")]
+    #[test_case(&PROMO_UNTIL_DECEMBER, LAST_SECOND_BEFORE, CHANGED_LIST_PRICE ; "until_bills_the_period_before")]
+    #[test_case(&PROMO_UNTIL_DECEMBER, FIRST_SECOND_OF, LIST_PRICE            ; "until_bills_the_table_on_its_day")]
+    #[test_case(&DECEMBER_RATE, LAST_SECOND_BEFORE, LIST_PRICE                ; "between_bills_the_table_before")]
+    #[test_case(&DECEMBER_RATE, LAST_SECOND_OF_DECEMBER, CHANGED_LIST_PRICE   ; "between_bills_the_period_inside")]
+    #[test_case(&DECEMBER_RATE, FIRST_SECOND_OF_JANUARY, LIST_PRICE           ; "between_switches_back")]
+    fn a_turn_bills_the_rates_in_force_when_it_ends(
+        period: &'static PricePeriod,
+        at: &str,
+        expected: f64,
+    ) {
         let mut current = model(CURRENT, INPUT_RATE);
-        current.price_change = Some(&CHANGE);
+        current.dated_rates = Some(DatedRates {
+            period,
+            otherwise: &TABLE_RATES,
+        });
         let usage = TokenUsage {
             input: ONE_MILLION,
             ..Default::default()
         };
 
-        assert_eq!(current.billed_cost_at(&usage, false, instant(at)), expected);
+        assert_eq!(
+            current.billed_cost_at(&usage, false, instant(at)),
+            Some(expected)
+        );
         assert_eq!(
             current.list_cost(&usage, false),
             Some(LIST_PRICE),
-            "re-pricing history must not depend on the clock"
+            "{HISTORY_IGNORES_THE_CLOCK}"
         );
-    }
-
-    #[test]
-    fn rates_in_force_hand_over_once() {
-        let base = ModelPricing {
-            input: INPUT_RATE,
-            ..ModelPricing::ZERO
-        };
-
-        let (before, pending) = rates_in_force(&base, Some(&CHANGE), instant(LAST_SECOND_BEFORE));
-        assert_eq!(before.input, INPUT_RATE);
-        assert!(pending.is_some());
-
-        let (after, pending) = rates_in_force(&base, Some(&CHANGE), instant(FIRST_SECOND_OF));
-        assert_eq!(after.input, CHANGED_INPUT_RATE);
-        assert!(pending.is_none());
     }
 
     #[test]
