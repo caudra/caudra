@@ -20,6 +20,10 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 >
 > Updating from Preview 16 saves a copy first at `backups/caudra.db.v43.bak` in the state directory. Older builds cannot open the upgraded database, and `caudra rollback` restores only the previous binary.
 
+### Models
+
+- **DeepSeek V4.1 Flash on Mistral.** `mistral/deepseek-v4-1-flash-1017` is DeepSeek's text model hosted by Mistral, with a 1M window. It costs $0.30 per million input tokens and $1.20 per million output tokens, with cache reads at $0.007. See [Mistral](/docs/providers/#mistral).
+
 ### Changes
 
 - **Git-aware automations.** Experimental automations can use `git_compare(base)` to compare a checkout with a local branch without a model turn. Caudra's contributor checkout includes `sync-main`, which asks for a merge at a safe point when local `main` moves and skips when the worktree is current. See [Automations](/docs/automations/#compare-local-git-branches).
