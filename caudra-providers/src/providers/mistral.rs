@@ -80,6 +80,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 "mistral-medium-3.5",
                 "mistral-medium-3-5",
                 "mistral-medium-2604",
+                "mistral-medium-3",
             ],
             small: false,
             family: ModelFamily::Generic,
@@ -116,6 +117,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
+            prefixes: &["mistral-large-latest", "mistral-large-2512"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.50,
+                output: 1.50,
+                cache_write: 0.00,
+                cache_read: 0.05,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 262_144,
+            reasoning_options: None,
+        },
+        ModelEntry {
             prefixes: &["zai-glm-5-3-flash"],
             small: true,
             family: ModelFamily::Glm,
@@ -134,7 +153,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
-            prefixes: &["glm-5-3", "zai-glm-5-3"],
+            prefixes: &["glm-5-3", "zai-glm-5-3", "zai-glm-5", "zai-glm-latest"],
             small: false,
             family: ModelFamily::Glm,
             vision: false,
@@ -430,10 +449,27 @@ mod tests {
     #[test_case("mistral-medium-latest", 0.15 ; "medium")]
     #[test_case("mistral-small-latest", 0.015 ; "small")]
     #[test_case("ministral-14b-2512", 0.02 ; "ministral")]
+    #[test_case("mistral-large-2512", 0.05 ; "large_3")]
     fn cached_input_pricing(id: &str, expected: f64) {
         assert_eq!(
             lookup_entry(models(), id).unwrap().pricing.cache_read,
             expected
+        );
+    }
+
+    #[test_case("mistral-large-latest", "mistral-large-2512" ; "large_latest_is_large_3")]
+    #[test_case("mistral-large-4-0", LARGE_4 ; "large_4_keeps_its_entry")]
+    #[test_case("zai-glm-5", "zai-glm-5-3" ; "glm_5_alias_is_glm_5_3")]
+    #[test_case("zai-glm-latest", "zai-glm-5-3" ; "glm_latest_alias_is_glm_5_3")]
+    #[test_case("zai-glm-5-2", "zai-glm-5-2" ; "glm_5_2_keeps_its_entry")]
+    #[test_case("zai-glm-5-3-flash", "zai-glm-5-3-flash" ; "glm_5_3_flash_keeps_its_entry")]
+    #[test_case("mistral-medium-3", "mistral-medium-3-5" ; "medium_3_alias_is_medium_3_5")]
+    fn api_names_resolve_to_their_model(id: &str, model: &str) {
+        assert!(
+            lookup_entry(models(), id)
+                .unwrap()
+                .prefixes
+                .contains(&model)
         );
     }
 
