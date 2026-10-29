@@ -1,40 +1,31 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::tools::{
     DEADLINE_EXCEEDED, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
-    ParseError, PermissionScopes, QUESTION_TOOL_NAME, Tool, ToolAudience, ToolContext,
-    ToolExecResult, ToolFailure, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    test_support::stub_ctx, timeout_annotation,
+    ParseError, Tool, ToolContext, ToolExecResult, ToolFailure, ToolInvocation, ToolLive,
+    ToolRegistry, ToolSource, test_support::stub_ctx, timeout_annotation,
 };
 use caudra_agent::{AgentMode, CancelToken, TokenScale, ToolOutput, ToolOutputLimits};
-use caudra_config::{
-    AlwaysThinking, Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey,
-    ToolOutputLines, TouchMode,
-};
+use caudra_config::{AlwaysThinking, Effect, ToolKey, ToolOutputLines, TouchMode};
 use caudra_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
-use caudra_storage::sessions::SessionDatabase;
 use caudra_storage::tool_outputs::ToolOutputStore;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
-const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const TASK_LOCAL_TOOLS_RESERVED: &str =
     "task-local tools are reserved for Caudra's bundled task tool";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
-const TOOL_OUTPUT_PLUGIN: &str = include_str!("../../plugins/tool_output/init.lua");
-const BASH_PLUGIN: &str = include_str!("../../plugins/bash/init.lua");
+const VIEW_IMAGE_PLUGIN: &str = include_str!("../example/view_image.lua");
 const TOOL_OUTPUT_SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
-const OTHER_TOOL_OUTPUT_SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5ww";
 const MANAGED_OUTPUT_PLUGIN: &str = r#"
 caudra.api.register_tool({
     name = "managed_output_probe",
@@ -147,11 +138,10 @@ fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
 }
 
-fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+fn view_image_host() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("view_image", VIEW_IMAGE_PLUGIN).unwrap();
     (reg, host)
 }
 
@@ -691,331 +681,10 @@ fn intentional_streamed_error_keeps_and_loads_managed_ref() {
     assert!(!done.model_output_from_ref);
 }
 
-fn tool_output_host() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("tool_output", TOOL_OUTPUT_PLUGIN).unwrap();
-    (reg, host)
-}
-
 fn save_output_owner(temp: &tempfile::TempDir, session: &SessionRef) {
     caudra_agent::tools::test_support::save_output_owner(
         &StateDir::from_path(temp.path().to_path_buf()),
         session.id(),
-    );
-}
-
-fn tool_output_fixture(text: &str) -> (tempfile::TempDir, ToolContext, String) {
-    let temp = tempfile::tempdir().unwrap();
-    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-        temp.path().to_path_buf(),
-    )));
-    let session: SessionRef = TOOL_OUTPUT_SESSION_ID.parse().unwrap();
-    save_output_owner(&temp, &session);
-    let output = store.put(session.id(), text).unwrap();
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.session_id = Some(session);
-    ctx.tool_output_store = Some(store);
-    (temp, ctx, output.id.to_string())
-}
-
-#[test]
-fn managed_tool_output_read_requires_a_session() {
-    let (reg, _host) = tool_output_host();
-    let (_temp, mut ctx, output_id) = tool_output_fixture("output");
-    ctx.session_id = None;
-
-    let error = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": output_id }),
-        &ctx,
-    )
-    .unwrap_err();
-    assert!(
-        error.contains("tool output retrieval requires a session"),
-        "got: {error}"
-    );
-}
-
-#[test]
-fn managed_tool_output_rejects_invalid_ids() {
-    let (reg, _host) = tool_output_host();
-    let (_temp, ctx, _output_id) = tool_output_fixture("output");
-
-    let error = exec_with_ctx(
-        &reg,
-        "tool_output_grep",
-        json!({ "output_id": "../not-an-output-id", "pattern": "output" }),
-        &ctx,
-    )
-    .unwrap_err();
-    assert!(error.contains("invalid tool output ID"), "got: {error}");
-}
-
-#[test]
-fn managed_tool_output_enforces_session_ownership() {
-    let (reg, _host) = tool_output_host();
-    let (_temp, mut ctx, output_id) = tool_output_fixture("private output");
-    ctx.session_id = Some(OTHER_TOOL_OUTPUT_SESSION_ID.parse().unwrap());
-
-    let error = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": output_id }),
-        &ctx,
-    )
-    .unwrap_err();
-    assert!(error.contains("does not exist for session"), "got: {error}");
-}
-
-#[test]
-fn managed_tool_output_read_paginates_with_exact_hint() {
-    const TEXT: &str = "one\ntwo\nthree\nfour\n";
-
-    let (reg, _host) = tool_output_host();
-    let (_temp, ctx, output_id) = tool_output_fixture(TEXT);
-    let first = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": &output_id, "limit": 2 }),
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(
-        first,
-        format!(
-            "Tool output {output_id}: lines 1-2 of 4 (19 bytes)\n\none\ntwo\n\nNext call: tool_output_read(output_id=\"{output_id}\", offset=3, limit=2)"
-        )
-    );
-
-    let second = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": &output_id, "offset": 3, "limit": 2 }),
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(
-        second,
-        format!("Tool output {output_id}: lines 3-4 of 4 (19 bytes)\n\nthree\nfour")
-    );
-}
-
-#[test]
-fn managed_tool_output_read_continues_within_a_long_utf8_line() {
-    let text = "蟹".repeat(1_000);
-    let (reg, _host) = tool_output_host();
-    let (_temp, ctx, output_id) = tool_output_fixture(&text);
-
-    let first = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": &output_id, "limit": 1 }),
-        &ctx,
-    )
-    .unwrap();
-    assert!(
-        first.contains(&format!(
-            "Next call: tool_output_read(output_id=\"{output_id}\", offset=1, byte_offset=1998, limit=1)"
-        )),
-        "got: {first}"
-    );
-    let second = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({
-            "output_id": &output_id,
-            "offset": 1,
-            "byte_offset": 1998,
-            "limit": 1,
-        }),
-        &ctx,
-    )
-    .unwrap();
-    let first_body = first
-        .split_once("\n\n")
-        .unwrap()
-        .1
-        .split_once("\n\nNext call:")
-        .unwrap()
-        .0;
-    let second_body = second.split_once("\n\n").unwrap().1;
-
-    assert_eq!(format!("{first_body}{second_body}"), text);
-}
-
-#[test]
-fn managed_tool_output_grep_formats_context_and_exact_hint() {
-    const TEXT: &str = "before\nerror 42\nbetween\nerror 7\nafter\n";
-
-    let (reg, _host) = tool_output_host();
-    let (_temp, ctx, output_id) = tool_output_fixture(TEXT);
-    let first = exec_with_ctx(
-        &reg,
-        "tool_output_grep",
-        json!({
-            "output_id": &output_id,
-            "pattern": "error",
-            "limit": 1,
-            "context_before": 1,
-            "context_after": 1,
-        }),
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(
-        first,
-        format!(
-            "1- before\n2: error 42\n3- between\n\nNext call: tool_output_grep(output_id=\"{output_id}\", pattern=\"error\", offset=4, limit=1, context_before=1, context_after=1)"
-        )
-    );
-
-    let second = exec_with_ctx(
-        &reg,
-        "tool_output_grep",
-        json!({
-            "output_id": &output_id,
-            "pattern": "error",
-            "offset": 4,
-            "limit": 1,
-            "context_before": 1,
-            "context_after": 1,
-        }),
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(second, "3- between\n4: error 7\n5- after");
-}
-
-#[test]
-fn managed_tool_output_formatting_stays_within_store_caps() {
-    let text = (0..40)
-        .map(|_| "x".repeat(2_000))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (reg, _host) = tool_output_host();
-    let (_temp, ctx, output_id) = tool_output_fixture(&text);
-
-    let output = exec_with_ctx(
-        &reg,
-        "tool_output_read",
-        json!({ "output_id": &output_id, "limit": 200 }),
-        &ctx,
-    )
-    .unwrap();
-    assert!(output.len() <= 50 * 1024, "{} bytes", output.len());
-    assert!(output.lines().count() <= 2_000);
-    assert!(output.contains("Next call: tool_output_read"));
-
-    let output = exec_with_ctx(
-        &reg,
-        "tool_output_grep",
-        json!({ "output_id": output_id, "pattern": "x", "limit": 200 }),
-        &ctx,
-    )
-    .unwrap();
-    assert!(output.len() <= 50 * 1024, "{} bytes", output.len());
-    assert!(output.lines().count() <= 2_000);
-    assert!(output.contains("Next call: tool_output_grep"));
-}
-
-#[test]
-fn managed_tool_output_is_default_documentable_and_prompt_free() {
-    let (reg, _host) = builtins_host();
-
-    for (name, required, optional) in [
-        (
-            "tool_output_read",
-            &["output_id"][..],
-            &["offset", "byte_offset", "limit"][..],
-        ),
-        (
-            "tool_output_grep",
-            &["output_id", "pattern"][..],
-            &["offset", "limit", "context_before", "context_after"][..],
-        ),
-    ] {
-        let entry = reg
-            .get(name)
-            .unwrap_or_else(|| panic!("default builtin {name} was not registered"));
-        assert_eq!(entry.tool.audience(), ToolAudience::all());
-        assert!(
-            matches!(entry.source, ToolSource::Lua { ref plugin, .. } if plugin.as_ref() == "tool_output")
-        );
-
-        let schema = entry.tool.schema();
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], false);
-        let properties = schema["properties"].as_object().unwrap();
-        let schema_required: Vec<&str> = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect();
-        for field in required {
-            assert!(
-                schema_required.contains(field),
-                "{name}.{field} is optional"
-            );
-            assert_eq!(properties[*field]["type"], "string");
-        }
-        for field in optional {
-            assert!(properties.contains_key(*field), "missing {name}.{field}");
-            assert_eq!(properties[*field]["type"], "integer");
-            assert!(
-                properties[*field]["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("default:"),
-                "{name}.{field} does not document its default"
-            );
-        }
-
-        let input = if name == "tool_output_read" {
-            json!({ "output_id": "not-an-output-id" })
-        } else {
-            json!({ "output_id": "not-an-output-id", "pattern": "x" })
-        };
-        let invocation = entry.tool.parse(&input).unwrap();
-        assert!(smol::block_on(invocation.permission_scopes()).is_none());
-    }
-}
-
-// `required` is emitted in property order, which comes from a Lua hash table.
-fn sorted_required(schema: &Value) -> Vec<&str> {
-    let mut fields: Vec<&str> = schema["required"]
-        .as_array()
-        .expect("object schema must declare required fields")
-        .iter()
-        .map(|field| field.as_str().expect("required entry must be a string"))
-        .collect();
-    fields.sort_unstable();
-    fields
-}
-
-#[test]
-fn question_schema_requires_header_options_and_option_descriptions() {
-    let (reg, _host) = builtins_host();
-    let schema = reg
-        .get(QUESTION_TOOL_NAME)
-        .expect("question builtin was not registered")
-        .tool
-        .schema();
-
-    let question = &schema["properties"]["questions"]["items"];
-    assert_eq!(sorted_required(question), ["header", "options", "question"]);
-    assert_eq!(
-        sorted_required(&question["properties"]["options"]["items"]),
-        ["description", "label"]
-    );
-
-    let multi_select = &question["properties"]["multiSelect"];
-    assert_eq!(multi_select["type"], "boolean");
-    assert!(
-        multi_select.get("alias").is_none(),
-        "alias must stay host-side and never reach the model"
     );
 }
 
@@ -1263,37 +932,6 @@ fn user_plugin_with_valid_manifest_accepts_allow_permission_rule() {
     let rules = host.plugin_rules().snapshot();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].effect, Effect::Allow);
-}
-
-#[test]
-fn bundled_memory_policy_still_allows_owned_paths() {
-    const MEMORY_POLICY_TOOLS: &[&str] = &["memory", "file_write", "file_edit", "file_apply_patch"];
-
-    let (_reg, host) = builtins_host();
-    let rules = host.plugin_rules().snapshot();
-    let memory_scope = rules
-        .iter()
-        .find(|rule| {
-            rule.tool == ToolKey::native("memory")
-                && rule.effect == Effect::Allow
-                && rule
-                    .scope
-                    .as_deref()
-                    .is_some_and(|scope| scope.ends_with("/memories/**"))
-        })
-        .and_then(|rule| rule.scope.as_deref())
-        .expect("bundled memory allow rule missing");
-
-    for tool in MEMORY_POLICY_TOOLS {
-        assert!(
-            rules.iter().any(|rule| {
-                rule.tool == ToolKey::native(tool)
-                    && rule.scope.as_deref() == Some(memory_scope)
-                    && rule.effect == Effect::Allow
-            }),
-            "missing bundled memory policy for {tool}"
-        );
-    }
 }
 
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
@@ -3491,59 +3129,6 @@ fn register_options_rejects_bad_spec(src: &str, expected: &str) {
 }
 
 #[test]
-fn builtin_opts_flow_from_setup_plugins() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let raw = host
-        .send_run_init_lua(
-            "caudra.setup({ plugins = { grep = { search_result_limit = 42 } } })".to_owned(),
-            "test_init.lua".to_owned(),
-            None,
-        )
-        .unwrap()
-        .expect("expected Some(RawConfig)");
-    host.load_builtins(&PluginsConfig::from_plugins(raw.plugins))
-        .unwrap();
-
-    let options = host.plugin_options().unwrap();
-    let grep = options.get("grep").expect("grep options registered");
-    let limit = grep
-        .iter()
-        .find(|o| o.name == "search_result_limit")
-        .expect("search_result_limit declared");
-    assert!(limit.default.is_some(), "declared default surfaces");
-    assert!(limit.min.is_some(), "declared min surfaces");
-    assert!(!limit.desc.is_empty(), "declared desc surfaces");
-}
-
-#[test_case::test_case(
-    serde_json::json!({}),
-    &["edit", "multiedit", "edit_lines"], &["insert_lines"]
-    ; "defaults_on_insert_lines_opt_in"
-)]
-#[test_case::test_case(
-    serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
-    &["edit", "insert_lines"], &["multiedit", "edit_lines"]
-    ; "toggles_flip_sub_tools"
-)]
-fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[&str]) {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let config = PluginsConfig {
-        enabled: true,
-        names: vec!["edit".to_owned()],
-        opts: HashMap::from([("edit".to_owned(), json_obj(opts))]),
-    };
-    host.load_builtins(&config).unwrap();
-    for tool in on {
-        assert!(reg.get(tool).is_some(), "{tool} should be registered");
-    }
-    for tool in off {
-        assert!(reg.get(tool).is_none(), "{tool} should not be registered");
-    }
-}
-
-#[test]
 fn undeclared_opts_fail_the_load() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -3555,57 +3140,6 @@ fn undeclared_opts_fail_the_load() {
         )
         .expect_err("plugin load should fail");
     assert!(err.to_string().contains(UNDECLARED_OPTS_ERR), "got: {err}");
-}
-
-#[test]
-fn opts_for_unknown_plugin_fail_load_builtins() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.opts.insert(
-        "bsah".to_owned(),
-        json_obj(serde_json::json!({ "timeout_secs": 5 })),
-    );
-    let err = host
-        .load_builtins(&config)
-        .expect_err("load_builtins should fail");
-    assert!(
-        err.to_string()
-            .contains("plugins.bsah sets options (timeout_secs)"),
-        "got: {err}"
-    );
-}
-
-#[test]
-fn unknown_plugin_name_fails_load_builtins() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.names.push("gerp".to_string());
-    let err = host
-        .load_builtins(&config)
-        .expect_err("load_builtins should fail");
-    assert!(
-        err.to_string().contains("no bundled plugin named \"gerp\""),
-        "got: {err}"
-    );
-}
-
-#[test]
-fn disabled_plugin_opts_are_ignored_not_rejected() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let config = PluginsConfig {
-        enabled: true,
-        names: vec!["grep".to_owned()],
-        opts: HashMap::from([(
-            "bash".to_owned(),
-            json_obj(serde_json::json!({ "timeout_secs": 180 })),
-        )]),
-    };
-    host.load_builtins(&config).unwrap();
-    assert!(reg.get("bash").is_none(), "bash stays disabled");
-    assert!(reg.get("grep").is_some(), "enabled plugin still loads");
 }
 
 #[test_case::test_case("true", AlwaysThinking::Toggle(true) ; "bool")]
@@ -3829,18 +3363,6 @@ fn unload_clears_commands() {
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
 
-/// `/tasks` and `/sessions` used to be Rust commands. The plugins that took
-/// them over have to keep the names, or the palette quietly loses a row.
-#[test]
-fn builtin_plugins_register_their_commands() {
-    let (_reg, host) = builtins_host();
-    let snap = host.command_reader().load();
-    let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
-    for command in BUILTIN_COMMANDS {
-        assert!(names.contains(command), "missing {command} in {names:?}");
-    }
-}
-
 #[test]
 fn job_callback_finishes_after_handler_returns_nil() {
     let reg = fresh_registry();
@@ -3911,22 +3433,6 @@ fn ctx_set_deadline_twice_errors() {
     assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
 }
 
-/// Generous: every wait below ends on an event, never on the clock, so only
-/// an already failing test pays this.
-const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
-    loop {
-        if let Some(got) = check() {
-            return got;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what}");
-        std::thread::sleep(CANCEL_POLL_INTERVAL);
-    }
-}
-
 const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
 const PARKED_DEADLINE_PLUGIN: &str = r#"
 caudra.api.register_tool({
@@ -3964,656 +3470,6 @@ fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
     assert_eq!(result.output.unwrap_err(), PARKED_DEADLINE_REPLY);
     assert_eq!(result.failure, Some(ToolFailure::Timeout));
     drop(host);
-}
-
-const BASH_CANCEL_ID: &str = "bash-cancel-1";
-const BASH_CONTROL_RESERVE_BYTES: usize = 256;
-const BASH_OUTPUT_LIMIT_MARKER: &str = "[stopped: output limit exceeded]";
-const BASH_STREAM_FAILURE_MARKER: &str = "[stopped: stream failure]";
-/// Mirrors the cancelled marker in `plugins/lib/caudra/partial.lua`.
-const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
-/// Assembled by printf so the probe never appears in the command header.
-const BASH_PARTIAL_PROBE: &str = "XY";
-const BASH_PARTIAL_CMD: &str = "sleep 1 && printf '%s%s\\n' X Y && sleep 30";
-
-fn bash_cancel_host() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    (reg, host)
-}
-
-fn bash_dispatch_context(
-    temp: &tempfile::TempDir,
-    max_store_bytes: usize,
-) -> (ToolContext, Arc<ToolOutputStore>, SessionRef) {
-    let store = Arc::new(ToolOutputStore::with_max_bytes(
-        StateDir::from_path(temp.path().to_path_buf()),
-        max_store_bytes,
-    ));
-    let session = SessionRef::generate();
-    save_output_owner(temp, &session);
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.config.no_rtk = true;
-    ctx.session_id = Some(session.clone());
-    ctx.tool_output_store = Some(Arc::clone(&store));
-    (ctx, store, session)
-}
-
-#[test]
-fn bash_returns_full_raw_output_and_host_limits() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let config = PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::from([(
-            "bash".to_owned(),
-            json_obj(json!({ "max_output_lines": 4, "max_output_bytes": 1_000 })),
-        )]),
-    };
-    host.load_builtins(&config).unwrap();
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.config.no_rtk = true;
-
-    let result = exec_result_with_ctx(
-        &reg,
-        "bash",
-        json!({ "command": "printf 'one\\ntwo\\nthree\\nfour\\n'" }),
-        &ctx,
-    );
-
-    assert_eq!(
-        result.output_limits,
-        Some(ToolOutputLimits {
-            max_lines: 4,
-            max_bytes: 1_000,
-        })
-    );
-    let output = result.output.unwrap().as_text();
-    assert_eq!(output, "one\ntwo\nthree\nfour\n");
-    assert!(!output.contains("[truncated"));
-}
-
-#[test_case::test_case("printf foo; exit 7", "foo\nExit code: 7" ; "unterminated_output")]
-#[test_case::test_case("printf 'foo\\n'; exit 7", "foo\nExit code: 7" ; "trailing_newline")]
-fn bash_exit_code_separator_is_exact(command: &str, expected: &str) {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.config.no_rtk = true;
-
-    let error = exec_result_with_ctx(&reg, "bash", json!({ "command": command }), &ctx)
-        .output
-        .unwrap_err();
-
-    assert_eq!(error, expected);
-}
-
-#[test]
-fn bash_small_output_discards_managed_artifact() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let (ctx, _store, _session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-small".into(),
-        "bash",
-        &json!({ "command": "printf small-output" }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(!done.is_error);
-    assert_eq!(done.output.as_text(), "small-output");
-    assert!(done.output_ref.is_none());
-    let stats = SessionDatabase::open(&StateDir::from_path(temp.path().to_path_buf()))
-        .unwrap()
-        .stats()
-        .unwrap();
-    assert_eq!(stats.saved_output_count, 0);
-}
-
-#[test]
-fn bash_large_error_persists_complete_output_and_bounds_preview() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::from([(
-            "bash".to_owned(),
-            json_obj(json!({ "max_output_lines": 5, "max_output_bytes": 360 })),
-        )]),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
-    let expected = format!("{}\nExit code: 7", "0".repeat(9_000));
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-large".into(),
-        "bash",
-        &json!({ "command": "printf '%09000d' 0; exit 7" }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(done.is_error);
-    assert!(done.output.as_text().len() <= 360);
-    assert!(done.model_output.as_ref().unwrap().len() <= 360);
-    let output_ref = done.output_ref.unwrap();
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        expected
-    );
-}
-
-#[test]
-fn bash_persists_a_single_line_larger_than_transport_chunks() {
-    const OUTPUT_BYTES: usize = 40_000;
-
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-long-line".into(),
-        "bash",
-        &json!({ "command": format!("printf '%0{OUTPUT_BYTES}d' 0") }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(!done.is_error);
-    let output_ref = done.output_ref.unwrap();
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        "0".repeat(OUTPUT_BYTES)
-    );
-}
-
-#[test]
-fn bash_live_view_fragments_a_huge_line_with_bounded_rows() {
-    const OUTPUT_BYTES: usize = 40_000;
-    const DISPLAY_FRAGMENT_BYTES: usize = 500;
-    const TOOL_ID: &str = "bash-live-long-line";
-
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let (tx, events) = flume::unbounded();
-    let event_tx = caudra_agent::EventSender::new(tx, 0);
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx_with(
-        &caudra_agent::AgentMode::Build,
-        Some(&event_tx),
-        Some(TOOL_ID),
-    );
-    ctx.config.no_rtk = true;
-
-    let done = smol::block_on(
-        reg.get("bash")
-            .unwrap()
-            .tool
-            .parse(&json!({ "command": format!("printf '%0{OUTPUT_BYTES}d' 0") }))
-            .unwrap()
-            .execute(&ctx),
-    );
-
-    assert!(done.output.is_ok());
-    let buf = recv_live_buf(&events, TOOL_ID).expect("bash did not publish its live buffer");
-    let snapshot = buf.take();
-    let line_text = snapshot
-        .lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        line_text
-            .iter()
-            .all(|line| line.len() <= DISPLAY_FRAGMENT_BYTES),
-        "live row exceeded {DISPLAY_FRAGMENT_BYTES} bytes"
-    );
-    assert!(
-        line_text.iter().any(|line| {
-            line.len() == DISPLAY_FRAGMENT_BYTES && line.bytes().all(|byte| byte == b'0')
-        }),
-        "no full bounded output fragment was rendered"
-    );
-}
-
-#[test]
-fn bash_nonzero_exit_uses_control_reserve_at_process_output_cap() {
-    const STORE_MAX_BYTES: usize = 20 * 1024;
-    const EXIT_CODE: i32 = 7;
-
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let (ctx, store, session) = bash_dispatch_context(&temp, STORE_MAX_BYTES);
-    let process_bytes = STORE_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-control-reserve".into(),
-        "bash",
-        &json!({
-            "command": format!("printf '%0{process_bytes}d' 0; exit {EXIT_CODE}")
-        }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(done.is_error);
-    assert!(
-        done.model_suffix()
-            .is_none_or(|suffix| !suffix.contains("output limit"))
-    );
-    let output_ref = done.output_ref.unwrap();
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        format!("{}\nExit code: {EXIT_CODE}", "0".repeat(process_bytes))
-    );
-}
-
-#[test]
-fn bash_invalid_utf8_is_an_explicit_tool_error() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.config.no_rtk = true;
-
-    let error = exec_result_with_ctx(&reg, "bash", json!({ "command": "printf '\\xFF'" }), &ctx)
-        .output
-        .unwrap_err();
-
-    assert!(error.contains("Bash job stream failed"), "got: {error}");
-    assert!(error.contains("not valid UTF-8"), "got: {error}");
-}
-
-#[test]
-fn bash_stream_failure_persists_a_reason_marker_after_partial_output() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let (ctx, store, session) = bash_dispatch_context(&temp, 100 * 1024 * 1024);
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-stream-failure".into(),
-        "bash",
-        &json!({ "command": "printf 'accepted\\xFF'" }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(done.is_error);
-    assert!(
-        done.model_suffix()
-            .is_some_and(|suffix| suffix.contains("Bash job stream failed"))
-    );
-    let output_ref = done.output_ref.unwrap();
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        format!("accepted\n{BASH_STREAM_FAILURE_MARKER}")
-    );
-}
-
-#[test]
-fn bash_no_session_fallback_enforces_cap_and_reserves_control() {
-    const TEST_FALLBACK_MAX_BYTES: usize = 512;
-
-    let test_limit = format!("local FALLBACK_MAX_OUTPUT_BYTES = {TEST_FALLBACK_MAX_BYTES}");
-    let source = BASH_PLUGIN.replacen(
-        "local FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024 * 1024",
-        &test_limit,
-        1,
-    );
-    assert_ne!(source, BASH_PLUGIN, "bash fallback limit fixture drifted");
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("bash", &source).unwrap();
-    let mut ctx = caudra_agent::tools::test_support::stub_ctx(&caudra_agent::AgentMode::Build);
-    ctx.config.no_rtk = true;
-    let process_bytes = TEST_FALLBACK_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
-
-    let at_cap = exec_result_with_ctx(
-        &reg,
-        "bash",
-        json!({
-            "command": format!("printf '%0{process_bytes}d' 0; exit 7")
-        }),
-        &ctx,
-    )
-    .output
-    .unwrap_err();
-    assert_eq!(
-        at_cap,
-        format!("{}\nExit code: 7", "0".repeat(process_bytes))
-    );
-
-    let over_cap = exec_result_with_ctx(
-        &reg,
-        "bash",
-        json!({ "command": format!("printf '%0{}d' 0", process_bytes + 1) }),
-        &ctx,
-    )
-    .output
-    .unwrap_err();
-    assert!(
-        over_cap.contains("Bash output limit exceeded; command stopped"),
-        "got: {over_cap}"
-    );
-}
-
-#[test]
-fn bash_output_limit_finishes_prefix_and_ignores_later_callbacks() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig {
-        enabled: true,
-        names: vec!["bash".to_owned()],
-        opts: HashMap::new(),
-    })
-    .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let store_max_bytes = 16 * 1024 + BASH_CONTROL_RESERVE_BYTES;
-    let (ctx, store, session) = bash_dispatch_context(&temp, store_max_bytes);
-
-    let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-        &reg,
-        None,
-        "bash-limit".into(),
-        "bash",
-        &json!({ "command": "printf '%032768d' 0" }),
-        &ctx,
-        caudra_agent::agent::tool_dispatch::Emit::Silent,
-    ));
-
-    assert!(done.is_error);
-    assert!(
-        done.model_suffix()
-            .unwrap()
-            .contains("Bash output limit exceeded; command stopped")
-    );
-    let output_ref = done.output_ref.unwrap();
-    let accepted = store.load_text(session.id(), output_ref.id).unwrap();
-    let (process_output, marker) = accepted.rsplit_once('\n').unwrap();
-    assert_eq!(marker, BASH_OUTPUT_LIMIT_MARKER);
-    assert!(process_output.len() <= store_max_bytes - BASH_CONTROL_RESERVE_BYTES);
-    assert!(process_output.bytes().all(|byte| byte == b'0'));
-}
-
-/// Esc mid-stream on a real bash run: the lines printed so far come back as
-/// an error reply ending in the marker, not a bare "cancelled".
-#[test]
-fn cancelled_bash_keeps_streamed_output_as_partial() {
-    let (reg, host) = bash_cancel_host();
-    let (tx, events) = flume::unbounded();
-    let event_tx = caudra_agent::EventSender::new(tx, 0);
-    let (trigger, token) = caudra_agent::CancelToken::new();
-    let temp = tempfile::tempdir().unwrap();
-    let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
-        temp.path().to_path_buf(),
-    )));
-    let session = SessionRef::generate();
-    save_output_owner(&temp, &session);
-    let thread_store = Arc::clone(&store);
-    let thread_session = session.clone();
-    let (result_tx, result_rx) = flume::bounded(1);
-    std::thread::spawn(move || {
-        let mut ctx = caudra_agent::tools::test_support::stub_ctx_with(
-            &caudra_agent::AgentMode::Build,
-            Some(&event_tx),
-            Some(BASH_CANCEL_ID),
-        );
-        ctx.cancel = token;
-        ctx.session_id = Some(thread_session);
-        ctx.tool_output_store = Some(thread_store);
-        // The rtk probe costs up to two 2s job waits before the command even
-        // starts: pointless here, and a flake risk under load.
-        ctx.config.no_rtk = true;
-        let input = json!({ "command": BASH_PARTIAL_CMD });
-        let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-            &reg,
-            None,
-            BASH_CANCEL_ID.into(),
-            "bash",
-            &input,
-            &ctx,
-            caudra_agent::agent::tool_dispatch::Emit::Silent,
-        ));
-        result_tx.send(done).ok();
-        drop(host);
-    });
-
-    let buf = poll_until("bash must publish its live buf", || {
-        recv_live_buf(&events, BASH_CANCEL_ID)
-    });
-    poll_until("bash output never reached the live buf", || {
-        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
-    });
-
-    trigger.cancel();
-
-    let done = result_rx
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("cancelled bash must settle");
-    assert!(done.is_error);
-    assert_eq!(
-        done.output.as_text(),
-        format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}")
-    );
-    let output_ref = done.output_ref.unwrap();
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}")
-    );
-}
-
-#[test]
-fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
-    const STORE_MAX_BYTES: usize = 20 * 1024;
-    // Split like `BASH_PARTIAL_PROBE`, so printf assembles the probe and it
-    // never appears in the command header the live buf carries from the start.
-    const PROBE_HEAD: &str = "CAP-";
-    const PROBE_TAIL: &str = "END";
-
-    let (reg, host) = bash_cancel_host();
-    let (tx, events) = flume::unbounded();
-    let event_tx = caudra_agent::EventSender::new(tx, 0);
-    let (trigger, token) = caudra_agent::CancelToken::new();
-    let temp = tempfile::tempdir().unwrap();
-    let store = Arc::new(ToolOutputStore::with_max_bytes(
-        StateDir::from_path(temp.path().to_path_buf()),
-        STORE_MAX_BYTES,
-    ));
-    let session = SessionRef::generate();
-    save_output_owner(&temp, &session);
-    let thread_store = Arc::clone(&store);
-    let thread_session = session.clone();
-    let probe = format!("{PROBE_HEAD}{PROBE_TAIL}");
-    let process_bytes = STORE_MAX_BYTES - BASH_CONTROL_RESERVE_BYTES;
-    // The probe ends on a newline because the view holds an unterminated line
-    // back, so without one it would never reach the buf the test polls.
-    let zero_bytes = process_bytes - probe.len() - 2;
-    let process_output = format!("{}\n{probe}\n", "0".repeat(zero_bytes));
-    let command = format!(
-        "printf '%0{zero_bytes}d' 0; printf '\\n%s%s\\n' '{PROBE_HEAD}' '{PROBE_TAIL}'; sleep 30"
-    );
-    let (result_tx, result_rx) = flume::bounded(1);
-    std::thread::spawn(move || {
-        let mut ctx = caudra_agent::tools::test_support::stub_ctx_with(
-            &caudra_agent::AgentMode::Build,
-            Some(&event_tx),
-            Some("bash-cancel-cap"),
-        );
-        ctx.cancel = token;
-        ctx.session_id = Some(thread_session);
-        ctx.tool_output_store = Some(thread_store);
-        ctx.config.no_rtk = true;
-        let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
-            &reg,
-            None,
-            "bash-cancel-cap".into(),
-            "bash",
-            &json!({ "command": command }),
-            &ctx,
-            caudra_agent::agent::tool_dispatch::Emit::Silent,
-        ));
-        result_tx.send(done).ok();
-        drop(host);
-    });
-
-    let buf = poll_until("bash must publish its live buf", || {
-        recv_live_buf(&events, "bash-cancel-cap")
-    });
-    poll_until("bash cap probe never reached the live buf", || {
-        buf.take().text().contains(&probe).then_some(())
-    });
-    trigger.cancel();
-
-    let done = result_rx
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("cancelled bash at cap must settle");
-    assert!(done.is_error);
-    assert!(
-        done.model_suffix()
-            .is_none_or(|suffix| !suffix.contains("output limit"))
-    );
-    let output_ref = done.output_ref.unwrap();
-    // No separator before the marker: the process output already ends on a
-    // newline, so `append_control` adds none.
-    assert_eq!(
-        store.load_text(session.id(), output_ref.id).unwrap(),
-        format!("{process_output}{BASH_PARTIAL_MARKER}")
-    );
-}
-
-#[test]
-fn restore_tool_async_ordering_and_delivery() {
-    let (_reg, host) = builtins_host();
-
-    let input = serde_json::json!({"command": "echo ok", "timeout": 1});
-
-    let handle = host.event_handle();
-    let (tx, rx) = flume::unbounded();
-    let event_tx = caudra_agent::EventSender::new(tx, 0);
-
-    let bash_item = |id: &str| caudra_lua::RestoreItem {
-        tool: Arc::from("bash"),
-        tool_use_id: id.to_owned(),
-        output: "tool bash timed out after 1s".to_owned(),
-        input: input.clone(),
-        is_error: true,
-        tool_output_lines: ToolOutputLines::default(),
-        theme_gen: None,
-        clicks: Vec::new(),
-        state: None,
-        lua_provenance: None,
-    };
-    let unknown_item = caudra_lua::RestoreItem {
-        tool: Arc::from("definitely_not_a_tool"),
-        tool_use_id: "unknown_id".to_owned(),
-        output: "ignored".to_owned(),
-        input: serde_json::json!({}),
-        is_error: false,
-        tool_output_lines: ToolOutputLines::default(),
-        theme_gen: None,
-        clicks: Vec::new(),
-        state: None,
-        lua_provenance: None,
-    };
-
-    handle.request_restore(unknown_item, event_tx.clone());
-    handle.request_restore(bash_item("a"), event_tx.clone());
-    handle.request_restore(bash_item("b"), event_tx.clone());
-
-    handle.wait_restore_complete_for_test();
-
-    let snapshots: Vec<caudra_agent::Envelope> = rx.drain().collect();
-
-    let tool_ids: Vec<&str> = snapshots
-        .iter()
-        .filter_map(|env| match &env.event {
-            caudra_agent::AgentEvent::ToolSnapshot { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    assert!(
-        !tool_ids.contains(&"unknown_id"),
-        "unknown tool should emit no snapshots"
-    );
-    assert!(
-        tool_ids.contains(&"a"),
-        "known tool 'a' should emit snapshot"
-    );
-    assert!(
-        tool_ids.contains(&"b"),
-        "known tool 'b' should emit snapshot"
-    );
 }
 
 #[test]
@@ -4723,278 +3579,123 @@ fn restore_rejects_an_error_that_never_reached_the_tool() {
     assert!(rx.is_empty());
 }
 
-#[test_case::test_case(
-    "write",
-    serde_json::json!({"path": "/tmp/x.md", "content": "alpha\nbeta"}),
-    "wrote 10 bytes to /tmp/x.md",
-    &["alpha", "beta"]
-    ; "write_tool_restores_file_content"
-)]
-#[test_case::test_case(
-    "memory",
-    serde_json::json!({"command": "write", "path": "n.md", "content": "gamma"}),
-    "wrote n.md (1 line)",
-    &["gamma"]
-    ; "memory_write_restores_saved_content"
-)]
-fn restore_rebuilds_body_from_input_content(
-    tool: &str,
-    input: serde_json::Value,
-    summary: &str,
-    expected: &[&str],
-) {
-    let (_reg, host) = builtins_host();
+const RESTORE_PROBE_TOOL: &str = "restore_probe";
+const RESTORE_PROBE_HEADER: &str = "echo marker";
+const RESTORE_PROBE_PLUGIN: &str = r#"caudra.api.register_tool({
+    name = "restore_probe",
+    description = "t",
+    schema = { type = "object", properties = {} },
+    handler = function() return "ok" end,
+    header = function()
+        local buf = caudra.ui.buf()
+        buf:set_lines(caudra.ui.highlight("echo marker", "bash"))
+        return buf
+    end,
+    restore = function(_, output)
+        local buf = caudra.ui.buf()
+        buf:line("restored " .. output)
+        return buf
+    end,
+})"#;
+
+fn restore_item(tool: &str, tool_use_id: &str) -> caudra_lua::RestoreItem {
+    caudra_lua::RestoreItem {
+        tool: Arc::from(tool),
+        tool_use_id: tool_use_id.to_owned(),
+        output: "ok".to_owned(),
+        input: json!({}),
+        is_error: false,
+        tool_output_lines: ToolOutputLines::default(),
+        theme_gen: None,
+        clicks: Vec::new(),
+        state: None,
+        lua_provenance: None,
+    }
+}
+
+/// Restores every item, then waits for the tasks they spawned, so async
+/// header work has landed before the events are read.
+fn restore_events(items: Vec<caudra_lua::RestoreItem>) -> Vec<caudra_agent::AgentEvent> {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source("restore_probe_plugin", RESTORE_PROBE_PLUGIN)
+        .unwrap();
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
-
-    handle.request_restore(
-        caudra_lua::RestoreItem {
-            tool: Arc::from(tool),
-            tool_use_id: "restore_id".to_owned(),
-            output: summary.to_owned(),
-            input,
-            is_error: false,
-            tool_output_lines: ToolOutputLines::default(),
-            theme_gen: None,
-            clicks: vec![0],
-            state: None,
-            lua_provenance: None,
-        },
-        caudra_agent::EventSender::new(tx, 0),
-    );
+    let event_tx = caudra_agent::EventSender::new(tx, 0);
+    for item in items {
+        handle.request_restore(item, event_tx.clone());
+    }
     handle.wait_restore_complete_for_test();
-
-    let mut text = String::new();
-    for env in rx.drain() {
-        if let caudra_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
-            for line in snapshot.lines.iter() {
-                for span in &line.spans {
-                    text.push_str(&span.text);
-                }
-            }
-        }
-    }
-
-    for needle in expected {
-        assert!(
-            text.contains(needle),
-            "restored body missing '{needle}', got: {text}"
-        );
-    }
-    assert!(
-        !text.contains(summary),
-        "restored body should show content, not the summary: {text}"
-    );
-}
-
-/// Guards the stale-cancelled-handle bug: `permission_scopes` must call
-/// the plugin callback and return parsed scopes, not fall back to raw JSON.
-/// A leaked `{"command":...}` scope would break allow rules.
-#[test_case::test_case("git status" ; "parseable command")]
-#[test_case::test_case("echo 'unterminated" ; "unparseable command")]
-fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
-    let (reg, _host) = builtins_host();
-
-    let input = serde_json::json!({ "command": command });
-    let entry = reg.get("bash").expect("bash registered");
-    let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes())
-        .expect("permission_scopes returned None (would fall back to raw JSON)");
-
-    assert!(
-        !scopes.scopes.iter().any(|s| s.contains("\"command\"")),
-        "fell back to raw JSON scope: {:?}",
-        scopes.scopes
-    );
-}
-
-fn builtin_permission_scopes(
-    reg: &ToolRegistry,
-    tool: &str,
-    input: serde_json::Value,
-) -> caudra_agent::tools::PermissionScopes {
-    let entry = reg.get(tool).unwrap_or_else(|| panic!("{tool} registered"));
-    let invocation = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(invocation.permission_scopes()).expect("permission scopes missing")
+    host.load_source("barrier", "").unwrap();
+    rx.drain().map(|envelope| envelope.event).collect()
 }
 
 #[test]
-fn path_permission_scope_expands_and_normalizes_tilde() {
-    let (reg, _host) = builtins_host();
-    let home = caudra_storage::paths::home().expect("home directory");
-    let scopes = builtin_permission_scopes(
-        &reg,
-        "write",
-        json!({
-            "path": "~/caudra-permission-scope/../scope.txt",
-            "content": "unused",
-        }),
-    );
+fn restore_skips_unknown_tools_and_delivers_each_known_one() {
+    let events = restore_events(vec![
+        restore_item("definitely_not_a_tool", "unknown"),
+        restore_item(RESTORE_PROBE_TOOL, "a"),
+        restore_item(RESTORE_PROBE_TOOL, "b"),
+    ]);
 
-    assert_eq!(
-        scopes.scopes,
-        [home.join("scope.txt").display().to_string()]
-    );
-    assert!(!scopes.force_prompt);
-}
-
-const BLOCKED_READ_PATH: &str = "/tmp/blocked";
-const ALLOWED_READ_PATH: &str = "/tmp/allowed";
-
-/// Runs the real permission evaluator with no response channel, so a call the
-/// rules do not settle reports the refusal instead of waiting on a prompt.
-fn enforce_read_without_prompt(
-    manager: &caudra_agent::permissions::PermissionManager,
-    path: &str,
-) -> Result<(), caudra_agent::permissions::PermissionError> {
-    let (event_tx, _event_rx) = flume::unbounded();
-    smol::block_on(manager.enforce(
-        &ToolKey::native("read"),
-        &PermissionScopes::single(path.to_owned()),
-        &json!({ "path": path }),
-        &caudra_agent::EventSender::new(event_tx, 0),
-        None,
-        "read-request",
-        &caudra_agent::CancelToken::none(),
-        None,
-    ))
+    let mut restored: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            caudra_agent::AgentEvent::ToolSnapshot { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    restored.sort_unstable();
+    restored.dedup();
+    assert_eq!(restored, ["a", "b"]);
 }
 
 #[test]
-fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior() {
-    let (reg, host) = builtins_host();
-    let cases = [
-        (
-            "read",
-            json!({ "path": "/tmp/parent/../scope", "offset": 1, "limit": 1 }),
-        ),
-        ("list", json!({ "path": "/tmp/parent/../scope" })),
-        ("file_index", json!({ "path": "/tmp/parent/../scope" })),
-        ("view_image", json!({ "path": "/tmp/parent/../scope" })),
-        (
-            "glob",
-            json!({ "pattern": "**/*", "path": "/tmp/parent/../scope" }),
-        ),
-        (
-            "grep",
-            json!({ "pattern": "needle", "path": "/tmp/parent/../scope" }),
-        ),
-    ];
-    for (tool, input) in cases {
-        let scopes = builtin_permission_scopes(&reg, tool, input);
-        let expected = if matches!(tool, "glob" | "grep") {
-            "/tmp/scope/**"
-        } else {
-            "/tmp/scope"
-        };
-        assert_eq!(scopes.scopes, [expected], "wrong scope for {tool}");
-        assert!(!scopes.force_prompt, "{tool} unexpectedly forces a prompt");
-    }
+fn restore_header_may_await_async_apis() {
+    let events = restore_events(vec![restore_item(RESTORE_PROBE_TOOL, "header")]);
 
-    let manager = caudra_agent::permissions::PermissionManager::new_nonpersistent(
-        PermissionsConfig {
-            rules: vec![PermissionRule {
-                tool: ToolKey::native("read"),
-                scope: Some(BLOCKED_READ_PATH.into()),
-                effect: Effect::Deny,
-            }],
-            ..PermissionsConfig::default()
+    let header = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            caudra_agent::AgentEvent::ToolHeaderSnapshot { snapshot, .. } => Some(snapshot.text()),
+            _ => None,
+        })
+        .expect("restore must publish a header");
+    assert!(header.contains(RESTORE_PROBE_HEADER), "header: {header}");
+}
+
+/// A plugin presenting another tool's call reads the registry: native tools
+/// have no Lua header, so `tool_header` must ask the tool itself.
+#[test]
+fn tool_registry_apis_see_native_tools() {
+    let reg = fresh_registry();
+    reg.register(
+        Arc::new(UsageTool),
+        ToolSource::Native {
+            owner: "test".into(),
+            contract: "test".into(),
+            trusted: true,
         },
-        "/tmp".into(),
-        host.plugin_rules(),
-    );
-    assert!(enforce_read_without_prompt(&manager, BLOCKED_READ_PATH).is_err());
-    assert!(enforce_read_without_prompt(&manager, ALLOWED_READ_PATH).is_ok());
-}
-
-#[test]
-fn bash_permission_scope_distinguishes_normalized_workdirs() {
-    let (reg, _host) = builtins_host();
-    let first = builtin_permission_scopes(
-        &reg,
-        "bash",
-        json!({ "command": "git status", "workdir": "/tmp/one/../first" }),
-    );
-    let second = builtin_permission_scopes(
-        &reg,
-        "bash",
-        json!({ "command": "git status", "workdir": "/tmp/second" }),
-    );
-    let home = caudra_storage::paths::home().expect("home directory");
-    let expected_home = home.join("second").display().to_string();
-    let tilde = builtin_permission_scopes(
-        &reg,
-        "bash",
-        json!({ "command": "git status", "workdir": "~/one/../second" }),
-    );
-
-    assert_eq!(first.scopes.len(), 1);
-    assert_eq!(second.scopes.len(), 1);
-    assert_ne!(first.scopes, second.scopes);
-    assert!(first.scopes[0].ends_with("caudra-workdir[10]=/tmp/first # caudra-frame[10]"));
-    assert!(second.scopes[0].ends_with("caudra-workdir[11]=/tmp/second # caudra-frame[11]"));
-    assert!(
-        tilde.scopes[0].ends_with(&format!(
-            "caudra-workdir[{}]={} # caudra-frame[{}]",
-            expected_home.len(),
-            expected_home,
-            expected_home.len(),
-        )),
-        "tilde workdir was not normalized: {:?}",
-        tilde.scopes
-    );
-}
-
-#[test_case::test_case("if true; then rm -rf /tmp/hidden; fi" ; "if_statement")]
-#[test_case::test_case("for item in one two; do rm -f \"$item\"; done" ; "loop_statement")]
-#[test_case::test_case("cleanup() { rm -rf /tmp/hidden; }; cleanup" ; "function_definition")]
-fn bash_permission_scopes_include_nested_rm(command: &str) {
-    let (reg, _host) = builtins_host();
-    let scopes = builtin_permission_scopes(&reg, "bash", json!({ "command": command }));
-
-    assert!(
-        scopes.scopes.iter().any(|scope| scope.starts_with("rm ")),
-        "nested rm was hidden: {:?}",
-        scopes.scopes
-    );
-}
-
-#[test]
-fn bash_permission_scopes_include_normalized_redirect_target() {
-    let (reg, _host) = builtins_host();
-    let scopes = builtin_permission_scopes(
-        &reg,
-        "bash",
-        json!({
-            "command": "printf ok > artifacts/../result.txt",
-            "workdir": "/tmp/project",
-        }),
-    );
-
-    assert!(
-        scopes
-            .scopes
-            .iter()
-            .any(|scope| scope.starts_with("redirect ")
-                && scope.contains("=> /tmp/project/result.txt")),
-        "redirect target was hidden: {:?}",
-        scopes.scopes
-    );
-}
-
-#[test_case::test_case("echo $(whoami)" ; "command_substitution")]
-#[test_case::test_case("diff <(printf a) <(printf b)" ; "process_substitution")]
-#[test_case::test_case("(cd /tmp && pwd)" ; "subshell")]
-#[test_case::test_case("echo $((1 + 2))" ; "arithmetic_expansion")]
-fn bash_complex_constructs_force_exact_review(command: &str) {
-    let (reg, _host) = builtins_host();
-    let scopes = builtin_permission_scopes(&reg, "bash", json!({ "command": command }));
-
-    assert!(
-        scopes.force_prompt,
-        "complex command did not force exact review: {:?}",
-        scopes.scopes
-    );
+    )
+    .unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "registry_reader",
+        &format!(
+            r#"
+            assert(caudra.api.tool_header("{USAGE_TOOL_NAME}", {{}}) == "{USAGE_TOOL_NAME}")
+            assert(caudra.api.tool_header("no_such_tool", {{}}) == "no_such_tool")
+            local seen
+            for _, tool in ipairs(caudra.api.get_tools({{ config = {{ disabled_tools = {{ "{USAGE_TOOL_NAME}" }} }} }})) do
+                if tool.name == "{USAGE_TOOL_NAME}" then seen = tool end
+            end
+            assert(seen, "get_tools must list native tools")
+            assert(seen.enabled == false, "disabled_tools must clear enabled")
+            "#
+        ),
+    )
+    .unwrap();
 }
 
 fn exec_tool_with_perms(
@@ -5679,139 +4380,6 @@ fn session_task_id_reopens_completed_history() {
 
 const MODE_MISMATCH_ERR: &str = "uses `build` mode, not requested `plan` mode";
 
-mod task_output_policy {
-    use std::sync::Arc;
-
-    use caudra_agent::AgentMode;
-    use caudra_agent::agent::subagent::STRUCTURED_OUTPUT_TOOL;
-    use caudra_agent::tools::{ToolFilter, test_support::stub_ctx};
-    use caudra_config::PluginsConfig;
-    use caudra_lua::PluginHost;
-    use caudra_providers::provider::{BoxFuture, Provider};
-    use caudra_providers::{
-        AgentError, CacheKey, ContentBlock, Message, Model, ModelInfo, ProviderEvent,
-        RequestOptions, Role, StopReason, StreamResponse,
-    };
-    use serde_json::{Value, json};
-    use test_case::test_case;
-
-    use super::{exec_result_with_ctx, fresh_registry};
-
-    const TASK_TOOL: &str = "task";
-    const OUTPUT_CALL_ID: &str = "task-output";
-    const OUTPUT_ACK: &str = "Output recorded.";
-    const OUTPUT_ANSWER: &str = "required sink dispatched";
-    const TASK_DESCRIPTION: &str = "Required output regression";
-
-    struct OutputProvider;
-
-    impl Provider for OutputProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _model: &'a Model,
-            messages: &'a [Message],
-            _system: &'a str,
-            tools: &'a Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
-            _opts: RequestOptions,
-            _cache_key: Option<&'a CacheKey>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async move {
-                assert!(
-                    tools
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|definition| definition["name"] == STRUCTURED_OUTPUT_TOOL),
-                    "required output definition missing: {tools}"
-                );
-                let result = messages
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .find_map(|block| match block {
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                            ..
-                        } if tool_use_id == OUTPUT_CALL_ID => Some((content, is_error)),
-                        _ => None,
-                    });
-                let (message, stop_reason) = if let Some((content, is_error)) = result {
-                    assert!(!is_error, "required output dispatch failed: {content}");
-                    assert_eq!(content, OUTPUT_ACK);
-                    (
-                        Message::synthetic(OUTPUT_ANSWER.into()),
-                        StopReason::EndTurn,
-                    )
-                } else {
-                    (
-                        Message {
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::tool_use(
-                                OUTPUT_CALL_ID,
-                                STRUCTURED_OUTPUT_TOOL,
-                                json!({"answer": OUTPUT_ANSWER}),
-                            )],
-                            ..Message::default()
-                        },
-                        StopReason::ToolUse,
-                    )
-                };
-                Ok(StreamResponse {
-                    message,
-                    stop_reason: Some(stop_reason),
-                    ..StreamResponse::default()
-                })
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
-    #[test_case(AgentMode::Build, Some("build"); "explicit_build")]
-    #[test_case(AgentMode::Build, Some("plan"); "explicit_plan")]
-    #[test_case(AgentMode::Build, None; "inherited_build")]
-    #[test_case(AgentMode::ReadOnly, None; "inherited_plan")]
-    fn bundled_task_output_survives_child_ceiling(parent_mode: AgentMode, mode: Option<&str>) {
-        let reg = fresh_registry();
-        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_builtins(&PluginsConfig {
-            enabled: true,
-            names: vec![TASK_TOOL.into()],
-            opts: Default::default(),
-        })
-        .unwrap();
-        let mut ctx = stub_ctx(&parent_mode);
-        ctx.registry = Arc::clone(&reg);
-        ctx.provider = Arc::new(OutputProvider);
-        ctx.chat_provider = Arc::clone(&ctx.provider);
-        ctx.tool_ceiling = ToolFilter::Only(Vec::new());
-        let mut input = json!({
-            "description": TASK_DESCRIPTION,
-            "prompt": TASK_DESCRIPTION,
-            "output_schema": {
-                "type": "object",
-                "properties": {"answer": {"type": "string"}},
-                "required": ["answer"],
-                "additionalProperties": false,
-            },
-        });
-        if let Some(mode) = mode {
-            input["mode"] = json!(mode);
-        }
-        let result = exec_result_with_ctx(&reg, TASK_TOOL, input, &ctx);
-        let output = result.output.unwrap();
-        let model_output = result.model_output.unwrap_or_else(|| output.as_text());
-        assert_eq!(
-            serde_json::from_str::<Value>(&model_output).unwrap(),
-            json!({"answer": OUTPUT_ANSWER})
-        );
-    }
-}
-
 /// An omitted mode is the caller's own, so a task opened from build mode can
 /// build. The stored spec is what a continuation is then held to.
 #[test]
@@ -6021,7 +4589,7 @@ fn call_tool_flattens_image_output_with_not_visible_note() {
 fn view_image_tool_returns_image_output() {
     use base64::Engine as _;
 
-    let (reg, _host) = builtins_host();
+    let (reg, _host) = view_image_host();
 
     // The python_execution bridge flattens output to text, so view_image is
     // pointless from the interpreter.
@@ -6055,7 +4623,7 @@ fn view_image_tool_returns_image_output() {
 
 #[test]
 fn view_image_tool_rejects_non_image() {
-    let (reg, _host) = builtins_host();
+    let (reg, _host) = view_image_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("notes.txt");
     std::fs::write(&path, "plain text").unwrap();
@@ -6083,7 +4651,7 @@ fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {
 
 #[test]
 fn view_image_downscales_oversized_png_with_honest_caption() {
-    let (reg, _host) = builtins_host();
+    let (reg, _host) = view_image_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.png");
     image::DynamicImage::new_rgb8(2000, 100)
@@ -6112,7 +4680,7 @@ fn view_image_downscales_oversized_png_with_honest_caption() {
 
 #[test]
 fn view_image_oversized_gif_reencodes_to_png_first_frame() {
-    let (reg, _host) = builtins_host();
+    let (reg, _host) = view_image_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("banner.gif");
     image::DynamicImage::new_rgb8(2000, 8)
@@ -6143,7 +4711,7 @@ fn view_image_oversized_gif_reencodes_to_png_first_frame() {
 fn view_image_small_gif_passes_through_unchanged() {
     use base64::Engine as _;
 
-    let (reg, _host) = builtins_host();
+    let (reg, _host) = view_image_host();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.gif");
     image::DynamicImage::new_rgb8(4, 2)
@@ -6257,178 +4825,4 @@ fn job_callbacks_fire_while_command_handler_parked() {
         .recv_timeout(Duration::from_secs(5))
         .expect("job callbacks starved while command handler was parked");
     assert!(matches!(action, caudra_lua::UiAction::Flash(msg) if msg == "job:hi"));
-}
-
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
-    use super::*;
-
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
-    const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
-    const MAX_OUTPUT_LINES: i32 = 2000;
-
-    #[test]
-    fn missing_offset_fails_parse() {
-        let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
-            .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
-    }
-
-    #[test]
-    fn missing_limit_fails_parse() {
-        let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }))
-            .err()
-            .expect("missing limit should fail");
-        assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
-    }
-
-    #[test]
-    fn both_offset_and_limit_present_parses() {
-        let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let result = entry.tool.parse(&serde_json::json!({
-            "path": "/tmp/foo.txt",
-            "offset": 1,
-            "limit": 10
-        }));
-        assert!(result.is_ok(), "valid input should parse");
-    }
-
-    #[test]
-    fn limit_zero_reads_to_end_with_right_aligned_line_numbers() {
-        let (reg, _host) = builtins_host();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.txt");
-        let content = (1..=100i32)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, &content).unwrap();
-
-        let out = exec_tool(
-            &reg,
-            "read",
-            serde_json::json!({
-                "path": path.to_str().unwrap(),
-                "offset": 1,
-                "limit": 0
-            }),
-        );
-        let out = out.expect("read should succeed");
-        assert!(
-            out.starts_with("  1: line 1\n"),
-            "line 1 must be padded to the width of line 100, got: {out}"
-        );
-        assert!(
-            out.ends_with("\n100: line 100"),
-            "limit=0 should read to the end, got: {out}"
-        );
-    }
-
-    #[test]
-    fn limit_zero_respects_2000_cap() {
-        let (reg, _host) = builtins_host();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("huge.txt");
-        // Write 2500 lines
-        let content = (1..=2500i32)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, &content).unwrap();
-
-        let out = exec_tool(
-            &reg,
-            "read",
-            serde_json::json!({
-                "path": path.to_str().unwrap(),
-                "offset": 1,
-                "limit": 0
-            }),
-        );
-        let out = out.expect("read should succeed");
-        // limit=0 capped at 2000, so should have lines 1-2000
-        assert!(out.contains("1: line 1"), "should start at line 1");
-        assert!(
-            out.contains("2000: line 2000"),
-            "should include line 2000, got last lines: {}",
-            out.split('\n').rev().take(5).collect::<Vec<_>>().join("\n")
-        );
-        assert!(
-            !out.contains("2001: line 2001"),
-            "should not include line 2001"
-        );
-        // Should have truncation hint
-        assert!(
-            out.contains("Truncated"),
-            "should mention truncation, got: {out}"
-        );
-    }
-
-    #[test]
-    fn explicit_limit_above_cap_is_clamped() {
-        let (reg, _host) = builtins_host();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("huge.txt");
-        let content = (1..=MAX_OUTPUT_LINES + 500)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, &content).unwrap();
-
-        let out = exec_tool(
-            &reg,
-            "read",
-            serde_json::json!({
-                "path": path.to_str().unwrap(),
-                "offset": 1,
-                "limit": MAX_OUTPUT_LINES + 500
-            }),
-        );
-        let out = out.expect("read should succeed");
-        assert!(
-            out.contains(&format!("{MAX_OUTPUT_LINES}: line {MAX_OUTPUT_LINES}")),
-            "should include the last line within the cap, got: {out}"
-        );
-        assert!(
-            !out.contains(&format!(
-                "{}: line {}",
-                MAX_OUTPUT_LINES + 1,
-                MAX_OUTPUT_LINES + 1
-            )),
-            "explicit limit must be clamped to the cap, got: {out}"
-        );
-    }
-
-    #[test]
-    fn offset_beyond_file_returns_empty() {
-        let (reg, _host) = builtins_host();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("small.txt");
-        std::fs::write(&path, "just one line\n").unwrap();
-
-        let out = exec_tool(
-            &reg,
-            "read",
-            serde_json::json!({
-                "path": path.to_str().unwrap(),
-                "offset": 100,
-                "limit": 10
-            }),
-        );
-        let out = out.expect("read should succeed");
-        assert!(
-            out.is_empty(),
-            "offset beyond file should return empty, got: {out}"
-        );
-    }
 }

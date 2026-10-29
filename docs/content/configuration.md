@@ -898,9 +898,7 @@ Each feature checks its own options at startup. A typo, a wrong type, or an unkn
 
 `enabled = false` turns off the tools that key produced, under the names they are registered with today, so `plugins.bash` turns off `shell` and `plugins.edit` turns off `file_edit` and `file_apply_patch`. To name a tool directly, use `agent.disabled_tools`, described in [Disabling tools](/docs/tools/#disabling-tools).
 
-The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`.
-
-This table is for bundled plugins only, and it works without Lua. Your own plugins go in `~/.config/caudra/lua/` and need `lua_plugins` turned on. See [Plugins](/docs/plugins/).
+This table is for built-in tools only, and it works without Lua. Your own plugins go in `~/.config/caudra/lua/` and need `lua_plugins` turned on. See [Plugins](/docs/plugins/).
 
 ```toml
 [plugins.bash]

@@ -56,7 +56,7 @@
             path: type:
             (craneLib.filterCargoSources path type)
             || (builtins.match ".*/vendor/crossterm/.*" path != null)
-            || (builtins.match ".*/plugins/.*" path != null)
+            || (builtins.match ".*/caudra-lua/(lua|example|tests/lua)/.*" path != null)
             || (builtins.match ".*/prompts/.*" path != null)
             || (builtins.match ".*/themes/.*" path != null)
             || (builtins.match ".*/caudra-highlight/syntaxes/.*" path != null)

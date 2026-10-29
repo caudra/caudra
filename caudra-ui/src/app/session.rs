@@ -713,6 +713,7 @@ impl App {
         self.recoverable_queue_together = false;
         self.drop_questions();
         self.close_all_overlays();
+        self.discard_btw_threads();
         self.pending_input = PendingInput::None;
         self.cancelling_run = None;
         self.replacement_item = None;
@@ -1744,7 +1745,7 @@ impl App {
     fn retire_current_session(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
         self.release_revert_confirmation();
         self.close_stream_modal();
-        self.stream_modal.forget_parked_draft();
+        self.discard_btw_threads();
         self.flush_goal_log();
         self.checkpoint_now();
         if self.has_content() {

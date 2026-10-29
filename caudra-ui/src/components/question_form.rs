@@ -34,6 +34,7 @@ use super::form::render_form;
 use super::keybindings::{Bind, key};
 use super::sweep::{self, Sweep};
 use super::tab_bar::{Tab, tab_spans};
+use super::tooltip::{Tip, TipKey};
 use super::{Hint, Overlay, VisualRows, field_styles, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
 use crate::theme;
@@ -72,16 +73,42 @@ const MAX_HEIGHT_PERCENT: u16 = 75;
 /// The form wraps the answer box itself, so a painted line is never clipped.
 const UNCLIPPED: usize = usize::MAX;
 const LINE_BREAK: &str = "\n";
-const ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask /btw");
-const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask");
+const TIP_ASK: &str =
+    "Ask a side question about this one without answering it. Nothing enters history";
+const TIP_PICK: &str = "Answer with the highlighted option";
+const TIP_TOGGLE: &str = "Tick or untick the highlighted option";
+const TIP_USE_TYPED: &str = "Use what you typed as the answer";
+const TIP_CHECK_TYPED: &str = "Check the answer, then go on to the next question or the review";
+const TIP_SEND: &str = "Send every answer to the agent";
+const TIP_CONSENT: &str = "Accept or decline, whichever row is highlighted";
+const TIP_NOTE_CLOSE: &str = "Close the note box and keep the note";
+const TIP_NEWLINE: &str = "Start a new line in the box";
+const TIP_LEAVE_BOX: &str = "Leave the box and go back to the options";
+const TIP_NEXT_TAB: &str = "Go to the next question, or the review after the last";
+const TIP_PREVIOUS: &str = "Go back to the previous question";
+const TIP_DISMISS: &str = "Close the form without answering. The agent carries on";
+const TIP_CANCEL: &str = "Stop the agent that asked. Only a new message moves it again";
+const TIP_NOTE: &str = "Write a note the agent gets with your answer or dismissal";
+const TIP_DECLINE: &str = "Turn the server's request down";
+const TIP_DEFER: &str = "Let the agent carry on now and answer this later";
+const TIP_NEXT_DEFERRED: &str = "Show the next question waiting for an answer";
+const TIP_PUT_ASIDE: &str = "Hide the form and keep what you picked for later";
+
+const ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask /btw").tip(TIP_ASK);
+const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask").tip(TIP_ASK);
 /// Every bar but consent's opens on what `Enter` does, then Ask.
 const ASK_HINT_INDEX: usize = 1;
-const NOTE_HINT: Hint = Hint::bind(key::QUESTION_NOTE, "note");
-const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline");
-const DEFER_HINT: Hint = Hint::bind(key::QUESTION_LATER, "later");
-const NEXT_HINT: Hint = Hint::bind(key::QUESTION_LATER, "next");
-const PUT_ASIDE_HINT: Hint = Hint::bind(key::ESC, "later");
+const NOTE_HINT: Hint = Hint::bind(key::QUESTION_NOTE, "note").tip(TIP_NOTE);
+const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline").tip(TIP_DECLINE);
+const DEFER_HINT: Hint = Hint::bind(key::QUESTION_LATER, "later").tip(TIP_DEFER);
+const NEXT_HINT: Hint = Hint::bind(key::QUESTION_LATER, "next").tip(TIP_NEXT_DEFERRED);
+const PUT_ASIDE_HINT: Hint = Hint::bind(key::ESC, "later").tip(TIP_PUT_ASIDE);
 const DISMISS_LABEL: &str = "dismiss";
+const DISMISS_HINT: Hint = Hint::bind(key::ESC, DISMISS_LABEL).tip(TIP_DISMISS);
+const CANCEL_HINT: Hint = Hint::bind(key::QUIT, "cancel").tip(TIP_CANCEL);
+const NEWLINE_HINT: Hint = Hint::bind(SHIFT_ENTER, "newline").tip(TIP_NEWLINE);
+const PREVIOUS_HINT: Hint = Hint::bind(key::SHIFT_TAB, "back").tip(TIP_PREVIOUS);
+const NEXT_TAB_HINT: Hint = Hint::bind(key::TAB, "next").tip(TIP_NEXT_TAB);
 const DEFERRED_TITLE: &str = "Deferred question";
 /// Every bar ends on dismiss and cancel, and a server's form adds decline
 /// right before them.
@@ -94,54 +121,54 @@ const SHIFT_ENTER: Bind = Bind {
 };
 
 const EDITING_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(key::ENTER, "submit").tip(TIP_USE_TYPED),
     ASK_HINT,
-    Hint::bind(SHIFT_ENTER, "newline"),
-    Hint::bind(key::ESC, "back"),
-    Hint::bind(key::QUIT, "cancel"),
+    NEWLINE_HINT,
+    Hint::bind(key::ESC, "back").tip(TIP_LEAVE_BOX),
+    CANCEL_HINT,
 ];
 /// `Enter` and `Esc` both leave the note box, and neither loses the note.
 const NOTE_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "done"),
+    Hint::bind(key::ENTER, "done").tip(TIP_NOTE_CLOSE),
     ASK_HINT,
-    Hint::bind(SHIFT_ENTER, "newline"),
-    Hint::bind(key::ESC, "back"),
-    Hint::bind(key::QUIT, "cancel"),
+    NEWLINE_HINT,
+    Hint::bind(key::ESC, "back").tip(TIP_NOTE_CLOSE),
+    CANCEL_HINT,
 ];
 /// A server's text or number field has no list to go back to, so `Esc`
 /// dismisses it like every other question.
 const TYPED_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "next"),
+    Hint::bind(key::ENTER, "next").tip(TIP_CHECK_TYPED),
     ASK_HINT,
-    Hint::bind(key::SHIFT_TAB, "back"),
-    Hint::bind(key::ESC, "dismiss"),
-    Hint::bind(key::QUIT, "cancel"),
+    PREVIOUS_HINT,
+    DISMISS_HINT,
+    CANCEL_HINT,
 ];
 const CONFIRMING_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(key::ENTER, "submit").tip(TIP_SEND),
     ASK_HINT,
-    Hint::bind(key::SHIFT_TAB, "back"),
-    Hint::bind(key::ESC, "dismiss"),
-    Hint::bind(key::QUIT, "cancel"),
+    PREVIOUS_HINT,
+    DISMISS_HINT,
+    CANCEL_HINT,
 ];
 const MULTI_SELECT_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "toggle"),
+    Hint::bind(key::ENTER, "toggle").tip(TIP_TOGGLE),
     ASK_HINT,
-    Hint::bind(key::TAB, "next"),
-    Hint::bind(key::ESC, "dismiss"),
-    Hint::bind(key::QUIT, "cancel"),
+    NEXT_TAB_HINT,
+    DISMISS_HINT,
+    CANCEL_HINT,
 ];
 const SINGLE_SELECT_HINTS: [Hint; 5] = [
-    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(key::ENTER, "submit").tip(TIP_PICK),
     ASK_HINT,
-    Hint::bind(key::TAB, "next"),
-    Hint::bind(key::ESC, "dismiss"),
-    Hint::bind(key::QUIT, "cancel"),
+    NEXT_TAB_HINT,
+    DISMISS_HINT,
+    CANCEL_HINT,
 ];
 const CONSENT_HINTS: [Hint; 3] = [
-    Hint::bind(key::ENTER, "select"),
-    Hint::bind(key::ESC, "dismiss"),
-    Hint::bind(key::QUIT, "cancel"),
+    Hint::bind(key::ENTER, "select").tip(TIP_CONSENT),
+    DISMISS_HINT,
+    CANCEL_HINT,
 ];
 
 pub enum QuestionFormAction {
@@ -1686,12 +1713,25 @@ impl Overlay for QuestionForm {
     fn cadence(&self) -> Cadence {
         Cadence::IDLE
     }
+
+    fn tooltip(&self) -> Option<Tip> {
+        let Some(FormTarget::Hint(index)) = self.hover else {
+            return None;
+        };
+        let hit = self
+            .row_hits
+            .iter()
+            .find(|hit| hit.target == FormTarget::Hint(index))?;
+        let text = self.hint_pairs().get(index)?.tip_text()?;
+        Some(Tip::at(TipKey::FooterHint(index), hit.area, text))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::key as key_event;
+    use crate::components::tooltip::Anchor;
     use caudra_agent::mcp::elicitation::{
         ABOVE_MAXIMUM, ElicitForm, NO_LABEL, NOT_A_WHOLE_NUMBER, YES_LABEL,
     };
@@ -3836,5 +3876,109 @@ mod tests {
             false => assert!(matches!(action, QuestionFormAction::Cancel)),
         }
         assert_eq!(form.note_text(), NOTE_TEXT, "{EXPECT_NOTE_KEPT}");
+    }
+
+    /// Narrow enough that Ask is shortened, as `ask_hint_stays_visible_and_clickable` pins.
+    const COMPACT_WIDTH: u16 = 24;
+    const NO_TIP: &str = "every hint the bar can draw must explain itself";
+
+    fn single_select() -> QuestionForm {
+        opened(vec![question(HEADER, false)])
+    }
+
+    fn multi_select() -> QuestionForm {
+        opened(vec![question(HEADER, true)])
+    }
+
+    fn editing() -> QuestionForm {
+        typing(false)
+    }
+
+    fn reviewing() -> QuestionForm {
+        let mut form = opened(two_questions());
+        form.review();
+        form
+    }
+
+    fn writing_a_note() -> QuestionForm {
+        noting(vec![question(HEADER, false)])
+    }
+
+    fn typed_field() -> QuestionForm {
+        asked_by_server(vec![count_question()])
+    }
+
+    fn consent() -> QuestionForm {
+        asked_by_server(Vec::new())
+    }
+
+    fn deferrable() -> QuestionForm {
+        delivered(QuestionDelivery::Deferrable)
+    }
+
+    fn deferred_among_others() -> QuestionForm {
+        let mut form = delivered(deferred());
+        form.set_place(Some((1, 2)));
+        form
+    }
+
+    #[test]
+    fn every_hint_the_bar_can_draw_has_a_tip() {
+        let tables: [&[Hint]; 7] = [
+            &EDITING_HINTS,
+            &NOTE_HINTS,
+            &TYPED_HINTS,
+            &CONFIRMING_HINTS,
+            &MULTI_SELECT_HINTS,
+            &SINGLE_SELECT_HINTS,
+            &CONSENT_HINTS,
+        ];
+        let inserted = [
+            COMPACT_ASK_HINT,
+            NOTE_HINT,
+            DECLINE_HINT,
+            DEFER_HINT,
+            NEXT_HINT,
+            PUT_ASIDE_HINT,
+        ];
+        for hint in tables.into_iter().flatten().chain(&inserted) {
+            assert!(hint.has_tip(), "{NO_TIP}: {}", hint.label());
+        }
+    }
+
+    #[test_case(single_select ; "single_select")]
+    #[test_case(multi_select ; "multi_select")]
+    #[test_case(editing ; "editing")]
+    #[test_case(reviewing ; "reviewing")]
+    #[test_case(writing_a_note ; "writing_a_note")]
+    #[test_case(typed_field ; "typed_field")]
+    #[test_case(consent ; "consent")]
+    #[test_case(deferrable ; "deferrable")]
+    #[test_case(deferred_among_others ; "deferred_among_others")]
+    fn every_drawn_hint_explains_itself_where_it_is_drawn(build: fn() -> QuestionForm) {
+        for width in [TERMINAL_WIDTH, COMPACT_WIDTH] {
+            let mut form = build();
+            let backend = ratatui::backend::TestBackend::new(width, TERMINAL_HEIGHT);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let area = Rect::new(0, 0, width, TERMINAL_HEIGHT);
+            terminal.draw(|frame| form.view(frame, area)).unwrap();
+            let hints: Vec<(usize, Rect)> = form
+                .row_hits
+                .iter()
+                .filter_map(|hit| match hit.target {
+                    FormTarget::Hint(index) => Some((index, hit.area)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!hints.is_empty(), "{NO_TIP}");
+
+            for (index, area) in hints {
+                form.handle_mouse(mouse(MouseEventKind::Moved, area.x, area.y));
+                let tip = form.tooltip().expect(NO_TIP);
+                assert_eq!(tip.key, TipKey::FooterHint(index), "{NO_TIP}");
+                assert_eq!(tip.anchor, Anchor::Area(area), "{NO_TIP}");
+                assert!(!tip.text.is_empty(), "{NO_TIP}");
+            }
+        }
     }
 }

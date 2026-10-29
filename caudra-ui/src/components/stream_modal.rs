@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use crate::animation::{live_elapsed, spinner_str};
 use crate::components::ModalScroll;
 use crate::components::Overlay;
+use crate::components::input::control_tip;
+use crate::components::keybindings::key;
 use crate::components::messages::{
     ASSISTANT_HEADING, ERROR_HEADING, THINKING_HEADING, USER_HEADING, append_selection_section,
 };
@@ -13,6 +15,7 @@ use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
 use crate::components::sweep::{self, Sweep};
+use crate::components::tooltip::{Tip, TipKey};
 use crate::components::{field_styles, input_text_style};
 use crate::theme;
 
@@ -79,57 +82,92 @@ const COMPACT_SEND_HINT: &str = " Follow-up";
 const COMPACT_QUEUE_HINT: &str = " Queue";
 const COMPACT_FOOTER_GAP: &str = " ";
 const DRAFT_SEPARATOR: &str = " | ";
+const CLEAR_LABEL: &str = key::CLEAR_BTW.label;
+const CLEAR_HINT: &str = " Clear";
+/// Drawn under the last answer a thread kept from before the conversation it
+/// reads moved on, so the reader knows the next answer sees more than it did.
+pub(crate) const MOVED_ON_NOTE: &str =
+    "The conversation moved on since this answer. The next question reads it as it stands now.";
+
+pub(crate) const TIP_SEND: &str = "Ask the next question in this thread. While an answer is still \
+streaming, the question waits until it is in";
+const TIP_ASK: &str = "Ask about the conversation so far. No tool runs and nothing enters history";
+const TIP_CLARIFY: &str = "Ask about these choices. Nothing is answered or submitted";
+pub(crate) const TIP_COPY: &str =
+    "Copy the selection, or the whole answer when nothing is selected";
+const TIP_CLOSE: &str = "Close this window";
+pub(crate) const TIP_KEEP: &str = "Close this side thread. It is kept until you clear it or the \
+session changes, and F2 or /btw reopens it";
+const TIP_BACK: &str = "Return to the question form, unchanged";
+pub(crate) const TIP_CLEAR: &str =
+    "Forget this side thread and start an empty one. Nothing in it is kept";
 
 const CLOSE_CONTROL: StreamControl = StreamControl {
     label: ESC_LABEL,
     hint: CLOSE_HINT,
+    tip: TIP_CLOSE,
     command: StreamCommand::Close,
+};
+const CTRL_COPY_CONTROL: StreamControl = StreamControl {
+    label: CTRL_COPY_LABEL,
+    hint: COPY_HINT,
+    tip: TIP_COPY,
+    command: StreamCommand::Copy,
 };
 const CLOSE_FOOTER: [StreamControl; 1] = [CLOSE_CONTROL];
 const COPY_FOOTER: [StreamControl; 2] = [
     StreamControl {
         label: COPY_LABEL,
         hint: COPY_HINT,
+        tip: TIP_COPY,
         command: StreamCommand::Copy,
     },
     CLOSE_CONTROL,
 ];
-/// Copy needs a chord here: a bare `y` is text the input is owed.
-const FOLLOW_UP_FOOTER: [StreamControl; 3] = [
+/// Copy needs a chord here: a bare `y` is text the input is owed. Clear comes
+/// last, so a narrow footer loses it before the controls a reader needs.
+const FOLLOW_UP_FOOTER: [StreamControl; 4] = [
     StreamControl {
         label: SEND_LABEL,
         hint: SEND_HINT,
+        tip: TIP_SEND,
         command: StreamCommand::Send,
     },
+    CTRL_COPY_CONTROL,
     StreamControl {
-        label: CTRL_COPY_LABEL,
-        hint: COPY_HINT,
-        command: StreamCommand::Copy,
+        label: ESC_LABEL,
+        hint: CLOSE_HINT,
+        tip: TIP_KEEP,
+        command: StreamCommand::Close,
     },
-    CLOSE_CONTROL,
+    StreamControl {
+        label: CLEAR_LABEL,
+        hint: CLEAR_HINT,
+        tip: TIP_CLEAR,
+        command: StreamCommand::Clear,
+    },
 ];
 const CLARIFICATION_FOOTER: [StreamControl; 3] = [
     StreamControl {
         label: ESC_LABEL,
         hint: BACK_HINT,
+        tip: TIP_BACK,
         command: StreamCommand::Close,
     },
     StreamControl {
         label: SEND_LABEL,
         hint: INITIAL_SEND_HINT,
+        tip: TIP_CLARIFY,
         command: StreamCommand::Send,
     },
-    StreamControl {
-        label: CTRL_COPY_LABEL,
-        hint: COPY_HINT,
-        command: StreamCommand::Copy,
-    },
+    CTRL_COPY_CONTROL,
 ];
 /// Before the first question there is nothing to copy or follow up.
 const ASK_FOOTER: [StreamControl; 2] = [
     StreamControl {
         label: SEND_LABEL,
         hint: INITIAL_SEND_HINT,
+        tip: TIP_ASK,
         command: StreamCommand::Send,
     },
     CLOSE_CONTROL,
@@ -189,14 +227,16 @@ enum StreamCommand {
     Copy,
     Send,
     Close,
+    Clear,
 }
 
-/// One footer control: the key it names, the words that gloss it, and what it
-/// does. The footer is built from these and a click resolves through them, so
-/// a control's index is never magic.
+/// One footer control: the key it names, the words that gloss it, what its
+/// tooltip says, and what it does. The footer is built from these and a click
+/// resolves through them, so a control's index is never magic.
 struct StreamControl {
     label: &'static str,
     hint: &'static str,
+    tip: &'static str,
     command: StreamCommand,
 }
 
@@ -210,6 +250,15 @@ pub enum StreamAction {
     /// What a sweep over the thread covers.
     CopySelection(String),
     Submit(String),
+    /// Forget the side thread the modal shows.
+    Clear,
+}
+
+/// A side thread's exchanges as the modal drew them, set aside while the
+/// modal is closed so reopening shows them again. Never persisted.
+pub(crate) struct ParkedThread {
+    title: &'static str,
+    exchanges: Vec<Exchange>,
 }
 
 /// How an exchange ended, which is what its body is painted as.
@@ -263,6 +312,8 @@ struct Exchange {
     settled: Option<Duration>,
     usage: Option<TokenUsage>,
     outcome: ExchangeOutcome,
+    /// The conversation the thread reads moved on after this answer.
+    moved_on: bool,
 }
 
 impl Exchange {
@@ -274,6 +325,7 @@ impl Exchange {
             settled: None,
             usage: None,
             outcome: ExchangeOutcome::Live,
+            moved_on: false,
         }
     }
 
@@ -369,6 +421,8 @@ pub struct StreamModal {
     /// What a dismissed side question left unsent, until the next
     /// [`StreamModal::open_ask`]. Outlives [`StreamModal::close`].
     parked_draft: String,
+    /// What the last [`StreamModal::park`] set aside, until the host takes it.
+    parked: Option<ParkedThread>,
     popup: Rect,
     /// The thread's lines as the last frame wrapped them into `viewport`,
     /// which is what a press is read back against.
@@ -400,6 +454,7 @@ impl StreamModal {
             rate: PromptRate::default(),
             queued: None,
             parked_draft: String::new(),
+            parked: None,
             popup: Rect::default(),
             body: Vec::new(),
             parts: Vec::new(),
@@ -467,11 +522,12 @@ impl StreamModal {
 
     pub(crate) fn dismiss(&mut self) {
         if !self.is_clarification() {
-            let unsent = self.take_unsent().unwrap_or_else(|| self.input.text());
-            if !unsent.trim().is_empty() {
-                self.parked_draft = unsent;
+            if self.footer == StreamFooter::FollowUp && !self.exchanges.is_empty() {
+                self.park();
+            } else {
+                self.park_draft();
+                self.close();
             }
-            self.close();
             return;
         }
         let _ = self.poll();
@@ -486,6 +542,49 @@ impl StreamModal {
         self.scrollbar = Scrollbar::default();
         self.sweep = None;
         self.sweeping = false;
+    }
+
+    fn park_draft(&mut self) {
+        let unsent = self.take_unsent().unwrap_or_else(|| self.input.text());
+        if !unsent.trim().is_empty() {
+            self.parked_draft = unsent;
+        }
+    }
+
+    /// Closes the modal and sets its thread aside for the host to keep,
+    /// stopping an answer still streaming so it shows as stopped when the
+    /// thread comes back. What was left unsent is parked as a draft.
+    pub(crate) fn park(&mut self) {
+        let _ = self.poll();
+        if self.is_streaming() {
+            self.stop();
+        }
+        self.park_draft();
+        self.parked = Some(ParkedThread {
+            title: self.title,
+            exchanges: mem::take(&mut self.exchanges),
+        });
+        self.close();
+    }
+
+    /// The thread the last [`Self::park`] set aside.
+    pub(crate) fn take_parked(&mut self) -> Option<ParkedThread> {
+        self.parked.take()
+    }
+
+    /// Opens on a thread [`Self::park`] set aside, with whatever it left unsent.
+    pub(crate) fn resume(&mut self, parked: ParkedThread) {
+        self.open_ask();
+        self.title = parked.title;
+        self.exchanges = parked.exchanges;
+        self.scroll.scroll_to(u16::MAX);
+    }
+
+    /// Says under the last answer that the conversation has moved on since.
+    pub(crate) fn mark_moved_on(&mut self) {
+        if let Some(last) = self.exchanges.last_mut() {
+            last.moved_on = true;
+        }
     }
 
     /// Appends the next question to the thread and streams its answer under
@@ -691,6 +790,7 @@ impl StreamModal {
                     self.dismiss();
                     StreamAction::Consumed
                 }
+                StreamCommand::Clear => StreamAction::Clear,
             };
         }
         if !self.contains(at) {
@@ -872,6 +972,14 @@ impl StreamModal {
     /// Space are text here, and `Ctrl+C` copies what is selected in it before
     /// it stops anything.
     fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamAction {
+        if key::CLEAR_BTW.matches(key_event)
+            && self
+                .controls()
+                .iter()
+                .any(|control| control.command == StreamCommand::Clear)
+        {
+            return StreamAction::Clear;
+        }
         match key_event.code {
             KeyCode::Esc => self.dismiss(),
             KeyCode::Enter => {
@@ -953,34 +1061,33 @@ impl StreamModal {
 
     /// Each control is one phrase, key and gloss together, so the pointer
     /// marks and presses the whole of what it reads. The send control says
-    /// which of the two things it does, because mid-stream it queues.
+    /// which of the two things it does, because mid-stream it queues. A
+    /// footer too wide for its row says less about each control and then
+    /// drops the last ones, so the controls that stay are drawn whole.
     fn footer_line(&self, width: u16) -> FooterLine {
         let theme = theme::current();
         let mut footer = FooterLine::default();
-        let contextual = self.is_clarification();
-        let gap = if contextual {
+        let roomy: usize = self
+            .controls()
+            .iter()
+            .enumerate()
+            .map(|(index, control)| {
+                control.label.width()
+                    + self.control_hint(control, false, width).width()
+                    + usize::from(index > 0) * FOOTER_GAP.width()
+            })
+            .sum();
+        let compact = self.is_clarification() || roomy > usize::from(width);
+        let gap = if compact {
             COMPACT_FOOTER_GAP
         } else {
             FOOTER_GAP
         };
         let mut used = 0;
         for (index, control) in self.controls().iter().enumerate() {
-            let hint = match control.command {
-                StreamCommand::Close
-                    if contextual
-                        && control.label.width() + BACK_HINT.width() > usize::from(width) =>
-                {
-                    COMPACT_BACK_HINT
-                }
-                StreamCommand::Send if contextual && self.is_streaming() => COMPACT_QUEUE_HINT,
-                StreamCommand::Send if contextual && !self.exchanges.is_empty() => {
-                    COMPACT_SEND_HINT
-                }
-                StreamCommand::Send if self.is_streaming() => QUEUE_HINT,
-                _ => control.hint,
-            };
+            let hint = self.control_hint(control, compact, width);
             used += control.label.width() + hint.width() + usize::from(index > 0) * gap.width();
-            if contextual && used > usize::from(width) {
+            if compact && used > usize::from(width) {
                 break;
             }
             if index > 0 {
@@ -990,6 +1097,21 @@ impl StreamModal {
             footer.describe(hint, theme.tool_dim);
         }
         footer
+    }
+
+    fn control_hint(&self, control: &StreamControl, compact: bool, width: u16) -> &'static str {
+        match control.command {
+            StreamCommand::Close
+                if self.is_clarification()
+                    && control.label.width() + BACK_HINT.width() > usize::from(width) =>
+            {
+                COMPACT_BACK_HINT
+            }
+            StreamCommand::Send if compact && self.is_streaming() => COMPACT_QUEUE_HINT,
+            StreamCommand::Send if compact && !self.exchanges.is_empty() => COMPACT_SEND_HINT,
+            StreamCommand::Send if self.is_streaming() => QUEUE_HINT,
+            _ => control.hint,
+        }
     }
 
     /// A paste lands in the input, flattened to the one line it has.
@@ -1062,6 +1184,10 @@ impl StreamModal {
                     exchange: index,
                     kind: PartKind::Section(section_index),
                 });
+            }
+            if exchange.moved_on {
+                lines.push(Line::default());
+                lines.push(Line::styled(MOVED_ON_NOTE, theme.tool_dim.italic()));
             }
         }
 
@@ -1227,6 +1353,13 @@ impl Overlay for StreamModal {
 
     fn cadence(&self) -> Cadence {
         self.cadence()
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.footer_hits.tip(TipKey::FooterHint, |index| {
+            let control = self.controls().get(index)?;
+            Some(control_tip(control.tip, control.label))
+        })
     }
 }
 
@@ -2634,6 +2767,122 @@ mod tests {
         m.open_ask();
 
         assert!(m.input_text().is_empty());
+    }
+
+    const FOLLOW_UP_CLEAR: usize = 3;
+    const WIDE: u16 = 200;
+    const PARKED_MISSING: &str = "a dismissed side thread must be set aside for the host";
+    const TIP_WRONG: &str = "every footer control must explain itself under the pointer";
+
+    #[test_case(false ; "settled")]
+    #[test_case(true ; "streaming")]
+    fn a_parked_thread_resumes_with_what_it_showed(streaming: bool) {
+        let mut m = StreamModal::new(0);
+        let (tx, cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        if !streaming {
+            tx.send(done()).unwrap();
+        }
+        type_text(&mut m, DRAFT);
+
+        m.dismiss();
+        assert!(!m.is_open() && cancel.is_cancelled());
+        let parked = m.take_parked().expect(PARKED_MISSING);
+        assert!(m.take_parked().is_none());
+        m.resume(parked);
+
+        assert!(m.is_open() && m.text_input_active() && !m.is_streaming());
+        assert_eq!(m.title, TITLE);
+        assert_eq!(m.headers(), [HEADER]);
+        assert_eq!(m.input_text(), DRAFT);
+        let outcome = if streaming {
+            ExchangeOutcome::Stopped
+        } else {
+            ExchangeOutcome::Done
+        };
+        assert!(m.exchanges[0].outcome == outcome);
+        assert_eq!(
+            m.take_done().is_some(),
+            !streaming,
+            "a landed answer is billed"
+        );
+    }
+
+    #[test]
+    fn a_thread_that_moved_on_says_so_under_its_last_answer() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        m.mark_moved_on();
+        let mut terminal = Terminal::new(TestBackend::new(WIDE, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert!(terminal.backend().to_string().contains(MOVED_ON_NOTE));
+    }
+
+    #[test_case(StreamFooter::FollowUp, true, true ; "answered_thread")]
+    #[test_case(StreamFooter::FollowUp, false, false ; "empty_ask")]
+    #[test_case(StreamFooter::Copy, true, false ; "extract")]
+    fn ctrl_l_clears_only_a_thread_with_answers(
+        footer: StreamFooter,
+        answered: bool,
+        clears: bool,
+    ) {
+        let mut m = StreamModal::new(0);
+        if answered {
+            let (tx, _cancel) = open_modal(&mut m, HEADER, footer);
+            tx.send(done()).unwrap();
+            let _ = m.poll();
+        } else {
+            m.open_ask();
+        }
+        let action = m.handle_key(key::CLEAR_BTW.to_key_event());
+        assert_eq!(matches!(action, StreamAction::Clear), clears);
+    }
+
+    #[test_case(WIDE ; "roomy")]
+    #[test_case(WIDTH ; "compact")]
+    fn the_follow_up_footer_clears_by_click_and_explains_every_control(width: u16) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+
+        let tips: Vec<Option<String>> = (0..FOLLOW_UP_FOOTER.len())
+            .map(|index| {
+                m.handle_mouse(&mouse(MouseEventKind::Moved, m.footer_hit(index)));
+                Overlay::tooltip(&m).map(|tip| tip.text)
+            })
+            .collect();
+        let expected: Vec<Option<String>> = FOLLOW_UP_FOOTER
+            .iter()
+            .map(|control| Some(control_tip(control.tip, control.label)))
+            .collect();
+        assert_eq!(tips, expected, "{TIP_WRONG}");
+
+        let clear = m.footer_hit(FOLLOW_UP_CLEAR);
+        assert!(matches!(click(&mut m, clear), StreamAction::Clear));
+    }
+
+    #[test_case(StreamFooter::Close ; "plain")]
+    #[test_case(StreamFooter::Copy ; "extract")]
+    fn every_other_footer_explains_its_controls(footer: StreamFooter) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, footer);
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        for (index, control) in m.controls().iter().enumerate() {
+            m.handle_mouse(&mouse(MouseEventKind::Moved, m.footer_hit(index)));
+            assert_eq!(
+                Overlay::tooltip(&m).map(|tip| tip.text),
+                Some(control_tip(control.tip, control.label)),
+                "{TIP_WRONG}"
+            );
+        }
     }
 
     #[test]

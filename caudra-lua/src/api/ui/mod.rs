@@ -727,6 +727,8 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[caudra_markdown::render::Line]) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use caudra_highlight::StyledSegment;
     use mlua::Lua;
@@ -757,6 +759,28 @@ mod tests {
             .eval()
             .unwrap();
         (reply, rx)
+    }
+
+    #[test]
+    fn theme_color_answers_hex_for_known_names_and_nil_otherwise() {
+        const ACCENT: &str = "accent";
+        caudra_highlight::set_ui_colors(HashMap::from([(ACCENT.to_owned(), (255, 128, 0))]));
+        let lua = Lua::new();
+        let ui = lua.create_table().unwrap();
+        theme_color__register(&ui, &lua).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+
+        let known: Option<String> = lua
+            .load(format!("return ui.theme_color({ACCENT:?})"))
+            .eval()
+            .unwrap();
+        let missing: Option<String> = lua
+            .load(format!("return ui.theme_color({MISSING_KEY:?})"))
+            .eval()
+            .unwrap();
+
+        assert_eq!(known.as_deref(), Some(ORANGE_HEX));
+        assert_eq!(missing, None);
     }
 
     #[test_case(None ; "without a line")]

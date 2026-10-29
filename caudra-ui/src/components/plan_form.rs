@@ -1,7 +1,8 @@
 use crate::components::autopilot_panel::card_note;
 use crate::components::form::{footer_row, render_form, selected_prefix};
 use crate::components::keybindings::key;
-use crate::components::{Hint, HintBar, VisualRows, hanging_lines, visual_rows};
+use crate::components::tooltip::Tip;
+use crate::components::{Hint, HintBar, VisualRows, hanging_lines, hint_hits, visual_rows};
 use crate::theme;
 
 use caudra_agent::permissions::AutopilotNote;
@@ -21,17 +22,26 @@ const DESC_GAP: &str = "  ";
 const DESC_INDENT: &str = "    ";
 const PARALLEL_MARK: &str = " (parallel)";
 
-const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
-    "⌃T/Esc"
-} else {
-    "Ctrl+T/Esc"
-};
-const HINTS: [Hint; 5] = [
-    Hint::inert("↑↓", "select"),
-    Hint::bind(key::SPACE, "toggle parallel"),
-    Hint::bind(key::ENTER, "confirm"),
-    Hint::bind(key::OPEN_EDITOR, "edit plan"),
-    Hint::key(DISMISS_KEYS, KeyCode::Esc, "dismiss"),
+const TIP_SELECT: &str = "Choose how to finish planning";
+const TIP_PARALLEL: &str = "Have the implementing agent split the work across parallel subagents, \
+     each owning a separate module and running only that module's tests. Options read \
+     (parallel) while it is on";
+const TIP_CONFIRM: &str = "Run the highlighted option";
+const TIP_ASK: &str = "Ask a side question about the conversation and the plan without \
+     leaving this form. Nothing enters history";
+const TIP_EDIT: &str = "Open the plan in the workbench to read or edit it";
+const TIP_DISMISS: &str = "Hide the form and keep planning. The composer's Plan hint reopens it";
+
+const ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask /btw").tip(TIP_ASK);
+const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask").tip(TIP_ASK);
+pub(crate) const ASK_HINT_INDEX: usize = 3;
+const HINTS: [Hint; 6] = [
+    Hint::inert("↑↓", "select").tip(TIP_SELECT),
+    Hint::bind(key::SPACE, "toggle parallel").tip(TIP_PARALLEL),
+    Hint::bind(key::ENTER, "confirm").tip(TIP_CONFIRM),
+    ASK_HINT,
+    Hint::bind(key::OPEN_EDITOR, "edit plan").tip(TIP_EDIT),
+    Hint::bind(key::ESC, "dismiss").tip(TIP_DISMISS),
 ];
 
 struct MenuItem {
@@ -71,6 +81,7 @@ pub enum PlanFormAction {
     ClearAndImplement,
     Implement,
     OpenEditor,
+    AskBtw,
     Hide,
 }
 
@@ -201,6 +212,9 @@ impl PlanForm {
         if key::OPEN_EDITOR.matches(key_event) {
             return PlanFormAction::OpenEditor;
         }
+        if key::ASK_BTW.matches(key_event) {
+            return PlanFormAction::AskBtw;
+        }
         match key_event.code {
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
@@ -299,7 +313,8 @@ impl PlanForm {
         let rows = visual_rows(&lines, width);
         let visible = area.height.saturating_sub(CHROME_LINES);
         let scroll = self.scroll(&rows, &owners, visible);
-        let footer = self.hints.line(footer_row(area), HINTS.to_vec());
+        let footer_area = footer_row(area);
+        let footer = self.hints.line(footer_area, footer_hints(footer_area));
 
         render_form(
             &t,
@@ -420,11 +435,35 @@ impl PlanForm {
         self.mouse_down = None;
         self.hints.reset();
     }
+
+    pub(crate) fn tooltip(&self) -> Option<Tip> {
+        self.hints.tooltip()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn footer_hit(&self, index: usize) -> Rect {
+        self.hints.hit(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+/// The footer for `area`, shortening Ask before the bar drops a control.
+fn footer_hints(area: Rect) -> Vec<Hint> {
+    let mut hints = HINTS.to_vec();
+    if hint_hits(&hints, area).len() < hints.len() {
+        hints[ASK_HINT_INDEX] = COMPACT_ASK_HINT;
+    }
+    hints
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::tooltip::TipKey;
     use crate::components::{buffer_text, key};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::buffer::Buffer;
@@ -793,6 +832,81 @@ mod tests {
         );
         assert!(form.row_hits.is_empty());
         assert!(form.mouse_down.is_none());
+    }
+
+    /// Wide enough for every control once Ask is shortened, and no wider.
+    const COMPACT: u16 = 92;
+    const SUBAGENTS: &str = "subagents";
+    const NO_TIP: &str = "every control the footer draws must explain itself";
+    const WRONG_ASK: &str = "Ask must shorten exactly when the whole bar does not fit";
+
+    fn shown_at(width: u16) -> PlanForm {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        render_at(&mut form, width);
+        form
+    }
+
+    fn hover(form: &mut PlanForm, index: usize) {
+        form.handle_mouse(mouse(MouseEventKind::Moved, form.footer_hit(index)));
+    }
+
+    #[test_case(false ; "key")]
+    #[test_case(true  ; "click")]
+    fn ask_asks_btw(click: bool) {
+        let mut form = shown_at(NARROW);
+        let action = if click {
+            let ask = form.footer_hit(ASK_HINT_INDEX);
+            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), ask));
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), ask))
+        } else {
+            form.handle_key(key::ASK_BTW.to_key_event())
+        };
+
+        assert_eq!(action, PlanFormAction::AskBtw);
+    }
+
+    #[test_case(WIDE, ASK_HINT, true ; "full")]
+    #[test_case(COMPACT, COMPACT_ASK_HINT, true ; "compact")]
+    #[test_case(NARROW, COMPACT_ASK_HINT, false ; "narrow")]
+    fn ask_shortens_before_the_bar_drops_a_control(width: u16, expected: Hint, whole: bool) {
+        let form = shown_at(width);
+        let drawn = form.hints.drawn();
+
+        assert_eq!(
+            drawn[ASK_HINT_INDEX].description(),
+            expected.description(),
+            "{WRONG_ASK}"
+        );
+        assert_eq!(drawn.len() == HINTS.len(), whole, "{WRONG_ASK}");
+    }
+
+    #[test_case(WIDE ; "full")]
+    #[test_case(COMPACT ; "compact")]
+    #[test_case(NARROW ; "narrow")]
+    fn every_footer_control_explains_itself(width: u16) {
+        let mut form = shown_at(width);
+
+        for (index, hint) in form.hints.drawn().to_vec().into_iter().enumerate() {
+            hover(&mut form, index);
+            let tip = form.tooltip().expect(NO_TIP);
+            assert_eq!(tip.key, TipKey::FooterHint(index), "{NO_TIP}");
+            assert!(tip.text.contains(hint.label()), "{NO_TIP}: {}", tip.text);
+        }
+    }
+
+    #[test]
+    fn the_parallel_tip_says_subagents_share_the_work() {
+        let mut form = shown_at(WIDE);
+        let parallel = HINTS
+            .iter()
+            .position(|hint| hint.label() == key::SPACE.label)
+            .expect(NO_TIP);
+
+        hover(&mut form, parallel);
+
+        let tip = form.tooltip().expect(NO_TIP);
+        assert!(tip.text.contains(SUBAGENTS), "{NO_TIP}: {}", tip.text);
     }
 
     const ESCALATION: &str = "the plan needs the user's call";

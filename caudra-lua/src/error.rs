@@ -17,12 +17,6 @@ pub enum PluginError {
         #[source]
         source: io::Error,
     },
-    #[error(
-        "plugins.{plugin} sets options ({keys}), but there is no bundled plugin named \"{plugin}\""
-    )]
-    UnknownPluginOptions { plugin: String, keys: String },
-    #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
-    UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]
     HostDead,
     #[error("Lua is turned off for this process")]

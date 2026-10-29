@@ -358,6 +358,8 @@ pub mod key {
     pub const SANDBOX_CLEAR_RULE: Bind = ctrl_bind!('u');
     pub const SANDBOX_FIRST_FIELD: Bind = SCROLL_TOP;
     pub const SANDBOX_LAST_FIELD: Bind = ctrl_bind!('l');
+    /// Forgets a kept `/btw` thread. Free in every text field.
+    pub const CLEAR_BTW: Bind = ctrl_bind!('l');
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
     pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
     /// The workbench's find keys, which `/docs` steps through its search
@@ -1242,7 +1244,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::ASK_BTW.label),
-        description: "Ask /btw about a pending question without answering it",
+        description: "Ask /btw about a pending question or plan without answering it",
         context: KeybindContext::FormInput,
     },
     Keybind {
@@ -1461,8 +1463,13 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Btw,
     },
     Keybind {
+        label: KeyLabel::Single(key::CLEAR_BTW.label),
+        description: "Forget the thread and start an empty one",
+        context: KeybindContext::Btw,
+    },
+    Keybind {
         label: KeyLabel::Single("Esc"),
-        description: "Close and forget the thread",
+        description: "Close and keep the thread for the next /btw",
         context: KeybindContext::Btw,
     },
     Keybind {
