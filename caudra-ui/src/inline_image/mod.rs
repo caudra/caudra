@@ -23,14 +23,13 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use caudra_agent::ImageSource;
 use caudra_config::InlineImages;
-use caudra_storage::StateDir;
 use caudra_storage::media::MediaStore;
 use caudra_terminal_host::mux::TerminalMux;
 use caudra_workbench::{ImageSampling, ImageViewport, PaintedImage};
@@ -62,13 +61,6 @@ const MAX_RASTER_PIXELS: u32 = 1_000_000;
 const MAX_RASTER_EDGE: u32 = 4096;
 const DRAWN_CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const LOADING_LABEL: &str = "loading image…";
-
-static MEDIA: LazyLock<Option<MediaStore>> =
-    LazyLock::new(|| StateDir::resolve().ok().map(|dir| MediaStore::new(&dir)));
-
-pub(crate) fn media_store() -> Option<&'static MediaStore> {
-    MEDIA.as_ref()
-}
 
 thread_local! {
     static STORE: RefCell<ImageStore> = RefCell::new(ImageStore::new());
@@ -183,6 +175,9 @@ pub(crate) enum ImageOrigin {
     /// Base64, as a tool result or an attachment carries it.
     Bytes(Arc<str>),
     File(Arc<Path>),
+    /// A media store file: read like a file, shown like pasted bytes, since
+    /// its extensionless hash path means nothing to the user.
+    Stored(Arc<Path>),
 }
 
 /// A picture the transcript can draw: where its bytes are, what it is called,
@@ -200,10 +195,14 @@ impl ImageRef {
     /// over the size caps.
     pub(crate) fn from_file(path: &Path, alt: &str) -> Option<Self> {
         media_type_for(path)?;
-        Self::from_picture_file(path, alt)
+        Self::from_picture_file(path, alt, ImageOrigin::File)
     }
 
-    fn from_picture_file(path: &Path, alt: &str) -> Option<Self> {
+    fn from_picture_file(
+        path: &Path,
+        alt: &str,
+        origin: fn(Arc<Path>) -> ImageOrigin,
+    ) -> Option<Self> {
         let meta = fs::metadata(path).ok().filter(|meta| meta.is_file())?;
         if meta.len() > MAX_IMAGE_BYTES as u64 {
             return None;
@@ -214,7 +213,7 @@ impl ImageRef {
             modified: meta.modified().ok(),
             len: meta.len(),
         };
-        let origin = ImageOrigin::File(path);
+        let origin = origin(path);
         let pixels = with_store(|store| store.pixels(&key, &origin))?;
         Some(Self {
             key,
@@ -228,8 +227,9 @@ impl ImageRef {
     /// file in the media store. `None` when that file is gone.
     pub(crate) fn from_source(source: &ImageSource, alt: &str) -> Option<Self> {
         let Some(data) = source.data() else {
-            let path = media_store()?.path(&source.stored()?.sha256);
-            return Self::from_picture_file(&path, alt);
+            let sha256 = &source.stored()?.sha256;
+            let path = with_store(|store| Some(store.media.as_ref()?.path(sha256)))?;
+            return Self::from_picture_file(&path, alt, ImageOrigin::Stored);
         };
         if data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
             return None;
@@ -250,7 +250,7 @@ impl ImageRef {
     pub(crate) fn path(&self) -> Option<&Path> {
         match &self.origin {
             ImageOrigin::File(path) => Some(path),
-            ImageOrigin::Bytes(_) => None,
+            ImageOrigin::Bytes(_) | ImageOrigin::Stored(_) => None,
         }
     }
 
@@ -468,6 +468,11 @@ pub(crate) fn set_local_root(root: Option<&Path>) {
     });
 }
 
+/// The store whose files restored references name: the app's own state dir.
+pub(crate) fn set_media_store(media: MediaStore) {
+    with_store(|store| store.media = Some(media));
+}
+
 /// Re-reads the cell pixel size, which changes with the font and with a
 /// resize that reports one.
 pub(crate) fn refresh_cell_size() {
@@ -564,6 +569,7 @@ struct ImageStore {
     cell: CellSize,
     reported_cell: Option<(u16, u16)>,
     root: Option<Arc<Path>>,
+    media: Option<MediaStore>,
     generation: u64,
     worker: DecodeWorker,
     headers: LruCache<ImageKey, Option<(u32, u32)>>,
@@ -594,6 +600,7 @@ impl ImageStore {
             cell: CellSize::FALLBACK,
             reported_cell: None,
             root: None,
+            media: None,
             generation: 0,
             worker: DecodeWorker::new(),
             headers: LruCache::new(NonZeroUsize::new(HEADER_CACHE_ENTRIES).unwrap()),
@@ -844,7 +851,7 @@ fn loading_lines(layout: ImageLayout) -> Vec<Line<'static>> {
 
 fn read_dimensions(origin: &ImageOrigin) -> Option<(u32, u32)> {
     match origin {
-        ImageOrigin::File(path) => ImageReader::open(path)
+        ImageOrigin::File(path) | ImageOrigin::Stored(path) => ImageReader::open(path)
             .ok()?
             .with_guessed_format()
             .ok()?
@@ -875,9 +882,13 @@ pub(crate) mod tests {
     use super::{
         CellSize, Drawn, ImageLayout, ImageMode, ImageRef, ImageSource, ImageStore, LOADING_LABEL,
         MAX_IMAGE_ROWS, STANDARD, Ticket, blocks, draw, draw_viewport, forget_uploads, generation,
-        is_pending, is_pixel, resolve_markdown, set_local_root, set_mode, take_output, with_store,
+        is_pending, is_pixel, resolve_markdown, set_local_root, set_media_store, set_mode,
+        take_output, with_store,
     };
     use base64::Engine;
+    use caudra_agent::ImageMediaType;
+    use caudra_storage::StateDir;
+    use caudra_storage::media::{MediaStore, StoredImage};
     use caudra_workbench::{ImageSampling, ImageViewport, keys};
     use image::{ImageFormat, Rgba, RgbaImage};
     use ratatui::layout::Rect;
@@ -905,6 +916,19 @@ pub(crate) mod tests {
             caudra_agent::ImageMediaType::Png,
             Arc::from(STANDARD.encode(png_bytes(width, height))),
         )
+    }
+
+    /// A restored reference whose bytes live only in a media store under the
+    /// returned directory, which this thread's pictures now read from.
+    pub(crate) fn stored_png_source(width: u32, height: u32) -> (TempDir, ImageSource) {
+        let dir = TempDir::new().unwrap();
+        let media = MediaStore::new(&StateDir::from_path(dir.path().to_path_buf()));
+        let reference = StoredImage::Media {
+            media_type: ImageMediaType::Png.mime().into(),
+            media: media.put(&png_bytes(width, height)).unwrap(),
+        };
+        set_media_store(media);
+        (dir, ImageSource::try_from(reference).unwrap())
     }
 
     /// Runs every queued decode on this thread and takes in the results, so a
@@ -983,6 +1007,16 @@ pub(crate) mod tests {
     fn bytes_read_their_size_from_the_header() {
         let image = ImageRef::from_source(&png_source(24, 8), ALT).unwrap();
         assert_eq!(image.pixels(), (24, 8));
+        assert_eq!(image.markdown(), format!("![{ALT}]()"));
+    }
+
+    #[test]
+    fn a_stored_reference_reads_the_store_but_names_no_file() {
+        let (_dir, source) = stored_png_source(24, 8);
+        assert_eq!(source.data(), None);
+        let image = ImageRef::from_source(&source, ALT).unwrap();
+        assert_eq!(image.pixels(), (24, 8));
+        assert_eq!(image.path(), None);
         assert_eq!(image.markdown(), format!("![{ALT}]()"));
     }
 

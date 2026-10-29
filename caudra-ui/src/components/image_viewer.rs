@@ -219,10 +219,13 @@ fn meta_line(image: &ImageRef) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageRef, ImageViewer, ImageViewerAction, KeyEvent, key};
+    use super::{ImageRef, ImageViewer, ImageViewerAction, KeyEvent, UNTITLED, key, title};
     use crate::components::Overlay;
     use crate::components::keybindings::Bind;
-    use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_source};
+    use crate::inline_image::tests::{
+        PIXEL_SYMBOL, decode_queued, png_bytes, png_source, stored_png_source,
+    };
+    use caudra_agent::ImageSource;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -401,14 +404,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pasted_bytes_have_no_path_to_offer() {
+    fn pasted() -> (TempDir, ImageSource) {
+        (TempDir::new().unwrap(), png_source(8, 8))
+    }
+
+    fn restored() -> (TempDir, ImageSource) {
+        stored_png_source(8, 8)
+    }
+
+    #[test_case(pasted, key::IMAGE_COPY_PATH ; "pasted_copy_path")]
+    #[test_case(pasted, key::IMAGE_OPEN_WORKBENCH ; "pasted_workbench")]
+    #[test_case(restored, key::IMAGE_COPY_PATH ; "restored_copy_path")]
+    #[test_case(restored, key::IMAGE_OPEN_WORKBENCH ; "restored_workbench")]
+    fn an_image_without_a_user_file_has_no_path_to_offer(
+        source: fn() -> (TempDir, ImageSource),
+        bind: Bind,
+    ) {
+        let (_dir, source) = source();
         let mut viewer = ImageViewer::default();
-        viewer.open(ImageRef::from_source(&png_source(8, 8), ALT).unwrap());
+        viewer.open(ImageRef::from_source(&source, "").unwrap());
         assert!(matches!(
-            press(&mut viewer, key::IMAGE_COPY_PATH.code),
+            press(&mut viewer, bind.code),
             ImageViewerAction::Consumed
         ));
+        assert_eq!(title(viewer.image.as_ref().unwrap()), UNTITLED);
     }
 
     #[test]

@@ -215,6 +215,7 @@ use caudra_storage::background::JobKind;
 use caudra_storage::cache_warming::{CacheWarmLedger, WarmingSummary};
 use caudra_storage::id::SessionRef;
 use caudra_storage::input_history::InputHistory;
+use caudra_storage::media::MediaStore;
 use caudra_storage::model::persist_model;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
@@ -868,6 +869,7 @@ impl App {
         features: FeatureFlags,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
+        inline_image::set_media_store(MediaStore::new(&storage));
         let state = SessionState::from_session(
             session,
             model,
