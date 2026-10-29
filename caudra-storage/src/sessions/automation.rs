@@ -61,6 +61,7 @@ pub const SUPERSEDED_ON_RESUME: &str = "resume fires armed and schedules catch u
 /// Why waiting firings end when their session moves to another directory.
 pub const INTERRUPTED_BY_RELOCATION: &str = "the session moved to another directory";
 const EMPTY_OBJECT: &str = "{}";
+const DONE_APPLIED_RESULT: &str = r#"{"disarmed":true}"#;
 const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const PENDING_STATUSES: &str = "('queued', 'deferred', 'running')";
 const WAITING_STATUSES: &str = "('queued', 'deferred')";
@@ -614,6 +615,7 @@ pub struct FiringFinished {
     /// hands back. The row holds it until the release succeeds.
     pub release: Option<String>,
     pub disarmed: Option<String>,
+    pub done_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +682,8 @@ pub struct AutomationActionRow {
 pub struct AutomationOutboxRow {
     pub automation: String,
     pub action: AutomationActionRow,
+    pub finished: bool,
+    pub done_reason: Option<String>,
 }
 
 /// Another session the swarm view lists.
@@ -1276,7 +1280,7 @@ impl SessionDatabase {
             let changed = transaction.execute(
                 &format!(
                     "UPDATE automation_bindings SET armed = 0, updated_ms = {NOW_MS} \
-                 WHERE session_id = ?1 AND automation = ?2 AND EXISTS (\
+                 WHERE session_id = ?1 AND automation = ?2 AND armed = 1 AND EXISTS (\
                      SELECT 1 FROM automation_actions \
                      WHERE fire_id = ?3 AND seq = ?4 AND kind = ?5 AND status = ?6)"
                 ),
@@ -1289,7 +1293,30 @@ impl SessionDatabase {
                     AutomationActionStatus::Done.as_str(),
                 ],
             )?;
-            (changed > 0).then_some(firing.automation)
+            if changed > 0 {
+                transaction.execute(
+                    "UPDATE automation_actions SET result = ?3, result_cut = 0 \
+                     WHERE fire_id = ?1 AND seq = ?2",
+                    params![
+                        fire_id,
+                        to_i64(seq, "automation_actions.seq")?,
+                        DONE_APPLIED_RESULT
+                    ],
+                )?;
+                Some(firing.automation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let done_reason = if disarmed.is_some() {
+            Some(transaction.query_row(
+                "SELECT CASE WHEN json_valid(request) THEN json_extract(request, '$.reason') END FROM automation_actions \
+                 WHERE fire_id = ?1 AND seq = ?2",
+                params![fire_id, end.done_action.map(|seq| to_i64(seq, "automation_actions.seq")).transpose()?],
+                |row| row.get::<_, Option<String>>(0),
+            )?.unwrap_or_default())
         } else {
             None
         };
@@ -1299,6 +1326,7 @@ impl SessionDatabase {
             absorbed,
             release: firing.delivery.filter(|_| !keeps),
             disarmed,
+            done_reason,
         })
     }
 
@@ -1463,7 +1491,12 @@ impl SessionDatabase {
         session_id: CaudraId,
     ) -> Result<Vec<AutomationOutboxRow>, SessionError> {
         let mut statement = self.connection().prepare(&format!(
-            "SELECT f.automation, {ACTION_SUMMARY_COLUMNS}, a.request, a.result \
+            "SELECT f.automation, {ACTION_SUMMARY_COLUMNS}, a.request, a.result, \
+                 f.finished_ms IS NOT NULL, \
+                 (SELECT CASE WHEN json_valid(d.request) THEN coalesce(json_extract(d.request, '$.reason'), '') ELSE '' END FROM automation_actions AS d \
+                  WHERE d.fire_id = f.fire_id AND d.kind = 'done' \
+                    AND json_valid(d.result) AND json_extract(d.result, '$.disarmed') = 1 \
+                  ORDER BY d.seq LIMIT 1) \
              FROM automation_actions AS a \
              JOIN automation_firings AS f ON f.fire_id = a.fire_id \
              WHERE a.status = ?2 AND f.session_id = ?1 \
@@ -1479,6 +1512,8 @@ impl SessionDatabase {
             outbox.push(AutomationOutboxRow {
                 automation: row.get(0)?,
                 action: read_action(row, 1)?,
+                finished: row.get(ACTION_SUMMARY_WIDTH + 3)?,
+                done_reason: row.get(ACTION_SUMMARY_WIDTH + 4)?,
             });
         }
         Ok(outbox)
@@ -2382,6 +2417,9 @@ mod tests {
     const NOT_REFUSED: &str = "expected an invalid input refusal";
     const NOT_MISSING: &str = "expected a not found error";
     const DONE_REQUEST: &str = r#"{"kind":"done","reason":"sent"}"#;
+    const DONE_REASON: &str = "sent";
+    const FUTURE_DONE_RESULT: &str = r#"{"disarmed":true,"future_field":"ignored"}"#;
+    const UNKNOWN_DONE_RESULT: &str = r#"{"future_field":"ignored"}"#;
     const FAIL_DISARM: &str = "CREATE TEMP TRIGGER fail_disarm BEFORE UPDATE OF armed ON automation_bindings \
         BEGIN SELECT RAISE(ABORT, 'disarm failed'); END";
     const ALLOW_DISARM: &str = "DROP TRIGGER fail_disarm";
@@ -2486,13 +2524,18 @@ mod tests {
         }
     }
 
-    #[test_case(AutomationFiringStatus::Completed, true; "completed")]
-    #[test_case(AutomationFiringStatus::Skipped, true; "skipped")]
-    #[test_case(AutomationFiringStatus::Released, true; "released")]
-    #[test_case(AutomationFiringStatus::Failed, false; "failed")]
-    #[test_case(AutomationFiringStatus::Cancelled, false; "cancelled")]
-    #[test_case(AutomationFiringStatus::Interrupted, false; "interrupted")]
-    fn done_disarms_only_a_completed_firing(status: AutomationFiringStatus, disarmed: bool) {
+    #[test_case(AutomationFiringStatus::Completed, true, true; "completed")]
+    #[test_case(AutomationFiringStatus::Skipped, true, true; "skipped")]
+    #[test_case(AutomationFiringStatus::Released, true, true; "released")]
+    #[test_case(AutomationFiringStatus::Failed, true, false; "failed")]
+    #[test_case(AutomationFiringStatus::Cancelled, true, false; "cancelled")]
+    #[test_case(AutomationFiringStatus::Interrupted, true, false; "interrupted")]
+    #[test_case(AutomationFiringStatus::Completed, false, false; "already_disarmed")]
+    fn done_disarms_only_a_completed_firing(
+        status: AutomationFiringStatus,
+        armed: bool,
+        disarmed: bool,
+    ) {
         let (_temp, _state_dir, database, session_id) = open();
         database
             .upsert_automation_binding(&arming(session_id, AUTOMATION))
@@ -2500,6 +2543,9 @@ mod tests {
         database
             .upsert_automation_binding(&arming(session_id, OTHER_AUTOMATION))
             .unwrap();
+        if !armed {
+            database.disarm_automation(session_id, AUTOMATION).unwrap();
+        }
         running(
             &database,
             &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
@@ -2524,12 +2570,16 @@ mod tests {
             .unwrap();
         assert_eq!(finished.disarmed.as_deref(), disarmed.then_some(AUTOMATION));
         assert_eq!(
+            finished.done_reason.as_deref(),
+            disarmed.then_some(DONE_REASON)
+        );
+        assert_eq!(
             database
                 .load_automation_binding(session_id, AUTOMATION)
                 .unwrap()
                 .unwrap()
                 .armed,
-            !disarmed
+            armed && !disarmed
         );
         assert!(
             database
@@ -2544,6 +2594,74 @@ mod tests {
             .unwrap();
         assert_eq!(stored.summary.kind, AutomationActionKind::Done);
         assert_eq!(stored.request, DONE_REQUEST);
+        assert_eq!(
+            stored.result.as_deref(),
+            disarmed.then_some(DONE_APPLIED_RESULT)
+        );
+    }
+
+    #[test_case(None, false; "older_missing_result")]
+    #[test_case(Some(UNKNOWN_DONE_RESULT), false; "missing_applied_field")]
+    #[test_case(Some(FUTURE_DONE_RESULT), true; "unknown_fields_are_ignored")]
+    fn done_delivery_result_round_trips_without_a_format_change(
+        result: Option<&str>,
+        tagged: bool,
+    ) {
+        let (_temp, state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        database
+            .start_automation_action(&action(FIRE_ID, 0, AutomationActionStatus::Queued))
+            .unwrap();
+        database
+            .start_automation_action(&NewAutomationAction {
+                kind: AutomationActionKind::Done,
+                request: DONE_REQUEST.into(),
+                ..http(FIRE_ID, 1)
+            })
+            .unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 1, &done(None))
+            .unwrap();
+        let finished = database
+            .finish_automation_firing(
+                FIRE_ID,
+                &AutomationFiringEnd {
+                    done_action: Some(1),
+                    ..end(AutomationFiringStatus::Completed)
+                },
+            )
+            .unwrap();
+        assert_eq!(finished.done_reason.as_deref(), Some(DONE_REASON));
+        database
+            .connection()
+            .execute(
+                "UPDATE automation_actions SET result = ?2 WHERE fire_id = ?1 AND seq = 1",
+                params![FIRE_ID, result],
+            )
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let action = database
+            .load_automation_action(FIRE_ID, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.result.as_deref(), result);
+        if let Some(result) = action.result {
+            assert!(serde_json::from_str::<Value>(&result).unwrap().is_object());
+        }
+        let deliveries = database.load_automation_outbox(session_id).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].finished);
+        assert_eq!(
+            deliveries[0].done_reason.as_deref(),
+            tagged.then_some(DONE_REASON)
+        );
     }
 
     #[test_case(() ; "atomic_commit")]

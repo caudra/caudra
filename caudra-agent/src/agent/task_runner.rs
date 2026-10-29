@@ -345,14 +345,13 @@ impl PreparedTask {
     ) -> TaskOutcome {
         let started = self.started;
         let session = &mut self.session;
-        let ran_as = RanAs::of(&session.0);
         let permit = cancel.race(permits.acquire_arc()).await;
         let mut verdict = if let Ok(_permit) = permit {
             if let Some(reporter) = &self.reporter
                 && let Err(error) = reporter.running().await
             {
                 session.0.close();
-                return finish(started, Some(ran_as), 0, Err(error.into()));
+                return finish(started, Some(RanAs::of(&session.0)), 0, Err(error.into()));
             }
             converse(
                 &mut session.0,
@@ -371,7 +370,7 @@ impl PreparedTask {
             verdict = Err(error.into());
         }
         session.0.close();
-        finish(started, Some(ran_as), tokens_used, verdict)
+        finish(started, Some(RanAs::of(&session.0)), tokens_used, verdict)
     }
 }
 
@@ -990,7 +989,8 @@ mod tests {
     use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
     use crate::workflow::{RuntimeDeps, WorkflowRuntime, WorkspaceRebind};
     use crate::{
-        AgentEvent, AgentInput, StoredSession, SubagentEnd, ThinkingConfig, ToolDoneEvent,
+        AgentEvent, AgentInput, SettingsChange, StoredSession, SubagentEnd, ThinkingConfig,
+        ToolDoneEvent,
     };
     use caudra_storage::{StateDir, id::CaudraId};
     use caudra_workflow::{
@@ -1025,6 +1025,8 @@ mod tests {
     const COMPACTION_CONTEXT_WINDOW: u32 = 200_000;
     const COMPACTION_INPUT_TOKENS: u32 = 190_000;
     const CURRENT_CHAT_ID: &str = "current-chat";
+    const SWITCHED_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const STALE_RAN_ON: &str = "the outcome must name the model the task ended on";
     const PLAN_PATH: &str = ".caudra/plans/current.md";
     const BOUND_PLAN: &str = ".caudra/plans/bound.md";
     const CURSOR_PROBE: &str = "resume_cursor_probe";
@@ -1564,6 +1566,37 @@ mod tests {
             let outcome = run_task(&ctx, request(TaskIdentity::Derive, requested)).await;
 
             assert_eq!(outcome.mode, Some(expected));
+        });
+    }
+
+    /// The parent reads which model answered off the outcome, so a model the
+    /// user moved the task to mid-run is the one it names.
+    #[test]
+    fn an_outcome_reports_the_model_a_live_switch_moved_to() {
+        smol::block_on(async {
+            let ctx = ctx_with(
+                AgentMode::Build,
+                ScriptedProvider::new(vec![text_response(SUMMARY, FIRST_TURN)]),
+            );
+            let task = PreparedTask::prepare(&ctx, request(TaskIdentity::Derive, None), None)
+                .await
+                .unwrap();
+            task.session.0.control().live.request(SettingsChange {
+                route: Some((
+                    Arc::clone(&ctx.provider),
+                    Model::from_spec(SWITCHED_SPEC).unwrap(),
+                )),
+                thinking: None,
+            });
+
+            let outcome = task.run(&ctx.cancel).await;
+
+            assert_eq!(outcome.error, None);
+            assert_eq!(
+                outcome.model.as_deref(),
+                Some(SWITCHED_SPEC),
+                "{STALE_RAN_ON}"
+            );
         });
     }
 

@@ -16317,11 +16317,12 @@ fn remote_cd_persistence_failure_preserves_live_state() {
 
 /// A live skill-pack flip reaches a remote tab, whose commands come from its own project
 /// rather than the ones the event loop rediscovers locally.
-#[test_case(false, false ; "both_off")]
-#[test_case(true, false ; "pstack_on")]
-#[test_case(false, true ; "mattpocock_on")]
-#[test_case(true, true ; "both_on")]
-fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) {
+#[test_case(false, false, false ; "all_off")]
+#[test_case(true, false, false ; "pstack_on")]
+#[test_case(false, true, false ; "mattpocock_on")]
+#[test_case(false, false, true ; "emil_on")]
+#[test_case(true, true, true ; "all_on")]
+fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool, emil: bool) {
     let mut app = test_app();
     let original = remote_workspace_session();
     let workspace = WorkspaceSession::new(
@@ -16352,16 +16353,26 @@ fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) 
     let grill = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::MATTPOCOCK, true)
         [0]
     .display_name();
-    let packs = SkillPacks { pstack, mattpocock };
+    let animate = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::EMIL, true)[0]
+        .display_name();
+    let packs = SkillPacks {
+        pstack,
+        mattpocock,
+        emil,
+    };
 
     app.set_skill_packs(SkillPacks {
         pstack: !pstack,
         mattpocock: !mattpocock,
+        emil: !emil,
     });
     app.set_skill_packs(packs);
 
     let listed = |name: &str| app.command_palette.find_custom_command(name).is_some();
-    assert_eq!((listed(&poteto), listed(&grill)), (pstack, mattpocock));
+    assert_eq!(
+        (listed(&poteto), listed(&grill), listed(&animate)),
+        (pstack, mattpocock, emil)
+    );
 }
 
 #[test]
@@ -29492,6 +29503,7 @@ pub(crate) mod automation_runtime {
             seq: 0,
             text: COURIER_MESSAGE.into(),
             attach: None,
+            done_reason: None,
             goal: Some(GoalClaim {
                 condition: GOAL.into(),
                 continuation_limit: Some(CONTINUATION_LIMIT),

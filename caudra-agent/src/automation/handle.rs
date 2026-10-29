@@ -4,8 +4,8 @@
 //! before it, and stores it before it resolves. It never waits on a firing, so neither does a
 //! claim.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard};
 
 use arc_swap::ArcSwap;
 use async_lock::Mutex;
@@ -30,6 +30,7 @@ use super::clock::Clock;
 use super::messaging::{Messaging, Observed, Observer, ReleaseError, Watching};
 use super::outbox::Outbox;
 use super::registry;
+use super::reminder::Reminder;
 use super::store::{AutomationStore, Mirrored};
 use super::work_finished::WorkChecked;
 use super::workflows::Settled;
@@ -116,6 +117,7 @@ pub(super) struct Shared {
     pub(super) clock: Arc<dyn Clock>,
     pub(super) directories: AutomationDirs,
     state: ArcSwap<AutomationState>,
+    pub(super) reminder: SyncMutex<Reminder>,
     events: flume::Sender<AutomationEvent>,
     receiver: flume::Receiver<AutomationEvent>,
     /// What the message observers match against; only the actor replaces it.
@@ -156,6 +158,7 @@ impl Shared {
             clock,
             directories,
             state: ArcSwap::from_pointee(state),
+            reminder: SyncMutex::new(Reminder::default()),
             events,
             receiver,
             watching: Arc::new(ArcSwap::from_pointee(Watching::default())),
@@ -164,6 +167,12 @@ impl Shared {
 
     pub(super) fn state(&self) -> Arc<AutomationState> {
         self.state.load_full()
+    }
+
+    pub(super) fn reminder(&self) -> MutexGuard<'_, Reminder> {
+        self.reminder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Announces a change the mirror already holds. A full channel drops its oldest event: the

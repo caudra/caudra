@@ -1377,6 +1377,12 @@ version = 5
 # Type: boolean.
 # mattpocock = false
 
+# Offer Emil Kowalski's bundled design-engineering skills (animation, motion
+# review, UI stress tests, prototypes, mobile polish, Swift): the `emil` skill
+# and the `/emil:` commands.
+# Type: boolean.
+# emil = false
+
 [plugins.task]
 
 # Max concurrently running subagents.

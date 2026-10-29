@@ -4682,6 +4682,9 @@ async fn spawn_prepared_session(
                                 background: background.as_ref(),
                                 jobs: None,
                                 workflow: workflow.as_ref(),
+                                automation: automations
+                                    .as_ref()
+                                    .map(|automations| &automations.handle),
                             },
                             &mut refresh,
                             ActiveContext {
@@ -10184,6 +10187,7 @@ complete(#{ report: first.output });
                 seq: 0,
                 text: GOAL.into(),
                 attach: None,
+                done_reason: None,
                 goal: Some(GoalClaim {
                     condition: GOAL.into(),
                     continuation_limit: None,

@@ -717,6 +717,7 @@ fn action_line(action: &ActionRow) -> String {
 
 fn wait_text(reason: WaitReason) -> String {
     match reason {
+        WaitReason::FiringUnfinished => "waiting for the firing to finish".to_owned(),
         WaitReason::Paused => "automations are paused".to_owned(),
         WaitReason::HumanPromptQueued => "a human prompt goes first".to_owned(),
         WaitReason::ModalOpen => "a dialog is open".to_owned(),

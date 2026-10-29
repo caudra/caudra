@@ -14,6 +14,7 @@ use caudra_agent::agent::{
     ActiveContext, ContextRefresh, PrefixKey, RefreshedContext, StandingState, Surface,
     SurfaceBaseline,
 };
+use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::code::CodeSession;
 use caudra_agent::context::{
@@ -904,6 +905,10 @@ impl AgentLoop {
         }
         .collect_with_favorites(prepared.history.as_slice(), listed);
         prepared.refresh_reminders(reminders);
+        let automation = self
+            .session_id
+            .as_ref()
+            .and_then(|session| AutomationHandle::lookup(session.id()));
         prepared.finish(
             &mut self.history,
             event_tx,
@@ -912,6 +917,7 @@ impl AgentLoop {
                 background: self.background.as_ref(),
                 jobs: None,
                 workflow: self.workflow.as_ref(),
+                automation: automation.as_ref(),
             },
         )?;
         agent::append_post_compaction_instructions(&mut self.history, event_tx, &self.config)?;
