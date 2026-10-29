@@ -152,10 +152,14 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Best | **gpt-5.6-sol, gpt-5.6** (gpt-5.6 default) | $4.00 / $20.00 | 372K ctx / 128K out |
 |  | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 |  | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
+|  | gpt-5.5-pro | $30.00 / $180.00 | 1050K ctx / 128K out |
 |  | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
+|  | gpt-5.4-pro | $30.00 / $180.00 | 1050K ctx / 128K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
+|  | o3-pro | $20.00 / $80.00 | 200K ctx / 100K out |
 |  | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+|  | gpt-5.2-pro | $21.00 / $168.00 | 400K ctx / 128K out |
 |  | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
 
 Routing defaults: gpt-6-luna (Fast), gpt-6-astra (Best)
@@ -261,9 +265,10 @@ Connects to any OpenAI-compatible `/v1` endpoint. Set `LLAMA_CPP_HOST` to your s
 |---------|--------|-------------------------------|---------|
 | Small | zai-glm-5-3-flash | $0.15 / $0.50 | 1000K ctx |
 | Fast | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
-| Best | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
+| Best | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604, mistral-medium-3** (default) | $1.50 / $7.50 | 262K ctx |
 |  | mistral-large-4 | $0.68 / $2.09, then $1.36 / $4.18 from 2026-10-20 | 1000K ctx |
-|  | glm-5-3, zai-glm-5-3 | $1.40 / $4.40 | 1000K ctx |
+|  | mistral-large-latest, mistral-large-2512 | $0.50 / $1.50 | 262K ctx |
+|  | glm-5-3, zai-glm-5-3, zai-glm-5, zai-glm-latest | $1.40 / $4.40 | 1000K ctx |
 |  | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
 |  | deepseek-v4-1-flash-1017 | $0.30 / $1.20 | 1000K ctx |
 |  | mistral-small-latest, mistral-small-2603 | $0.15 / $0.60 | 262K ctx |
@@ -283,14 +288,18 @@ Routing defaults: ministral-14b-latest (Fast), mistral-medium-latest (Best)
 | Small | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Small | glm-4.7-flashx | $0.07 / $0.40 | 200K ctx / 131K out |
 | Fast | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
+| Small | glm-4.6v-flashx | $0.04 / $0.40 | 128K ctx |
+| Small | glm-4.6v-flash | $0.00 / $0.00 | 128K ctx |
 | Small | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Small | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
+| Small | glm-4.5-airx | $1.10 / $4.50 | 131K ctx / 98K out |
 | Best | **glm-5.3** (default) | $1.40 / $4.40 | 1000K ctx / 131K out |
-|  | glm-5-code | $1.20 / $5.00 | 200K ctx / 131K out |
 |  | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 |  | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
 |  | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 |  | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
+|  | glm-4.6v | $0.30 / $0.90 | 128K ctx |
+|  | glm-4.5-x | $2.20 / $8.90 | 131K ctx / 98K out |
 |  | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 
 Routing defaults: glm-4.7-flash (Fast), glm-5.3 (Best)
@@ -325,11 +334,17 @@ OpenRouter aggregates models from many providers behind a single API key. Browse
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Fast | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
-| Best | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
-|  | hf:deepseek-ai/DeepSeek-V3.2 | $0.56 / $1.68 | 200K ctx / 131K out |
+| Fast | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 196K ctx / 65K out |
+| Small | hf:zai-org/GLM-5.3-Flash | $0.15 / $0.50 | 524K ctx / 65K out |
+| Small | hf:Qwen/Qwen3.8-27B | $0.45 / $2.20 | 262K ctx / 65K out |
+| Best | **hf:moonshotai/Kimi-K3** (default) | $3.00 / $15.00 | 524K ctx / 65K out |
+|  | hf:zai-org/GLM-5.3 | $1.40 / $4.40 | 524K ctx / 65K out |
+|  | hf:deepseek-ai/DeepSeek-V4.1-Flash-1017 | $0.60 / $1.20 | 524K ctx / 65K out |
+|  | hf:deepseek-ai/DeepSeek-V4.1-Flash | $0.60 / $1.20 | 524K ctx / 65K out |
+|  | hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | $0.30 / $1.00 | 262K ctx / 65K out |
+|  | hf:openai/gpt-oss-120b | $0.10 / $0.10 | 131K ctx / 65K out |
 
-Routing defaults: hf:zai-org/GLM-4.7-Flash (Fast), hf:moonshotai/Kimi-K2.5 (Best)
+Routing defaults: hf:zai-org/GLM-4.7-Flash (Fast), hf:moonshotai/Kimi-K3 (Best)
 
 ### TensorX
 
@@ -701,7 +716,7 @@ Current plans:
 | Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-medium-latest` |
 | Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
 | Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.3` |
-| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
+| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5.3` |
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
