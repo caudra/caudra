@@ -63,6 +63,7 @@ include_dir = { workspace = true }
 workspace-hack.workspace = true
 
 [dev-dependencies]
+async-lock = { workspace = true }
 caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 

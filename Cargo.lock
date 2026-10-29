@@ -879,6 +879,7 @@ dependencies = [
 name = "caudra"
 version = "0.2.0-preview.16"
 dependencies = [
+ "async-lock",
  "async-trait",
  "caudra-acp",
  "caudra-agent",
