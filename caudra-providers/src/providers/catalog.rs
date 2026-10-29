@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use caudra_config::providers::{ProvidersConfig, builtin_provider};
-use caudra_models::{ALLOWED_NPM, BLOCKED_CATALOG_PROVIDERS};
+use caudra_models::{ALLOWED_NPM, BLOCKED_CATALOG_PROVIDERS, npm_endpoint};
 use flume::Sender;
 use isahc::Request;
 use serde_json::Value;
@@ -82,7 +82,9 @@ impl ProviderData {
             slug,
             display_name: catalog_provider.name.clone(),
             env_keys: catalog_provider.env.clone(),
-            base_url: catalog_provider.api.clone(),
+            base_url: npm_endpoint(&catalog_provider.npm)
+                .map(str::to_owned)
+                .or_else(|| catalog_provider.api.clone()),
             npm: catalog_provider.npm.clone(),
             api_format,
             models,
@@ -367,10 +369,10 @@ impl CatalogData {
                 continue;
             }
 
-            let Some(_base_url) = &provider.api else {
+            if npm_endpoint(&provider.npm).is_none() && provider.api.is_none() {
                 debug!(provider = %provider_id, "skipping: no API URL in catalog");
                 continue;
-            };
+            }
 
             if builtin_provider(&provider_id).is_some()
                 && !OPENCODE_FAMILY_SLUGS.contains(&provider_id.as_str())
@@ -804,6 +806,11 @@ mod tests {
     const NVIDIA: &str = "nvidia";
     const NVIDIA_MODEL: &str = "z-ai/glm-5.3";
     const NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/chat/completions";
+    const GROQ: &str = "groq";
+    const GROQ_NPM: &str = "@ai-sdk/groq";
+    const GROQ_MODEL: &str = "openai/gpt-oss-120b";
+    const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+    const UNTRUSTED_API: &str = "https://untrusted.example/v1";
     const UNKNOWN_PROVIDER: &str = "caudra-unknown-catalog-provider";
     const UNKNOWN_MESSAGE: &str = "unknown provider 'caudra-unknown-catalog-provider'";
 
@@ -830,6 +837,43 @@ mod tests {
             .unwrap();
         assert_eq!(wire.url, NVIDIA_URL);
         assert_eq!(wire.body["model"], NVIDIA_MODEL);
+    }
+
+    #[test_case(None; "without_an_api")]
+    #[test_case(Some(UNTRUSTED_API); "ignoring_the_row_api")]
+    fn groq_rows_send_to_the_built_in_endpoint(api: Option<&str>) {
+        let data = CatalogData::from_index(HashMap::from([(
+            GROQ.into(),
+            CatalogProvider {
+                name: GROQ.into(),
+                env: vec![],
+                npm: GROQ_NPM.into(),
+                api: api.map(Into::into),
+                models: HashMap::from([(GROQ_MODEL.into(), CatalogModel::default())]),
+            },
+        )]));
+        let provider = super::try_create(
+            &data,
+            GROQ,
+            &api_key_account(GROQ, ACCOUNT, CATALOG_CREDENTIAL),
+            Timeouts::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut model = Model::from_spec(&format!("{NVIDIA}/{NVIDIA_MODEL}")).unwrap();
+        model.id = GROQ_MODEL.into();
+        let wire = provider
+            .wire_request(
+                &model,
+                &[],
+                SYSTEM_PROMPT,
+                &json!([]),
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(wire.url, GROQ_URL);
+        assert_eq!(wire.body["model"], GROQ_MODEL);
     }
 
     #[test]

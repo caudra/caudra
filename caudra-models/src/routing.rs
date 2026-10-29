@@ -4,9 +4,9 @@ use std::fmt::Write;
 use serde::Deserialize;
 
 use crate::validate::pointer_token;
-use crate::{CatalogProvider, Issue, Provider};
+use crate::{CatalogProvider, Issue, Provider, npm_endpoint};
 
-pub(crate) const HEADING: &str = "## Routing changes\n\nA catalog row's `api`, `env`, and `npm` decide where Caudra sends a request and which key it sends. Confirm each change on the provider's own page, then accept it in `audit/accepted.json` under `routing`, or `make check` fails. A protected row belongs to a built-in provider or shares a built-in key. Caudra keeps its bundled routing for those, so only a person accepts their changes.\n";
+pub(crate) const HEADING: &str = "## Routing changes\n\nA catalog row's `api`, `env`, and `npm` decide where Caudra sends a request and which key it sends. Confirm each change on the provider's own page, then accept it in `audit/accepted.json` under `routing`, or `make check` fails. A protected row belongs to a built-in provider, uses a package with a built-in endpoint such as `@ai-sdk/groq`, or shares one of their keys. Caudra keeps its bundled routing for those, so only a person accepts their changes.\n";
 pub(crate) const NONE: &str = "No routing changes.";
 pub(crate) const NOT_COMPARED: &str =
     "Not compared: pass --published with the published models.json.";
@@ -118,17 +118,21 @@ pub fn changes(
         .collect()
 }
 
-/// Rows named by a built-in catalog slug, plus rows that list one of those
-/// rows' environment keys in either catalog.
+/// Rows named by a built-in catalog slug or using a package with a built-in
+/// endpoint, plus rows that list one of those rows' environment keys, in
+/// either catalog.
 fn protected_rows<'a>(builtin: &BTreeSet<String>, catalogs: [&'a Catalog; 2]) -> BTreeSet<&'a str> {
     let rows = || catalogs.into_iter().flatten();
+    let built_in = |slug: &str, row: &CatalogProvider| {
+        builtin.contains(slug) || npm_endpoint(&row.npm).is_some()
+    };
     let keys: BTreeSet<&str> = rows()
-        .filter(|(slug, _)| builtin.contains(*slug))
+        .filter(|(slug, row)| built_in(slug, row))
         .flat_map(|(_, row)| row.env.iter().map(String::as_str))
         .collect();
     rows()
         .filter(|(slug, row)| {
-            builtin.contains(*slug) || row.env.iter().any(|key| keys.contains(key.as_str()))
+            built_in(slug, row) || row.env.iter().any(|key| keys.contains(key.as_str()))
         })
         .map(|(slug, _)| slug.as_str())
         .collect()
@@ -186,6 +190,7 @@ mod tests {
     const API: &str = "https://gateway.example.com/v1";
     const MOVED_API: &str = "https://moved.example.com/v1";
     const NPM: &str = "@ai-sdk/openai-compatible";
+    const GROQ_PACKAGE: &str = "@ai-sdk/groq";
 
     fn row(env: &str, api: &str) -> CatalogProvider {
         serde_json::from_value(json!({"name": "Row", "env": [env], "npm": NPM, "api": api}))
@@ -221,6 +226,17 @@ mod tests {
             ),
             (slug, RoutingField::Api, API, MOVED_API, protected)
         );
+    }
+
+    #[test]
+    fn a_row_using_a_package_endpoint_is_protected() {
+        let mut moved = row(OTHER_KEY, MOVED_API);
+        moved.npm = GROQ_PACKAGE.to_owned();
+        let before = catalog(&[(OTHER, row(OTHER_KEY, API))]);
+        let after = catalog(&[(OTHER, moved)]);
+        let found = changes(&builtin(), &before, &after);
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|change| change.protected));
     }
 
     #[test]

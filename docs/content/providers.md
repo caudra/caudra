@@ -62,7 +62,7 @@ The first entry also names the model that wins automatic resolution, so it has t
 
 Model prices, limits, defaults, and availability come from a signed model list. Every Caudra binary bundles a copy, so the list works offline, and the model tables on this page show that copy. At startup Caudra also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
 
-The list also carries a reviewed import of the [models.dev](https://models.dev) catalog. It describes models that have no curated entry, and the providers Caudra reaches only through it, such as NVIDIA. Caudra does not contact models.dev itself.
+The list also carries a reviewed import of the [models.dev](https://models.dev) catalog. It describes models that have no curated entry, and the providers Caudra reaches only through it, such as NVIDIA and Groq. Caudra sends Groq requests to `https://api.groq.com/openai/v1` with `GROQ_API_KEY`, whatever the model list says. Caudra does not contact models.dev itself.
 
 Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. A missing or invalid cache, or a check timestamp in the future, triggers a new check. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
 

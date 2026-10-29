@@ -37,7 +37,12 @@ pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROVIDERS: usize = 1000;
 pub const MAX_CATALOG_MODELS: usize = 50_000;
 pub const MAX_TOKENS: u32 = 100_000_000;
-pub const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
+const GROQ_NPM: &str = "@ai-sdk/groq";
+pub const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic", GROQ_NPM];
+/// Packages that serve one vendor's API. Caudra sends their rows to the
+/// endpoint listed here and ignores the row's `api`, so a model file cannot
+/// redirect the vendor's key.
+pub const NPM_ENDPOINTS: &[(&str, &str)] = &[(GROQ_NPM, "https://api.groq.com/openai/v1")];
 pub const BLOCKED_CATALOG_PROVIDERS: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
 pub const SUPPORTED_REQUIREMENTS: &[&str] = &[];
 pub const TRUSTED_KEYS: &[[u8; 32]] = &[[
@@ -94,6 +99,14 @@ pub fn to_pretty_bytes(snapshot: &Snapshot) -> Vec<u8> {
         .expect("model-file wire types serialize infallibly to a byte vector");
     bytes.push(b'\n');
     bytes
+}
+
+/// The endpoint Caudra uses for a catalog row with this `npm`, if the package
+/// names one vendor's API.
+pub fn npm_endpoint(npm: &str) -> Option<&'static str> {
+    NPM_ENDPOINTS
+        .iter()
+        .find_map(|(package, endpoint)| (*package == npm).then_some(*endpoint))
 }
 
 impl Payload {

@@ -13,8 +13,8 @@ use caudra_config::providers::{ProvidersConfig, all_builtins, resolve_api_key_en
 use caudra_config::websearch::WebsearchBackendName;
 use caudra_models::sign::{Signature, SignatureError, verify};
 use caudra_models::{
-    BLOCKED_CATALOG_PROVIDERS, MAX_BYTES, ParseError, Snapshot, TRUSTED_KEYS, parse_bounded,
-    validate,
+    BLOCKED_CATALOG_PROVIDERS, MAX_BYTES, NPM_ENDPOINTS, ParseError, Snapshot, TRUSTED_KEYS,
+    npm_endpoint, parse_bounded, validate,
 };
 use caudra_storage::{StorageError, atomic_write_permissions, paths, try_exclusive_state_lock};
 use flate2::read::GzDecoder;
@@ -462,7 +462,10 @@ struct ProtectedRouting {
 
 impl ProtectedRouting {
     fn bundled() -> Self {
-        let catalog = bundled::snapshot();
+        Self::from_snapshot(bundled::snapshot())
+    }
+
+    fn from_snapshot(catalog: Snapshot) -> Self {
         let mut slugs: HashSet<String> = catalog
             .payload
             .providers
@@ -476,6 +479,14 @@ impl ProtectedRouting {
                 .iter()
                 .map(|slug| (*slug).to_owned()),
         );
+        slugs.extend(
+            catalog
+                .payload
+                .catalog
+                .iter()
+                .filter(|(_, provider)| npm_endpoint(&provider.npm).is_some())
+                .map(|(slug, _)| slug.clone()),
+        );
         let mut env: HashSet<String> = EXTRA_AUTH_ENV.iter().map(|key| (*key).to_owned()).collect();
         env.extend(
             DECISION_PRESETS
@@ -488,7 +499,10 @@ impl ProtectedRouting {
                 .iter()
                 .filter_map(|field| field.env.map(str::to_owned))
         }));
-        let mut hosts = HashSet::new();
+        let mut hosts: HashSet<String> = NPM_ENDPOINTS
+            .iter()
+            .filter_map(|(_, endpoint)| url_host(endpoint))
+            .collect();
         for provider in all_builtins() {
             slugs.insert(provider.slug.to_owned());
             if !provider.default_api_key_env.is_empty() {
@@ -595,7 +609,7 @@ fn url_host(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -611,9 +625,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Cache, LOCK_FILE, LOCK_MODE, MAX_BYTES, ModelsConfig, REFRESH_INTERVAL, RefreshError,
-        STATE_FILE, State, Timestamp, bundled, current, select, try_exclusive_state_lock,
-        verified_snapshot,
+        Cache, LOCK_FILE, LOCK_MODE, MAX_BYTES, ModelsConfig, ProvidersConfig, REFRESH_INTERVAL,
+        RefreshError, STATE_FILE, State, Timestamp, bundled, current, select,
+        try_exclusive_state_lock, verified_snapshot,
     };
     use crate::Model;
     use crate::model_data::install;
@@ -640,6 +654,10 @@ mod tests {
     const PROTECTED_SLUG: &str = "opencode";
     const COLLISION_SLUG: &str = "new-collision";
     const CUSTOM_KEY: &str = "CUSTOM_ROUTING_TEST_KEY";
+    const GROQ: &str = "groq";
+    const GROQ_NPM: &str = "@ai-sdk/groq";
+    const GROQ_KEY: &str = "GROQ_API_KEY";
+    const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1";
     const NEWEST: &str = "2026-10-31T12:00:00Z";
     const TURN_MODEL: &str = "turn-model";
     const ADDED_MODEL: &str = "added-model";
@@ -845,6 +863,27 @@ mod tests {
         );
         super::ROUTING.protect(&mut candidate, &config);
         assert!(candidate.payload.catalog.is_empty());
+    }
+
+    #[test]
+    fn package_endpoint_rows_keep_their_routing_and_host() {
+        let mut bundled = snapshot(NOW, true);
+        bundled.payload.catalog = serde_json::from_str(CATALOG).unwrap();
+        let mut groq = bundled.payload.catalog["test"].clone();
+        groq.npm = GROQ_NPM.into();
+        groq.api = None;
+        groq.env = vec![GROQ_KEY.into()];
+        bundled.payload.catalog = BTreeMap::from([(GROQ.into(), groq.clone())]);
+        let routing = super::ProtectedRouting::from_snapshot(bundled);
+        let mut candidate = snapshot(NEWER, true);
+        candidate.payload.catalog = serde_json::from_str(CATALOG).unwrap();
+        candidate.payload.catalog.get_mut("test").unwrap().api = Some(GROQ_ENDPOINT.into());
+        let mut redirected = groq.clone();
+        redirected.npm = "@ai-sdk/openai-compatible".into();
+        redirected.api = Some("https://untrusted.example/v1".into());
+        candidate.payload.catalog.insert(GROQ.into(), redirected);
+        routing.protect(&mut candidate, &ProvidersConfig::default());
+        assert_eq!(candidate.payload.catalog, BTreeMap::from([(GROQ.into(), groq)]));
     }
 
     #[test_case(false; "unknown_family")]

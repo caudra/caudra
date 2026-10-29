@@ -1,8 +1,8 @@
 {
   "$schema": "schema.json",
   "format": 1,
-  "updated_at": "2026-10-29T17:32:35.211466379Z",
-  "content_sha256": "88db35136db2617fcaa770571c57e30db5685acdd06aa86abb955118f8a6a719",
+  "updated_at": "2026-10-29T21:34:56Z",
+  "content_sha256": "7b2566be5c6c1e92af50171fdb1e28cbd3bd6b0966cc518f7717b71e5da56bcb",
   "providers": [
     {
       "slug": "anthropic",
@@ -72284,6 +72284,389 @@
           "last_updated": "2025-07-15",
           "status": "deprecated",
           "tool_call": true
+        }
+      }
+    },
+    "groq": {
+      "name": "Groq",
+      "env": [
+        "GROQ_API_KEY"
+      ],
+      "npm": "@ai-sdk/groq",
+      "models": {
+        "allam-2-7b": {
+          "limit": {
+            "context": 4096,
+            "output": 4096
+          },
+          "cost": {
+            "input": 0.0,
+            "output": 0.0
+          },
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2025-01-23",
+          "last_updated": "2025-01-23",
+          "tool_call": false
+        },
+        "canopylabs/orpheus-arabic-saudi": {
+          "limit": {
+            "context": 4000,
+            "output": 50000
+          },
+          "provider": {},
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "audio"
+            ]
+          },
+          "release_date": "2025-12-16",
+          "last_updated": "2025-12-16",
+          "status": "beta",
+          "tool_call": false
+        },
+        "canopylabs/orpheus-v1-english": {
+          "limit": {
+            "context": 4000,
+            "output": 50000
+          },
+          "provider": {},
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "audio"
+            ]
+          },
+          "release_date": "2025-12-19",
+          "last_updated": "2025-12-19",
+          "status": "beta",
+          "tool_call": false
+        },
+        "llama-3.1-8b-instant": {
+          "limit": {
+            "context": 131072,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.05,
+            "output": 0.08
+          },
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2024-07-23",
+          "last_updated": "2024-07-23",
+          "status": "deprecated",
+          "tool_call": true
+        },
+        "llama-3.3-70b-versatile": {
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0.59,
+            "output": 0.79
+          },
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2024-12-06",
+          "last_updated": "2024-12-06",
+          "status": "deprecated",
+          "tool_call": true
+        },
+        "meta-llama/llama-prompt-guard-2-22m": {
+          "limit": {
+            "context": 512,
+            "output": 512
+          },
+          "cost": {
+            "input": 0.03,
+            "output": 0.03
+          },
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2025-04-29",
+          "last_updated": "2025-04-29",
+          "status": "beta",
+          "tool_call": false
+        },
+        "meta-llama/llama-prompt-guard-2-86m": {
+          "limit": {
+            "context": 512,
+            "output": 512
+          },
+          "cost": {
+            "input": 0.04,
+            "output": 0.04
+          },
+          "attachment": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2025-04-29",
+          "last_updated": "2025-04-29",
+          "status": "beta",
+          "tool_call": false
+        },
+        "openai/gpt-oss-120b": {
+          "limit": {
+            "context": 131072,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.075
+          },
+          "attachment": false,
+          "reasoning": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "release_date": "2025-08-05",
+          "last_updated": "2025-08-05",
+          "tool_call": true
+        },
+        "openai/gpt-oss-20b": {
+          "limit": {
+            "context": 131072,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.075,
+            "output": 0.3,
+            "cache_read": 0.0375
+          },
+          "attachment": false,
+          "reasoning": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "release_date": "2025-08-05",
+          "last_updated": "2025-08-05",
+          "tool_call": true
+        },
+        "openai/gpt-oss-safeguard-20b": {
+          "limit": {
+            "context": 131072,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.075,
+            "output": 0.3,
+            "cache_read": 0.0375
+          },
+          "attachment": false,
+          "reasoning": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "release_date": "2025-10-29",
+          "last_updated": "2025-10-29",
+          "status": "beta",
+          "tool_call": true
+        },
+        "qwen/qwen3.6-27b": {
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.6,
+            "output": 3.0,
+            "cache_read": 0.3
+          },
+          "attachment": true,
+          "reasoning": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "default"
+              ]
+            }
+          ],
+          "release_date": "2026-04-22",
+          "last_updated": "2026-04-22",
+          "status": "deprecated",
+          "tool_call": true
+        },
+        "qwen/qwen3.8-27b": {
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.8,
+            "output": 4.0
+          },
+          "attachment": true,
+          "reasoning": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "default",
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "release_date": "2026-08-14",
+          "last_updated": "2026-08-14",
+          "status": "beta",
+          "tool_call": true
+        },
+        "whisper-large-v3": {
+          "limit": {
+            "context": 448,
+            "output": 448
+          },
+          "attachment": true,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "audio"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2023-11-06",
+          "last_updated": "2023-11-06",
+          "tool_call": false
+        },
+        "whisper-large-v3-turbo": {
+          "limit": {
+            "context": 448,
+            "output": 448
+          },
+          "attachment": true,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "audio"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "release_date": "2024-10-01",
+          "last_updated": "2024-10-01",
+          "tool_call": false
         }
       }
     },
