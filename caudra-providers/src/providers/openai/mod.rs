@@ -55,6 +55,9 @@ const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
 const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
     "low", "medium", "high", "xhigh", "max",
 ])];
+/// The gpt-5 pro models start at `medium`, per each model page.
+const EFFORT_MEDIUM_TO_XHIGH: &[StaticReasoningOption] =
+    &[StaticReasoningOption::Effort(&["medium", "high", "xhigh"])];
 
 /// The two ladders OpenAI currently sells side by side. Each carries its own
 /// Fast and Best, so a conversation on one never has a lane answered from the
@@ -430,6 +433,31 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
+            prefixes: &["gpt-5.5-pro"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 30.00,
+                output: 180.00,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_ABOVE,
+                    input: 60.00,
+                    output: 270.00,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                }]),
+            },
+            max_output_tokens: Some(128_000),
+            context_window: 1_050_000,
+            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
+        },
+        ModelEntry {
             prefixes: &["gpt-5.5"],
             small: false,
             family: ModelFamily::Gpt,
@@ -455,6 +483,31 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
+            prefixes: &["gpt-5.4-pro"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 30.00,
+                output: 180.00,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_ABOVE,
+                    input: 60.00,
+                    output: 270.00,
+                    cache_write: 0.00,
+                    cache_read: 0.00,
+                    fast: None,
+                }]),
+            },
+            max_output_tokens: Some(128_000),
+            context_window: 1_050_000,
+            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
+        },
+        ModelEntry {
             prefixes: &["gpt-5.4"],
             small: false,
             family: ModelFamily::Gpt,
@@ -478,6 +531,25 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(128_000),
             context_window: 1_050_000,
             reasoning_options: Some(EFFORT_TO_XHIGH),
+        },
+        // Shuts down 2026-12-11 (https://developers.openai.com/api/docs/deprecations).
+        ModelEntry {
+            prefixes: &["o3-pro"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 20.00,
+                output: 80.00,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
         },
         ModelEntry {
             prefixes: &["o3"],
@@ -514,6 +586,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(128_000),
             context_window: 400_000,
             reasoning_options: Some(EFFORT_TO_XHIGH),
+        },
+        ModelEntry {
+            prefixes: &["gpt-5.2-pro"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 21.00,
+                output: 168.00,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(128_000),
+            context_window: 400_000,
+            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
         },
         ModelEntry {
             prefixes: &["gpt-5.2"],
@@ -554,6 +644,7 @@ mod tests {
     const LONG_CONTEXT_RULE: &str =
         "past 272K OpenAI bills twice the input and cache rates and 1.5x the output rate";
     const FAST_RULE: &str = "OpenAI's fast mode costs twice whichever rate applies";
+    const NO_CACHE_DISCOUNT: &str = "OpenAI's pro models offer no cached input discount";
 
     #[test_case("gpt-4.1-nano")]
     #[test_case("gpt-4.1-nano-2025-04-14")]
@@ -678,6 +769,10 @@ mod tests {
     #[test_case("gpt-5.4-mini", false)]
     #[test_case("gpt-5.4-nano", false)]
     #[test_case("gpt-5.2", false)]
+    #[test_case("gpt-5.5-pro", true)]
+    #[test_case("gpt-5.4-pro", true)]
+    #[test_case("gpt-5.2-pro", false)]
+    #[test_case("o3-pro", false)]
     fn only_long_context_models_state_a_tier(model_id: &str, tiered: bool) {
         let entry = lookup_entry(models(), model_id).unwrap();
         assert_eq!(
@@ -685,6 +780,30 @@ mod tests {
             tiered,
             "{LONG_CONTEXT_RULE}"
         );
+    }
+
+    /// Lookup is longest-prefix, so a pro id without its own entry would bill
+    /// at its base model's rates.
+    #[test_case("gpt-5.5-pro", "gpt-5.5-pro", 30.0, 180.0, 1_050_000)]
+    #[test_case("gpt-5.5-pro-2026-04-23", "gpt-5.5-pro", 30.0, 180.0, 1_050_000 ; "gpt_5_5_pro_snapshot")]
+    #[test_case("gpt-5.4-pro", "gpt-5.4-pro", 30.0, 180.0, 1_050_000)]
+    #[test_case("gpt-5.2-pro", "gpt-5.2-pro", 21.0, 168.0, 400_000)]
+    #[test_case("o3-pro", "o3-pro", 20.0, 80.0, 200_000)]
+    #[test_case("o3-pro-2025-06-10", "o3-pro", 20.0, 80.0, 200_000 ; "o3_pro_snapshot")]
+    fn pro_models_bill_at_their_own_rates(
+        model_id: &str,
+        entry_prefix: &str,
+        input: f64,
+        output: f64,
+        context_window: u32,
+    ) {
+        let entry = lookup_entry(models(), model_id).unwrap();
+
+        assert_eq!(entry.prefixes, [entry_prefix]);
+        assert_eq!(entry.pricing.input, input);
+        assert_eq!(entry.pricing.output, output);
+        assert_eq!(entry.pricing.cache_read, 0.0, "{NO_CACHE_DISCOUNT}");
+        assert_eq!(entry.context_window, context_window);
     }
 
     #[test_case("gpt-6.1-terra", false, 1.0, 0.05, 1.25, 5.0)]

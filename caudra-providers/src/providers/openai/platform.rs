@@ -50,6 +50,11 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.2",
 ];
 
+/// Models the platform serves on the Responses API alone, matched by prefix
+/// so their dated snapshots route too. No page says the plan serves them, so
+/// they stay out of `PLAN_MODELS` and the coding-plan listing.
+const RESPONSES_ONLY_MODELS: &[&str] = &["gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.2-pro", "o3-pro"];
+
 /// Families that accept an explicit `prompt_cache_breakpoint`; earlier models
 /// are implicit-only and reject the field.
 const EXPLICIT_CACHE_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-", "gpt-6.1-"];
@@ -86,6 +91,13 @@ struct AuthState {
 
 fn is_codex_model(model_id: &str) -> bool {
     coding_plan_context_window(model_id).is_some()
+}
+
+fn uses_responses(model_id: &str) -> bool {
+    is_codex_model(model_id)
+        || RESPONSES_ONLY_MODELS
+            .iter()
+            .any(|family| model_id.starts_with(family))
 }
 
 /// Asks for the priority tier when fast mode is on. `supports_fast()` is
@@ -468,7 +480,7 @@ impl OpenAi {
     ) -> Result<WireRequest, AgentError> {
         let mut buf = String::new();
         let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
-        if is_codex_model(&model.id) {
+        if uses_responses(&model.id) {
             return Ok(WireRequest::post(
                 super::responses::responses_url(auth)?,
                 responses_body(oauth, model, messages, system, tools, opts, cache_key),
@@ -609,15 +621,15 @@ impl Provider for OpenAi {
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let codex = is_codex_model(&model.id);
+            let responses = uses_responses(&model.id);
             let stream_timeout = self.compat.stream_timeout();
-            self.with_oauth_stream_retry(codex, event_tx, |auth, oauth, attempt_tx| {
+            self.with_oauth_stream_retry(responses, event_tx, |auth, oauth, attempt_tx| {
                 let wire = self.request(
                     oauth, &auth, model, messages, system, tools, &opts, cache_key,
                 );
                 async move {
                     let wire = wire?;
-                    if !codex {
+                    if !responses {
                         return self
                             .compat
                             .do_stream(model, &[], &wire, &attempt_tx, &auth)
@@ -648,7 +660,7 @@ impl Provider for OpenAi {
         cache_key: Option<&CacheKey>,
     ) -> Result<WireRequest, AgentError> {
         let snapshot = self.auth_snapshot();
-        let auth = self.request_auth(&snapshot, is_codex_model(&model.id));
+        let auth = self.request_auth(&snapshot, uses_responses(&model.id));
         self.request(
             snapshot.oauth_tokens.is_some(),
             &auth,
@@ -662,7 +674,7 @@ impl Provider for OpenAi {
     }
 
     fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
-        if is_codex_model(&model.id) {
+        if uses_responses(&model.id) {
             crate::ReasoningTransport::OpenAiResponses
         } else {
             crate::ReasoningTransport::OpenAiChatCompletions
@@ -917,6 +929,12 @@ mod tests {
     #[test_case(CHAT_MODEL, false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "other_models_post_chat_completions")]
     #[test_case("openai/gpt-5.6", false, TEST_BASE_URL, RESPONSES_PATH ; "alias_uses_responses_with_a_key")]
     #[test_case("openai/gpt-5.6", true, auth::CODING_PLAN_BASE_URL, RESPONSES_PATH ; "alias_uses_responses_with_a_login")]
+    #[test_case("openai/gpt-5.5-pro", false, TEST_BASE_URL, RESPONSES_PATH ; "gpt_5_5_pro_is_responses_only")]
+    #[test_case("openai/gpt-5.5-pro-2026-04-23", false, TEST_BASE_URL, RESPONSES_PATH ; "a_pro_snapshot_is_responses_only")]
+    #[test_case("openai/gpt-5.4-pro", false, TEST_BASE_URL, RESPONSES_PATH ; "gpt_5_4_pro_is_responses_only")]
+    #[test_case("openai/gpt-5.2-pro", false, TEST_BASE_URL, RESPONSES_PATH ; "gpt_5_2_pro_is_responses_only")]
+    #[test_case("openai/o3-pro", false, TEST_BASE_URL, RESPONSES_PATH ; "o3_pro_is_responses_only")]
+    #[test_case("openai/o3", false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "o3_keeps_chat_completions")]
     fn wire_request_posts_where_the_send_does(spec: &str, oauth: bool, base: &str, path: &str) {
         let wire = provider_with_login(oauth)
             .wire_request(
@@ -949,6 +967,8 @@ mod tests {
     #[test_case("gpt-5.6-terra-preview", None ; "non-codex near-match is rejected")]
     #[test_case("gpt-6-astra-preview", None ; "non-codex gpt-6 near-match is rejected")]
     #[test_case("gpt-5.4-nano", None)]
+    #[test_case("gpt-5.5-pro", None ; "responses_only_pro_is_not_a_plan_model")]
+    #[test_case("o3-pro", None ; "o3_pro_is_not_a_plan_model")]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
         assert_eq!(coding_plan_context_window(model_id), expected);
     }
@@ -1060,6 +1080,11 @@ mod tests {
     #[test_case("gpt-6.1-terra", ThinkingConfig::Off, Some("none") ; "terra_off_disables_reasoning")]
     #[test_case("gpt-6.1-terra", effort("max"), Some("max") ; "terra_supports_max")]
     #[test_case("gpt-6.1-terra", ThinkingConfig::Adaptive, None ; "terra_uses_api_default")]
+    #[test_case("gpt-5.5-pro", ThinkingConfig::Off, Some("medium") ; "off_is_medium_on_a_pro_model")]
+    #[test_case("gpt-5.5-pro", effort("low"), Some("medium") ; "low_rises_to_medium_on_a_pro_model")]
+    #[test_case("gpt-5.4-pro", effort("xhigh"), Some("xhigh") ; "xhigh_passes_through_on_5_4_pro")]
+    #[test_case("gpt-5.2-pro", effort("max"), Some("xhigh") ; "max_snaps_to_xhigh_on_5_2_pro")]
+    #[test_case("o3-pro", effort("xhigh"), Some("high") ; "xhigh_snaps_to_high_on_o3_pro")]
     fn responses_reasoning_uses_the_levels_the_model_declares(
         model_id: &str,
         thinking: ThinkingConfig,
