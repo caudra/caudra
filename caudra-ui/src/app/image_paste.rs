@@ -3,6 +3,7 @@ use std::thread;
 
 use crate::image;
 use caudra_agent::{ImageMediaType, ImageSource};
+use caudra_storage::media::MediaStore;
 
 use crate::repaint::Dirty;
 
@@ -34,8 +35,9 @@ impl App {
         f: impl FnOnce() -> Result<ImageSource, String> + Send + 'static,
     ) {
         let (tx, rx) = flume::bounded(1);
+        let media = MediaStore::new(&self.storage);
         thread::spawn(move || {
-            let _ = tx.send(f());
+            let _ = tx.send(f().map(|image| stored(image, &media)));
         });
         self.image_paste_rx.push(rx);
         self.status_bar.flash(flash);
@@ -65,4 +67,13 @@ impl App {
         }
         dirty
     }
+}
+
+/// Stores a fresh attachment once, so the draft, the queue, the stash and the
+/// agent all carry its reference. One the store refuses stays inline.
+fn stored(mut image: ImageSource, media: &MediaStore) -> ImageSource {
+    if let Err(error) = image.store_in(media) {
+        tracing::warn!(media_type = image.media_type.mime(), %error, "image kept inline");
+    }
+    image
 }

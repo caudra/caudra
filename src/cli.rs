@@ -1163,7 +1163,8 @@ pub enum StorageAction {
         #[arg(long)]
         records: bool,
     },
-    /// Check database and foreign-key integrity
+    /// Check database and foreign-key integrity, and that every image and PDF
+    /// the sessions refer to is intact in the media store
     Check,
     /// Checkpoint the write-ahead log
     Checkpoint {
@@ -1190,9 +1191,9 @@ pub enum StorageAction {
     ///
     /// Trimming releases the session's local file change records and removes
     /// retained tool output files, rewind archives, and large rich tool output
-    /// records. The conversation stays and the session can still be resumed.
-    /// Without any --keep-* flag the configured storage.retention.trim policy
-    /// applies.
+    /// records. The conversation stays and the session can still be resumed,
+    /// so the images and PDFs it refers to stay in the media store. Without
+    /// any --keep-* flag the configured storage.retention.trim policy applies.
     Trim {
         /// Session IDs to trim regardless of policy
         #[arg(value_name = "ID", conflicts_with_all = ["directory", "group_by"])]
@@ -1232,7 +1233,11 @@ pub enum StorageAction {
         prune: bool,
     },
     /// Reclaim space no session references: cleanup jobs, orphaned artifact
-    /// directories, the WAL, and freelist pages
+    /// directories, media files, the WAL, and freelist pages
+    ///
+    /// An image or PDF is removed once no session, archive, or database
+    /// backup refers to it and it is seven days old. Backups are never
+    /// removed, so the media only they refer to stays and is reported.
     Prune {
         /// Show what would be reclaimed without changing anything
         #[arg(long)]

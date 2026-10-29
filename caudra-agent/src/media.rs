@@ -66,7 +66,7 @@ pub(crate) async fn stored_message_images(
 }
 
 /// The references in `messages` whose bytes are not loaded.
-pub(crate) fn unloaded_media(messages: &[Message]) -> Vec<MediaHash> {
+fn unloaded_media(messages: &[Message]) -> Vec<MediaHash> {
     let images = messages
         .iter()
         .flat_map(|message| &message.content)
@@ -87,10 +87,7 @@ pub(crate) fn unloaded_media(messages: &[Message]) -> Vec<MediaHash> {
 
 /// Reads `hashes` into the store's cache off the executor, so loading them
 /// into history afterwards does not block on disk.
-pub(crate) async fn warm(store: &MediaStore, hashes: Vec<MediaHash>) {
-    if hashes.is_empty() {
-        return;
-    }
+async fn warm(store: &MediaStore, hashes: Vec<MediaHash>) {
     let store = store.clone();
     smol::unblock(move || {
         for hash in &hashes {
@@ -102,8 +99,20 @@ pub(crate) async fn warm(store: &MediaStore, hashes: Vec<MediaHash>) {
     .await;
 }
 
+/// Fills in the bytes of every reference in `messages` the store still has,
+/// reading the files off the executor first, so a request built from them
+/// carries what a restored session holds only references to.
+pub async fn load_stored_media(messages: &mut [Message], store: &MediaStore) {
+    let unloaded = unloaded_media(messages);
+    if unloaded.is_empty() {
+        return;
+    }
+    warm(store, unloaded).await;
+    load_media(messages, store);
+}
+
 /// Fills in the bytes of every reference in `messages` the store still has.
-pub(crate) fn load_media(messages: &mut [Message], store: &MediaStore) {
+fn load_media(messages: &mut [Message], store: &MediaStore) {
     for message in messages {
         for block in &mut message.content {
             if let ContentBlock::Image { source } = block {
@@ -163,8 +172,7 @@ mod tests {
         let mut messages = vec![restored(&store)];
         assert_eq!(unloaded_media(&messages).len(), 1);
 
-        smol::block_on(warm(&store, unloaded_media(&messages)));
-        load_media(&mut messages, &store);
+        smol::block_on(load_stored_media(&mut messages, &store));
 
         assert!(matches!(messages[0].role, Role::User));
         assert_eq!(
@@ -181,7 +189,7 @@ mod tests {
         let hash = image(&messages[0]).stored().unwrap().sha256.clone();
         fs::remove_file(store.path(&hash)).unwrap();
 
-        load_media(&mut messages, &store);
+        smol::block_on(load_stored_media(&mut messages, &store));
 
         let source = image(&messages[0]);
         assert!(source.data().is_none());

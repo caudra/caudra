@@ -31,7 +31,8 @@ use super::{
 };
 use crate::backups::BACKUPS_DIR;
 use crate::media::{
-    MEDIA_GRACE, MediaError, MediaHash, MediaPruneReport, MediaStore, StoredImage, referenced_media,
+    MEDIA_GRACE, MediaCheckReport, MediaError, MediaHash, MediaHealth, MediaPruneReport,
+    MediaStore, StoredImage, referenced_media,
 };
 use crate::sessions::{ARCHIVE_DIR, SESSIONS_DIR};
 use crate::{StateDir, StorageError, atomic_write_permissions};
@@ -620,31 +621,117 @@ impl MediaCleanupError {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaCleanupReport {
+    pub unreferenced: MediaPruneReport,
+    /// Files that stay only because a database backup refers to them.
+    /// Caudra never deletes backups, so these stay until the user does.
+    pub backup_only: MediaPruneReport,
+    /// `<backup>.media` reference caches whose backup is gone.
+    pub orphan_sidecars: usize,
+}
+
 impl SessionDatabase {
     /// Deletes media files nothing references once they are past
-    /// [`MEDIA_GRACE`], or counts them in a dry run. The roots are every
-    /// payload of every session, the global state rows (the prompt stash
-    /// among them), session archives, and database backups. Any root that
-    /// cannot be read fails the whole cleanup closed. The caller holds the
-    /// session artifact lock, which a migration storing media also holds.
+    /// [`MEDIA_GRACE`], and the reference caches of deleted backups, or
+    /// counts them in a dry run. The roots are every payload of every
+    /// session, the global state rows (the prompt stash among them), session
+    /// archives, and database backups. Any root that cannot be read fails the
+    /// whole cleanup closed. The caller holds the session artifact lock,
+    /// which a migration storing media also holds.
     pub(crate) fn prune_unreferenced_media(
         &self,
         dry_run: bool,
-    ) -> Result<MediaPruneReport, MediaCleanupError> {
+    ) -> Result<MediaCleanupReport, MediaCleanupError> {
         let state_dir = self.state_dir();
+        let orphan_sidecars = remove_orphan_sidecars(state_dir, dry_run)?;
         let mut referenced = HashSet::new();
         database_references(self.connection(), &mut referenced)
             .map_err(|error| MediaCleanupError::Database(Box::new(error)))?;
         archive_references(state_dir, &mut referenced)?;
-        backup_references(state_dir, &mut referenced)?;
+        let mut backed_up = HashSet::new();
+        backup_references(state_dir, &mut backed_up)?;
         let store = MediaStore::new(state_dir);
+        let backup_only = store.usage_of(backed_up.difference(&referenced));
+        referenced.extend(backed_up);
         let cutoff = SystemTime::now() - MEDIA_GRACE;
-        Ok(if dry_run {
+        let unreferenced = if dry_run {
             store.unreferenced(&referenced, cutoff)?
         } else {
             store.prune(&referenced, cutoff)?
+        };
+        Ok(MediaCleanupReport {
+            unreferenced,
+            backup_only,
+            orphan_sidecars,
         })
     }
+
+    /// Reads back every media file the database's payloads name. Archives
+    /// and backups are not checked.
+    pub fn check_media(&self) -> Result<MediaCheckReport, SessionError> {
+        let mut referenced = HashSet::new();
+        database_references(self.connection(), &mut referenced)?;
+        let mut hashes: Vec<MediaHash> = referenced.into_iter().collect();
+        hashes.sort_unstable();
+        let store = MediaStore::new(self.state_dir());
+        let mut report = MediaCheckReport {
+            referenced: hashes.len(),
+            ..MediaCheckReport::default()
+        };
+        for hash in hashes {
+            match store.verify(&hash).map_err(StorageError::Io)? {
+                MediaHealth::Intact => {}
+                MediaHealth::Missing => report.missing.push(hash),
+                MediaHealth::Corrupt => report.corrupt.push(hash),
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Deletes each `<backup>.media` whose backup is gone, or counts them in a
+/// dry run.
+fn remove_orphan_sidecars(state_dir: &StateDir, dry_run: bool) -> Result<usize, MediaCleanupError> {
+    let root = state_dir.path().join(BACKUPS_DIR);
+    let failed = |path: &Path| {
+        let path = path.to_path_buf();
+        move |error: io::Error| MediaCleanupError::Backup {
+            path,
+            source: Box::new(StorageError::Io(error).into()),
+        }
+    };
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(failed(&root)(error)),
+    };
+    let mut orphans = 0;
+    for entry in entries {
+        let entry = entry.map_err(failed(&root))?;
+        let name = entry.file_name();
+        let Some(backup) = name
+            .to_str()
+            .filter(|name| name.starts_with(SESSIONS_DB_FILE))
+            .and_then(|name| name.strip_suffix(SIDECAR_SUFFIX))
+            .filter(|backup| backup.ends_with(BACKUP_SUFFIX))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if root.join(backup).try_exists().map_err(failed(&path))? {
+            continue;
+        }
+        if !dry_run {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(failed(&path)(error)),
+            }
+        }
+        orphans += 1;
+    }
+    Ok(orphans)
 }
 
 /// Every hash the payload columns of `connection` name, read in one
@@ -842,6 +929,9 @@ mod tests {
     const RERUN_IS_NOOP: &str = "rerunning the step must change nothing";
     const BACKUP_KEEPS_INLINE: &str = "the pre-migration backup must keep the inline images";
     const DELETED_NOTHING: &str = "a root that cannot be read must delete nothing";
+    const SIDECAR_BYTES: &[u8] = b"sidecar";
+    const BACKUP_BYTES: &[u8] = b"backup";
+    const CACHED_BACKUP: &[u8] = b"never opened while its sidecar exists";
 
     fn png(width: u32) -> String {
         let mut bytes = Vec::new();
@@ -869,6 +959,13 @@ mod tests {
             media,
         })
         .unwrap()
+    }
+
+    fn hash_of(reference: &str) -> MediaHash {
+        let StoredImage::Media { media, .. } = serde_json::from_str(reference).unwrap() else {
+            unreachable!("a reference names a stored file")
+        };
+        media.sha256
     }
 
     fn age(path: &Path, by: Duration) {
@@ -1258,8 +1355,8 @@ mod tests {
         let (in_metadata, metadata_ref) = fixture.old_file(b"metadata");
         let (in_stash, stash_ref) = fixture.old_file(b"stash");
         let (in_archive, archive_ref) = fixture.old_file(b"archive");
-        let (in_sidecar, sidecar_ref) = fixture.old_file(b"sidecar");
-        let (in_backup, backup_ref) = fixture.old_file(b"backup");
+        let (in_sidecar, sidecar_ref) = fixture.old_file(SIDECAR_BYTES);
+        let (in_backup, backup_ref) = fixture.old_file(BACKUP_BYTES);
         let (unreferenced, _) = fixture.old_file(b"unreferenced");
         let connection = &fixture.database.connection;
         insert_session(
@@ -1291,12 +1388,12 @@ mod tests {
         .unwrap();
         let backups = fixture.backups();
         let cached = backups.join(format!("{SESSIONS_DB_FILE}.v{MEDIA_SCHEMA}.bak"));
-        fs::write(&cached, b"never opened while its sidecar exists").unwrap();
-        let sidecar_hash: StoredImage = serde_json::from_str(&sidecar_ref).unwrap();
-        let StoredImage::Media { media, .. } = sidecar_hash else {
-            unreachable!()
-        };
-        fs::write(sidecar_path(&cached), format!("{}\n", media.sha256)).unwrap();
+        fs::write(&cached, CACHED_BACKUP).unwrap();
+        fs::write(
+            sidecar_path(&cached),
+            format!("{}\n{}\n", hash_of(&metadata_ref), hash_of(&sidecar_ref)),
+        )
+        .unwrap();
         fs::write(
             backups.join(format!("{SESSIONS_DB_FILE}.v{PREVIOUS_SCHEMA}.bak")),
             b"inline",
@@ -1324,7 +1421,14 @@ mod tests {
 
         let report = fixture.database.prune_unreferenced_media(false).unwrap();
 
-        assert_eq!(report.files, 1);
+        assert_eq!(report.unreferenced.files, 1);
+        assert_eq!(
+            report.backup_only,
+            MediaPruneReport {
+                files: 2,
+                bytes: (SIDECAR_BYTES.len() + BACKUP_BYTES.len()) as u64,
+            }
+        );
         assert!(!unreferenced.exists());
         for kept in [in_metadata, in_stash, in_archive, in_sidecar, in_backup] {
             assert!(kept.exists(), "{}", kept.display());
@@ -1439,7 +1543,51 @@ mod tests {
 
         let report = fixture.database.prune_unreferenced_media(true).unwrap();
 
-        assert_eq!(report.files, 1);
+        assert_eq!(report.unreferenced.files, 1);
         assert!(unreferenced.exists());
+    }
+
+    #[test_case(true; "a dry run counts it")]
+    #[test_case(false; "a prune deletes it")]
+    fn the_reference_cache_of_a_deleted_backup_goes(dry_run: bool) {
+        let fixture = PruneFixture::new();
+        let backups = fixture.backups();
+        let deleted = backups.join(format!("{SESSIONS_DB_FILE}.permission-review-x.bak"));
+        fs::write(sidecar_path(&deleted), b"").unwrap();
+        let present = backups.join(format!("{SESSIONS_DB_FILE}.v{MEDIA_SCHEMA}.bak"));
+        fs::write(&present, CACHED_BACKUP).unwrap();
+        fs::write(sidecar_path(&present), b"").unwrap();
+
+        let report = fixture.database.prune_unreferenced_media(dry_run).unwrap();
+
+        assert_eq!(report.orphan_sidecars, 1);
+        assert_eq!(sidecar_path(&deleted).exists(), dry_run);
+        assert!(sidecar_path(&present).exists());
+    }
+
+    #[test]
+    fn check_names_missing_and_corrupt_media() {
+        let fixture = PruneFixture::new();
+        let (_, intact) = fixture.old_file(b"intact");
+        let (missing_path, missing) = fixture.old_file(b"missing");
+        let (corrupt_path, corrupt) = fixture.old_file(b"corrupt");
+        fs::remove_file(missing_path).unwrap();
+        fs::write(corrupt_path, b"tampered").unwrap();
+        insert_session(
+            &fixture.database.connection,
+            CaudraId::generate(),
+            &format!(r#"{{"input_draft_images":[{intact},{missing},{corrupt}]}}"#),
+        );
+
+        let report = fixture.database.check_media().unwrap();
+
+        assert_eq!(
+            report,
+            MediaCheckReport {
+                referenced: 3,
+                missing: vec![hash_of(&missing)],
+                corrupt: vec![hash_of(&corrupt)],
+            }
+        );
     }
 }

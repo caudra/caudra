@@ -231,6 +231,28 @@ pub struct MediaPruneReport {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaHealth {
+    Intact,
+    Missing,
+    Corrupt,
+}
+
+/// What reading back every file the live payloads name found. Both lists
+/// are sorted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MediaCheckReport {
+    pub referenced: usize,
+    pub missing: Vec<MediaHash>,
+    pub corrupt: Vec<MediaHash>,
+}
+
+impl MediaCheckReport {
+    pub fn is_intact(&self) -> bool {
+        self.missing.is_empty() && self.corrupt.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaStore {
     root: PathBuf,
@@ -317,6 +339,54 @@ impl MediaStore {
         cutoff: SystemTime,
     ) -> Result<MediaPruneReport, MediaError> {
         self.collect_unreferenced(referenced, cutoff, true)
+    }
+
+    /// How many files the store holds and their size, temp files included.
+    pub fn usage(&self) -> MediaPruneReport {
+        let mut usage = MediaPruneReport::default();
+        let Ok(shards) = fs::read_dir(self.root.join(HASH_DIR)) else {
+            return usage;
+        };
+        for shard in shards.flatten() {
+            let Ok(files) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for metadata in files.flatten().filter_map(|file| file.metadata().ok()) {
+                if metadata.is_file() {
+                    usage.files += 1;
+                    usage.bytes += metadata.len();
+                }
+            }
+        }
+        usage
+    }
+
+    /// How many of `hashes` the store holds and their size.
+    pub fn usage_of<'a>(
+        &self,
+        hashes: impl IntoIterator<Item = &'a MediaHash>,
+    ) -> MediaPruneReport {
+        let mut usage = MediaPruneReport::default();
+        for hash in hashes {
+            if let Ok(metadata) = fs::metadata(self.path(hash))
+                && metadata.is_file()
+            {
+                usage.files += 1;
+                usage.bytes += metadata.len();
+            }
+        }
+        usage
+    }
+
+    /// Reads the file back and compares its bytes with its hash. The cache is
+    /// bypassed, so a file damaged after it was cached is still caught.
+    pub fn verify(&self, sha256: &MediaHash) -> io::Result<MediaHealth> {
+        match fs::read(self.path(sha256)) {
+            Ok(bytes) if MediaHash::of(&bytes) == *sha256 => Ok(MediaHealth::Intact),
+            Ok(_) => Ok(MediaHealth::Corrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(MediaHealth::Missing),
+            Err(error) => Err(error),
+        }
     }
 
     /// What [`Self::prune`] would delete, deleting nothing.
@@ -590,6 +660,23 @@ mod tests {
 
         assert_eq!(report, MediaPruneReport::default());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn usage_counts_each_stored_file_once() {
+        let (_temp, store) = store();
+        assert_eq!(store.usage(), MediaPruneReport::default());
+        store.put(TEXT_BYTES).unwrap();
+        store.put(TEXT_BYTES).unwrap();
+        store.put_base64(PIXEL_PNG).unwrap();
+
+        let usage = store.usage();
+
+        assert_eq!(usage.files, 2);
+        assert_eq!(
+            usage.bytes,
+            (TEXT_BYTES.len() + BASE64.decode(PIXEL_PNG).unwrap().len()) as u64
+        );
     }
 
     #[test]

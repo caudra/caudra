@@ -16,6 +16,7 @@ pub mod learning;
 pub mod mailbox;
 pub mod mcp;
 mod media;
+pub use media::load_stored_media;
 pub mod memory;
 pub mod peers;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};

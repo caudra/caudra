@@ -76,6 +76,7 @@ use crate::automation::{
 use crate::background::{JobOwner, accept_owned_job_event};
 use crate::backups::{database_migration_backup, permission_review_backup};
 use crate::id::CaudraId;
+use crate::media::MediaStore;
 use crate::retention::SessionFacts;
 use crate::state::{
     WorkspaceTabs, remove_relocated_workspace_tabs, write_relocated_workspace_tabs,
@@ -1491,6 +1492,9 @@ pub struct SessionStorageStats {
     /// What the local change record stores occupy.
     pub snapshot_bytes: u64,
     pub archive_bytes: u64,
+    /// The images and PDFs in the media store, outside the database.
+    pub media_files: u64,
+    pub media_bytes: u64,
     pub pending_cleanup_jobs: u64,
 }
 
@@ -2602,6 +2606,7 @@ impl SessionDatabase {
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
         let state_path = self.state_dir.path();
+        let media = MediaStore::new(&self.state_dir).usage();
         Ok(SessionStorageStats {
             database_bytes: files.database,
             wal_bytes: files.wal,
@@ -2637,6 +2642,8 @@ impl SessionDatabase {
                     .join(super::SESSIONS_DIR)
                     .join(super::ARCHIVE_DIR),
             ),
+            media_files: media.files as u64,
+            media_bytes: media.bytes,
             pending_cleanup_jobs: from_i64(pending_cleanup_jobs, "pending cleanup jobs")?,
         })
     }

@@ -422,6 +422,10 @@ const CHANGELOG_UNSETTLED: &str = "opening /changelog must settle the notes owed
 const DOCS_ADDRESS: &str = "permissions#modes";
 const DOCS_QUERY: &str = "shell timeout";
 const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
+const PASTED_IMAGE_FILE: &str = "pasted.png";
+const PASTED_IMAGE_INLINE: &str =
+    "a pasted image was saved as inline base64, not a media reference";
+const QUEUED_WITH_IMAGE: &str = "look at this";
 const IMAGE_UNDER_MODAL: &str = "a paste into an open modal reached the composer behind it";
 const CONTEXT_UPPERCASE_COMMAND: &str = "/CONTEXT";
 const CONTEXT_TRAILING_COMMAND: &str = "/context   ";
@@ -28403,6 +28407,87 @@ fn stash_app() -> (TempDir, App) {
 
 fn stash_entries(app: &App) -> Vec<StashEntry> {
     PromptStash::open(&app.storage).unwrap().entries().to_vec()
+}
+
+/// Pastes a real PNG file and lands its load as `poll_image_paste` does once
+/// the reading thread finishes, without polling for it.
+fn paste_image(app: &mut App) -> TempDir {
+    let dir = private_tempdir();
+    let path = dir.path().join(PASTED_IMAGE_FILE);
+    fs::write(&path, crate::inline_image::tests::png_bytes(4, 4)).unwrap();
+    app.update(Msg::Paste(path.display().to_string()));
+    let loading = app.image_paste_rx.pop().unwrap();
+    let (sender, landed) = flume::bounded(1);
+    sender.send(loading.recv().unwrap()).unwrap();
+    app.image_paste_rx.push(landed);
+    let _ = app.poll_image_paste();
+    assert_eq!(app.input_box.pending_images().len(), 1);
+    dir
+}
+
+fn all_references(images: &[StoredImage]) -> bool {
+    !images.is_empty()
+        && images
+            .iter()
+            .all(|image| matches!(image, StoredImage::Media { .. }))
+}
+
+#[test]
+fn a_pasted_image_saves_in_the_draft_as_a_reference() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _image = paste_image(&mut app);
+    app.checkpoint_now();
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let saved = AppSession::load(id, &dir).unwrap();
+    assert!(
+        all_references(&saved.meta.input_draft_images),
+        "{PASTED_IMAGE_INLINE}"
+    );
+}
+
+#[test]
+fn a_pasted_image_saves_in_a_queued_prompt_as_a_reference() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let (queue, _receiver) = shared_queue::queue();
+    app.queue.set_shared(queue);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let _image = paste_image(&mut app);
+    app.update(Msg::Paste(QUEUED_WITH_IMAGE.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.checkpoint_now();
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let saved = AppSession::load(id, &dir).unwrap();
+    let [queued] = saved.meta.queued_messages.as_slice() else {
+        panic!(
+            "expected one queued prompt, got {:?}",
+            saved.meta.queued_messages
+        );
+    };
+    assert_eq!(queued.text, QUEUED_WITH_IMAGE);
+    assert!(all_references(&queued.images), "{PASTED_IMAGE_INLINE}");
+}
+
+#[test]
+fn a_pasted_image_stays_a_reference_through_stash_and_pop() {
+    let (_tmp, mut app) = stash_app();
+    let _image = paste_image(&mut app);
+    app.execute_command(cmd("/stash"), 0);
+    assert!(
+        all_references(&stash_entries(&app)[0].images),
+        "{PASTED_IMAGE_INLINE}"
+    );
+
+    app.execute_command(cmd("/stash pop"), 0);
+    app.execute_command(cmd("/stash"), 0);
+    assert!(
+        all_references(&stash_entries(&app)[0].images),
+        "{PASTED_IMAGE_INLINE}"
+    );
 }
 
 #[test]

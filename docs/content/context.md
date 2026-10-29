@@ -339,16 +339,9 @@ The default reserve is 20%, because for most models the context window is the to
 
 The reserve moves the point where compaction fires below the window, so the status bar counter names both: `300.1k/372k (81%/90%)` reads as 81% of the window in use and compaction at 90%. Exact multiples omit the empty decimal. When its row has room, a gauge in front of the counter draws the same pair as `▕████████░│▏`, filled to the share in use with a tick in the cell where compaction fires. Both turn amber once the border is behind you. A narrow terminal drops the gauge first, then the border, then the counts, then the figure itself. `/context` names the same pair on its `Used` and `Measured` lines, showing tenths when they are nonzero.
 
-Compaction replaces the summarized turns in the session's on-disk log with the summary and keeps the preserved ones after it. The dropped turns are not lost: before the rewrite, Caudra parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
+Compaction replaces the summarized turns in the session's stored history with the summary and keeps the preserved ones after it. The dropped turns are not lost: before the rewrite, Caudra writes the whole session as it stood to `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
 
-An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Caudra you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
-
-```sh
-cd ~/.local/state/caudra/sessions
-mv <session-id>.jsonl <session-id>.jsonl.bak
-cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-caudra -s <session-id>
-```
+An archive is a JSON Lines file, so `jq` or an editor reads it as it is. Caudra keeps sessions in `caudra.db` and does not open an archive as a session. Images and PDFs in an archive are references into `media/` in the state directory, named by the SHA-256 of their bytes, and prune keeps every file an archive refers to. To keep those files with an archive you copy elsewhere, copy the `media/` directory too.
 
 The model can still find what a summary left out. In the `code` tool, `history.search(query, scope="session")` searches the whole stored conversation, compacted turns and subagent transcripts included, and `history.read()` returns an item in full. See [Search past conversations](/docs/code/#search-past-conversations).
 

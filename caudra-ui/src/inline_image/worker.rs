@@ -212,7 +212,7 @@ impl SourceCache {
 
 pub(super) fn load(origin: &ImageOrigin) -> Result<DynamicImage, String> {
     let bytes = match origin {
-        ImageOrigin::File(path) => {
+        ImageOrigin::File(path) | ImageOrigin::Stored(path) => {
             let mut bytes = Vec::new();
             File::open(path)
                 .and_then(|file| {

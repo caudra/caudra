@@ -191,6 +191,12 @@ pub struct PruneReport {
     /// past the grace period. Nothing is removed when a root cannot be read.
     pub unreferenced_media_files: u64,
     pub unreferenced_media_bytes: u64,
+    /// Media files that only database backups refer to. Caudra never deletes
+    /// backups, so these stay until the user deletes the backups.
+    pub backup_only_media_files: u64,
+    pub backup_only_media_bytes: u64,
+    /// `<backup>.media` reference caches whose backup is gone.
+    pub orphan_media_sidecars: u64,
     /// Change store holders with no session, released once past the grace
     /// period.
     pub orphan_record_holders: u64,
@@ -433,8 +439,11 @@ pub fn prune(
     };
     match media {
         Ok(media) => {
-            report.unreferenced_media_files = media.files as u64;
-            report.unreferenced_media_bytes = media.bytes;
+            report.unreferenced_media_files = media.unreferenced.files as u64;
+            report.unreferenced_media_bytes = media.unreferenced.bytes;
+            report.backup_only_media_files = media.backup_only.files as u64;
+            report.backup_only_media_bytes = media.backup_only.bytes;
+            report.orphan_media_sidecars = media.orphan_sidecars as u64;
         }
         Err(error) => {
             warn!(root = error.root(), %error, dry_run, "media cleanup deleted nothing");
@@ -504,6 +513,8 @@ pub fn sweep_if_due(
         forgotten = report.forget.acted(),
         failed = report.trim.failed() + report.forget.failed(),
         released_bytes = report.trim.released_bytes() + report.forget.released_bytes(),
+        unreferenced_media_files = report.prune.unreferenced_media_files,
+        unreferenced_media_bytes = report.prune.unreferenced_media_bytes,
         "retention sweep finished"
     );
     Ok(Some(report))
