@@ -265,6 +265,7 @@ Connects to any OpenAI-compatible `/v1` endpoint. Set `LLAMA_CPP_HOST` to your s
 |  | mistral-large-4 | $0.68 / $2.09, then $1.36 / $4.18 from 2026-10-20 | 1000K ctx |
 |  | glm-5-3, zai-glm-5-3 | $1.40 / $4.40 | 1000K ctx |
 |  | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+|  | deepseek-v4-1-flash-1017 | $0.30 / $1.20 | 1000K ctx |
 |  | mistral-small-latest, mistral-small-2603 | $0.15 / $0.60 | 262K ctx |
 
 Routing defaults: ministral-14b-latest (Fast), mistral-medium-latest (Best)

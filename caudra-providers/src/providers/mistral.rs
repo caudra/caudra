@@ -170,6 +170,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
+            prefixes: &["deepseek-v4-1-flash-1017"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.30,
+                output: 1.20,
+                cache_write: 0.00,
+                cache_read: 0.007,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 1_000_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
             small: false,
             family: ModelFamily::Generic,
@@ -421,7 +439,8 @@ mod tests {
 
     #[test_case("zai-glm-5-3-flash", 0.15, 0.03, 0.50, true ; "flash")]
     #[test_case("zai-glm-5-3", 1.40, 0.14, 4.40, false ; "full")]
-    fn glm_flash_has_distinct_metadata(
+    #[test_case("deepseek-v4-1-flash-1017", 0.30, 0.007, 1.20, false ; "deepseek_flash")]
+    fn hosted_models_have_distinct_metadata(
         id: &str,
         input: f64,
         cache_read: f64,
