@@ -35,7 +35,7 @@ Usage notes:
 - The user may save it for this session or for all sessions, or decline.";
 
 /// Injected into the `tool_usage` prompt slot whenever this tool is offered.
-pub const TOOL_USAGE: &str = "- When a command needs a token, API key or password, call **request_secret** yourself; never ask for it in chat and never explain how to provide it instead.";
+pub const TOOL_USAGE: &str = "- When a command needs a token, API key or password, call **request_secret** yourself. Never ask for it in chat, and never explain how to provide it instead.";
 
 pub const NO_VAULT: &str =
     "request_secret needs a session to keep the secret in, and this run has none";
@@ -105,7 +105,6 @@ impl Tool for RequestSecretTool {
     }
 }
 
-/// What a `request_secret` call asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRequest {
     pub name: String,
@@ -255,24 +254,24 @@ pub fn settle(
     }
 }
 
-/// The card's warning when `name` already holds a live secret.
 pub fn replaces_note(name: &str) -> String {
     format!("Saving replaces the value ${name} holds now.")
 }
 
-/// Where the card says the secret goes.
 pub fn kept_note(name: &str) -> String {
-    format!("Kept out of chat. This session's shell commands receive it as ${name}.")
+    format!("The value stays out of the chat. This session's shell commands receive it as ${name}.")
 }
 
 fn saved(name: &str) -> String {
-    format!("${name} is set for this session's shell commands. Use it as ${name}; never print it.")
+    format!(
+        "${name} is set for this session's shell commands. Use it as ${name} and never print it."
+    )
 }
 
 fn remembered(name: &str) -> String {
     format!(
         "${name} is set for this session's shell commands and remembered for all sessions. \
-         Use it as ${name}; never print it."
+         Use it as ${name} and never print it."
     )
 }
 

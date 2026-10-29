@@ -1161,17 +1161,14 @@ impl QuestionForm {
 
     /// Hands the typed secret out once, and empties the field behind it.
     fn save_secret(&mut self, scope: SecretScope) -> QuestionFormAction {
-        let value = self.custom.text().trim().to_owned();
-        if value.is_empty() {
+        let value = SecretValue::new(self.custom.text().to_owned());
+        if value.expose().is_empty() {
             self.mode = Mode::EditingCustom;
             self.error = Some(EMPTY_SECRET.to_owned());
             return QuestionFormAction::Consumed;
         }
         self.custom.clear();
-        QuestionFormAction::Secret(SecretReply::Save {
-            value: SecretValue::new(value),
-            scope,
-        })
+        QuestionFormAction::Secret(SecretReply::Save { value, scope })
     }
 
     /// `Esc` lets the asking agent carry on without an answer, except on a

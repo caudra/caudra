@@ -273,7 +273,7 @@ set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
 - The commands [pstack's scripts](/docs/code/#pstack-scripts) run, such as `git` and `gh`, get the same environment.
 - The setting applies to local sessions. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's own variables instead, and a [remote Workcell](/docs/remote-workspaces/) uses the environment its operator gives the server.
 
-The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded.
+The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded. When a command needs a token, the agent can ask for it on a private card instead. See [Secrets](/docs/secrets/).
 
 Docker contexts already work without this: `docker context use` stores the choice under `~/.docker`, and `HOME` is forwarded.
 
