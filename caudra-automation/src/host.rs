@@ -88,6 +88,7 @@ pub enum ActionKind {
     Broadcast,
     StartWorkflow,
     Pause,
+    Done,
     Log,
 }
 
@@ -118,6 +119,9 @@ pub enum ActionRequest {
     /// Sets the session's pause latch. Other firings stop, but the calling firing runs on to its
     /// end, so it can still notify about the pause.
     Pause {
+        reason: String,
+    },
+    Done {
         reason: String,
     },
     Log {
@@ -415,14 +419,15 @@ impl ActionKind {
             Self::Broadcast => "broadcast",
             Self::StartWorkflow => "start_workflow",
             Self::Pause => "pause",
+            Self::Done => "done",
             Self::Log => "log",
         }
     }
 
     /// The first such action asks [`AutomationHost::admit`]. A log line costs nothing, and
-    /// pausing must work while a limit holds.
+    /// pausing or finishing must work while a limit holds.
     pub const fn charges(self) -> bool {
-        !matches!(self, Self::Log | Self::Pause)
+        !matches!(self, Self::Log | Self::Pause | Self::Done)
     }
 
     /// Queues an outbox item for this session's model.
@@ -450,6 +455,7 @@ impl ActionRequest {
             Self::Broadcast { .. } => ActionKind::Broadcast,
             Self::StartWorkflow(_) => ActionKind::StartWorkflow,
             Self::Pause { .. } => ActionKind::Pause,
+            Self::Done { .. } => ActionKind::Done,
             Self::Log { .. } => ActionKind::Log,
         }
     }
@@ -591,6 +597,7 @@ mod tests {
     #[test_case(ActionKind::Http => (true, false); "http")]
     #[test_case(ActionKind::Publish => (true, false); "publish")]
     #[test_case(ActionKind::Pause => (false, false); "pause")]
+    #[test_case(ActionKind::Done => (false, false); "done")]
     #[test_case(ActionKind::Log => (false, false); "log")]
     fn action_kinds_charge_and_deliver(kind: ActionKind) -> (bool, bool) {
         (kind.charges(), kind.delivers())

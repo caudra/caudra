@@ -5,50 +5,7 @@ pub(crate) mod responses;
 
 pub use platform::OpenAi;
 
-use std::borrow::Cow;
-
-use jiff::civil;
-
-use crate::manifest::Availability;
-use crate::model::{
-    FastPricing, ModelEntry, ModelFamily, ModelGeneration, ModelPricing, PricingTier,
-    StaticReasoningOption,
-};
-use crate::pricing::Period;
-
 pub(crate) const SETUP_MODEL_SPEC: &str = "openai/gpt-6.1-sol";
-
-/// Working window for the long-context OpenAI models, gpt-5.6 and gpt-6.
-/// Deliberately below what the API accepts — gpt-6 advertises 1,050,000 —
-/// because the window is what caudra fills before compacting, and cost and
-/// latency scale with it.
-pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
-const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
-/// A request whose prompt runs past this many tokens bills in full at twice
-/// the input and cache rates and one and a half times the output rate. The
-/// wide window sits above it, so the last stretch before compaction always
-/// pays the long rate.
-pub(crate) const LONG_CONTEXT_ABOVE: u32 = 272_000;
-
-/// Shutdowns from <https://developers.openai.com/api/docs/deprecations>.
-pub(crate) const AVAILABILITY: &[Availability] = &[
-    Availability {
-        prefix: "o3",
-        during: Period::until(civil::date(2026, 12, 11)),
-    },
-    Availability {
-        prefix: "o3-pro",
-        during: Period::until(civil::date(2026, 12, 11)),
-    },
-    Availability {
-        prefix: "gpt-5.3-codex",
-        during: Period::until(civil::date(2027, 4, 1)),
-    },
-    Availability {
-        prefix: "gpt-5.4-nano",
-        during: Period::until(civil::date(2027, 4, 1)),
-    },
-];
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "openai",
@@ -62,604 +19,18 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-/// Levels these models declare, matching the models.dev catalog. Kept in the
-/// table so a cold catalog still resolves an effort correctly, and so the Codex
-/// plan models the catalog has not reached resolve at all.
-const EFFORT_WITH_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high", "xhigh", "max",
-])];
-const EFFORT_TO_XHIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high", "xhigh",
-])];
-/// The o-series predates the explicit opt-out, so it always reasons.
-const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
-/// gpt-6-astra and gpt-6.1-sol reason unconditionally, so they drop the `none`
-/// the gpt-5.6 ladder offers while keeping the rungs above it.
-const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "low", "medium", "high", "xhigh", "max",
-])];
-/// The gpt-5 pro models start at `medium`, per each model page.
-const EFFORT_MEDIUM_TO_XHIGH: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["medium", "high", "xhigh"])];
-
-/// The two ladders OpenAI currently sells side by side. Each carries its own
-/// Fast and Best, so a conversation on one never has a lane answered from the
-/// other while its own line still has a model for the job. A point release
-/// such as gpt-6.1 extends its ladder rather than starting one.
-pub(crate) const fn generations() -> &'static [ModelGeneration] {
-    const GENERATIONS: &[ModelGeneration] = &[
-        ModelGeneration {
-            label: "gpt-6",
-            members: &["gpt-6-", "gpt-6.1-"],
-        },
-        ModelGeneration {
-            label: "gpt-5.6",
-            members: &["gpt-5.6"],
-        },
-    ];
-    GENERATIONS
-}
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["gpt-6-astra"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 1.00,
-                fast: Some(FastPricing {
-                    input: 20.00,
-                    output: 100.00,
-                    cache_write: 25.00,
-                    cache_read: 2.00,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 20.00,
-                    output: 75.00,
-                    cache_write: 25.00,
-                    cache_read: 2.00,
-                    fast: Some(FastPricing {
-                        input: 40.00,
-                        output: 150.00,
-                        cache_write: 50.00,
-                        cache_read: 4.00,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
-        },
-        ModelEntry {
-            prefixes: &["gpt-6-luna"],
-            small: true,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.125,
-                cache_read: 0.01,
-                fast: Some(FastPricing {
-                    input: 0.20,
-                    output: 1.00,
-                    cache_write: 0.25,
-                    cache_read: 0.02,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 0.20,
-                    output: 0.75,
-                    cache_write: 0.25,
-                    cache_read: 0.02,
-                    fast: Some(FastPricing {
-                        input: 0.40,
-                        output: 1.50,
-                        cache_write: 0.50,
-                        cache_read: 0.04,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-6.1-sol"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.10,
-                fast: Some(FastPricing {
-                    input: 4.00,
-                    output: 20.00,
-                    cache_write: 5.00,
-                    cache_read: 0.20,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 4.00,
-                    output: 15.00,
-                    cache_write: 5.00,
-                    cache_read: 0.20,
-                    fast: Some(FastPricing {
-                        input: 8.00,
-                        output: 30.00,
-                        cache_write: 10.00,
-                        cache_read: 0.40,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
-        },
-        ModelEntry {
-            prefixes: &["gpt-6.1-terra"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 5.00,
-                cache_write: 1.25,
-                cache_read: 0.05,
-                fast: Some(FastPricing {
-                    input: 2.00,
-                    output: 10.00,
-                    cache_write: 2.50,
-                    cache_read: 0.10,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 2.00,
-                    output: 7.50,
-                    cache_write: 2.50,
-                    cache_read: 0.10,
-                    fast: Some(FastPricing {
-                        input: 4.00,
-                        output: 15.00,
-                        cache_write: 5.00,
-                        cache_read: 0.20,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-6-sol"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: Some(FastPricing {
-                    input: 4.00,
-                    output: 20.00,
-                    cache_write: 5.00,
-                    cache_read: 0.40,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 4.00,
-                    output: 15.00,
-                    cache_write: 5.00,
-                    cache_read: 0.40,
-                    fast: Some(FastPricing {
-                        input: 8.00,
-                        output: 30.00,
-                        cache_write: 10.00,
-                        cache_read: 0.80,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-luna"],
-            small: true,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.20,
-                cache_write: 0.25,
-                cache_read: 0.02,
-                fast: Some(FastPricing {
-                    input: 0.40,
-                    output: 2.40,
-                    cache_write: 0.50,
-                    cache_read: 0.04,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 0.40,
-                    output: 1.80,
-                    cache_write: 0.50,
-                    cache_read: 0.04,
-                    fast: Some(FastPricing {
-                        input: 0.80,
-                        output: 3.60,
-                        cache_write: 1.00,
-                        cache_read: 0.08,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-terra"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 12.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: Some(FastPricing {
-                    input: 4.00,
-                    output: 24.00,
-                    cache_write: 5.00,
-                    cache_read: 0.40,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 4.00,
-                    output: 18.00,
-                    cache_write: 5.00,
-                    cache_read: 0.40,
-                    fast: Some(FastPricing {
-                        input: 8.00,
-                        output: 36.00,
-                        cache_write: 10.00,
-                        cache_read: 0.80,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-sol", "gpt-5.6"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: true,
-            // OpenAI's promotional rate, offered through at least 2026-11-21.
-            pricing: ModelPricing {
-                input: 4.00,
-                output: 20.00,
-                cache_write: 5.00,
-                cache_read: 0.40,
-                fast: Some(FastPricing {
-                    input: 8.00,
-                    output: 40.00,
-                    cache_write: 10.00,
-                    cache_read: 0.80,
-                }),
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 8.00,
-                    output: 30.00,
-                    cache_write: 10.00,
-                    cache_read: 0.80,
-                    fast: Some(FastPricing {
-                        input: 16.00,
-                        output: 60.00,
-                        cache_write: 20.00,
-                        cache_read: 1.60,
-                    }),
-                }]),
-            },
-            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_WITH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-nano"],
-            small: true,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.25,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            small: true,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-4.1-mini"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.40,
-                output: 1.60,
-                cache_write: 0.00,
-                cache_read: 0.10,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(32_768),
-            context_window: 1_047_576,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["gpt-4.1"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 8.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(32_768),
-            context_window: 1_047_576,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5-pro"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 30.00,
-                output: 180.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 60.00,
-                    output: 270.00,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 1_050_000,
-            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 10.00,
-                    output: 45.00,
-                    cache_write: 0.00,
-                    cache_read: 1.00,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 1_050_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-pro"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 30.00,
-                output: 180.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 60.00,
-                    output: 270.00,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 1_050_000,
-            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.50,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.25,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_ABOVE,
-                    input: 5.00,
-                    output: 22.50,
-                    cache_write: 0.00,
-                    cache_read: 0.50,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 1_050_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        // Shuts down 2026-12-11 (https://developers.openai.com/api/docs/deprecations).
-        ModelEntry {
-            prefixes: &["o3-pro"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 20.00,
-                output: 80.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
-        },
-        ModelEntry {
-            prefixes: &["o3"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 8.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH_NO_NONE),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.3-codex"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.75,
-                output: 14.00,
-                cache_write: 0.00,
-                cache_read: 0.175,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.2-pro"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 21.00,
-                output: 168.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_MEDIUM_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.2"],
-            small: false,
-            family: ModelFamily::Gpt,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.75,
-                output: 14.00,
-                cache_write: 0.00,
-                cache_read: 0.175,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128_000),
-            context_window: 400_000,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-    ];
-    MODELS
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::manifest::ManifestRegistry;
     use caudra_config::providers::{ProviderDef, resolve_default_model};
     use std::ptr;
     use test_case::test_case;
 
-    use super::*;
     use crate::model::lookup_entry;
+    use crate::model::{FastPricing, ModelPricing, PricingTier};
 
+    const WIDE_CONTEXT_WINDOW: u32 = 372_000;
+    const LONG_CONTEXT_ABOVE: u32 = 272_000;
     /// A quoted rate times 1.5 is not always exact in binary.
     const RATE_TOLERANCE: f64 = 1e-9;
     const LONG_INPUT_AND_CACHE: f64 = 2.0;
@@ -676,7 +47,9 @@ mod tests {
     #[test_case("o4-mini-2025-04-16")]
     fn retired_models_are_not_listed(model_id: &str) {
         assert!(
-            !models()
+            !ManifestRegistry::get("openai")
+                .unwrap()
+                .models
                 .iter()
                 .any(|entry| entry.prefixes.contains(&model_id))
         );
@@ -684,11 +57,13 @@ mod tests {
 
     #[test]
     fn gpt_5_6_alias_shares_sol_metadata_and_generation() {
-        let entries = models();
+        let entries = ManifestRegistry::get("openai").unwrap().models;
         let alias = lookup_entry(entries, "gpt-5.6").unwrap();
         let sol = lookup_entry(entries, "gpt-5.6-sol").unwrap();
         assert!(ptr::eq(alias, sol));
-        let generation = generations()
+        let generation = ManifestRegistry::get("openai")
+            .unwrap()
+            .generations
             .iter()
             .find(|generation| generation.label == "gpt-5.6")
             .unwrap();
@@ -749,7 +124,7 @@ mod tests {
 
     #[test]
     fn long_context_tiers_follow_openais_rule() {
-        for model in models() {
+        for model in ManifestRegistry::get("openai").unwrap().models {
             let model_id = model.prefixes[0];
             for tier in model.pricing.tiers.iter() {
                 assert_eq!(
@@ -764,7 +139,7 @@ mod tests {
 
     #[test]
     fn fast_is_twice_the_applicable_rate() {
-        for model in models() {
+        for model in ManifestRegistry::get("openai").unwrap().models {
             let Some(fast) = &model.pricing.fast else {
                 continue;
             };
@@ -798,7 +173,8 @@ mod tests {
     #[test_case("gpt-5.2-pro", false)]
     #[test_case("o3-pro", false)]
     fn only_long_context_models_state_a_tier(model_id: &str, tiered: bool) {
-        let entry = lookup_entry(models(), model_id).unwrap();
+        let entry =
+            lookup_entry(ManifestRegistry::get("openai").unwrap().models, model_id).unwrap();
         assert_eq!(
             !entry.pricing.tiers.is_empty(),
             tiered,
@@ -821,7 +197,8 @@ mod tests {
         output: f64,
         context_window: u32,
     ) {
-        let entry = lookup_entry(models(), model_id).unwrap();
+        let entry =
+            lookup_entry(ManifestRegistry::get("openai").unwrap().models, model_id).unwrap();
 
         assert_eq!(entry.prefixes, [entry_prefix]);
         assert_eq!(entry.pricing.input, input);
@@ -843,7 +220,9 @@ mod tests {
         cache_write: f64,
         output: f64,
     ) {
-        let model = models()
+        let model = ManifestRegistry::get("openai")
+            .unwrap()
+            .models
             .iter()
             .find(|model| model.prefixes.contains(&model_id))
             .expect("model should be registered");

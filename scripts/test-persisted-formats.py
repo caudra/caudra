@@ -196,6 +196,13 @@ class PersistedFormatTests(unittest.TestCase):
         (problem,) = FORMATS.lint(self.repository.root)
         self.assertIn(f"{DATABASE} CACHE_VERSION {STALE}", problem)
 
+    def test_lint_reports_an_unstaged_deletion_without_crashing(self) -> None:
+        (self.repository.root / CONFIG).unlink()
+        (problem,) = FORMATS.lint(self.repository.root)
+        self.assertIn(f"{CONFIG} CONFIG_VERSION {STALE}", problem)
+        self.repository.registry(DATABASE_ENTRY, CACHE_ENTRY)
+        self.assertEqual(FORMATS.lint(self.repository.root), [])
+
 
 if __name__ == "__main__":
     unittest.main()

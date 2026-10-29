@@ -14,6 +14,32 @@ use strum::IntoEnumIterator;
 use crate::gen_regions::{footer, keys_table, reference};
 use crate::page_header;
 
+const MODEL_LIST: &str = r#"## Model list
+
+Model prices, limits, defaults, and availability come from a signed model list. Every Caudra binary bundles a copy, so the list works offline, and the model tables on this page show that copy. At startup Caudra also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
+
+The list also carries a reviewed import of the [models.dev](https://models.dev) catalog. It describes models that have no curated entry, and the providers Caudra reaches only through it, such as NVIDIA and Groq. Caudra sends Groq requests to `https://api.groq.com/openai/v1` with `GROQ_API_KEY`, whatever the model list says. Caudra does not contact models.dev itself.
+
+Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. A missing or invalid cache, or a check timestamp in the future, triggers a new check. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
+
+`caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. If another process is refreshing, it reports that and exits with an error. A failed check keeps the current list. A verified update takes effect even if saving the cache fails.
+
+```toml
+[models]
+refresh = true
+url = "https://models.caudra.ai/v1/models.json"
+```
+
+Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `CAUDRA_MODELS_REFRESH=1` enables them unless the project disables refresh. The environment override also accepts `false` or `true`, `no` or `yes`, and `off` or `on`, without regard to case. Invalid values warn and leave the configured setting unchanged. The override comes from the process or global `.env`, never a project `.env`. Cached files still load when refresh is disabled.
+
+`url` is global-only and can point to a mirror over HTTPS, or HTTP on localhost, 127.0.0.1 or [::1]. A project can only disable refresh. Its URL and attempts to enable refresh are ignored. Caudra fetches the signature from `<url>.sig`. Changing the URL does not change which signing keys Caudra trusts. Restart after changing these settings.
+
+Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key or incompatible format rejects the whole file. Caudra keeps its bundled endpoint, credential names, and protocol for protected catalog providers. It drops new rows that claim protected endpoints or credentials and logs a warning, without rejecting the rest of the file. Entries that need newer Caudra features stay hidden and cannot be selected. An unsupported built-in provider keeps its previous manifest.
+
+An interrupted cache write leaves the previous list in use.
+
+The list is maintained in [github.com/caudra/models](https://github.com/caudra/models). To report a wrong price or limit, or a missing model, open an issue or a pull request there."#;
+
 const MODEL_JOBS_NOTE: &str = r#"## Model jobs
 
 Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Extract**, **Memory**, **Autopilot**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
@@ -150,7 +176,7 @@ const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+- **Features**: Models from the bundled catalog, including Opencode Go
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 "#;
@@ -287,7 +313,7 @@ The file starts with `version = 1`. A file without it counts as version 1, and C
 ### Provider fields
 
 {provider_fields}
-A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores {builtin_ignored}. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only {builtin_model}, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
+A built-in slug keeps its compiled protocol and auth setup, and its models from the [model list](#model-list), so it ignores {builtin_ignored}. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only {builtin_model}, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
 
 A `[SLUG.purposes]` table takes these keys:
 
@@ -332,9 +358,9 @@ id = "claude-sonnet-4-6"
 context_window = 200000
 ```
 
-A `models` entry wins over `model_defaults`, and both win over the limits the provider lists, the built-in model table, and models.dev, in that order. A declared window is the total the prompt and the reply share, as on a custom provider, so compaction leaves room in it for the reply. The OpenAI Coding Plan still caps a declared window at the plan's own. On `aperture`, a declared window also wins over [Aperture overrides](#aperture-overrides).
+A `models` entry wins over `model_defaults`, and both win over the limits the provider lists, the model's curated entry in the [model list](#model-list), and the model list's catalog, in that order. A declared window is the total the prompt and the reply share, as on a custom provider, so compaction leaves room in it for the reply. The OpenAI Coding Plan still caps a declared window at the plan's own. On `aperture`, a declared window also wins over [Aperture overrides](#aperture-overrides).
 
-An entry adds no model to the model list, and its `id` has to match the id in the model spec exactly. Every other model key on a built-in slug, such as `supports_vision` or a price, is ignored with a warning. Caudra reads an edit the next time it resolves the model, such as in a new session or after you pick the model again, see [Hot reload](/docs/configuration/#hot-reload).
+An entry adds no model, and its `id` has to match the id in the model spec exactly. Every other model key on a built-in slug, such as `supports_vision` or a price, is ignored with a warning. Caudra reads an edit the next time it resolves the model, such as in a new session or after you pick the model again, see [Hot reload](/docs/configuration/#hot-reload).
 
 ### Aperture overrides
 
@@ -958,6 +984,7 @@ pub fn generate() -> String {
          which configured or discovered model serves each kind of work.\n"
     );
     let _ = writeln!(out, "{MODEL_JOBS_NOTE}\n");
+    let _ = writeln!(out, "{MODEL_LIST}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
@@ -984,8 +1011,8 @@ mod tests {
     use caudra_config::interpolation::{self, Lookup};
     use caudra_config::migration;
     use caudra_config::providers::{PROVIDERS_FORMAT, ProvidersConfig};
-    use caudra_providers::manifest::{Availability, ManifestRegistry, ProviderManifest};
-    use caudra_providers::model::{ModelEntry, ModelPricing};
+    use caudra_providers::manifest::{Availability, ProviderManifest};
+    use caudra_providers::model::{ModelEntry, ModelFamily, ModelPricing};
     use caudra_providers::pricing::{Period, PricePeriod};
     use jiff::civil::{Date, date};
     use test_case::test_case;
@@ -996,11 +1023,9 @@ mod tests {
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
     const DECISION_HEADER: &str = "[decisions.";
-    const COPILOT_HANDOVER: &str =
-        "claude-opus-5 (Best) until 2026-11-16, then claude-opus-5.5 (Best)";
-
-    const ARGON: &str = "gemini-4-argon";
-    const STEADY: &str = "gemini-3.5-flash-lite";
+    const HANDOVER: &str = "retiring (Best) until 2026-12-01, then successor (Best)";
+    const RETIRING: &str = "retiring";
+    const SUCCESSOR: &str = "successor";
     const PERIOD_RATES: ModelPricing = ModelPricing {
         input: 4.00,
         output: 20.00,
@@ -1008,21 +1033,47 @@ mod tests {
     };
     const DECEMBER: Date = date(2026, 12, 1);
     const JANUARY: Date = date(2027, 1, 1);
+    const ENTRY: ModelEntry = ModelEntry {
+        prefixes: &[RETIRING],
+        small: false,
+        default: true,
+        vision: false,
+        family: ModelFamily::Generic,
+        pricing: ModelPricing {
+            input: 0.30,
+            output: 2.50,
+            ..ModelPricing::ZERO
+        },
+        max_output_tokens: Some(8_000),
+        context_window: 32_000,
+        window_excludes_output: false,
+        unsupported: None,
+        reasoning_options: None,
+        api: None,
+        plan_context_window: None,
+        supports_thinking: None,
+    };
+    const MANIFEST: ProviderManifest = ProviderManifest {
+        slug: "test",
+        display_name: "Test",
+        family: ModelFamily::Generic,
+        supports_thinking: false,
+        accepts_arbitrary_models: false,
+        fallback_max_output: ENTRY.max_output_tokens,
+        fallback_context_window: ENTRY.context_window,
+        models: &[],
+        generations: &[],
+        serves_fast_mode: false,
+        pricing_schedule: None,
+        price_periods: &[],
+        availability: &[],
+        catalog_slug: None,
+    };
 
-    fn google_entry(prefix: &str) -> &'static ModelEntry {
-        ManifestRegistry::get("google")
-            .unwrap()
-            .models
-            .iter()
-            .find(|entry| entry.prefixes.contains(&prefix))
-            .unwrap()
-    }
-
-    #[test_case(ARGON, "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
-    #[test_case(STEADY, "$0.30 / $2.50"                                     ; "a_steady_price_stands_alone")]
-    fn pricing_shows_an_announced_change_with_its_date(prefix: &str, expected: &str) {
-        let google = ManifestRegistry::get("google").unwrap();
-        assert_eq!(format_pricing(google_entry(prefix), google), expected);
+    #[test]
+    fn a_steady_price_stands_alone() {
+        const EXPECTED: &str = "$0.30 / $2.50";
+        assert_eq!(format_pricing(&ENTRY, &MANIFEST), EXPECTED);
     }
 
     #[test_case(Period::from(DECEMBER), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01" ; "from_follows_the_table")]
@@ -1030,15 +1081,15 @@ mod tests {
     #[test_case(Period::between(DECEMBER, JANUARY), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01 until 2027-01-01, then $0.30 / $2.50" ; "between_returns_to_the_table")]
     fn pricing_reads_a_period_in_date_order(during: Period, expected: &str) {
         let periods: &'static [PricePeriod] = Box::leak(Box::new([PricePeriod {
-            prefix: STEADY,
+            prefix: RETIRING,
             during,
             pricing: PERIOD_RATES,
         }]));
         let manifest = ProviderManifest {
             price_periods: periods,
-            ..*ManifestRegistry::get("google").unwrap()
+            ..MANIFEST
         };
-        assert_eq!(format_pricing(google_entry(STEADY), &manifest), expected);
+        assert_eq!(format_pricing(&ENTRY, &manifest), expected);
     }
 
     #[test_case(Period::until(DECEMBER), Some("retires 2026-12-01")                                   ; "a_shutdown")]
@@ -1046,27 +1097,37 @@ mod tests {
     #[test_case(Period::between(DECEMBER, JANUARY), Some("available from 2026-12-01, retires 2027-01-01") ; "both")]
     fn availability_reads_its_dates(during: Period, expected: Option<&str>) {
         let rows: &'static [Availability] = Box::leak(Box::new([Availability {
-            prefix: STEADY,
+            prefix: RETIRING,
             during,
         }]));
         let manifest = ProviderManifest {
             availability: rows,
-            ..*ManifestRegistry::get("google").unwrap()
+            ..MANIFEST
         };
-        assert_eq!(
-            format_availability(google_entry(STEADY), &manifest).as_deref(),
-            expected
-        );
+        assert_eq!(format_availability(&ENTRY, &manifest).as_deref(), expected);
     }
 
     #[test]
     fn a_retiring_default_hands_its_lane_over_in_the_routing_line() {
+        let models = Box::leak(Box::new([
+            ENTRY,
+            ModelEntry {
+                prefixes: &[SUCCESSOR],
+                ..ENTRY
+            },
+        ]));
+        let availability = Box::leak(Box::new([Availability {
+            prefix: RETIRING,
+            during: Period::until(DECEMBER),
+        }]));
+        let manifest = ProviderManifest {
+            models,
+            availability,
+            ..MANIFEST
+        };
         let mut out = String::new();
-        write_model_table(&mut out, ManifestRegistry::get("copilot").unwrap());
-        assert!(
-            out.contains(COPILOT_HANDOVER),
-            "{COPILOT_HANDOVER} missing from:\n{out}"
-        );
+        write_model_table(&mut out, &manifest);
+        assert!(out.contains(HANDOVER), "{HANDOVER} missing from:\n{out}");
     }
 
     #[test]

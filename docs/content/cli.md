@@ -40,7 +40,7 @@ caudra decisions purge --yes
 
 `status` shows effective configuration without contacting the endpoint, including the active `endpoint` name. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and the shell runs behind shell ETAs intact. It does not erase copies in SQLite free pages, WAL files, or backups.
 
-`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `source_code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
+`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `source_code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 
 Labels are partial evidence, not a complete evaluation dataset. Tool-search actual-use labels and shell-effect observed-filesystem labels are not collected. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Redaction is best effort. Review exported states and question text before sharing them. See [decision engine advice](/docs/permissions/#decision-engine-advice) and [configuration](/docs/configuration/#decisions).
 
@@ -273,13 +273,13 @@ set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
 - The commands [pstack's scripts](/docs/code/#pstack-scripts) run, such as `git` and `gh`, get the same environment.
 - The setting applies to local sessions. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's own variables instead, and a [remote Workcell](/docs/remote-workspaces/) uses the environment its operator gives the server.
 
-The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded.
+The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded. When a command needs a token, the agent can ask for it on a private card instead. See [Secrets](/docs/secrets/).
 
 Docker contexts already work without this: `docker context use` stores the choice under `~/.docker`, and `HOME` is forwarded.
 
 ### Network proxies
 
-Caudra sends its own requests through the proxy that `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` name. This covers model providers and their sign-in, [MCP servers](/docs/mcp/), [decision endpoints](/docs/providers/#decision-endpoints), telemetry, update checks and downloads, the web tools, automations' `http()`, and Lua's `caudra.net`.
+Caudra sends its own requests through the proxy that `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` name. This covers model providers and their sign-in, [MCP servers](/docs/mcp/), [decision endpoints](/docs/providers/#decision-endpoints), telemetry, update checks and downloads, [model list](/docs/providers/#model-list) checks, the web tools, automations' `http()`, and Lua's `caudra.net`.
 
 - An `https://` endpoint uses `HTTPS_PROXY`, and an `http://` endpoint uses `HTTP_PROXY`. Either falls back to `ALL_PROXY`. The uppercase name wins over the lowercase one, and an empty value counts as unset.
 - `NO_PROXY` lists hosts, domains, and address ranges, separated by commas, that Caudra reaches directly.
@@ -493,11 +493,14 @@ The TUI `/login` command offers the same method choice for Anthropic, OpenAI, an
 caudra models
 caudra models --jobs
 caudra models --jobs --model anthropic/claude-sonnet-4-6
+caudra models refresh
 ```
 
 The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
 
 `--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Autopilot, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
+
+`refresh` checks for a newer [model list](/docs/providers/#model-list) now, even when automatic refresh is off.
 
 ### `caudra mcp`
 

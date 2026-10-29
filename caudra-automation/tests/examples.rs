@@ -40,6 +40,9 @@ const PROJECT_AUTOMATIONS_DIR: &str = "../.caudra/automations";
 const EXAMPLE_EXTENSION: &str = "rhai";
 const CI_TRIAGE: &str = "ci-triage";
 const CI_WATCH: &str = "ci-watch";
+const FOLLOW_UP: &str = "follow-up";
+const FOLLOW_UP_TEXT: &str = "Check whether the test run has finished.";
+const FOLLOW_UP_SENT: &str = "sent";
 const GOAL_CHAIN: &str = "goal-chain";
 const GOAL_WEBHOOK: &str = "goal-webhook";
 const JOIN_SWARM: &str = "join-swarm";
@@ -55,9 +58,10 @@ const STATUS_DESK: &str = "status-desk";
 const TASK_TRACKER: &str = "task-tracker";
 const TIMEBOX: &str = "timebox";
 const WORK_NUDGE: &str = "work-nudge";
-const EXAMPLES: [&str; 17] = [
+const EXAMPLES: [&str; 18] = [
     CI_TRIAGE,
     CI_WATCH,
+    FOLLOW_UP,
     GOAL_CHAIN,
     GOAL_WEBHOOK,
     JOIN_SWARM,
@@ -236,7 +240,6 @@ const NIGHTLY_CI: &str = "nightly-ci";
 const STRANGER: &str = "@intern";
 const AGENT_BUDGET: u32 = 24;
 
-const MODEL_WATCH: &str = "model-watch";
 const SYNC_MAIN: &str = "sync-main";
 const SYNC_HEAD: &str = "1111111111111111111111111111111111111111";
 const SYNC_BASE_HEAD: &str = "2222222222222222222222222222222222222222";
@@ -259,51 +262,6 @@ const SYNC_WAIT_NOTICE: &str = "sync-main has waited 12 hours for a safe point t
 const SYNC_IDLE_LEAD: &str = "Sync this worktree with main: 1 commits arrived (now 2222222222222222222222222222222222222222).";
 const SYNC_GUIDE_LEAD: &str = "main gained 1 commits (now 2222222222222222222222222222222222222222). Add the todo `Sync with main` right after your current item, and run it at the next safe point under the sync policy below. Do not stop running work for it.";
 const MS_PER_HOUR: i64 = 3_600_000;
-const MAIN_WORKTREE: &str = "/work/caudra";
-const TUESDAY: Date = date(2026, 10, 6);
-const NIGHT_HOUR: i8 = 5;
-const RUN_DATE: &str = "2026-10-05";
-const FIRST_SINCE: &str = "2026-10-01";
-const OTHER_FIRE_ID: &str = "fire-0";
-const MS_PER_MINUTE: i64 = 60_000;
-const MS_PER_SECOND: i64 = 1_000;
-const RETRY_GAP_MINUTES: i64 = 30;
-const PAST_NOTICE_MINUTES: i64 = 13 * 60;
-const PAST_STEP_NOTICE_MINUTES: i64 = 7 * 60;
-const STEP_FINISHED_MINUTES: i64 = 60;
-const SYNC_STEP: &str = "step 1 of 4, sync";
-const SURVEY_STEP: &str = "step 2 of 4, survey";
-const APPLY_STEP: &str = "step 3 of 4, apply";
-const VALIDATE_STEP: &str = "step 4 of 4, validate";
-const LAND_DONE: &str = "Fast-forwarded main.\nMODEL-WATCH LAND: DONE";
-const LAND_DONE_REVIEW: &str = "Fast-forwarded main.\nMODEL-WATCH REVIEW\nMODEL-WATCH LAND: DONE";
-const LAND_NOTHING: &str = "MODEL-WATCH LAND: NOTHING\n";
-const LAND_WAIT: &str = "The main checkout has untracked files.\nMODEL-WATCH LAND: WAIT";
-const LAND_STALE: &str = "main moved on.\nMODEL-WATCH LAND: STALE";
-const LAND_UNMARKED: &str = "I could not tell whether main is busy.";
-const MODEL_WATCH_DONE: &str = "model-watch landed the 2026-10-05 model updates on main. Report: target/model-watch/2026-10-05.md in the model-watch worktree.";
-const MODEL_WATCH_DONE_REVIEW: &str = "model-watch landed the 2026-10-05 model updates on main, and some need a person: see target/model-watch/2026-10-05.md in the model-watch worktree.";
-const MODEL_WATCH_NOTHING: &str = "nothing to land";
-const MODEL_WATCH_UNLANDED: &str = "model-watch could not land the 2026-10-05 run. The transcript says why. Arm model-watch again in /automations to retry.";
-const MODEL_WATCH_WAITED: &str = "model-watch has waited 12 hours to land on main, because /work/caudra is busy: changed or untracked files, another branch, or an operation in progress.";
-const MODEL_WATCH_NO_AUTOPILOT: &str =
-    "model-watch cannot start today's run: autopilot is not engaged, run /autopilot.";
-const MODEL_WATCH_IMPOSSIBLE: &str = "model-watch stopped at the survey step of the 2026-10-05 run: the goal was impossible. Fix what blocked it, then arm model-watch again in /automations.";
-const MODEL_WATCH_SYNC_OPEN: &str = "model-watch's sync step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal clear stops the step, and arming model-watch again retries it.";
-const MODEL_WATCH_SURVEY_OPEN: &str = "model-watch's survey step of the 2026-10-05 run has had its goal open for over 6 hours, so it may be looping. Check the session: /goal clear stops the step, and arming model-watch again retries it.";
-const MODEL_WATCH_SYNC_STALLED: &str = "model-watch's sync step of the 2026-10-05 run stopped making progress, and its goal stays open. Check the session: a reply there lets it go on, /goal clear stops the step, and arming model-watch again retries it.";
-const ALREADY_TOLD_STUCK: &str = "already told that this step is stuck";
-const SYNC_IN_PROGRESS: &str = "the sync step is in progress";
-const RUN_DONE: &str = "today's run is done";
-const BEFORE_START: &str = "before 7:00";
-const NO_AUTOPILOT: &str = "autopilot is not engaged, run /autopilot";
-const HALTED: &str = "halted: arm model-watch again to resume";
-const NOT_LANDING: &str = "not a landing turn";
-const LANDING: &str = "landing in progress";
-const MAIN_BUSY: &str = "the main checkout is busy, the next check asks again";
-const MUST_HOLD_GOAL: &str = "a model-watch step holds the goal it set";
-const MUST_ASK_TO_LAND: &str = "the landing request names the main checkout and its markers";
-
 const MUST_READ: &str = "the example is readable";
 const MUST_LIST: &str = "the examples directory is listable";
 const MUST_PARSE: &str = "the example's header parses";
@@ -581,6 +539,7 @@ fn success(request: &ActionRequest) -> ActionReply {
         ActionRequest::Message(_)
         | ActionRequest::Notify { .. }
         | ActionRequest::Pause { .. }
+        | ActionRequest::Done { .. }
         | ActionRequest::Log { .. } => ActionReply::Done,
     }
 }
@@ -963,6 +922,30 @@ fn every_example_validates_under_its_own_name() {
         })
         .collect::<Vec<_>>();
     assert_eq!(failures, Vec::<String>::new());
+}
+
+#[test_case(FOLLOW_UP_TEXT; "reminder")]
+#[test_case(APPROVE_SHELL; "custom_text")]
+fn follow_up_fires_once(text: &str) {
+    let follow_up = Automation::armed_with(FOLLOW_UP, json!({ "text": text }));
+    let event = scheduled();
+    let host = ScriptedHost::default();
+    assert!(!follow_up.routes(&armed(ArmedReason::Manual)));
+    assert!(follow_up.routes(&event));
+
+    let outcome = follow_up.outcome(&event, &host);
+    assert_eq!(outcome.end, FiringEnd::Completed);
+    assert_eq!(
+        host.requests(),
+        vec![
+            messaged(text),
+            json!({ "kind": "done", "reason": FOLLOW_UP_SENT }),
+        ]
+    );
+
+    let replayed = follow_up.replay(&event, &[]);
+    assert_eq!(replayed.outcome, outcome);
+    assert_eq!(answers(&replayed), host.replay_answers());
 }
 
 #[test]
@@ -1764,24 +1747,19 @@ fn a_replay_runs_against_the_current_state() {
     assert_eq!(answers(&replayed), vec![(runs_request(), Answer::Journal)]);
 }
 
-/// The project's own automation, armed on this repository's main checkout.
-fn model_watch() -> Automation {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(PROJECT_AUTOMATIONS_DIR)
-        .join(MODEL_WATCH)
-        .with_extension(EXAMPLE_EXTENSION);
-    Automation::from_source(
-        fs::read_to_string(path).expect(MUST_READ),
-        json!({ "main_worktree": MAIN_WORKTREE }),
-    )
-}
-
 fn sync_main() -> Automation {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(PROJECT_AUTOMATIONS_DIR)
         .join(SYNC_MAIN)
         .with_extension(EXAMPLE_EXTENSION);
     Automation::from_source(fs::read_to_string(path).expect(MUST_READ), json!({}))
+}
+
+fn kinds(requests: &[Value]) -> Vec<&str> {
+    requests
+        .iter()
+        .filter_map(|request| request["kind"].as_str())
+        .collect()
 }
 
 fn sync_host() -> ScriptedHost {
@@ -2039,293 +2017,4 @@ fn sync_main_replay_uses_scripted_comparison_without_actions() {
     let default = sync.replay(&event, &[]);
     assert_eq!(default.outcome.end, skipped(SYNC_MISSING));
     assert!(default.actions.is_empty());
-}
-
-/// A session ready for a run: in Build mode, under autopilot, with no goal.
-fn on_autopilot() -> SessionView {
-    SessionView {
-        autopilot: Some(AutopilotView {
-            owns_goal: false,
-            waiting: false,
-        }),
-        ..session()
-    }
-}
-
-fn at_work(minutes_later: i64) -> ScriptedHost {
-    ScriptedHost::at(local_ms(MONDAY, WORK_HOUR) + minutes_later * MS_PER_MINUTE)
-}
-
-fn tick() -> Event {
-    scheduled_in(on_autopilot())
-}
-
-fn landing_turn(fire_id: &str, reply: &str) -> Event {
-    idle(IdleDetail {
-        started_by: StartedBy::Automation {
-            automation: MODEL_WATCH.to_owned(),
-            fire_id: fire_id.to_owned(),
-        },
-        last_response: Untrusted::text(reply),
-        ..turn()
-    })
-}
-
-fn kinds(requests: &[Value]) -> Vec<&str> {
-    requests
-        .iter()
-        .filter_map(|request| request["kind"].as_str())
-        .collect()
-}
-
-/// Asserts that the firing set exactly one goal, for `step`.
-fn assert_step(fired: &Fired, step: &str) {
-    let (end, requests) = fired;
-    assert_eq!(
-        (end, kinds(requests)),
-        (&FiringEnd::Completed, vec!["set_goal"])
-    );
-    let condition = requests[0]["condition"].as_str().unwrap_or_default();
-    assert!(condition.contains(step), "{MUST_HOLD_GOAL}: {condition}");
-}
-
-fn assert_asks_to_land(fired: &Fired) {
-    let (end, requests) = fired;
-    assert_eq!(
-        (end, kinds(requests)),
-        (&FiringEnd::Completed, vec!["message"])
-    );
-    let text = requests[0]["text"].as_str().unwrap_or_default();
-    assert!(
-        text.contains(MAIN_WORKTREE) && text.contains("MODEL-WATCH LAND: WAIT"),
-        "{MUST_ASK_TO_LAND}: {text}"
-    );
-}
-
-/// Finishes the goal model-watch holds, an hour after the run started.
-fn finish_step(watch: &mut Automation, verdict: GoalVerdict) -> Fired {
-    let condition = watch.state["current"]
-        .as_str()
-        .expect(MUST_HOLD_GOAL)
-        .to_owned();
-    watch.fire(
-        &goal_finished(verdict, &condition),
-        &at_work(STEP_FINISHED_MINUTES),
-    )
-}
-
-/// A run that reached its landing step and asked to land.
-fn landing_watch() -> Automation {
-    let mut watch = model_watch();
-    watch.fire(&tick(), &at_work(0));
-    for _ in [SURVEY_STEP, APPLY_STEP, VALIDATE_STEP] {
-        finish_step(&mut watch, GoalVerdict::Met);
-    }
-    assert_asks_to_land(&finish_step(&mut watch, GoalVerdict::Met));
-    watch
-}
-
-#[test]
-fn model_watch_chains_its_steps_and_lands_once_a_day() {
-    let mut watch = model_watch();
-    assert_step(&watch.fire(&tick(), &at_work(0)), SYNC_STEP);
-    assert_eq!(
-        (&watch.state["run"], &watch.state["since"]),
-        (&json!(RUN_DATE), &json!(FIRST_SINCE))
-    );
-    for step in [SURVEY_STEP, APPLY_STEP, VALIDATE_STEP] {
-        assert_step(&finish_step(&mut watch, GoalVerdict::Met), step);
-    }
-    assert_asks_to_land(&finish_step(&mut watch, GoalVerdict::Met));
-    assert_eq!(
-        watch.fire(&tick(), &at_work(RETRY_GAP_MINUTES)),
-        (skipped(LANDING), Vec::new())
-    );
-    assert_eq!(
-        watch.fire(&landing_turn(OTHER_FIRE_ID, LAND_DONE), &at_work(90)),
-        (skipped(NOT_LANDING), Vec::new())
-    );
-    assert_eq!(
-        watch.fire(&landing_turn(FIRE_ID, LAND_DONE), &at_work(90)),
-        (FiringEnd::Completed, vec![notified(MODEL_WATCH_DONE)])
-    );
-    assert_eq!(
-        (watch.state.get("step"), &watch.state["last_landed"]),
-        (None, &json!(RUN_DATE))
-    );
-    assert_eq!(
-        watch.fire(&tick(), &at_work(120)),
-        (skipped(RUN_DONE), Vec::new())
-    );
-    let next_day = ScriptedHost::at(local_ms(TUESDAY, WORK_HOUR));
-    assert_step(&watch.fire(&tick(), &next_day), SYNC_STEP);
-    assert_eq!(watch.state["since"], json!(RUN_DATE));
-}
-
-#[test]
-fn model_watch_waits_for_its_hour_and_asks_once_a_day_for_autopilot() {
-    let mut watch = model_watch();
-    assert_eq!(
-        watch.fire(&tick(), &ScriptedHost::at(local_ms(MONDAY, NIGHT_HOUR))),
-        (skipped(BEFORE_START), Vec::new())
-    );
-    assert_eq!(
-        watch.fire(&scheduled(), &at_work(0)),
-        (
-            FiringEnd::Completed,
-            vec![notified(MODEL_WATCH_NO_AUTOPILOT)]
-        )
-    );
-    assert_eq!(
-        watch.fire(&scheduled(), &at_work(RETRY_GAP_MINUTES)),
-        (skipped(NO_AUTOPILOT), Vec::new())
-    );
-    assert_step(&watch.fire(&tick(), &at_work(60)), SYNC_STEP);
-}
-
-#[test]
-fn model_watch_halts_on_a_failed_step_and_resumes_it_when_armed_again() {
-    let mut watch = model_watch();
-    watch.fire(&tick(), &at_work(0));
-    finish_step(&mut watch, GoalVerdict::Met);
-    assert_eq!(
-        finish_step(&mut watch, GoalVerdict::Impossible),
-        (FiringEnd::Completed, vec![notified(MODEL_WATCH_IMPOSSIBLE)])
-    );
-    assert_eq!(
-        watch.fire(&tick(), &at_work(90)),
-        (skipped(HALTED), Vec::new())
-    );
-    let rearmed = event_in(
-        on_autopilot(),
-        EventDetail::Armed {
-            reason: ArmedReason::Manual,
-        },
-    );
-    assert_step(&watch.fire(&rearmed, &at_work(120)), SURVEY_STEP);
-    assert_eq!(watch.state.get("halted"), None);
-}
-
-#[test]
-fn model_watch_says_once_per_step_when_its_goal_stays_open_for_hours() {
-    let mut watch = model_watch();
-    watch.fire(&tick(), &at_work(0));
-    let open = |watch: &Automation| {
-        pursuing(
-            tick(),
-            watch.state["current"].as_str().expect(MUST_HOLD_GOAL),
-        )
-    };
-    assert_eq!(
-        watch.fire(&open(&watch), &at_work(RETRY_GAP_MINUTES)),
-        (skipped(SYNC_IN_PROGRESS), Vec::new())
-    );
-    assert_eq!(
-        watch.fire(&open(&watch), &at_work(PAST_STEP_NOTICE_MINUTES)),
-        (FiringEnd::Completed, vec![notified(MODEL_WATCH_SYNC_OPEN)])
-    );
-    assert_eq!(
-        watch.fire(
-            &open(&watch),
-            &at_work(PAST_STEP_NOTICE_MINUTES + RETRY_GAP_MINUTES)
-        ),
-        (skipped(SYNC_IN_PROGRESS), Vec::new())
-    );
-    assert_step(&finish_step(&mut watch, GoalVerdict::Met), SURVEY_STEP);
-    assert_eq!(
-        watch.fire(
-            &open(&watch),
-            &at_work(STEP_FINISHED_MINUTES + PAST_STEP_NOTICE_MINUTES)
-        ),
-        (
-            FiringEnd::Completed,
-            vec![notified(MODEL_WATCH_SURVEY_OPEN)]
-        )
-    );
-}
-
-#[test]
-fn model_watch_says_once_when_its_step_stalls_and_carries_on_when_it_is_met() {
-    let mut watch = model_watch();
-    watch.fire(&tick(), &at_work(0));
-    assert_eq!(
-        finish_step(&mut watch, GoalVerdict::Stalled),
-        (
-            FiringEnd::Completed,
-            vec![notified(MODEL_WATCH_SYNC_STALLED)]
-        )
-    );
-    assert_eq!(
-        finish_step(&mut watch, GoalVerdict::Stalled),
-        (skipped(ALREADY_TOLD_STUCK), Vec::new())
-    );
-    let open = pursuing(
-        tick(),
-        watch.state["current"].as_str().expect(MUST_HOLD_GOAL),
-    );
-    assert_eq!(
-        watch.fire(&open, &at_work(PAST_STEP_NOTICE_MINUTES)),
-        (skipped(SYNC_IN_PROGRESS), Vec::new())
-    );
-    assert_step(&finish_step(&mut watch, GoalVerdict::Met), SURVEY_STEP);
-}
-
-#[test]
-fn model_watch_waits_on_a_busy_main_checkout_and_says_so_after_hours() {
-    let mut watch = landing_watch();
-    assert_eq!(
-        watch.fire(&landing_turn(FIRE_ID, LAND_WAIT), &at_work(90)),
-        (skipped(MAIN_BUSY), Vec::new())
-    );
-    let waiting_since = (local_ms(MONDAY, WORK_HOUR) + 90 * MS_PER_MINUTE) / MS_PER_SECOND;
-    assert_eq!(watch.state["wait_since"], json!(waiting_since));
-    assert_asks_to_land(&watch.fire(&tick(), &at_work(90 + RETRY_GAP_MINUTES)));
-    watch.fire(
-        &landing_turn(FIRE_ID, LAND_WAIT),
-        &at_work(90 + RETRY_GAP_MINUTES),
-    );
-    let (end, requests) = watch.fire(&tick(), &at_work(90 + PAST_NOTICE_MINUTES));
-    assert_eq!(
-        (end, kinds(&requests)),
-        (FiringEnd::Completed, vec!["notify", "message"])
-    );
-    assert_eq!(requests[0], notified(MODEL_WATCH_WAITED));
-    assert_eq!(
-        watch.fire(
-            &landing_turn(FIRE_ID, LAND_DONE),
-            &at_work(90 + PAST_NOTICE_MINUTES)
-        ),
-        (FiringEnd::Completed, vec![notified(MODEL_WATCH_DONE)])
-    );
-    assert_eq!(
-        (
-            watch.state.get("wait_since"),
-            watch.state.get("waited_notice")
-        ),
-        (None, None)
-    );
-}
-
-#[test]
-fn model_watch_merges_main_again_when_main_moved_then_lands() {
-    let mut watch = landing_watch();
-    assert_step(
-        &watch.fire(&landing_turn(FIRE_ID, LAND_STALE), &at_work(90)),
-        SYNC_STEP,
-    );
-    assert_step(&finish_step(&mut watch, GoalVerdict::Met), VALIDATE_STEP);
-    assert_asks_to_land(&finish_step(&mut watch, GoalVerdict::Met));
-    assert_eq!(watch.state.get("resync"), None);
-}
-
-#[test_case(LAND_DONE_REVIEW, vec![notified(MODEL_WATCH_DONE_REVIEW)], false ; "landed_with_items_for_a_person")]
-#[test_case(LAND_NOTHING, vec![logged(MODEL_WATCH_NOTHING)], false ; "nothing_to_land")]
-#[test_case(LAND_UNMARKED, vec![notified(MODEL_WATCH_UNLANDED)], true ; "no_marker_halts")]
-fn model_watch_reads_the_landing_marker(reply: &str, requests: Vec<Value>, halted: bool) {
-    let mut watch = landing_watch();
-    assert_eq!(
-        watch.fire(&landing_turn(FIRE_ID, reply), &at_work(90)),
-        (FiringEnd::Completed, requests)
-    );
-    assert_eq!(watch.state.get("halted") == Some(&json!(true)), halted);
 }

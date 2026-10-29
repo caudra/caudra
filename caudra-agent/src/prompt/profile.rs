@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::agent::{resolve_purpose_model, resolve_purpose_model_for_inspection};
+use crate::agent::resolve_purpose_model;
 
 pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 
@@ -371,7 +371,7 @@ impl PromptProfileCatalog {
                 profile,
                 parent_thinking,
                 |binding| {
-                    resolve_purpose_model_for_inspection(
+                    resolve_purpose_model(
                         ModelPurpose::Subagent,
                         binding,
                         parent_model,
@@ -804,7 +804,7 @@ mod tests {
 
     use caudra_automation::meta::MAX_NAME_BYTES;
     use caudra_config::ModelPolicy;
-    use caudra_providers::{Model, ThinkingConfig, catalog_providers_if_available, model_registry};
+    use caudra_providers::{Model, ThinkingConfig, model_registry};
     use caudra_storage::StateDir;
     use caudra_storage::thinking::StoredThinking;
     use serde_json::json;
@@ -822,13 +822,14 @@ mod tests {
     const INSPECTION_OPUS: &str = "anthropic/claude-opus-5-5";
     const INSPECTION_ROUTED: &str = "aperture/mistral/mistral-medium-latest";
     const INSPECTION_UNKNOWN: &str = "caudra-inspection-unknown/model";
+    const INSPECTION_CATALOG_PROVIDER: &str = "nvidia";
     const INCOMPATIBLE_THINKING: &str = "subagent thinking Adaptive is incompatible with model \"mistral/ministral-14b-latest\": model does not support thinking";
     const OPUS_INCOMPATIBLE_OFF: &str = "subagent thinking Off is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as low";
     const OPUS_INCOMPATIBLE_BUDGET: &str = "subagent thinking Budget(8192) is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as adaptive";
     const OPUS_INCOMPATIBLE_MINIMAL: &str = "subagent thinking Effort(\"minimal\") is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as low";
     const INSPECTION_OFFLINE_ENV: &str = "CAUDRA_TEST_PROFILE_INSPECTION_OFFLINE";
     const INSPECTION_OFFLINE_TEST: &str =
-        "prompt::profile::tests::inspection_task_bindings_need_no_auth_or_catalog";
+        "prompt::profile::tests::inspection_task_bindings_use_the_snapshot_without_auth_or_network";
     const AUTOMATION_PROFILE: &str = "worker";
     const JOIN_SWARM: &str = "join-swarm";
     const GOAL_CHAIN: &str = "goal-chain";
@@ -1130,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn inspection_task_bindings_need_no_auth_or_catalog() {
+    fn inspection_task_bindings_use_the_snapshot_without_auth_or_network() {
         if env::var_os(INSPECTION_OFFLINE_ENV).is_none() {
             let home = TempDir::new().unwrap();
             let status = Command::new(env::current_exe().unwrap())
@@ -1142,6 +1143,7 @@ mod tests {
                 .env("XDG_DATA_HOME", home.path())
                 .env("XDG_STATE_HOME", home.path())
                 .env("XDG_CACHE_HOME", home.path())
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
                 .current_dir(home.path())
                 .status()
                 .unwrap();
@@ -1152,7 +1154,21 @@ mod tests {
         let parent = Model::from_spec(INSPECTION_PARENT).unwrap();
         let chat = Model::from_spec(INSPECTION_CHAT).unwrap();
         let policy = ModelPolicy::default();
-        assert!(catalog_providers_if_available().is_none());
+        let catalog_model = caudra_providers::model_ids(INSPECTION_CATALOG_PROVIDER)
+            .into_iter()
+            .find(|id| {
+                caudra_providers::model_meta(INSPECTION_CATALOG_PROVIDER, id)
+                    .is_some_and(|meta| !meta.supports_thinking)
+            })
+            .unwrap();
+        let catalog_spec = format!("{INSPECTION_CATALOG_PROVIDER}/{catalog_model}");
+        let bindings = inspection_catalog(Some(&catalog_spec), None).bind_for_tasks_for_inspection(
+            &parent,
+            &chat,
+            &ThinkingConfig::Off,
+            &policy,
+        );
+        assert!(bindings.resolve(INSPECTION_PROFILE).unwrap().is_some());
         for model in [INSPECTION_CHAT, INSPECTION_ROUTED] {
             let bindings = inspection_catalog(Some(model), None).bind_for_tasks_for_inspection(
                 &parent,
@@ -1200,7 +1216,6 @@ mod tests {
             bindings.resolve(INSPECTION_PROFILE),
             Err(PromptProfileSelectionError::Unavailable { .. })
         ));
-        assert!(catalog_providers_if_available().is_none());
     }
 
     #[test]

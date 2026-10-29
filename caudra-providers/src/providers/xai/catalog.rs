@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::AgentError;
+use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelInfo, ModelPricing, ThinkingSupport};
 use crate::{ReasoningOption, ReasoningOptions};
 
@@ -197,8 +198,9 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
 }
 
 fn curated_fallback() -> Vec<CachedModel> {
-    super::models()
-        .iter()
+    ManifestRegistry::get("xai")
+        .into_iter()
+        .flat_map(|manifest| manifest.listed_models())
         .filter_map(|entry| {
             let id = *entry.prefixes.first()?;
             Some(CachedModel {
@@ -380,8 +382,9 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         }
     };
 
-    let known = super::models()
-        .iter()
+    let known = ManifestRegistry::get("xai")
+        .into_iter()
+        .flat_map(|manifest| manifest.models)
         .find(|entry| entry.prefixes.iter().any(|p| normalized.starts_with(p)));
     let vision = first_bool(obj, meta, &["acceptsImages"])
         .or_else(|| parse_accepts_images(first_value(obj, meta, &["inputModalities"])))
@@ -436,8 +439,9 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
 }
 
 fn known_max_tokens(model_id: &str) -> Option<u32> {
-    super::models()
-        .iter()
+    ManifestRegistry::get("xai")
+        .into_iter()
+        .flat_map(|manifest| manifest.models)
         .find(|entry| entry.prefixes.iter().any(|p| model_id.starts_with(p)))
         .and_then(|entry| entry.max_output_tokens)
 }

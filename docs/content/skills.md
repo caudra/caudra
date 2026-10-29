@@ -186,6 +186,29 @@ Both packs can be on at once, and each keeps its own commands, so `/pstack:tdd` 
 
 The `pr` skill's Summary section comes from [Dex Horthy](https://github.com/dexhorthy)'s `show-me` skill, credited in `mattpocock/pr/CREDITS.md`.
 
+### emil
+
+It is off by default. [emil](https://github.com/emilkowalski/skills) is Emil Kowalski's design-engineering set, bundled under its MIT license. Its skills build and review animations, make a web app feel native on a phone, stress-test a UI with worst-case data, prototype variants, and cover Sonner toasts and modern Swift. Caudra ships all 16 skills and both cheatsheets. `emil = true` adds two things:
+
+- The `emil` skill, one line in the `skill` tool's list. Its description names the work that makes the agent reach for it, such as adding a transition or fixing janky motion.
+- A `/emil:<name>` command for every skill. `/emil:review-animations the drawer` tells the agent to load `emil/review-animations` and follow it for that request.
+
+| Who starts it | Skills |
+|---|---|
+| The agent, when the work calls for it, or you | `animate`, `animate-expo`, `animation-performance`, `animation-vocabulary`, `apple-design`, `ask-sonner`, `emil-design-eng`, `find-animation-opportunities`, `mobile-native`, `remove-animations`, `write-swift` |
+| Only you, with its command | `improve-animations`, `review-animations`, `break-ui`, `prototype`, `pick-ui-library` |
+
+Addresses work as they do for the other packs: `emil`, `emil/animate`, `emil/animate/RECIPES.md` and `emil?spring`.
+
+Caudra translates the skills and adapts them to how it works:
+
+- Emil's curves, durations and taste are defaults. A coherent motion style already in your project, or a choice you make, wins. Findings cite a file and line, and accessibility problems rank above polish.
+- Caudra has no browser of its own. To look at a page, a skill uses a screenshot MCP server or the project's own Playwright or Storybook, and reads the images with `view_image`. Without them, it labels each finding as inferred from the code. Timing and feel need motion, so the skill tells you what to check and reports it as unverified until you answer.
+- `improve-animations` audits with parallel read-only tasks, asks which findings to plan through the `question` tool, and writes the plans into the session plan. It writes `plans/` files in the repository only when you ask. `execute` runs one plan in a separate git worktree and reviews the diff without merging it.
+- `review-animations` first names what it reviews: a commit range, or staged, unstaged and untracked work.
+- `break-ui` and `prototype` add only dev-only fixtures, routes or a standalone HTML file in the scratch directory, and remove what they added. In Plan mode, skills that edit code put the change into the session plan instead.
+- Skills read the installed versions of Expo, Reanimated, Sonner or Swift before applying a recipe, and never upgrade a dependency unless you ask.
+
 Each builtin has a switch under `plugins.skill`:
 
 ```toml
@@ -193,10 +216,11 @@ Each builtin has a switch under `plugins.skill`:
 [plugins.skill]
 automation_dev = true
 docs = false
+emil = true
 mattpocock = true
 plugin_dev = true
 pstack = true
 workflow_dev = false
 ```
 
-`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working. `pstack = false` removes the skill, its commands, its profiles and its `code` calls, and `mattpocock = false` removes its skill and commands. While the terminal UI runs, switching `pstack` or `mattpocock` applies as soon as you save the file.
+`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working. `pstack = false` removes the skill, its commands, its profiles and its `code` calls, and `mattpocock = false` or `emil = false` removes that pack's skill and commands. While the terminal UI runs, switching `pstack`, `mattpocock` or `emil` applies as soon as you save the file.

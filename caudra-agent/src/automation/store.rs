@@ -101,6 +101,8 @@ pub struct QueuedDelivery {
     pub item: OutboxItem,
     pub request: Value,
     pub request_cut: bool,
+    pub finished: bool,
+    pub done_reason: Option<String>,
 }
 
 /// Whose firings a trace read may return.
@@ -146,7 +148,7 @@ macro_rules! mirrored {
 }
 
 mirrored! {
-    Scope = AutomationScope { User, Project, Bundled }
+    Scope = AutomationScope { Session, User, Project, Bundled }
     ArmOrigin = AutomationOrigin { Cli, Profile, Manual, Always, Sdk }
     TriggerKind = AutomationTrigger {
         Armed, Idle, NeedsInput, GoalFinished, MessageReceived, WorkFinished, WorkflowFinished,
@@ -158,7 +160,7 @@ mirrored! {
     }
     StateOutcome = AutomationStateOutcome { Committed, Conflict }
     ActionKind = AutomationActionKind {
-        Message, SetGoal, Notify, Http, Reply, Send, Publish, Broadcast, StartWorkflow, Pause, Log,
+        Message, SetGoal, Notify, Http, Reply, Send, Publish, Broadcast, StartWorkflow, Pause, Done, Log,
     }
     ActionStatus = AutomationActionStatus {
         Running, Done, Failed, Refused, Queued, Delivered, Deduplicated, Dropped, Expired,
@@ -537,6 +539,8 @@ impl AutomationStore {
                         },
                         request,
                         request_cut: action.request_cut,
+                        finished: row.finished,
+                        done_reason: row.done_reason,
                     })
                 })
                 .collect()
@@ -1217,6 +1221,7 @@ mod tests {
             operations: OPERATIONS,
             state_patch: None,
             commit: None,
+            done_action: None,
         }
     }
 

@@ -63,6 +63,7 @@ include_dir = { workspace = true }
 workspace-hack.workspace = true
 
 [dev-dependencies]
+async-lock = { workspace = true }
 caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
@@ -79,12 +80,14 @@ members = [
   "caudra-diff",
   "caudra-docgen",
   "caudra-docs",
+  "caudra-emil",
   "caudra-grab",
   "caudra-highlight",
   "caudra-interpreter",
   "caudra-lua",
   "caudra-markdown",
   "caudra-mattpocock",
+  "caudra-models",
   "caudra-otel",
   "caudra-providers",
   "caudra-proxy",
@@ -165,7 +168,9 @@ caudra-lua-macro = { path = "caudra-lua-macro" }
 caudra-grab = { path = "caudra-grab" }
 caudra-highlight = { path = "caudra-highlight" }
 caudra-markdown = { path = "caudra-markdown" }
+caudra-emil = { path = "caudra-emil" }
 caudra-mattpocock = { path = "caudra-mattpocock" }
+caudra-models = { path = "caudra-models" }
 caudra-otel = { path = "caudra-otel" }
 caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
@@ -191,6 +196,7 @@ workcell-workspace-scm = { path = "workcell/crates/workspace-scm" }
 workcell-workspace-snapshot = { path = "workcell/crates/workspace-snapshot" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
 semver = "1.0.28"
 rusqlite = { version = "0.41", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
 bs58 = "0.5"
@@ -204,6 +210,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json", "registry"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
+ring = "0.17.14"
 hmac = { version = "0.13", default-features = false }
 base64 = "0.23"
 url = "2"

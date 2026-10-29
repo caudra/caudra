@@ -119,7 +119,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, [`plugins.skill.pstack`](/docs/skills/#pstack), and [`plugins.skill.mattpocock`](/docs/skills/#mattpocock) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, [`plugins.skill.pstack`](/docs/skills/#pstack), [`plugins.skill.mattpocock`](/docs/skills/#mattpocock), and [`plugins.skill.emil`](/docs/skills/#emil) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -403,7 +403,7 @@ Click the banner's `×` or run `/update dismiss` to hide it in every session unt
 
 GitHub receives your source IP address and normal request metadata, including a `caudra` user agent. The check sends no session data, machine identifier, or current version.
 
-Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, and it asks GitHub instead of reading the cache, so a release published since the last check shows at once. Its answer refreshes the cache for later starts. An empty value leaves the config in effect. A normal run still contacts your model provider, fetches the public [models.dev](https://models.dev/) model catalog when the cached copy is more than a day old, and sends web searches to Exa when the agent uses `websearch`.
+Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, and it asks GitHub instead of reading the cache, so a release published since the last check shows at once. Its answer refreshes the cache for later starts. An empty value leaves the config in effect. A normal run still contacts your model provider and sends web searches to Exa when the agent uses `websearch`. Long-running sessions also check `models.caudra.ai` daily for a newer [model list](/docs/providers/#model-list) unless `models.refresh` is false.
 
 ### `ui.update_channel`
 
@@ -433,7 +433,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
+| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `request_secret`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 
@@ -456,6 +456,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `shell_eta` | bool | `true` | - | Show an ETA on a shell card and in `/shells`, from a small model trained on this machine's past shell runs. It only labels the command: timeouts and delivery never change. When off, nothing is predicted or recorded |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `summarize_memory` | bool | `true` | - | Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them |
+| `memory_nudges` | bool | `true` | - | Remind the main agent to save a memory note after a failed command passes, a long search ends in an edit, the user corrects it, or the context nears compaction. Reminders thin out as the project's notes grow and stop once the agent saves notes without them |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `tool_json_repair` | bool | `true` | - | Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch |
 | `eager_tool_dispatch` | bool | `true` | - | Start tools and batch children as soon as their complete arguments arrive, instead of waiting for the whole message |
@@ -632,6 +633,13 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Longest the server may send nothing before the request is abandoned (seconds) |
 
+### `models`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `refresh` | bool | `true` | `CAUDRA_MODELS_REFRESH` | Check for signed model updates daily in long-running sessions. A project may only disable refresh. The environment variable accepts 0/1, false/true, no/yes or off/on. Cached models remain usable when disabled |
+| `url` | String | unset | - | Global-only signed model file URL. Project values are ignored. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart |
+
 ### `storage`
 
 | Field | Type | Default | Env | Min | Description |
@@ -796,6 +804,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `history_search` | `off` | `off`, `shadow`, `enforce` | Rerank session history search's keyword matches against the agent's query, drop those judged unrelated, and return the rest best first. Sends the query and each candidate's kind, tool, date, session title, and a redacted excerpt. |
 | `memory_recall` | `off` | `off`, `shadow`, `advise` | Remind the agent of at most three saved notes likely relevant to a new user message, a todo step it starts, an unmet goal, or the work after compaction, without loading them. Sends a redacted excerpt of the request and of the open todos, the previous request when this one is short, and an unmet goal with the evaluator's reason, and each keyword-matched note's name, heading, and redacted excerpt. |
 | `memory_duplicates` | `off` | `off`, `shadow`, `advise` | When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes. |
+| `memory_nudge` | `off` | `off`, `shadow`, `advise` | Judge whether a new user message corrects the agent or states a rule for the project. When it does and `agent.memory_nudges` allows a reminder, the agent is reminded to save a note. Sends redacted excerpts of the message and of the reply before it. |
 | `compaction_retention` | `off` | `off`, `shadow`, `enforce` | During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts. |
 | `output_pointers` | `off` | `off`, `shadow`, `advise` | When a saved tool output was truncated, point the agent to at most two omitted line ranges likely to matter. Nothing extra is removed. Sends redacted excerpts of the in-progress todos, latest request, tool input, and omitted lines. |
 | `source_code_context` | `off` | `off`, `shadow`, `enforce` | In local sessions, judge the first 64 code-context rows against the task and keep only those judged relevant, best first. Sends the task and each row's symbol name, kind, path, line span, and reference counts, never source text. |
@@ -928,6 +937,7 @@ enabled = false
 | `docs` | boolean | `true` | Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time. |
 | `pstack` | boolean | `false` | Offer the bundled pstack: its skills as the `pstack` skill, the `/pstack:` commands, the `pstack-poteto-agent` and `pstack-comment-sicko` task profiles, and its scripts as `pstack` calls in `code`. |
 | `mattpocock` | boolean | `false` | Offer Matt Pocock's bundled skills (grilling, TDD, diagnosing bugs, code review, specs, tickets): the `mattpocock` skill and the `/mattpocock:` commands. |
+| `emil` | boolean | `false` | Offer Emil Kowalski's bundled design-engineering skills (animation, motion review, UI stress tests, prototypes, mobile polish, Swift): the `emil` skill and the `/emil:` commands. |
 
 ### `plugins.task`
 

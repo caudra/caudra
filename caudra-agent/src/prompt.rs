@@ -169,6 +169,11 @@ pub const WORK_NUDGE_BUILD_PROMPT: &str = include_str!("prompts/work_nudge_build
 pub const WORK_NUDGE_PLAN_PROMPT: &str = include_str!("prompts/work_nudge_plan.md");
 pub const WORK_NUDGE_REPORT_PROMPT: &str = include_str!("prompts/work_nudge_report.md");
 pub const COMPACTIONS_SLOT: &str = "{compactions}";
+/// Follows a moment worth a memory note, while the project has few notes and
+/// the agent has not yet saved them on its own.
+pub const MEMORY_NUDGE_PROMPT: &str = include_str!("prompts/memory_nudge.md");
+pub const MEMORY_NUDGE_EVENT_SLOT: &str = "{event}";
+pub const MEMORY_NUDGE_NOTES_SLOT: &str = "{notes}";
 /// Asks the agent waiting on a background shell, once per interval it runs,
 /// whether the wait is still worth it or the command hangs.
 pub const SHELL_WAIT_NUDGE_PROMPT: &str = include_str!("prompts/shell_wait_nudge.md");
@@ -205,6 +210,7 @@ pub const MEMORY_REFRESHED_PROMPT: &str = include_str!("prompts/memory_refreshed
 pub const MEMORY_UNAVAILABLE_PROMPT: &str = "<system-reminder>\n# Memory updated\n\nThe current system prompt has no project memory view. Earlier memory-update reminders no longer apply.\n</system-reminder>";
 pub const INSTRUCTIONS_CUSTOM_PROMPT: &str = "<system-reminder>\n# Instructions changed\n\nThis session uses a custom system prompt. Earlier instruction-file update reminders no longer apply.\n</system-reminder>";
 pub const MEMORY_UPDATED_MARKER: &str = "# Memory updated";
+pub const AUTOMATIONS_MARKER: &str = "# Automations";
 /// The tool array and system prompt are fixed so the prompt stays cached, and
 /// configuration that changes afterwards arrives here as a difference from them.
 pub const CONFIGURATION_CHANGED_PROMPT: &str = include_str!("prompts/configuration_changed.md");
@@ -360,6 +366,11 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
         crate::tools::MEMORY_TOOL_NAME,
         Slot::ToolUsage,
         crate::tools::native::memory::TOOL_USAGE,
+    ),
+    (
+        crate::tools::REQUEST_SECRET_TOOL_NAME,
+        Slot::ToolUsage,
+        crate::tools::native::secret::TOOL_USAGE,
     ),
 ];
 

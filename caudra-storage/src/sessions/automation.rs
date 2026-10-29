@@ -13,16 +13,17 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::StorageError;
 use crate::id::CaudraId;
-use crate::sessions::{SessionDatabase, SessionError, from_i64, id_from_row, to_i64};
+use crate::sessions::{SESSIONS_DIR, SessionDatabase, SessionError, from_i64, id_from_row, to_i64};
 use crate::workflow::{UnknownVariant, parse_column, text_enum};
+use crate::{StateDir, StorageError};
 
 /// What one firing stores in full across its event, action bodies and state
 /// patch. Past it, each further body keeps a [`PREVIEW_BYTES`] preview.
@@ -60,6 +61,7 @@ pub const SUPERSEDED_ON_RESUME: &str = "resume fires armed and schedules catch u
 /// Why waiting firings end when their session moves to another directory.
 pub const INTERRUPTED_BY_RELOCATION: &str = "the session moved to another directory";
 const EMPTY_OBJECT: &str = "{}";
+const DONE_APPLIED_RESULT: &str = r#"{"disarmed":true}"#;
 const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const PENDING_STATUSES: &str = "('queued', 'deferred', 'running')";
 const WAITING_STATUSES: &str = "('queued', 'deferred')";
@@ -67,14 +69,17 @@ const WAITING_STATUSES: &str = "('queued', 'deferred')";
 const KEEPING_STATUSES: &str = "('completed', 'skipped')";
 const SUPERSEDED_TRIGGERS: &str = "('armed', 'idle', 'needs_input', 'schedule')";
 
-/// The scopes a binding's CHECK allows: `v36` before bundled scripts, then
-/// `current`.
+pub(crate) const SESSION_AUTOMATIONS_DIR: &str = "automations";
+
 macro_rules! binding_scopes {
     (v36) => {
         "'user', 'project'"
     };
-    (current) => {
+    (v44) => {
         "'user', 'project', 'bundled'"
+    };
+    (current) => {
+        "'user', 'project', 'bundled', 'session'"
     };
 }
 pub(crate) use binding_scopes;
@@ -148,7 +153,7 @@ FROM "#,
 pub(crate) use rebuild_bindings;
 
 macro_rules! tables {
-    ($scopes:ident) => {
+    ($scopes:ident, $actions:ident) => {
         concat!(
             $crate::automation::bindings_table!($scopes),
             r#"
@@ -201,11 +206,31 @@ CREATE TABLE automation_firings (
 CREATE INDEX automation_firings_by_automation ON automation_firings(session_id, automation, queued_ms);
 CREATE INDEX automation_firings_pending ON automation_firings(session_id, queued_ms)
     WHERE status IN ('queued', 'deferred', 'running');
+"#,
+            $crate::automation::actions_table!($actions)
+        )
+    };
+}
 
+macro_rules! action_kinds {
+    (v44) => {
+        "'message', 'set_goal', 'notify', 'http', 'reply', 'send', 'publish', 'broadcast', 'start_workflow', 'pause', 'log'"
+    };
+    (current) => {
+        concat!($crate::automation::action_kinds!(v44), ", 'done'")
+    };
+}
+pub(crate) use action_kinds;
+
+macro_rules! actions_table {
+    ($kinds:ident) => {
+        concat!(r#"
 CREATE TABLE automation_actions (
     fire_id       TEXT NOT NULL REFERENCES automation_firings(fire_id) ON DELETE CASCADE,
     seq           INTEGER NOT NULL CHECK(seq >= 0),
-    kind          TEXT NOT NULL CHECK(kind IN ('message', 'set_goal', 'notify', 'http', 'reply', 'send', 'publish', 'broadcast', 'start_workflow', 'pause', 'log')),
+    kind          TEXT NOT NULL CHECK(kind IN ("#,
+            $crate::automation::action_kinds!($kinds),
+            r#")),
     source_line   INTEGER,
     source_column INTEGER,
     request_hash  TEXT NOT NULL,
@@ -238,18 +263,48 @@ CREATE INDEX automation_actions_queued ON automation_actions(fire_id, seq) WHERE
     };
 }
 
+pub(crate) use actions_table;
+
+macro_rules! rebuild_actions {
+    ($kinds:ident, $previous:literal) => {
+        concat!(
+            "DROP INDEX automation_actions_queued;\nALTER TABLE automation_actions RENAME TO ",
+            $previous,
+            ";\n",
+            $crate::automation::actions_table!($kinds),
+            r#"
+INSERT INTO automation_actions (
+    fire_id, seq, kind, source_line, source_column, request_hash, request_cut, status, result_cut,
+    error, target, delivery, expires_ms, turn_outcome, turn_cost, started_ms, finished_ms,
+    delivered_ms, request, result
+)
+SELECT fire_id, seq, kind, source_line, source_column, request_hash, request_cut, status, result_cut,
+    error, target, delivery, expires_ms, turn_outcome, turn_cost, started_ms, finished_ms,
+    delivered_ms, request, result
+FROM "#,
+            $previous,
+            ";\nDROP TABLE ",
+            $previous,
+            ";\n"
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use rebuild_actions;
+
 /// The bindings of every automation a session armed, the script versions its
 /// firings ran, the firings, and the actions each took. Small columns come
 /// before the bodies so reading a row's status or `bytes` never walks its
 /// overflow pages. Byte bounds live in this module rather than in CHECKs, so
 /// raising one needs no table rebuild.
-pub(crate) const TABLES: &str = tables!(current);
-/// [`TABLES`] as schema 21 created them, before bundled scripts. Only that
-/// step still does: the schema 37 step rebuilds the bindings as [`TABLES`]
-/// has them.
-pub(crate) const TABLES_V21: &str = tables!(v36);
-pub(crate) const BUNDLED_SCOPE_MIGRATION: &str =
-    rebuild_bindings!(current, "automation_bindings_v36");
+pub(crate) const TABLES: &str = tables!(current, current);
+/// The original CHECKs, widened by the schema 37 and 45 rebuilds.
+pub(crate) const TABLES_V21: &str = tables!(v36, v44);
+pub(crate) const BUNDLED_SCOPE_MIGRATION: &str = rebuild_bindings!(v44, "automation_bindings_v36");
+pub(crate) const SESSION_SCOPE_MIGRATION: &str = concat!(
+    rebuild_bindings!(current, "automation_bindings_v44"),
+    rebuild_actions!(current, "automation_actions_v44")
+);
 /// Per-session automation row bytes, as a scalar over the `sessions` alias.
 pub(crate) const SESSION_AUTOMATION_BYTES: &str = "coalesce((SELECT sum(bytes) \
         FROM automation_bindings WHERE session_id = sessions.id), 0) \
@@ -277,6 +332,7 @@ const ACTION_SUMMARY_WIDTH: usize = 19;
 
 text_enum! {
     AutomationScope as "automation scope" {
+        Session = "session",
         User = "user",
         Project = "project",
         Bundled = "bundled",
@@ -342,6 +398,7 @@ text_enum! {
         Broadcast = "broadcast",
         StartWorkflow = "start_workflow",
         Pause = "pause",
+        Done = "done",
         Log = "log",
     }
 }
@@ -366,6 +423,14 @@ text_enum! {
         Next = "next",
         Guide = "guide",
     }
+}
+
+pub fn session_dir(state_dir: &StateDir, session_id: CaudraId) -> PathBuf {
+    state_dir
+        .path()
+        .join(SESSIONS_DIR)
+        .join(session_id.to_string())
+        .join(SESSION_AUTOMATIONS_DIR)
 }
 
 impl AutomationFiringStatus {
@@ -530,6 +595,8 @@ pub struct AutomationFiringEnd {
     pub operations: u64,
     pub state_patch: Option<String>,
     pub commit: Option<StateCommit>,
+    /// The `done` action from this attempt, never an earlier deferred attempt.
+    pub done_action: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +614,8 @@ pub struct FiringFinished {
     /// The delivery of the consumed message an ending that does not keep it
     /// hands back. The row holds it until the release succeeds.
     pub release: Option<String>,
+    pub disarmed: Option<String>,
+    pub done_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -613,6 +682,8 @@ pub struct AutomationActionRow {
 pub struct AutomationOutboxRow {
     pub automation: String,
     pub action: AutomationActionRow,
+    pub finished: bool,
+    pub done_reason: Option<String>,
 }
 
 /// Another session the swarm view lists.
@@ -1205,11 +1276,57 @@ impl SessionDatabase {
         } else {
             None
         };
+        let disarmed = if let Some(seq) = end.done_action.filter(|_| end.status.completes()) {
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE automation_bindings SET armed = 0, updated_ms = {NOW_MS} \
+                 WHERE session_id = ?1 AND automation = ?2 AND armed = 1 AND EXISTS (\
+                     SELECT 1 FROM automation_actions \
+                     WHERE fire_id = ?3 AND seq = ?4 AND kind = ?5 AND status = ?6)"
+                ),
+                params![
+                    firing.session_id.as_bytes().as_slice(),
+                    firing.automation,
+                    fire_id,
+                    to_i64(seq, "automation_actions.seq")?,
+                    AutomationActionKind::Done.as_str(),
+                    AutomationActionStatus::Done.as_str(),
+                ],
+            )?;
+            if changed > 0 {
+                transaction.execute(
+                    "UPDATE automation_actions SET result = ?3, result_cut = 0 \
+                     WHERE fire_id = ?1 AND seq = ?2",
+                    params![
+                        fire_id,
+                        to_i64(seq, "automation_actions.seq")?,
+                        DONE_APPLIED_RESULT
+                    ],
+                )?;
+                Some(firing.automation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let done_reason = if disarmed.is_some() {
+            Some(transaction.query_row(
+                "SELECT CASE WHEN json_valid(request) THEN json_extract(request, '$.reason') END FROM automation_actions \
+                 WHERE fire_id = ?1 AND seq = ?2",
+                params![fire_id, end.done_action.map(|seq| to_i64(seq, "automation_actions.seq")).transpose()?],
+                |row| row.get::<_, Option<String>>(0),
+            )?.unwrap_or_default())
+        } else {
+            None
+        };
         transaction.commit()?;
         Ok(FiringFinished {
             state,
             absorbed,
             release: firing.delivery.filter(|_| !keeps),
+            disarmed,
+            done_reason,
         })
     }
 
@@ -1374,7 +1491,12 @@ impl SessionDatabase {
         session_id: CaudraId,
     ) -> Result<Vec<AutomationOutboxRow>, SessionError> {
         let mut statement = self.connection().prepare(&format!(
-            "SELECT f.automation, {ACTION_SUMMARY_COLUMNS}, a.request, a.result \
+            "SELECT f.automation, {ACTION_SUMMARY_COLUMNS}, a.request, a.result, \
+                 f.finished_ms IS NOT NULL, \
+                 (SELECT CASE WHEN json_valid(d.request) THEN coalesce(json_extract(d.request, '$.reason'), '') ELSE '' END FROM automation_actions AS d \
+                  WHERE d.fire_id = f.fire_id AND d.kind = 'done' \
+                    AND json_valid(d.result) AND json_extract(d.result, '$.disarmed') = 1 \
+                  ORDER BY d.seq LIMIT 1) \
              FROM automation_actions AS a \
              JOIN automation_firings AS f ON f.fire_id = a.fire_id \
              WHERE a.status = ?2 AND f.session_id = ?1 \
@@ -1390,6 +1512,8 @@ impl SessionDatabase {
             outbox.push(AutomationOutboxRow {
                 automation: row.get(0)?,
                 action: read_action(row, 1)?,
+                finished: row.get(ACTION_SUMMARY_WIDTH + 3)?,
+                done_reason: row.get(ACTION_SUMMARY_WIDTH + 4)?,
             });
         }
         Ok(outbox)
@@ -2292,6 +2416,13 @@ mod tests {
         "an ephemeral store and the persistent one must never list each other's sessions";
     const NOT_REFUSED: &str = "expected an invalid input refusal";
     const NOT_MISSING: &str = "expected a not found error";
+    const DONE_REQUEST: &str = r#"{"kind":"done","reason":"sent"}"#;
+    const DONE_REASON: &str = "sent";
+    const FUTURE_DONE_RESULT: &str = r#"{"disarmed":true,"future_field":"ignored"}"#;
+    const UNKNOWN_DONE_RESULT: &str = r#"{"future_field":"ignored"}"#;
+    const FAIL_DISARM: &str = "CREATE TEMP TRIGGER fail_disarm BEFORE UPDATE OF armed ON automation_bindings \
+        BEGIN SELECT RAISE(ABORT, 'disarm failed'); END";
+    const ALLOW_DISARM: &str = "DROP TRIGGER fail_disarm";
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct TestMessage(String);
@@ -2393,6 +2524,196 @@ mod tests {
         }
     }
 
+    #[test_case(AutomationFiringStatus::Completed, true, true; "completed")]
+    #[test_case(AutomationFiringStatus::Skipped, true, true; "skipped")]
+    #[test_case(AutomationFiringStatus::Released, true, true; "released")]
+    #[test_case(AutomationFiringStatus::Failed, true, false; "failed")]
+    #[test_case(AutomationFiringStatus::Cancelled, true, false; "cancelled")]
+    #[test_case(AutomationFiringStatus::Interrupted, true, false; "interrupted")]
+    #[test_case(AutomationFiringStatus::Completed, false, false; "already_disarmed")]
+    fn done_disarms_only_a_completed_firing(
+        status: AutomationFiringStatus,
+        armed: bool,
+        disarmed: bool,
+    ) {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        database
+            .upsert_automation_binding(&arming(session_id, OTHER_AUTOMATION))
+            .unwrap();
+        if !armed {
+            database.disarm_automation(session_id, AUTOMATION).unwrap();
+        }
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        let action = NewAutomationAction {
+            kind: AutomationActionKind::Done,
+            request: DONE_REQUEST.into(),
+            ..http(FIRE_ID, 0)
+        };
+        database.start_automation_action(&action).unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 0, &done(None))
+            .unwrap();
+        let finished = database
+            .finish_automation_firing(
+                FIRE_ID,
+                &AutomationFiringEnd {
+                    done_action: Some(0),
+                    ..end(status)
+                },
+            )
+            .unwrap();
+        assert_eq!(finished.disarmed.as_deref(), disarmed.then_some(AUTOMATION));
+        assert_eq!(
+            finished.done_reason.as_deref(),
+            disarmed.then_some(DONE_REASON)
+        );
+        assert_eq!(
+            database
+                .load_automation_binding(session_id, AUTOMATION)
+                .unwrap()
+                .unwrap()
+                .armed,
+            armed && !disarmed
+        );
+        assert!(
+            database
+                .load_automation_binding(session_id, OTHER_AUTOMATION)
+                .unwrap()
+                .unwrap()
+                .armed
+        );
+        let stored = database
+            .load_automation_action(FIRE_ID, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.summary.kind, AutomationActionKind::Done);
+        assert_eq!(stored.request, DONE_REQUEST);
+        assert_eq!(
+            stored.result.as_deref(),
+            disarmed.then_some(DONE_APPLIED_RESULT)
+        );
+    }
+
+    #[test_case(None, false; "older_missing_result")]
+    #[test_case(Some(UNKNOWN_DONE_RESULT), false; "missing_applied_field")]
+    #[test_case(Some(FUTURE_DONE_RESULT), true; "unknown_fields_are_ignored")]
+    fn done_delivery_result_round_trips_without_a_format_change(
+        result: Option<&str>,
+        tagged: bool,
+    ) {
+        let (_temp, state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        database
+            .start_automation_action(&action(FIRE_ID, 0, AutomationActionStatus::Queued))
+            .unwrap();
+        database
+            .start_automation_action(&NewAutomationAction {
+                kind: AutomationActionKind::Done,
+                request: DONE_REQUEST.into(),
+                ..http(FIRE_ID, 1)
+            })
+            .unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 1, &done(None))
+            .unwrap();
+        let finished = database
+            .finish_automation_firing(
+                FIRE_ID,
+                &AutomationFiringEnd {
+                    done_action: Some(1),
+                    ..end(AutomationFiringStatus::Completed)
+                },
+            )
+            .unwrap();
+        assert_eq!(finished.done_reason.as_deref(), Some(DONE_REASON));
+        database
+            .connection()
+            .execute(
+                "UPDATE automation_actions SET result = ?2 WHERE fire_id = ?1 AND seq = 1",
+                params![FIRE_ID, result],
+            )
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let action = database
+            .load_automation_action(FIRE_ID, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.result.as_deref(), result);
+        if let Some(result) = action.result {
+            assert!(serde_json::from_str::<Value>(&result).unwrap().is_object());
+        }
+        let deliveries = database.load_automation_outbox(session_id).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].finished);
+        assert_eq!(
+            deliveries[0].done_reason.as_deref(),
+            tagged.then_some(DONE_REASON)
+        );
+    }
+
+    #[test_case(() ; "atomic_commit")]
+    fn a_failed_done_disarm_rolls_back_the_firing_and_state(_: ()) {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        database
+            .start_automation_action(&NewAutomationAction {
+                kind: AutomationActionKind::Done,
+                request: DONE_REQUEST.into(),
+                ..http(FIRE_ID, 0)
+            })
+            .unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 0, &done(None))
+            .unwrap();
+        let end = AutomationFiringEnd {
+            done_action: Some(0),
+            ..committing(0, STATE)
+        };
+        database.connection().execute_batch(FAIL_DISARM).unwrap();
+        assert!(database.finish_automation_firing(FIRE_ID, &end).is_err());
+        assert_eq!(
+            summary(&database, FIRE_ID).status,
+            AutomationFiringStatus::Running
+        );
+        let binding = database
+            .load_automation_binding(session_id, AUTOMATION)
+            .unwrap()
+            .unwrap();
+        assert!(binding.armed);
+        assert_eq!(binding.state, EMPTY_OBJECT);
+        database.connection().execute_batch(ALLOW_DISARM).unwrap();
+        database.finish_automation_firing(FIRE_ID, &end).unwrap();
+        let binding = database
+            .load_automation_binding(session_id, AUTOMATION)
+            .unwrap()
+            .unwrap();
+        assert!(!binding.armed);
+        assert_eq!(binding.state, STATE);
+        assert_eq!(
+            summary(&database, FIRE_ID).status,
+            AutomationFiringStatus::Completed
+        );
+    }
+
     fn end(status: AutomationFiringStatus) -> AutomationFiringEnd {
         AutomationFiringEnd {
             status,
@@ -2401,6 +2722,7 @@ mod tests {
             operations: 0,
             state_patch: None,
             commit: None,
+            done_action: None,
         }
     }
 
@@ -2518,6 +2840,7 @@ mod tests {
     }
 
     #[test_case(AutomationScope::User; "user")]
+    #[test_case(AutomationScope::Session; "session")]
     #[test_case(AutomationScope::Project; "project")]
     #[test_case(AutomationScope::Bundled; "bundled")]
     fn a_binding_keeps_its_scope(scope: AutomationScope) {

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::cache_warming::{CacheWarmer, WarmStop, WarmerContext, WarmerRef};
 use crate::decisions::{DecisionNote, Decisions, resolve_active_decisions};
+use crate::secrets::SecretVaults;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
 use caudra_automation::event::{GoalView, SessionStatus, SessionView, StartedBy, WorkView};
@@ -1846,6 +1847,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
 
     let session_id = CaudraId::generate();
     let mut store = open_print_store(&params, state_dir, session_id, &working_dir)?;
+    let secrets = SecretVaults::for_session(&store.dir, session_id);
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
@@ -1962,6 +1964,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 tool_output_store: crate::tool_output::default_store(),
                 permissions,
                 session_id: Some(session_ref_clone.clone()),
+                secrets: Some(secrets),
                 cache_key: Some(CacheKey::session(&session_ref_clone)),
                 workspace_session: params.workspace_session.clone(),
                 remote_project_context: params.remote_project_context.clone(),
@@ -4013,6 +4016,7 @@ async fn spawn_prepared_session(
         tool_output_store: Some(Arc::new(ToolOutputStore::new(state_dir.clone()))),
         permissions: Arc::clone(&permissions),
         session_id: Some(session_ref.clone()),
+        secrets: Some(SecretVaults::for_session(&state_dir, session_id)),
         cache_key: Some(CacheKey::session(&session_ref)),
         workspace_session: params.workspace_session.clone(),
         remote_project_context: params.remote_project_context.clone(),
@@ -4678,6 +4682,9 @@ async fn spawn_prepared_session(
                                 background: background.as_ref(),
                                 jobs: None,
                                 workflow: workflow.as_ref(),
+                                automation: automations
+                                    .as_ref()
+                                    .map(|automations| &automations.handle),
                             },
                             &mut refresh,
                             ActiveContext {
@@ -10180,6 +10187,7 @@ complete(#{ report: first.output });
                 seq: 0,
                 text: GOAL.into(),
                 attach: None,
+                done_reason: None,
                 goal: Some(GoalClaim {
                     condition: GOAL.into(),
                     continuation_limit: None,

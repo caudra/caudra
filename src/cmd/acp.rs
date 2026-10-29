@@ -211,6 +211,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     let (storage, _ephemeral_root) =
         super::run_storage(storage, cli.ephemeral || config.storage.ephemeral)?;
     super::configure_native_tools(&config);
+    caudra_providers::model_data::start_refresh(&config.models);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 
     plugin_host.warm_jit();

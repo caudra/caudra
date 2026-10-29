@@ -16,7 +16,7 @@ use crate::components::context_modal::{
 };
 use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::document_view::COPIED_SELECTION;
-use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
+use crate::components::env_modal::{EDIT_KEY as ENV_EDIT_KEY, PATTERN_KEY as ENV_PATTERN_KEY};
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_panel::{FooterCommand, GOAL_CLEAR, GOAL_MODEL, PanelCommand};
 use crate::components::help_modal::HelpTarget;
@@ -66,7 +66,10 @@ use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
     PermissionResourceSelector, PermissionRuleRecord, RuleOrigin,
 };
+use caudra_agent::secrets::scope::{ForeignEntry, remember};
+use caudra_agent::secrets::{SecretScope, SecretValue, SecretVaults};
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
+use caudra_agent::tools::native::secret::SecretReply;
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
@@ -8554,6 +8557,57 @@ fn a_server_request_is_answered_with_its_reply(press: KeyEvent, reply: &str) {
     assert_eq!(answers.try_recv().unwrap(), reply);
 }
 
+const SECRET_CANARY: &str = "secret-canary-4711";
+const SECRET_VARIABLE: &str = "CLOUDFLARE_API_TOKEN";
+const SECRET_LEAKED: &str = "the secret must reach only the answer channel";
+
+/// The main agent's run, waiting on its `request_secret` card.
+fn secret_request_app() -> (App, flume::Receiver<String>) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    app.update(agent_msg(AgentEvent::Question(Box::new(QuestionEvent {
+        questions: vec![AskedQuestion {
+            question: QUESTION_TEXT.into(),
+            header: QUESTION_HEADER.into(),
+            answer: AnswerKind::Secret {
+                name: SECRET_VARIABLE.into(),
+                placeholder: None,
+                replaces: false,
+            },
+            ..AskedQuestion::default()
+        }],
+        ..QuestionEvent::default()
+    }))));
+    assert!(app.question_form.is_open());
+    (app, answers)
+}
+
+#[test]
+fn a_secret_reaches_only_the_answer_channel() {
+    let (mut app, answers) = secret_request_app();
+    app.update(Msg::Paste(SECRET_CANARY.into()));
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.question_form.is_open());
+    let SecretReply::Save { value, .. } = SecretReply::decode(&answers.try_recv().unwrap()) else {
+        panic!("Enter saves the secret");
+    };
+    assert_eq!(value.expose(), SECRET_CANARY);
+    assert!(app.input_box.is_empty(), "{SECRET_LEAKED}");
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
+}
+
 #[test]
 fn a_withdrawn_request_closes_its_form_without_a_reply() {
     let (mut app, answers) = server_request_app();
@@ -16263,11 +16317,12 @@ fn remote_cd_persistence_failure_preserves_live_state() {
 
 /// A live skill-pack flip reaches a remote tab, whose commands come from its own project
 /// rather than the ones the event loop rediscovers locally.
-#[test_case(false, false ; "both_off")]
-#[test_case(true, false ; "pstack_on")]
-#[test_case(false, true ; "mattpocock_on")]
-#[test_case(true, true ; "both_on")]
-fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) {
+#[test_case(false, false, false ; "all_off")]
+#[test_case(true, false, false ; "pstack_on")]
+#[test_case(false, true, false ; "mattpocock_on")]
+#[test_case(false, false, true ; "emil_on")]
+#[test_case(true, true, true ; "all_on")]
+fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool, emil: bool) {
     let mut app = test_app();
     let original = remote_workspace_session();
     let workspace = WorkspaceSession::new(
@@ -16298,16 +16353,26 @@ fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) 
     let grill = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::MATTPOCOCK, true)
         [0]
     .display_name();
-    let packs = SkillPacks { pstack, mattpocock };
+    let animate = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::EMIL, true)[0]
+        .display_name();
+    let packs = SkillPacks {
+        pstack,
+        mattpocock,
+        emil,
+    };
 
     app.set_skill_packs(SkillPacks {
         pstack: !pstack,
         mattpocock: !mattpocock,
+        emil: !emil,
     });
     app.set_skill_packs(packs);
 
     let listed = |name: &str| app.command_palette.find_custom_command(name).is_some();
-    assert_eq!((listed(&poteto), listed(&grill)), (pstack, mattpocock));
+    assert_eq!(
+        (listed(&poteto), listed(&grill), listed(&animate)),
+        (pstack, mattpocock, emil)
+    );
 }
 
 #[test]
@@ -19546,6 +19611,49 @@ fn env_command_writes_a_pass_pattern_to_the_global_config() {
     assert!(written.contains(SECTION), "{written}");
     assert!(written.contains(PATTERN), "{written}");
     assert!(app.env_modal.is_open());
+}
+
+/// `/secrets` replaces a secret in the vault the session's agent reads, without the old or the
+/// new value reaching the screen. A remembered secret's file changed, which no watcher sees, so
+/// the settings are read again.
+#[test_case(SecretScope::Session, false ; "session")]
+#[test_case(SecretScope::Remembered, true ; "remembered")]
+fn secrets_command_replaces_a_secret_in_the_sessions_vault(scope: SecretScope, reread: bool) {
+    const CONFIG_FILE: &str = "caudra.toml";
+    const NAME: &str = "CLOUDFLARE_API_TOKEN";
+    const OLD: &str = "secret-canary-old-4711";
+    const NEW: &str = "secret-canary-new-0815";
+    const SHOWN: &str = "a secret's value must never reach the screen";
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    let mut app = test_app();
+    app.shell_env.config_path = Some(path.clone());
+    let vault = SecretVaults::for_session(&app.storage, app.state.session.id);
+    vault.set(NAME, SecretValue::new(OLD.into())).unwrap();
+    if scope == SecretScope::Remembered {
+        remember(&vault, &path, NAME, ForeignEntry::Refuse).unwrap();
+    }
+
+    app.execute_command(cmd("/secrets"), 0);
+    app.finish_env_work();
+    let screen = rendered(&mut app);
+    assert!(screen.contains(NAME), "{screen}");
+    assert!(!screen.contains(OLD), "{SHOWN}");
+
+    app.update(Msg::Key(key(KeyCode::Char(ENV_EDIT_KEY))));
+    app.update(Msg::Paste(NEW.into()));
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.finish_env_work();
+
+    let injected: Vec<_> = vault
+        .overlay()
+        .into_iter()
+        .map(|(name, value)| (name, value.into_string().unwrap()))
+        .collect();
+    assert_eq!(injected, [(NAME.to_owned(), NEW.to_owned())]);
+    assert_eq!(app.take_settings_stale(), reread);
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
 }
 
 #[test]
@@ -29992,6 +30100,7 @@ pub(crate) mod automation_runtime {
             seq: 0,
             text: COURIER_MESSAGE.into(),
             attach: None,
+            done_reason: None,
             goal: Some(GoalClaim {
                 condition: GOAL.into(),
                 continuation_limit: Some(CONTINUATION_LIMIT),

@@ -314,6 +314,7 @@ fn target(request: &ActionRequest, event: &Event, automation: &str, seq: u64) ->
         | ActionRequest::Notify { .. }
         | ActionRequest::Http(_)
         | ActionRequest::Pause { .. }
+        | ActionRequest::Done { .. }
         | ActionRequest::Log { .. } => None,
     }
 }

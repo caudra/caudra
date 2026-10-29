@@ -16,7 +16,8 @@ use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{Billing, Model, ModelPricing, ThinkingSupport};
+use crate::model::{Billing, Model, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model_data::Current;
 use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
 use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{
@@ -91,7 +92,11 @@ struct ScriptModel {
 
 impl ScriptModel {
     fn to_model(&self, slug: &str, base: ProviderKind, id: String) -> Model {
+        let manifest = ManifestRegistry::get(&base.to_string());
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest,
+            entry: manifest.and_then(|manifest| lookup_entry(manifest.models, &id).ok()),
             id,
             provider: Arc::from(slug),
             family: base.family(),
@@ -106,6 +111,7 @@ impl ScriptModel {
             pricing: self.pricing.clone().unwrap_or_default(),
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
             window_excludes_output: false,
@@ -547,7 +553,11 @@ pub fn auth_providers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub(crate) fn create(
+    slug: &str,
+    timeouts: super::Timeouts,
+    data: &Arc<Current>,
+) -> Result<Box<dyn Provider>, AgentError> {
     let meta = find_meta(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown dynamic provider '{slug}'"),
     })?;
@@ -600,7 +610,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
+            Opencode::with_auth(auth.clone(), timeouts, Arc::clone(data))
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Xai => Box::new(
@@ -851,6 +861,8 @@ impl Provider for DynamicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_data::edit_model;
+    use crate::providers::Timeouts;
     #[cfg(unix)]
     use std::fs::{self, File};
     #[cfg(unix)]
@@ -864,6 +876,41 @@ mod tests {
     const STALE_TOKEN: &str = "Bearer stale";
     #[cfg(unix)]
     const CONSTANT_TOKEN: &str = "Bearer constant";
+
+    #[test_case(false; "chat")]
+    #[test_case(true; "responses")]
+    fn script_models_keep_upstream_request_fields(responses: bool) {
+        const ID: &str = "o3-pro";
+        const SCRIPT: &str = "request-field-script";
+        const BODY: &str = r#"{"id":"o3-pro"}"#;
+        const RESPONSES_PATH: &str = "/responses";
+        const CHAT_PATH: &str = "/chat/completions";
+        let script: ScriptModel = serde_json::from_str(BODY).unwrap();
+        edit_model("openai", ID, |entry| {
+            if !responses {
+                entry.api = None;
+            }
+        });
+        let model = script.to_model(SCRIPT, ProviderKind::OpenAi, ID.into());
+        let provider = OpenAi::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(SCRIPT))),
+            Timeouts::default(),
+        );
+        let wire = provider
+            .wire_request(
+                &model,
+                &[],
+                "",
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            wire.url
+                .ends_with(if responses { RESPONSES_PATH } else { CHAT_PATH })
+        );
+    }
 
     #[test_case("myslug", true ; "valid_simple")]
     #[test_case("my-slug", true ; "valid_hyphen")]

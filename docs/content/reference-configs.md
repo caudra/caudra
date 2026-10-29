@@ -291,8 +291,9 @@ version = 5
 # web = 3
 
 # Rows for `automation`, `batch`, `execution_environment`, `list_sessions`,
-# `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
-# `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
+# `publish_message`, `question`, `read_topic`, `request_secret`,
+# `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`,
+# `work_assignment`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 
@@ -394,6 +395,13 @@ version = 5
 # the view only as titles and `memory search` still finds them.
 # Type: bool.
 # summarize_memory = true
+
+# Remind the main agent to save a memory note after a failed command passes, a
+# long search ends in an edit, the user corrects it, or the context nears
+# compaction. Reminders thin out as the project's notes grow and stop once the
+# agent saves notes without them.
+# Type: bool.
+# memory_nudges = true
 
 # Block a write to a file that changed on disk since it was read, and point a
 # failed edit or patch at the change.
@@ -779,6 +787,20 @@ version = 5
 # Type: u64, at least 10.
 # stream_timeout_secs = 300
 
+[models]
+
+# Check for signed model updates daily in long-running sessions. A project may
+# only disable refresh. The environment variable accepts 0/1, false/true,
+# no/yes or off/on. Cached models remain usable when disabled.
+# Type: bool. Env: CAUDRA_MODELS_REFRESH.
+# refresh = true
+
+# Global-only signed model file URL. Project values are ignored. Requires
+# HTTPS, or HTTP to loopback. The signature is fetched from the same URL with
+# .sig appended. Takes effect after a restart.
+# Type: String. Default: unset.
+# url = <String>
+
 [storage]
 
 # Max total log size (MB).
@@ -1116,6 +1138,13 @@ version = 5
 # Type: string.
 # memory_duplicates = "off"
 
+# Judge whether a new user message corrects the agent or states a rule for the
+# project. When it does and `agent.memory_nudges` allows a reminder, the agent
+# is reminded to save a note. Sends redacted excerpts of the message and of the
+# reply before it. Modes: off, shadow, advise.
+# Type: string.
+# memory_nudge = "off"
+
 # During compaction, keep the tool results most relevant to the active goal,
 # open todos, and latest request instead of only the newest, and keep the most
 # relevant part of a long result. Sends redacted goal, todo, and request
@@ -1375,6 +1404,12 @@ version = 5
 # commands.
 # Type: boolean.
 # mattpocock = false
+
+# Offer Emil Kowalski's bundled design-engineering skills (animation, motion
+# review, UI stress tests, prototypes, mobile polish, Swift): the `emil` skill
+# and the `/emil:` commands.
+# Type: boolean.
+# emil = false
 
 [plugins.task]
 

@@ -1,0 +1,39 @@
+[package]
+name = "caudra-models"
+description = "Versioned model-file format, validation, and signing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+schema = ["dep:schemars"]
+cli = ["schema", "dep:caudra-automation", "dep:clap", "dep:color-eyre", "dep:zstd"]
+
+[[bin]]
+name = "caudra-models"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+base64 = { workspace = true }
+caudra-automation = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+color-eyre = { workspace = true, optional = true }
+jiff = { workspace = true, features = ["serde"] }
+ring = { workspace = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+zstd = { workspace = true, optional = true }
+workspace-hack.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }

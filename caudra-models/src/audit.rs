@@ -1,25 +1,24 @@
-//! Compares the built-in model tables with the models.dev catalog, so a
-//! `make model-watch` run sees what moved upstream before anyone reads the
-//! provider's own pages. The catalog is a lead and never a source: it is
-//! sometimes wrong, and the tables cap some limits on purpose. [`ACCEPTED`]
-//! holds the divergences that were checked against a model card, each only for
-//! as long as models.dev prints the value that was checked.
-
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::path::Path;
 
 use jiff::civil::Date;
 use serde::Deserialize;
 
-use crate::AgentError;
-use crate::decision_pricing;
-use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
-use crate::providers::anthropic::shared::{WIDE_CONTEXT_WINDOW, declares_input_budget};
-use crate::providers::catalog::{self, CatalogMeta, schema::CatalogModel};
-use crate::providers::openai;
-use crate::providers::xai::GROK_MAX_OUTPUT_TOKENS;
+use crate::repo::{self, RepoError};
+use crate::routing::{self, RoutingAccepted, RoutingChange};
+use crate::{
+    Availability, CatalogCost, CatalogModel, CatalogProvider, DecisionModel, ModelEntry, Payload,
+    Pricing, Provider, Tier,
+};
 
+pub(crate) const RULES: &str = "audit/accepted.json";
+const UNKNOWN_PROVIDER: &str = "must name a provider with curated models and a catalog slug";
+const PREFIX_RULE: &str =
+    "unlisted must name an uncovered model; other fields must name a curated prefix or alias";
+const EMPTY_VALUE: &str = "must not be empty";
+const DUPLICATE_RULE: &str = "duplicate audit rule";
+const UNUSED_CAP: &str = "cap must name a context or output limit held by a provider entry";
 /// Catalog slugs whose new models belong in a table. Aggregators relist every
 /// vendor's models, so their additions are someone else's release.
 const NEW_MODELS_FROM: &[&str] = &[
@@ -41,38 +40,13 @@ const NO_TIERS: &str = "none";
 const TIER_SEPARATOR: &str = "; ";
 const NO_DIFFERENCES: &str = "No differences.";
 const NEW_MODELS_HEADING: &str = "## New models\n";
-const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `caudra-providers/src/decision_pricing.rs` when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
+const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `decision-models.json` in the model data repository when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
 const RETIRED_HEADING: &str = "## Retired, remove from the table\n\nPast the shutdown day of their availability row, so every list already leaves them out. Delete each entry and its row.\n";
-const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `ACCEPTED` as `Field::Unlisted` with the reason.\n";
-const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
-const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
-const XAI_LONG_PROMPT: &str = "xAI bills a prompt of 200,000 tokens or more at the long-context rate (docs.x.ai/developers/models), and a tier's `above` is exclusive, so the table's sits at 199,999.";
-const GEMINI_2_5_LIMITED: &str = "Google limits the 2.5 models to past users and sends new projects to 3.8 Flash or 3.5 Flash-Lite (2026-09-18, https://ai.google.dev/gemini-api/docs/changelog).";
-const GEMINI_LATEST_ALIAS: &str = "A floating alias Google hot-swaps with each release (https://ai.google.dev/gemini-api/docs/models); the table lists the models themselves.";
-const GEMINI_DEEP_RESEARCH: &str = "A Deep Research managed agent, not a chat model, per https://ai.google.dev/gemini-api/docs/deprecations.";
-const GEMINI_3_1_PRO: &str = "A preview overtaken by stable gemini-4-argon, which costs less and which Google calls its most capable model (https://ai.google.dev/gemini-api/docs/pricing).";
-const GEMMA_4: &str = "An open-weight Gemma model the Gemini API also serves (2026-04-02, https://ai.google.dev/gemini-api/docs/changelog); the table lists Gemini models.";
-const OPENAI_GPT_4O: &str = "GPT-4o snapshots shut down Jan 14, 2027, replaced by gpt-6-luna, which the table lists (https://developers.openai.com/api/docs/deprecations).";
-const OPENAI_DEC_2026: &str = "Deprecated, shuts down Dec 11, 2026, replaced by the gpt-5.6 models the table lists (https://developers.openai.com/api/docs/deprecations).";
-const XAI_GROK_4_20: &str = "Superseded by grok-4.3 at the same price and window; xAI sends code to Grok 4.7 (https://docs.x.ai/developers/models).";
-const MINISTRAL_EDGE: &str = "A small edge model; Ministral 3 14B, which the table lists, covers the family (https://docs.mistral.ai/getting-started/models/models_overview/).";
-const CODESTRAL: &str = "A code-completion (FIM) model; Mistral sends coding agents to Medium 3.5, which the table lists (https://docs.mistral.ai/models/codestral-25-08).";
-const VOXTRAL: &str =
-    "An audio-input model with a 32k window (https://docs.mistral.ai/models/voxtral-small-25-07).";
-const ZAI_TURBO: &str = "No longer on Z.AI's pricing page or chat API model list (https://docs.z.ai/guides/overview/pricing).";
-const MISTRAL_ONE_M: &str = "Mistral's model pages say \"1M\" (https://docs.mistral.ai/models.md), and `/v1/models` reports the exact window at runtime.";
-const ZAI_200K: &str =
-    "Z.AI's model pages say 200K and count K as 1,000 (https://docs.z.ai/guides/llm/glm-5).";
-const DEEPSEEK_ONE_M: &str =
-    "DeepSeek's pricing page says 1M (https://api-docs.deepseek.com/quick_start/pricing).";
-const COPILOT_OUTPUT: &str = "GitHub publishes no output limit (https://docs.github.com/en/copilot/reference/ai-models/supported-models); Copilot's `/models` replaces it at runtime.";
-const LEAD_NOT_SOURCE: &str = "models.dev is a lead, not a source: confirm every row on the provider's own model card, pricing, or deprecation page before changing a table. A divergence that is deliberate goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs` with the value shown here and the reason.";
+const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `audit/accepted.json` with field `unlisted` and a reason.\n";
+const LEAD_NOT_SOURCE: &str = "models.dev is a lead, not a source. Confirm every row on the provider's own model card, pricing, or deprecation page before changing a table. A deliberate divergence goes into `audit/accepted.json` with the value shown here and the reason.";
 
-/// What a finding is about. Each one is a column of a table entry, except
-/// [`Field::Unlisted`] (models.dev has a model no table names),
-/// [`Field::Retired`] (a table entry is past its shutdown day) and
-/// [`Field::Missing`] (a table names a model models.dev does not list).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Field {
     Unlisted,
     Status,
@@ -108,389 +82,34 @@ impl Field {
 /// A divergence checked against the provider's own page and kept on purpose.
 /// It silences the finding with the same provider, model, and field only while
 /// models.dev prints exactly `catalog`, so a later change reports again.
-#[derive(Debug)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Accepted {
     /// The manifest slug, such as `copilot`.
-    pub provider: &'static str,
-    /// The table prefix, or the catalog id for [`Field::Unlisted`].
-    pub model: &'static str,
+    pub provider: String,
+    /// The model id printed in the report, including catalog aliases.
+    pub model: String,
     pub field: Field,
     /// The models.dev column of the report, as printed.
-    pub catalog: &'static str,
-    pub reason: &'static str,
+    pub catalog: String,
+    pub reason: String,
 }
-
-const fn unlisted(
-    provider: &'static str,
-    model: &'static str,
-    released: &'static str,
-    reason: &'static str,
-) -> Accepted {
-    Accepted {
-        provider,
-        model,
-        field: Field::Unlisted,
-        catalog: released,
-        reason,
-    }
-}
-
-const fn diverges(
-    provider: &'static str,
-    model: &'static str,
-    field: Field,
-    catalog: &'static str,
-    reason: &'static str,
-) -> Accepted {
-    Accepted {
-        provider,
-        model,
-        field,
-        catalog,
-        reason,
-    }
-}
-
-pub const ACCEPTED: &[Accepted] = &[
-    unlisted(
-        "google",
-        "gemini-2.5-computer-use-preview-10-2025",
-        "2025-10-07",
-        "Retired July 28, 2026 per https://ai.google.dev/gemini-api/docs/deprecations. Keep the shutdown selector out of the table.",
-    ),
-    unlisted(
-        "google",
-        "deep-research-max-preview-04-2026",
-        "2026-04-21",
-        GEMINI_DEEP_RESEARCH,
-    ),
-    unlisted(
-        "google",
-        "deep-research-preview-04-2026",
-        "2026-04-21",
-        GEMINI_DEEP_RESEARCH,
-    ),
-    unlisted(
-        "google",
-        "gemini-2.5-flash",
-        "2025-06-17",
-        GEMINI_2_5_LIMITED,
-    ),
-    unlisted(
-        "google",
-        "gemini-2.5-flash-lite",
-        "2025-06-17",
-        GEMINI_2_5_LIMITED,
-    ),
-    unlisted("google", "gemini-2.5-pro", "2025-06-17", GEMINI_2_5_LIMITED),
-    unlisted(
-        "google",
-        "gemini-3-flash-preview",
-        "2025-12-17",
-        "A preview Google replaces with gemini-3.6-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
-    ),
-    unlisted(
-        "google",
-        "gemini-3.1-flash-lite",
-        "2026-05-07",
-        "Shuts down May 7, 2027; Google names gemini-3.5-flash-lite, which the table lists, as its replacement (https://ai.google.dev/gemini-api/docs/deprecations).",
-    ),
-    unlisted(
-        "google",
-        "gemini-3.1-flash-lite-image",
-        "2026-06-30",
-        "Nano Banana 2 Lite, an image generation model (https://ai.google.dev/gemini-api/docs/models).",
-    ),
-    unlisted(
-        "google",
-        "gemini-3.1-flash-live-preview",
-        "2026-03-26",
-        "A Live audio preview that shuts down Nov 17, 2026 (https://ai.google.dev/gemini-api/docs/deprecations).",
-    ),
-    unlisted(
-        "google",
-        "gemini-3.1-pro-preview",
-        "2026-02-19",
-        GEMINI_3_1_PRO,
-    ),
-    unlisted(
-        "google",
-        "gemini-3.1-pro-preview-customtools",
-        "2026-02-19",
-        GEMINI_3_1_PRO,
-    ),
-    unlisted(
-        "google",
-        "gemini-3.5-flash",
-        "2026-05-19",
-        "Deprecated 2026-10-08; the API serves its requests with gemini-3.6-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
-    ),
-    unlisted(
-        "google",
-        "gemini-3.7-flash",
-        "2026-08-13",
-        "Deprecated 2026-10-08; the API serves its requests with gemini-3.8-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
-    ),
-    unlisted(
-        "google",
-        "gemini-flash-latest",
-        "2026-08-13",
-        GEMINI_LATEST_ALIAS,
-    ),
-    unlisted(
-        "google",
-        "gemini-flash-lite-latest",
-        "2026-07-21",
-        GEMINI_LATEST_ALIAS,
-    ),
-    unlisted(
-        "google",
-        "gemini-pro-latest",
-        "2026-02-19",
-        GEMINI_LATEST_ALIAS,
-    ),
-    unlisted("google", "gemma-4-26b-a4b-it", "2026-04-02", GEMMA_4),
-    unlisted("google", "gemma-4-31b-it", "2026-04-02", GEMMA_4),
-    unlisted("openai", "gpt-4o", "2024-05-13", OPENAI_GPT_4O),
-    unlisted("openai", "gpt-4o-2024-08-06", "2024-08-06", OPENAI_GPT_4O),
-    unlisted("openai", "gpt-4o-2024-11-20", "2024-11-20", OPENAI_GPT_4O),
-    unlisted("openai", "gpt-4o-mini", "2024-07-18", OPENAI_GPT_4O),
-    unlisted("openai", "gpt-5", "2025-08-07", OPENAI_DEC_2026),
-    unlisted("openai", "gpt-5-mini", "2025-08-07", OPENAI_DEC_2026),
-    unlisted("openai", "gpt-5-nano", "2025-08-07", OPENAI_DEC_2026),
-    unlisted("openai", "gpt-5-pro", "2025-10-06", OPENAI_DEC_2026),
-    unlisted(
-        "openai",
-        "gpt-5.1",
-        "2025-11-13",
-        "Deprecated, shuts down Apr 1, 2027, replaced by gpt-6-sol, which the table lists (https://developers.openai.com/api/docs/deprecations).",
-    ),
-    unlisted(
-        "openai",
-        "gpt-5.3-codex-spark",
-        "2026-02-05",
-        "A Codex research preview for ChatGPT Pro, absent from https://developers.openai.com/api/docs/models and the API pricing page.",
-    ),
-    unlisted(
-        "openai",
-        "gpt-daybreak-blue-latest",
-        "2026-08-07",
-        "A deprecated cyber alias of gpt-5.6-sol, which the table lists (https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest).",
-    ),
-    unlisted(
-        "openai",
-        "gpt-daybreak-red-latest",
-        "2026-08-07",
-        "A deprecated alias of gpt-5.6-cyber, a model for authorized security research (https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest).",
-    ),
-    unlisted(
-        "openai",
-        "gpt-realtime-2.1",
-        "2026-07-06",
-        "A speech-to-speech model served only on the Realtime endpoint (https://developers.openai.com/api/docs/models/gpt-realtime-2.1).",
-    ),
-    unlisted(
-        "xai",
-        "grok-4.20-0309-non-reasoning",
-        "2026-03-09",
-        XAI_GROK_4_20,
-    ),
-    unlisted(
-        "xai",
-        "grok-4.20-0309-reasoning",
-        "2026-03-09",
-        XAI_GROK_4_20,
-    ),
-    unlisted(
-        "xai",
-        "grok-build-0.1",
-        "2026-04-16",
-        "xAI says \"for everything else, including code, use Grok 4.7\", which the table lists (https://docs.x.ai/developers/models).",
-    ),
-    unlisted("mistral", "codestral-2508", "2025-07-30", CODESTRAL),
-    unlisted("mistral", "codestral-latest", "2024-05-29", CODESTRAL),
-    unlisted("mistral", "ministral-3b-2512", "2025-12-02", MINISTRAL_EDGE),
-    unlisted(
-        "mistral",
-        "ministral-3b-latest",
-        "2024-10-01",
-        MINISTRAL_EDGE,
-    ),
-    unlisted("mistral", "ministral-8b-2512", "2025-12-02", MINISTRAL_EDGE),
-    unlisted(
-        "mistral",
-        "ministral-8b-latest",
-        "2024-10-01",
-        MINISTRAL_EDGE,
-    ),
-    unlisted("mistral", "voxtral-small-2507", "2025-07-15", VOXTRAL),
-    unlisted("mistral", "voxtral-small-latest", "2025-07-15", VOXTRAL),
-    unlisted("zai", "glm-5-turbo", "2026-03-16", ZAI_TURBO),
-    unlisted("zai", "glm-5v-turbo", "2026-04-01", ZAI_TURBO),
-    unlisted(
-        "zai",
-        "glm-4.5v",
-        "2025-08-11",
-        "Zhipu lists no function calling for it (https://docs.bigmodel.cn/cn/guide/models/vlm/glm-4.5v), so it cannot drive tools.",
-    ),
-    diverges(
-        "xai",
-        "grok-4.3",
-        Field::MaxOutput,
-        "30000",
-        "xAI documents no output limit for Grok 4.3 (https://docs.x.ai/developers/models/grok-4.3), so the table asks for at most 131,072.",
-    ),
-    diverges(
-        "mistral",
-        "mistral-large-4",
-        Field::Context,
-        "1048576",
-        MISTRAL_ONE_M,
-    ),
-    diverges(
-        "mistral",
-        "zai-glm-5-3-flash",
-        Field::Context,
-        "1048576",
-        MISTRAL_ONE_M,
-    ),
-    diverges(
-        "mistral",
-        "zai-glm-5-3",
-        Field::Context,
-        "1048576",
-        MISTRAL_ONE_M,
-    ),
-    diverges(
-        "mistral",
-        "glm-5-2",
-        Field::Context,
-        "1048576",
-        MISTRAL_ONE_M,
-    ),
-    diverges(
-        "mistral",
-        "deepseek-v4-1-flash-1017",
-        Field::Context,
-        "1048576",
-        MISTRAL_ONE_M,
-    ),
-    diverges("zai", "glm-5", Field::Context, "204800", ZAI_200K),
-    diverges("zai", "glm-4.7", Field::Context, "204800", ZAI_200K),
-    diverges(
-        "deepseek",
-        "deepseek-flash",
-        Field::Context,
-        "1048576",
-        DEEPSEEK_ONE_M,
-    ),
-    diverges(
-        "deepseek",
-        "deepseek-v4-pro",
-        Field::Context,
-        "1048576",
-        DEEPSEEK_ONE_M,
-    ),
-    diverges(
-        "copilot",
-        "gemini-3.8-flash",
-        Field::MaxOutput,
-        "64000",
-        COPILOT_OUTPUT,
-    ),
-    diverges(
-        "copilot",
-        "claude-sonnet-4.6",
-        Field::MaxOutput,
-        "32000",
-        COPILOT_OUTPUT,
-    ),
-    diverges(
-        "google",
-        "gemini-4-argon",
-        Field::MaxOutput,
-        "32768",
-        "Google's model page (ai.google.dev/gemini-api/docs/models) gives Gemini 4 Argon 65,536 output tokens.",
-    ),
-    diverges(
-        "xai",
-        "grok-4.7",
-        Field::Tiers,
-        "above 200000: 4 / 12 / 1 / 0",
-        XAI_LONG_PROMPT,
-    ),
-    diverges(
-        "xai",
-        "grok-4.6",
-        Field::Tiers,
-        "above 200000: 4 / 12 / 1 / 0",
-        XAI_LONG_PROMPT,
-    ),
-    diverges(
-        "xai",
-        "grok-4.5",
-        Field::Tiers,
-        "above 200000: 4 / 12 / 0.6 / 0",
-        XAI_LONG_PROMPT,
-    ),
-    diverges(
-        "xai",
-        "grok-4.3",
-        Field::Tiers,
-        "above 200000: 2.5 / 5 / 0.4 / 0",
-        XAI_LONG_PROMPT,
-    ),
-];
 
 /// A limit a table holds below what the model accepts, on purpose: a working
 /// window caudra compacts inside, or a cold-start fallback the provider's own
 /// listing replaces. It silences a finding of `field` for `provider` whose
 /// table value is `ours` while models.dev prints more. A model that accepts
 /// less still reports, because then the table overstates it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Cap {
-    pub provider: &'static str,
+    pub provider: String,
     pub field: Field,
     pub ours: u32,
-    pub reason: &'static str,
+    pub reason: String,
 }
-
-pub const CAPS: &[Cap] = &[
-    Cap {
-        provider: "anthropic",
-        field: Field::Context,
-        ours: WIDE_CONTEXT_WINDOW,
-        reason: "The working window of the 1M-token models, capped to bound cost and latency. A `-1m` id opens the full window.",
-    },
-    Cap {
-        provider: "openai",
-        field: Field::Context,
-        ours: openai::WIDE_CONTEXT_WINDOW,
-        reason: "The working window of gpt-5.6 and gpt-6, below what the API accepts, because caudra fills it before compacting.",
-    },
-    Cap {
-        provider: "copilot",
-        field: Field::Context,
-        ours: COPILOT_FALLBACK_WINDOW,
-        reason: "A cold-start fallback: Copilot's `/models` reports each model's prompt limit, which replaces it.",
-    },
-    Cap {
-        provider: "copilot",
-        field: Field::MaxOutput,
-        ours: COPILOT_FALLBACK_OUTPUT,
-        reason: "A cold-start fallback: Copilot's `/models` reports each model's output limit, which replaces it.",
-    },
-    Cap {
-        provider: "xai",
-        field: Field::MaxOutput,
-        ours: GROK_MAX_OUTPUT_TOKENS,
-        reason: "xAI documents no text output limit for Grok 4.5 and later (docs.x.ai/developers/grok-4-7), so the table asks for at most this many.",
-    },
-];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finding {
-    pub provider: &'static str,
+    pub provider: String,
     pub model: String,
     pub field: Field,
     /// What the table says, or for an unlisted model the entry it resolves to
@@ -514,71 +133,143 @@ pub struct Audit {
     pub today: Date,
     pub since: Date,
     pub findings: Vec<Finding>,
-    pub stale: Vec<&'static Accepted>,
+    pub stale: Vec<Accepted>,
+    /// Unaccepted changes against the published file, `None` without one.
+    pub routing: Option<Vec<RoutingChange>>,
+    pub stale_routing: Vec<RoutingAccepted>,
+    pub decisions: Vec<DecisionModel>,
 }
 
-/// The facts the runtime schema has no use for.
-#[derive(Deserialize)]
-struct Listing {
+#[derive(Debug, Default, Deserialize)]
+pub struct Rules {
+    pub accepted: Vec<Accepted>,
+    pub caps: Vec<Cap>,
     #[serde(default)]
-    release_date: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tool_call: bool,
-    #[serde(default)]
-    modalities: Option<Modalities>,
+    pub routing: Vec<RoutingAccepted>,
 }
 
-#[derive(Deserialize)]
-struct Modalities {
-    #[serde(default)]
-    output: Vec<String>,
+impl Rules {
+    /// The changes no `routing` acceptance covers, and the acceptances no
+    /// change needs any more.
+    pub fn unaccepted_routing(
+        &self,
+        changes: Vec<RoutingChange>,
+    ) -> (Vec<RoutingChange>, Vec<RoutingAccepted>) {
+        let stale = self
+            .routing
+            .iter()
+            .filter(|row| !changes.iter().any(|change| change.matches(row)))
+            .cloned()
+            .collect();
+        let unaccepted = changes
+            .into_iter()
+            .filter(|change| !self.routing.iter().any(|row| change.matches(row)))
+            .collect();
+        (unaccepted, stale)
+    }
 }
 
-#[derive(Deserialize)]
-struct RawProvider {
-    #[serde(default)]
-    models: HashMap<String, serde_json::Value>,
+pub fn load_rules(dir: &Path, providers: &[Provider]) -> Result<Rules, RepoError> {
+    let path = dir.join(RULES);
+    let rules = if path
+        .try_exists()
+        .map_err(|error| RepoError::new(&path, "", error))?
+    {
+        repo::read_json(&path)?
+    } else {
+        Rules::default()
+    };
+    validate_rules(&rules, providers)
+        .map_err(|(pointer, message)| RepoError::new(&path, &pointer, message))?;
+    Ok(rules)
 }
 
-struct CatalogEntry {
-    model: CatalogModel,
-    listing: Listing,
+fn validate_rules(rules: &Rules, providers: &[Provider]) -> Result<(), (String, &'static str)> {
+    let provider = |slug: &str| {
+        providers.iter().find(|provider| {
+            provider.slug == slug && !provider.models.is_empty() && provider.catalog_slug.is_some()
+        })
+    };
+    let mut accepted = HashSet::new();
+    for (index, row) in rules.accepted.iter().enumerate() {
+        let path = format!("/accepted/{index}");
+        for (key, value) in [("model", &row.model), ("reason", &row.reason)] {
+            if value.trim().is_empty() {
+                return Err((format!("{path}/{key}"), EMPTY_VALUE));
+            }
+        }
+        if row.field != Field::Unlisted && row.catalog.trim().is_empty() {
+            return Err((format!("{path}/catalog"), EMPTY_VALUE));
+        }
+        let Some(provider) = provider(&row.provider) else {
+            return Err((format!("{path}/provider"), UNKNOWN_PROVIDER));
+        };
+        let named = covered(&provider.models, &row.model);
+        if named == (row.field == Field::Unlisted) {
+            return Err((format!("{path}/model"), PREFIX_RULE));
+        }
+        if !accepted.insert((&row.provider, &row.model, row.field, &row.catalog)) {
+            return Err((path, DUPLICATE_RULE));
+        }
+    }
+    let mut caps = HashSet::new();
+    for (index, row) in rules.caps.iter().enumerate() {
+        let path = format!("/caps/{index}");
+        if row.reason.trim().is_empty() {
+            return Err((format!("{path}/reason"), EMPTY_VALUE));
+        }
+        let Some(provider) = provider(&row.provider) else {
+            return Err((format!("{path}/provider"), UNKNOWN_PROVIDER));
+        };
+        if !provider.models.iter().any(|entry| match row.field {
+            Field::Context => entry.context_window == row.ours,
+            Field::MaxOutput => entry.max_output_tokens == Some(row.ours),
+            _ => false,
+        }) {
+            return Err((path, UNUSED_CAP));
+        }
+        if !caps.insert((&row.provider, row.field, row.ours)) {
+            return Err((path, DUPLICATE_RULE));
+        }
+    }
+    let mut routing = HashSet::new();
+    for (index, row) in rules.routing.iter().enumerate() {
+        let path = format!("/routing/{index}");
+        for (key, value) in [
+            ("provider", &row.provider),
+            ("catalog", &row.catalog),
+            ("reason", &row.reason),
+        ] {
+            if value.trim().is_empty() {
+                return Err((format!("{path}/{key}"), EMPTY_VALUE));
+            }
+        }
+        if !routing.insert((&row.provider, row.field, &row.catalog)) {
+            return Err((path, DUPLICATE_RULE));
+        }
+    }
+    Ok(())
 }
 
-type Catalog = HashMap<String, HashMap<String, CatalogEntry>>;
-
-/// models.dev's catalog as it is served now, never from the cache.
-pub fn fetch_catalog() -> Result<String, AgentError> {
-    catalog::fetch_catalog_text()
-}
-
-/// Every divergence between the built-in tables and `catalog_json`, minus
-/// [`ACCEPTED`]. Prices are compared as they stand on `today`. Every model no
-/// table names reports, whenever it was released: a run's window only moves
-/// forward, so one released before the first run would otherwise never show.
-/// The report lists those released before `since` apart from the new ones.
-pub fn audit(catalog_json: &str, today: Date, since: Date) -> Result<Audit, serde_json::Error> {
-    audit_with(catalog_json, today, since, ACCEPTED)
-}
-
-fn audit_with(
-    catalog_json: &str,
+pub fn audit(
+    payload: &Payload,
+    catalog: &BTreeMap<String, CatalogProvider>,
+    published: Option<&Payload>,
     today: Date,
     since: Date,
-    accepted: &'static [Accepted],
-) -> Result<Audit, serde_json::Error> {
-    let catalog = parse(catalog_json)?;
+    rules: &Rules,
+) -> Audit {
+    let accepted = &rules.accepted;
     let mut seen = HashSet::new();
-    let raw: Vec<Finding> = ManifestRegistry::builtins()
+    let raw: Vec<Finding> = payload
+        .providers
         .iter()
         .filter(|manifest| !manifest.models.is_empty())
-        .filter_map(|manifest| Some((manifest, manifest.catalog_slug?)))
+        .filter_map(|manifest| Some((manifest, manifest.catalog_slug.as_deref()?)))
         .filter(|(_, slug)| seen.insert(*slug))
         .flat_map(|(manifest, slug)| {
-            let listed = catalog.get(slug);
-            let mut findings = table_findings(manifest, listed, today);
+            let listed = catalog.get(slug).map(|provider| &provider.models);
+            let mut findings = table_findings(manifest, listed, today, &rules.caps);
             if NEW_MODELS_FROM.contains(&slug) {
                 findings.extend(unlisted_models(manifest, listed));
             }
@@ -588,53 +279,88 @@ fn audit_with(
     let stale = accepted
         .iter()
         .filter(|row| !raw.iter().any(|finding| finding.matches(row)))
+        .cloned()
         .collect();
     let findings = raw
         .into_iter()
         .filter(|finding| !accepted.iter().any(|row| finding.matches(row)))
         .collect();
-    Ok(Audit {
+    let (routing, stale_routing) = published.map_or((None, Vec::new()), |published| {
+        let (unaccepted, stale) = rules.unaccepted_routing(routing_changes(published, payload));
+        (Some(unaccepted), stale)
+    });
+    Audit {
         today,
         since,
         findings,
         stale,
-    })
+        routing,
+        stale_routing,
+        decisions: payload.decision_models.clone(),
+    }
 }
 
-/// Reads each model on its own, so one shape this schema has not met costs
-/// that model rather than the audit.
-fn parse(catalog_json: &str) -> Result<Catalog, serde_json::Error> {
-    let raw: HashMap<String, RawProvider> = serde_json::from_str(catalog_json)?;
-    Ok(raw
-        .into_iter()
-        .map(|(slug, provider)| {
-            let models = provider
-                .models
-                .into_iter()
-                .filter_map(|(id, value)| {
-                    let model = CatalogModel::deserialize(&value).ok()?;
-                    let listing = Listing::deserialize(&value).ok()?;
-                    Some((id, CatalogEntry { model, listing }))
-                })
-                .collect();
-            (slug, models)
+/// Routing changes from the published file to `next`, protecting the rows
+/// of every built-in provider either of them names.
+pub fn routing_changes(published: &Payload, next: &Payload) -> Vec<RoutingChange> {
+    routing::changes(
+        &routing::builtin_slugs(published.providers.iter().chain(&next.providers)),
+        &published.catalog,
+        &next.catalog,
+    )
+}
+
+fn availability<'a>(provider: &'a Provider, entry: &ModelEntry) -> Option<&'a Availability> {
+    provider
+        .availability
+        .iter()
+        .find(|row| entry.prefixes.contains(&row.prefix))
+}
+
+fn lookup_entry<'a>(entries: &'a [ModelEntry], id: &str) -> Option<&'a ModelEntry> {
+    entries
+        .iter()
+        .flat_map(|entry| entry.prefixes.iter().map(move |prefix| (prefix, entry)))
+        .filter(|(prefix, _)| id.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, entry)| entry)
+}
+
+fn catalog_tiers(cost: &CatalogCost) -> Vec<Tier> {
+    let mut tiers: Vec<Tier> = cost
+        .tiers
+        .iter()
+        .map(|tier| Tier {
+            above: tier.tier.size,
+            input: tier.input.or(cost.input).unwrap_or_default(),
+            output: tier.output.or(cost.output).unwrap_or_default(),
+            cache_read: tier.cache_read.or(cost.cache_read).unwrap_or_default(),
+            cache_write: tier.cache_write.or(cost.cache_write).unwrap_or_default(),
+            fast: None,
         })
-        .collect())
+        .collect();
+    tiers.sort_by_key(|tier| tier.above);
+    tiers
 }
 
 fn table_findings(
-    manifest: &'static ProviderManifest,
-    listed: Option<&HashMap<String, CatalogEntry>>,
+    manifest: &Provider,
+    listed: Option<&BTreeMap<String, CatalogModel>>,
     today: Date,
+    caps: &[Cap],
 ) -> Vec<Finding> {
     manifest
         .models
         .iter()
         .flat_map(|entry| {
-            let primary = entry.prefixes.first().copied().unwrap_or_default();
+            let primary = entry
+                .prefixes
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
             if let Some(shutdown) = shut_down_by(manifest, entry, today) {
                 return vec![Finding {
-                    provider: manifest.slug,
+                    provider: manifest.slug.clone(),
                     model: primary.to_owned(),
                     field: Field::Retired,
                     ours: shutdown.to_string(),
@@ -642,9 +368,9 @@ fn table_findings(
                 }];
             }
             match listed.and_then(|models| find_listing(entry, models)) {
-                Some((id, listing)) => entry_findings(manifest, entry, id, listing, today),
+                Some((id, listing)) => entry_findings(manifest, entry, id, listing, today, caps),
                 None => vec![Finding {
-                    provider: manifest.slug,
+                    provider: manifest.slug.clone(),
                     model: primary.to_owned(),
                     field: Field::Missing,
                     ours: entry.prefixes.join(", "),
@@ -656,9 +382,8 @@ fn table_findings(
 }
 
 /// The day `entry` left the lists, once `today` has reached it.
-fn shut_down_by(manifest: &ProviderManifest, entry: &ModelEntry, today: Date) -> Option<Date> {
-    manifest
-        .availability(entry)
+fn shut_down_by(manifest: &Provider, entry: &ModelEntry, today: Date) -> Option<Date> {
+    availability(manifest, entry)
         .and_then(|row| row.during.until)
         .filter(|until| *until <= today)
 }
@@ -667,12 +392,12 @@ fn shut_down_by(manifest: &ProviderManifest, entry: &ModelEntry, today: Date) ->
 /// snapshot or alias of one.
 fn find_listing<'a>(
     entry: &ModelEntry,
-    models: &'a HashMap<String, CatalogEntry>,
-) -> Option<(&'a str, &'a CatalogEntry)> {
+    models: &'a BTreeMap<String, CatalogModel>,
+) -> Option<(&'a str, &'a CatalogModel)> {
     let exact = entry
         .prefixes
         .iter()
-        .find_map(|prefix| models.get_key_value(*prefix));
+        .find_map(|prefix| models.get_key_value(prefix));
     exact
         .or_else(|| {
             models
@@ -684,14 +409,15 @@ fn find_listing<'a>(
 }
 
 fn entry_findings(
-    manifest: &'static ProviderManifest,
+    manifest: &Provider,
     entry: &ModelEntry,
     id: &str,
-    listed: &CatalogEntry,
+    listed: &CatalogModel,
     today: Date,
+    caps: &[Cap],
 ) -> Vec<Finding> {
     let finding = |field, ours: String, catalog: String| Finding {
-        provider: manifest.slug,
+        provider: manifest.slug.clone(),
         model: id.to_owned(),
         field,
         ours,
@@ -700,21 +426,28 @@ fn entry_findings(
     let mut findings = Vec::new();
     // A shutdown day already on the table is handled: the entry leaves the
     // lists by itself, and the report says when to delete it.
-    let scheduled = manifest
-        .availability(entry)
-        .is_some_and(|row| row.during.until.is_some());
-    if listed.listing.status.as_deref() == Some(DEPRECATED) && !scheduled {
+    let scheduled = availability(manifest, entry).is_some_and(|row| row.during.until.is_some());
+    if listed.status.as_deref() == Some(DEPRECATED) && !scheduled {
         findings.push(finding(
             Field::Status,
             NOT_LISTED.to_owned(),
             DEPRECATED.to_owned(),
         ));
     }
-    let pricing = match manifest.price_period(entry) {
-        Some(period) if period.during.contains_day(today) => &period.pricing,
+    let pricing = match manifest
+        .price_periods
+        .iter()
+        .find(|row| entry.prefixes.contains(&row.prefix))
+    {
+        Some(period)
+            if period.during.from.is_none_or(|from| from <= today)
+                && period.during.until.is_none_or(|until| today < until) =>
+        {
+            &period.pricing
+        }
         _ => &entry.pricing,
     };
-    if let Some(cost) = &listed.model.cost {
+    if let Some(cost) = &listed.cost {
         for (field, ours, theirs) in [
             (Field::Input, pricing.input, cost.input),
             (Field::Output, pricing.output, cost.output),
@@ -727,7 +460,7 @@ fn entry_findings(
                 findings.push(finding(field, ours.to_string(), theirs.to_string()));
             }
         }
-        let theirs = CatalogMeta::from_model(&listed.model).pricing_tiers;
+        let theirs = catalog_tiers(cost);
         if !same_tiers(pricing, &theirs, entry.context_window) {
             findings.push(finding(
                 Field::Tiers,
@@ -736,8 +469,8 @@ fn entry_findings(
             ));
         }
     }
-    let limit = listed.model.limit.as_ref();
-    let input_budget = declares_input_budget(manifest.slug, entry);
+    let limit = listed.limit.as_ref();
+    let input_budget = entry.window_excludes_output;
     let limits = [
         (
             Field::Context,
@@ -759,7 +492,7 @@ fn entry_findings(
     for (field, ours, theirs) in limits {
         if let (Some(ours), Some(theirs)) = (ours, theirs)
             && ours != theirs
-            && !(ours < theirs && capped(manifest.slug, field, ours))
+            && !(ours < theirs && capped(caps, &manifest.slug, field, ours))
         {
             findings.push(finding(field, ours.to_string(), theirs.to_string()));
         }
@@ -768,34 +501,33 @@ fn entry_findings(
 }
 
 fn unlisted_models(
-    manifest: &'static ProviderManifest,
-    listed: Option<&HashMap<String, CatalogEntry>>,
+    manifest: &Provider,
+    listed: Option<&BTreeMap<String, CatalogModel>>,
 ) -> Vec<Finding> {
     let Some(models) = listed else {
         return Vec::new();
     };
     let mut findings: Vec<Finding> = models
         .iter()
-        .filter(|(_, entry)| is_live_tool_model(&entry.listing))
-        .filter(|(id, _)| !covered(manifest.models, id))
+        .filter(|(_, entry)| is_live_tool_model(entry))
+        .filter(|(id, _)| !covered(&manifest.models, id))
         .map(|(id, entry)| Finding {
-            provider: manifest.slug,
+            provider: manifest.slug.clone(),
             model: id.clone(),
             field: Field::Unlisted,
-            ours: lookup_entry(manifest.models, id)
-                .ok()
-                .and_then(|entry| entry.prefixes.first().copied())
+            ours: lookup_entry(&manifest.models, id)
+                .and_then(|entry| entry.prefixes.first().map(String::as_str))
                 .unwrap_or(NOT_LISTED)
                 .to_owned(),
-            catalog: entry.listing.release_date.clone(),
+            catalog: entry.release_date.clone().unwrap_or_default(),
         })
         .collect();
     findings.sort_by(|left, right| left.model.cmp(&right.model));
     findings
 }
 
-fn is_live_tool_model(listing: &Listing) -> bool {
-    listing.tool_call
+fn is_live_tool_model(listing: &CatalogModel) -> bool {
+    listing.tool_call == Some(true)
         && listing.status.as_deref() != Some(DEPRECATED)
         && listing
             .modalities
@@ -810,8 +542,8 @@ fn is_live_tool_model(listing: &Listing) -> bool {
 fn covered(entries: &[ModelEntry], id: &str) -> bool {
     entries
         .iter()
-        .flat_map(|entry| entry.prefixes)
-        .any(|prefix| id == *prefix || is_alias(id, prefix))
+        .flat_map(|entry| &entry.prefixes)
+        .any(|prefix| id == prefix || is_alias(id, prefix))
 }
 
 /// `id` is `prefix` plus a date stamp (`-20250805`, `-2024-08-06`, `-2411`)
@@ -839,14 +571,14 @@ fn same_rate(ours: f64, theirs: f64) -> bool {
     (ours - theirs).abs() < RATE_TOLERANCE
 }
 
-fn capped(provider: &str, field: Field, ours: u32) -> bool {
-    CAPS.iter()
+fn capped(caps: &[Cap], provider: &str, field: Field, ours: u32) -> bool {
+    caps.iter()
         .any(|cap| cap.provider == provider && cap.field == field && cap.ours == ours)
 }
 
 /// Compares only the tiers a prompt inside `window` can reach: a table states
 /// no tier past its own window, since no prompt it sends bills there.
-fn same_tiers(ours: &ModelPricing, theirs: &[PricingTier], window: u32) -> bool {
+fn same_tiers(ours: &Pricing, theirs: &[Tier], window: u32) -> bool {
     let (ours, theirs) = (reachable(&ours.tiers, window), reachable(theirs, window));
     ours.len() == theirs.len()
         && ours.iter().zip(&theirs).all(|(ours, theirs)| {
@@ -858,11 +590,11 @@ fn same_tiers(ours: &ModelPricing, theirs: &[PricingTier], window: u32) -> bool 
         })
 }
 
-fn reachable(tiers: &[PricingTier], window: u32) -> Vec<&PricingTier> {
+fn reachable(tiers: &[Tier], window: u32) -> Vec<&Tier> {
     tiers.iter().filter(|tier| tier.above < window).collect()
 }
 
-fn tiers_text(tiers: &[PricingTier]) -> String {
+fn tiers_text(tiers: &[Tier]) -> String {
     if tiers.is_empty() {
         return NO_TIERS.to_owned();
     }
@@ -895,25 +627,30 @@ impl fmt::Display for Audit {
             self.today, self.since
         )?;
         writeln!(f, "{LEAD_NOT_SOURCE}\n")?;
-        if self.findings.is_empty() && self.stale.is_empty() {
+        if self.findings.is_empty()
+            && self.stale.is_empty()
+            && self.stale_routing.is_empty()
+            && self.routing.as_ref().is_none_or(Vec::is_empty)
+        {
             writeln!(f, "{NO_DIFFERENCES}\n")?;
         } else {
             self.write_findings(f)?;
         }
-        write_decision_models(f)
+        writeln!(f, "{}", routing::section(self.routing.as_deref()))?;
+        write_decision_models(f, &self.decisions)
     }
 }
 
 /// models.dev has no decision models, so the report restates the table for a
 /// run to check against each entry's source page by hand.
-fn write_decision_models(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn write_decision_models(f: &mut fmt::Formatter<'_>, decisions: &[DecisionModel]) -> fmt::Result {
     writeln!(f, "{DECISION_MODELS_HEADING}")?;
     writeln!(
         f,
         "| Protocol | Models | Input / output / cache read / cache write | Tiers | Source |"
     )?;
     writeln!(f, "|---|---|---|---|---|")?;
-    for entry in decision_pricing::entries() {
+    for entry in decisions {
         let pricing = &entry.pricing;
         writeln!(
             f,
@@ -1023,11 +760,11 @@ impl Audit {
             }
             writeln!(f)?;
         }
-        if !self.stale.is_empty() {
+        if !self.stale.is_empty() || !self.stale_routing.is_empty() {
             writeln!(f, "## Stale acceptances\n")?;
             writeln!(
                 f,
-                "models.dev no longer prints these values. Delete each row from `ACCEPTED`, and check any new finding for the same model.\n"
+                "models.dev no longer prints these values. Delete each row from `audit/accepted.json`, and check any new finding for the same model.\n"
             )?;
             writeln!(f, "| Provider | Model | Field | Accepted value | Reason |")?;
             writeln!(f, "|---|---|---|---|---|")?;
@@ -1037,6 +774,16 @@ impl Audit {
                     "| {} | `{}` | {} | {} | {} |",
                     row.provider,
                     row.model,
+                    row.field.label(),
+                    row.catalog,
+                    row.reason
+                )?;
+            }
+            for row in &self.stale_routing {
+                writeln!(
+                    f,
+                    "| {} | {NOT_LISTED} | routing {} | {} | {} |",
+                    row.provider,
                     row.field.label(),
                     row.catalog,
                     row.reason
@@ -1053,7 +800,15 @@ mod tests {
     use jiff::civil::date;
     use test_case::test_case;
 
-    use super::*;
+    use super::{
+        Accepted, Audit, Cap, DECISION_MODELS_HEADING, DEPRECATED, DUPLICATE_RULE, EMPTY_VALUE,
+        Field, Finding, NEW_MODELS_HEADING, NO_DIFFERENCES, OLDER_MODELS_HEADING, PREFIX_RULE,
+        RETIRED_HEADING, Rules, TEXT_OUTPUT, UNKNOWN_PROVIDER, UNUSED_CAP, audit, is_alias,
+        validate_rules,
+    };
+    use crate::routing::{self, RoutingAccepted, RoutingField};
+    use crate::{ModelEntry, Payload, Provider};
+    use jiff::civil::Date;
 
     const TODAY: Date = date(2026, 10, 14);
     const SINCE: Date = date(2026, 7, 1);
@@ -1083,9 +838,6 @@ mod tests {
     const REPORT_EMPTY: &str = "an audit without findings must say so";
     const DECISION_MODELS_LISTED: &str =
         "every report must restate the decision models and where to check them";
-    const UNKNOWN_SLUG: &str = "an acceptance must name a builtin slug";
-    const PREFIX_RULE: &str =
-        "an unlisted model must name no table prefix, and every other field must name one";
     const NO_REASON: &str = "an acceptance needs a reason";
     const COPILOT: &str = "copilot";
     const COPILOT_CATALOG: &str = "github-copilot";
@@ -1103,22 +855,78 @@ mod tests {
     const UNREACHABLE_TIER: &str = "a tier past the table's window never bills";
     const WINDOW_KIND: &str =
         "a total window compares with the catalog's context, an input budget with its input limit";
-    const UNUSED_CAP: &str = "a cap must name a builtin slug and a value its table holds";
+    const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
+    const GATEWAY: &str = "gateway";
+    const GATEWAY_API: &str = "https://gateway.example.com/v1";
+    const MOVED_API: &str = "https://moved.example.com/v1";
+    const ROUTING_REPORTED: &str = "an unaccepted routing change must be reported";
+    const ROUTING_STALE: &str = "a routing acceptance no change needs must be reported as stale";
 
-    static OPUS_INPUT_ACCEPTED: &[Accepted] = &[Accepted {
-        provider: PROVIDER,
-        model: OPUS,
-        field: Field::Input,
-        catalog: CHANGED_PRICE,
-        reason: ACCEPTANCE_REASON,
-    }];
+    fn fixture() -> Payload {
+        serde_json::from_str(include_str!("audit_fixture.json")).unwrap()
+    }
 
-    fn entry(provider: &str, prefix: &str) -> &'static ModelEntry {
-        ManifestRegistry::get(provider)
+    fn provider(slug: &str) -> Option<Provider> {
+        fixture()
+            .providers
+            .into_iter()
+            .find(|provider| provider.slug == slug)
+    }
+
+    fn opus_input_accepted() -> Vec<Accepted> {
+        vec![Accepted {
+            provider: PROVIDER.into(),
+            model: OPUS.into(),
+            field: Field::Input,
+            catalog: CHANGED_PRICE.into(),
+            reason: ACCEPTANCE_REASON.into(),
+        }]
+    }
+
+    fn caps() -> Vec<Cap> {
+        [
+            (PROVIDER, Field::Context, 372_000),
+            (OPENAI, Field::Context, 372_000),
+            (COPILOT, Field::Context, COPILOT_FALLBACK_WINDOW),
+            (COPILOT, Field::MaxOutput, 100_000),
+            ("xai", Field::MaxOutput, 131_072),
+        ]
+        .into_iter()
+        .map(|(provider, field, ours)| Cap {
+            provider: provider.into(),
+            field,
+            ours,
+            reason: ACCEPTANCE_REASON.into(),
+        })
+        .collect()
+    }
+
+    fn audit_with(
+        json: &str,
+        today: Date,
+        since: Date,
+        accepted: &[Accepted],
+    ) -> Result<Audit, serde_json::Error> {
+        Ok(audit(
+            &fixture(),
+            &serde_json::from_str(json)?,
+            None,
+            today,
+            since,
+            &Rules {
+                accepted: accepted.to_vec(),
+                caps: caps(),
+                routing: Vec::new(),
+            },
+        ))
+    }
+
+    fn entry(slug: &str, prefix: &str) -> ModelEntry {
+        provider(slug)
             .unwrap()
             .models
-            .iter()
-            .find(|entry| entry.prefixes.contains(&prefix))
+            .into_iter()
+            .find(|entry| entry.prefixes.iter().any(|p| p == prefix))
             .unwrap()
     }
 
@@ -1147,11 +955,11 @@ mod tests {
     }
 
     fn catalog(provider: &str, models: serde_json::Value) -> String {
-        serde_json::json!({ provider: { "models": models } }).to_string()
+        serde_json::json!({ provider: { "name": provider, "npm": "@ai-sdk/openai-compatible", "models": models } }).to_string()
     }
 
     fn opus_with(change: impl FnOnce(&mut serde_json::Value)) -> String {
-        let mut model = faithful(entry(PROVIDER, OPUS), OPUS);
+        let mut model = faithful(&entry(PROVIDER, OPUS), OPUS);
         change(&mut model);
         catalog(PROVIDER, serde_json::json!({ OPUS: model }))
     }
@@ -1165,7 +973,7 @@ mod tests {
             .collect()
     }
 
-    fn opus_fields(json: &str, accepted: &'static [Accepted]) -> (Vec<Field>, Audit) {
+    fn opus_fields(json: &str, accepted: &[Accepted]) -> (Vec<Field>, Audit) {
         let audit = audit_with(json, TODAY, SINCE, accepted).unwrap();
         (fields_of(&audit, PROVIDER, OPUS), audit)
     }
@@ -1208,7 +1016,7 @@ mod tests {
     #[test]
     fn an_accepted_divergence_is_silenced_while_the_catalog_prints_its_value() {
         let json = opus_with(|model| model["cost"]["input"] = serde_json::json!(CHANGED_RATE));
-        let (fields, audit) = opus_fields(&json, OPUS_INPUT_ACCEPTED);
+        let (fields, audit) = opus_fields(&json, &opus_input_accepted());
         assert_eq!(fields, Vec::<Field>::new(), "{SILENCED}");
         assert!(audit.stale.is_empty(), "{SILENCED}");
     }
@@ -1217,9 +1025,9 @@ mod tests {
     fn a_changed_catalog_value_reports_again_and_the_acceptance_goes_stale() {
         let json =
             opus_with(|model| model["cost"]["input"] = serde_json::json!(OTHER_CHANGED_RATE));
-        let (fields, audit) = opus_fields(&json, OPUS_INPUT_ACCEPTED);
+        let (fields, audit) = opus_fields(&json, &opus_input_accepted());
         assert_eq!(fields, vec![Field::Input], "{REPORTED}");
-        assert_eq!(audit.stale.len(), OPUS_INPUT_ACCEPTED.len(), "{STALE}");
+        assert_eq!(audit.stale.len(), opus_input_accepted().len(), "{STALE}");
     }
 
     #[test]
@@ -1237,7 +1045,7 @@ mod tests {
         let dated = format!("{OPUS}{SNAPSHOT_STAMP}");
         let json = catalog(
             PROVIDER,
-            serde_json::json!({ dated.clone(): faithful(entry(PROVIDER, OPUS), &dated) }),
+            serde_json::json!({ dated.clone(): faithful(&entry(PROVIDER, OPUS), &dated) }),
         );
         let (fields, audit) = opus_fields(&json, &[]);
         assert_eq!(fields, Vec::<Field>::new(), "{ALIAS}");
@@ -1325,15 +1133,16 @@ mod tests {
     #[test_case(true ; "a_period_in_force_is_compared")]
     #[test_case(false ; "a_pending_period_is_not")]
     fn a_price_period_counts_from_its_date(in_force: bool) {
-        let period = ManifestRegistry::get(GOOGLE)
+        let period = provider(GOOGLE)
             .unwrap()
             .price_periods
             .first()
+            .cloned()
             .unwrap();
         let from = period.during.from.unwrap();
-        let mut model = faithful(entry(GOOGLE, period.prefix), period.prefix);
+        let mut model = faithful(&entry(GOOGLE, &period.prefix), &period.prefix);
         model["cost"]["input"] = serde_json::json!(period.pricing.input);
-        let json = catalog(GOOGLE, serde_json::json!({ period.prefix: model }));
+        let json = catalog(GOOGLE, serde_json::json!({ &period.prefix: model }));
         let today = if in_force {
             from
         } else {
@@ -1341,13 +1150,13 @@ mod tests {
         };
         let audit = audit_with(&json, today, SINCE, &[]).unwrap();
         assert_eq!(
-            fields_of(&audit, GOOGLE, period.prefix).contains(&Field::Input),
+            fields_of(&audit, GOOGLE, &period.prefix).contains(&Field::Input),
             !in_force
         );
     }
 
     fn deprecated_opus_5() -> String {
-        let mut model = faithful(entry(COPILOT, RETIRING), RETIRING);
+        let mut model = faithful(&entry(COPILOT, RETIRING), RETIRING);
         model["status"] = serde_json::json!(DEPRECATED);
         catalog(COPILOT_CATALOG, serde_json::json!({ RETIRING: model }))
     }
@@ -1357,7 +1166,7 @@ mod tests {
     #[test_case(LAST_DAY_BEFORE_SHUTDOWN, &[] ; "a_scheduled_shutdown_is_not_a_finding")]
     #[test_case(SHUTDOWN_DAY, &[Field::Retired] ; "past_the_shutdown_only_the_retirement_reports")]
     fn a_dated_shutdown_settles_the_deprecation(today: Date, expected: &[Field]) {
-        let audit = audit_with(&deprecated_opus_5(), today, SINCE, ACCEPTED).unwrap();
+        let audit = audit_with(&deprecated_opus_5(), today, SINCE, &[]).unwrap();
         let fields = fields_of(&audit, COPILOT, RETIRING);
         assert!(!fields.contains(&Field::Status), "{SCHEDULED}");
         assert_eq!(
@@ -1388,6 +1197,9 @@ mod tests {
             since: SINCE,
             findings: Vec::new(),
             stale: Vec::new(),
+            routing: None,
+            stale_routing: Vec::new(),
+            decisions: fixture().decision_models,
         };
         assert!(audit.to_string().contains(NO_DIFFERENCES), "{REPORT_EMPTY}");
     }
@@ -1397,7 +1209,7 @@ mod tests {
     fn every_report_lists_the_decision_models_with_their_sources(with_findings: bool) {
         let findings = with_findings
             .then(|| Finding {
-                provider: PROVIDER,
+                provider: PROVIDER.into(),
                 model: OPUS.into(),
                 field: Field::Input,
                 ours: CHANGED_PRICE.into(),
@@ -1410,16 +1222,19 @@ mod tests {
             since: SINCE,
             findings,
             stale: Vec::new(),
+            routing: None,
+            stale_routing: Vec::new(),
+            decisions: fixture().decision_models,
         }
         .to_string();
         let section = report
             .split_once(DECISION_MODELS_HEADING)
             .map(|(_, rest)| rest)
             .expect(DECISION_MODELS_LISTED);
-        for entry in decision_pricing::entries() {
-            assert!(section.contains(entry.source), "{DECISION_MODELS_LISTED}");
+        for entry in fixture().decision_models {
+            assert!(section.contains(&entry.source), "{DECISION_MODELS_LISTED}");
             for prefix in entry.prefixes {
-                assert!(section.contains(prefix), "{DECISION_MODELS_LISTED}");
+                assert!(section.contains(&prefix), "{DECISION_MODELS_LISTED}");
             }
         }
     }
@@ -1439,28 +1254,26 @@ mod tests {
         }
     }
 
-    fn capped_entry(cap: &Cap) -> &'static ModelEntry {
-        ManifestRegistry::get(cap.provider)
+    fn capped_entry(cap: &Cap) -> ModelEntry {
+        provider(&cap.provider)
             .unwrap()
             .models
             .iter()
             .find(|entry| cap_limit(entry, cap.field) == Some(cap.ours))
+            .cloned()
             .expect(UNUSED_CAP)
     }
 
     #[test_case(1, false ; "above_the_cap_is_silenced")]
     #[test_case(-1, true ; "below_the_cap_is_reported")]
     fn a_cap_silences_only_a_catalog_that_accepts_more(offset: i64, reported: bool) {
-        for cap in CAPS {
+        for cap in &caps() {
             let entry = capped_entry(cap);
-            let id = entry.prefixes[0];
-            let mut model = faithful(entry, id);
+            let id = entry.prefixes[0].as_str();
+            let mut model = faithful(&entry, id);
             model["limit"][limit_key(cap.field)] = serde_json::json!(i64::from(cap.ours) + offset);
-            let slug = ManifestRegistry::get(cap.provider)
-                .unwrap()
-                .catalog_slug
-                .unwrap();
-            let json = catalog(slug, serde_json::json!({ id: model }));
+            let slug = provider(&cap.provider).unwrap().catalog_slug.unwrap();
+            let json = catalog(&slug, serde_json::json!({ id: model }));
             let audit = audit_with(&json, TODAY, SINCE, &[]).unwrap();
             let message = if reported {
                 CAP_OVERSTATES
@@ -1468,7 +1281,7 @@ mod tests {
                 CAP_SILENCES
             };
             assert_eq!(
-                fields_of(&audit, cap.provider, id).contains(&cap.field),
+                fields_of(&audit, &cap.provider, id).contains(&cap.field),
                 reported,
                 "{message}: {cap:?}"
             );
@@ -1478,14 +1291,11 @@ mod tests {
     #[test_case(COPILOT_FALLBACK_WINDOW, false ; "a_tier_past_the_window_is_not_compared")]
     #[test_case(TIER_ABOVE, true ; "a_tier_inside_the_window_is")]
     fn a_tier_counts_only_inside_the_window(above: u32, reported: bool) {
-        let mut model = faithful(entry(COPILOT, COPILOT_UNTIERED), COPILOT_UNTIERED);
+        let mut model = faithful(&entry(COPILOT, COPILOT_UNTIERED), COPILOT_UNTIERED);
         model["cost"]["tiers"] =
             serde_json::json!([{ "input": TIER_INPUT, "tier": { "size": above } }]);
-        let slug = ManifestRegistry::get(COPILOT)
-            .unwrap()
-            .catalog_slug
-            .unwrap();
-        let json = catalog(slug, serde_json::json!({ COPILOT_UNTIERED: model }));
+        let slug = provider(COPILOT).unwrap().catalog_slug.unwrap();
+        let json = catalog(&slug, serde_json::json!({ COPILOT_UNTIERED: model }));
         let audit = audit_with(&json, TODAY, SINCE, &[]).unwrap();
         assert_eq!(
             fields_of(&audit, COPILOT, COPILOT_UNTIERED).contains(&Field::Tiers),
@@ -1497,7 +1307,7 @@ mod tests {
     #[test_case(OPENAI, TOTAL_WINDOW, false ; "a_total_window_ignores_the_input_limit")]
     #[test_case(PROVIDER, INPUT_BUDGET, true ; "an_input_budget_compares_with_it")]
     fn a_window_compares_with_the_limit_of_its_kind(provider: &str, id: &str, reported: bool) {
-        let mut model = faithful(entry(provider, id), id);
+        let mut model = faithful(&entry(provider, id), id);
         model["limit"]["input"] = serde_json::json!(TINY_LIMIT);
         let json = catalog(provider, serde_json::json!({ id: model }));
         let audit = audit_with(&json, TODAY, SINCE, &[]).unwrap();
@@ -1510,27 +1320,184 @@ mod tests {
 
     #[test]
     fn every_cap_holds_a_limit_of_its_table() {
-        for cap in CAPS {
+        for cap in &caps() {
             capped_entry(cap);
             assert!(!cap.reason.is_empty(), "{NO_REASON}: {cap:?}");
         }
     }
 
+    #[test_case("reason", "", EMPTY_VALUE; "empty_reason")]
+    #[test_case("catalog", "", EMPTY_VALUE; "empty_price")]
+    #[test_case("provider", "unknown", UNKNOWN_PROVIDER; "unknown_provider")]
+    #[test_case("model", "unknown", PREFIX_RULE; "unknown_model")]
+    fn invalid_acceptance_names_its_field(field: &str, value: &str, message: &str) {
+        let mut row = serde_json::json!({"provider": PROVIDER, "model": OPUS, "field": "input", "catalog": CHANGED_PRICE, "reason": ACCEPTANCE_REASON});
+        row[field] = value.into();
+        let rules = Rules {
+            accepted: vec![serde_json::from_value(row).unwrap()],
+            caps: vec![],
+            routing: Vec::new(),
+        };
+        assert_eq!(
+            validate_rules(&rules, &fixture().providers),
+            Err((format!("/accepted/0/{field}"), message))
+        );
+    }
+
     #[test]
-    fn every_acceptance_names_a_table_and_its_model() {
-        for row in ACCEPTED {
-            let manifest = ManifestRegistry::get(row.provider);
-            assert!(manifest.is_some(), "{UNKNOWN_SLUG}: {row:?}");
-            let named = manifest
-                .into_iter()
-                .flat_map(|manifest| manifest.models)
-                .any(|entry| entry.prefixes.contains(&row.model));
-            assert_eq!(
-                named,
-                row.field != Field::Unlisted,
-                "{PREFIX_RULE}: {row:?}"
-            );
-            assert!(!row.reason.is_empty(), "{NO_REASON}: {row:?}");
+    fn duplicate_acceptances_are_rejected() {
+        let mut accepted = opus_input_accepted();
+        accepted.extend(opus_input_accepted());
+        assert_eq!(
+            validate_rules(
+                &Rules {
+                    accepted,
+                    caps: vec![],
+                    routing: Vec::new(),
+                },
+                &fixture().providers
+            )
+            .unwrap_err()
+            .1,
+            DUPLICATE_RULE
+        );
+    }
+
+    #[test_case(SNAPSHOT_STAMP; "dated_snapshot")]
+    #[test_case("-latest"; "latest_alias")]
+    fn a_catalog_alias_divergence_can_be_accepted(suffix: &str) {
+        let alias = format!("{OPUS}{suffix}");
+        let mut model = faithful(&entry(PROVIDER, OPUS), &alias);
+        model["cost"]["input"] = serde_json::json!(CHANGED_RATE);
+        let catalog = catalog(PROVIDER, serde_json::json!({ &alias: model }));
+        let mut accepted = opus_input_accepted();
+        accepted[0].model = alias.clone();
+        let rules = Rules {
+            accepted,
+            caps: vec![],
+            routing: Vec::new(),
+        };
+        validate_rules(&rules, &fixture().providers).unwrap();
+        let audit = audit_with(&catalog, TODAY, SINCE, &rules.accepted).unwrap();
+        assert!(fields_of(&audit, PROVIDER, &alias).is_empty(), "{SILENCED}");
+        assert!(audit.stale.is_empty(), "{SILENCED}");
+    }
+
+    #[test]
+    fn an_unlisted_model_without_a_release_date_can_be_accepted() {
+        let mut model = new_model(true, TEXT_OUTPUT, RELEASED);
+        model.as_object_mut().unwrap().remove("release_date");
+        let catalog = catalog(PROVIDER, serde_json::json!({ NOVEL: model }));
+        let rules = Rules {
+            accepted: vec![Accepted {
+                provider: PROVIDER.into(),
+                model: NOVEL.into(),
+                field: Field::Unlisted,
+                catalog: String::new(),
+                reason: ACCEPTANCE_REASON.into(),
+            }],
+            caps: vec![],
+            routing: Vec::new(),
+        };
+        validate_rules(&rules, &fixture().providers).unwrap();
+        let audit = audit_with(&catalog, TODAY, SINCE, &rules.accepted).unwrap();
+        assert!(fields_of(&audit, PROVIDER, NOVEL).is_empty(), "{SILENCED}");
+        assert!(audit.stale.is_empty(), "{SILENCED}");
+    }
+
+    #[test_case(Field::Input; "not_a_limit")]
+    #[test_case(Field::MaxOutput; "wrong_value")]
+    fn a_cap_must_name_an_existing_limit(field: Field) {
+        let cap = Cap {
+            provider: PROVIDER.into(),
+            field,
+            ours: TINY_LIMIT,
+            reason: ACCEPTANCE_REASON.into(),
+        };
+        assert_eq!(
+            validate_rules(
+                &Rules {
+                    accepted: vec![],
+                    caps: vec![cap],
+                    routing: Vec::new(),
+                },
+                &fixture().providers
+            )
+            .unwrap_err()
+            .1,
+            UNUSED_CAP
+        );
+    }
+
+    fn routed(api: &str) -> Payload {
+        let mut payload = fixture();
+        payload.catalog.insert(
+            GATEWAY.into(),
+            serde_json::from_value(serde_json::json!({
+                "name": GATEWAY, "npm": "@ai-sdk/openai-compatible", "api": api
+            }))
+            .unwrap(),
+        );
+        payload
+    }
+
+    fn routing_acceptance(catalog: &str, reason: &str) -> RoutingAccepted {
+        RoutingAccepted {
+            provider: GATEWAY.into(),
+            field: RoutingField::Api,
+            catalog: catalog.into(),
+            reason: reason.into(),
         }
+    }
+
+    #[test_case(None, true, false; "unaccepted")]
+    #[test_case(Some(MOVED_API), false, false; "accepted")]
+    #[test_case(Some(GATEWAY_API), true, true; "accepted_another_value")]
+    fn a_routing_change_reports_until_accepted(
+        accepted: Option<&str>,
+        reported: bool,
+        stale: bool,
+    ) {
+        let rules = Rules {
+            routing: accepted
+                .map(|catalog| routing_acceptance(catalog, ACCEPTANCE_REASON))
+                .into_iter()
+                .collect(),
+            ..Rules::default()
+        };
+        let next = routed(MOVED_API);
+        let audit = audit(
+            &next,
+            &next.catalog,
+            Some(&routed(GATEWAY_API)),
+            TODAY,
+            SINCE,
+            &rules,
+        );
+        let report = audit.to_string();
+        let section = report
+            .split_once(routing::HEADING)
+            .and_then(|(_, rest)| rest.split(SECTION_START).next())
+            .expect(ROUTING_REPORTED);
+        assert_eq!(section.contains(MOVED_API), reported, "{ROUTING_REPORTED}");
+        assert_eq!(
+            audit.stale_routing.len(),
+            usize::from(stale),
+            "{ROUTING_STALE}"
+        );
+    }
+
+    #[test_case("", EMPTY_VALUE; "empty_reason")]
+    #[test_case(ACCEPTANCE_REASON, DUPLICATE_RULE; "duplicate")]
+    fn invalid_routing_acceptance_is_rejected(reason: &str, message: &str) {
+        let row = routing_acceptance(MOVED_API, reason);
+        let rules = Rules {
+            routing: vec![row.clone(), row],
+            ..Rules::default()
+        };
+        assert_eq!(
+            validate_rules(&rules, &fixture().providers).unwrap_err().1,
+            message
+        );
     }
 }

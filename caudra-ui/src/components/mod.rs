@@ -1811,6 +1811,9 @@ pub(crate) fn register_native_tools() {
 #[cfg(test)]
 pub(crate) fn test_model() -> caudra_providers::Model {
     caudra_providers::Model {
+        model_revision: caudra_providers::model_data::current().revision,
+        manifest: caudra_providers::manifest::ManifestRegistry::get("anthropic"),
+        entry: None,
         id: "test-model".into(),
         provider: std::sync::Arc::<str>::from("anthropic"),
         family: caudra_providers::ModelFamily::Claude,
@@ -1822,6 +1825,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         pricing: test_pricing(),
         dated_rates: None,
         discovered_free: false,
+        catalog_free: false,
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
         window_excludes_output: false,

@@ -49,6 +49,7 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 half = { version = "2" }
 hashbrown = { version = "0.17" }
@@ -216,6 +217,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = { version = "1" }
@@ -235,6 +237,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["event", "pipe", "stdio", "system", "termios", "time"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
@@ -251,6 +254,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = { version = "1" }
@@ -270,6 +274,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["event", "pipe", "stdio", "system", "termios", "time"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
@@ -286,6 +291,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = { version = "1" }
@@ -305,6 +311,7 @@ event-listener-strategy = { version = "0.5" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["event", "pipe", "stdio", "system", "termios", "time"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
@@ -318,6 +325,7 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 errno = { version = "0.3" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
@@ -331,6 +339,7 @@ tower = { version = "0.5", default-features = false, features = ["make", "retry"
 errno = { version = "0.3" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
@@ -344,6 +353,7 @@ tower = { version = "0.5", default-features = false, features = ["make", "retry"
 errno = { version = "0.3" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
@@ -357,6 +367,7 @@ tower = { version = "0.5", default-features = false, features = ["make", "retry"
 errno = { version = "0.3" }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 objc2 = { version = "0.6" }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFPlugInCOM", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }

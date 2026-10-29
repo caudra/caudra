@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use caudra_agent::secrets::SessionSecrets;
 use caudra_agent::shell_environment::local_shell_overlay;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::shell_env::ShellEnvConfig;
@@ -16,19 +17,34 @@ use crate::RemoteWorkcellClient;
 
 const UNSET_SUFFIX: &str = " (unset)";
 const SET_SUFFIX: &str = " (set)";
+const SESSION_SECRET_SUFFIX: &str = " (session secret)";
 const LIST_SEPARATOR: &str = ", ";
 const GUEST_LISTING_UNAVAILABLE: &str =
     "this sandbox's Workcell does not list its environment; update its image";
 pub(crate) const BUILT_IN_ONLY: &str =
     "built-in only; the user can forward more with /env or [agent.shell_env]";
 
-pub(crate) fn local_shell_environment(config: &ShellEnvConfig) -> ShellEnvironment {
-    local_shell_overlay(config).into()
+pub(crate) fn local_shell_environment(
+    config: &ShellEnvConfig,
+    secrets: Option<&SessionSecrets>,
+) -> ShellEnvironment {
+    local_shell_overlay(config, secrets).into()
 }
 
-/// Names and counts, never values: `DOCKER_HOST, AWS_* (3 names), SSH_AUTH_SOCK (unset)`.
-pub(crate) fn forwarded_summary(config: &ShellEnvConfig) -> String {
-    if config.pass.is_empty() && config.set.is_empty() {
+/// Names and counts, never values: `DOCKER_HOST, AWS_* (3 names), SSH_AUTH_SOCK (unset),
+/// GH_TOKEN (session secret)`.
+pub(crate) fn forwarded_summary(
+    config: &ShellEnvConfig,
+    secrets: Option<&SessionSecrets>,
+) -> String {
+    let live_secrets: Vec<String> = secrets
+        .map(SessionSecrets::listing)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|listing| !listing.expired())
+        .map(|listing| format!("{}{SESSION_SECRET_SUFFIX}", listing.name))
+        .collect();
+    if config.pass.is_empty() && config.set.is_empty() && live_secrets.is_empty() {
         return BUILT_IN_ONLY.to_owned();
     }
     let visible: HashSet<String> = shell_visible_environment()
@@ -47,6 +63,7 @@ pub(crate) fn forwarded_summary(config: &ShellEnvConfig) -> String {
             }
         })
         .chain(config.set.keys().map(|name| format!("{name}{SET_SUFFIX}")))
+        .chain(live_secrets)
         .collect::<Vec<_>>()
         .join(LIST_SEPARATOR)
 }
@@ -124,27 +141,50 @@ impl GuestShellEnvironment {
 mod tests {
     use std::collections::BTreeMap;
 
+    use caudra_agent::secrets::{SecretValue, SecretVaults};
+    use caudra_storage::StateDir;
+    use caudra_storage::id::CaudraId;
+    use tempfile::TempDir;
     use workcell_tool_contract::shell_env::EnvPattern;
 
     use super::*;
 
     const MISSING: &str = "CAUDRA_SHELL_ENV_SUMMARY_MISSING_CANARY";
     const SET_NAME: &str = "CAUDRA_SHELL_ENV_SUMMARY_SET";
+    const SECRET_NAME: &str = "CAUDRA_SHELL_ENV_SUMMARY_SECRET";
+    const SECRET_VALUE: &str = "secret-canary";
 
     #[test]
     fn an_empty_configuration_points_at_the_settings() {
-        assert_eq!(forwarded_summary(&ShellEnvConfig::default()), BUILT_IN_ONLY);
+        assert_eq!(
+            forwarded_summary(&ShellEnvConfig::default(), None),
+            BUILT_IN_ONLY
+        );
     }
 
     #[test]
     fn the_summary_names_unset_and_set_entries_without_values() {
         let config = ShellEnvConfig {
             pass: vec![EnvPattern::Exact(MISSING.into())],
-            set: BTreeMap::from([(SET_NAME.into(), "secret-canary".into())]),
+            set: BTreeMap::from([(SET_NAME.into(), SECRET_VALUE.into())]),
         };
         assert_eq!(
-            forwarded_summary(&config),
+            forwarded_summary(&config, None),
             format!("{MISSING}{UNSET_SUFFIX}{LIST_SEPARATOR}{SET_NAME}{SET_SUFFIX}")
         );
+    }
+
+    #[test]
+    fn the_summary_names_session_secrets_without_values() {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let secrets = SecretVaults::for_session(&state, CaudraId::generate());
+        secrets
+            .set(SECRET_NAME, SecretValue::new(SECRET_VALUE.to_owned()))
+            .unwrap();
+
+        let summary = forwarded_summary(&ShellEnvConfig::default(), Some(&secrets));
+
+        assert_eq!(summary, format!("{SECRET_NAME}{SESSION_SECRET_SUFFIX}"));
     }
 }

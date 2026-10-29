@@ -17,7 +17,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker incremental-sweep install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests formats-lint formats-check gen-docs gen-docs-check model-watch sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete hakari ci
+.PHONY: help code-worker incremental-sweep install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests formats-lint formats-check gen-docs gen-docs-check sync-pstack sync-mattpocock sync-emil workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete hakari ci
 
 help:
 	@printf '%s\n' \
@@ -41,9 +41,9 @@ help:
 		'  make formats-check  Check a patch keeps the persisted formats of its vX.Y.0' \
 		'  make gen-docs       Regenerate canonical documentation' \
 		'  make gen-docs-check Check generated documentation' \
-		'  make model-watch    Report model changes from models.dev (flags via ARGS="-- --since DATE")' \
 		'  make sync-pstack    Refresh the bundled pstack (ARGS="--source <cursor/plugins checkout>")' \
 		'  make sync-mattpocock  Refresh the bundled mattpocock skills (ARGS="--source <mattpocock/skills checkout>")' \
+		'  make sync-emil      Refresh the bundled emil skills (ARGS="--source <emilkowalski/skills checkout>")' \
 		'  make workcell-build Build the standalone Workcell server' \
 		'  make workcell-run   Run Workcell (server flags via ARGS)' \
 		'  make workcell-release  Build the release Workcell server' \
@@ -127,14 +127,14 @@ gen-docs: code-worker incremental-sweep
 gen-docs-check: code-worker incremental-sweep
 	$(CARGO) run -p caudra-docgen -- --check
 
-model-watch: code-worker incremental-sweep
-	$(CARGO) run -q -p caudra-docgen --bin caudra-model-watch $(ARGS)
-
 sync-pstack:
 	$(PYTHON) scripts/sync-skillpack.py pstack $(ARGS)
 
 sync-mattpocock:
 	$(PYTHON) scripts/sync-skillpack.py mattpocock $(ARGS)
+
+sync-emil:
+	$(PYTHON) scripts/sync-skillpack.py emil $(ARGS)
 
 workcell-build: code-worker incremental-sweep
 	$(CARGO) build $(if $(filter --locked,$(ARGS)),,--locked) --package workcell-mcp $(ARGS)

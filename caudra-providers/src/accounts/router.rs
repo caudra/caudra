@@ -29,6 +29,7 @@ use super::route::{
 };
 use crate::AgentError;
 use crate::model::{Model, ModelInfo, TokenUsage};
+use crate::model_data::{Current, current};
 use crate::provider::{BoxFuture, CacheWarm, Provider, WireRequest};
 use crate::providers::Timeouts;
 use crate::types::{
@@ -153,6 +154,7 @@ struct Routed {
 pub struct RoutedProvider {
     state: Arc<SlugState>,
     timeouts: Timeouts,
+    model_data: Arc<Current>,
 }
 
 impl RoutedProvider {
@@ -166,7 +168,11 @@ impl RoutedProvider {
         state: Arc<SlugState>,
         timeouts: Timeouts,
     ) -> Result<Self, AgentError> {
-        let router = Self { state, timeouts };
+        let router = Self {
+            state,
+            timeouts,
+            model_data: current(),
+        };
         let snapshot = router.state.snapshot();
         let credential = router
             .preferred(&snapshot, "")
@@ -178,7 +184,9 @@ impl RoutedProvider {
                     .find_map(|slot| slot.credential.clone())
                     .ok_or_else(|| no_account_error(&router.state.slug))
             })?;
-        router.state.instance(&credential, timeouts)?;
+        router
+            .state
+            .instance(&credential, timeouts, &router.model_data)?;
         Ok(router)
     }
 
@@ -299,7 +307,8 @@ impl RoutedProvider {
     fn preferred_instance(&self, model_id: &str) -> Result<Arc<dyn Provider>, AgentError> {
         let snapshot = self.state.snapshot();
         let routed = self.preferred(&snapshot, model_id)?;
-        self.state.instance(&routed.credential, self.timeouts)
+        self.state
+            .instance(&routed.credential, self.timeouts, &self.model_data)
     }
 
     fn standing(
@@ -334,7 +343,11 @@ impl RoutedProvider {
         let ttl = snapshot
             .position(&current)
             .and_then(|index| snapshot.accounts[index].credential.as_ref())
-            .and_then(|credential| self.state.instance(credential, self.timeouts).ok())
+            .and_then(|credential| {
+                self.state
+                    .instance(credential, self.timeouts, &self.model_data)
+                    .ok()
+            })
             .and_then(|instance| instance.prompt_cache_ttl(model))
             .unwrap_or(UNKNOWN_CACHE_IDLE);
         let cold = model_id != model.id
@@ -378,7 +391,10 @@ impl RoutedProvider {
         if !may_warm(&account) {
             return None;
         }
-        let instance = self.state.instance(&credential, self.timeouts).ok()?;
+        let instance = self
+            .state
+            .instance(&credential, self.timeouts, &self.model_data)
+            .ok()?;
         Some((instance, account))
     }
 
@@ -418,9 +434,10 @@ impl RoutedProvider {
             }
             let state = Arc::clone(&self.state);
             let timeouts = self.timeouts;
+            let model_data = Arc::clone(&self.model_data);
             smol::spawn(async move {
                 let name = credential.id.name.to_string();
-                let Ok(instance) = state.instance(&credential, timeouts) else {
+                let Ok(instance) = state.instance(&credential, timeouts, &model_data) else {
                     return;
                 };
                 match instance.fetch_usage().await {
@@ -665,6 +682,18 @@ impl CacheWarm for RoutedWarm {
 }
 
 impl Provider for RoutedProvider {
+    fn same_model_route(&self, model: &Model, data: &Current) -> bool {
+        let (slug, id) = if model
+            .manifest
+            .is_some_and(|manifest| manifest.slug == "opencode")
+        {
+            model.id.split_once('/').unwrap_or(("opencode", &model.id))
+        } else {
+            (model.provider.as_ref(), model.id.as_str())
+        };
+        self.model_data.catalog.same_route(&data.catalog, slug, id)
+    }
+
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,
@@ -681,8 +710,9 @@ impl Provider for RoutedProvider {
             let standing = self.standing(key, model, system_hash, messages.len());
             if !matches!(standing, Standing::Warm { .. }) {
                 let state = Arc::clone(&self.state);
+                let data = Arc::clone(&self.model_data);
                 smol::unblock(move || {
-                    state.refresh(false);
+                    state.refresh_with_data(false, &data);
                     state.reload_health();
                 })
                 .await;
@@ -754,7 +784,9 @@ impl Provider for RoutedProvider {
                 }
             }
             self.refresh_stale_quota(&snapshot, routed.index, now_ms);
-            let instance = self.state.instance(&routed.credential, self.timeouts)?;
+            let instance =
+                self.state
+                    .instance(&routed.credential, self.timeouts, &self.model_data)?;
             let mut response = instance
                 .stream_message(model, messages, system, tools, event_tx, opts, cache_key)
                 .await?;
@@ -815,7 +847,7 @@ impl Provider for RoutedProvider {
             None => self.preferred(&snapshot, &model.id)?.credential,
         };
         self.state
-            .instance(&credential, self.timeouts)?
+            .instance(&credential, self.timeouts, &self.model_data)?
             .wire_request(model, messages, system, tools, opts, cache_key)
     }
 
@@ -838,6 +870,7 @@ impl Provider for RoutedProvider {
             router: Self {
                 state: Arc::clone(&self.state),
                 timeouts: self.timeouts,
+                model_data: Arc::clone(&self.model_data),
             },
             key: cache_key?.as_str().to_owned(),
             model_id: model.id.clone(),
@@ -871,7 +904,11 @@ impl Provider for RoutedProvider {
             let instances: Vec<Arc<dyn Provider>> = order
                 .into_iter()
                 .filter_map(|index| snapshot.accounts[index].credential.clone())
-                .filter_map(|credential| self.state.instance(&credential, self.timeouts).ok())
+                .filter_map(|credential| {
+                    self.state
+                        .instance(&credential, self.timeouts, &self.model_data)
+                        .ok()
+                })
                 .collect();
             let listed = join_all(instances.iter().map(|instance| instance.list_models())).await;
             let mut models: Vec<ModelInfo> = Vec::new();
@@ -904,7 +941,7 @@ impl Provider for RoutedProvider {
             let name = routed.credential.id.name.to_string();
             let usage = self
                 .state
-                .instance(&routed.credential, self.timeouts)?
+                .instance(&routed.credential, self.timeouts, &self.model_data)?
                 .fetch_usage()
                 .await?;
             if let Some(usage) = &usage {
@@ -929,7 +966,8 @@ impl Provider for RoutedProvider {
         Box::pin(async move {
             self.state.clear_auth_failures();
             let state = Arc::clone(&self.state);
-            smol::unblock(move || state.refresh(true)).await;
+            let data = Arc::clone(&self.model_data);
+            smol::unblock(move || state.refresh_with_data(true, &data)).await;
             let mut last_error = None;
             let mut refreshed = false;
             for instance in self.state.built_instances() {
@@ -949,7 +987,8 @@ impl Provider for RoutedProvider {
         Box::pin(async move {
             self.state.clear_auth_failures();
             let state = Arc::clone(&self.state);
-            smol::unblock(move || state.refresh(true)).await;
+            let data = Arc::clone(&self.model_data);
+            smol::unblock(move || state.refresh_with_data(true, &data)).await;
             for instance in self.state.built_instances() {
                 instance.reload_auth().await?;
             }
@@ -960,7 +999,8 @@ impl Provider for RoutedProvider {
     fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async move {
             let state = Arc::clone(&self.state);
-            let mut changed = smol::unblock(move || state.refresh(true)).await;
+            let data = Arc::clone(&self.model_data);
+            let mut changed = smol::unblock(move || state.refresh_with_data(true, &data)).await;
             for instance in self.state.built_instances() {
                 changed |= instance.reload_auth_if_changed().await?;
             }
@@ -1106,7 +1146,10 @@ impl Provider for RoutedProvider {
         let Ok(routed) = self.preferred(&snapshot, &model.id) else {
             return;
         };
-        if let Ok(instance) = self.state.instance(&routed.credential, self.timeouts) {
+        if let Ok(instance) =
+            self.state
+                .instance(&routed.credential, self.timeouts, &self.model_data)
+        {
             instance.adjust_model(model);
         }
         model.billing = routed.credential.billing();

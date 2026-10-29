@@ -1,20 +1,21 @@
 ---
 name: skillpack-translate
-description: Translate a vendored skill pack (pstack from cursor/plugins, mattpocock from mattpocock/skills) from its harness's vocabulary into Caudra's, so agents follow the pages Caudra serves as written. Use for the pstack-sync run, after `make sync-pstack` or `make sync-mattpocock` reports TRANSLATE, NEW, or ORPHAN, and for any edit under caudra-pstack/translated/ or caudra-mattpocock/translated/.
+description: Translate a vendored skill pack (pstack from cursor/plugins, mattpocock from mattpocock/skills, emil from emilkowalski/skills) from its harness's vocabulary into Caudra's, so agents follow the pages Caudra serves as written. Use for the pstack-sync run, after `make sync-pstack`, `make sync-mattpocock`, or `make sync-emil` reports TRANSLATE, NEW, or ORPHAN, and for any edit under caudra-pstack/translated/, caudra-mattpocock/translated/, or caudra-emil/translated/.
 ---
 
 # Translating a skill pack into Caudra
 
-Caudra bundles third-party skill packs, each as one builtin skill (`pstack`, `mattpocock`) that serves every vendored file as a page. Each pack is written for another harness: pstack for Cursor, mattpocock for Claude Code and its peers. The agent that reads a page must be able to follow it as written, with no mapping table. So every foreign tool, field, path, model slug, command, and feature is rewritten here, once, by us.
+Caudra bundles third-party skill packs, each as one builtin skill (`pstack`, `mattpocock`, `emil`) that serves every vendored file as a page. Each pack is written for another harness: pstack for Cursor, mattpocock for Claude Code and its peers, emil for any harness that installs skills. The agent that reads a page must be able to follow it as written, with no mapping table. So every foreign tool, field, path, model slug, command, and feature is rewritten here, once, by us.
 
 The rules shared by every pack are below. Each pack's own mapping is a reference page; read the one for the pack you translate first:
 
 - [pstack](references/pstack.md): Cursor's tools, subagent fields, model roles, pstack's ported scripts, and benny.
 - [mattpocock](references/mattpocock.md): Claude Code's tools, the issue tracker, grilling through `question`, and the methodology changes we made.
+- [emil](references/emil.md): who starts each skill, sibling skills by their `emil/` address, the shared visual check, and the changes of method for motion work.
 
 ## Layout
 
-`<crate>` is `caudra-pstack` or `caudra-mattpocock`, and `<pack>` is `pstack` or `mattpocock`.
+`<crate>` is `caudra-pstack`, `caudra-mattpocock`, or `caudra-emil`, and `<pack>` is `pstack`, `mattpocock`, or `emil`.
 
 - `<crate>/pack.json` says what `make sync-<pack>` copies: each upstream root's files and trees, where they land, and what is left out.
 - `<crate>/upstream/` is the copy `make sync-<pack> ARGS='--source <checkout>'` writes. Never edit it by hand. It is the base for the next translation and the license record. `upstream.json` hashes every stored file, and under `sources` the raw upstream bytes of each Markdown file whose links the sync rewrote.
@@ -29,7 +30,8 @@ The rules shared by every pack are below. Each pack's own mapping is a reference
 - a translation's recorded upstream hash differs from the upstream file (the upstream file changed: retranslate),
 - a translation has no upstream file (upstream deleted or moved it: delete or move the translation),
 - a relative link leads nowhere,
-- a page tells the user to type a bare `/<skill>` instead of `/<pack>:<skill>`.
+- a page tells the user to type a bare `/<skill>` instead of `/<pack>:<skill>`,
+- for emil, a page names a sibling skill bare in backticks instead of `emil/<name>` or `/emil:<name>`, or a page outside a user-only skill loads one.
 
 ## How to translate a file
 

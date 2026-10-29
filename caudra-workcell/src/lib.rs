@@ -65,6 +65,7 @@ use caudra_agent::permissions::{
     PermissionResourceKind, PermissionRisk, RemotePermissionIdentity, ShellOpacity,
     filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
+use caudra_agent::secrets::redact::Redactor;
 use caudra_agent::tools::{
     BoxFuture, DEADLINE_EXCEEDED, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
     LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PartialOutputFilter, PermissionIntent,
@@ -1380,7 +1381,8 @@ impl WorkcellInvocation {
                 let cwd = project.clone();
                 let input = input.clone();
                 let output_filter = ctx.config.shell_output_filter;
-                let environment = local_shell_environment(&ctx.config.shell_env);
+                let environment =
+                    local_shell_environment(&ctx.config.shell_env, ctx.secrets.as_ref());
                 let (group, shell) = self
                     .host
                     .run(ctx, move |_| async move {
@@ -3242,7 +3244,8 @@ impl WorkcellInvocation {
                 }
             }
             (Input::Shell(_), PreparedExecution::Shell(group, prepared)) => {
-                let progress = Arc::new(NativeProgressSink::new(ctx));
+                let redactor = Arc::new(shell_redactor(ctx));
+                let progress = Arc::new(NativeProgressSink::new(ctx, Arc::clone(&redactor)));
                 progress.publish_live_buf(ctx);
                 let printed = Arc::clone(&progress.body);
                 let reduce = prepared.partial_output_filter();
@@ -3255,11 +3258,13 @@ impl WorkcellInvocation {
                     })
                     .await
                 {
-                    Ok(Ok(Some(execution))) => shell_result(execution),
+                    Ok(Ok(Some(execution))) => shell_result(execution, &redactor),
                     Ok(Ok(None)) => ToolExecResult::failed(
                         ToolFailure::Cancelled,
                         match output_so_far(&printed.read(), |text| reduce.apply(&text)) {
-                            Some(printed) => format!("{SHELL_CANCELLED}\n\n{printed}"),
+                            Some(printed) => {
+                                format!("{SHELL_CANCELLED}\n\n{}", redactor.text(&printed))
+                            }
                             None => SHELL_CANCELLED.to_owned(),
                         },
                     ),
@@ -3350,9 +3355,13 @@ impl WorkcellInvocation {
                     })
                     .await
                 {
-                    Ok(Ok(result)) => {
-                        environment_result(result, Some(forwarded_summary(&ctx.config.shell_env)))
-                    }
+                    Ok(Ok(result)) => environment_result(
+                        result,
+                        Some(forwarded_summary(
+                            &ctx.config.shell_env,
+                            ctx.secrets.as_ref(),
+                        )),
+                    ),
                     Ok(Err(error)) => failed(environment_error(error)),
                     Err(error) => failed(error),
                 }
@@ -4323,15 +4332,30 @@ fn remote_webfetch_result(mut output: Value, model_output: String) -> ToolExecRe
     }
 }
 
-fn shell_result(execution: ShellExecution) -> ToolExecResult {
-    shell_result_parts(execution.output, execution.model_text, execution.filter)
+/// Hides the session's secrets, and the remembered ones, in what a local shell prints.
+fn shell_redactor(ctx: &ToolContext) -> Redactor {
+    ctx.secrets
+        .as_ref()
+        .map(|secrets| secrets.redactor(&ctx.config.shell_env))
+        .unwrap_or_default()
+}
+
+fn shell_result(execution: ShellExecution, redactor: &Redactor) -> ToolExecResult {
+    shell_result_parts(
+        execution.output,
+        execution.model_text,
+        execution.filter,
+        redactor,
+    )
 }
 
 fn shell_result_parts(
     output: WorkcellShellOutput,
-    mut model_text: String,
+    model_text: String,
     filter: Option<WorkcellShellFilterInfo>,
+    redactor: &Redactor,
 ) -> ToolExecResult {
+    let mut model_text = redactor.owned(model_text);
     model_text.push_str("\n\n");
     model_text.push_str(&shell_status(&output));
     let output = AgentShellOutput {
@@ -4346,8 +4370,8 @@ fn shell_result_parts(
         final_sequence: output.final_sequence,
         stdout_utf8_bytes: output.stdout_utf8_bytes,
         stderr_utf8_bytes: output.stderr_utf8_bytes,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout: redactor.owned(output.stdout),
+        stderr: redactor.owned(output.stderr),
         stdout_capture_truncated: output.stdout_capture_truncated,
         stderr_capture_truncated: output.stderr_capture_truncated,
         stdout_preview_truncated: output.stdout_preview_truncated,
@@ -4883,6 +4907,7 @@ struct NativeProgressSink {
     live_sink: Option<flume::Sender<ToolLive>>,
     body: Arc<caudra_agent::SharedBuf>,
     tail: Mutex<ProgressTail>,
+    redactor: Arc<Redactor>,
 }
 
 /// Turns a source-code phase into the one line the card shows while it runs.
@@ -4916,13 +4941,14 @@ impl WorkcellInvocation {
 }
 
 impl NativeProgressSink {
-    fn new(ctx: &ToolContext) -> Self {
+    fn new(ctx: &ToolContext, redactor: Arc<Redactor>) -> Self {
         Self {
             id: ctx.tool_use_id.clone(),
             event_tx: ctx.event_tx.clone(),
             live_sink: ctx.live_sink.clone(),
             body: Arc::new(caudra_agent::SharedBuf::new()),
             tail: Mutex::new(ProgressTail::default()),
+            redactor,
         }
     }
 
@@ -4939,11 +4965,12 @@ impl NativeProgressSink {
 #[async_trait::async_trait]
 impl ShellProgressSink for NativeProgressSink {
     async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
-        let text = self
-            .tail
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(&chunk);
+        let text = self.redactor.owned(
+            self.tail
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(&chunk),
+        );
         self.body.set_lines(
             text.lines()
                 .map(|line| SnapshotLine::plain(line.to_owned()))
@@ -4984,6 +5011,8 @@ mod tests {
         permission_rule_covers_resource,
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
+    use caudra_agent::secrets::redact::shown_variable;
+    use caudra_agent::secrets::{SecretValue, SecretVaults};
     use caudra_agent::template::Vars;
     #[cfg(target_os = "linux")]
     use caudra_agent::tools::OUTPUT_SO_FAR_HEADING;
@@ -5009,11 +5038,12 @@ mod tests {
     use caudra_storage::{
         StateDir,
         background::JobKind,
-        id::SessionRef,
+        id::{CaudraId, SessionRef},
         permission_patterns::{
             ArgumentDomain, ArgumentRole, OptionLikePolicy, PatternToken, SlotCombinations,
         },
         permission_state::PermissionState,
+        secrets::save_remembered_secret,
         sessions::SessionDatabase,
         tool_outputs::ToolOutputStore,
     };
@@ -7937,6 +7967,7 @@ mod tests {
                 unfiltered_utf8_bytes: 100,
                 filtered_utf8_bytes: 20,
             }),
+            &Redactor::default(),
         );
         assert!(!success.is_error);
         assert_eq!(
@@ -7956,7 +7987,12 @@ mod tests {
         assert_eq!(output.redraws_collapsed(), 192);
         assert_eq!(output.filter.unwrap().stages, ["make", "progress"]);
 
-        let failure = shell_result_parts(shell_output(101), "filtered".into(), None);
+        let failure = shell_result_parts(
+            shell_output(101),
+            "filtered".into(),
+            None,
+            &Redactor::default(),
+        );
         assert!(failure.is_error);
         assert_eq!(
             failure.model_output.as_deref(),
@@ -8012,7 +8048,8 @@ mod tests {
             },
             TokenScale::UNIT,
         );
-        let local = shell_result_parts(output, MISLEADING_OUTPUT.into(), None);
+        let local =
+            shell_result_parts(output, MISLEADING_OUTPUT.into(), None, &Redactor::default());
 
         assert_eq!(
             (remote.is_error, remote.failure),
@@ -11165,6 +11202,139 @@ mod tests {
         assert!(message.starts_with(SHELL_CANCELLED), "{message}");
         assert!(message.contains(OUTPUT_SO_FAR_HEADING), "{message}");
         assert!(message.contains(PRINTED), "{message}");
+    }
+
+    const SECRET_NAME: &str = "CAUDRA_TEST_SESSION_SECRET";
+    const SECRET_VALUE: &str = "session-canary-4711";
+    const SECRET_CONFIGURED: &str = "configured-canary-0815";
+    const REMEMBERED_NAME: &str = "CAUDRA_TEST_REMEMBERED_SECRET";
+    const REMEMBERED_VALUE: &str = "remembered-canary-2342";
+    const SECRET_MATCHED: &str = "the session secret won";
+    const SECRET_LEAKED: &str = "a secret value reached shell output";
+
+    /// A context whose session holds `SECRET_NAME`, which `[agent.shell_env] set` also names,
+    /// and whose config sets the remembered `REMEMBERED_NAME`.
+    fn secret_context(
+        root: &Path,
+        state: &Path,
+        registry: Arc<ToolRegistry>,
+        cancel: CancelToken,
+    ) -> ToolContext {
+        let state = StateDir::from_path(state.to_path_buf());
+        let secrets = SecretVaults::for_session(&state, CaudraId::generate());
+        secrets
+            .set(SECRET_NAME, SecretValue::new(SECRET_VALUE.to_owned()))
+            .expect("session secret");
+        save_remembered_secret(&state, REMEMBERED_NAME, REMEMBERED_VALUE)
+            .expect("remembered secret");
+        let mut ctx = context(root, registry, cancel);
+        ctx.config.shell_env = ShellEnvConfig {
+            set: BTreeMap::from([
+                (SECRET_NAME.into(), SECRET_CONFIGURED.into()),
+                (REMEMBERED_NAME.into(), REMEMBERED_VALUE.into()),
+            ]),
+            ..ShellEnvConfig::default()
+        };
+        ctx.secrets = Some(secrets);
+        ctx
+    }
+
+    fn leaks(text: &str) -> bool {
+        [SECRET_VALUE, SECRET_CONFIGURED, REMEMBERED_VALUE]
+            .iter()
+            .any(|secret| text.contains(secret))
+    }
+
+    #[test]
+    fn a_shell_receives_the_session_secret_over_the_configured_value_and_never_shows_either() {
+        let root = TempDir::new().expect("tempdir");
+        let state = TempDir::new().expect("state");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = secret_context(
+            root.path(),
+            state.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+        );
+        let command = format!(
+            "test \"${SECRET_NAME}\" = {SECRET_VALUE} && echo '{SECRET_MATCHED}'; \
+             echo \"${SECRET_NAME} ${REMEMBERED_NAME}\"; echo \"${SECRET_NAME}\" >&2"
+        );
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({ "command": command }))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+
+        let result = smol::block_on(invocation.execute(&ctx));
+
+        let model_output = result.model_output.clone().unwrap_or_default();
+        let ToolOutput::Shell(output) = result.output.unwrap() else {
+            panic!("expected typed shell output");
+        };
+        let shown_secret = shown_variable(SECRET_NAME);
+        let shown_remembered = shown_variable(REMEMBERED_NAME);
+        assert_eq!(
+            output.stdout.lines().collect::<Vec<_>>(),
+            [
+                SECRET_MATCHED.to_owned(),
+                format!("{shown_secret} {shown_remembered}")
+            ]
+        );
+        assert_eq!(output.stderr.trim(), shown_secret);
+        for text in [
+            &output.stdout,
+            &output.stderr,
+            &output.model_text,
+            &model_output,
+        ] {
+            assert!(!leaks(text), "{SECRET_LEAKED}: {text}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_shell_hides_secrets_in_live_rows_and_its_output_so_far() {
+        let root = TempDir::new().expect("tempdir");
+        let state = TempDir::new().expect("state");
+        let (_host, registry) = host_and_registry(root.path());
+        let (trigger, token) = CancelToken::new();
+        let mut ctx = secret_context(root.path(), state.path(), Arc::clone(&registry), token);
+        let live = ShellLive::default();
+        ctx.shell_live = Some(live.clone());
+        let shown = shown_variable(SECRET_NAME);
+        let command =
+            format!("echo \"${SECRET_NAME} ${REMEMBERED_NAME}\" && exec sleep {SLEEPER_SECONDS}");
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({ "command": command }))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let live_text = || {
+            live.lines()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.to_string()))
+                .collect::<String>()
+        };
+
+        let result = smol::block_on(future::or(invocation.execute(&ctx), async {
+            assert!(
+                eventually(|| live_text().contains(&shown)).await,
+                "the command printed nothing"
+            );
+            trigger.cancel();
+            future::pending().await
+        }));
+
+        assert!(!leaks(&live_text()), "{SECRET_LEAKED}");
+        let message = result.output.expect_err(SHELL_CANCELLED);
+        assert!(message.contains(&shown), "{message}");
+        assert!(!leaks(&message), "{SECRET_LEAKED}: {message}");
     }
 
     #[cfg(target_os = "linux")]

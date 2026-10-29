@@ -11,6 +11,7 @@ use std::sync::Arc;
 use caudra_config::ModelPolicy;
 pub use caudra_config::providers::ModelPurpose;
 use caudra_config::providers::{ModelFields, UnknownPurpose};
+use caudra_models::Api;
 use caudra_storage::sessions::{StoredTokenUsage, cache_hit_rate};
 use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
@@ -34,7 +35,6 @@ const PER_MILLION: f64 = 1_000_000.0;
 const TOKEN_THOUSAND: u64 = 1_000;
 const TOKEN_MILLION: u64 = 1_000_000;
 const TOKEN_TENTHS: u128 = 10;
-pub(crate) const ANTHROPIC_SLUG: &str = "anthropic";
 const GPT_PREFIX: &str = "gpt-";
 const GPT_4_PREFIX: &str = "gpt-4";
 const OPEN_WEIGHTS_PREFIX: &str = "gpt-oss";
@@ -67,6 +67,8 @@ pub enum ModelError {
     UnsupportedProvider(String),
     #[error("unknown model '{0}'")]
     UnknownModel(String),
+    #[error("model '{model}' needs a newer Caudra ({reason}). Upgrade Caudra to use this model.")]
+    NeedsNewerCaudra { model: String, reason: &'static str },
     #[error(transparent)]
     InvalidPurpose(#[from] UnknownPurpose),
     #[error("model '{0}' is not allowed by provider model policy")]
@@ -98,7 +100,7 @@ pub struct PricingTier {
     pub fast: Option<FastPricing>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -316,7 +318,7 @@ pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     /// Whether this is a deliberately small model. False means known non-small,
@@ -330,9 +332,14 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    pub window_excludes_output: bool,
+    pub unsupported: Option<&'static str>,
     /// Corrects the catalog where it describes the model rather than the
-    /// request caudra sends. `None` defers to discovery and models.dev.
+    /// request caudra sends. `None` defers to discovery and the catalog.
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
+    pub api: Option<Api>,
+    pub plan_context_window: Option<u32>,
+    pub supports_thinking: Option<bool>,
 }
 
 /// A release line, so a routing lane can answer inside the line the user is
@@ -342,6 +349,7 @@ pub struct ModelEntry {
 /// `members` are id prefixes. The longest match wins, so a line can be spelled
 /// as broadly as `gpt-6-` without capturing a narrower line declared beside it.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ModelGeneration {
     pub label: &'static str,
     pub members: &'static [&'static str],
@@ -445,6 +453,9 @@ impl Billing {
 
 #[derive(Debug, Clone)]
 pub struct Model {
+    pub model_revision: u64,
+    pub manifest: Option<&'static ProviderManifest>,
+    pub entry: Option<&'static ModelEntry>,
     pub id: String,
     pub provider: Arc<str>,
     pub family: ModelFamily,
@@ -470,6 +481,7 @@ pub struct Model {
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
+    pub catalog_free: bool,
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
@@ -487,12 +499,6 @@ pub struct Model {
     /// API key and a subscription set it from their auth in `adjust_model`, so
     /// a model built from a spec alone is `Api` until a provider says otherwise.
     pub billing: Billing,
-}
-
-#[derive(Clone, Copy)]
-enum CatalogAccess {
-    Warm,
-    IfAvailable,
 }
 
 /// `ManifestRegistry::for_slug` resolves a custom slug to its base provider's
@@ -517,10 +523,48 @@ fn inherited_lineage(
 }
 
 impl Model {
+    pub fn same_configuration(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.provider == other.provider
+            && self.family == other.family
+            && self.entry == other.entry
+            && self.pricing == other.pricing
+            && self.dated_rates == other.dated_rates
+            && self.max_output_tokens == other.max_output_tokens
+            && self.context_window == other.context_window
+            && self.window_excludes_output == other.window_excludes_output
+            && self.thinking_fields == other.thinking_fields
+            && self.reasoning_options == other.reasoning_options
+            && self.billing == other.billing
+            && self.discovered_free == other.discovered_free
+            && self.catalog_free == other.catalog_free
+            && self.supports_tool_examples_override == other.supports_tool_examples_override
+            && self.thinking_override == other.thinking_override
+            && self.supports_vision_override == other.supports_vision_override
+            && self.supports_cache_breakpoints_override == other.supports_cache_breakpoints_override
+            && self.supports_pdf == other.supports_pdf
+            && self
+                .manifest
+                .map(|m| (m.supports_thinking, m.serves_fast_mode, m.pricing_schedule))
+                == other
+                    .manifest
+                    .map(|m| (m.supports_thinking, m.serves_fast_mode, m.pricing_schedule))
+    }
+
     /// When no static entry matches (a freshly released model the table has not
     /// caught up to yet), fall back to the provider defaults so it still resolves.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
+    fn from_base(
+        manifest: &'static ProviderManifest,
+        slug: &str,
+        model_id: &str,
+    ) -> Result<Self, ModelError> {
         let static_entry = lookup_entry(manifest.models, model_id).ok();
+        if let Some(reason) = static_entry.and_then(|entry| entry.unsupported) {
+            return Err(ModelError::NeedsNewerCaudra {
+                model: format!("{slug}/{model_id}"),
+                reason,
+            });
+        }
         // A wrapper's own listing wins. Before it has listed, metadata already
         // discovered through the builtin remains a useful fallback.
         let discovered = model_registry::discovered(slug, model_id).or_else(|| {
@@ -585,12 +629,7 @@ impl Model {
             })
             .or_else(|| anthropic::shared::long_context_window(model_id).map(|w| (w, false)))
             .or_else(|| {
-                static_entry.map(|entry| {
-                    (
-                        entry.context_window,
-                        anthropic::shared::declares_input_budget(manifest.slug, entry),
-                    )
-                })
+                static_entry.map(|entry| (entry.context_window, entry.window_excludes_output))
             })
             .or_else(|| catalog.map(|meta| (meta.context, meta.context_excludes_output)))
             .unwrap_or((manifest.fallback_context_window, false));
@@ -614,6 +653,9 @@ impl Model {
             .or_else(|| catalog_reasoning_options(catalog))
             .unwrap_or_default();
         let mut model = Self {
+            model_revision: crate::model_data::current().revision,
+            manifest: Some(manifest),
+            entry: static_entry,
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family,
@@ -625,6 +667,7 @@ impl Model {
             pricing,
             dated_rates,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
+            catalog_free: crate::providers::catalog::free_model(slug, model_id),
             max_output_tokens,
             context_window,
             window_excludes_output,
@@ -633,7 +676,7 @@ impl Model {
             billing: Billing::default(),
         };
         model.apply_declared_limits();
-        model
+        Ok(model)
     }
 
     /// Lay the limits `providers.toml` declares for this model over every other
@@ -654,17 +697,19 @@ impl Model {
         self.max_output_tokens = declared.max_output_tokens.or(self.max_output_tokens);
     }
 
-    /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
-    /// fireworks, groq, ...). The slug is the catalogue sub-provider key, not a
-    /// builtin; metadata is read once from the models.dev catalog and cached on
-    /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
-    /// catalog lookup.
+    /// Build a `Model` from a catalog sub-provider such as nvidia. The slug is
+    /// the catalog's provider key, not a builtin; metadata is read once from the
+    /// catalog and cached on the `Model` so `supports_thinking`/`supports_vision`
+    /// do not need a live catalog lookup.
     fn from_catalog(
         slug: &str,
         model_id: &str,
         meta: crate::providers::catalog::CatalogMetaView,
     ) -> Self {
         Self {
+            model_revision: crate::model_data::current().revision,
+            manifest: None,
+            entry: None,
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family: ModelFamily::Generic,
@@ -683,6 +728,9 @@ impl Model {
             },
             dated_rates: None,
             discovered_free: false,
+            catalog_free: crate::providers::catalog::OPENCODE_FAMILY_SLUGS.contains(&slug)
+                && meta.input_price == 0.0
+                && meta.output_price == 0.0,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
             window_excludes_output: meta.context_excludes_output,
@@ -702,13 +750,18 @@ impl Model {
         }
     }
 
+    pub(crate) fn exact_entry(&self) -> Option<&'static ModelEntry> {
+        self.entry
+            .filter(|entry| entry.prefixes.contains(&self.id.as_str()))
+    }
+
     pub fn supports_thinking(&self) -> bool {
         if let Some(thinking) = self.thinking_override {
             return thinking != ThinkingSupport::No;
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
         // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        let Some(manifest) = self.manifest else {
             return false;
         };
         model_registry::discovered(manifest.slug, &self.id)
@@ -728,7 +781,7 @@ impl Model {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let manifest = ManifestRegistry::for_slug(&self.provider);
+        let manifest = self.manifest;
         manifest
             .and_then(|m| {
                 model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
@@ -789,8 +842,7 @@ impl Model {
     /// how an oauth script keeps fast mode. Bedrock separately ignores
     /// `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
-        self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.serves_fast_mode)
+        self.pricing.fast.is_some() && self.manifest.is_some_and(|m| m.serves_fast_mode)
     }
 
     pub fn spec(&self) -> String {
@@ -819,7 +871,7 @@ impl Model {
     ) -> Option<f64> {
         let pricing = self.dated_rates.map_or(&self.pricing, |dated| dated.at(at));
         let cost = (!pricing.is_zero()).then(|| usage.cost(pricing, fast))?;
-        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+        let schedule = self.manifest.and_then(|m| m.pricing_schedule);
         Some(schedule.map_or(cost, |s| cost * s.multiplier_at(at)))
     }
 
@@ -837,7 +889,7 @@ impl Model {
     }
 
     pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
+        self.manifest.map_or("Unknown", |m| m.display_name)
     }
 
     /// Which model serves `purpose` while `anchor` is the caller's current model.
@@ -850,30 +902,7 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        Self::resolve_seen(
-            purpose,
-            anchor,
-            policy,
-            &mut Vec::new(),
-            CatalogAccess::Warm,
-        )
-    }
-
-    /// Non-warming variant of [`Self::resolve`] for latency-sensitive callers.
-    /// An exact binding whose catalog provider is not already available returns
-    /// [`ModelError::UnsupportedProvider`] without loading the catalog.
-    pub fn resolve_if_available(
-        purpose: ModelPurpose,
-        anchor: &Self,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        Self::resolve_seen(
-            purpose,
-            anchor,
-            policy,
-            &mut Vec::new(),
-            CatalogAccess::IfAvailable,
-        )
+        Self::resolve_seen(purpose, anchor, policy, &mut Vec::new())
     }
 
     /// [`Self::resolve`] against a binding the caller already read, so a caller
@@ -884,31 +913,12 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::Warm)
-    }
-
-    /// Non-warming variant of [`Self::resolve_binding`].
-    pub fn resolve_binding_if_available(
-        purpose: ModelPurpose,
-        binding: Option<&Binding>,
-        anchor: &Self,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::IfAvailable)
-    }
-
-    fn resolve_captured_binding(
-        purpose: ModelPurpose,
-        binding: Option<&Binding>,
-        anchor: &Self,
-        policy: &ModelPolicy,
-        catalog_access: CatalogAccess,
-    ) -> Result<Self, ModelError> {
         let seen = &mut vec![purpose];
         match binding {
-            Some(binding) => Self::follow(binding, anchor, policy, seen, catalog_access),
-            None => Ok(Self::auto(purpose, anchor, policy, seen, catalog_access)?
-                .unwrap_or_else(|| anchor.clone())),
+            Some(binding) => Self::follow(binding, anchor, policy, seen),
+            None => {
+                Ok(Self::auto(purpose, anchor, policy, seen)?.unwrap_or_else(|| anchor.clone()))
+            }
         }
     }
 
@@ -917,12 +927,8 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
-        Ok(
-            Self::resolve_chosen(purpose, anchor, policy, seen, catalog_access)?
-                .unwrap_or_else(|| anchor.clone()),
-        )
+        Ok(Self::resolve_chosen(purpose, anchor, policy, seen)?.unwrap_or_else(|| anchor.clone()))
     }
 
     /// What a binding or the purpose's own rule chooses; `None` when neither
@@ -932,15 +938,14 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Option<Self>, ModelError> {
         if seen.contains(&purpose) {
             return Err(ModelError::PurposeCycle(purpose));
         }
         seen.push(purpose);
         match model_registry::binding(purpose) {
-            Some(binding) => Self::follow(&binding, anchor, policy, seen, catalog_access).map(Some),
-            None => Self::auto(purpose, anchor, policy, seen, catalog_access),
+            Some(binding) => Self::follow(&binding, anchor, policy, seen).map(Some),
+            None => Self::auto(purpose, anchor, policy, seen),
         }
     }
 
@@ -949,21 +954,10 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         match binding {
-            Binding::Exact(spec) => {
-                match (catalog_access, Self::from_spec_with_policy(spec, policy)) {
-                    (CatalogAccess::Warm, Err(ModelError::UnsupportedProvider(_))) => {
-                        crate::warm_catalog();
-                        Self::from_spec_with_policy(spec, policy)
-                    }
-                    (_, result) => result,
-                }
-            }
-            Binding::Same(other) => {
-                Self::resolve_seen(*other, anchor, policy, seen, catalog_access)
-            }
+            Binding::Exact(spec) => Self::from_spec_with_policy(spec, policy),
+            Binding::Same(other) => Self::resolve_seen(*other, anchor, policy, seen),
         }
     }
 
@@ -972,7 +966,6 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Option<Self>, ModelError> {
         match purpose {
             // A memory line stands in for its notes for months, and a learned
@@ -985,10 +978,10 @@ impl Model {
             | ModelPurpose::Memory
             | ModelPurpose::Learn => Ok(Some(anchor.clone())),
             ModelPurpose::Title | ModelPurpose::Goal | ModelPurpose::Extract => {
-                Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
+                Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen)
             }
             ModelPurpose::Autopilot => {
-                Self::resolve_chosen(ModelPurpose::Best, anchor, policy, seen, catalog_access)
+                Self::resolve_chosen(ModelPurpose::Best, anchor, policy, seen)
             }
             ModelPurpose::Fast | ModelPurpose::Best => {
                 Ok(Self::provider_default(purpose, anchor, policy))
@@ -1078,31 +1071,78 @@ impl Model {
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
+        loop {
+            let revision = crate::model_data::current().revision;
+            let resolved = Self::resolve_spec(spec);
+            if revision == crate::model_data::current().revision {
+                let mut model = resolved?;
+                model.model_revision = revision;
+                return Ok(model);
+            }
+        }
+    }
+
+    pub fn refreshed(&self, policy: &ModelPolicy) -> Result<Self, ModelError> {
+        let model = Self::from_spec_with_policy(&self.spec(), policy)?;
+        if self
+            .manifest
+            .is_some_and(|manifest| manifest.slug == "opencode")
+        {
+            let (slug, id) = self.id.split_once('/').unwrap_or(("opencode", &self.id));
+            if crate::providers::catalog::model_meta(slug, id).is_none() {
+                return Err(ModelError::UnknownModel(self.spec()));
+            }
+        }
+        let was_curated = self
+            .manifest
+            .is_some_and(|manifest| lookup_entry(manifest.models, &self.id).is_ok());
+        let still_curated = model
+            .manifest
+            .is_some_and(|manifest| lookup_entry(manifest.models, &model.id).is_ok());
+        if was_curated && !still_curated {
+            return Err(ModelError::UnknownModel(self.spec()));
+        }
+        Ok(model)
+    }
+
+    fn resolve_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
+        if let Some(&reason) = crate::model_data::current().unsupported_providers.get(slug) {
+            return Err(ModelError::NeedsNewerCaudra {
+                model: spec.to_owned(),
+                reason,
+            });
+        }
 
         // Precedence: builtin, then dynamic script, then providers.toml custom,
-        // then models.dev catalogue sub-provider.
+        // then catalog sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
         if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
+            return Self::from_base(manifest, slug, model_id);
         }
 
         if let Some(model) = dynamic::lookup_model(slug, model_id) {
+            if let Some(reason) = model.entry.and_then(|entry| entry.unsupported) {
+                return Err(ModelError::NeedsNewerCaudra {
+                    model: spec.to_owned(),
+                    reason,
+                });
+            }
             return Ok(model);
         }
 
         if let Some(base) = dynamic::base_for_slug(slug)
             && let Some(manifest) = ManifestRegistry::get(&base.to_string())
         {
-            return Ok(Self::from_base(manifest, slug, model_id));
+            return Self::from_base(manifest, slug, model_id);
         }
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
             return Ok(model);
         }
 
-        if let Some(meta) = crate::providers::catalog::model_meta_if_available(slug, model_id) {
+        if let Some(meta) = crate::providers::catalog::model_meta(slug, model_id) {
             return Ok(Self::from_catalog(slug, model_id, meta));
         }
 
@@ -1113,13 +1153,8 @@ impl Model {
     /// using the catalog's definition of free (zero input and output price),
     /// the same one that gates `enable_free_models`, plus models a provider's
     /// `/models` call reported at an explicit zero price.
-    ///
-    /// Queries the live catalog rather than `self.pricing`, which may not yet
-    /// reflect catalog prices when discovery hasn't seeded the registry, and
-    /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free
-            || crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
+        self.discovered_free || self.catalog_free
     }
 }
 
@@ -1294,8 +1329,8 @@ mod tests {
     const AGGREGATOR: &str = "tensorx";
     const ALIASED_VENDOR_MODEL: &str = "z-ai/glm-4.5-air";
     const UNCLASSIFIABLE: &str = "ollama";
-    const UNKNOWN_CATALOG_PROVIDER: &str = "caudra-cold-catalog-test-provider";
-    const UNKNOWN_CATALOG_SPEC: &str = "caudra-cold-catalog-test-provider/model";
+    const UNKNOWN_CATALOG_PROVIDER: &str = "caudra-unknown-catalog-test-provider";
+    const UNKNOWN_CATALOG_SPEC: &str = "caudra-unknown-catalog-test-provider/model";
 
     const OPENAI_CHAT_SPEC: &str = "openai/gpt-5.6-sol";
 
@@ -1541,10 +1576,8 @@ mod tests {
         let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
 
         let model = Model::resolve(purpose, &anchor, &policy(&[], &[])).unwrap();
-        let non_warming = Model::resolve_if_available(purpose, &anchor, &policy(&[], &[])).unwrap();
 
         assert_eq!(model.spec(), expected);
-        assert_eq!(non_warming.spec(), model.spec());
     }
 
     /// A lane answers inside the anchor's own release line. Anthropic declares
@@ -1567,19 +1600,14 @@ mod tests {
     }
 
     #[test]
-    fn non_warming_resolution_leaves_an_unknown_exact_provider_cold() {
-        assert!(crate::catalog_providers_if_available().is_none());
+    fn resolution_rejects_an_unknown_exact_provider() {
         let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
         let binding = Binding::Exact(UNKNOWN_CATALOG_SPEC.to_string());
         let model_policy = policy(&[], &[]);
 
-        let captured_error = Model::resolve_binding_if_available(
-            ModelPurpose::Plan,
-            Some(&binding),
-            &anchor,
-            &model_policy,
-        )
-        .unwrap_err();
+        let captured_error =
+            Model::resolve_binding(ModelPurpose::Plan, Some(&binding), &anchor, &model_policy)
+                .unwrap_err();
         assert!(matches!(
             captured_error,
             ModelError::UnsupportedProvider(provider)
@@ -1589,35 +1617,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
         model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, &state_dir).unwrap();
-        let purpose_error =
-            Model::resolve_if_available(ModelPurpose::Plan, &anchor, &model_policy).unwrap_err();
+        let purpose_error = Model::resolve(ModelPurpose::Plan, &anchor, &model_policy).unwrap_err();
         assert!(matches!(
             purpose_error,
             ModelError::UnsupportedProvider(provider)
                 if provider == UNKNOWN_CATALOG_PROVIDER
         ));
-        assert!(crate::catalog_providers_if_available().is_none());
         model_registry::clear_binding_and_persist(ModelPurpose::Plan, &state_dir).unwrap();
-    }
-
-    #[test]
-    fn captured_non_warming_resolution_matches_resolution_for_an_available_model() {
-        let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
-        let binding = Binding::Exact("anthropic/claude-haiku-4-5".to_string());
-        let model_policy = policy(&[], &[]);
-
-        let resolved =
-            Model::resolve_binding(ModelPurpose::Fast, Some(&binding), &anchor, &model_policy)
-                .unwrap();
-        let non_warming = Model::resolve_binding_if_available(
-            ModelPurpose::Fast,
-            Some(&binding),
-            &anchor,
-            &model_policy,
-        )
-        .unwrap();
-
-        assert_eq!(non_warming.spec(), resolved.spec());
     }
 
     /// No anchor to read a line from, so these are the provider-wide answers:
@@ -1638,10 +1644,6 @@ mod tests {
 
     #[test]
     fn from_spec_unknown_catalogue_subprovider_is_unsupported() {
-        // The on-disk models.dev cache may populate the catalog in a
-        // developer's environment, so pick a slug that is likely not in any
-        // catalog and confirm it falls through to the generic
-        // unsupported-provider branch.
         let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
         assert!(matches!(err, ModelError::UnsupportedProvider(_)));
     }
@@ -1851,7 +1853,7 @@ mod tests {
         cache_read: 300_000,
     };
 
-    /// An `openai/` session never warms the catalog, so the table alone has to
+    /// The curated table owns these rates, independently of catalog metadata,
     /// know what a prompt past 272K costs.
     #[test_case(false, 0.325 ; "standard")]
     #[test_case(true, 0.650  ; "fast")]
@@ -2046,7 +2048,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-nonexistent-99",
-        );
+        )
+        .unwrap();
         assert_eq!(model.provider, Arc::<str>::from("anthropic"));
         assert_eq!(model.id, "claude-nonexistent-99");
         assert_eq!(model.spec(), "anthropic/claude-nonexistent-99");
@@ -2090,7 +2093,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
-        );
+        )
+        .unwrap();
         assert_eq!(model.supports_fast(), expected);
     }
 
@@ -2113,6 +2117,7 @@ mod tests {
             "anthropic",
             model_id,
         )
+        .unwrap()
         .pricing;
         assert_eq!(
             (
@@ -2134,7 +2139,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-opus-5-5",
-        );
+        )
+        .unwrap();
         let usage = TokenUsage {
             cache_read: 1_000_000,
             ..Default::default()
@@ -2150,7 +2156,8 @@ mod tests {
             ManifestRegistry::get("google").unwrap(),
             "google",
             "gemini-4-argon",
-        );
+        )
+        .unwrap();
         model.pricing.fast = Some(FastPricing::derived(30.0, 150.0));
         assert!(!model.supports_fast());
     }
@@ -2260,7 +2267,8 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model =
+            Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id).unwrap();
         assert_eq!(model.context_window, expected_window);
 
         // A dynamic/custom slug shares its base provider's discovery.
@@ -2268,7 +2276,8 @@ mod tests {
             ManifestRegistry::get("ollama").unwrap(),
             "my-ollama-wrap",
             model_id,
-        );
+        )
+        .unwrap();
         assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
         assert_eq!(wrapped.context_window, expected_window);
     }
@@ -2298,7 +2307,8 @@ mod tests {
             ManifestRegistry::get("openai").unwrap(),
             wrapper_slug,
             model_id,
-        );
+        )
+        .unwrap();
 
         assert_eq!(model.spec(), format!("{wrapper_slug}/{model_id}"));
         assert_eq!(model.context_window, wrapper_window);
@@ -2319,7 +2329,8 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model =
+            Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id).unwrap();
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
@@ -2346,7 +2357,12 @@ mod tests {
         pricing: input_only(TABLE_INPUT_RATE),
         max_output_tokens: None,
         context_window: 1_000,
+        window_excludes_output: false,
+        unsupported: None,
         reasoning_options: None,
+        api: None,
+        plan_context_window: None,
+        supports_thinking: None,
     }];
     /// One date the suite never reaches and one long gone, so the real clock
     /// that `from_base` reads cannot move the answer.
@@ -2397,7 +2413,8 @@ mod tests {
             ..*ManifestRegistry::get("google").unwrap()
         };
 
-        let model = Model::from_base(&manifest, slug, PRICE_PERIOD_MODEL);
+        let model =
+            Model::from_base(Box::leak(Box::new(manifest)), slug, PRICE_PERIOD_MODEL).unwrap();
 
         assert_eq!(
             model.pricing.input, expected_rate,

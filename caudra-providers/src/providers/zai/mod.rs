@@ -7,7 +7,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::accounts::{AccountCredential, QuotaWindow, WindowKind};
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
+use crate::model::{Model, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
@@ -26,9 +26,6 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
 };
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-/// The models that take `reasoning_effort`, from
-/// <https://docs.z.ai/guides/overview/migrate-to-glm-new>.
-const THINKING_MODELS: &[&str] = &["glm-5.2", "glm-5.3"];
 
 #[derive(Deserialize)]
 struct QuotaResponse {
@@ -126,318 +123,6 @@ inventory::submit!(BuiltInProvider {
     login_url: Some("https://z.ai/manage-apikey/apikey-list"),
     needs_url: false,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["glm-5.3"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.2"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.1"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3-flashx"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.37,
-                output: 1.25,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3-flash"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flashx"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.07,
-                output: 0.40,
-                cache_write: 0.00,
-                cache_read: 0.01,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flash"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7", "glm-4.6"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.6v"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.30,
-                output: 0.90,
-                cache_write: 0.00,
-                cache_read: 0.05,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 128_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.6v-flashx"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.04,
-                output: 0.40,
-                cache_write: 0.00,
-                cache_read: 0.004,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 128_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.6v-flash"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 128_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-flash"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-air"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.10,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-airx"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.10,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.22,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-x"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.20,
-                output: 8.90,
-                cache_write: 0.00,
-                cache_read: 0.45,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-            reasoning_options: None,
-        },
-    ];
-    MODELS
-}
 
 pub struct Zai {
     compat: OpenAiCompatProvider,
@@ -561,15 +246,20 @@ impl Provider for Zai {
 }
 
 pub(crate) fn adjust_model(model: &mut Model) {
-    if THINKING_MODELS.contains(&model.id.as_str()) {
-        model.thinking_override = Some(ThinkingSupport::Yes);
+    if let Some(supports) = model
+        .exact_entry()
+        .and_then(|entry| entry.supports_thinking)
+    {
+        model.thinking_override = ThinkingSupport::from_flags(Some(supports), false);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestRegistry;
     use crate::model::lookup_entry;
+    use crate::model_data::edit_model;
     use test_case::test_case;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[
@@ -577,6 +267,27 @@ mod tests {
         {"type":"TOKENS_LIMIT","unit":6,"percentage":4,"nextResetTime":1778262784969},
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
+    const THINKING_ID: &str = "glm-5.1";
+    const THINKING_SPEC: &str = "zai/glm-5.1";
+    const THINKING_NEAR_MATCH: &str = "zai/glm-5.1-preview";
+
+    #[test_case(None, false; "default")]
+    #[test_case(Some(false), false; "disabled")]
+    #[test_case(Some(true), true; "enabled")]
+    fn data_alone_changes_exact_id_thinking_support(supports: Option<bool>, expected: bool) {
+        let mut old = Model::from_spec(THINKING_SPEC).unwrap();
+        edit_model("zai", THINKING_ID, |entry| {
+            entry.supports_thinking = supports
+        });
+        let mut model = Model::from_spec(THINKING_SPEC).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.supports_thinking(), expected);
+        adjust_model(&mut old);
+        assert!(!old.supports_thinking());
+        let mut near_match = Model::from_spec(THINKING_NEAR_MATCH).unwrap();
+        adjust_model(&mut near_match);
+        assert!(!near_match.supports_thinking());
+    }
 
     #[test_case("glm-4.7-flashx", 0.07, 0.01, 0.40, false ; "paid_flashx")]
     #[test_case("glm-4.7-flash", 0.00, 0.00, 0.00, true ; "free_flash")]
@@ -587,7 +298,7 @@ mod tests {
         output: f64,
         default: bool,
     ) {
-        let entry = lookup_entry(models(), id).unwrap();
+        let entry = lookup_entry(ManifestRegistry::get("zai").unwrap().models, id).unwrap();
         assert!(entry.prefixes.contains(&id));
         assert_eq!(entry.pricing.input, input);
         assert_eq!(entry.pricing.cache_read, cache_read);
@@ -615,7 +326,7 @@ mod tests {
         small: bool,
         context_window: u32,
     ) {
-        let entry = lookup_entry(models(), id).unwrap();
+        let entry = lookup_entry(ManifestRegistry::get("zai").unwrap().models, id).unwrap();
         assert!(entry.prefixes.contains(&id));
         assert_eq!(entry.pricing.input, input);
         assert_eq!(entry.pricing.cache_read, cache_read);

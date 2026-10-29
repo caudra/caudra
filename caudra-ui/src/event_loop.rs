@@ -2637,6 +2637,13 @@ impl<'t> EventLoop<'t> {
             }
         }
         dirty |= self.poll_sandbox_actions();
+        let settings_stale = self.sessions.iter_mut().fold(false, |stale, runtime| {
+            runtime.app.take_settings_stale() | stale
+        });
+        if settings_stale {
+            self.reread_settings();
+            dirty |= Dirty::YES;
+        }
         for (runtime, previous) in self.sessions.iter_mut().zip(blocked) {
             let current = runtime.app.sandbox_network_dispatch_blocker();
             if previous.is_some() && current.is_none() {

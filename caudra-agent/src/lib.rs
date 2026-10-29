@@ -63,6 +63,7 @@ pub mod pstack;
 pub mod remote_project_context;
 pub mod restart;
 pub mod scratch;
+pub mod secrets;
 pub mod session_fork;
 pub mod shell_environment;
 pub mod shell_eta;

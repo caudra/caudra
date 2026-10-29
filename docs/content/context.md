@@ -197,6 +197,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items and no background work is running, at most once per run |
 | Stalled work | After a compaction, when a request has gone through `work_nudge_compactions` compactions with no work started |
 | Long-running shell | Every `shell_wait_nudge_minutes` while a background shell runs, to the agent waiting on it |
+| Save what you learned | After a recovered command, a long search ending in an edit, a correction, or near compaction, while the project has few [memory notes](/docs/memory/#reminders-to-save-notes) |
 | Autopilot | When [autopilot](/docs/autopilot/) engages, and again to withdraw that when it ends |
 | Model favorites | On the first message once the main agent can choose a task's model and you have [favorite models](/docs/commands/#models-and-reasoning), again when they or the jobs bound to them change, and once to withdraw them when none apply |
 

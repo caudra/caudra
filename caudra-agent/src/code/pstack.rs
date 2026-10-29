@@ -38,6 +38,7 @@ use crate::permissions::{
     PermissionExecutorKind, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
     PermissionRisk, PermissionSubject, filesystem_permission_resource,
 };
+use crate::secrets::SessionSecrets;
 use crate::shell_environment::local_command_environment;
 use crate::tools::registry::{PermissionIntent, PermissionScopes};
 use crate::tools::{CODE_TOOL_NAME, ToolContext, ToolLive, native};
@@ -171,7 +172,7 @@ fn plan(cwd: PathBuf, call: ScriptCall) -> Result<HostCallPlan, ScriptError> {
                 state: StateDir::resolve()
                     .ok()
                     .filter(|state| !state.is_ephemeral()),
-                environment: command_environment(&ctx.config.shell_env),
+                environment: command_environment(&ctx.config.shell_env, ctx.secrets.as_ref()),
                 gh_signed_out: AtomicBool::new(false),
             };
             let output = smol::unblock(move || {
@@ -202,8 +203,11 @@ fn check_session_plan(ctx: &ToolContext) -> Output {
 }
 
 /// What a `shell` command gets, then [`PROMPTS_OFF`].
-fn command_environment(config: &ShellEnvConfig) -> Vec<(String, OsString)> {
-    let mut environment = local_command_environment(config);
+fn command_environment(
+    config: &ShellEnvConfig,
+    secrets: Option<&SessionSecrets>,
+) -> Vec<(String, OsString)> {
+    let mut environment = local_command_environment(config, secrets);
     environment.extend(
         PROMPTS_OFF
             .iter()
@@ -597,7 +601,7 @@ mod tests {
             cancel,
             live: None,
             state: None,
-            environment: command_environment(&ShellEnvConfig::default()),
+            environment: command_environment(&ShellEnvConfig::default(), None),
             gh_signed_out: AtomicBool::new(false),
         }
     }

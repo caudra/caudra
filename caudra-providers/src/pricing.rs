@@ -31,7 +31,7 @@ pub(crate) const FLAT_RATE: f64 = 1.0;
 /// constant edit instead of new code.
 ///
 /// One multiplier is enough while providers move all four rates together.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PricingSchedule {
     windows: &'static [PricingWindow],
     multiplier: f64,
@@ -39,20 +39,16 @@ pub struct PricingSchedule {
 
 /// Half-open `[start, end)` in whole UTC hours. `start > end` wraps past
 /// midnight, so a window never needs splitting in two.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PricingWindow {
     start: u8,
     end: u8,
 }
 
 impl PricingWindow {
-    /// `hours(22, 2)` wraps past midnight. Every window is a `const`, so a typo
-    /// here is a build error rather than a mispriced turn.
-    pub const fn hours(start: u8, end: u8) -> Self {
-        assert!(start < HOURS_PER_DAY, "window starts after the day ends");
-        assert!(end <= HOURS_PER_DAY, "window ends after the day ends");
-        assert!(start != end, "window covers no time at all");
-        Self { start, end }
+    pub(crate) fn try_hours(start: u8, end: u8) -> Option<Self> {
+        (start < HOURS_PER_DAY && end <= HOURS_PER_DAY && start != end)
+            .then_some(Self { start, end })
     }
 
     fn contains(&self, hour: u8) -> bool {
@@ -72,19 +68,11 @@ impl fmt::Display for PricingWindow {
 }
 
 impl PricingSchedule {
-    pub const fn new(windows: &'static [PricingWindow], multiplier: f64) -> Self {
-        assert!(
-            !windows.is_empty(),
-            "a schedule with no windows never applies; drop it instead"
-        );
-        assert!(
-            multiplier > FLAT_RATE,
-            "model tables quote the off-peak rates, so a schedule only ever adds a surcharge"
-        );
-        Self {
+    pub(crate) fn try_new(windows: &'static [PricingWindow], multiplier: f64) -> Option<Self> {
+        (!windows.is_empty() && multiplier.is_finite() && multiplier > FLAT_RATE).then_some(Self {
             windows,
             multiplier,
-        }
+        })
     }
 
     pub(crate) fn multiplier_at(&self, at: Timestamp) -> f64 {
@@ -175,7 +163,7 @@ fn utc_day(at: Timestamp) -> Date {
 /// (`Period::until`), or both. Inside `during` every turn bills at `pricing`,
 /// tiers included, and outside it at the entry's own rates, so a build shipped
 /// before either edge stays right after it.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PricePeriod {
     /// The `ModelEntry` prefix whose rates the period sets.
     pub prefix: &'static str,
@@ -186,7 +174,7 @@ pub struct PricePeriod {
 /// An entry's rates on both sides of its [`PricePeriod`]. A model billed from
 /// the static table carries them while an edge is still ahead, so each turn
 /// pays the side it ends on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DatedRates {
     pub period: &'static PricePeriod,
     pub otherwise: &'static ModelPricing,
@@ -345,11 +333,19 @@ mod tests {
     const SECONDS_PER_MINUTE: i64 = 60;
     const PEAK: f64 = 2.0;
     const DAYS_SINCE_EPOCH: i64 = 20_000;
-    const PEAK_WINDOWS: &[PricingWindow] =
-        &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
-    const WRAPPING_WINDOW: &[PricingWindow] = &[PricingWindow::hours(22, 2)];
-    const UNTIL_MIDNIGHT_WINDOW: &[PricingWindow] = &[PricingWindow::hours(22, HOURS_PER_DAY)];
-    const WHOLE_DAY_WINDOW: &[PricingWindow] = &[PricingWindow::hours(0, HOURS_PER_DAY)];
+    const PEAK_WINDOWS: &[PricingWindow] = &[
+        PricingWindow { start: 1, end: 4 },
+        PricingWindow { start: 6, end: 10 },
+    ];
+    const WRAPPING_WINDOW: &[PricingWindow] = &[PricingWindow { start: 22, end: 2 }];
+    const UNTIL_MIDNIGHT_WINDOW: &[PricingWindow] = &[PricingWindow {
+        start: 22,
+        end: HOURS_PER_DAY,
+    }];
+    const WHOLE_DAY_WINDOW: &[PricingWindow] = &[PricingWindow {
+        start: 0,
+        end: HOURS_PER_DAY,
+    }];
     const LAST_MINUTE: i64 = 59;
     const LAST_SECOND: i64 = 59;
 
@@ -393,6 +389,9 @@ mod tests {
 
     fn model(id: &str, input_rate: f64) -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get("anthropic"),
+            entry: None,
             id: id.into(),
             provider: Arc::from("anthropic"),
             family: ModelFamily::Claude,
@@ -407,6 +406,7 @@ mod tests {
             },
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: None,
             context_window: 0,
             window_excludes_output: false,
@@ -456,7 +456,7 @@ mod tests {
         second: i64,
         expected: f64,
     ) {
-        let schedule = PricingSchedule::new(windows, PEAK);
+        let schedule = PricingSchedule::try_new(windows, PEAK).unwrap();
         for day in [DAYS_SINCE_EPOCH, -DAYS_SINCE_EPOCH] {
             assert_eq!(
                 schedule.multiplier_at(utc(day, hour, minute, second)),
@@ -576,11 +576,15 @@ mod tests {
     #[test]
     fn schedules_render_the_hours_they_bill() {
         assert_eq!(
-            PricingSchedule::new(PEAK_WINDOWS, PEAK).to_string(),
+            PricingSchedule::try_new(PEAK_WINDOWS, PEAK)
+                .unwrap()
+                .to_string(),
             "2x during 01:00-04:00, 06:00-10:00 UTC"
         );
         assert_eq!(
-            PricingSchedule::new(WRAPPING_WINDOW, PEAK).to_string(),
+            PricingSchedule::try_new(WRAPPING_WINDOW, PEAK)
+                .unwrap()
+                .to_string(),
             "2x during 22:00-02:00 UTC"
         );
     }

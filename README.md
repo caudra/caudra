@@ -294,6 +294,7 @@ Each one links to its documentation. Experimental items are marked and stay off 
 - [Skills from `.claude` and `.agents` folders](https://caudra.ai/docs/skills/#where-skills-live)
 - [pstack engineering skills, off by default](https://caudra.ai/docs/skills/#pstack)
 - [Matt Pocock's skills, off by default](https://caudra.ai/docs/skills/#mattpocock)
+- [Emil Kowalski's design-engineering skills, off by default](https://caudra.ai/docs/skills/#emil)
 - [`@file` and `#commit` mentions](https://caudra.ai/docs/context/#mention-a-file-with)
 - [Inspect with `/context` and `/projection`](https://caudra.ai/docs/context/#inspect-the-active-window)
 - [Compaction that keeps recent turns](https://caudra.ai/docs/context/#when-the-window-fills)

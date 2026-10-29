@@ -971,23 +971,19 @@ fn job_entry_with_binding(
         Some(Binding::Same(target)) => format!("same as {}", target.label()),
         Some(Binding::Exact(_)) => PINNED_BINDING.to_string(),
     };
-    let detail = match Model::resolve_binding_if_available(
-        purpose,
-        binding.as_ref(),
-        current_model,
-        model_policy,
-    ) {
-        Ok(model) => model.spec(),
-        Err(error) => {
-            let unavailable = format!("{UNAVAILABLE_PREFIX}{error}");
-            match binding.as_ref() {
-                Some(Binding::Exact(spec)) => {
-                    format!("{spec}{DETAIL_SEPARATOR}{unavailable}")
+    let detail =
+        match Model::resolve_binding(purpose, binding.as_ref(), current_model, model_policy) {
+            Ok(model) => model.spec(),
+            Err(error) => {
+                let unavailable = format!("{UNAVAILABLE_PREFIX}{error}");
+                match binding.as_ref() {
+                    Some(Binding::Exact(spec)) => {
+                        format!("{spec}{DETAIL_SEPARATOR}{unavailable}")
+                    }
+                    _ => unavailable,
                 }
-                _ => unavailable,
             }
-        }
-    };
+        };
     ModelEntry {
         spec: format!("{JOB_KEY_PREFIX}{purpose}"),
         id: purpose.label().to_string(),
@@ -1226,7 +1222,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         kind.display_name().to_string()
     } else if let Some(name) = dynamic::display_name(provider_str) {
         name.to_string()
-    } else if let Some(info) = caudra_providers::catalog_provider_if_available(provider_str) {
+    } else if let Some(info) = caudra_providers::catalog_provider(provider_str) {
         info.display_name.clone()
     } else if let Some(builtin) = caudra_config::providers::builtin_provider(provider_str) {
         builtin.display_name.to_string()

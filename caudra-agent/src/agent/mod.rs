@@ -12,6 +12,7 @@ mod instructions;
 pub(crate) mod judging;
 mod live_switch;
 mod measured;
+mod memory_nudge;
 pub mod mention_preamble;
 mod provider_projection;
 mod refresh;
@@ -66,6 +67,7 @@ pub use refresh::{
     ActiveContext, ContextRefresh, RefreshedContext, StandingState, favorite_models,
 };
 pub use run::last_announced;
+pub(crate) use run::standing_notice;
 pub use run::{
     Agent, AgentParams, AgentRunParams, ConversationRoute, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
@@ -75,6 +77,5 @@ pub(crate) use run::{
     GOAL_MET_QUESTION, goal_prescreen_state, should_skip_goal, skill_questions, skill_shortlist,
     skill_state, suggested_skill,
 };
-pub(crate) use run::{resolve_purpose_model_for_inspection, standing_notice};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;
 pub use surface::{PrefixKey, Settled, Surface, SurfaceBaseline};

@@ -54,6 +54,8 @@ const PRESERVE_RECENT_FRACTION: u32 = 4;
 /// fallback that does not fit the model, such as a 16k output cap on an 8k
 /// local model, and reserving all of it would compact after every turn.
 const MAX_OUTPUT_RESERVE_DIVISOR: u32 = 2;
+/// The share of the window before compaction that counts as near it.
+const NEAR_OVERFLOW_DIVISOR: u32 = 10;
 /// Newlines that separate the summary from the requirements section appended
 /// below it, so the two never run together as one paragraph.
 const BLANK_LINE_NEWLINES: usize = 2;
@@ -158,6 +160,9 @@ impl PreparedCompaction {
         }
         if self.had_background || session.had_context(history) {
             session.refresh(history, event_tx, config.background_reminder_turns, true);
+        }
+        if let Some(automation) = session.automation {
+            automation.refresh_reminder(history, event_tx, true);
         }
         Ok(self.spend)
     }
@@ -717,6 +722,20 @@ pub(super) fn is_overflow(
         .context_window
         .saturating_sub(compaction_reserve(model, buffer));
     usage.context_tokens() >= usable
+}
+
+/// Whether `usage` is within a [`NEAR_OVERFLOW_DIVISOR`]th of the window of
+/// compacting, while the model still has requests left to act in.
+pub(super) fn nears_overflow(
+    usage: &TokenUsage,
+    model: &Model,
+    buffer: Option<CompactionBuffer>,
+) -> bool {
+    let usable = model
+        .context_window
+        .saturating_sub(compaction_reserve(model, buffer));
+    let near = usable.saturating_sub(model.context_window / NEAR_OVERFLOW_DIVISOR);
+    usage.context_tokens() >= near
 }
 
 fn strip_images(messages: &mut [Message]) {

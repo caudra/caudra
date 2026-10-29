@@ -369,6 +369,7 @@ pub struct DryRunDetail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReason {
+    FiringUnfinished,
     Paused,
     HumanPromptQueued,
     ModalOpen,
@@ -781,6 +782,16 @@ mod tests {
             Some(Some(ArmOrigin::Always))
         );
         assert!(state.find("missing").is_none());
+    }
+
+    #[test_case(Scope::Session; "session")]
+    #[test_case(Scope::Project; "project")]
+    #[test_case(Scope::User; "user")]
+    #[test_case(Scope::Bundled; "bundled")]
+    fn snapshot_keeps_its_scope(scope: Scope) {
+        let mut snapshot = automation(NAME, Some(ArmOrigin::Manual));
+        snapshot.scope = scope;
+        round_trip(&snapshot);
     }
 
     #[test]

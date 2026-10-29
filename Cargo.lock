@@ -879,6 +879,7 @@ dependencies = [
 name = "caudra"
 version = "0.2.0-preview.16"
 dependencies = [
+ "async-lock",
  "async-trait",
  "caudra-acp",
  "caudra-agent",
@@ -959,6 +960,7 @@ dependencies = [
  "caudra-config",
  "caudra-decision",
  "caudra-diff",
+ "caudra-emil",
  "caudra-mattpocock",
  "caudra-otel",
  "caudra-providers",
@@ -1106,12 +1108,15 @@ dependencies = [
  "caudra-docs",
  "caudra-lua",
  "caudra-providers",
+ "caudra-storage",
  "caudra-ui",
  "caudra-workcell",
  "color-eyre",
  "jiff",
  "regex",
+ "serde",
  "serde_json",
+ "smol",
  "strum 0.28.0",
  "test-case",
  "workspace-hack",
@@ -1130,6 +1135,16 @@ dependencies = [
  "thiserror 2.0.21",
  "workspace-hack",
  "yaml_serde",
+]
+
+[[package]]
+name = "caudra-emil"
+version = "0.2.0-preview.16"
+dependencies = [
+ "caudra-skillpack",
+ "include_dir",
+ "regex",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1277,6 +1292,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "caudra-models"
+version = "0.2.0-preview.16"
+dependencies = [
+ "base64 0.23.1",
+ "caudra-automation",
+ "clap",
+ "color-eyre",
+ "jiff",
+ "ring",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.11.1",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.21",
+ "url",
+ "workspace-hack",
+ "zstd",
+]
+
+[[package]]
 name = "caudra-otel"
 version = "0.2.0-preview.16"
 dependencies = [
@@ -1304,8 +1342,10 @@ dependencies = [
  "async-lock",
  "base64 0.23.1",
  "caudra-config",
+ "caudra-models",
  "caudra-storage",
  "fastrand",
+ "flate2",
  "flume",
  "futures",
  "futures-lite",
@@ -1331,6 +1371,7 @@ dependencies = [
  "wait-timeout",
  "workspace-hack",
  "yaml_serde",
+ "zstd",
 ]
 
 [[package]]
@@ -11177,6 +11218,7 @@ dependencies = [
  "lock_api 0.4.14",
  "log",
  "memchr",
+ "miniz_oxide 0.8.9",
  "mio",
  "num-bigint",
  "num-integer",

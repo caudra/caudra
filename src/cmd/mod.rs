@@ -599,7 +599,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
             subcmd::index(&cli, &path)?;
         }
         Some(Command::Remote { args }) => subcmd::remote_control(&cli, &args)?,
-        Some(Command::Models { jobs }) => subcmd::models(&cli, jobs)?,
+        Some(Command::Models { jobs, action }) => subcmd::models(&cli, jobs, action.is_some())?,
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             let runtime = if cli.workcell.is_set() {

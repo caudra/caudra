@@ -295,6 +295,8 @@ features! {
         "Remind the agent of at most three saved notes likely relevant to a new user message, a todo step it starts, an unmet goal, or the work after compaction, without loading them. Sends a redacted excerpt of the request and of the open todos, the previous request when this one is short, and an unmet goal with the evaluator's reason, and each keyword-matched note's name, heading, and redacted excerpt.";
     memory_duplicates: [Advise],
         "When a new memory note is written, name existing notes that may cover the same topic in the write receipt. The write itself is never blocked or changed. Sends redacted excerpts of the new note and of keyword-matched notes.";
+    memory_nudge: [Advise],
+        "Judge whether a new user message corrects the agent or states a rule for the project. When it does and `agent.memory_nudges` allows a reminder, the agent is reminded to save a note. Sends redacted excerpts of the message and of the reply before it.";
     compaction_retention: [Enforce],
         "During compaction, keep the tool results most relevant to the active goal, open todos, and latest request instead of only the newest, and keep the most relevant part of a long result. Sends redacted goal, todo, and request excerpts, and each recent result's tool name with redacted input and output excerpts.";
     output_pointers: [Advise],
@@ -1519,6 +1521,7 @@ mod tests {
     #[test_case("goal_prescreen", false, true)]
     #[test_case("subagent_routing", false, true)]
     #[test_case("question_tool_nudge", true, false)]
+    #[test_case("memory_nudge", true, false)]
     #[test_case("memory_search", false, true)]
     #[test_case("memory_recall", true, false)]
     #[test_case("memory_duplicates", true, false)]

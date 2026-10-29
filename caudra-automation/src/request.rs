@@ -265,6 +265,9 @@ pub struct OutboxClaim {
     /// The item's `attach` value, already framed as an untrusted block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
+    /// The reason of the `done()` request applied when this firing finalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_reason: Option<String>,
     /// The goal a `set_goal` item sets before its kickoff turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalClaim>,

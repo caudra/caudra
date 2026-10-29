@@ -13,6 +13,7 @@ use caudra_config::example::Entry;
 use caudra_config::files::{self, CONFIG_FILES, Scope};
 use caudra_config::mcp::MCP_FORMAT;
 use caudra_config::migration::{ConfigFormat, Stamp, migrate};
+use caudra_config::models::ModelsConfig;
 use caudra_config::providers::PROVIDERS_FORMAT;
 use caudra_config::sandbox::SANDBOX_FORMAT;
 use caudra_config::shell_env::ShellEnvConfig;
@@ -445,10 +446,11 @@ fn write_update_check_section(out: &mut String) {
          and it asks GitHub instead of reading the cache, so a release published \
          since the last check shows at once. Its answer refreshes the cache for \
          later starts. An empty value leaves the config in effect. A normal run \
-         still contacts your model provider, fetches the public \
-         [models.dev](https://models.dev/) model catalog when the cached copy \
-         is more than a day old, and sends web searches to Exa when the agent \
-         uses `websearch`.\n"
+         still contacts your model provider and sends web searches to Exa when \
+         the agent uses `websearch`. Long-running sessions also check \
+         `models.caudra.ai` daily for a newer \
+         [model list](/docs/providers/#model-list) unless `models.refresh` is \
+         false.\n"
     )
     .unwrap();
     writeln!(out, "### `ui.update_channel`\n").unwrap();
@@ -1000,7 +1002,7 @@ While the terminal UI runs, Caudra watches its config files, skill and command d
 
 | What changed | When it applies |
 |--------------|-----------------|
-| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, [`plugins.skill.pstack`](/docs/skills/#pstack), and [`plugins.skill.mattpocock`](/docs/skills/#mattpocock) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
+| `caudra.toml` | [`[decisions]`](#decisions), [`[web]`](#web), [`[websearch]`](/docs/web-search/), `ui.show_decisions`, [`plugins.skill.pstack`](/docs/skills/#pstack), [`plugins.skill.mattpocock`](/docs/skills/#mattpocock), and [`plugins.skill.emil`](/docs/skills/#emil) at once, in every open session. `[agent]` settings and [`[autopilot]`](/docs/autopilot/#budgets) limits from the next turn. Other tables after `/reload`. `[experimental]` after a restart. |
 | `permissions.toml` | Before the next tool call. |
 | `mcp.toml` | At once. New servers start, even when Caudra started with none. Removed and disabled servers stop, and changed servers restart. The other servers keep running. |
 | `providers.toml` | The next time Caudra reads it, such as when a model list opens. An edit to the active [decision endpoint](/docs/providers/#decision-endpoints) applies at once, and removing its table turns decisions off. |
@@ -1382,6 +1384,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_shell_env_section(&mut out);
     write_steering_section(&mut out);
     write_section(&mut out, "provider", ProviderConfig::FIELDS);
+    write_section(&mut out, "models", ModelsConfig::FIELDS);
     write_section(&mut out, "storage", StorageConfig::FIELDS);
     write_retention_section(&mut out);
     write_snapshots_section(&mut out);

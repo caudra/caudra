@@ -98,7 +98,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 44;
+const SCHEMA_VERSION: i64 = 46;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -187,6 +187,18 @@ const CHANGE_RECORDS_CLEANUP: &str = "change_records";
 /// named whole, so a pending one is dropped.
 const LEGACY_SNAPSHOT_CLEANUP: &str = "snapshot";
 const ARTIFACT_CLEANUP_KINDS: [&str; 3] = ["archive", CHANGE_RECORDS_CLEANUP, "workflow_scratch"];
+const SESSION_AUTOMATIONS_CLEANUP: &str = "session_automations";
+const SESSION_SECRETS_CLEANUP: &str = "session_secrets";
+/// Kinds that belong to the session itself, so trimming it keeps them.
+const DELETION_ONLY_CLEANUP_KINDS: [&str; 2] =
+    [SESSION_AUTOMATIONS_CLEANUP, SESSION_SECRETS_CLEANUP];
+const DELETION_CLEANUP_KINDS: [&str; 5] = [
+    "archive",
+    CHANGE_RECORDS_CLEANUP,
+    "workflow_scratch",
+    SESSION_AUTOMATIONS_CLEANUP,
+    SESSION_SECRETS_CLEANUP,
+];
 const NO_CHANGE_STORES: &str =
     "this process cannot reach the change stores; a Caudra session or storage command will";
 /// What a session's file revert relies on, which the transcript tier drops.
@@ -973,6 +985,16 @@ const MIGRATIONS: &[Migration] = &[
         to: media_payloads::MEDIA_SCHEMA,
         sql: "",
     },
+    Migration {
+        from: 44,
+        to: 45,
+        sql: crate::automation::SESSION_SCOPE_MIGRATION,
+    },
+    Migration {
+        from: 45,
+        to: 46,
+        sql: crate::memory_nudges::TABLES,
+    },
 ];
 
 /// Which automation sent a message for its session, a stamp ordering every
@@ -1251,7 +1273,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{USAGE_NO_COST_ESTIMATE_COLUMNS}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}{}{}{}{SESSION_PURPOSE_USAGE_TABLE}{}{}{}{}{}{}{}{}{}{}{}{USAGE_NO_COST_ESTIMATE_COLUMNS}{}{}",
         crate::background::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
@@ -1274,7 +1296,8 @@ fn full_schema() -> String {
         crate::background::TRANSCRIPTS,
         crate::engine_decisions::SCREENING_COLUMN,
         crate::tool_outputs::SAVED_OUTPUTS_SCHEMA,
-        crate::shell_runs::HOST_COLUMN
+        crate::shell_runs::HOST_COLUMN,
+        crate::memory_nudges::TABLES
     )
 }
 
@@ -2909,7 +2932,7 @@ impl SessionDatabase {
                 metadata,
             ],
         )?;
-        enqueue_cleanup_jobs(&transaction, id)?;
+        enqueue_cleanup_jobs(&transaction, id, &ARTIFACT_CLEANUP_KINDS)?;
         transaction.commit()?;
         drop(_artifact_lock);
         // The lease is still held, so the jobs run now instead of waiting
@@ -3954,7 +3977,7 @@ impl SessionDatabase {
         )?;
         // Queue external work before commit so a crash can leak artifacts only
         // temporarily; a later repository open resumes these idempotent jobs.
-        enqueue_cleanup_jobs(&transaction, id)?;
+        enqueue_cleanup_jobs(&transaction, id, &DELETION_CLEANUP_KINDS)?;
         transaction.commit()?;
         Ok(SessionRecreation {
             session_id: id,
@@ -4081,7 +4104,7 @@ impl SessionDatabase {
                 self.remove_cleanup_job(id, &kind)?;
                 continue;
             }
-            if !ARTIFACT_CLEANUP_KINDS.contains(&kind.as_str()) {
+            if !DELETION_CLEANUP_KINDS.contains(&kind.as_str()) {
                 self.record_cleanup_failure(id, &kind, UNKNOWN_CLEANUP_KIND)?;
                 continue;
             }
@@ -4120,7 +4143,10 @@ impl SessionDatabase {
             .optional()?;
         Ok(match guard {
             Some((true, _)) => CleanupGuard::Deleted,
-            Some((false, true)) => CleanupGuard::Trimmed,
+            Some((false, true)) if !DELETION_ONLY_CLEANUP_KINDS.contains(&kind) => {
+                CleanupGuard::Trimmed
+            }
+            Some((false, true)) => CleanupGuard::Stale,
             Some((false, false)) | None => CleanupGuard::Stale,
         })
     }
@@ -4147,7 +4173,17 @@ impl SessionDatabase {
             "archive" => remove_state_directory(
                 &self.state_dir,
                 &[super::SESSIONS_DIR, super::ARCHIVE_DIR],
-                id,
+                &id.to_string(),
+            ),
+            SESSION_AUTOMATIONS_CLEANUP => remove_state_directory(
+                &self.state_dir,
+                &[super::SESSIONS_DIR, &id.to_string()],
+                crate::automation::SESSION_AUTOMATIONS_DIR,
+            ),
+            SESSION_SECRETS_CLEANUP => remove_state_directory(
+                &self.state_dir,
+                &[super::SESSIONS_DIR, &id.to_string()],
+                crate::secrets::SESSION_SECRETS_DIR,
             ),
             CHANGE_RECORDS_CLEANUP => match &self.change_stores {
                 Some(stores) => release_everywhere(stores.as_ref(), &self.state_dir, id),
@@ -5834,7 +5870,7 @@ fn ensure_real_directory(path: &Path, create: bool) -> io::Result<bool> {
 fn remove_state_directory(
     state_dir: &StateDir,
     components: &[&str],
-    id: CaudraId,
+    name: &str,
 ) -> Result<(), io::Error> {
     let mut root = state_dir.path().to_path_buf();
     for component in components {
@@ -5862,7 +5898,7 @@ fn remove_state_directory(
             format!("refusing cleanup through {}", root.display()),
         ));
     }
-    let target = root.join(id.to_string());
+    let target = root.join(name);
     let metadata = match fs::symlink_metadata(&target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -6903,8 +6939,12 @@ fn update_root_values<M, U, T>(
     Ok(())
 }
 
-fn enqueue_cleanup_jobs(transaction: &Transaction<'_>, id: CaudraId) -> Result<(), SessionError> {
-    for kind in ARTIFACT_CLEANUP_KINDS {
+fn enqueue_cleanup_jobs(
+    transaction: &Transaction<'_>,
+    id: CaudraId,
+    kinds: &[&str],
+) -> Result<(), SessionError> {
+    for kind in kinds {
         transaction.execute(
             "INSERT INTO cleanup_jobs (session_id, kind, next_attempt_ms) VALUES (?1, ?2, 0) \
              ON CONFLICT(session_id, kind) DO UPDATE SET next_attempt_ms = 0",
@@ -7675,14 +7715,16 @@ mod tests {
 
     use super::*;
     use crate::automation::{
-        AutomationArming, AutomationFiringStatus, AutomationOrigin, AutomationScope,
-        AutomationTrigger, INTERRUPTED_BY_RELOCATION, NewAutomationFiring,
+        AutomationActionKind, AutomationActionStatus, AutomationArming, AutomationDelivery,
+        AutomationFiringStatus, AutomationOrigin, AutomationScope, AutomationTrigger,
+        INTERRUPTED_BY_RELOCATION, NewAutomationAction, NewAutomationFiring, session_dir,
     };
     use crate::autopilot::{DECISIONS_TABLE_V24, StoredAutopilotDecision};
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::backups::BACKUPS_DIR;
     use crate::id::{UUID_VARIANT_BYTE, UUID_VERSION_BYTE};
     use crate::permission_state::StructuredPermissionEffect;
+    use crate::secrets::session_secrets_dir;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
     use crate::sessions::sweep::LEGACY_SNAPSHOT_DIRS;
     use crate::sessions::{
@@ -7830,9 +7872,36 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    macro_rules! memory_nudges_downgrade {
+        () => {
+            "DROP TABLE memory_nudges;"
+        };
+    }
+    const MEMORY_NUDGES_DOWNGRADE: &str = memory_nudges_downgrade!();
+    const MEMORY_NUDGES_PREVIOUS_SCHEMA: i64 = 45;
+    macro_rules! session_scope_downgrade {
+        () => {
+            concat!(
+                memory_nudges_downgrade!(),
+                crate::automation::rebuild_bindings!(v44, "automation_bindings_v45"),
+                crate::automation::rebuild_actions!(v44, "automation_actions_v45")
+            )
+        };
+    }
+    const SESSION_SCOPE_DOWNGRADE: &str = session_scope_downgrade!();
+    const SESSION_SCOPE_PREVIOUS_SCHEMA: i64 = 44;
+    const SESSION_AUTOMATION: &str = "session-automation";
+    const DONE_ACTION: &str = "done";
+    const MIGRATION_ACTION_SEQ: u64 = 2;
+    const MIGRATION_ACTION_LINE: u32 = 7;
+    const MIGRATION_ACTION_COLUMN: u32 = 3;
+    const MIGRATION_ACTION_EXPIRES: u64 = 1_900_000_000_000;
     macro_rules! shell_host_downgrade {
         () => {
-            "ALTER TABLE shell_runs DROP COLUMN host;"
+            concat!(
+                session_scope_downgrade!(),
+                "ALTER TABLE shell_runs DROP COLUMN host;"
+            )
         };
     }
     const SHELL_HOST_DOWNGRADE: &str = shell_host_downgrade!();
@@ -14691,6 +14760,158 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
+    #[test_case((); "version_44")]
+    fn session_scope_migration_preserves_bindings_actions_and_backup(_: ()) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(SESSION_SCOPE_DOWNGRADE)
+            .unwrap();
+        let arming = AutomationArming {
+            session_id: session.id,
+            automation: SESSION_AUTOMATION.into(),
+            scope: AutomationScope::Session,
+            origin: AutomationOrigin::Manual,
+            armed: true,
+            args: EMPTY_JSON_OBJECT.into(),
+            args_digest: Some(RELOCATION_DIGEST.into()),
+        };
+        assert!(database.upsert_automation_binding(&arming).is_err());
+        database
+            .upsert_automation_binding(&AutomationArming {
+                scope: AutomationScope::Bundled,
+                ..arming.clone()
+            })
+            .unwrap();
+        database
+            .commit_automation_state(session.id, SESSION_AUTOMATION, 0, EMPTY_JSON_OBJECT)
+            .unwrap();
+        database
+            .insert_automation_firing(&NewAutomationFiring {
+                fire_id: RELOCATION_FIRING.into(),
+                session_id: session.id,
+                automation: SESSION_AUTOMATION.into(),
+                digest: RELOCATION_DIGEST.into(),
+                trigger: AutomationTrigger::Idle,
+                trigger_index: 0,
+                event: EMPTY_JSON_OBJECT.into(),
+                event_key: None,
+                consumed: false,
+            })
+            .unwrap();
+        database.start_automation_firing(RELOCATION_FIRING).unwrap();
+        database
+            .start_automation_action(&NewAutomationAction {
+                fire_id: RELOCATION_FIRING.into(),
+                seq: MIGRATION_ACTION_SEQ,
+                kind: AutomationActionKind::Message,
+                line: Some(MIGRATION_ACTION_LINE),
+                column: Some(MIGRATION_ACTION_COLUMN),
+                request_hash: RELOCATION_DIGEST.into(),
+                request: EMPTY_JSON_OBJECT.into(),
+                status: AutomationActionStatus::Queued,
+                delivery: Some(AutomationDelivery::Next),
+                expires_ms: Some(MIGRATION_ACTION_EXPIRES),
+            })
+            .unwrap();
+        let change_kind = "UPDATE automation_actions SET kind = ?1 WHERE fire_id = ?2";
+        assert!(
+            database
+                .connection
+                .execute(change_kind, params![DONE_ACTION, RELOCATION_FIRING])
+                .is_err()
+        );
+        let bindings = database.load_automation_bindings(session.id).unwrap();
+        let firing = database.load_automation_firing(RELOCATION_FIRING).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", SESSION_SCOPE_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            migrated.load_automation_bindings(session.id).unwrap(),
+            bindings
+        );
+        assert_eq!(
+            migrated.load_automation_firing(RELOCATION_FIRING).unwrap(),
+            firing
+        );
+        migrated.upsert_automation_binding(&arming).unwrap();
+        assert_eq!(
+            migrated
+                .load_automation_binding(session.id, SESSION_AUTOMATION)
+                .unwrap()
+                .unwrap()
+                .scope,
+            AutomationScope::Session
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .execute(change_kind, params![DONE_ACTION, RELOCATION_FIRING])
+                .unwrap(),
+            1
+        );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        let backup_path = state.path().join(BACKUPS_DIR).join(format!(
+            "{SESSIONS_DB_FILE}.v{SESSION_SCOPE_PREVIOUS_SCHEMA}.bak"
+        ));
+        assert!(backup_path.is_file());
+        let backup = Connection::open(backup_path).unwrap();
+        assert_eq!(
+            backup
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SESSION_SCOPE_PREVIOUS_SCHEMA
+        );
+        assert!(
+            backup
+                .execute(change_kind, params![DONE_ACTION, RELOCATION_FIRING])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn memory_nudges_migration_adds_the_table_and_keeps_the_rest() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(MEMORY_NUDGES_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", MEMORY_NUDGES_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.id, session.id);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
     #[test_case(false; "missing_root")]
     #[test_case(true; "existing_empty_root")]
     fn existing_state_open_never_initializes_missing_storage(existing_root: bool) {
@@ -16272,6 +16493,41 @@ CREATE TABLE subagents (
         database.save(&session, Some(&cursor)).unwrap();
     }
 
+    #[test_case(session_dir, false; "deletion_removes_scripts")]
+    #[test_case(session_dir, true; "trim_keeps_scripts")]
+    #[test_case(session_secrets_dir, false; "deletion_removes_secrets")]
+    #[test_case(session_secrets_dir, true; "trim_keeps_secrets")]
+    fn session_owned_cleanup_is_deletion_only(
+        directory: fn(&StateDir, CaudraId) -> PathBuf,
+        trim: bool,
+    ) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let directory = directory(&state, session.id);
+        state.ensure_subdir(&directory).unwrap();
+        let script = directory.join(ARTIFACT_NAME);
+        fs::write(&script, CHANGE_RECORD_DATA).unwrap();
+        let sibling = directory.parent().unwrap().join(ARTIFACT_NAME);
+        fs::write(&sibling, CHANGE_RECORD_DATA).unwrap();
+        if trim {
+            let lease = SessionLease::acquire(&state, session.id).unwrap();
+            database.trim(&lease).unwrap();
+        } else {
+            database.delete(session.id, None).unwrap();
+        }
+        drop(database);
+        let mut reopened = SessionDatabase::open_state(&state).unwrap();
+        reopened.process_cleanup_jobs().unwrap();
+        assert_eq!(directory.exists(), trim);
+        assert_eq!(script.exists(), trim);
+        assert!(sibling.exists());
+        if trim {
+            assert_eq!(fs::read(script).unwrap(), CHANGE_RECORD_DATA);
+        }
+    }
+
     #[test]
     fn trim_keeps_transcript_and_small_outputs_and_removes_artifacts() {
         let (_temp, state_dir) = state_dir();
@@ -16364,7 +16620,7 @@ CREATE TABLE subagents (
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        enqueue_cleanup_jobs(&transaction, session.id).unwrap();
+        enqueue_cleanup_jobs(&transaction, session.id, &ARTIFACT_CLEANUP_KINDS).unwrap();
         transaction.commit().unwrap();
         let paths = seed_artifacts(&state_dir, session.id);
 
@@ -16398,7 +16654,7 @@ CREATE TABLE subagents (
                 params![session.id.as_bytes().as_slice()],
             )
             .unwrap();
-        enqueue_cleanup_jobs(&transaction, session.id).unwrap();
+        enqueue_cleanup_jobs(&transaction, session.id, &ARTIFACT_CLEANUP_KINDS).unwrap();
         transaction.commit().unwrap();
         let paths = seed_artifacts(&state_dir, session.id);
 

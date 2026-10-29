@@ -3,10 +3,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use caudra_agent::secrets::scope::remembered_names;
+use caudra_agent::secrets::{SecretListing, SecretScope, SessionSecrets};
 use caudra_config::interpolation::holds_reference;
 use caudra_config::shell_env::GlobalShellEnvFile;
 use caudra_config::{EnvSource, env_source, shell_visible_environment};
-use caudra_providers::catalog_providers_if_available;
+use caudra_providers::catalog_providers;
 use caudra_terminal_host::PANE_ENVIRONMENT;
 use workcell_tool_contract::shell_env::{
     BASE_ALLOWLIST, EnvPattern, is_shell_startup_variable, is_valid_variable_name, looks_secret,
@@ -44,18 +46,30 @@ pub(crate) struct HostVariable {
     pub(crate) source: EnvSource,
 }
 
-/// The global config as written and every variable this process sees, with the provider
-/// credential names a forward should ask about first.
+/// The global config as written, every variable this process sees, with the provider
+/// credential names a forward should ask about first, and the session's secrets by name.
 pub(crate) struct LocalEnvironment {
     pub(crate) file: GlobalShellEnvFile,
     /// [`EnvSource::ProjectEnvFile`] marks a name only the project's `.env` set, which no
     /// shell command receives.
     pub(crate) variables: BTreeMap<String, HostVariable>,
     pub(crate) credentials: HashSet<String>,
+    /// The session's own secrets, then the `set` entries that read a remembered secret's file.
+    pub(crate) secrets: Vec<SecretListing>,
 }
 
 impl LocalEnvironment {
-    pub(crate) fn capture(file: GlobalShellEnvFile) -> Self {
+    pub(crate) fn capture(file: GlobalShellEnvFile, vault: &SessionSecrets) -> Self {
+        let mut secrets = vault.listing();
+        secrets.extend(
+            remembered_names(vault.state_dir(), file.set())
+                .into_iter()
+                .map(|name| SecretListing {
+                    name,
+                    scope: SecretScope::Remembered,
+                    expires_at: None,
+                }),
+        );
         let mut variables: BTreeMap<String, HostVariable> = std::env::vars_os()
             .filter_map(|(name, value)| {
                 Some((
@@ -75,16 +89,23 @@ impl LocalEnvironment {
             let value = value.to_string_lossy().into_owned();
             variables.insert(name, HostVariable { value, source });
         }
-        let credentials = catalog_providers_if_available()
+        let credentials = catalog_providers()
             .into_iter()
-            .flatten()
             .flat_map(|provider| provider.env_keys)
             .collect();
         Self {
             file,
             variables,
             credentials,
+            secrets,
         }
+    }
+
+    /// The listing a secret row stands for.
+    pub(super) fn secret(&self, name: &str, scope: SecretScope) -> Option<&SecretListing> {
+        self.secrets
+            .iter()
+            .find(|secret| secret.name == name && secret.scope == scope)
     }
 
     pub(super) fn is_sensitive(&self, name: &str) -> bool {
@@ -124,6 +145,7 @@ pub(super) fn local_rows(environment: &LocalEnvironment) -> Vec<EnvRow> {
     let mut rows: Vec<EnvRow> = file
         .set()
         .iter()
+        .filter(|(name, _)| environment.secret(name, SecretScope::Remembered).is_none())
         .map(|(name, value)| set_row(name, value))
         .collect();
     rows.extend(file.pass().iter().map(|raw| pattern_row(environment, raw)));

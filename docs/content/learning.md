@@ -15,6 +15,8 @@ Each interactive session (the TUI, the SDK and ACP) runs a learner for its proje
 - At least 2 hours passed since the last run. When the last run had more history than it could read, the next one can start after 10 minutes.
 - The session has been idle for a minute, so the learner does not compete with a turn for rate limits.
 
+While a project has no [memory notes](/docs/memory/), its first 2 runs of the day need only 3 typed messages and 10 minutes since the last run. Later sessions then start with notes to build on.
+
 A project runs at most 8 times a day. A lease in the state database keeps two Caudra processes from learning the same project at once. `--print` runs, ephemeral sessions, and remote workspaces never learn.
 
 The first run in a project reads the last 7 days. Each later run reads from where the last one stopped.

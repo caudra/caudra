@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
@@ -10,10 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::model::{
-    ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, PricingTier,
-    StaticReasoningOption,
-};
+use crate::model::Model;
 use crate::{
     AgentError, ContentBlock, DocumentSource, EMPTY_RESPONSE_MARKER, InvalidToolInput, Message,
     PDF_MEDIA_TYPE, ProviderEvent, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
@@ -52,24 +48,6 @@ pub(crate) const FALLBACK_MAX_TOKENS: u32 = 32_000;
 pub(crate) const LONG_CONTEXT_SUFFIX: &str = "-1m";
 pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
 
-/// Long-context models accept 1M tokens natively, with no beta header. This is
-/// the working window we run them at, capped well below that ceiling to bound
-/// cost and latency, and aligned with `WIDE_PLAN_CONTEXT_WINDOW`. Unlike the
-/// 200k entries, it is an *input* budget: `max_output_tokens` is granted on top
-/// of it rather than carved out of it.
-pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
-
-/// Haiku 5.5 bills a prompt past 100k tokens at five times its base rates,
-/// and Copilot passes the same list price through.
-pub(crate) const HAIKU_5_5_LONG_PROMPT: PricingTier = PricingTier {
-    above: 100_000,
-    input: 0.50,
-    output: 2.50,
-    cache_write: 0.625,
-    cache_read: 0.05,
-    fast: None,
-};
-
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
 const TEXT_BLOCK: &str = "text";
@@ -86,15 +64,6 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
     model_id
         .ends_with(LONG_CONTEXT_SUFFIX)
         .then_some(LONG_CONTEXT_WINDOW)
-}
-
-/// Whether a static entry's own declared window is an input budget rather than
-/// the API total. Only the window caudra caps itself is one, and only this table
-/// declares any, so the question is scoped to an entry the manifest owns: a
-/// window discovered from a provider or published by models.dev answers for
-/// itself and never reaches here.
-pub(crate) fn declares_input_budget(manifest_slug: &str, entry: &ModelEntry) -> bool {
-    manifest_slug == ANTHROPIC_SLUG && entry.context_window == WIDE_CONTEXT_WINDOW
 }
 
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
@@ -939,312 +908,6 @@ impl EventParser {
     }
 }
 
-/// Levels these models declare, matching the models.dev catalog. Claude reasons
-/// unconditionally unless it declares a toggle, and no Claude model has ever
-/// accepted `minimal`, so the canonical fallback ladder would offer a level the
-/// API rejects.
-const EFFORT_TO_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "low", "medium", "high", "xhigh", "max",
-])];
-const TOGGLE_WITH_EFFORT_TO_MAX: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Toggle,
-    StaticReasoningOption::Effort(&["low", "medium", "high", "xhigh", "max"]),
-];
-const EFFORT_TO_MAX_WITH_BUDGET: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Effort(&["low", "medium", "high", "max"]),
-    StaticReasoningOption::BudgetTokens {
-        min: Some(1_024),
-        max: None,
-    },
-];
-const EFFORT_TO_HIGH_WITH_BUDGET: &[StaticReasoningOption] = &[
-    StaticReasoningOption::Effort(&["low", "medium", "high"]),
-    StaticReasoningOption::BudgetTokens {
-        min: Some(1_024),
-        max: None,
-    },
-];
-/// Pre-effort models: a token budget is the only knob they take.
-const BUDGET_ONLY: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetTokens {
-    min: Some(1_024),
-    max: None,
-}];
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["claude-haiku-5-5"],
-            small: true,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.125,
-                cache_read: 0.01,
-                fast: None,
-                tiers: Cow::Borrowed(&[HAIKU_5_5_LONG_PROMPT]),
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-haiku-4-5"],
-            small: true,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 5.00,
-                cache_write: 1.25,
-                cache_read: 0.10,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-            reasoning_options: Some(BUDGET_ONLY),
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-            reasoning_options: Some(BUDGET_ONLY),
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-6"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.10,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-            reasoning_options: Some(EFFORT_TO_HIGH_WITH_BUDGET),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-6"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                // Fast mode withdrawn on 2026-06-29.
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-7"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                // Fast mode withdrawn on 2026-07-24.
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-8"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 10.00,
-                    output: 50.00,
-                    cache_write: 12.50,
-                    cache_read: 1.00,
-                }),
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-5-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 4.00,
-                output: 20.00,
-                cache_write: 5.00,
-                cache_read: 0.20,
-                fast: Some(FastPricing {
-                    input: 8.00,
-                    output: 40.00,
-                    cache_write: 10.00,
-                    cache_read: 0.40,
-                }),
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 10.00,
-                    output: 50.00,
-                    cache_write: 12.50,
-                    cache_read: 1.00,
-                }),
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-fable-5-1"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 0.25,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["claude-fable-5"],
-            small: false,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 1.00,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(128000),
-            context_window: WIDE_CONTEXT_WINDOW,
-            reasoning_options: Some(EFFORT_TO_MAX),
-        },
-    ];
-    MODELS
-}
-
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
@@ -1543,8 +1206,8 @@ mod tests {
     }
 
     use super::{
-        AMBIGUOUS_TOOL_WORDS, LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW,
-        long_context_window, mapped_oauth_tool_name, rewrite_tool_mentions, strip_long_context,
+        AMBIGUOUS_TOOL_WORDS, LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window,
+        mapped_oauth_tool_name, rewrite_tool_mentions, strip_long_context,
     };
     use std::collections::HashMap;
 
@@ -1562,6 +1225,7 @@ mod tests {
     }
 
     const NARROW_CONTEXT_WINDOW: u32 = 200_000;
+    const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 
     /// Only the window caudra picks itself is an input budget. The 200k entries
     /// and the 1M ceiling are API totals, so they keep the larger reserve.

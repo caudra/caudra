@@ -593,6 +593,9 @@ mod tests {
 
     fn test_model(thinking: bool) -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get("xai"),
+            entry: None,
             id: "grok-4.6".into(),
             provider: "xai".into(),
             family: ModelFamily::Generic,
@@ -608,6 +611,7 @@ mod tests {
             pricing: ModelPricing::ZERO,
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(131_072),
             context_window: 500_000,
             window_excludes_output: false,

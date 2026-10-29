@@ -6,9 +6,9 @@ pub(crate) mod error;
 pub mod history;
 pub mod manifest;
 pub mod model;
+pub mod model_data;
 pub mod model_lookup;
 pub mod model_registry;
-pub mod model_watch;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
@@ -39,10 +39,7 @@ pub use provider::WireRequest;
 pub use providers::Timeouts;
 pub use providers::anthropic::auth as anthropic_auth;
 pub use providers::catalog::ProviderData;
-pub use providers::catalog::{
-    catalog_provider, catalog_provider_if_available, catalog_providers,
-    catalog_providers_if_available, model_meta_if_available, warm_catalog,
-};
+pub use providers::catalog::{catalog_provider, catalog_providers, model_ids, model_meta};
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;

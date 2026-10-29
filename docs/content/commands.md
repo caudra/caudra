@@ -63,6 +63,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/view` |  | Cycle transcript: auto / compact / expanded |  |  |
 | `/mcp` |  | Configure MCP servers |  |  |
 | `/env` |  | View environment variables and choose which reach shell commands |  |  |
+| `/secrets` |  | Save, replace, move and delete the secrets shell commands receive |  |  |
 | `/settings` |  | Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml |  |  |
 | `/permissions` | `[discover]` | Inspect active conversation permission rules |  |  |
 | `/login` |  | Authenticate with an LLM provider |  |  |
@@ -341,7 +342,7 @@ A command written for another agent loads as-is. Caudra reads `name`, `descripti
 
 Levels still combine. Later sources override earlier ones when the command **name** matches (the stem of the file, or `name` in frontmatter). Because the walk goes cwd → … → git root, a command at the **repository root overrides** the same name found only under a nested cwd. Project commands override user commands. Palette names are `/project:<name>` or `/user:<name>` depending on which scope won.
 
-With the [pstack skill](/docs/skills/#pstack) on, the palette also lists a `/pstack:<name>` command for each pstack skill you run directly. `/pstack:poteto-mode fix the flaky test` tells the agent to load `pstack/poteto-mode` and follow it for that request. The [mattpocock skill](/docs/skills/#mattpocock) adds a `/mattpocock:<name>` command for each of its skills the same way. Their own prefix keeps them apart, so a command of yours with the same name never replaces one.
+With the [pstack skill](/docs/skills/#pstack) on, the palette also lists a `/pstack:<name>` command for each pstack skill you run directly. `/pstack:poteto-mode fix the flaky test` tells the agent to load `pstack/poteto-mode` and follow it for that request. The [mattpocock skill](/docs/skills/#mattpocock) and the [emil skill](/docs/skills/#emil) add a `/mattpocock:<name>` or `/emil:<name>` command for each of their skills the same way. Their own prefix keeps them apart, so a command of yours with the same name never replaces one.
 
 Skip all of the above with `--no-commands` (see [CLI](/docs/cli/)).
 

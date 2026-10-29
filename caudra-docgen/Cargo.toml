@@ -14,8 +14,8 @@ name = "caudra-docgen"
 path = "src/main.rs"
 
 [[bin]]
-name = "caudra-model-watch"
-path = "src/bin/model_watch.rs"
+name = "caudra-models-parity"
+path = "src/bin/models_parity.rs"
 
 [dependencies]
 caudra-agent = { workspace = true }
@@ -24,12 +24,15 @@ caudra-config = { workspace = true }
 caudra-docs = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-providers = { workspace = true }
+caudra-storage = { workspace = true }
 caudra-ui = { workspace = true }
 caudra-workcell = { workspace = true }
 color-eyre = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+smol = { workspace = true }
 strum = { workspace = true }
 workspace-hack.workspace = true
 

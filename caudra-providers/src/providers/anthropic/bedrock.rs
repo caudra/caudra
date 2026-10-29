@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::manifest::ManifestRegistry;
+use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -694,11 +695,12 @@ impl Provider for Bedrock {
         Ok(self.request(&region, model, messages, system, tools, opts))
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async {
-            let models: Vec<crate::model::ModelInfo> = shared::models()
-                .iter()
-                .map(|entry| crate::model::ModelInfo::id_only(entry.prefixes[0].to_string()))
+            let models = ManifestRegistry::get("anthropic")
+                .into_iter()
+                .flat_map(|manifest| manifest.listed_models())
+                .map(|entry| ModelInfo::id_only(entry.prefixes[0].to_string()))
                 .collect();
             Ok(models)
         })

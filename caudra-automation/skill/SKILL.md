@@ -15,7 +15,9 @@ A firing can also read the time with `now()` and compare its checkout with a loc
 
 The script is trusted. Values from outside it, such as the model's last response, the session title, or another session's message, arrive marked untrusted, and the host refuses to turn them into this session's instructions.
 
-An automation does nothing until it is armed in a session. The user can arm it with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. You can arm it with `await automation.arm(name, args)` in `code`, subject to Caudra's permission rules. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open and never finishes on its own. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
+An automation does nothing until it is armed in a session. The user can arm it with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. You can arm it with `await automation.arm(name, args)` in `code`, subject to Caudra's permission rules. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open until it is disarmed, including by its own `done(reason)` call. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
+
+Before a model request, `# Automations` reports armed scripts, their scopes and triggers, and changes made outside your automation tool calls. Use the latest reminder. An unchanged session adds no new reminder, except after compaction. A quiet session that has not used automations adds none.
 
 Write an automation when:
 
@@ -31,18 +33,20 @@ Write a workflow instead when the job is one multi-agent plan that runs to a res
 
 | Scope | Location | Trust |
 |-------|----------|-------|
+| Session | `<session_dir>/<name>.rhai`, using the directory that `automation.list()` reports | Trusted by location, visible only to this session |
 | Project | `<project root>/.caudra/automations/<name>.rhai` | Trust covers the exact digest, approved in `/automations` or through an agent arm permission. Changing any byte revokes it. |
 | User | `<config dir>/automations/<name>.rhai` | Trusted as written |
 | Bundled | Shipped inside Caudra, such as pstack's scripts while pstack is on. No file. | Trusted as shipped |
 
-Run `await automation.list()` in a `code` snippet before writing. Its `project_dir` and `user_dir` name both directories as resolved for this machine and build, beside the `automations` themselves. Use those paths rather than guessing. The user directory is `~/.config/caudra/automations/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured) and `%APPDATA%\caudra\automations\` on Windows, with `caudra-debug` in place of `caudra` for a debug build.
+Run `await automation.list()` in a `code` snippet before writing. Its `session_dir`, `project_dir`, and `user_dir` name the directories as resolved for this machine and build, beside the `automations` themselves. `session_dir` is absent when tools run remotely. Use the reported paths rather than guessing. The user directory is `~/.config/caudra/automations/` on Linux and macOS (`XDG_CONFIG_HOME` is honoured) and `%APPDATA%\caudra\automations\` on Windows, with `caudra-debug` in place of `caudra` for a debug build.
 
 Choosing a scope:
 
+- The automation manages a reminder, follow-up, or wait in this session only: session scope, as described below. It needs no digest trust. `arm: "always"` is refused here.
 - The automation is about this repository, its paths, commands, or conventions: project scope. Approval of `automation.arm` also trusts the exact digest shown in the permission prompt. The user can instead trust it in `/automations`. Every edit needs fresh trust. A script cannot grant trust or arm another script.
 - The automation is a personal routine for any session: user scope. It can be armed as soon as the file is saved. Only user scripts may use `arm: "always"`.
 - You never write a bundled script. It is already listed in `/automations` and can be armed there or through `automation.arm`. To change one, write a script with the same name in the user or project directory, and it replaces the bundled one.
-- When scopes hold scripts with the same name, the project script wins over the user script, and either wins over a bundled one. The hidden scripts are listed as shadowed.
+- When scopes hold scripts with the same name, session wins over project, then user, then bundled. The hidden scripts are listed as shadowed.
 
 File rules:
 
@@ -50,7 +54,19 @@ File rules:
 - A regular file, not a symlink, UTF-8, at most 64 KiB.
 - The first statement is the header, `let meta = #{ … };`. Comment lines above it are fine. Anything else above it is not.
 
-A file that breaks a rule stays in `list` as invalid, with the reason. Caudra reads both directories again on every list, every arm, and every session start, so a fixed file shows up without a restart.
+A file that breaks a rule stays in `list` as invalid, with the reason. Caudra reads the directories again on every list, every arm, and every session start, so a fixed file shows up without a restart.
+
+### Ad-hoc automations for this session
+
+Use a session automation when work needs a later trigger, such as a reminder in twenty minutes, a step after a goal finishes, or a check while waiting. Use a todo for work you can do in the current turn. Use a goal for one objective that should keep the session working until it is met.
+
+1. Read `session_dir` from `await automation.list()`. It points to `<state>/sessions/<id>/automations`. If it is absent because tools run remotely, report that session scripts are unavailable. Do not retry or write into the project or user directory instead.
+2. Choose a descriptive, unused kebab-case name, such as `follow-up`. Check the catalog first so the script does not hide another automation. Write `<session_dir>/<name>.rhai` with the same `meta.name`.
+3. Give a one-shot script a `done(reason)` call after its action. The `follow-up` example in section 12 queues trusted `args.text` after twenty minutes, then requests its own disarm. Keep the session open for the trigger to run.
+4. Validate with `await automation.validate(name)` before calling `await automation.arm(name, args)`. Arming asks the user unless a rule, YOLO, or autopilot approves. If the user denies it, report that the script remains disarmed. Do not retry, rename it to evade the denial, or write it elsewhere.
+5. Report what was armed and when it acts. Use `automation.disarm(name)` to cancel it or `automation.delete(name)` to remove its file when no longer needed. Session disarm and delete need no prompt by default, though user deny or ask rules still win. Deleting the session removes its scripts.
+
+Only this session sees the file. It survives closing and reopening the session, and `done()` leaves the file and state in place for inspection or re-arming.
 
 ## 3. Anatomy of a script
 
@@ -215,7 +231,7 @@ Both lists hold at most 16 entries, without repeats.
 | `cooldown` | `"0s"` | At most `"24h"`. The shortest gap between two firings that act. |
 | `max_per_hour` | `12` | 1 to 600. Firings that act, per rolling hour. |
 
-A firing acts when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
+A firing counts against these rate limits when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `done`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
 
 ### Args
 
@@ -359,6 +375,14 @@ Every field not marked U is trusted. Goal conditions are trusted because `set_go
 ## 6. Host API
 
 These functions are a firing's only way to reach the session.
+
+### `done(reason)`
+
+Requests disarming of the calling automation only when this firing completes. It leaves other automations armed and keeps messages already queued by this firing for delivery. Call it after the action in a one-shot script. It returns `()` without ending the firing, so later code still runs.
+
+Queued messages wait until the firing finishes. When the disarm applies, each delivered message says that this automation disarmed itself and quotes its reason as data. A failed or stopped firing delivers its queued messages without that notice.
+
+`reason` is required text, may be untrusted, and is recorded in history. The first call counts as one action against the firing's ceiling, but bypasses `cooldown` and `max_per_hour`. Further calls in the same firing do nothing and keep the first reason. A failed, stopped, or cancelled firing does not apply the request. Re-arming enables the automation again with its state intact.
 
 ### `message(text)` and `message(text, options)`
 
@@ -620,6 +644,7 @@ The marking keeps outside text from steering the session, and `attach` is the su
 `state` is the automation's memory in one session. It is a map, empty until a firing commits something.
 
 - **Commit rule:** a firing that completes commits its `state` changes. It completes when it runs to the end, returns, or calls `skip` or `release`. A firing that fails, is stopped, or is cancelled commits nothing. Effects it already caused are not undone.
+- **Self-disarm:** a `done()` request applies in the same transaction as the completed firing's commit. A failed, stopped, or cancelled firing leaves the automation armed. Messages already queued in the firing still deliver after a successful self-disarm.
 - **Removal:** setting a key to `()` removes it at commit.
 - **Size:** at most 64 KiB serialized. A firing that ends over the limit fails.
 - **Shape:** `state` stays a map. Assigning anything else to it fails the firing.
@@ -640,7 +665,9 @@ Args are stored with the session, so they come back on resume. A profile's args 
 
 Automations start turns while nobody watches, so several limits apply.
 
-**Automation limits.** The first action of a firing checks `cooldown`, `max_per_hour`, and the failure backoff. A firing that only reads, logs, skips, or releases costs nothing.
+**Automation limits.** The first rate-limited action of a firing checks `cooldown`, `max_per_hour`, and the failure backoff. A firing that only reads, logs, skips, or releases costs nothing.
+
+`done()` bypasses the automation rate limits, so an exhausted allowance cannot prevent self-disarming. It still counts toward the per-firing action ceiling.
 
 - When a limit refuses, the firing stops before acting and its `state` changes are discarded.
 - A one-shot event, `armed`, `goal_finished`, `message_received`, `work_finished`, or `workflow_finished`, is deferred and retried once the limit allows. Later events wait behind it, and a consumed message waits with its event.
@@ -662,6 +689,8 @@ Automations start turns while nobody watches, so several limits apply.
 - A check of `event.outcome`, so an error or a cancelled turn does not start another.
 - `max_per_hour` and `cooldown` sized to the work.
 - `event.started_by` and `event.automations`, to tell the turns this automation started from the turns a person started.
+
+**Timer loops.** A schedule that calls `message()` starts turns repeatedly even when nothing has changed. Prefer an event trigger when one fits, set `max_per_hour` for checks that must recur, and call `done()` when the work is finished. A one-shot reminder must stop with `done()` after sending its message.
 
 **Loops between sessions.** A message from an automation can fire an automation in the session it reaches, and the answer can fire the first one again. `message_received` ignores what other sessions' automations send unless the trigger sets `from_automations: true`, so by default two automations cannot keep each other going. Give such a trigger a way out too, such as answering only messages that answer nothing (`event.reply_to == ()`). An automation and another session's model can still keep a conversation going. `max_per_hour` and the messaging rate limits slow it, and Esc Esc in the automation's session stops it.
 
@@ -692,7 +721,7 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
 
 ## 11. Write, validate, and hand over
 
-1. Run `await automation.list()` in `code`. Note the two directories and check that the name is free.
+1. Run `await automation.list()` in `code`. Choose the reported directory for the intended scope and check that the name is free.
 2. Write `<dir>/<name>.rhai` with `file_write`. The header comes first.
 3. Validate with `await automation.validate("<name>")`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal, a cost, or an engaged autopilot, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
 4. Arm the validated script with the args the task needs:
@@ -716,11 +745,31 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
    A workflow script also needs `experimental.workflows`, which only the user can turn on. Every workflow in `meta.workflows` must exist, and the user must approve a project workflow in `/workflows`. Name those workflows in the answer.
 5. Debug with `await automation.history()`. It lists this session's newest firings with their status, only one automation's when you pass `name`. Pass `fire_id` to see one firing's event and its actions, log lines included. A skipped firing shows its reason, and a failed one shows its error and line. When you fix a script that has already fired, add to the hand-over that the user can press `r` on one of its finished firings in `/automations` to replay that event against the edited file, a dry run that performs nothing.
 
-`automation.list`, `.validate` and `.history` never prompt. `automation.disarm(name)` stops the automation in this session and drops queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular project or user file, and rescans. Both require permission like `arm`, and all three mutations are refused in Plan mode. Delete refuses bundled scripts and symlinks. Other open sessions keep their armed source until disarmed or restarted.
+`automation.list`, `.validate` and `.history` never prompt. `automation.disarm(name)` stops the automation in this session and drops queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular session, project, or user file, and rescans. Session disarm and delete need no prompt by default, though user deny or ask rules still win. Other scopes require permission like `arm`, and all three mutations are refused in Plan mode. Delete refuses bundled scripts and symlinks. Other open sessions keep their armed source until disarmed or restarted.
 
 ## 12. Complete examples
 
 Each example below validates, and the test suite replays it against scripted events. The last six, from `ci-watch` on, are for sessions with cross-session messaging turned on. `nightly-review` needs workflows turned on, and `research-desk`, the last, needs both messaging and workflows.
+
+### follow-up
+
+Queues one reminder twenty minutes after arming, then disarms itself.
+
+```rhai
+let meta = #{
+    name: "follow-up",
+    description: "Send one follow-up after twenty minutes, then disarm",
+    triggers: [#{ kind: "schedule", every: "20m" }],
+    limits: #{ max_per_hour: 1 },
+    args: #{
+        text: #{ type: "string", description: "The follow-up instruction", example: "Check whether the test run has finished." },
+    },
+};
+message(args.text);
+done("sent");
+```
+
+Write this to the reported `session_dir`, validate it, then arm with `await automation.arm("follow-up", {"text": "Check whether the test run has finished."})`. Args are trusted, so `message(args.text)` is allowed. Completing the firing disarms the script without dropping its message. Re-arming starts another twenty-minute wait. The session must be open to fire, and a missed occurrence follows the schedule's default catch-up rule.
 
 ### keep-going
 

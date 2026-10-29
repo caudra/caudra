@@ -18,6 +18,7 @@ pub mod peers;
 pub mod plan;
 pub mod question;
 pub(crate) mod report_to_parent;
+pub mod secret;
 pub mod skill;
 pub mod task;
 pub mod task_control;
@@ -107,6 +108,11 @@ fn entries(
             question::QuestionTool,
             ToolEffect::Isolated,
             question::DESCRIPTION,
+        ),
+        entry(
+            secret::RequestSecretTool,
+            ToolEffect::Isolated,
+            secret::DESCRIPTION,
         ),
         entry(skill, ToolEffect::ReadOnly, skill::DESCRIPTION),
         entry(task::TaskTool, ToolEffect::Orchestrator, task::DESCRIPTION),

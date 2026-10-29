@@ -31,7 +31,7 @@ A script does nothing until you arm it in a session. Arming takes args, so one s
 - `/automations arm NAME` arms it in the current session, with the args as a JSON object after the name: `/automations arm goal-chain {"goals": ["The login tests pass"]}`. `/automations disarm NAME` disarms it, and Space in the [inspector](#the-inspector) does both.
 - `--automation NAME` arms it in the session Caudra starts with. `NAME=JSON` gives the args inline and `NAME=@FILE` reads them from a file. Repeat the flag for more automations, naming each once.
 - The `automations:` list in the frontmatter of a [system prompt profile](/docs/system-prompts/) arms each entry when a session starts with the profile or switches to it. An entry is a name, or a map with `name` and `args`. Switching to a profile that lacks an entry disarms what the previous profile armed.
-- `arm: "always"` in the header of a user script arms it in every session as the session starts. Every arg then needs a `default_value`. Project scripts cannot use it.
+- `arm: "always"` in the header of a user script arms it in every session as the session starts. Every arg then needs a `default_value`. No other scope can use it.
 - SDK clients send `automation_arm`. See [Headless Mode](/docs/headless/#automations).
 
 A profile that arms two automations, one of them with args:
@@ -53,13 +53,16 @@ Args are saved with the session. Resuming it arms each automation again with its
 
 | Scope | Location | Trust |
 |-------|----------|-------|
+| Session | `<state>/sessions/<id>/automations/<name>.rhai` | trusted by location, visible only to this session |
 | Project | `<project root>/.caudra/automations/<name>.rhai` | per exact SHA-256 digest |
 | User | `~/.config/caudra/automations/<name>.rhai` | trusted as written |
 | Bundled | shipped inside Caudra by a feature you turned on, such as [pstack](/docs/skills/#pstack) | trusted as shipped |
 
 Debug builds use `~/.config/caudra-debug/automations/` instead, following the platform directory rule in [Configuration](/docs/configuration/#directory-layout). A session on a remote workspace or a sandbox loads user and bundled scripts only, because its project lives on another machine.
 
-The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-8 file of at most 64 KiB, and a symlink is refused. A file that breaks a rule stays in the list as invalid, with the reason. Caudra reads both directories again whenever it lists the catalog, arms a script, or starts a session, so a fixed file shows up without a restart. When two scopes hold the same name, the nearer one wins: a project script hides a user script, and either hides a bundled one. The winner lists the scopes it hides, so a file of a bundled script's name replaces it.
+`automation.list()` reports the resolved `session_dir`, `project_dir`, and `user_dir`. Use these paths rather than guessing. A session script survives closing and reopening that session, and deleting the session removes it. When tools run remotely, `session_dir` is absent. The agent must report that session scripts are unavailable rather than write the script into another scope.
+
+The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-8 file of at most 64 KiB, and a symlink is refused. A file that breaks a rule stays in the list as invalid, with the reason. Caudra reads the directories again whenever it lists the catalog, arms a script, or starts a session, so a fixed file shows up without a restart. When scopes hold the same name, session wins over project, then user, then bundled. The winner lists the scopes it hides, so a file of a bundled script's name replaces it.
 
 A bundled script has no file. Its path in the inspector reads `builtin:<provider>/<name>.rhai`, and `o` has nothing to open. It appears while its feature is on and goes when the feature is turned off. A bundled script that is armed when its feature goes off keeps running until the session restarts, and the resumed session disarms it and keeps its args, as it does for a deleted file. Bundled scripts cannot use `arm: "always"`.
 
@@ -94,9 +97,11 @@ The body is ordinary Rhai that runs top to bottom once per firing, with `event`,
 
 The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and arms it with `automation.arm(name, args)`.
 
-Arming, disarming and deleting through the agent follow your permission rules. Ask mode prompts unless an allow rule covers the call. YOLO approves after deny rules, and autopilot can decide the prompt. The prompt shows the action, name, scope, path, digest, triggers, args, and network, secrets, messaging and workflow capabilities. An untrusted project script also shows `trusts digest`, so approval grants trust to those exact bytes. A script changed during approval is refused. Plan mode refuses these changes. `automation.list`, `.validate` and `.history` never prompt.
+For an ad-hoc reminder, a follow-up after a goal, or a check while waiting, the agent uses session scope. A todo fits work in the current turn, and a goal fits one objective to pursue until it is met. The agent checks the catalog for a free name, writes into `session_dir`, validates, then asks to arm. If you deny arming, it reports that the script remains disarmed without retrying or writing elsewhere. A one-shot calls `done(reason)` after acting, as the [follow-up pattern](#follow-up) shows.
 
-`automation.disarm(name)` stops the automation in this session and drops its queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular project or user file, and rescans the catalog. Bundled scripts and symlinks cannot be deleted. Other open sessions keep their armed source until disarmed or restarted, even if a catalog rescan no longer finds its file. Permission scopes are `read`, `arm:<name>`, `disarm:<name>` and `delete:<name>`, so an allow rule for `automation` with scope `arm:*` covers arming only.
+Arming through the agent asks for permission unless a rule, YOLO, or autopilot approves. Disarming and deleting ask too, except for session scripts, which need no prompt by default. Your deny or ask rules still take precedence. The prompt shows the action, name, scope, path, digest, triggers, args, and network, secrets, messaging and workflow capabilities. An untrusted project script also shows `trusts digest`, so approval grants trust to those exact bytes. A script changed during approval is refused. Plan mode refuses these changes. `automation.list`, `.validate` and `.history` never prompt.
+
+`automation.disarm(name)` stops the automation in this session and drops its queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular session, project, or user file, and rescans the catalog. Bundled scripts and symlinks cannot be deleted. Other open sessions keep their armed source until disarmed or restarted, even if a catalog rescan no longer finds its file. Permission scopes are `read`, `arm:<name>`, `disarm:<name>` and `delete:<name>`. Session disarm and delete use `disarm-session:<name>` and `delete-session:<name>`. An allow rule for `automation` with scope `arm:*` covers arming only.
 
 ### Triggers
 
@@ -125,6 +130,7 @@ Arming, disarming and deleting through the agent follow your permission rules. A
 | `release(reason)` | Ends the firing and hands a consumed message back to the model |
 | `start_workflow(name, args)` | Starts a workflow run, as [Workflows](#workflows) describes |
 | `pause_automations(reason)` | Sets the session's pause latch, as Esc Esc does |
+| `done(reason)` | Disarms only the calling automation when the firing completes, without dropping its queued messages |
 | `skip(reason)` | Ends the firing without acting and records why |
 | `log(text)` | Adds a line to the firing's trace |
 | `now()` | Returns the time in the script's time zone |
@@ -133,6 +139,12 @@ Arming, disarming and deleting through the agent follow your permission rules. A
 Messages wait in an outbox until the session can take them, and the model receives each one under a header that names the automation. `http()` sends each request once, without retries, and every status comes back as an answer. The script names environment variables for its secrets and never sees their values, and the history keeps only the names. Caudra reads those variables from its own environment and the global `.env` file. A project `.env` cannot set them. Loopback and private hosts stay out of reach unless the global config sets `allow_private_network = true`.
 
 A call the header does not allow, untrusted text in `message()` or `set_goal()`, or a per-firing limit stops the firing at once, and `try` cannot catch it. Other failures, such as an active goal or an unknown recipient, can be caught with `try` and `catch`. A firing that fails or stops keeps none of its state changes, and effects it already caused stay.
+
+`done(reason)` returns `()` without ending the firing. Its required reason may be untrusted text and appears in history. The first call counts toward the firing's action ceiling, but bypasses `cooldown` and `max_per_hour`. Repeated calls do nothing and keep the first reason. Re-arming enables the automation again with its state intact.
+
+Messages wait until their firing finishes. When `done()` applies, the delivered message tells the model that the automation disarmed itself and quotes its reason as data. Failed or stopped firings deliver their queued messages without that notice.
+
+Before the next model request, a bounded `# Automations` reminder lists armed scripts with their scopes and triggers. It explains changes made outside the agent's automation tool, including user controls, self-disarms, startup arming, pauses, restore failures, and session moves. Unchanged sessions add no reminder, except after compaction. Sessions that have not used automations add none.
 
 ### Compare local Git branches
 
@@ -165,6 +177,8 @@ Interpolating an untrusted value with `${…}` gives a placeholder that every ho
 
 `state` is a map the automation keeps in one session, empty until a firing commits something. A firing commits its changes when it completes: it runs to the end, returns, skips, or releases. A firing that fails, is stopped, or is cancelled commits nothing. One firing per automation runs at a time, so firings never race on `state`. It holds at most 64 KiB, keeps untrusted values marked, and survives disarming, new args, and script edits.
 
+A `done()` request applies in the same transaction as the completed firing's commit. A failed, stopped, or cancelled firing leaves the automation armed. A successful self-disarm keeps messages already queued by that firing for delivery.
+
 Each commit raises the state's revision, and a write applies only at the revision it read. When you save an edit while a firing runs, the firing loses: it commits nothing, and its trace says so. When a firing commits while you edit, your save is refused, and the editor stays open and names the newer revision.
 
 Args are typed. A script declares each one as a `string`, `int`, `float`, `bool`, or `list` of strings, with an optional `default_value`, `min` and `max`, `choices`, and a description. An arg without a default is required. Args cannot change the header, so triggers, limits, and capabilities stay as the script wrote them.
@@ -175,12 +189,14 @@ Automations start turns while nobody watches, so limits apply to each firing, ea
 
 **Each firing** may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, 4 calls to `message` and `set_goal` together, and 4 `git_compare` queries. Reaching any of them stops it.
 
-**Each automation** takes `max_per_hour` and `cooldown` from the `limits` in its header. `max_per_hour` counts the firings that act per rolling hour, 12 by default and 600 at most. `cooldown` is the shortest gap between two of them, none by default and 24 hours at most. A firing acts when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Its first action checks the limits, so a firing that only reads, logs, or skips costs nothing. When a limit refuses, the firing stops before acting and keeps no state. What happens to its event depends on the trigger:
+**Each automation** takes `max_per_hour` and `cooldown` from the `limits` in its header. `max_per_hour` counts the firings that act per rolling hour, 12 by default and 600 at most. `cooldown` is the shortest gap between two of them, none by default and 24 hours at most. A firing counts against these rate limits when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `done`, `pause_automations`, and the parsers. Its first rate-limited action checks the limits, so a firing that only reads, logs, or skips costs nothing. When a limit refuses, the firing stops before acting and keeps no state. What happens to its event depends on the trigger:
 
 - `armed`, `goal_finished`, `message_received`, `work_finished`, and `workflow_finished` happen once. Their event is deferred and retried once the limit allows, and later events wait behind it.
 - `idle`, `needs_input`, and `schedule` recur. Their event is recorded as `rate_limited` and not retried.
 
 After a failed firing, the automation's next acting firing waits 1 minute, doubling up to 30 minutes. A firing that acts and completes resets this backoff, and so does arming again.
+
+An `idle` or `schedule` trigger that queues a message on every firing can keep starting turns. Set `max_per_hour` to bound recurring work and call `done()` when it is finished. For one-shot reminders, call `done()` after queuing the message.
 
 Each automation queues at most 16 events and runs one firing at a time. A newer `armed`, `idle`, `needs_input`, or `schedule` event replaces a waiting one of its kind, and a full queue drops its oldest event. A session runs at most 4 firings at once.
 
@@ -276,7 +292,7 @@ Each automation keeps its newest 100 finished firings per session, and waiting o
 
 Resuming a session restores its bindings, state, waiting events, and outbox, so the inspector shows the same history. Firings that were running when Caudra stopped end as `interrupted`. Waiting `armed`, `idle`, `needs_input`, and `schedule` events are dropped, because resume fires `armed` again and schedules catch up. Schedules, limit windows, and the `work_finished` cursor keep their marks, so a restart repeats no schedule occurrence or work outcome.
 
-A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or state. [Trimming](/docs/sessions/#retention) a session deletes its firings, actions, and script versions, and keeps its bindings and state. [Moving a session](/docs/sessions/#moving-sessions-to-another-directory) to another directory is refused while a firing runs. The move interrupts waiting firings and disarms project scripts, because they belong to the old project. User and bundled scripts stay armed. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its own `caudra.db`, which goes away at exit with everything in it.
+A [fork](/docs/sessions/#fork-boundaries) starts with no automations, args, or state. [Trimming](/docs/sessions/#retention) a session deletes its firings, actions, and script versions, and keeps its bindings and state. [Moving a session](/docs/sessions/#moving-sessions-to-another-directory) to another directory is refused while a firing runs. The move interrupts waiting firings and disarms project scripts, because they belong to the old project. Session, user, and bundled scripts stay armed. Deleting a session removes its session-scoped script directory. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its own `caudra.db`, which goes away at exit with everything in it.
 
 ## Autopilot
 
@@ -299,6 +315,24 @@ One-shot `--print` and ACP sessions run no automations, and both refuse `--autom
 These scripts are the examples Caudra's test suite replays against scripted events, ordered from one session on its own to a swarm. A script that needs more switches than `automations` to load names them.
 
 <!-- caudra-docgen:automation-patterns -->
+
+### follow-up
+
+Send one follow-up after twenty minutes, then disarm.
+
+```rhai
+let meta = #{
+    name: "follow-up",
+    description: "Send one follow-up after twenty minutes, then disarm",
+    triggers: [#{ kind: "schedule", every: "20m" }],
+    limits: #{ max_per_hour: 1 },
+    args: #{
+        text: #{ type: "string", description: "The follow-up instruction", example: "Check whether the test run has finished." },
+    },
+};
+message(args.text);
+done("sent");
+```
 
 ### retry-overload
 

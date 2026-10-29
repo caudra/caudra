@@ -1362,13 +1362,9 @@ impl App {
     pub(super) fn route_model(&self, mode: Mode) -> Option<Cow<'_, Model>> {
         match mode {
             Mode::Build => Some(Cow::Borrowed(&self.state.model)),
-            Mode::Plan => Model::resolve_if_available(
-                ModelPurpose::Plan,
-                &self.state.model,
-                &self.model_policy,
-            )
-            .ok()
-            .map(Cow::Owned),
+            Mode::Plan => Model::resolve(ModelPurpose::Plan, &self.state.model, &self.model_policy)
+                .ok()
+                .map(Cow::Owned),
         }
     }
 
@@ -2050,6 +2046,7 @@ impl App {
             QuestionFormAction::Submit(_)
                 | QuestionFormAction::Accept
                 | QuestionFormAction::Decline
+                | QuestionFormAction::Secret(_)
                 | QuestionFormAction::Dismiss
                 | QuestionFormAction::Cancel
         );
@@ -2110,6 +2107,7 @@ impl App {
             }
             QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
             QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
+            QuestionFormAction::Secret(reply) => reply.encode(),
             QuestionFormAction::Submit(answers) => self.question_form.reply(Some(answers)),
         };
         let subagent = self.question_subagent.take();
@@ -6645,6 +6643,7 @@ impl App {
                 vec![]
             }
             "/env" => self.open_env(),
+            "/secrets" => self.open_secrets(),
             "/settings" => self.open_settings(),
             "/permissions" => {
                 let discover = match subcommand(&cmd.args) {
@@ -7616,8 +7615,7 @@ impl App {
         }
         let mode = self.agent_mode();
         let mut model = if self.state.mode == Mode::Plan {
-            Model::resolve_if_available(ModelPurpose::Plan, &self.state.model, &self.model_policy)
-                .ok()?
+            Model::resolve(ModelPurpose::Plan, &self.state.model, &self.model_policy).ok()?
         } else {
             self.state.model.clone()
         };

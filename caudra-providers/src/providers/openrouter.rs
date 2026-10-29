@@ -5,7 +5,7 @@ use flume::Sender;
 use serde_json::{Value, json};
 
 use crate::accounts::AccountCredential;
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
@@ -38,10 +38,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: Some("https://openrouter.ai/keys"),
     needs_url: false,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}
 
 pub struct OpenRouter {
     compat: OpenAiCompatProvider,

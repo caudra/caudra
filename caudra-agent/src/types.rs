@@ -348,6 +348,16 @@ pub enum AnswerKind {
         maximum: Option<Number>,
     },
     Boolean,
+    /// The `request_secret` card's masked field. The value goes to the session's vault as
+    /// variable `name`, never into an answer.
+    Secret {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        /// `name` already holds a live secret, which the value replaces.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replaces: bool,
+    },
 }
 
 impl AnswerKind {
@@ -357,7 +367,14 @@ impl AnswerKind {
 
     /// Typed into a box rather than picked from a list.
     pub fn is_typed(&self) -> bool {
-        matches!(self, Self::Text { .. } | Self::Number { .. })
+        matches!(
+            self,
+            Self::Text { .. } | Self::Number { .. } | Self::Secret { .. }
+        )
+    }
+
+    pub fn is_secret(&self) -> bool {
+        matches!(self, Self::Secret { .. })
     }
 }
 

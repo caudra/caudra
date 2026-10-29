@@ -38,7 +38,7 @@ use super::cache_warming::{CacheWarmer, WarmerContext, subagent_mode};
 use super::favorites;
 use super::live_switch::{ConversationControl, SettingsChange};
 use super::steering::{SharedSteering, Steering};
-use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
+use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot, CancelToken};
 use crate::code::CodeSession;
@@ -119,8 +119,10 @@ async fn relay_session_events(
 ) {
     let mut cost = None;
     let mut progress = ProgressRelay::new();
+    let mut stamp = RelayStamp::new(subagent_info);
     while let Ok(mut envelope) = sub_rx.recv_async().await {
-        progress.relay(&envelope, &parent_tx, &subagent_info, live_sink.as_ref());
+        stamp.observe(&envelope);
+        progress.relay(&envelope, &parent_tx, &stamp, live_sink.as_ref());
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -154,8 +156,57 @@ async fn relay_session_events(
             }
             _ => {}
         }
-        envelope.subagent = subagent_info.get().cloned();
+        envelope.subagent = stamp.current();
         let _ = parent_tx.send_envelope(envelope);
+    }
+}
+
+/// The identity a task's envelopes carry: the one it opened with, moved to
+/// whatever model and level its latest request, pick or reroute reported,
+/// so the parent never reads the model it started on as the one in force.
+struct RelayStamp {
+    info: Arc<OnceLock<SubagentInfo>>,
+    model: Option<String>,
+    thinking: Option<Option<String>>,
+}
+
+impl RelayStamp {
+    fn new(info: Arc<OnceLock<SubagentInfo>>) -> Self {
+        Self {
+            info,
+            model: None,
+            thinking: None,
+        }
+    }
+
+    /// Only the task's own events move it: one already stamped is a nested
+    /// task's, whose model is not this one's.
+    fn observe(&mut self, envelope: &Envelope) {
+        if envelope.subagent.is_some() {
+            return;
+        }
+        match &envelope.event {
+            AgentEvent::MessageStarted {
+                model, thinking, ..
+            }
+            | AgentEvent::SettingsChanged { model, thinking } => {
+                self.model = Some(model.clone());
+                self.thinking = Some(thinking.clone());
+            }
+            AgentEvent::ModelRerouted(reroute) => self.model = Some(reroute.to.clone()),
+            _ => {}
+        }
+    }
+
+    fn current(&self) -> Option<SubagentInfo> {
+        let mut info = self.info.get()?.clone();
+        if let Some(model) = &self.model {
+            info.model = Some(model.clone());
+        }
+        if let Some(thinking) = &self.thinking {
+            info.thinking.clone_from(thinking);
+        }
+        Some(info)
     }
 }
 
@@ -433,7 +484,7 @@ impl ProgressRelay {
         &mut self,
         envelope: &Envelope,
         parent_tx: &EventSender,
-        subagent_info: &OnceLock<SubagentInfo>,
+        stamp: &RelayStamp,
         live_sink: Option<&flume::Sender<ToolLive>>,
     ) {
         if envelope.subagent.is_some() {
@@ -460,7 +511,7 @@ impl ProgressRelay {
         }
         let _ = parent_tx.send_envelope(Envelope {
             event: AgentEvent::SubagentProgress { progress },
-            subagent: subagent_info.get().cloned(),
+            subagent: stamp.current(),
             run_id: parent_tx.run_id(),
             workflow: envelope.workflow.clone(),
             task: envelope.task.clone(),
@@ -690,6 +741,11 @@ impl Subagent {
 
     pub fn model_spec(&self) -> String {
         self.params.model.spec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control(&self) -> &ConversationControl {
+        &self.control
     }
 
     /// The level this session's requests carry, snapped to its model. `None`
@@ -1683,9 +1739,9 @@ async fn route_subagent(
     }
 }
 
-/// The Subagent model a binding resolves to, without warming the catalog.
+/// The Subagent model a binding resolves to.
 fn inspected_subagent_model(ctx: &ToolContext, binding: Option<&Binding>) -> Option<Model> {
-    resolve_purpose_model_for_inspection(
+    resolve_purpose_model(
         ModelPurpose::Subagent,
         binding,
         &ctx.model,
@@ -2124,7 +2180,6 @@ mod tests {
     const ROUTING_BASE_URL: &str = "http://127.0.0.1:1";
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
-    const ROUTING_FAST: &str = "anthropic/claude-haiku-5-5";
     const ROUTING_BASELINE_NAME: &str = "sonnet 4.6";
     const ROUTING_PROFILE: &str = "security";
     const ROUTING_SECRET: &str = "do-not-send-this-value";
@@ -2138,10 +2193,16 @@ mod tests {
     const SUBAGENT_ROOT: &str = "/work/project";
     const LOCAL_READER: &str = "local_reader";
     const LOCAL_RESULT: &str = "local result";
-    const SONNET_NAME: &str = "sonnet";
-    const NEWEST_SONNET: &str = "anthropic/claude-sonnet-5-5";
-    const FAVORITE_SONNET: &str = "anthropic/claude-sonnet-4-5";
-    const OTHER_PROVIDER_SONNET: &str = "copilot/claude-sonnet-4.6";
+    const SONNET_NAME: &str = "fixture-sonnet";
+    const NEWEST_SONNET: &str = "ollama/fixture-sonnet-2";
+    const FAVORITE_SONNET: &str = "ollama/fixture-sonnet-1";
+    const OTHER_PROVIDER_SONNET: &str = "llama-cpp/fixture-sonnet-1";
+
+    fn routing_fast() -> String {
+        Model::curated_default("anthropic", ModelPurpose::Fast)
+            .unwrap()
+            .spec()
+    }
 
     struct RevisionChangingProvider {
         permissions: Arc<PermissionManager>,
@@ -2391,14 +2452,14 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut ctx = routing_context();
             ctx.model = Arc::new(
-                Model::from_spec(if same_model {
-                    ROUTING_FAST
+                Model::from_spec(&if same_model {
+                    routing_fast()
                 } else {
-                    ROUTING_BASELINE
+                    ROUTING_BASELINE.to_owned()
                 })
                 .unwrap(),
             );
-            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
             if let Some(leave_yolo) = leave_yolo {
                 ctx.chat_provider = Arc::new(RevisionChangingProvider {
                     permissions: Arc::clone(&ctx.permissions),
@@ -2439,7 +2500,7 @@ mod tests {
                 assert_eq!(
                     subagent.params.model.spec(),
                     if expected == DecisionEffect::Rerouted {
-                        ROUTING_FAST.into()
+                        routing_fast()
                     } else {
                         ctx.model.spec()
                     }
@@ -2489,7 +2550,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut ctx = routing_context();
             ctx.model = Arc::new(Model::from_spec(ROUTING_BASELINE).unwrap());
-            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
             let calls = Arc::new(AtomicUsize::new(0));
             ctx.permissions.set_decisions(Some(routing_decisions(
                 &directory,
@@ -2528,8 +2589,6 @@ mod tests {
         });
     }
 
-    /// The session runs the newest Sonnet, which a bare `sonnet` names unless
-    /// the user starred another one.
     #[test_case(&[], &[] => NEWEST_SONNET ; "without_favorites_the_newest_wins")]
     #[test_case(&[FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "a_favorite_beats_a_newer_model")]
     #[test_case(&[OTHER_PROVIDER_SONNET, FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "the_session_provider_breaks_a_tie_between_favorites")]
@@ -2577,14 +2636,14 @@ mod tests {
             for _ in 0..ROUTING_ROUNDS {
                 let mut ctx = routing_context();
                 ctx.model = Arc::new(
-                    Model::from_spec(if same_model {
-                        ROUTING_FAST
+                    Model::from_spec(&if same_model {
+                        routing_fast()
                     } else {
-                        ROUTING_BASELINE
+                        ROUTING_BASELINE.to_owned()
                     })
                     .unwrap(),
                 );
-                ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+                ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
                 ctx.event_tx = EventSender::new(sender.clone(), RUN_ID);
                 ctx.tool_use_id = Some(TOOL_ID.into());
                 ctx.permissions.set_decisions(Some(decisions.clone()));
@@ -2612,8 +2671,9 @@ mod tests {
                     NoteOutcome::Acted | NoteOutcome::Shadow => assert_eq!(
                         note.summary,
                         format!(
-                            "{}{phrase} {ROUTING_FAST} instead of {ROUTING_BASELINE} (difficulty {ROUTINE_BAND}, {:.2})",
+                            "{}{phrase} {} instead of {ROUTING_BASELINE} (difficulty {ROUTINE_BAND}, {:.2})",
                             note.outcome.lead(),
+                            routing_fast(),
                             FAST_LEVELS[0] + FAST_LEVELS[1]
                         )
                     ),
@@ -2654,6 +2714,9 @@ mod tests {
     const THINKING_LABEL: &str = "thinking";
     const RESPONDING_LABEL: &str = "responding";
     const THOUGHT_TITLE: &str = "Weighing the options";
+    const OPENED_LEVEL: &str = "high";
+    const SWITCHED_LEVEL: &str = "low";
+    const STALE_STAMP: &str = "the parent must read the model the task runs on now";
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
         TokenUsage {
@@ -3499,6 +3562,92 @@ mod tests {
                 (RESPONDING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
                 (THINKING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
             ]
+        );
+    }
+
+    fn opened_on_pinned_model() -> Arc<OnceLock<SubagentInfo>> {
+        let mut info = parent_info().get().unwrap().clone();
+        info.model = Some(PINNED_MODEL_SPEC.into());
+        info.thinking = Some(OPENED_LEVEL.into());
+        Arc::new(OnceLock::from(info))
+    }
+
+    fn settings_changed() -> AgentEvent {
+        AgentEvent::SettingsChanged {
+            model: PLAN_MODEL_SPEC.into(),
+            thinking: Some(SWITCHED_LEVEL.into()),
+        }
+    }
+
+    fn message_started() -> AgentEvent {
+        AgentEvent::MessageStarted {
+            id: CaudraId::generate(),
+            model: PLAN_MODEL_SPEC.into(),
+            thinking: Some(SWITCHED_LEVEL.into()),
+        }
+    }
+
+    fn rerouted() -> AgentEvent {
+        AgentEvent::ModelRerouted(Box::new(caudra_providers::accounts::Reroute {
+            from: PINNED_MODEL_SPEC.into(),
+            to: PLAN_MODEL_SPEC.into(),
+            reason: caudra_providers::accounts::RerouteReason::Spent {
+                window: None,
+                used_percent: None,
+            },
+            cached_tokens: 0,
+        }))
+    }
+
+    fn nested(event: AgentEvent) -> Envelope {
+        let mut envelope = envelope(event);
+        envelope.subagent = Some(session_info(SECOND_SUBAGENT_ID).get().unwrap().clone());
+        envelope
+    }
+
+    fn stamped(envelope: &Envelope) -> (Option<&str>, Option<&str>) {
+        let info = envelope.subagent.as_ref().unwrap();
+        (info.model.as_deref(), info.thinking.as_deref())
+    }
+
+    /// A pick, a reroute, or simply the next request on another model moves
+    /// what every later envelope says the task runs on, its progress
+    /// included, while a nested task's switch leaves it alone.
+    #[test_case(envelope(settings_changed()), PLAN_MODEL_SPEC, SWITCHED_LEVEL; "a_live_switch")]
+    #[test_case(envelope(message_started()), PLAN_MODEL_SPEC, SWITCHED_LEVEL; "a_request_on_another_model")]
+    #[test_case(envelope(rerouted()), PLAN_MODEL_SPEC, OPENED_LEVEL; "a_reroute_keeps_the_level")]
+    #[test_case(nested(settings_changed()), PINNED_MODEL_SPEC, OPENED_LEVEL; "a_nested_tasks_switch")]
+    fn relay_stamps_the_model_the_task_runs_on_now(moved: Envelope, model: &str, level: &str) {
+        let forwarded = relay_hop(
+            opened_on_pinned_model(),
+            vec![
+                envelope(text_delta()),
+                moved,
+                envelope(AgentEvent::ThinkingDelta { text: "hm".into() }),
+            ],
+        );
+
+        let delta = |event: fn(&AgentEvent) -> bool| {
+            forwarded
+                .iter()
+                .find(|envelope| event(&envelope.event))
+                .unwrap()
+        };
+        let before = delta(|event| matches!(event, AgentEvent::TextDelta { .. }));
+        assert_eq!(
+            stamped(before),
+            (Some(PINNED_MODEL_SPEC), Some(OPENED_LEVEL))
+        );
+        let after = delta(|event| matches!(event, AgentEvent::ThinkingDelta { .. }));
+        assert_eq!(stamped(after), (Some(model), Some(level)), "{STALE_STAMP}");
+        let progress = forwarded
+            .iter()
+            .rfind(|envelope| matches!(envelope.event, AgentEvent::SubagentProgress { .. }))
+            .unwrap();
+        assert_eq!(
+            stamped(progress),
+            (Some(model), Some(level)),
+            "{STALE_STAMP}"
         );
     }
 

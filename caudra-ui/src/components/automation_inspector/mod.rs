@@ -3215,6 +3215,7 @@ mod tests {
     }
 
     #[test_case(Scope::Project, "project"; "project")]
+    #[test_case(Scope::Session, "session"; "session")]
     #[test_case(Scope::User, "user"; "user")]
     #[test_case(Scope::Bundled, "bundled"; "bundled")]
     fn a_script_row_names_its_scope_and_when_its_last_firing_ended_and_how(
@@ -3904,6 +3905,22 @@ mod tests {
             AutomationAction::OpenScript {
                 path: PathBuf::from(SCRIPT_PATH),
                 line,
+            }
+        );
+    }
+
+    #[test_case(Scope::Session; "session")]
+    #[test_case(Scope::Project; "project")]
+    #[test_case(Scope::User; "user")]
+    fn o_opens_a_file_backed_script(scope: Scope) {
+        let mut state = catalog();
+        state.automations[0].scope = scope;
+        let mut inspector = opened(state, Some(SCRIPT));
+        assert_eq!(
+            press_char(&mut inspector, SCRIPT_KEY),
+            AutomationAction::OpenScript {
+                path: PathBuf::from(SCRIPT_PATH),
+                line: None
             }
         );
     }

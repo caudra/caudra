@@ -7,14 +7,12 @@ use caudra_storage::id::CaudraId;
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use jiff::civil;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::accounts::AccountCredential;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
-use crate::pricing::{Period, PricePeriod};
+use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -25,21 +23,6 @@ use super::{ResolvedAuth, auth_proxy_route, http_client, next_sse_line, proxy_ro
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
-const ONE_MILLION_WINDOW: u32 = 1_048_576;
-/// The output limit of every Gemini model in the table. On Gemini 4 it is the
-/// most one streaming request returns. Asking for more starts long decode,
-/// which stops with `CONTINUATION` and expects the client to resume.
-const MAX_OUTPUT_TOKENS: u32 = 65_536;
-const ARGON: &str = "gemini-4-argon";
-const FLASH_3_8: &str = "gemini-3.8-flash";
-const FLASH_3_6: &str = "gemini-3.6-flash";
-/// Gemini 4 and 3 take a `thinkingLevel` and cannot turn thinking off, so
-/// `off` runs at the lowest level. Argon and 3.8 Flash reject `minimal`.
-const LEVELS_LOW_TO_HIGH: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
-const LEVELS_MINIMAL_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "minimal", "low", "medium", "high",
-])];
 /// What Google's FAQ says to send in place of a thought signature on a
 /// function call the model did not produce, such as one carried over from
 /// another model's turn. Gemini 3 and later reject such a call otherwise.
@@ -57,50 +40,6 @@ const ZERO_QUOTA_LIMIT: &str = "0";
 /// Reported as a billing refusal, which neither the retry loop nor a goal
 /// retries: no wait raises a limit of 0.
 const PAYMENT_REQUIRED: u16 = 402;
-const FLASH_PROMO_PRICE: ModelPricing = ModelPricing {
-    input: 0.75,
-    output: 3.75,
-    cache_write: 0.00,
-    cache_read: 0.075,
-    fast: None,
-    tiers: ModelPricing::UNTIERED,
-};
-const FLASH_LIST_PRICE: ModelPricing = ModelPricing {
-    input: 1.50,
-    output: 7.50,
-    cache_write: 0.00,
-    cache_read: 0.15,
-    fast: None,
-    tiers: ModelPricing::UNTIERED,
-};
-
-/// Introductory rates Google ends on a set day, from
-/// <https://ai.google.dev/gemini-api/docs/pricing>.
-pub(crate) const PRICE_PERIODS: &[PricePeriod] = &[
-    PricePeriod {
-        prefix: ARGON,
-        during: Period::from(civil::date(2026, 12, 1)),
-        pricing: ModelPricing {
-            input: 4.00,
-            output: 20.00,
-            cache_write: 0.00,
-            cache_read: 0.20,
-            fast: None,
-            tiers: ModelPricing::UNTIERED,
-        },
-    },
-    PricePeriod {
-        prefix: FLASH_3_8,
-        during: Period::from(civil::date(2027, 1, 1)),
-        pricing: FLASH_LIST_PRICE,
-    },
-    PricePeriod {
-        prefix: FLASH_3_6,
-        during: Period::from(civil::date(2027, 1, 1)),
-        pricing: FLASH_LIST_PRICE,
-    },
-];
-
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "google",
     display_name: "Google",
@@ -112,73 +51,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: Some("https://aistudio.google.com/apikey"),
     needs_url: false,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &[ARGON],
-            small: false,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            // Introductory through 2026-11-30, see `PRICE_CHANGES`.
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 0.00,
-                cache_read: 0.10,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: ONE_MILLION_WINDOW,
-            reasoning_options: Some(LEVELS_LOW_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &[FLASH_3_8],
-            small: false,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: false,
-            // Introductory through 2026-12-31, see `PRICE_CHANGES`.
-            pricing: FLASH_PROMO_PRICE,
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: ONE_MILLION_WINDOW,
-            reasoning_options: Some(LEVELS_LOW_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &[FLASH_3_6],
-            small: false,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: false,
-            // Introductory through 2026-12-31, see `PRICE_CHANGES`.
-            pricing: FLASH_PROMO_PRICE,
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: ONE_MILLION_WINDOW,
-            reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.5-flash-lite"],
-            small: true,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.30,
-                output: 2.50,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: ONE_MILLION_WINDOW,
-            reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
-        },
-    ];
-    MODELS
-}
 
 fn resolve_google_base_url() -> Option<String> {
     let config = caudra_config::providers::ProvidersConfig::load();
@@ -855,6 +727,8 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestRegistry;
+    use crate::model::{ModelFamily, ModelPricing};
     use crate::providers::test_support::{
         CREDENTIAL_IN_URL, PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin,
         pasted_image, peer_message_origin, restored, task_event_origin,
@@ -864,6 +738,8 @@ mod tests {
     use std::sync::Arc;
     use test_case::test_case;
 
+    const MAX_OUTPUT_TOKENS: u32 = 65_536;
+    const ARGON: &str = "gemini-4-argon";
     const GEMINI_API_KEY: &str = "test-key";
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const STEERING_RULE: &str = "empty_output";
@@ -940,6 +816,9 @@ mod tests {
 
     fn test_model() -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get("google"),
+            entry: None,
             id: "gemini-2.5-flash".into(),
             provider: Arc::<str>::from("google"),
             family: ModelFamily::Gemini,
@@ -951,6 +830,7 @@ mod tests {
             pricing: ModelPricing::default(),
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
             window_excludes_output: false,
@@ -1447,7 +1327,7 @@ mod tests {
 
     #[test]
     fn models_list_has_defaults() {
-        let models = models();
+        let models = ManifestRegistry::get("google").unwrap().models;
         assert!(!models.is_empty());
         for entry in models {
             assert!(!entry.prefixes.is_empty());

@@ -296,6 +296,7 @@ mod tests {
     use crate::engine::{ErrorKind, StopKind};
     use crate::host::{ActionKind, FailureKind};
     use crate::matcher::{TopicMatcher, first_match};
+    use crate::replay::Answer;
 
     const NOW_MS: i64 = 1_791_189_000_000;
     const EVERY_TRIGGER: &str = r#"let meta = #{
@@ -346,6 +347,19 @@ log(event.input);
     const MUST_COMMIT: &str = "the smoke run commits its args";
 
     struct ExactTopics;
+
+    #[test_case("done(event.session.title); done(event.session.title);"; "done")]
+    fn control_actions_are_recorded_without_effects(body: &str) {
+        let source = format!("{EVERY_TRIGGER}\n{body}");
+        let report = validate(&source, NOW_MS).expect(MUST_VALIDATE);
+        for smoke in report.smoke {
+            assert_eq!(smoke.run.outcome.end, FiringEnd::Completed);
+            assert_eq!(smoke.run.actions.len(), 2);
+            let done = &smoke.run.actions[1];
+            assert_eq!(done.request.kind(), ActionKind::Done);
+            assert_eq!(done.answer, Answer::Recorded);
+        }
+    }
 
     impl TopicMatcher for ExactTopics {
         fn matches(&self, pattern: &str, topic: &str) -> bool {
