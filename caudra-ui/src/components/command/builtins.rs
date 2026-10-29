@@ -629,7 +629,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     .main_only(),
     BuiltinCommand::new(
         "/btw",
-        "Ask a side question, with follow-ups (no tools, nothing enters history)",
+        "Ask a side question, with follow-ups (read-only tools, nothing enters history)",
         Node::args(&[Arg::text("question", "Your side question", None).required()]),
     ),
     BuiltinCommand::new(

@@ -12,6 +12,12 @@ use crate::components::{
 
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
+const SIDE_SCROLL_KEYS: &[&str] = &[
+    "\u{2191}",
+    "\u{2193}",
+    key::PAGE_UP.label,
+    key::PAGE_DOWN.label,
+];
 
 macro_rules! mod_key {
     ($suffix:expr) => {
@@ -1433,33 +1439,49 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Changelog,
     },
     Keybind {
-        label: KeyLabel::Single("y"),
-        description: "Copy the requirements list, even while it is still streaming",
+        label: KeyLabel::Alt("y", "Ctrl+Y"),
+        description: "Copy the selection, or the whole list, even while it is still streaming",
         context: KeybindContext::Extract,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+C"),
-        description: "Stop the extraction and keep what has streamed",
+        description: "Copy the selection, stop the extraction and keep what has streamed, or close",
         context: KeybindContext::Extract,
     },
     Keybind {
-        label: KeyLabel::Single("Esc"),
+        label: KeyLabel::Multi(SIDE_SCROLL_KEYS),
+        description: "Scroll",
+        context: KeybindContext::Extract,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Home", "End"),
+        description: "Top or bottom",
+        context: KeybindContext::Extract,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["Enter", "Space", "Esc"]),
         description: "Close",
         context: KeybindContext::Extract,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Send what you typed as a follow-up, or queue it while the answer streams",
+        description: "Send what you typed as a follow-up, or queue it while the answer streams. \
+            With nothing typed, close",
         context: KeybindContext::Btw,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+Y"),
-        description: "Copy the answer, even while it is still streaming",
+        description: "Copy the selection, or the whole answer, even while it is still streaming",
         context: KeybindContext::Btw,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+C"),
-        description: "Stop the answer and keep the thread",
+        description: "Copy the selection, stop a streaming answer and keep the thread, or close",
+        context: KeybindContext::Btw,
+    },
+    Keybind {
+        label: KeyLabel::Multi(SIDE_SCROLL_KEYS),
+        description: "Scroll the thread",
         context: KeybindContext::Btw,
     },
     Keybind {

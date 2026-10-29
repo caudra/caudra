@@ -79,7 +79,7 @@ When a run changes something, the status bar says so briefly. SDK clients receiv
 
 A revert restores a block or note only while it still holds what the run wrote. A note the run created is deleted. Changes to the committed project file also show in git and the [workbench](/docs/workbench/), so you can review them before you commit.
 
-The transcript shows the learner's conversation: the digest it was given, its `history` calls, and its report. A run in progress in this session updates live, and `Esc` goes back to the list. Caudra keeps the transcripts of each project's last 20 runs, compressed, so finished runs open from any session. Transcripts are never indexed for `history.search`.
+The transcript shows the learner's conversation: the digest it was given, its `history` calls, and its report. A run in progress in this session updates live. Drag over the transcript to select a passage, and releasing the mouse button copies it. `Esc` goes back to the list. Caudra keeps the transcripts of each project's last 20 runs, compressed, so finished runs open from any session. Transcripts are never indexed for `history.search`.
 
 ## Configuration
 

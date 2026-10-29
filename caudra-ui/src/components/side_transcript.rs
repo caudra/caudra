@@ -82,7 +82,8 @@ pub(crate) const MOVED_ON_NOTE: &str =
 
 const TIP_SEND: &str = "Ask the next question in this thread. While an answer is still \
 streaming, the question waits until it is in";
-const TIP_ASK: &str = "Ask about the conversation so far. No tool runs and nothing enters history";
+const TIP_ASK: &str =
+    "Ask about the conversation so far. Only read-only tools run, and nothing enters history";
 const TIP_CLARIFY: &str = "Ask about these choices. Nothing is answered or submitted";
 const TIP_COPY: &str = "Copy the selection, or the whole answer when nothing is selected";
 const TIP_CLOSE: &str = "Close this window";
