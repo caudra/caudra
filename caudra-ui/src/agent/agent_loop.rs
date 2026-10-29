@@ -57,6 +57,7 @@ use caudra_providers::{
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::media::MediaStore;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use serde_json::Value;
@@ -766,6 +767,13 @@ impl AgentLoop {
                 return false;
             }
             spawn_oauth_for_needs_auth(mcp);
+        }
+        // A restored PDF stays attached to the request, and so counts toward
+        // the gauge, only once its bytes are loaded.
+        if let Some(outputs) = &self.tool_output_store {
+            self.history
+                .load_media(&MediaStore::new(outputs.state_dir()))
+                .await;
         }
         // Built once MCP has settled, so a `/btw` fired before the first prompt
         // carries the same tools the live request will.

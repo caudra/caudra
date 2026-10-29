@@ -1128,6 +1128,7 @@ mod tests {
         ReasoningSource, ReasoningTransport, ResponsesReasoning, Role,
     };
     use caudra_storage::id::CaudraId;
+    use caudra_storage::media::{MediaHash, StoredMedia};
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::json;
     use test_case::test_case;
@@ -2078,11 +2079,17 @@ mod tests {
         );
     }
 
-    /// A PDF the request can carry is priced per page. One a restored session
-    /// no longer holds is never sent, so it costs nothing.
-    #[test_case(Some(PDF_DATA), PDF_PAGES * DOCUMENT_TOKENS_PER_PAGE ; "a_held_pdf_costs_its_pages")]
-    #[test_case(None, 0 ; "a_pdf_without_bytes_costs_nothing")]
-    fn a_pdf_is_priced_per_page_while_it_can_be_sent(data: Option<&str>, document_tokens: usize) {
+    /// A PDF the request can carry is priced per page, including one a
+    /// restored session holds only a reference to, since its bytes are loaded
+    /// before the request goes out. One with neither is never sent.
+    #[test_case(Some(PDF_DATA), false, PDF_PAGES * DOCUMENT_TOKENS_PER_PAGE ; "a_held_pdf_costs_its_pages")]
+    #[test_case(None, true, PDF_PAGES * DOCUMENT_TOKENS_PER_PAGE ; "a_stored_pdf_costs_its_pages_before_it_is_loaded")]
+    #[test_case(None, false, 0 ; "a_pdf_without_bytes_or_reference_costs_nothing")]
+    fn a_pdf_is_priced_per_page_while_it_can_be_sent(
+        data: Option<&str>,
+        stored: bool,
+        document_tokens: usize,
+    ) {
         let result = Message {
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: PDF_CALL.into(),
@@ -2099,7 +2106,12 @@ mod tests {
                 url: PDF_URL.into(),
                 filename: None,
                 page_count: PDF_PAGES,
-                stored: None,
+                stored: stored.then(|| StoredMedia {
+                    sha256: MediaHash::of(PDF_DATA.as_bytes()),
+                    bytes: PDF_DATA.len() as u64,
+                    width: None,
+                    height: None,
+                }),
                 data: data.map(Arc::from),
             }],
         );

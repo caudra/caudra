@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use caudra_agent::CancelToken;
@@ -8,6 +7,7 @@ use caudra_providers::{
     TokenUsage, project_messages,
 };
 use caudra_storage::id::SessionRef;
+use caudra_storage::media::MediaStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
 use flume::Sender;
 use futures_lite::future;
@@ -144,27 +144,31 @@ pub(crate) struct BtwThread {
     clarification_context: Option<String>,
 }
 
+/// Exactly what the live request sends for `base`, so the provider can reuse
+/// the cached prefix instead of re-reading the whole history as fresh input
+/// tokens. That includes answering a call the mirror caught mid-turn, which a
+/// provider would otherwise reject. The base is projected per request, after
+/// its stored media is loaded, so a PDF a restored session holds only a
+/// reference to goes out attached instead of as a note to fetch it again.
+fn request(prompt: &BtwPrompt, base: &[Message], questions: Vec<Message>) -> Vec<Message> {
+    let mut messages = caudra_agent::project_request(
+        base,
+        &prompt.tools,
+        &prompt.model,
+        prompt.provider.reasoning_transport(&prompt.model),
+    )
+    .into_owned();
+    messages.extend(questions);
+    messages
+}
+
 impl BtwThread {
-    /// Opens over exactly what the live request sends for `history`, so the
-    /// provider can reuse the cached prefix instead of re-reading the whole
-    /// history as fresh input tokens. That includes answering a call the
-    /// mirror caught mid-turn, which a provider would otherwise reject.
     fn new(prompt: Arc<BtwPrompt>, history: Vec<Message>) -> Self {
-        let transport = prompt.provider.reasoning_transport(&prompt.model);
-        let base = match caudra_agent::project_request(
-            &history,
-            &prompt.tools,
-            &prompt.model,
-            transport,
-        ) {
-            Cow::Borrowed(_) => history,
-            Cow::Owned(projected) => projected,
-        };
         Self {
             prompt,
             cache_key: None,
             task: None,
-            base,
+            base: history,
             exchanges: Vec::new(),
             pending: None,
             clarification_context: None,
@@ -203,7 +207,10 @@ impl BtwThread {
     /// The text of every message the thread opened over.
     #[cfg(test)]
     pub(super) fn base_texts(&self) -> Vec<String> {
-        self.base.iter().filter_map(answer_text).collect()
+        request(&self.prompt, &self.base, Vec::new())
+            .iter()
+            .filter_map(answer_text)
+            .collect()
     }
 
     /// The model the thread asks and the cache it reads.
@@ -226,10 +233,15 @@ impl BtwThread {
         }
     }
 
+    #[cfg(test)]
+    fn request_messages(&self) -> Vec<Message> {
+        request(&self.prompt, &self.base, self.questions())
+    }
+
     /// The reminder rides the first question only: a later block would say
     /// nothing new and would move the cache boundary for every follow-up.
-    fn request_messages(&self) -> Vec<Message> {
-        let mut messages = self.base.clone();
+    fn questions(&self) -> Vec<Message> {
+        let mut messages = Vec::new();
         let questions = self
             .exchanges
             .iter()
@@ -490,9 +502,11 @@ impl App {
             return;
         };
         // A btw forks a conversation, so it shares that conversation's cache key on purpose.
-        smol::spawn(run_btw(
+        smol::spawn(run_btw_over(
             Arc::clone(&thread.prompt),
-            thread.request_messages(),
+            thread.base.clone(),
+            thread.questions(),
+            MediaStore::new(&self.storage),
             tx,
             thread.cache_key.clone(),
             cancel,
@@ -516,6 +530,22 @@ impl App {
             chat.remove_notice(BTW_CUTOFF_MARKER);
         }
     }
+}
+
+/// Loads what the snapshot holds only references to off the UI thread, then
+/// asks over it.
+async fn run_btw_over(
+    prompt: Arc<BtwPrompt>,
+    mut base: Vec<Message>,
+    questions: Vec<Message>,
+    store: MediaStore,
+    btw_tx: Sender<StreamEvent>,
+    cache_key: Option<CacheKey>,
+    cancel: CancelToken,
+) {
+    caudra_agent::load_stored_media(&mut base, &store).await;
+    let messages = request(&prompt, &base, questions);
+    run_btw(prompt, messages, btw_tx, cache_key, cancel).await;
 }
 
 async fn run_btw(
@@ -660,13 +690,18 @@ async fn answer_without_tools(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::Mutex;
 
     use arc_swap::ArcSwap;
     use caudra_agent::UNAVAILABLE_RESULT;
     use caudra_providers::provider::{BoxFuture, Provider};
-    use caudra_providers::{Model, ModelInfo, StreamResponse};
+    use caudra_providers::{
+        DOCUMENT_OMITTED_PREFIX, DocumentSource, Model, ModelInfo, StreamResponse,
+    };
+    use caudra_storage::StateDir;
     use serde_json::{Value, json};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -691,6 +726,9 @@ mod tests {
     const CLARIFY_STORAGE: &str = "About: Q1/2 · Storage\nWhich database?\nSQLite\nPostgreSQL";
     const CLARIFY_DEPLOYMENT: &str = "About: Q2/2 · Deployment\nWhere should it run?\nLocal\nCloud";
     const LOOKING: &str = "the config decides";
+    const PDF_CALL: &str = "fetch-pdf";
+    const PDF_URL: &str = "https://example.com/paper.pdf";
+    const PDF_DATA: &str = "JVBERi0xLjc=";
     const ROUND_USAGE: TokenUsage = TokenUsage {
         input: 1_000,
         output: 50,
@@ -1363,6 +1401,83 @@ mod tests {
                 serde_json::to_value(expected).unwrap()
             );
         });
+    }
+
+    /// A resumed session holds only a reference to a PDF. The thread loads it
+    /// before projecting, so the PDF goes out attached while its file exists,
+    /// and as a note to fetch it again only once the file is gone.
+    #[test_case(true ; "stored_file_attaches")]
+    #[test_case(false ; "missing_file_becomes_a_note")]
+    fn a_restored_pdf_is_loaded_before_the_thread_sends(file_exists: bool) {
+        let temp = TempDir::new().unwrap();
+        let store = MediaStore::new(&StateDir::from_path(temp.path().to_path_buf()));
+        let mut document = DocumentSource {
+            url: PDF_URL.into(),
+            filename: None,
+            page_count: 1,
+            stored: None,
+            data: Some(Arc::from(PDF_DATA)),
+        };
+        document.store_in(&store).unwrap();
+        document.data = None;
+        if !file_exists {
+            fs::remove_file(store.path(&document.stored.as_ref().unwrap().sha256)).unwrap();
+        }
+        let mut result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: PDF_CALL.into(),
+                content: ANSWER.into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        };
+        result
+            .tool_result_documents
+            .insert(PDF_CALL.into(), vec![document]);
+        let base = vec![
+            Message::user(BASE.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(PDF_CALL, TOOL, json!({}))],
+                ..Default::default()
+            },
+            result,
+        ];
+        let (called, requests) = flume::unbounded();
+        let mut prompt = prompt(FIRST_MODEL, called);
+        prompt.model.supports_pdf = true;
+        let (event_tx, _event_rx) = flume::unbounded();
+
+        smol::block_on(run_btw_over(
+            Arc::new(prompt),
+            base,
+            vec![btw_question(Q)],
+            store,
+            event_tx,
+            None,
+            CancelToken::none(),
+        ));
+
+        let (_, sent) = requests.try_recv().unwrap();
+        let attached: Vec<_> = sent
+            .iter()
+            .flat_map(Message::result_documents)
+            .map(|document| document.data.as_deref())
+            .collect();
+        let noted = sent.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { content, .. }
+                    if content.contains(DOCUMENT_OMITTED_PREFIX))
+            })
+        });
+        if file_exists {
+            assert_eq!(attached, [Some(PDF_DATA)]);
+        } else {
+            assert!(attached.is_empty());
+        }
+        assert_eq!(noted, !file_exists);
     }
 
     /// Reading the history rejects every broken tool pairing but one: a turn

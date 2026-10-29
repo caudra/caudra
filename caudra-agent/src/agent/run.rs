@@ -1287,9 +1287,12 @@ impl<'h> Agent<'h> {
             standing.append(&mut self.mention_preamble(&input.mentions, &mut budget).await);
             standing.append(&mut self.commit_preamble(&input.commits, &mut budget).await);
         }
+        let media = self.media_store();
+        if let Some(store) = &media {
+            arrivals = crate::media::stored_message_images(arrivals, store.clone()).await;
+        }
         self.push_arrivals(arrivals);
 
-        let media = self.media_store();
         let mut telemetry = Vec::with_capacity(inputs.len());
         for mut input in inputs {
             if input.message.trim().is_empty() && input.images.is_empty() {
@@ -2338,15 +2341,9 @@ impl<'h> Agent<'h> {
     /// Loads what a restored session holds only references to, once, so the
     /// request about to go out carries the bytes.
     async fn load_history_media(&mut self) {
-        let Some(store) = self.media_store() else {
-            return;
-        };
-        let unloaded = self.history.unloaded_media();
-        if unloaded.is_empty() {
-            return;
+        if let Some(store) = self.media_store() {
+            self.history.load_media(&store).await;
         }
-        crate::media::warm(&store, unloaded).await;
-        self.history.load_media(&store);
     }
 
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
@@ -2449,6 +2446,7 @@ impl<'h> Agent<'h> {
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
         self.report_speculative();
+        self.load_history_media().await;
         let main_session = self.is_main_session();
         let preflight_compacted = if main_session || self.child_jobs().is_some() {
             BackgroundReminderContext {
@@ -2497,7 +2495,6 @@ impl<'h> Agent<'h> {
             model: source.spec(),
             thinking: source.thinking,
         })?;
-        self.load_history_media().await;
         let (stream_result, warm, prefix, sent) = {
             let tools = &self.tools;
             repair_state.register_definitions(tools);
@@ -5127,12 +5124,13 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
     })
 }
 
-/// A PDF's text and page images, priced per page. Only a document that still
-/// holds its bytes can be sent, so one without them costs nothing.
+/// A PDF's text and page images, priced per page. One a restored session holds
+/// only a reference to is loaded before it is sent, so it costs the same; one
+/// with neither bytes nor a reference is never sent and costs nothing.
 fn document_tokens(message: &Message) -> u32 {
     let tokens: usize = message
         .result_documents()
-        .filter(|document| document.data.is_some())
+        .filter(|document| document.data.is_some() || document.stored.is_some())
         .map(|document| document.page_count.saturating_mul(DOCUMENT_TOKENS_PER_PAGE))
         .sum();
     u32::try_from(tokens).unwrap_or(u32::MAX)
@@ -5250,9 +5248,9 @@ mod tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, ContentBlock,
-        InvalidToolInput, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-        StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
+        AutomationEventOrigin, AutopilotMessageKind, AutopilotOrigin, ContentBlock, ImageMediaType,
+        ImageSource, InvalidToolInput, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+        Role, StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
         TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_storage::StateDir;
@@ -6540,6 +6538,7 @@ mod tests {
     const NO_PREFILL: &str = "an arrival must never leave the request ending on the assistant";
     const SHELL_RESULT: &str = "I ran: $ ls\n\nOutput:\na.rs";
     const PROMPT_SEED: &str = "Here is how I review code.";
+    const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MEMORY_UPDATED: &str =
@@ -10041,6 +10040,45 @@ mod tests {
         });
     }
 
+    /// An MCP prompt's image enters history as a reference, as a typed one
+    /// does, so the saved session never carries its base64 inline.
+    #[test]
+    fn an_arrival_image_is_stored_before_it_enters_history() {
+        smol::block_on(async {
+            let directory = tempdir();
+            let mut input = default_input();
+            input.preamble = vec![Message::user_with_images(
+                String::new(),
+                vec![ImageSource::new(ImageMediaType::Png, Arc::from(PIXEL_PNG))],
+            )];
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            agent.tool_output_store = Some(Arc::new(ToolOutputStore::new(StateDir::from_path(
+                directory.path().into(),
+            ))));
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                Box::new(input),
+                0,
+                QueueItemId::new(),
+            )]);
+            let mut agent = agent.with_interrupt_source(source);
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let image = history
+                .as_slice()
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    ContentBlock::Image { source } => Some(source),
+                    _ => None,
+                })
+                .expect("the arrival's image reaches history");
+            assert!(image.stored().is_some());
+        });
+    }
+
     #[test]
     fn queued_batch_emits_one_event_and_preserves_separate_history_messages() {
         smol::block_on(async {
@@ -10048,10 +10086,9 @@ mod tests {
             let second_id = QueueItemId::new();
             let mut first = default_input();
             first.message = "first".into();
-            first.images.push(caudra_providers::ImageSource::new(
-                caudra_providers::ImageMediaType::Png,
-                Arc::from("aGVsbG8="),
-            ));
+            first
+                .images
+                .push(ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")));
             let mut second = default_input();
             second.message = "second".into();
             let source = MockInterruptSource::new(vec![ExtractedCommand::InterruptBatch(vec![
