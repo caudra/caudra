@@ -136,7 +136,7 @@ fn entries(
     if features.enabled(Feature::Automations) {
         entries.push(entry(
             automation::AutomationTool,
-            ToolEffect::ReadOnly,
+            ToolEffect::Mutating,
             automation::DESCRIPTION,
         ));
     }

@@ -74,9 +74,10 @@ const FN_BROADCAST: &str = "broadcast";
 const FN_START_WORKFLOW: &str = "start_workflow";
 const FN_PAUSE: &str = "pause_automations";
 const FN_NOW: &str = "now";
+const FN_GIT_COMPARE: &str = "git_compare";
 const FN_LOG: &str = "log";
 /// Every function the host gives scripts, so an inspector can list the ones a script calls.
-pub const HOST_FUNCTIONS: [&str; 14] = [
+pub const HOST_FUNCTIONS: [&str; 15] = [
     FN_MESSAGE,
     FN_SET_GOAL,
     FN_SKIP,
@@ -90,6 +91,7 @@ pub const HOST_FUNCTIONS: [&str; 14] = [
     FN_START_WORKFLOW,
     FN_PAUSE,
     FN_NOW,
+    FN_GIT_COMPARE,
     FN_LOG,
 ];
 
@@ -151,6 +153,14 @@ const KEY_WEEKDAY: &str = "weekday";
 const KEY_HOUR: &str = "hour";
 const KEY_MINUTE: &str = "minute";
 const KEY_TZ: &str = "tz";
+const KEY_BRANCH: &str = "branch";
+const KEY_HEAD: &str = "head";
+const KEY_BASE_HEAD: &str = "base_head";
+const KEY_AHEAD: &str = "ahead";
+const KEY_BEHIND: &str = "behind";
+const KEY_OPERATION: &str = "operation";
+const MAX_GIT_QUERIES: u32 = 4;
+const GIT_QUERIES_EXCEEDED: &str = "the firing reached its limit of git_compare queries";
 
 const UNTRUSTED_INSTRUCTIONS: &str = "text that becomes this session's instructions must be \
     trusted: build it from literals, args and trusted event fields, and show untrusted values to \
@@ -329,6 +339,7 @@ struct Session {
     actions: Cell<u32>,
     logs: Cell<u32>,
     deliveries: Cell<u32>,
+    git_queries: Cell<u32>,
 }
 
 /// An options map whose keys the call accepts, read one key at a time. `()` counts as absent.
@@ -598,6 +609,7 @@ impl Session {
             actions: Cell::default(),
             logs: Cell::default(),
             deliveries: Cell::default(),
+            git_queries: Cell::default(),
         }
     }
 
@@ -1055,6 +1067,38 @@ impl Session {
         }
     }
 
+    fn git_compare(&self, ctx: &NativeCallContext, base: &Dynamic) -> ScriptResult<Dynamic> {
+        self.enter(ctx)?;
+        if self.git_queries.get() >= MAX_GIT_QUERIES {
+            return Err(self.stop(ctx, StopKind::FiringLimit, GIT_QUERIES_EXCEEDED));
+        }
+        self.git_queries.set(self.git_queries.get() + 1);
+        let base = self.text(ctx, base, FN_GIT_COMPARE)?;
+        let comparison = self
+            .host
+            .call(move |host| host.git_compare(&base))
+            .map_err(|BridgeClosed| self.stop(ctx, StopKind::Internal, HOST_GONE))?
+            .map_err(|failure| failure_error(failure.kind, failure.message))?;
+        let Some(comparison) = comparison else {
+            return Ok(Dynamic::UNIT);
+        };
+        Ok(script_map([
+            (
+                KEY_BRANCH,
+                comparison.branch.map_or(Dynamic::UNIT, Dynamic::from),
+            ),
+            (KEY_HEAD, comparison.head.into()),
+            (KEY_BASE_HEAD, comparison.base_head.into()),
+            (KEY_AHEAD, Dynamic::from_int(comparison.ahead.into())),
+            (KEY_BEHIND, Dynamic::from_int(comparison.behind.into())),
+            (
+                KEY_OPERATION,
+                comparison.operation.map_or(Dynamic::UNIT, label),
+            ),
+        ])
+        .into())
+    }
+
     fn now(&self, ctx: &NativeCallContext) -> ScriptResult<ScriptMap> {
         self.enter(ctx)?;
         let now_ms = self
@@ -1326,6 +1370,11 @@ fn register_host_api(engine: &mut Engine, session: &Rc<Session>) {
     let s = Rc::clone(session);
     engine.register_fn(FN_NOW, move |ctx: NativeCallContext| s.now(&ctx));
     let s = Rc::clone(session);
+    engine.register_fn(
+        FN_GIT_COMPARE,
+        move |ctx: NativeCallContext, base: Dynamic| s.git_compare(&ctx, &base),
+    );
+    let s = Rc::clone(session);
     engine.register_fn(FN_LOG, move |ctx: NativeCallContext, text: Dynamic| {
         s.log(&ctx, &text)
     });
@@ -1513,7 +1562,7 @@ mod tests {
         Admission, ArmedReason, Audience, Delivery, MessageDetail, SenderKind, SessionStatus,
         SessionView, WorkView,
     };
-    use crate::host::{Failure, HostResult, SendStatus};
+    use crate::host::{Failure, GitCompare, HostResult, SendStatus};
     use crate::limits::LimitReason;
     use crate::meta::parse_meta;
     use crate::state::MAX_STATE_BYTES;
@@ -1576,6 +1625,8 @@ mod tests {
     const MUST_COMMIT: &str = "the firing commits a change";
     const EXPECTED_STOP: &str = "expected a stopped firing";
     const EXPECTED_FAILURE: &str = "expected a failed firing";
+    const GIT_HEAD: &str = "1111111111111111111111111111111111111111";
+    const GIT_BASE_HEAD: &str = "2222222222222222222222222222222222222222";
 
     type Responder = Box<dyn Fn(&ActionRequest) -> HostResult<ActionReply>>;
 
@@ -1593,6 +1644,7 @@ mod tests {
     /// Records every request, answers with `respond`, and admits the first charging one with
     /// `admission`.
     struct Probe {
+        comparison: Result<Option<GitCompare>, Failure>,
         admission: Result<(), LimitRefusal>,
         interruption: Option<Interruption>,
         respond: Responder,
@@ -1601,6 +1653,10 @@ mod tests {
     }
 
     impl AutomationHost for Probe {
+        fn git_compare(&self, _base: &str) -> Result<Option<GitCompare>, Failure> {
+            self.comparison.clone()
+        }
+
         fn now_ms(&self) -> i64 {
             NOW_MS
         }
@@ -1641,6 +1697,7 @@ mod tests {
 
     fn answering(respond: impl Fn(&ActionRequest) -> HostResult<ActionReply> + 'static) -> Probe {
         Probe {
+            comparison: Ok(None),
             admission: Ok(()),
             interruption: None,
             respond: Box::new(respond),
@@ -2408,6 +2465,79 @@ mod tests {
                 "tz": BERLIN,
             } })
         );
+    }
+
+    #[test_case(r#"message(git_compare("main").branch);"#; "direct")]
+    #[test_case(r#"message("branch: " + git_compare("main").branch);"#; "joined")]
+    fn git_compare_branch_cannot_become_instructions(body: &str) {
+        let probe = Probe {
+            comparison: Ok(Some(GitCompare {
+                branch: Some(Untrusted::text(TITLE)),
+                head: GIT_HEAD.to_owned(),
+                base_head: GIT_BASE_HEAD.to_owned(),
+                ahead: 0,
+                behind: 1,
+                operation: None,
+            })),
+            ..probe()
+        };
+        let outcome = run(&probe, body);
+        assert_eq!(
+            stop_of(&outcome),
+            (StopKind::Untrusted, UNTRUSTED_INSTRUCTIONS)
+        );
+        assert!(probe.requests().is_empty());
+    }
+
+    #[test_case(FailureKind::Timeout; "timeout")]
+    #[test_case(FailureKind::Unavailable; "unavailable")]
+    #[test_case(FailureKind::InvalidArgument; "invalid_argument")]
+    fn git_compare_failures_are_catchable(kind: FailureKind) {
+        let probe = Probe {
+            comparison: Err(Failure::new(kind, FAILURE_MESSAGE)),
+            ..probe()
+        };
+        let outcome = run(
+            &probe,
+            r#"try { git_compare("main"); } catch (err) { state.caught = err.kind; }"#,
+        );
+        assert_eq!(outcome.end, FiringEnd::Completed);
+        assert_eq!(committed(outcome), json!({ "caught": kind.as_str() }));
+    }
+
+    #[test_case(1; "one")]
+    #[test_case(MAX_GIT_QUERIES; "four")]
+    fn git_compare_costs_no_action_even_when_rate_limited(calls: u32) {
+        let probe = Probe {
+            admission: Err(refusal()),
+            ..probe()
+        };
+        let outcome = run(
+            &probe,
+            &format!(r#"for n in 0..{calls} {{ git_compare("main"); }}"#),
+        );
+        assert_eq!(outcome.end, FiringEnd::Completed);
+        assert_eq!(
+            (outcome.actions, outcome.charged, probe.admitted.get()),
+            (0, false, 0)
+        );
+        assert!(probe.requests().is_empty());
+    }
+
+    #[test]
+    fn git_compare_query_limit_cannot_be_caught() {
+        let outcome = run(
+            &probe(),
+            &format!(
+                r#"try {{ for n in 0..{} {{ git_compare("main"); }} }} catch {{ state.caught = true; }}"#,
+                MAX_GIT_QUERIES + 1
+            ),
+        );
+        assert_eq!(
+            stop_of(&outcome),
+            (StopKind::FiringLimit, GIT_QUERIES_EXCEEDED)
+        );
+        assert!(outcome.state.is_none());
     }
 
     #[test]

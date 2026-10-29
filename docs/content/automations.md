@@ -63,7 +63,7 @@ The file name without `.rhai` must equal `meta.name`. A script is a regular UTF-
 
 A bundled script has no file. Its path in the inspector reads `builtin:<provider>/<name>.rhai`, and `o` has nothing to open. It appears while its feature is on and goes when the feature is turned off. A bundled script that is armed when its feature goes off keeps running until the session restarts, and the resumed session disarms it and keeps its args, as it does for a deleted file. Bundled scripts cannot use `arm: "always"`.
 
-A project script arms only after you trust it. Select it in `/automations` and press `t`, which shows the digest you approve. The digest is SHA-256 over the exact bytes together with the automation language and host ABI versions, so changing one byte makes the script untrusted again until you review it. Neither the model nor a script can grant trust.
+A project script arms only after its digest is trusted. Select it in `/automations` and press `t`, which shows the digest you approve. Approving the agent's `automation.arm` request also trusts the exact digest shown in its permission prompt. The digest is SHA-256 over the exact bytes together with the automation language and host ABI versions, so changing one byte makes the script untrusted again. A script cannot grant trust or arm another script.
 
 ## Write one
 
@@ -92,7 +92,11 @@ The header is the first statement, `let meta = #{ … };`. Caudra reads it witho
 
 The body is ordinary Rhai that runs top to bottom once per firing, with `event`, `state`, `args`, and `meta` in scope. Conditions are plain `if` statements. `skip(reason)` ends a firing without acting and records why, and `return` ends it early. Actions are calls to host functions.
 
-The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and gives you the line that arms it. Only you can trust and arm it.
+The agent can write one for you. The builtin `caudra-automation-dev` [skill](/docs/skills/#the-builtins) holds the full reference, from every header key, event field, and host function to the parts of Rhai that trip people up. The agent writes the file, validates it with `automation.validate()` in a [`code`](/docs/code/#tools-reached-from-code) snippet, and arms it with `automation.arm(name, args)`.
+
+Arming, disarming and deleting through the agent follow your permission rules. Ask mode prompts unless an allow rule covers the call. YOLO approves after deny rules, and autopilot can decide the prompt. The prompt shows the action, name, scope, path, digest, triggers, args, and network, secrets, messaging and workflow capabilities. An untrusted project script also shows `trusts digest`, so approval grants trust to those exact bytes. A script changed during approval is refused. Plan mode refuses these changes. `automation.list`, `.validate` and `.history` never prompt.
+
+`automation.disarm(name)` stops the automation in this session and drops its queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular project or user file, and rescans the catalog. Bundled scripts and symlinks cannot be deleted. Other open sessions keep their armed source until disarmed or restarted, even if a catalog rescan no longer finds its file. Permission scopes are `read`, `arm:<name>`, `disarm:<name>` and `delete:<name>`, so an allow rule for `automation` with scope `arm:*` covers arming only.
 
 ### Triggers
 
@@ -124,10 +128,23 @@ The agent can write one for you. The builtin `caudra-automation-dev` [skill](/do
 | `skip(reason)` | Ends the firing without acting and records why |
 | `log(text)` | Adds a line to the firing's trace |
 | `now()` | Returns the time in the script's time zone |
+| `git_compare(base)` | Compares HEAD with a local branch without an action or model turn |
 
 Messages wait in an outbox until the session can take them, and the model receives each one under a header that names the automation. `http()` sends each request once, without retries, and every status comes back as an answer. The script names environment variables for its secrets and never sees their values, and the history keeps only the names. Caudra reads those variables from its own environment and the global `.env` file. A project `.env` cannot set them. Loopback and private hosts stay out of reach unless the global config sets `allow_private_network = true`.
 
 A call the header does not allow, untrusted text in `message()` or `set_goal()`, or a per-firing limit stops the firing at once, and `try` cannot catch it. Other failures, such as an active goal or an unknown recipient, can be caught with `try` and `catch`. A firing that fails or stops keeps none of its state changes, and effects it already caused stay.
+
+### Compare local Git branches
+
+`git_compare("main")` discovers the repository from the session's working directory and compares HEAD with `refs/heads/main`. It returns `()` outside a repository or when that branch is missing. The query never fetches or changes files.
+
+The result is `#{ branch, head, base_head, ahead, behind, operation }`. `head` and `base_head` are full SHAs. `ahead` and `behind` count commits unique to each side, capped at 10000 each. `operation` is `"merge"`, `"rebase"`, `"cherry_pick"`, `"revert"`, `"bisect"`, or `()`.
+
+`branch` is untrusted text, or `()` on a detached HEAD. The other fields are trusted. Compare `branch` to a known name rather than joining it into a model instruction.
+
+Each query has a five-second timeout and costs no action. A firing may call it four times. Failures with kind `timeout`, `unavailable`, or `invalid_argument` can be caught. `unavailable` includes remote tool execution, and `invalid_argument` means the base is not a valid local branch name.
+
+Caudra's contributor checkout includes `.caudra/automations/sync-main.rhai`, which uses this query to notice changes on local `main` without starting a model turn when nothing moved. It checks every 15 minutes, when armed, and when the session becomes idle. An idle session gets a sync request that waits for background work to settle. A working session gets one guidance message per base SHA asking it to add `Sync with main` after its current todo. The policy asks the agent to read incoming changes, preserve unfinished work, merge at a safe point, and run `make check`. It never asks for a rebase, a push, or a change in the main checkout. Trust the script in `/automations` and arm it in each worktree session with `/automations arm sync-main`.
 
 ### Untrusted text
 
@@ -156,9 +173,9 @@ Args are typed. A script declares each one as a `string`, `int`, `float`, `bool`
 
 Automations start turns while nobody watches, so limits apply to each firing, each automation, and each session.
 
-**Each firing** may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, and 4 calls to `message` and `set_goal` together. Reaching any of them stops it.
+**Each firing** may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, 4 calls to `message` and `set_goal` together, and 4 `git_compare` queries. Reaching any of them stops it.
 
-**Each automation** takes `max_per_hour` and `cooldown` from the `limits` in its header. `max_per_hour` counts the firings that act per rolling hour, 12 by default and 600 at most. `cooldown` is the shortest gap between two of them, none by default and 24 hours at most. A firing acts when it calls a host function other than `now`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Its first action checks the limits, so a firing that only reads, logs, or skips costs nothing. When a limit refuses, the firing stops before acting and keeps no state. What happens to its event depends on the trigger:
+**Each automation** takes `max_per_hour` and `cooldown` from the `limits` in its header. `max_per_hour` counts the firings that act per rolling hour, 12 by default and 600 at most. `cooldown` is the shortest gap between two of them, none by default and 24 hours at most. A firing acts when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Its first action checks the limits, so a firing that only reads, logs, or skips costs nothing. When a limit refuses, the firing stops before acting and keeps no state. What happens to its event depends on the trigger:
 
 - `armed`, `goal_finished`, `message_received`, `work_finished`, and `workflow_finished` happen once. Their event is deferred and retried once the limit allows, and later events wait behind it.
 - `idle`, `needs_input`, and `schedule` recur. Their event is recorded as `rate_limited` and not retried.
@@ -207,6 +224,8 @@ The status bar shows `[auto · N]` while N automations are armed. A failed firin
 Deliveries, messages, releases, notifications, and pauses are recorded instead of performed. `start_workflow()` returns a placeholder run id. `http()` answers from the original firing's journal when the request matches, and otherwise gets the stub `#{ status: 0, body: "", json: () }`. Each action in the result is badged `recorded`, `journal`, or `stubbed` by how it was answered. A journaled result that was too large to store gets the stub too, badged `cut`.
 
 Capability checks and per-firing limits apply. A dry run reports what the automation limits would have done, runs on regardless, and spends none of their allowance. It needs no trust, because it performs nothing.
+
+`git_compare()` is not journaled. Inspector dry runs answer `()` without reading a repository. Validation instead supplies a canned comparison one commit behind, so it exercises code that reacts to new commits.
 
 The result appears at the top of Firings with a `dry run` badge until you select another row in the list or close the inspector. Dry runs are never stored. Enter opens the result like a firing, with the state change it would have committed and the state revision it ran against, and a note says when the script changed since the original firing. A firing whose event was cut for storage, or that matches no trigger of the current script, cannot be replayed, and the row says why. SDK clients send `automation_dry_run`, as [Headless Mode](/docs/headless/#automations) describes.
 

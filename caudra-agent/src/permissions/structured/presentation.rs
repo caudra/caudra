@@ -4,8 +4,10 @@ use super::{
     strict_http_url,
 };
 use crate::mcp::kind::McpCallFacts;
+use crate::tools::AUTOMATION_TOOL_NAME;
 use caudra_config::ToolKey;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub(super) const SUMMARY_MAX_CHARS: usize = 240;
 
@@ -13,6 +15,10 @@ pub(super) const LISTED_COMMANDS_MAX: usize = 3;
 
 const PERCENT: f64 = 100.0;
 const MCP_LABEL: &str = "MCP";
+const AUTOMATION_REVIEW_FIELDS: &[&str] = &[
+    "action", "name", "scope", "path", "digest", "trust", "triggers",
+];
+const AUTOMATION_CAPABILITIES: &[&str] = &["network", "secrets", "messaging", "workflows"];
 /// How a call the server itself calls read-only is summed up.
 pub(super) const READ_ONLY_MCP_SUMMARY: &str = "Read-only lookup, as the server describes it";
 
@@ -248,6 +254,29 @@ pub(super) fn action_summary(action: &str) -> String {
         .map(safe_summary)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(super) fn automation_review(tool: &ToolKey, input: &Value) -> Option<String> {
+    if tool != &ToolKey::native(AUTOMATION_TOOL_NAME) {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut field = |name: &str, value: &Value| {
+        if !value.is_null() {
+            let value = value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned);
+            lines.push(safe_summary(&format!("{name}: {value}")));
+        }
+    };
+    for name in AUTOMATION_REVIEW_FIELDS {
+        field(name, &input[name]);
+    }
+    for name in AUTOMATION_CAPABILITIES {
+        field(name, &input["capabilities"][name]);
+    }
+    field("args", &input["args"]);
+    Some(lines.join("\n"))
 }
 
 pub fn update_presentation_coverage(

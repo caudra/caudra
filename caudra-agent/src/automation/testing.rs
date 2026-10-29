@@ -617,3 +617,76 @@ pub async fn until(handle: &AutomationHandle, ready: impl Fn(&AutomationState) -
         events.recv_async().await.expect(EVENTS_CLOSED);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use caudra_automation::snapshot::FiringStatus;
+    use gix::ObjectId;
+    use gix::actor::SignatureRef;
+    use test_case::test_case;
+
+    use super::{AutomationFixture, AutomationRuntime, fs, until};
+
+    const NAME: &str = "git-probe";
+    const TRIGGERS: &str = r#"triggers: [#{ kind: "armed" }]"#;
+    const BODY: &str = r#"
+        try {
+            let comparison = git_compare("main");
+            if comparison != () && comparison.behind == 0 { skip("current"); }
+            throw "wrong repository";
+        } catch (err) {
+            if err.kind == "unavailable" { skip("remote"); }
+            throw err;
+        }
+    "#;
+    const CURRENT: &str = "current";
+    const REMOTE: &str = "remote";
+    const AUTHOR: &str = "Automation test";
+    const EMAIL: &str = "automation@example.com";
+    const TIME: &str = "1700000000 +0000";
+    const INITIAL: &str = "initial";
+
+    #[test_case(false, CURRENT; "session_cwd")]
+    #[test_case(true, REMOTE; "remote_tools")]
+    fn git_probe_uses_session_repository_without_an_action(remote: bool, reason: &str) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let repo = gix::init(fixture.project()).unwrap();
+            let signature = SignatureRef {
+                name: AUTHOR.into(),
+                email: EMAIL.into(),
+                time: TIME,
+            };
+            let tree = repo
+                .write_object(gix::objs::Tree::empty())
+                .unwrap()
+                .detach();
+            repo.commit_as(
+                signature,
+                signature,
+                "refs/heads/main",
+                INITIAL,
+                tree,
+                Vec::<ObjectId>::new(),
+            )
+            .unwrap();
+            fs::write(repo.path().join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            fixture.script(&fixture.user_scripts(), NAME, TRIGGERS, BODY);
+            let mut deps = fixture.deps(fixture.session_id(), &[NAME]);
+            deps.remote = remote;
+            let runtime = AutomationRuntime::spawn(deps).await.unwrap();
+            until(&runtime.handle(), |state| {
+                state.recent.iter().any(|firing| {
+                    matches!(firing.status, FiringStatus::Skipped | FiringStatus::Failed)
+                })
+            })
+            .await;
+            let state = runtime.handle().state();
+            assert_eq!(state.recent.len(), 1);
+            assert_eq!(state.recent[0].status, FiringStatus::Skipped);
+            assert_eq!(state.recent[0].reason.as_deref(), Some(reason));
+            assert_eq!(state.recent[0].action_count, 0);
+            runtime.shutdown().await;
+        });
+    }
+}

@@ -25,7 +25,7 @@ use crate::autopilot::{
 };
 use crate::decisions::{DecisionFeature, NoteAnchor, NoteSink};
 use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
-use crate::tools::{PermissionIntent, PermissionScopes, ToolContext};
+use crate::tools::{AUTOMATION_TOOL_NAME, PermissionIntent, PermissionScopes, ToolContext};
 use crate::types::Answerer;
 use crate::{AgentEvent, EventSender};
 use caudra_config::{DefaultEffect, FILE_WRITE_TOOLS, ToolKey};
@@ -52,6 +52,7 @@ const TAINTED_RESERVATION: &str = "tainted";
 const MAX_ITEM_INPUT_BYTES: usize = 2 * 1024;
 const ITEM_TOOL_LABEL: &str = "tool:";
 const ITEM_INPUT_LABEL: &str = "input:";
+const ITEM_ACTION_LABEL: &str = "action:";
 const ITEM_RESOURCES_LABEL: &str = "resources:";
 const ITEM_BULLET: &str = "-";
 const ITEM_PROTECTED: &str = "protected";
@@ -1564,6 +1565,9 @@ fn decision_item(
         request.tool,
         &input[..cut]
     );
+    if request.tool == ToolKey::native(AUTOMATION_TOOL_NAME) {
+        let _ = writeln!(item, "{ITEM_ACTION_LABEL}\n{}", presentation.action);
+    }
     for resource in presentation.resources.iter().take(PROMPT_LOG_MAX_RESOURCES) {
         let _ = write!(
             item,
@@ -1742,6 +1746,7 @@ pub(super) mod tests {
     const DELEGATE_DENY: &str = r#"{"action":"deny","reason":"outside the task","guidance":"run the narrower test instead"}"#;
     const DELEGATE_ESCALATE: &str = r#"{"action":"escalate","reason":"the user must choose"}"#;
     const DELEGATE_REASON: &str = "the user asked for the build";
+    const AUTOMATION_TRUST: &str = "trusts digest reviewed-digest";
     const ESCALATION_REASON: &str = "the user must choose";
     const HUMAN_ALLOW: &str = "allow";
     const HUMAN_DENIAL: &str = "deny_guidance: run the narrower test instead";
@@ -4449,6 +4454,51 @@ pub(super) mod tests {
         let manager = matrix_manager(Some(Effect::Ask));
         manager.set_autopilot(Some(engaged_handle(provider)));
         manager
+    }
+
+    #[test_case("arm:reviewed-script"; "arm")]
+    #[test_case("disarm:reviewed-script"; "disarm")]
+    #[test_case("delete:reviewed-script"; "delete")]
+    fn autopilot_can_approve_automation_lifecycle_prompts(scope: &str) {
+        let provider = ScriptedProvider::new(vec![Step::Answer(DELEGATE_ALLOW)]);
+        let manager = autopilot_manager(provider.clone());
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, 0);
+        let (_answers, answers) = flume::unbounded();
+        let answers = async_lock::Mutex::new(answers);
+        smol::block_on(manager.enforce_with_identity(
+            &ToolKey::native("automation"),
+            &PermissionScopes::single(scope.to_owned()),
+            &json!({"args": {"text": "x".repeat(MAX_ITEM_INPUT_BYTES)}, "trust": AUTOMATION_TRUST, "capabilities": {"network": [], "secrets": [], "messaging": {}, "workflows": []}}),
+            &event_tx,
+            Some(&answers),
+            CONTROLLED_REQUEST,
+            &CancelToken::none(),
+            None,
+            Some((
+                PermissionSubject::Native {
+                    owner: crate::tools::native::OWNER.into(),
+                    contract: "automation".into(),
+                },
+                PermissionExecutorKind::Native,
+            )),
+            true,
+            None,
+        ))
+        .unwrap();
+        let [prompt] = provider.prompts().try_into().unwrap();
+        assert!(prompt.contains(AUTOMATION_TRUST), "{prompt}");
+        for capability in ["network", "secrets", "messaging", "workflows"] {
+            assert!(prompt.contains(&format!("{capability}:")), "{prompt}");
+        }
+        assert!(
+            prompt.contains(&format!("{ITEM_RESERVED_LABEL} {ITEM_NOT_RESERVED}")),
+            "{prompt}"
+        );
+        assert_eq!(
+            resolved_by(&events_of(&events)),
+            [Some(Answerer::Autopilot)]
+        );
     }
 
     /// A provider that holds every call until it is dropped, the end of each

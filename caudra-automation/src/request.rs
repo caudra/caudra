@@ -45,6 +45,9 @@ pub enum AutomationRequest {
     Disarm {
         name: String,
     },
+    Delete {
+        name: String,
+    },
     Trust {
         name: String,
         digest: String,
@@ -159,6 +162,8 @@ pub enum AutomationError {
     },
     #[error("automation {name:?} is invalid: {reason}")]
     Invalid { name: String, reason: String },
+    #[error("cannot delete automation {name:?}: {reason}")]
+    DeleteRefused { name: String, reason: String },
     #[error("automation {name:?} rejected its args: {reason}")]
     Args { name: String, reason: String },
     #[error("automation {name:?} state is at revision {current}; {CONFLICT_HINT}")]

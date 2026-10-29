@@ -1093,6 +1093,7 @@ fn excerpt(output: &mut McpOutput) {
 
 #[cfg(test)]
 mod tests {
+    use caudra_automation::snapshot::ArmOrigin;
     use caudra_config::decisions::{DecisionEndpoint, DecisionProtocol};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -1100,7 +1101,7 @@ mod tests {
 
     use async_trait::async_trait;
     use caudra_config::decisions::DecisionsConfig;
-    use caudra_config::{Effect, PermissionRule, PermissionsConfig};
+    use caudra_config::{Effect, FeatureFlags, PermissionRule, PermissionsConfig};
     use caudra_decision::{
         Answer, ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest as EngineRequest,
         DecisionResponse, NoulAnswer, QuestionType, ScoreAnswer, Usage,
@@ -1115,6 +1116,7 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::agent::change_recording::fixture::{FakeChanges, Step};
+    use crate::automation::testing::AutomationFixture;
     use crate::code::CodeSession;
     use crate::code::decide;
     use crate::code::history::{self, UNSAVED};
@@ -1127,13 +1129,14 @@ mod tests {
     use crate::mcp::output::{DecisionHelper, McpHelper};
     use crate::mcp::{McpSession, SEPARATOR, recognised_stub_session, stub_session_replying};
     use crate::permissions::{
-        PERMISSION_DENIED_PREFIX, PermissionManager, PermissionMode, PermissionResource,
-        PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+        PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, PermissionMode,
+        PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
     };
     use std::borrow::Cow;
 
     use crate::cancel::CancelToken;
     use crate::code::names::HOST_MODULE;
+    use crate::tools::native::automation::AutomationTool;
     use crate::tools::registry::{
         ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
         ToolInvocation, ToolRegistry,
@@ -1154,6 +1157,10 @@ mod tests {
     const RECORD_ROOT: &str = "/workspace";
     const EXECUTOR: &str = "executor";
     const RESUME: &str = "resume";
+    const AUTOMATION_NAME: &str = "reviewed-script";
+    const AUTOMATION_ARM_SCOPE: &str = "arm:reviewed-script";
+    const AUTOMATION_FIELDS: &str = r#"triggers: [#{ kind: "idle" }], args: #{ count: #{ type: "int", default_value: 3 } }, network: ["https://example.com"], secrets: ["EXAMPLE_TOKEN"], messaging: #{ reply: true }, workflows: ["review"]"#;
+    const AUTOMATION_PROMPT: &str = "the automation must wait for permission";
 
     #[derive(Debug, PartialEq)]
     enum Verdict {
@@ -2396,6 +2403,171 @@ mod tests {
             Some(ToolOutput::Environment { .. })
         ));
         assert_eq!(call.ledger_name().0, HOSTED_TOOL);
+    }
+
+    #[test_case(PermissionMode::Ask, false, false, true; "ask_approved")]
+    #[test_case(PermissionMode::Ask, false, false, false; "ask_denied")]
+    #[test_case(PermissionMode::Yolo, false, false, true; "yolo_approves")]
+    #[test_case(PermissionMode::Yolo, false, true, false; "yolo_honors_deny")]
+    #[test_case(PermissionMode::Yolo, true, false, false; "plan_refuses")]
+    fn hosted_automation_arm_obeys_permissions(
+        mode: PermissionMode,
+        plan: bool,
+        deny: bool,
+        allowed: bool,
+    ) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let path = fixture.script(
+                &fixture.project_scripts(),
+                AUTOMATION_NAME,
+                AUTOMATION_FIELDS,
+                "",
+            );
+            let runtime = fixture.spawn(&[]).await;
+            let handle = runtime.handle();
+            let config = PermissionsConfig {
+                rules: if deny {
+                    vec![PermissionRule {
+                        tool: ToolKey::native("automation"),
+                        scope: Some("arm:*".into()),
+                        effect: Effect::Deny,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..PermissionsConfig::default()
+            };
+            let (_dir, permissions) = permissions(config, mode.clone());
+            let (tx, events) = flume::unbounded();
+            let (_answers, answers) = flume::unbounded();
+            let agent_mode = if plan {
+                AgentMode::Plan(PathBuf::from(PLAN_FILE))
+            } else {
+                AgentMode::Build
+            };
+            let mut ctx = stub_ctx_with_permissions(&agent_mode, Arc::clone(&permissions));
+            ctx.config.features = FeatureFlags::all();
+            ctx.session_id = Some(fixture.session_id().into());
+            ctx.event_tx = EventSender::new(tx, 0);
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answers)));
+            ctx.registry = Arc::new(ToolRegistry::new());
+            ctx.registry
+                .register_audited(
+                    Arc::new(AutomationTool),
+                    ToolSource::Native {
+                        owner: crate::tools::native::OWNER.into(),
+                        contract: "automation".into(),
+                        trusted: true,
+                    },
+                    ToolEffect::Mutating,
+                )
+                .unwrap();
+            let gateway = Gateway::new(ctx.clone(), vec![Arc::new(ToolModule::automation(&ctx))]);
+            let mut call = smol::spawn(async move {
+                invoke(
+                    &gateway,
+                    ScriptCall {
+                        namespace: Some("automation".into()),
+                        name: "arm".into(),
+                        args: vec![json!(AUTOMATION_NAME)],
+                        kwargs: Map::new(),
+                    },
+                )
+                .await
+            });
+            if mode == PermissionMode::Ask {
+                let request = loop {
+                    let event =
+                        future::race(async { events.recv_async().await.unwrap().event }, async {
+                            panic!("{AUTOMATION_PROMPT}: {:?}", (&mut call).await)
+                        })
+                        .await;
+                    if let AgentEvent::PermissionRequest(request) = event {
+                        break request;
+                    }
+                };
+                assert_eq!(request.scopes, [AUTOMATION_ARM_SCOPE]);
+                let input = &request.input;
+                assert_eq!(input["action"], "arm");
+                assert_eq!(input["name"], AUTOMATION_NAME);
+                assert_eq!(input["scope"], "project");
+                assert_eq!(input["path"], json!(path));
+                assert_eq!(input["args"], json!({"count": 3}));
+                assert_eq!(input["triggers"][0]["kind"], "idle");
+                assert_eq!(
+                    input["trust"],
+                    format!("trusts digest {}", input["digest"].as_str().unwrap())
+                );
+                assert_eq!(
+                    input["capabilities"]["network"],
+                    json!(["https://example.com"])
+                );
+                assert_eq!(input["capabilities"]["secrets"], json!(["EXAMPLE_TOKEN"]));
+                assert_eq!(input["capabilities"]["messaging"]["reply"], true);
+                assert_eq!(input["capabilities"]["workflows"], json!(["review"]));
+                for field in [
+                    "action",
+                    "name",
+                    "scope",
+                    "path",
+                    "digest",
+                    "trust",
+                    "triggers",
+                    "network",
+                    "secrets",
+                    "messaging",
+                    "workflows",
+                    "args",
+                ] {
+                    assert!(
+                        request.presentation.action.contains(&format!("{field}:")),
+                        "{}",
+                        request.presentation.action
+                    );
+                }
+                assert!(
+                    request
+                        .presentation
+                        .action
+                        .contains(input["trust"].as_str().unwrap())
+                );
+                assert!(
+                    request
+                        .resources
+                        .iter()
+                        .all(|resource| !resource.protected && !resource.requires_prompt)
+                );
+                assert!(
+                    handle
+                        .state()
+                        .find(AUTOMATION_NAME)
+                        .unwrap()
+                        .armed
+                        .is_none()
+                );
+                assert!(permissions.answer(
+                    &request.id,
+                    if allowed {
+                        PermissionAnswer::AllowOnce
+                    } else {
+                        PermissionAnswer::Deny
+                    }
+                ));
+            }
+            let result = call.await;
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+            let state = handle.state();
+            let automation = state.find(AUTOMATION_NAME).unwrap();
+            assert_eq!(automation.armed, allowed.then_some(ArmOrigin::Manual));
+            assert_eq!(automation.trust.is_trusted(), allowed);
+            assert!(
+                !events
+                    .try_iter()
+                    .any(|event| matches!(event.event, AgentEvent::PermissionRequest(_)))
+            );
+            runtime.shutdown().await;
+        });
     }
 
     /// The reported bug: a slow tool's row read as a bare module call until the tool answered.

@@ -19,14 +19,14 @@ use caudra_automation::event::{
 };
 use caudra_automation::host::{
     ActionKind, ActionReply, ActionRequest, AutomationHost, CallSite, Failure, FailureKind,
-    GoalSet, HostError, HostResult, HttpResponse, Interruption, PublishReceipt, SendReceipt,
-    SendStatus, WorkflowStarted, request_hash,
+    GitCompare, GitOperation, GoalSet, HostError, HostResult, HttpResponse, Interruption,
+    PublishReceipt, SendReceipt, SendStatus, WorkflowStarted, request_hash,
 };
 use caudra_automation::limits::{LimitReason, LimitRefusal};
 use caudra_automation::matcher::{TopicMatcher, first_match};
 use caudra_automation::meta::{AutomationMeta, Trigger, parse_meta};
 use caudra_automation::replay::{
-    Answer, DryRun, DryRunReport, JournalEntry, JournalResult, dry_run,
+    Answer, DryRun, DryRunReport, JournalEntry, JournalResult, dry_run, dry_run_with_git_compare,
 };
 use caudra_automation::untrusted::{UNTRUSTED_TAG, Untrusted};
 use caudra_automation::validate::validate;
@@ -237,6 +237,28 @@ const STRANGER: &str = "@intern";
 const AGENT_BUDGET: u32 = 24;
 
 const MODEL_WATCH: &str = "model-watch";
+const SYNC_MAIN: &str = "sync-main";
+const SYNC_HEAD: &str = "1111111111111111111111111111111111111111";
+const SYNC_BASE_HEAD: &str = "2222222222222222222222222222222222222222";
+const SYNC_NEW_HEAD: &str = "3333333333333333333333333333333333333333";
+const SYNC_BRANCH: &str = "feature";
+const SYNC_CURRENT: &str = "current with main";
+const SYNC_ON_BASE: &str = "this checkout has the base checked out";
+const SYNC_DETACHED: &str = "HEAD is detached";
+const SYNC_MISSING: &str = "no repository or local base branch";
+const SYNC_MERGING: &str = "a git merge is in progress";
+const SYNC_BLOCKED: &str = "blocked on this base commit";
+const SYNC_ASKED: &str = "already asked for this base commit within the last hour";
+const SYNC_NUDGED: &str = "already added a sync todo for this base commit";
+const SYNC_PASSING_ERROR: &str = "the sync turn hit a passing error, the next check asks again";
+const SYNC_BLOCKED_REPLY: &str = "A person must choose which API to keep.\nSYNC-MAIN: BLOCKED";
+const SYNC_WAIT_REPLY: &str = "The current unit is unfinished.\nSYNC-MAIN: WAIT";
+const SYNC_DONE_REPLY: &str = "Merged and checked.\nSYNC-MAIN: DONE";
+const SYNC_BLOCKED_NOTICE: &str = "sync-main is blocked on main at 2222222222222222222222222222222222222222. The transcript says what a person must decide. Arm sync-main again after resolving it.";
+const SYNC_WAIT_NOTICE: &str = "sync-main has waited 12 hours for a safe point to sync with main at 2222222222222222222222222222222222222222. Check the session's current work.";
+const SYNC_IDLE_LEAD: &str = "Sync this worktree with main: 1 commits arrived (now 2222222222222222222222222222222222222222).";
+const SYNC_GUIDE_LEAD: &str = "main gained 1 commits (now 2222222222222222222222222222222222222222). Add the todo `Sync with main` right after your current item, and run it at the next safe point under the sync policy below. Do not stop running work for it.";
+const MS_PER_HOUR: i64 = 3_600_000;
 const MAIN_WORKTREE: &str = "/work/caudra";
 const TUESDAY: Date = date(2026, 10, 6);
 const NIGHT_HOUR: i8 = 5;
@@ -296,6 +318,7 @@ type Fired = (FiringEnd, Vec<Value>);
 /// Answers each request with the first scripted answer of its kind, or else a success, and
 /// records both.
 struct ScriptedHost {
+    comparison: Result<Option<GitCompare>, Failure>,
     now_ms: i64,
     admission: Result<(), LimitRefusal>,
     answers: RefCell<Vec<(ActionKind, HostResult<ActionReply>)>>,
@@ -329,6 +352,10 @@ impl TopicMatcher for ExactTopics {
 }
 
 impl AutomationHost for ScriptedHost {
+    fn git_compare(&self, _base: &str) -> Result<Option<GitCompare>, Failure> {
+        self.comparison.clone()
+    }
+
     fn now_ms(&self) -> i64 {
         self.now_ms
     }
@@ -361,6 +388,7 @@ impl Default for ScriptedHost {
 impl ScriptedHost {
     fn at(now_ms: i64) -> Self {
         Self {
+            comparison: Ok(None),
             now_ms,
             admission: Ok(()),
             answers: RefCell::default(),
@@ -1746,6 +1774,271 @@ fn model_watch() -> Automation {
         fs::read_to_string(path).expect(MUST_READ),
         json!({ "main_worktree": MAIN_WORKTREE }),
     )
+}
+
+fn sync_main() -> Automation {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(PROJECT_AUTOMATIONS_DIR)
+        .join(SYNC_MAIN)
+        .with_extension(EXAMPLE_EXTENSION);
+    Automation::from_source(fs::read_to_string(path).expect(MUST_READ), json!({}))
+}
+
+fn sync_host() -> ScriptedHost {
+    ScriptedHost {
+        comparison: Ok(Some(GitCompare {
+            branch: Some(Untrusted::text(SYNC_BRANCH)),
+            head: SYNC_HEAD.to_owned(),
+            base_head: SYNC_BASE_HEAD.to_owned(),
+            ahead: 0,
+            behind: 1,
+            operation: None,
+        })),
+        ..ScriptedHost::default()
+    }
+}
+
+fn sync_reply(reply: &str) -> Event {
+    idle(IdleDetail {
+        started_by: StartedBy::Automation {
+            automation: SYNC_MAIN.to_owned(),
+            fire_id: FIRE_ID.to_owned(),
+        },
+        last_response: Untrusted::text(reply),
+        ..turn()
+    })
+}
+
+#[test]
+fn sync_main_validates_every_trigger_with_a_behind_comparison() {
+    let sync = sync_main();
+    let report = validate(&sync.source, NOW_MS).unwrap();
+    assert_eq!(report.smoke.len(), 3);
+    for smoke in report.smoke {
+        assert_eq!(smoke.run.outcome.end, FiringEnd::Completed);
+        assert_eq!(smoke.run.actions.len(), 1);
+        assert!(matches!(
+            smoke.run.actions[0].request,
+            ActionRequest::Message(_)
+        ));
+    }
+}
+
+#[test_case(Some(SYNC_BRANCH), 0, None, SYNC_CURRENT; "current")]
+#[test_case(Some("main"), 1, None, SYNC_ON_BASE; "base_checked_out")]
+#[test_case(None, 1, None, SYNC_DETACHED; "detached")]
+#[test_case(Some(SYNC_BRANCH), 1, Some(GitOperation::Merge), SYNC_MERGING; "merge_in_progress")]
+fn sync_main_skips_without_a_turn(
+    branch: Option<&str>,
+    behind: u32,
+    operation: Option<GitOperation>,
+    reason: &str,
+) {
+    let mut host = sync_host();
+    let comparison = host.comparison.as_mut().unwrap().as_mut().unwrap();
+    comparison.branch = branch.map(Untrusted::text);
+    comparison.behind = behind;
+    comparison.operation = operation;
+    assert_eq!(
+        sync_main().fire(&scheduled(), &host),
+        (skipped(reason), vec![])
+    );
+}
+
+#[test]
+fn sync_main_skips_missing_repository_or_base() {
+    assert_eq!(
+        sync_main().fire(&scheduled(), &ScriptedHost::default()),
+        (skipped(SYNC_MISSING), vec![])
+    );
+}
+
+#[test_case(FailureKind::Timeout; "timeout")]
+#[test_case(FailureKind::Unavailable; "unavailable")]
+#[test_case(FailureKind::InvalidArgument; "invalid_argument")]
+fn sync_main_skips_probe_failures(kind: FailureKind) {
+    let host = ScriptedHost {
+        comparison: Err(Failure::new(kind, TIMED_OUT)),
+        ..sync_host()
+    };
+    assert_eq!(
+        sync_main().fire(&scheduled(), &host),
+        (
+            skipped(&format!("git comparison failed: {}", kind.as_str())),
+            vec![]
+        )
+    );
+}
+
+#[test_case(SessionStatus::Idle, "next", SYNC_IDLE_LEAD; "idle")]
+#[test_case(SessionStatus::Working, "guide", SYNC_GUIDE_LEAD; "working")]
+fn sync_main_messages_with_the_full_policy(status: SessionStatus, delivery: &str, lead: &str) {
+    let (end, requests) = sync_main().fire(
+        &scheduled_in(SessionView {
+            status,
+            ..session()
+        }),
+        &sync_host(),
+    );
+    assert_eq!(end, FiringEnd::Completed);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["delivery"], delivery);
+    let text = requests[0]["text"].as_str().unwrap();
+    assert_eq!(text.lines().next(), Some(lead));
+    for policy in [
+        "No background job, subagent, or workflow",
+        "git log --reverse --format=fuller HEAD..main",
+        "git diff HEAD...main -- release-notes/",
+        "one read-only subagent",
+        "Commit this branch's finished, verified work first",
+        "git merge-tree --write-tree HEAD main",
+        "git merge main",
+        "Never rebase, push, or touch the main checkout",
+        "drop the duplicate",
+        "cargo hakari generate",
+        "make check",
+        "SYNC-MAIN: DONE",
+        "SYNC-MAIN: WAIT",
+        "SYNC-MAIN: BLOCKED",
+    ] {
+        assert!(text.contains(policy), "missing policy: {policy}");
+    }
+}
+
+#[test_case(SessionStatus::Idle, SYNC_ASKED; "idle_throttle")]
+#[test_case(SessionStatus::Working, SYNC_NUDGED; "one_guide_per_sha")]
+fn sync_main_deduplicates_each_base_commit(status: SessionStatus, reason: &str) {
+    let mut sync = sync_main();
+    let event = scheduled_in(SessionView {
+        status,
+        ..session()
+    });
+    assert_eq!(sync.fire(&event, &sync_host()).1.len(), 1);
+    assert_eq!(sync.fire(&event, &sync_host()), (skipped(reason), vec![]));
+    let mut changed = sync_host();
+    changed
+        .comparison
+        .as_mut()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .base_head = SYNC_NEW_HEAD.to_owned();
+    assert_eq!(sync.fire(&event, &changed).1.len(), 1);
+}
+
+#[test]
+fn sync_main_blocked_notifies_once_then_skips_that_sha() {
+    let mut sync = sync_main();
+    sync.fire(&scheduled(), &sync_host());
+    assert_eq!(
+        sync.fire(&sync_reply(SYNC_BLOCKED_REPLY), &sync_host()),
+        (FiringEnd::Completed, vec![notified(SYNC_BLOCKED_NOTICE)])
+    );
+    assert_eq!(
+        sync.fire(&sync_reply(SYNC_BLOCKED_REPLY), &sync_host()),
+        (skipped(SYNC_BLOCKED), vec![])
+    );
+    assert_eq!(
+        sync.fire(&scheduled(), &sync_host()),
+        (skipped(SYNC_BLOCKED), vec![])
+    );
+}
+
+#[test_case(ArmedReason::Manual, true; "manual_clears_block")]
+#[test_case(ArmedReason::Resume, false; "resume_keeps_block")]
+fn sync_main_only_manual_arming_clears_a_block(reason: ArmedReason, cleared: bool) {
+    let mut sync = sync_main();
+    sync.fire(&scheduled(), &sync_host());
+    sync.fire(&sync_reply(SYNC_BLOCKED_REPLY), &sync_host());
+    let (end, requests) = sync.fire(&armed(reason), &sync_host());
+    if cleared {
+        assert_eq!(end, FiringEnd::Completed);
+        assert_eq!(kinds(&requests), vec!["message"]);
+        assert!(sync.state.get("blocked").is_none());
+    } else {
+        assert_eq!((end, requests), (skipped(SYNC_BLOCKED), vec![]));
+    }
+}
+
+#[test]
+fn sync_main_wait_notifies_once_and_retries_after_an_hour() {
+    let mut sync = sync_main();
+    sync.fire(&scheduled(), &sync_host());
+    assert_eq!(
+        sync.fire(&sync_reply(SYNC_WAIT_REPLY), &sync_host()),
+        (skipped(SYNC_ASKED), vec![])
+    );
+    let later = ScriptedHost {
+        now_ms: NOW_MS + 12 * MS_PER_HOUR,
+        ..sync_host()
+    };
+    let (end, requests) = sync.fire(&scheduled(), &later);
+    assert_eq!(end, FiringEnd::Completed);
+    assert_eq!(kinds(&requests), vec!["notify", "message"]);
+    assert_eq!(requests[0], notified(SYNC_WAIT_NOTICE));
+    let later = ScriptedHost {
+        now_ms: NOW_MS + 13 * MS_PER_HOUR,
+        ..sync_host()
+    };
+    assert_eq!(kinds(&sync.fire(&scheduled(), &later).1), vec!["message"]);
+}
+
+#[test]
+fn sync_main_done_clears_request_state_when_current() {
+    let mut sync = sync_main();
+    sync.fire(&scheduled(), &sync_host());
+    let mut host = sync_host();
+    host.comparison.as_mut().unwrap().as_mut().unwrap().behind = 0;
+    assert_eq!(
+        sync.fire(&sync_reply(SYNC_DONE_REPLY), &host),
+        (skipped(SYNC_CURRENT), vec![])
+    );
+    assert_eq!(sync.state, json!({}));
+}
+
+#[test_case(ProviderError::RateLimit; "rate_limit")]
+#[test_case(ProviderError::Overloaded; "overloaded")]
+#[test_case(ProviderError::Timeout; "timeout")]
+#[test_case(ProviderError::Network; "network")]
+fn sync_main_passing_errors_skip(error_kind: ProviderError) {
+    let mut sync = sync_main();
+    sync.fire(&scheduled(), &sync_host());
+    let mut event = sync_reply(SYNC_DONE_REPLY);
+    let EventDetail::Idle(detail) = &mut event.detail else {
+        unreachable!()
+    };
+    detail.outcome = TurnOutcome::Error;
+    detail.error_kind = Some(error_kind);
+    assert_eq!(
+        sync.fire(&event, &sync_host()),
+        (skipped(SYNC_PASSING_ERROR), vec![])
+    );
+}
+
+#[test]
+fn sync_main_replay_uses_scripted_comparison_without_actions() {
+    let sync = sync_main();
+    let host = sync_host();
+    let event = scheduled();
+    let run = DryRun {
+        source: &sync.source,
+        meta: &sync.meta,
+        event: &event,
+        state: &sync.state,
+        args: &sync.args,
+        limits: &FiringLimits::default(),
+        now_ms: NOW_MS,
+        journal: &[],
+        admission: Ok(()),
+    };
+    let replayed = dry_run_with_git_compare(run, host.comparison.clone());
+    assert_eq!(replayed.outcome.end, FiringEnd::Completed);
+    assert_eq!(replayed.actions.len(), 1);
+    assert_eq!(replayed.actions[0].answer, Answer::Recorded);
+    assert!(host.calls.borrow().is_empty());
+    let default = sync.replay(&event, &[]);
+    assert_eq!(default.outcome.end, skipped(SYNC_MISSING));
+    assert!(default.actions.is_empty());
 }
 
 /// A session ready for a run: in Build mode, under autopilot, with no goal.
