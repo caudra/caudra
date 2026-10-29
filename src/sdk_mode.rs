@@ -51,6 +51,7 @@ use caudra_providers::model::Model;
 use caudra_providers::{
     AutomationEventOrigin, AutopilotMessageKind, Billing, HistoryItem, ImageSource, Message,
     StopReason, ThinkingConfig, Timeouts, TokenUsage, WorkflowEventOrigin, add_cost,
+    with_inline_images,
 };
 use caudra_storage::StateDir;
 use caudra_storage::autopilot::{
@@ -3739,7 +3740,7 @@ impl EventPump {
                     task: envelope.task.clone(),
                     message: UserMessage {
                         role: "user",
-                        content: serde_json::to_value(&message.content)?,
+                        content: serde_json::to_value(with_inline_images(&message.content))?,
                     },
                     parent_tool_use_id,
                     workflow: envelope.workflow.clone(),
@@ -5077,8 +5078,8 @@ mod tests {
         ]);
         let images = content_images(&blocks);
         assert_eq!(images.len(), 2);
-        assert_eq!(&*images[0].data, "AAAA");
-        assert_eq!(&*images[1].data, "BBBB");
+        assert_eq!(images[0].data().map(|data| &**data), Some("AAAA"));
+        assert_eq!(images[1].data().map(|data| &**data), Some("BBBB"));
 
         // Non-array content and malformed image blocks yield no images.
         assert!(content_images(&serde_json::json!("hi")).is_empty());

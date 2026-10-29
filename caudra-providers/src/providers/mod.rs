@@ -224,13 +224,28 @@ pub(crate) mod test_support {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use crate::history::{HistoryItem, expand_message, project_messages};
     use crate::types::{PeerAssignment, PeerAudience, PeerMessageOrigin};
     use crate::{
-        AutomationEventOrigin, ContentBlock, DocumentSource, Message, TaskEventOrigin,
-        WorkflowEventOrigin,
+        AutomationEventOrigin, ContentBlock, DocumentSource, ImageMediaType, ImageSource, Message,
+        Role, TaskEventOrigin, WorkflowEventOrigin,
     };
+    use caudra_storage::StateDir;
+    use caudra_storage::media::MediaStore;
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::json;
+
+    /// `hello`, as base64.
+    const IMAGE_DATA: &str = "aGVsbG8=";
+    const IMAGE_QUESTION: &str = "what is in this picture?";
+
+    const FETCH_TOOL: &str = "web_fetch";
+
+    pub(crate) struct Restored {
+        pub(crate) live: Vec<Message>,
+        pub(crate) restored: Vec<Message>,
+        pub(crate) missing: Vec<Message>,
+    }
 
     pub(crate) const DOCUMENT_CALL: &str = "fetch-paper";
     pub(crate) const DOCUMENT_RESULT: &str = "PDF fetched successfully. The PDF has 3 pages and is available as an application/pdf attachment.";
@@ -408,11 +423,105 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn pasted_image() -> Vec<Message> {
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA));
+        vec![Message::user_with_images(
+            IMAGE_QUESTION.into(),
+            vec![image],
+        )]
+    }
+
+    /// A fetch call and the result holding `document`.
+    pub(crate) fn fetch_exchange(document: DocumentSource) -> Vec<Message> {
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(DOCUMENT_CALL, FETCH_TOOL, json!({}))],
+            ..Message::default()
+        };
+        vec![call, fetched_document(document)]
+    }
+
+    /// What a request carries for the first image of `messages`, whose
+    /// file is gone.
+    pub(crate) fn unavailable_note(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::Image { source } => Some(source.unavailable_note()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn load_all(messages: &mut [Message], store: &MediaStore) -> Vec<bool> {
+        let mut loaded = Vec::new();
+        for message in messages {
+            for block in &mut message.content {
+                if let ContentBlock::Image { source } = block {
+                    loaded.push(source.load_from(store));
+                }
+            }
+            for document in message.tool_result_documents.values_mut().flatten() {
+                loaded.push(document.load_from(store));
+            }
+        }
+        assert!(!loaded.is_empty());
+        loaded
+    }
+
+    /// `live` saved as session history with its media in a store, then
+    /// restored twice: once with the files there to load, and once after
+    /// they were deleted.
+    pub(crate) fn restored(live: Vec<Message>) -> Restored {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(&StateDir::from_path(dir.path().to_path_buf()));
+        let mut items: Vec<HistoryItem> = Vec::new();
+        for message in &live {
+            let mut message = message.clone();
+            for block in &mut message.content {
+                if let ContentBlock::Image { source } = block {
+                    source.store_in(&store).unwrap();
+                }
+            }
+            for document in message.tool_result_documents.values_mut().flatten() {
+                document.store_in(&store).unwrap();
+            }
+            let parent_id = items.last().map(|item| item.id);
+            items.extend(expand_message(&message, parent_id));
+        }
+        let saved = serde_json::to_string(&items).unwrap();
+        assert!(!saved.contains(IMAGE_DATA) && !saved.contains(DOCUMENT_DATA));
+        let read_back = || {
+            let items: Vec<HistoryItem> = serde_json::from_str(&saved).unwrap();
+            project_messages(&items).unwrap()
+        };
+        let mut restored = read_back();
+        assert!(
+            load_all(&mut restored, &store)
+                .into_iter()
+                .all(|loaded| loaded)
+        );
+        dir.close().unwrap();
+        let mut missing = read_back();
+        assert!(
+            load_all(&mut missing, &store)
+                .into_iter()
+                .all(|loaded| !loaded)
+        );
+        Restored {
+            live,
+            restored,
+            missing,
+        }
+    }
+
     pub(crate) fn document(data: Option<&str>) -> DocumentSource {
         DocumentSource {
             url: DOCUMENT_URL.into(),
             filename: Some(DOCUMENT_NAME.into()),
             page_count: DOCUMENT_PAGES,
+            stored: None,
             data: data.map(Arc::from),
         }
     }

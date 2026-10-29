@@ -21,6 +21,7 @@ use crate::{
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 const BASE64_SOURCE: &str = "base64";
+const IMAGE_BLOCK: &str = "image";
 
 /// Tool names that are also ordinary English words. Prose rewriting only
 /// touches these when they are fenced in backticks or bold, so "a shell command
@@ -302,6 +303,21 @@ impl Serialize for WireContent<'_> {
                 is_error: *is_error,
             }
             .serialize(serializer),
+            ContentBlock::Image { source } => match source.data() {
+                Some(data) => WireImage {
+                    r#type: IMAGE_BLOCK,
+                    source: Base64Source {
+                        r#type: BASE64_SOURCE,
+                        media_type: source.media_type.mime(),
+                        data,
+                    },
+                }
+                .serialize(serializer),
+                None => ToolResultBlock::Text {
+                    text: &source.unavailable_note(),
+                }
+                .serialize(serializer),
+            },
             block => block.serialize(serializer),
         }
     }
@@ -350,6 +366,12 @@ enum ToolResultBlock<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<&'a str>,
     },
+}
+
+#[derive(Serialize)]
+struct WireImage<'a> {
+    r#type: &'static str,
+    source: Base64Source<'a>,
 }
 
 #[derive(Serialize)]
@@ -1231,8 +1253,9 @@ mod tests {
     use crate::model::ModelPricing;
     use crate::providers::test_support::{
         DOCUMENT_DATA, DOCUMENT_NAME, DOCUMENT_RESULT, PEER_ATTACK, PEER_TEXT, assert_peer_framing,
-        automation_event_origin, document, fetched_document, peer_message_origin,
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        automation_event_origin, document, fetch_exchange, fetched_document, pasted_image,
+        peer_message_origin, restored, task_event_origin, task_observation_with_output_refs,
+        unavailable_note, workflow_event_origin,
     };
     use crate::{
         ContentBlock, Message, Model, PDF_MEDIA_TYPE, ProviderEvent, StandingReminderKind,
@@ -1436,6 +1459,33 @@ mod tests {
         let messages = [fetched_document(document(data))];
         let wire = serde_json::to_value(super::build_wire_messages(&messages)).unwrap();
         assert_eq!(wire[0]["content"][0]["content"], expected);
+    }
+
+    fn wire(messages: &[Message]) -> Value {
+        serde_json::to_value(super::build_wire_messages(messages)).unwrap()
+    }
+
+    #[test_case(pasted_image() ; "a_pasted_image")]
+    #[test_case(fetch_exchange(document(Some(DOCUMENT_DATA))) ; "a_fetched_pdf")]
+    fn restored_media_reaches_the_wire_as_it_left_the_live_session(live: Vec<Message>) {
+        let media = restored(live);
+        assert_eq!(wire(&media.restored), wire(&media.live));
+    }
+
+    #[test]
+    fn an_image_whose_file_is_gone_reaches_the_wire_as_a_note() {
+        let media = restored(pasted_image());
+        let note = unavailable_note(&media.missing);
+        assert_eq!(
+            wire(&media.missing)[0]["content"][0],
+            json!({"type": "text", "text": note})
+        );
+    }
+
+    #[test]
+    fn a_pdf_whose_file_is_gone_reaches_the_wire_without_bytes() {
+        let media = restored(fetch_exchange(document(Some(DOCUMENT_DATA))));
+        assert_eq!(wire(&media.missing), wire(&fetch_exchange(document(None))));
     }
 
     #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]

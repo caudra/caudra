@@ -12,6 +12,7 @@ use caudra_providers::{
     HistoryItem, TokenUsage, active_history_items, resolve_history_head, settle_session,
 };
 use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::media::MediaStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{PermissionMode, StoredMode, StoredPlanTarget, StoredTokenUsage};
 use caudra_storage::thinking::StoredThinking;
@@ -104,8 +105,19 @@ pub(crate) fn load_history_from(
 
 /// What shows a stored conversation to the client that just opened it.
 /// Relative paths resolve against `cwd`.
-pub(crate) fn replay(registry: &ToolRegistry, history: &History, cwd: &Path) -> Vec<SessionUpdate> {
-    translate::replay_history(registry, history, cwd, paths::home().as_deref())
+pub(crate) fn replay(
+    registry: &ToolRegistry,
+    history: &History,
+    cwd: &Path,
+    storage: &StateDir,
+) -> Vec<SessionUpdate> {
+    translate::replay_history(
+        registry,
+        history,
+        cwd,
+        paths::home().as_deref(),
+        Some(&MediaStore::new(storage)),
+    )
 }
 
 /// Replays a session this process already runs, from what it has stored so far.
@@ -121,6 +133,7 @@ pub(crate) fn replay_stored(
         registry,
         &history,
         restored.cwd.as_deref().unwrap_or(request_cwd),
+        storage,
     ))
 }
 

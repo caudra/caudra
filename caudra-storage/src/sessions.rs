@@ -47,6 +47,7 @@ pub mod sweep;
 #[path = "sessions/types.rs"]
 mod types;
 
+pub use crate::media::StoredImage;
 pub(crate) use database::{
     AFTER_SEPARATOR, MAX_SQLITE_VALUE_BYTES, WriteTiming, compress_payload, decompress_payload,
     deserialize_json, from_i64, from_i64_usize, id_from_row, to_i64,
@@ -406,12 +407,6 @@ pub struct StoredGoalWait {
 pub struct StoredPasteRange {
     pub start: usize,
     pub end: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredImage {
-    pub media_type: String,
-    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2442,7 +2437,7 @@ mod tests {
     #[test]
     fn session_meta_roundtrips_draft_images() {
         let meta = SessionMeta {
-            input_draft_images: vec![StoredImage {
+            input_draft_images: vec![StoredImage::Base64 {
                 media_type: "image/png".into(),
                 data: "aW1hZ2U=".into(),
             }],
@@ -3500,7 +3495,7 @@ mod tests {
             StoredQueuedPrompt {
                 text: "guide".into(),
                 mode: Some(StoredMode::Build),
-                images: vec![StoredImage {
+                images: vec![StoredImage::Base64 {
                     media_type: "image/png".into(),
                     data: "aW1hZ2U=".into(),
                 }],

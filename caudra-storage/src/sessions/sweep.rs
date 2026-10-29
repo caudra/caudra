@@ -32,6 +32,7 @@ const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
 const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";
 const CHANGE_STORES_PHASE: &str = "cleaning change stores";
 const TOOL_OUTPUT_PHASE: &str = "pruning unreferenced tool outputs";
+const MEDIA_PHASE: &str = "pruning unreferenced media";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.
@@ -186,6 +187,10 @@ pub struct PruneReport {
     /// Saved tool outputs no session record references, removed once past
     /// the grace period.
     pub unreferenced_tool_outputs: u64,
+    /// Media files no payload, archive or backup references, removed once
+    /// past the grace period. Nothing is removed when a root cannot be read.
+    pub unreferenced_media_files: u64,
+    pub unreferenced_media_bytes: u64,
     /// Change store holders with no session, released once past the grace
     /// period.
     pub orphan_record_holders: u64,
@@ -421,6 +426,20 @@ pub fn prune(
     });
     report.unreferenced_tool_outputs =
         database.prune_unreferenced_outputs(UNREFERENCED_OUTPUT_GRACE, dry_run)?;
+    PRUNE.report(PruneEvent::Phase { label: MEDIA_PHASE });
+    let media = {
+        let _artifact_lock = lock_session_artifacts(state_dir)?;
+        database.prune_unreferenced_media(dry_run)
+    };
+    match media {
+        Ok(media) => {
+            report.unreferenced_media_files = media.files as u64;
+            report.unreferenced_media_bytes = media.bytes;
+        }
+        Err(error) => {
+            warn!(root = error.root(), %error, dry_run, "media cleanup deleted nothing");
+        }
+    }
     if !dry_run {
         PRUNE.report(PruneEvent::Phase {
             label: CHECKPOINT_PHASE,
@@ -689,6 +708,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::media::{MEDIA_GRACE, MediaStore};
     use crate::retention::Duration as RetentionDuration;
     use crate::sessions::change_stores::StoreUsage;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores};
@@ -990,6 +1010,37 @@ mod tests {
         assert!(fresh_dir.exists());
         assert!(known_dir.exists());
         assert!(report.checkpoint.is_some());
+    }
+
+    #[test]
+    fn prune_removes_old_media_that_no_saved_session_references() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let store = MediaStore::new(&state_dir);
+        let [referenced, unreferenced] =
+            [b"referenced".as_slice(), b"unreferenced"].map(|bytes| store.put(bytes).unwrap());
+        for media in [&referenced, &unreferenced] {
+            fs::File::options()
+                .write(true)
+                .open(store.path(&media.sha256))
+                .unwrap()
+                .set_modified(SystemTime::now() - MEDIA_GRACE - MARGIN)
+                .unwrap();
+        }
+        let mut session = TestSession::new(MODEL, CWD);
+        session.insert_tool_output(
+            "image".into(),
+            json!({"Image": {"source": {"type": "media", "media_type": "image/png", "sha256": referenced.sha256}}}),
+        );
+        database.save(&session, None).unwrap();
+
+        let preview = prune(&mut database, &state_dir, STORE_BUDGET, true).unwrap();
+        let report = prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
+
+        assert_eq!(preview.unreferenced_media_files, 1);
+        assert_eq!(report.unreferenced_media_files, 1);
+        assert!(store.path(&referenced.sha256).exists());
+        assert!(!store.path(&unreferenced.sha256).exists());
     }
 
     #[test]

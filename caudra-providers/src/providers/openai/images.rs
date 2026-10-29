@@ -146,7 +146,8 @@ fn build_body(req: &ImageRequest<'_>) -> Value {
     content.extend(
         req.references
             .iter()
-            .map(|image| json!({"type": "input_image", "image_url": image.to_data_url()})),
+            .filter_map(ImageSource::to_data_url)
+            .map(|url| json!({"type": "input_image", "image_url": url})),
     );
 
     let mut tool = json!({

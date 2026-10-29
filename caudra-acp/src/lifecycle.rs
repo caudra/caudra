@@ -466,6 +466,7 @@ impl Starter<'_> {
                 &runtime.registry,
                 &history,
                 restored.cwd.as_deref().unwrap_or(&cwd),
+                &ctx.storage,
             ),
             Restoring::Reopen(Reopen::Resume) | Restoring::Fork => Vec::new(),
         };

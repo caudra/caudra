@@ -4300,6 +4300,7 @@ fn take_document(output: &mut WebfetchOutput) -> Option<DocumentSource> {
         url: output.url.clone(),
         filename: attachment.filename.clone(),
         page_count: output.page_count?,
+        stored: None,
         data: Some(Arc::from(data)),
     })
 }
@@ -5662,6 +5663,7 @@ mod tests {
                 url: PDF_URL.into(),
                 filename: Some(PDF_NAME.into()),
                 page_count: PDF_PAGES,
+                stored: None,
                 data: Some(Arc::from(PDF_DATA)),
             }]
         );

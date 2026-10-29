@@ -7,12 +7,15 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 caudra-proxy = { workspace = true }
 caudra-workspace = { workspace = true }
 flume = { workspace = true }
 getrandom = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 isahc = { workspace = true }
 jiff = { workspace = true }
+lru = { workspace = true }
 memchr = { workspace = true }
 regex = { workspace = true }
 semver = { workspace = true }

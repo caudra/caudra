@@ -1,5 +1,4 @@
 use caudra_agent::ImageSource;
-use caudra_providers::ImageMediaType;
 use caudra_storage::prompt_stash::{PromptStash, PromptStashError, StashDraft, StashEntry};
 use caudra_storage::sessions::{StoredImage, StoredPasteRange};
 
@@ -145,12 +144,10 @@ impl App {
         let images = entry
             .images
             .into_iter()
-            .filter_map(|image| match ImageMediaType::from_mime(&image.media_type) {
-                Some(media_type) => Some(ImageSource::new(media_type, image.data.into())),
-                None => {
-                    tracing::warn!(media_type = %image.media_type, "dropping stashed image");
-                    None
-                }
+            .filter_map(|image| {
+                ImageSource::try_from(image)
+                    .inspect_err(|error| tracing::warn!(%error, "dropping stashed image"))
+                    .ok()
             })
             .collect();
         let draft = InputDraft {
@@ -186,10 +183,7 @@ fn to_stash_draft(draft: InputDraft, images: Vec<ImageSource>, cwd: String) -> S
             .collect(),
         images: images
             .into_iter()
-            .map(|image| StoredImage {
-                media_type: image.media_type.mime().into(),
-                data: image.data.to_string(),
-            })
+            .map(|image| StoredImage::from(&image))
             .collect(),
         cwd,
     }

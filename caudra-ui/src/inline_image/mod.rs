@@ -23,13 +23,15 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::SystemTime;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use caudra_agent::ImageSource;
 use caudra_config::InlineImages;
+use caudra_storage::StateDir;
+use caudra_storage::media::MediaStore;
 use caudra_terminal_host::mux::TerminalMux;
 use caudra_workbench::{ImageSampling, ImageViewport, PaintedImage};
 use image::ImageReader;
@@ -60,6 +62,13 @@ const MAX_RASTER_PIXELS: u32 = 1_000_000;
 const MAX_RASTER_EDGE: u32 = 4096;
 const DRAWN_CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const LOADING_LABEL: &str = "loading image…";
+
+static MEDIA: LazyLock<Option<MediaStore>> =
+    LazyLock::new(|| StateDir::resolve().ok().map(|dir| MediaStore::new(&dir)));
+
+pub(crate) fn media_store() -> Option<&'static MediaStore> {
+    MEDIA.as_ref()
+}
 
 thread_local! {
     static STORE: RefCell<ImageStore> = RefCell::new(ImageStore::new());
@@ -191,6 +200,10 @@ impl ImageRef {
     /// over the size caps.
     pub(crate) fn from_file(path: &Path, alt: &str) -> Option<Self> {
         media_type_for(path)?;
+        Self::from_picture_file(path, alt)
+    }
+
+    fn from_picture_file(path: &Path, alt: &str) -> Option<Self> {
         let meta = fs::metadata(path).ok().filter(|meta| meta.is_file())?;
         if meta.len() > MAX_IMAGE_BYTES as u64 {
             return None;
@@ -211,14 +224,20 @@ impl ImageRef {
         })
     }
 
+    /// The image's bytes, or for a reference whose bytes are not loaded, its
+    /// file in the media store. `None` when that file is gone.
     pub(crate) fn from_source(source: &ImageSource, alt: &str) -> Option<Self> {
-        if source.data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+        let Some(data) = source.data() else {
+            let path = media_store()?.path(&source.stored()?.sha256);
+            return Self::from_picture_file(&path, alt);
+        };
+        if data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
             return None;
         }
         let mut hasher = DefaultHasher::new();
-        source.data.hash(&mut hasher);
+        data.hash(&mut hasher);
         let key = ImageKey::Bytes(hasher.finish());
-        let origin = ImageOrigin::Bytes(Arc::clone(&source.data));
+        let origin = ImageOrigin::Bytes(Arc::clone(data));
         let pixels = with_store(|store| store.pixels(&key, &origin))?;
         Some(Self {
             key,

@@ -90,14 +90,7 @@ fn stored_queued_prompt(prompt: &PendingPrompt) -> StoredQueuedPrompt {
     StoredQueuedPrompt {
         mode: prompt.mode,
         text: prompt.text.clone(),
-        images: prompt
-            .images
-            .iter()
-            .map(|image| StoredImage {
-                media_type: image.media_type.mime().into(),
-                data: image.data.to_string(),
-            })
-            .collect(),
+        images: prompt.images.iter().map(StoredImage::from).collect(),
         paste_ranges: prompt
             .paste_ranges
             .iter()
@@ -500,10 +493,7 @@ impl App {
                 .input_box
                 .pending_images()
                 .iter()
-                .map(|image| StoredImage {
-                    media_type: image.media_type.mime().into(),
-                    data: image.data.to_string(),
-                })
+                .map(StoredImage::from)
                 .collect(),
             input_draft_pastes: draft
                 .paste_ranges
@@ -887,13 +877,10 @@ impl App {
         };
         self.input_box.set_draft(draft);
         for image in &self.state.session.meta.input_draft_images {
-            let Some(media_type) = caudra_providers::ImageMediaType::from_mime(&image.media_type)
-            else {
-                tracing::warn!(media_type = %image.media_type, "skipping stored draft image");
-                continue;
-            };
-            self.input_box
-                .attach_image(ImageSource::new(media_type, Arc::from(image.data.as_str())));
+            match ImageSource::try_from(image.clone()) {
+                Ok(image) => self.input_box.attach_image(image),
+                Err(error) => tracing::warn!(%error, "skipping stored draft image"),
+            }
         }
         self.input_box.move_to_end();
         self.unsent_subagent_steers = self

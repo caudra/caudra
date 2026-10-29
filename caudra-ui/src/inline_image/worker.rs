@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn decoder_rechecks_pixel_limits_without_a_trusted_header() {
         let source = png_source(MAX_IMAGE_PIXELS as u32 + 1, 1);
-        let error = load(&ImageOrigin::Bytes(source.data)).unwrap_err();
+        let error = load(&ImageOrigin::Bytes(Arc::clone(source.data().unwrap()))).unwrap_err();
         assert_eq!(error, SIZE_LIMIT);
     }
 

@@ -13,6 +13,7 @@ use std::iter;
 use std::sync::Arc;
 
 use caudra_storage::id::SessionRef;
+use caudra_storage::media::{MediaError, MediaStore, StoredImage, StoredMedia};
 use caudra_storage::sessions::TitleSource;
 pub use caudra_storage::thinking::{
     EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
@@ -100,31 +101,160 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// An image in history. Once it is in the media store, saving it writes only
+/// its [`StoredMedia`] reference, and its base64 is held for the live session
+/// alone: [`Self::load_from`] fills it in before a request needs it. An image
+/// that never reached the store saves inline, so no bytes are ever lost.
+#[derive(Debug, Clone)]
 pub struct ImageSource {
     pub media_type: ImageMediaType,
-    pub data: Arc<str>,
+    stored: Option<StoredMedia>,
+    data: Option<Arc<str>>,
 }
+
+impl PartialEq for ImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.media_type == other.media_type
+            && match (&self.stored, &other.stored) {
+                (Some(this), Some(that)) => this.sha256 == that.sha256,
+                _ => self.data.is_some() && self.data == other.data,
+            }
+    }
+}
+
+impl Eq for ImageSource {}
 
 impl Serialize for ImageSource {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ImageSource", 3)?;
-        state.serialize_field("type", "base64")?;
-        state.serialize_field("media_type", &self.media_type)?;
-        state.serialize_field("data", &self.data)?;
-        state.end()
+        StoredImage::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(StoredImage::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<StoredImage> for ImageSource {
+    type Error = String;
+
+    fn try_from(image: StoredImage) -> Result<Self, Self::Error> {
+        let media_type = ImageMediaType::from_mime(image.media_type())
+            .ok_or_else(|| format!("unknown image media type '{}'", image.media_type()))?;
+        Ok(match image {
+            StoredImage::Base64 { data, .. } => Self::new(media_type, data),
+            StoredImage::Media { media, .. } => Self {
+                media_type,
+                stored: Some(media),
+                data: None,
+            },
+        })
+    }
+}
+
+impl From<&ImageSource> for StoredImage {
+    fn from(image: &ImageSource) -> Self {
+        let media_type = image.media_type.mime().to_owned();
+        match (&image.stored, &image.data) {
+            (Some(media), _) => Self::Media {
+                media_type,
+                media: media.clone(),
+            },
+            (None, data) => Self::Base64 {
+                media_type,
+                data: data.clone().unwrap_or_default(),
+            },
+        }
     }
 }
 
 impl ImageSource {
+    /// An image not yet in the media store, from its base64.
     pub fn new(media_type: ImageMediaType, data: Arc<str>) -> Self {
-        Self { media_type, data }
+        Self {
+            media_type,
+            stored: None,
+            data: Some(data),
+        }
     }
 
-    pub fn to_data_url(&self) -> String {
-        format!("data:{};base64,{}", self.media_type.mime(), self.data)
+    /// The base64, unless this is a reference whose bytes are not loaded.
+    pub fn data(&self) -> Option<&Arc<str>> {
+        self.data.as_ref()
     }
+
+    pub fn stored(&self) -> Option<&StoredMedia> {
+        self.stored.as_ref()
+    }
+
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        let stored = self.stored.as_ref()?;
+        stored.width.zip(stored.height)
+    }
+
+    pub fn to_data_url(&self) -> Option<String> {
+        let data = self.data.as_deref()?;
+        Some(format!("data:{};base64,{data}", self.media_type.mime()))
+    }
+
+    /// Puts the bytes into `store`, so saving this image writes a reference.
+    pub fn store_in(&mut self, store: &MediaStore) -> Result<(), MediaError> {
+        store_media(&mut self.stored, self.data.as_deref(), store)
+    }
+
+    /// Fills in the bytes of a reference from `store`, returning whether
+    /// they are available. A missing file leaves the image without them.
+    pub fn load_from(&mut self, store: &MediaStore) -> bool {
+        load_media(self.stored.as_ref(), &mut self.data, store)
+    }
+
+    /// This image as it serializes for a reader outside Caudra, who has no
+    /// media store: its base64 inline whenever it is loaded.
+    pub fn inlined(&self) -> Self {
+        match &self.data {
+            Some(data) => Self::new(self.media_type, Arc::clone(data)),
+            None => self.clone(),
+        }
+    }
+
+    /// What a request carries in place of an image whose bytes are gone.
+    pub fn unavailable_note(&self) -> String {
+        let hash = self
+            .stored
+            .as_ref()
+            .map_or("unknown", |stored| stored.sha256.as_str());
+        format!("{IMAGE_UNAVAILABLE_PREFIX}{hash}{IMAGE_UNAVAILABLE_SUFFIX}")
+    }
+}
+
+fn store_media(
+    stored: &mut Option<StoredMedia>,
+    data: Option<&str>,
+    store: &MediaStore,
+) -> Result<(), MediaError> {
+    if stored.is_none()
+        && let Some(data) = data
+    {
+        *stored = Some(store.put_base64(data)?);
+    }
+    Ok(())
+}
+
+fn load_media(
+    stored: Option<&StoredMedia>,
+    data: &mut Option<Arc<str>>,
+    store: &MediaStore,
+) -> bool {
+    if data.is_none()
+        && let Some(stored) = stored
+    {
+        match store.base64(&stored.sha256) {
+            Ok(loaded) => *data = loaded,
+            Err(error) => warn!(sha256 = %stored.sha256, %error, "stored media unreadable"),
+        }
+    }
+    data.is_some()
 }
 
 pub const PDF_MEDIA_TYPE: &str = "application/pdf";
@@ -147,14 +277,28 @@ pub struct DocumentSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     pub page_count: usize,
-    /// The file as base64. Host-only and held for the live session alone, so
-    /// no saved session or checkpoint ever carries it. A document without it
+    /// Where the file lives in the media store, so a restored session can
+    /// attach it again. Absent on PDFs saved before the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<StoredMedia>,
+    /// The file as base64. Held for the live session alone, so no saved
+    /// session or checkpoint ever carries it inline. A document without it
     /// reaches the model as a note asking for the file to be fetched again.
     #[serde(skip)]
     pub data: Option<Arc<str>>,
 }
 
 impl DocumentSource {
+    /// Puts the bytes into `store`, so a saved session keeps a reference.
+    pub fn store_in(&mut self, store: &MediaStore) -> Result<(), MediaError> {
+        store_media(&mut self.stored, self.data.as_deref(), store)
+    }
+
+    /// Fills in the bytes from `store`, returning whether they are available.
+    pub fn load_from(&mut self, store: &MediaStore) -> bool {
+        load_media(self.stored.as_ref(), &mut self.data, store)
+    }
+
     pub fn data_url(&self) -> Option<String> {
         let data = self.data.as_deref()?;
         Some(format!("{PDF_DATA_URL_PREFIX}{data}"))
@@ -180,6 +324,8 @@ impl DocumentSource {
 
 pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
+pub const IMAGE_UNAVAILABLE_PREFIX: &str = "[image unavailable: its file ";
+const IMAGE_UNAVAILABLE_SUFFIX: &str = " is missing from the media store]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 /// The sole key of a tool input that never parsed. Asking Anthropic to stream
@@ -348,6 +494,27 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+}
+
+/// `content` for a protocol that carries images inline, such as stream JSON.
+pub fn with_inline_images(content: &[ContentBlock]) -> Cow<'_, [ContentBlock]> {
+    if !content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { source } if source.stored.is_some()))
+    {
+        return Cow::Borrowed(content);
+    }
+    Cow::Owned(
+        content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Image { source } => ContentBlock::Image {
+                    source: source.inlined(),
+                },
+                block => block.clone(),
+            })
+            .collect(),
+    )
 }
 
 impl ContentBlock {
@@ -2055,7 +2222,10 @@ mod tests {
     #[test_case(ImageMediaType::Webp, "image/webp" ; "webp")]
     fn image_source_data_url(media: ImageMediaType, mime: &str) {
         let source = ImageSource::new(media, Arc::from("dGVzdA=="));
-        assert_eq!(source.to_data_url(), format!("data:{mime};base64,dGVzdA=="));
+        assert_eq!(
+            source.to_data_url(),
+            Some(format!("data:{mime};base64,dGVzdA=="))
+        );
     }
 
     #[test_case("image/png",  Some(ImageMediaType::Png)  ; "png")]
@@ -2140,6 +2310,7 @@ mod tests {
                 let call = format!("{DOCUMENT_CALL}-{call}");
                 let document = DocumentSource {
                     page_count,
+                    stored: None,
                     data: data_len.map(|len| Arc::from(BASE64_DIGIT.repeat(len))),
                     ..document(None)
                 };
@@ -2223,7 +2394,7 @@ mod tests {
         assert_eq!(json["data"], "abc123");
         let deserialized: ImageSource = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.media_type, ImageMediaType::Png);
-        assert_eq!(&*deserialized.data, "abc123");
+        assert_eq!(deserialized.data().map(|data| &**data), Some("abc123"));
     }
 
     fn effort(level: &str) -> ThinkingConfig {

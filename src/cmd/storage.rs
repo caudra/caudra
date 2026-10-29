@@ -742,6 +742,12 @@ fn render_prune(report: &PruneReport) -> String {
     );
     let _ = writeln!(
         out,
+        "  {prefix}remove {} unreferenced media files ({})",
+        report.unreferenced_media_files,
+        bytes(report.unreferenced_media_bytes)
+    );
+    let _ = writeln!(
+        out,
         "  {prefix}release {} change record holders without a session and reclaim {} from \
          change record stores",
         report.orphan_record_holders,

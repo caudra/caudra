@@ -31,6 +31,7 @@ pub mod learning;
 pub mod local_documents;
 pub mod log;
 pub mod mcp_trust;
+pub mod media;
 pub mod memory_journal;
 pub mod messages;
 pub mod model;

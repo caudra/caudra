@@ -2186,12 +2186,12 @@ mod tests {
         assert!(matches!(
             &items[0].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_ONE && &*images[0].data == "first"
+                if call_id == CALL_ONE && images[0].data().is_some_and(|data| &**data == "first")
         ));
         assert!(matches!(
             &items[1].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_TWO && &*images[0].data == "second"
+                if call_id == CALL_TWO && images[0].data().is_some_and(|data| &**data == "second")
         ));
     }
 
@@ -2225,7 +2225,7 @@ mod tests {
         assert!(matches!(
             &items[0].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_ONE && images.len() == 1 && &*images[0].data == "first"
+                if call_id == CALL_ONE && images.len() == 1 && images[0].data().is_some_and(|data| &**data == "first")
         ));
         assert!(matches!(
             &items[1].kind,
@@ -2252,7 +2252,7 @@ mod tests {
         assert!(matches!(
             &roundtrip[0].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_ONE && images.len() == 1 && &*images[0].data == "first"
+                if call_id == CALL_ONE && images.len() == 1 && images[0].data().is_some_and(|data| &**data == "first")
         ));
         assert!(matches!(
             &roundtrip[1].kind,
@@ -2635,20 +2635,20 @@ mod tests {
                 ContentBlock::Image { source: second_image },
             ] if first_id == CALL_ONE
                 && second_id == CALL_TWO
-                && &*first_image.data == "first"
-                && &*second_image.data == "second"
+                && first_image.data().is_some_and(|data| &**data == "first")
+                && second_image.data().is_some_and(|data| &**data == "second")
         ));
         assert_eq!(messages[1].tool_result_image_owners, [CALL_ONE, CALL_TWO]);
         let expanded = expand_message(&messages[1], None);
         assert!(matches!(
             &expanded[0].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_ONE && &*images[0].data == "first"
+                if call_id == CALL_ONE && images[0].data().is_some_and(|data| &**data == "first")
         ));
         assert!(matches!(
             &expanded[1].kind,
             HistoryItemKind::ToolResult { call_id, images, .. }
-                if call_id == CALL_TWO && &*images[0].data == "second"
+                if call_id == CALL_TWO && images[0].data().is_some_and(|data| &**data == "second")
         ));
         assert!(
             serde_json::to_value(&messages[1])

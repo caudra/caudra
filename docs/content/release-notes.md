@@ -11,7 +11,18 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 [v0.2.0-preview.17 on GitHub](https://github.com/caudra/caudra/releases/tag/v0.2.0-preview.17)
 
+- Images and PDFs are stored once as files beside the session database, which shrinks it, and resumed sessions keep their PDFs.
 - A task whose transcript is too large to save no longer stops every background task, and a result lost that way is delivered after a restart.
+
+> **Important**
+>
+> Close other Caudra sessions before starting Preview 17. Its first start moves the images saved in sessions into the media store, which can take a few minutes on a large database.
+>
+> Updating from Preview 16 saves a copy first at `backups/caudra.db.v43.bak` in the state directory. Older builds cannot open the upgraded database, and `caudra rollback` restores only the previous binary.
+
+### Changes
+
+- **Images and PDFs are stored once.** Pasted images, images that tools and tasks return, and fetched PDFs are saved as files under `media/` in the state directory, and sessions keep only a reference to each. The same picture in several sessions, forks, or task transcripts takes space once, and the upgrade moves images already saved into the store. Resumed sessions now keep their fetched PDFs. If a file goes missing, the model is told the image is unavailable instead of receiving it. The storage sweep and `caudra storage prune` remove files that no session, archive, or backup refers to after seven days. See [Sessions](/docs/sessions/).
 
 ### Fixes
 

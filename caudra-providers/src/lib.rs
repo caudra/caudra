@@ -64,5 +64,5 @@ pub use types::{
     RequestOptions, ResolvedThinking, ResponsesReasoning, Role, StandingReminderKind, SteeringKind,
     SteeringOrigin, StopReason, StreamResponse, THINKING_USAGE, TaskEventOrigin, ThinkingConfig,
     ToolNameAliases, UsageLimit, WorkflowEventOrigin, adapt_attachments_for_model,
-    invalid_tool_input, tag_safe_literal,
+    invalid_tool_input, tag_safe_literal, with_inline_images,
 };

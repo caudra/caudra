@@ -251,7 +251,10 @@ impl<'a> Document<'a> {
             ContentBlock::Image { source } => {
                 let details = [
                     source.media_type.mime().to_owned(),
-                    format_bytes(decoded_len(&source.data)),
+                    format_bytes(source.stored().map_or_else(
+                        || source.data().map_or(0, |data| decoded_len(data)),
+                        |stored| stored.bytes,
+                    )),
                 ];
                 let label = Span::styled(IMAGE_LABEL, theme.accent);
                 self.push(tagged(label, details, dim));
@@ -637,6 +640,7 @@ mod tests {
                 url: PDF_URL.into(),
                 filename: Some(PDF_NAME.into()),
                 page_count: PDF_PAGES,
+                stored: None,
                 data: Some(PDF_DATA.into()),
             }],
         );

@@ -2474,7 +2474,7 @@ async fn remote_image_bytes(client: &RemoteWorkcellClient, root: &Path) {
                 text.contains(&format!("{EDITOR_IMAGE_EDGE}x{EDITOR_IMAGE_EDGE}")),
                 "{text}"
             );
-            assert!(!source.data.is_empty());
+            assert!(source.data().is_some_and(|data| !data.is_empty()));
         }
         other => panic!("remote view_image must return pixels: {other:?}"),
     }

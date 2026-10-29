@@ -5983,7 +5983,7 @@ fn lua_tool_image_reply_maps_to_image_output() {
         panic!("expected Image output, got {out:?}");
     };
     assert_eq!(source.media_type, caudra_agent::ImageMediaType::Png);
-    assert_eq!(&*source.data, "aGVsbG8=");
+    assert_eq!(source.data().map(|data| &**data), Some("aGVsbG8="));
     assert_eq!(text, "[image: test 1x1]");
 }
 
@@ -6048,7 +6048,7 @@ fn view_image_tool_returns_image_output() {
     assert!(text.contains("tiny.png"), "caption: {text}");
     assert!(text.contains("4x2"), "caption: {text}");
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&*source.data)
+        .decode(&**source.data().unwrap())
         .unwrap();
     assert_eq!(decoded, std::fs::read(&path).unwrap());
 }
@@ -6102,7 +6102,7 @@ fn view_image_downscales_oversized_png_with_honest_caption() {
     assert_eq!(source.media_type, caudra_agent::ImageMediaType::Png);
     assert!(text.contains("downscaled from 2000x100"), "caption: {text}");
 
-    let (format, w, h) = probe_output(&source.data);
+    let (format, w, h) = probe_output(source.data().unwrap());
     assert_eq!(format, image::ImageFormat::Png);
     assert_eq!(w, 1568, "long edge must land exactly on the API limit");
     assert!(h <= 79, "aspect ratio broken: {w}x{h}");
@@ -6133,7 +6133,10 @@ fn view_image_oversized_gif_reencodes_to_png_first_frame() {
     assert_eq!(source.media_type, caudra_agent::ImageMediaType::Png);
     assert!(text.contains("downscaled from 2000x8"), "caption: {text}");
     assert!(text.contains("first frame only"), "caption: {text}");
-    assert_eq!(probe_output(&source.data).0, image::ImageFormat::Png);
+    assert_eq!(
+        probe_output(source.data().unwrap()).0,
+        image::ImageFormat::Png
+    );
 }
 
 #[test]
@@ -6162,7 +6165,7 @@ fn view_image_small_gif_passes_through_unchanged() {
         "pass-through keeps animation, caption must not claim otherwise: {text}"
     );
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&*source.data)
+        .decode(&**source.data().unwrap())
         .unwrap();
     assert_eq!(
         decoded,

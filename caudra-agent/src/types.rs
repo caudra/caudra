@@ -18,6 +18,7 @@ use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::cache_warming::{CacheWarmEpisode, HitSamples};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::CaudraId;
+use caudra_storage::media::MediaStore;
 use caudra_storage::sessions::UnrecordedCall;
 use caudra_storage::token_calibration::StoredCalibration;
 use caudra_storage::tool_ledger::ToolOutcome;
@@ -2827,6 +2828,28 @@ const UNKNOWN_TOOL: &str = "unknown";
 const MODEL_SUFFIX_SEPARATOR: &str = "\n\n";
 
 impl ToolDoneEvent {
+    /// Whether the result carries an image or PDF not yet in the media store.
+    pub(crate) fn holds_unstored_media(&self) -> bool {
+        let image =
+            matches!(&self.output, ToolOutput::Image { source, .. } if source.stored().is_none());
+        image
+            || self
+                .documents
+                .iter()
+                .any(|document| document.stored.is_none() && document.data.is_some())
+    }
+
+    /// Moves the result's image and PDFs into `store`, so saving the result
+    /// writes references.
+    pub(crate) fn store_media(&mut self, store: &MediaStore) {
+        if let ToolOutput::Image { source, .. } = &mut self.output {
+            crate::media::store_image(source, store);
+        }
+        for document in &mut self.documents {
+            crate::media::store_document(document, store);
+        }
+    }
+
     pub fn error(id: String, message: impl Into<String>) -> Self {
         let message: String = message.into();
         Self {
@@ -5860,6 +5883,7 @@ mod tests {
             url: "https://example.com/paper.pdf".into(),
             filename: None,
             page_count: 3,
+            stored: None,
             data: Some(Arc::from(PDF_DATA)),
         };
         let mut fetched = ToolDoneEvent::error(FETCH_CALL.into(), "fetched");
@@ -5921,10 +5945,10 @@ mod tests {
             matches!(&msg.content[2], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t3")
         );
         assert!(
-            matches!(&msg.content[3], ContentBlock::Image { source } if &*source.data == "aGVsbG8=")
+            matches!(&msg.content[3], ContentBlock::Image { source } if source.data().is_some_and(|data| &**data == "aGVsbG8="))
         );
         assert!(
-            matches!(&msg.content[4], ContentBlock::Image { source } if &*source.data == "aW1n")
+            matches!(&msg.content[4], ContentBlock::Image { source } if source.data().is_some_and(|data| &**data == "aW1n"))
         );
         assert_eq!(msg.tool_result_image_owners, ["t1", "t3"]);
         assert!(

@@ -591,6 +591,15 @@ pub async fn run(
         DispatchResult::Completed(done, label) => (done, false, label),
         DispatchResult::ShellAdmission(done) => (done, true, None),
     };
+    if done.holds_unstored_media()
+        && let Some(store) = crate::media::store_for(ctx.tool_output_store.as_deref())
+    {
+        done = smol::unblock(move || {
+            done.store_media(&store);
+            done
+        })
+        .await;
+    }
     if let Some(Ok(repair)) = repair
         && repair.method != "unchanged"
     {

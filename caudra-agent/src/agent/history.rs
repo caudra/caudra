@@ -8,6 +8,7 @@ use caudra_providers::{
     CaudraId, ContentBlock, HistoryItem, HistoryItemKind, HistoryProjectionError, Message, Role,
     UserOrigin, expand_message, expand_message_in, project_messages,
 };
+use caudra_storage::media::{MediaHash, MediaStore};
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -320,6 +321,17 @@ impl History {
         self.messages.pop();
         self.publish();
         true
+    }
+
+    /// The references in the conversation whose bytes are not loaded.
+    pub(super) fn unloaded_media(&self) -> Vec<MediaHash> {
+        crate::media::unloaded_media(&self.messages)
+    }
+
+    /// Loads the bytes of stored images and PDFs into the conversation the
+    /// next request sends. The items keep only their references.
+    pub(super) fn load_media(&mut self, store: &MediaStore) {
+        crate::media::load_media(&mut self.messages, store);
     }
 
     pub fn into_vec(self) -> Vec<Message> {

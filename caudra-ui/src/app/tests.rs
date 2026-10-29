@@ -14516,7 +14516,7 @@ fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
         [StoredQueuedPrompt {
             mode: Some(StoredMode::Plan),
             text: QUEUED_TEXT.into(),
-            images: vec![StoredImage {
+            images: vec![StoredImage::Base64 {
                 media_type: "image/png".into(),
                 data: "aW1hZ2U=".into(),
             }],
@@ -14539,7 +14539,7 @@ fn restore_resumed_session_holds_complete_queued_prompts_and_round_trips() {
         StoredQueuedPrompt {
             mode: Some(StoredMode::Plan),
             text: "q1".into(),
-            images: vec![StoredImage {
+            images: vec![StoredImage::Base64 {
                 media_type: "image/png".into(),
                 data: "aW1hZ2U=".into(),
             }],

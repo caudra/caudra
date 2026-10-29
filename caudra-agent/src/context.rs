@@ -2099,6 +2099,7 @@ mod tests {
                 url: PDF_URL.into(),
                 filename: None,
                 page_count: PDF_PAGES,
+                stored: None,
                 data: data.map(Arc::from),
             }],
         );

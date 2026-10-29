@@ -54,7 +54,13 @@ const UNKNOWN_IMAGE_TOKENS: u32 = ((MAX_EDGE as u64 * MAX_EDGE as u64) / PIXELS_
 /// rather than the base64 length: a heavily compressed screenshot and a bloated
 /// one cost the same to send.
 pub(crate) fn token_estimate(source: &ImageSource) -> u32 {
-    let base64 = source.data.as_bytes();
+    if let Some((width, height)) = source.dimensions() {
+        return pixel_tokens(width, height);
+    }
+    let Some(base64) = source.data() else {
+        return UNKNOWN_IMAGE_TOKENS;
+    };
+    let base64 = base64.as_bytes();
     // Whole 4-character groups only; a partial group is not decodable, and the
     // header sits far enough forward that dropping a few bytes cannot matter.
     let prefix = &base64[..base64.len().min(HEADER_PROBE_BYTES) / 4 * 4];
@@ -62,12 +68,14 @@ pub(crate) fn token_estimate(source: &ImageSource) -> u32 {
         return UNKNOWN_IMAGE_TOKENS;
     };
     match probe(&bytes) {
-        Ok((_, width, height)) => {
-            let tokens = u64::from(width) * u64::from(height) / PIXELS_PER_TOKEN;
-            u32::try_from(tokens).unwrap_or(u32::MAX).max(1)
-        }
+        Ok((_, width, height)) => pixel_tokens(width, height),
         Err(_) => UNKNOWN_IMAGE_TOKENS,
     }
+}
+
+fn pixel_tokens(width: u32, height: u32) -> u32 {
+    let tokens = u64::from(width) * u64::from(height) / PIXELS_PER_TOKEN;
+    u32::try_from(tokens).unwrap_or(u32::MAX).max(1)
 }
 
 #[derive(Debug)]
@@ -379,10 +387,7 @@ pub(crate) fn unresolved_remote_permission_resource(
 }
 
 fn source(media_type: ImageMediaType, bytes: &[u8]) -> ImageSource {
-    ImageSource {
-        media_type,
-        data: BASE64.encode(bytes).into(),
-    }
+    ImageSource::new(media_type, BASE64.encode(bytes).into())
 }
 
 fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32), String> {
@@ -490,10 +495,7 @@ mod tests {
     /// A payload that will not parse must be charged, not waved through.
     #[test]
     fn an_unreadable_image_is_charged_the_fallback() {
-        let source = ImageSource {
-            media_type: ImageMediaType::Png,
-            data: "not base64 at all!!".into(),
-        };
+        let source = ImageSource::new(ImageMediaType::Png, "not base64 at all!!".into());
         assert_eq!(token_estimate(&source), UNKNOWN_IMAGE_TOKENS);
     }
 

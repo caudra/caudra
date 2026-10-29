@@ -363,7 +363,7 @@ mod tests {
         let mut multi = entry("a", "one\ntwo\nthree");
         assert_eq!(suffix(&multi).as_deref(), Some("+2 lines"));
 
-        multi.images.push(StoredImage {
+        multi.images.push(StoredImage::Base64 {
             media_type: "image/png".into(),
             data: "AAAA".into(),
         });

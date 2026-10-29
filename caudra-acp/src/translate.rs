@@ -16,10 +16,12 @@ use caudra_agent::types::{
 };
 use caudra_agent::{DoneReason, History};
 use caudra_providers::{
-    CaudraId, ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole, TokenUsage,
-    add_cost,
+    CaudraId, ContentBlock as MsgBlock, ImageMediaType, ImageSource, Message, Role as MsgRole,
+    TokenUsage, add_cost,
 };
+use caudra_storage::media::MediaStore;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::turn::{META_USAGE, PromptIdentity};
 
@@ -589,12 +591,14 @@ pub fn replay_history(
     history: &History,
     cwd: &Path,
     home: Option<&Path>,
+    media: Option<&MediaStore>,
 ) -> Vec<SessionUpdate> {
     let ids = message_ids(history);
     let mut replay = Replay {
         registry,
         cwd,
         home,
+        media,
         names: HashMap::new(),
         updates: Vec::new(),
     };
@@ -615,12 +619,29 @@ struct Replay<'a> {
     registry: &'a ToolRegistry,
     cwd: &'a Path,
     home: Option<&'a Path>,
+    /// Where the images a restored session references are read back from,
+    /// since the protocol carries them inline.
+    media: Option<&'a MediaStore>,
     /// The tool each replayed call ran, which its result names again.
     names: HashMap<&'a str, &'a str>,
     updates: Vec<SessionUpdate>,
 }
 
 impl<'a> Replay<'a> {
+    fn image_data(&self, source: &ImageSource) -> Option<Arc<str>> {
+        if let Some(data) = source.data() {
+            return Some(Arc::clone(data));
+        }
+        let (store, stored) = (self.media?, source.stored()?);
+        store
+            .base64(&stored.sha256)
+            .inspect_err(
+                |error| warn!(sha256 = %stored.sha256, %error, "replayed image unreadable"),
+            )
+            .ok()
+            .flatten()
+    }
+
     fn user(&mut self, msg: &'a Message, id: &str) {
         if msg.is_observation() {
             return;
@@ -644,13 +665,15 @@ impl<'a> Replay<'a> {
                         .push(replay_tool_result(tool_use_id, name, content, *is_error));
                 }
                 MsgBlock::Image { source } => {
-                    self.updates.push(SessionUpdate::UserMessageChunk(chunk(
-                        ContentBlock::Image(ImageContent::new(
-                            source.data.to_string(),
+                    let block = match self.image_data(source) {
+                        Some(data) => ContentBlock::Image(ImageContent::new(
+                            data.to_string(),
                             mime_type(&source.media_type),
                         )),
-                        id,
-                    )));
+                        None => ContentBlock::Text(TextContent::new(source.unavailable_note())),
+                    };
+                    self.updates
+                        .push(SessionUpdate::UserMessageChunk(chunk(block, id)));
                 }
                 _ => {}
             }
@@ -783,6 +806,7 @@ mod tests {
             &History::new(messages.to_vec()),
             Path::new(CWD),
             Some(Path::new(HOME)),
+            None,
         )
         .iter()
         .map(|u| serde_json::to_value(u).unwrap())
@@ -880,10 +904,10 @@ mod tests {
     fn replay_user_image_keeps_mime_type() {
         let msg = Message::user_with_images(
             String::new(),
-            vec![ImageSource {
-                media_type: ImageMediaType::Png,
-                data: std::sync::Arc::from("b64data"),
-            }],
+            vec![ImageSource::new(
+                ImageMediaType::Png,
+                std::sync::Arc::from("b64data"),
+            )],
         );
         let json = updates_json(&[msg]);
         assert_eq!(json.len(), 1);
@@ -1452,11 +1476,16 @@ mod tests {
         ));
         let history = History::restored(items).unwrap();
 
-        let ids: Vec<Value> =
-            replay_history(&ToolRegistry::default(), &history, Path::new(CWD), None)
-                .into_iter()
-                .map(|update| serde_json::to_value(update).unwrap()["messageId"].clone())
-                .collect();
+        let ids: Vec<Value> = replay_history(
+            &ToolRegistry::default(),
+            &history,
+            Path::new(CWD),
+            None,
+            None,
+        )
+        .into_iter()
+        .map(|update| serde_json::to_value(update).unwrap()["messageId"].clone())
+        .collect();
 
         assert_eq!(
             ids,

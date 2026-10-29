@@ -163,7 +163,7 @@ mod tests {
             .push(StashDraft {
                 text: "look at PASTED here".into(),
                 paste_ranges: vec![StoredPasteRange { start: 8, end: 14 }],
-                images: vec![StoredImage {
+                images: vec![StoredImage::Base64 {
                     media_type: "image/png".into(),
                     data: "AAAA".into(),
                 }],
@@ -177,7 +177,7 @@ mod tests {
             vec![StoredPasteRange { start: 8, end: 14 }]
         );
         assert_eq!(entry.images.len(), 1);
-        assert_eq!(entry.images[0].media_type, "image/png");
+        assert_eq!(entry.images[0].media_type(), "image/png");
         assert_eq!(entry.cwd, CWD);
     }
 

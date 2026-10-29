@@ -26,7 +26,7 @@ use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{AutopilotConfig, ModelPolicy, SnapshotsConfig};
 use caudra_lua::EventHandle;
 use caudra_providers::model::Model;
-use caudra_providers::{Billing, TokenUsage, add_cost};
+use caudra_providers::{Billing, TokenUsage, add_cost, with_inline_images};
 use caudra_storage::autopilot::{AutopilotBudget, AutopilotEnd};
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::PermissionMode;
@@ -742,7 +742,7 @@ pub fn run(
             }
             AgentEvent::ToolResultsSubmitted { message } => {
                 if let Some(out) = &mut verbose_out {
-                    let content_value = serde_json::to_value(&message.content)?;
+                    let content_value = serde_json::to_value(with_inline_images(&message.content))?;
                     out.emit(&UserEvent {
                         event_type: "user",
                         message: UserMessage {

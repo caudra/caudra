@@ -905,10 +905,10 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>)
             ContentBlock::Text(TextContent { text: t, .. }) => append(&mut text, t),
             ContentBlock::Image(ImageContent {
                 data, mime_type, ..
-            }) => images.push(ImageSource {
-                media_type: image_media_type(mime_type),
-                data: Arc::from(data.as_str()),
-            }),
+            }) => images.push(ImageSource::new(
+                image_media_type(mime_type),
+                Arc::from(data.as_str()),
+            )),
             ContentBlock::Resource(res) => {
                 if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
                     append(&mut text, &format!("--- {} ---\n{}", trc.uri, trc.text));
@@ -1234,11 +1234,16 @@ mod tests {
             ..Default::default()
         };
         let history = History::restored(expand_message_in(&message, None, id)).unwrap();
-        let replayed: Vec<Value> =
-            translate::replay_history(&ToolRegistry::default(), &history, Path::new(""), None)
-                .into_iter()
-                .map(|update| serde_json::to_value(update).unwrap())
-                .collect();
+        let replayed: Vec<Value> = translate::replay_history(
+            &ToolRegistry::default(),
+            &history,
+            Path::new(""),
+            None,
+            None,
+        )
+        .into_iter()
+        .map(|update| serde_json::to_value(update).unwrap())
+        .collect();
 
         let live = chunks(live.iter().map(|frame| &frame["params"]["update"]));
         assert!(!live.is_empty());

@@ -566,12 +566,15 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }));
                 }
                 ContentBlock::Image { source } => {
-                    let part = json!({
-                        "inlineData": {
-                            "mimeType": source.media_type.mime(),
-                            "data": source.data,
-                        }
-                    });
+                    let part = match source.data() {
+                        Some(data) => json!({
+                            "inlineData": {
+                                "mimeType": source.media_type.mime(),
+                                "data": data,
+                            }
+                        }),
+                        None => json!({"text": source.unavailable_note()}),
+                    };
                     if has_tool_results {
                         image_parts.push(part);
                     } else {
@@ -854,8 +857,8 @@ mod tests {
     use super::*;
     use crate::providers::test_support::{
         CREDENTIAL_IN_URL, PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin,
-        peer_message_origin, task_event_origin, task_observation_with_output_refs,
-        workflow_event_origin,
+        pasted_image, peer_message_origin, restored, task_event_origin,
+        task_observation_with_output_refs, unavailable_note, workflow_event_origin,
     };
     use crate::{ReasoningOptions, StandingReminderKind, SteeringKind};
     use std::sync::Arc;
@@ -1381,6 +1384,25 @@ mod tests {
         assert!(result[0]["parts"].as_array().unwrap().len() == 1);
         assert_eq!(result[1]["role"], "user");
         assert_eq!(result[1]["parts"][0]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn a_restored_image_reaches_the_wire_as_it_was_pasted() {
+        let media = restored(pasted_image());
+        assert_eq!(
+            convert_messages(&media.restored),
+            convert_messages(&media.live)
+        );
+    }
+
+    #[test]
+    fn an_image_whose_file_is_gone_reaches_the_wire_as_a_note() {
+        let media = restored(pasted_image());
+        let note = unavailable_note(&media.missing);
+        assert_eq!(
+            convert_messages(&media.missing)[0]["parts"][0],
+            json!({"text": note})
+        );
     }
 
     #[test]

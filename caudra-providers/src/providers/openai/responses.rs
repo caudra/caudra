@@ -139,10 +139,16 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                             }));
                         }
                         ContentBlock::Image { source } => {
+                            let part = match source.to_data_url() {
+                                Some(url) => json!({"type": "input_image", "image_url": url}),
+                                None => {
+                                    json!({"type": "input_text", "text": source.unavailable_note()})
+                                }
+                            };
                             input.push(json!({
                                 "type": "message",
                                 "role": "user",
-                                "content": [{"type": "input_image", "image_url": source.to_data_url()}]
+                                "content": [part]
                             }));
                         }
                         ContentBlock::ToolResult {
@@ -943,8 +949,9 @@ mod tests {
     use crate::invalid_tool_input;
     use crate::providers::test_support::{
         DOCUMENT_DATA, DOCUMENT_NAME, DOCUMENT_RESULT, PEER_ATTACK, PEER_TEXT, assert_peer_framing,
-        automation_event_origin, document, fetched_document, peer_message_origin,
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        automation_event_origin, document, fetch_exchange, fetched_document, pasted_image,
+        peer_message_origin, restored, task_event_origin, task_observation_with_output_refs,
+        unavailable_note, workflow_event_origin,
     };
     use crate::{PDF_DATA_URL_PREFIX, StandingReminderKind, SteeringKind};
     use futures_lite::io::Cursor;
@@ -1116,6 +1123,32 @@ mod tests {
     fn a_pdf_travels_inside_its_function_output(data: Option<&str>, expected: Value) {
         let wire = convert_input(&[fetched_document(document(data))]);
         assert_eq!(wire[0]["output"], expected);
+    }
+
+    #[test_case(pasted_image() ; "a_pasted_image")]
+    #[test_case(fetch_exchange(document(Some(DOCUMENT_DATA))) ; "a_fetched_pdf")]
+    fn restored_media_reaches_the_wire_as_it_left_the_live_session(live: Vec<Message>) {
+        let media = restored(live);
+        assert_eq!(convert_input(&media.restored), convert_input(&media.live));
+    }
+
+    #[test]
+    fn an_image_whose_file_is_gone_reaches_the_wire_as_a_note() {
+        let media = restored(pasted_image());
+        let note = unavailable_note(&media.missing);
+        assert_eq!(
+            convert_input(&media.missing)[0]["content"][0],
+            json!({"type": "input_text", "text": note})
+        );
+    }
+
+    #[test]
+    fn a_pdf_whose_file_is_gone_reaches_the_wire_without_bytes() {
+        let media = restored(fetch_exchange(document(Some(DOCUMENT_DATA))));
+        assert_eq!(
+            convert_input(&media.missing),
+            convert_input(&fetch_exchange(document(None)))
+        );
     }
 
     #[test_case("{broken", false ; "malformed_delta")]

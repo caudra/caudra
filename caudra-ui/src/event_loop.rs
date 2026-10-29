@@ -5748,10 +5748,7 @@ fn install_fork_draft(session: &mut AppSession, draft: ForkDraft) {
     session.meta.input_draft_images = draft
         .images
         .into_iter()
-        .map(|image| StoredImage {
-            media_type: image.media_type.mime().into(),
-            data: image.data.to_string(),
-        })
+        .map(|image| StoredImage::from(&image))
         .collect();
 }
 
@@ -6615,8 +6612,7 @@ mod tests {
         assert!(session_has_content(&session, StoredMode::Plan));
         assert_eq!(session.meta.input_draft.as_deref(), Some("edit me"));
         assert_eq!(session.meta.input_draft_images.len(), 1);
-        assert_eq!(session.meta.input_draft_images[0].media_type, "image/png");
-        assert_eq!(session.meta.input_draft_images[0].data, image.data.as_ref());
+        assert_eq!(session.meta.input_draft_images, [StoredImage::from(&image)]);
         assert!(session.messages().is_empty());
     }
 

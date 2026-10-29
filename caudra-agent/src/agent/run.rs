@@ -107,6 +107,7 @@ use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
 use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::media::MediaStore;
 use caudra_storage::now_epoch;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -1288,10 +1289,14 @@ impl<'h> Agent<'h> {
         }
         self.push_arrivals(arrivals);
 
+        let media = self.media_store();
         let mut telemetry = Vec::with_capacity(inputs.len());
-        for input in inputs {
+        for mut input in inputs {
             if input.message.trim().is_empty() && input.images.is_empty() {
                 continue;
+            }
+            if let Some(store) = &media {
+                input.images = crate::media::stored_images(input.images, store.clone()).await;
             }
             telemetry.push(input.message.clone());
             let message = if queued {
@@ -1313,6 +1318,9 @@ impl<'h> Agent<'h> {
             && let Some(autopilot) = self.main_autopilot()
         {
             autopilot.human_input();
+        }
+        if let Some(store) = media {
+            standing = crate::media::stored_message_images(standing, store).await;
         }
         for message in standing {
             self.push_injected(message);
@@ -2323,6 +2331,24 @@ impl<'h> Agent<'h> {
         self.tools = definitions.declared;
     }
 
+    fn media_store(&self) -> Option<MediaStore> {
+        crate::media::store_for(self.tool_output_store.as_deref())
+    }
+
+    /// Loads what a restored session holds only references to, once, so the
+    /// request about to go out carries the bytes.
+    async fn load_history_media(&mut self) {
+        let Some(store) = self.media_store() else {
+            return;
+        };
+        let unloaded = self.history.unloaded_media();
+        if unloaded.is_empty() {
+            return;
+        }
+        crate::media::warm(&store, unloaded).await;
+        self.history.load_media(&store);
+    }
+
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
         provider_projection::project_request(
             self.history.as_slice(),
@@ -2471,6 +2497,7 @@ impl<'h> Agent<'h> {
             model: source.spec(),
             thinking: source.thinking,
         })?;
+        self.load_history_media().await;
         let (stream_result, warm, prefix, sent) = {
             let tools = &self.tools;
             repair_state.register_definitions(tools);

@@ -832,6 +832,7 @@ mod tests {
                         url: PATTERN.into(),
                         filename: None,
                         page_count: self.0,
+                        stored: None,
                         data: Some(Arc::from(BODY)),
                     },
                 ])

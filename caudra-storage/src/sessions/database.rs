@@ -53,6 +53,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tracing::{field, warn};
 
+#[path = "media_payloads.rs"]
+mod media_payloads;
 #[path = "source_code_rename.rs"]
 mod source_code_rename;
 
@@ -95,7 +97,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 43;
+const SCHEMA_VERSION: i64 = 44;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -964,6 +966,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 42,
         to: 43,
         sql: crate::shell_runs::HOST_COLUMN,
+    },
+    Migration {
+        from: 43,
+        to: media_payloads::MEDIA_SCHEMA,
+        sql: "",
     },
 ];
 
@@ -6193,6 +6200,9 @@ fn migrate_to_current(
         if step.to == 41 {
             crate::tool_outputs::import_legacy_outputs(&transaction, state_dir)?;
         }
+        if step.to == media_payloads::MEDIA_SCHEMA {
+            media_payloads::store_inline_images(&transaction, state_dir)?;
+        }
         transaction.pragma_update(None, "user_version", step.to)?;
         MIGRATION.report(MigrationEvent::Phase {
             label: COMMIT_PHASE,
@@ -6479,13 +6489,7 @@ fn validate_scalars<M, U, T>(session: &Session<M, U, T>) -> Result<(), SessionEr
         .input_draft_images
         .iter()
         .try_fold(0usize, |total, image| {
-            let decoded = image
-                .data
-                .len()
-                .checked_add(3)
-                .and_then(|length| length.checked_div(4))
-                .and_then(|groups| groups.checked_mul(3))?;
-            total.checked_add(decoded)
+            total.checked_add(usize::try_from(image.decoded_bytes()).ok()?)
         })
         .unwrap_or(usize::MAX);
     validate_len(

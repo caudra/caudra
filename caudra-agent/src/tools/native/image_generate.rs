@@ -1040,7 +1040,7 @@ mod tests {
 
         assert_eq!(sources.len(), 2);
         assert!(sources.iter().all(|s| s.media_type == ImageMediaType::Png));
-        assert_ne!(sources[0].data, sources[1].data);
+        assert_ne!(sources[0].data(), sources[1].data());
     }
 
     #[test]

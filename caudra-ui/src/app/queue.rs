@@ -9,7 +9,7 @@ use caudra_agent::autopilot::ActionName;
 use caudra_agent::{AgentInput, AgentMode};
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
 use caudra_automation::event::StartedBy;
-use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
+use caudra_providers::{HistoryItemKind, ImageSource};
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{StoredPromptAdmission, StoredQueuedPrompt};
 
@@ -1839,14 +1839,9 @@ fn stored_pending_prompt(
             .images
             .iter()
             .filter_map(|image| {
-                let Some(media_type) = ImageMediaType::from_mime(&image.media_type) else {
-                    tracing::warn!(
-                        media_type = %image.media_type,
-                        "skipping stored queued image"
-                    );
-                    return None;
-                };
-                Some(ImageSource::new(media_type, image.data.clone().into()))
+                ImageSource::try_from(image.clone())
+                    .inspect_err(|error| tracing::warn!(%error, "skipping stored queued image"))
+                    .ok()
             })
             .collect(),
         paste_ranges: prompt
