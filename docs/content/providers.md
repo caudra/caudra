@@ -359,7 +359,7 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API
+- **Features**: Models from the bundled catalog, including Opencode Zen
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
@@ -407,7 +407,7 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+- **Features**: Models from the bundled catalog, including Opencode Go
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 

@@ -445,10 +445,9 @@ fn write_update_check_section(out: &mut String) {
          and it asks GitHub instead of reading the cache, so a release published \
          since the last check shows at once. Its answer refreshes the cache for \
          later starts. An empty value leaves the config in effect. A normal run \
-         still contacts your model provider, fetches the public \
-         [models.dev](https://models.dev/) model catalog when the cached copy \
-         is more than a day old, and sends web searches to Exa when the agent \
-         uses `websearch`.\n"
+         still contacts your model provider and sends web searches to Exa when \
+         the agent uses `websearch`. Model catalog lookups use the bundled \
+         snapshot and do not contact models.dev.\n"
     )
     .unwrap();
     writeln!(out, "### `ui.update_channel`\n").unwrap();

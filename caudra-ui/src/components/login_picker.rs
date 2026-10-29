@@ -16,7 +16,7 @@ use caudra_config::providers::{
 };
 use caudra_grab::grab_scope;
 use caudra_providers::accounts::{LoginCredential, save_login};
-use caudra_providers::catalog_providers_if_available;
+use caudra_providers::catalog_providers;
 use caudra_providers::copilot_auth::{self, CopilotIdentity};
 use caudra_storage::StateDir;
 use caudra_storage::accounts::{
@@ -39,7 +39,6 @@ use crate::components::{
 use crate::theme;
 
 const TITLE: &str = " Login ";
-const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
 const CATALOG_SECTION: &str = "Providers from Models.dev";
 const DECISION_SECTION: &str = "Decision models";
 const CUSTOM_DECISION_LABEL: &str = "Custom decision endpoint...";
@@ -506,30 +505,19 @@ impl LoginPicker {
 
         items.extend(decision_items(&config, &storage));
 
-        if let Some(catalog) = catalog_providers_if_available() {
-            let state_dir = StateDir::resolve().ok();
-            for cat in catalog {
-                let stored_auth = state_dir
-                    .as_ref()
-                    .and_then(|s| cat.load_key_from_storage(s))
-                    .map(|_| ProviderAuthKind::ApiKey);
-                let has_env = cat.env_key_set().is_some();
-                items.push(ProviderItem {
-                    slug: cat.slug.clone(),
-                    display_name: cat.display_name.clone(),
-                    stored_auth,
-                    has_env,
-                    configured: false,
-                    section: Some(CATALOG_SECTION),
-                    kind: ItemKind::Chat,
-                });
-            }
-        } else {
+        let catalog = catalog_providers();
+        let state_dir = StateDir::resolve().ok();
+        for cat in catalog {
+            let stored_auth = state_dir
+                .as_ref()
+                .and_then(|s| cat.load_key_from_storage(s))
+                .map(|_| ProviderAuthKind::ApiKey);
+            let has_env = cat.env_key_set().is_some();
             items.push(ProviderItem {
-                slug: CATALOG_UNAVAILABLE_SLUG.to_string(),
-                display_name: "Models.dev providers (not yet downloaded)".to_string(),
-                stored_auth: None,
-                has_env: false,
+                slug: cat.slug.clone(),
+                display_name: cat.display_name.clone(),
+                stored_auth,
+                has_env,
                 configured: false,
                 section: Some(CATALOG_SECTION),
                 kind: ItemKind::Chat,
@@ -903,8 +891,6 @@ impl LoginPicker {
                     StepAction::GoEnterKey(KeyTarget::Decision(draft))
                 } else if matches!(item.kind, ItemKind::CustomDecision) {
                     StepAction::GoDecisionName
-                } else if item.slug == CATALOG_UNAVAILABLE_SLUG {
-                    StepAction::None
                 } else if item.slug == "custom" {
                     StepAction::GoCustomName
                 } else {

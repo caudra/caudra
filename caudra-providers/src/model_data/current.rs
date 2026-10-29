@@ -1,19 +1,17 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use caudra_models::Snapshot;
 use jiff::Timestamp;
 
 use crate::decision_pricing::DecisionModelEntry;
 use crate::manifest::ProviderManifest;
+use crate::providers::catalog::CatalogData;
 
 use super::{bundled, convert};
 
-static CURRENT: LazyLock<RwLock<&'static Current>> = LazyLock::new(|| {
-    RwLock::new(Box::leak(Box::new(Current::from_snapshot(
-        bundled::snapshot(),
-    ))))
-});
+static CURRENT: LazyLock<RwLock<Arc<Current>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(Current::from_snapshot(bundled::snapshot()))));
 
 pub struct Current {
     pub revision: u64,
@@ -21,6 +19,7 @@ pub struct Current {
     pub content_sha256: String,
     pub manifests: &'static [ProviderManifest],
     pub decision_models: &'static [DecisionModelEntry],
+    pub(crate) catalog: CatalogData,
     pub(crate) unsupported_providers: HashMap<String, &'static str>,
 }
 
@@ -33,34 +32,41 @@ impl Current {
             content_sha256: snapshot.content_sha256,
             manifests,
             decision_models: convert::decisions(snapshot.payload.decision_models),
+            catalog: convert::catalog(snapshot.payload.catalog),
             unsupported_providers,
         }
     }
 }
 
-pub fn current() -> &'static Current {
-    *CURRENT
+pub fn current() -> Arc<Current> {
+    CURRENT
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[allow(
     dead_code,
     reason = "snapshot installation is wired to refresh in a later unit"
 )]
-pub(crate) fn install(mut next: Current) {
+pub(crate) fn install(snapshot: Snapshot) {
     let mut current = CURRENT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if snapshot.content_sha256 == current.content_sha256 {
+        return;
+    }
+    let mut next = Current::from_snapshot(snapshot);
     next.revision = current.revision + 1;
-    *current = Box::leak(Box::new(next));
+    *current = Arc::new(next);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use caudra_config::decisions::DecisionProtocol;
     use caudra_models::{self as wire, Payload, Snapshot};
-    use caudra_storage::StateDir;
     use test_case::test_case;
 
     use super::{Current, current};
@@ -68,7 +74,7 @@ mod tests {
     use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelError, ModelPurpose, TokenUsage, lookup_entry};
     use crate::model_data::{bundled, install};
-    use crate::providers::catalog::seed_catalog_for_tests;
+    use crate::providers::catalog::{catalog_provider, model_ids, model_meta};
 
     const NOW: &str = "2026-10-29T12:00:00Z";
     const LATER: &str = "2026-10-30T12:00:00Z";
@@ -82,6 +88,11 @@ mod tests {
     const UPGRADE_MESSAGE: &str = "Upgrade Caudra to use this model.";
     const UPDATED_NAME: &str = "Updated provider";
     const UPDATED_PRICE: f64 = 7.0;
+    const UPDATED_CONTEXT: u32 = 96_000;
+    const CATALOG_PROVIDER: &str = "catalog-test";
+    const CATALOG_MODEL: &str = "catalog-model";
+    const CATALOG_KEY_ENV: &str = "CAUDRA_SNAPSHOT_TEST_KEY";
+    const CATALOG_API: &str = "https://snapshot.example/v1";
     const MILLION: u32 = 1_000_000;
     const CATALOG: &str = r#"{
         "future-provider": {
@@ -117,11 +128,11 @@ mod tests {
         )
     }
 
-    fn converted(payload: Payload) -> Current {
+    fn validated(payload: Payload) -> Snapshot {
         let snapshot = Snapshot::stamp(payload, None, NOW.parse().unwrap());
         let snapshot = wire::parse_bounded(&wire::to_pretty_bytes(&snapshot)).unwrap();
         wire::validate(&snapshot).unwrap();
-        Current::from_snapshot(snapshot)
+        snapshot
     }
 
     #[test_case(false, FAMILY_REASON; "unknown_family")]
@@ -137,7 +148,7 @@ mod tests {
         } else {
             entry.family = wire::Family::Unknown(FUTURE.to_owned());
         }
-        install(converted(payload));
+        install(validated(payload));
         let manifest = ManifestRegistry::get(PROVIDER).unwrap();
         assert_eq!(
             manifest
@@ -183,14 +194,11 @@ mod tests {
     #[test_case(false; "unknown_family")]
     #[test_case(true; "unknown_requirement")]
     fn unsupported_provider_is_dropped_without_losing_other_providers(requirement: bool) {
-        let state = tempfile::tempdir().unwrap();
-        seed_catalog_for_tests(
-            serde_json::from_str(CATALOG).unwrap(),
-            StateDir::from_path(state.path().to_owned()),
-        );
+        let mut payload = snapshot().payload;
+        payload.catalog = serde_json::from_str(CATALOG).unwrap();
+        install(validated(payload.clone()));
         let spec = format!("{DROPPED_PROVIDER}/{BROAD}");
         assert!(Model::from_spec(&spec).is_ok());
-        let mut payload = snapshot().payload;
         let mut provider = payload.providers[0].clone();
         provider.slug = DROPPED_PROVIDER.to_owned();
         if requirement {
@@ -199,7 +207,7 @@ mod tests {
             provider.family = wire::Family::Unknown(FUTURE.to_owned());
         }
         payload.providers.insert(0, provider);
-        install(converted(payload));
+        install(validated(payload));
         assert!(ManifestRegistry::get(DROPPED_PROVIDER).is_none());
         assert!(ManifestRegistry::for_slug(DROPPED_PROVIDER).is_none());
         let reason = if requirement {
@@ -244,7 +252,11 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.payload.providers[0].models[0].prefixes =
             prefixes.iter().map(|prefix| (*prefix).to_owned()).collect();
-        install(Current::from_snapshot(snapshot));
+        install(Snapshot::stamp(
+            snapshot.payload,
+            None,
+            NOW.parse().unwrap(),
+        ));
         assert!(ManifestRegistry::get(PROVIDER).is_none());
         assert!(Model::curated_default(PROVIDER, ModelPurpose::Best).is_none());
     }
@@ -255,9 +267,29 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.payload.providers[0].display_name = UPDATED_NAME.to_owned();
         snapshot.payload.decision_models[0].pricing.input = UPDATED_PRICE;
+        snapshot.payload.catalog.insert(
+            CATALOG_PROVIDER.to_owned(),
+            wire::CatalogProvider {
+                name: UPDATED_NAME.to_owned(),
+                env: vec![CATALOG_KEY_ENV.to_owned()],
+                npm: "@ai-sdk/openai-compatible".to_owned(),
+                api: Some(CATALOG_API.to_owned()),
+                models: [(
+                    CATALOG_MODEL.to_owned(),
+                    wire::CatalogModel {
+                        limit: Some(wire::CatalogLimits {
+                            context: Some(UPDATED_CONTEXT),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+            },
+        );
         snapshot = Snapshot::stamp(snapshot.payload, None, LATER.parse().unwrap());
         let expected_hash = snapshot.content_sha256.clone();
-        install(Current::from_snapshot(snapshot));
+        install(snapshot);
         assert_eq!(current().revision, previous.revision + 1);
         assert_eq!(current().snapshot_updated_at, LATER.parse().unwrap());
         assert_eq!(current().content_sha256, expected_hash);
@@ -271,6 +303,21 @@ mod tests {
         );
         assert_eq!(ManifestRegistry::builtins()[0].display_name, UPDATED_NAME);
         assert_eq!(decision_pricing::entries()[0].pricing.input, UPDATED_PRICE);
+        let catalog = catalog_provider(CATALOG_PROVIDER).unwrap();
+        assert_eq!(catalog.display_name, UPDATED_NAME);
+        assert_eq!(catalog.env_keys, [CATALOG_KEY_ENV]);
+        assert_eq!(catalog.base_url.as_deref(), Some(CATALOG_API));
+        assert_eq!(model_ids(CATALOG_PROVIDER), [CATALOG_MODEL]);
+        assert_eq!(
+            model_meta(CATALOG_PROVIDER, CATALOG_MODEL).unwrap().context,
+            UPDATED_CONTEXT
+        );
+        assert_eq!(
+            Model::from_spec(&format!("{CATALOG_PROVIDER}/{CATALOG_MODEL}"))
+                .unwrap()
+                .context_window,
+            UPDATED_CONTEXT
+        );
         assert_eq!(
             decision_pricing::decision_cost(
                 &DecisionProtocol::OpenAI,
@@ -282,8 +329,32 @@ mod tests {
             ),
             Some(UPDATED_PRICE)
         );
-        install(Current::from_snapshot(bundled::snapshot()));
+        install(bundled::snapshot());
         assert_eq!(current().revision, previous.revision + 2);
         assert_eq!(previous.manifests, current().manifests);
+        assert!(catalog_provider(CATALOG_PROVIDER).is_none());
+        assert!(model_meta(CATALOG_PROVIDER, CATALOG_MODEL).is_none());
+    }
+
+    #[test_case(NOW; "same_timestamp")]
+    #[test_case(LATER; "newer_timestamp_same_content")]
+    fn identical_content_keeps_the_existing_snapshot(at: &str) {
+        let snapshot = snapshot();
+        install(snapshot.clone());
+        let previous = current();
+        install(Snapshot::stamp(snapshot.payload, None, at.parse().unwrap()));
+        assert!(Arc::ptr_eq(&previous, &current()));
+        assert_eq!(current().revision, previous.revision);
+        assert_eq!(current().snapshot_updated_at, NOW.parse().unwrap());
+    }
+
+    #[test]
+    fn install_releases_the_previous_catalog_after_its_last_reader() {
+        let previous = current();
+        let weak = Arc::downgrade(&previous);
+        install(snapshot());
+        assert!(weak.upgrade().is_some());
+        drop(previous);
+        assert!(weak.upgrade().is_none());
     }
 }

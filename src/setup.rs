@@ -6,7 +6,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use caudra_providers::manifest::ManifestRegistry;
-use caudra_providers::model::{Model, ModelError, ModelPurpose};
+use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{PROVIDER_PRIORITY, signed_in_defaults};
 use caudra_providers::{HistoryItem, active_history_items, resolve_history_head};
 use caudra_storage::StateDir;
@@ -78,11 +78,11 @@ pub fn resolve_model(
                 "model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid --model spec");
+        return Model::from_spec(spec).context("invalid --model spec");
     }
     if let Some(spec) = read_model(storage, mode) {
         if policy.allows(&spec)
-            && let Ok(m) = from_spec_or_warm_catalog(&spec)
+            && let Ok(m) = Model::from_spec(&spec)
         {
             return Ok(m);
         }
@@ -97,7 +97,7 @@ pub fn resolve_model(
                 "default model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
+        return Model::from_spec(spec).context("invalid default_model in config");
     }
     auto_detect_model(policy).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
@@ -109,19 +109,6 @@ pub fn resolve_model(
             "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `caudra auth login`, or use -m to specify a model{policy_note}\n\nSee https://caudra.ai/docs/providers/ for setup instructions"
         )
     })
-}
-
-/// An unknown slug may just mean the models.dev catalog has not been loaded
-/// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
-/// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
-    match Model::from_spec(spec) {
-        Err(ModelError::UnsupportedProvider(_)) => {
-            caudra_providers::warm_catalog();
-            Model::from_spec(spec)
-        }
-        result => result,
-    }
 }
 
 /// The model an ACP server opens on before any provider is signed in, so an

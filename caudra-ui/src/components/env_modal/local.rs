@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use caudra_config::interpolation::holds_reference;
 use caudra_config::shell_env::GlobalShellEnvFile;
 use caudra_config::{EnvSource, env_source, shell_visible_environment};
-use caudra_providers::catalog_providers_if_available;
+use caudra_providers::catalog_providers;
 use caudra_terminal_host::PANE_ENVIRONMENT;
 use workcell_tool_contract::shell_env::{
     BASE_ALLOWLIST, EnvPattern, is_shell_startup_variable, is_valid_variable_name, looks_secret,
@@ -75,9 +75,8 @@ impl LocalEnvironment {
             let value = value.to_string_lossy().into_owned();
             variables.insert(name, HostVariable { value, source });
         }
-        let credentials = catalog_providers_if_available()
+        let credentials = catalog_providers()
             .into_iter()
-            .flatten()
             .flat_map(|provider| provider.env_keys)
             .collect();
         Self {

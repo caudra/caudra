@@ -222,26 +222,6 @@ pub fn resolve_purpose_model(
         default_model,
         chat_model,
         model_policy,
-        Model::resolve_binding,
-    )
-}
-
-pub(crate) fn resolve_purpose_model_for_inspection(
-    purpose: ModelPurpose,
-    binding_override: Option<&Binding>,
-    default_model: &Model,
-    chat_model: &Model,
-    model_policy: &ModelPolicy,
-) -> Result<Model, ModelError> {
-    let binding = model_registry::binding(purpose);
-    resolve_captured_purpose_model(
-        purpose,
-        binding_override,
-        binding.as_ref(),
-        default_model,
-        chat_model,
-        model_policy,
-        Model::resolve_binding_if_available,
     )
 }
 
@@ -252,17 +232,11 @@ fn resolve_captured_purpose_model(
     default_model: &Model,
     chat_model: &Model,
     model_policy: &ModelPolicy,
-    resolve: impl FnOnce(
-        ModelPurpose,
-        Option<&Binding>,
-        &Model,
-        &ModelPolicy,
-    ) -> Result<Model, ModelError>,
 ) -> Result<Model, ModelError> {
     let binding = binding_override.or(purpose_binding);
     match binding {
-        Some(binding) => resolve(purpose, Some(binding), chat_model, model_policy),
-        None => resolve(purpose, None, default_model, model_policy),
+        Some(binding) => Model::resolve_binding(purpose, Some(binding), chat_model, model_policy),
+        None => Model::resolve_binding(purpose, None, default_model, model_policy),
     }
 }
 
@@ -281,20 +255,13 @@ pub async fn resolve_model_for_purpose(
     timeouts: Timeouts,
     model_policy: &ModelPolicy,
 ) -> Result<(Arc<dyn Provider>, Model), AgentError> {
-    let default_anchor = default.model.clone();
-    let chat_anchor = chat.model.clone();
-    let policy = model_policy.clone();
-    let binding = binding_override.cloned();
-    let mut model = smol::unblock(move || {
-        resolve_purpose_model(
-            purpose,
-            binding.as_ref(),
-            &default_anchor,
-            &chat_anchor,
-            &policy,
-        )
-    })
-    .await
+    let mut model = resolve_purpose_model(
+        purpose,
+        binding_override,
+        default.model,
+        chat.model,
+        model_policy,
+    )
     .map_err(|error| AgentError::Config {
         message: format!("cannot resolve the {purpose} model: {error}"),
     })?;
@@ -7647,7 +7614,6 @@ mod tests {
             &plan,
             &chat,
             &ModelPolicy::default(),
-            Model::resolve_binding,
         )
         .unwrap();
 

@@ -1,14 +1,16 @@
 use std::sync::{Arc, Mutex};
 
+use caudra_storage::StateDir;
 use flume::Sender;
 use serde_json::Value;
 
 use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelInfo};
+use crate::model_data::current;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::catalog::{
-    CatalogData, EndpointType, catalog_request, config_error, init_shared_catalog_if_needed,
-    send_catalog_request, warm_catalog_data,
+    CatalogData, EndpointType, catalog_provider, catalog_request, config_error,
+    free_fallback_allowed, send_catalog_request,
 };
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -52,7 +54,10 @@ fn route(
     let (meta, provider_data) = catalog.lookup(sub_provider, actual_id)?;
     let auth = match auth_override {
         None if sub_provider == ZEN_SLUG => provider_data.auth_for_key(zen_key).into_resolved(),
-        _ => provider_data.resolve_auth_with_override(auth_override, &catalog.state_dir),
+        _ => provider_data.resolve_auth_with_override(
+            auth_override,
+            &StateDir::resolve().map_err(|error| config_error(error.to_string()))?,
+        ),
     }
     .ok_or_else(|| {
             config_error(format!(
@@ -96,26 +101,23 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(
-            smol::unblock(move || init_shared_catalog_if_needed().lock().unwrap().all_models())
-                .await,
-        )
-    }
-
-    /// Routes on the shared catalog, which the first request may have to fetch.
-    async fn lookup(&self, model: &Model) -> Result<Route, AgentError> {
-        let model = model.clone();
-        let auth_override = self.auth.clone();
-        let zen_key = self.zen_key.clone();
+        let data = catalog_provider(ZEN_SLUG);
         smol::unblock(move || {
-            route(
-                &init_shared_catalog_if_needed().lock().unwrap(),
-                &model,
-                auth_override.as_ref(),
-                zen_key.as_deref(),
-            )
+            let state = StateDir::resolve().map_err(|error| config_error(error.to_string()))?;
+            Ok(data.map_or_else(Vec::new, |provider| {
+                provider.available_models(&state, free_fallback_allowed())
+            }))
         })
         .await
+    }
+
+    fn lookup(&self, model: &Model) -> Result<Route, AgentError> {
+        route(
+            &current().catalog,
+            model,
+            self.auth.as_ref(),
+            self.zen_key.as_deref(),
+        )
     }
 
     fn request(
@@ -153,7 +155,7 @@ impl Provider for Opencode {
         _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let route = self.lookup(model).await?;
+            let route = self.lookup(model)?;
             let wire = self.request(&route, messages, system, tools, &opts);
             send_catalog_request(
                 &self.chat_compat,
@@ -176,12 +178,7 @@ impl Provider for Opencode {
         opts: &RequestOptions,
         _cache_key: Option<&CacheKey>,
     ) -> Result<WireRequest, AgentError> {
-        let route = route(
-            &*warm_catalog_data()?,
-            model,
-            self.auth.as_ref(),
-            self.zen_key.as_deref(),
-        )?;
+        let route = self.lookup(model)?;
         Ok(self.request(&route, messages, system, tools, opts))
     }
 

@@ -46,13 +46,9 @@ pub struct ProviderManifest {
 }
 
 impl ProviderManifest {
-    /// What models.dev publishes about this model. Never triggers a fetch, so a
-    /// cold catalog simply leaves every decision to the static table and
-    /// discovery. Returned whole rather than field by field because each lookup
-    /// takes the catalog guard and clones, and `Model::from_base` needs four of
-    /// them for the same model.
+    /// Snapshot metadata for this model, including entries routed by a built-in.
     pub fn catalog_meta(&self, model_id: &str) -> Option<CatalogMetaView> {
-        crate::providers::catalog::model_meta_if_available(self.catalog_slug?, model_id)
+        crate::providers::catalog::model_meta(self.catalog_slug?, model_id)
     }
 
     /// The dated rates of `entry`, whether or not they are in force.
@@ -283,7 +279,7 @@ mod tests {
     use strum::IntoEnumIterator;
     use test_case::test_case;
 
-    const NO_CATALOG_NO_RATES: &str = "a cold catalog must not invent rates";
+    const NO_CATALOG_NO_RATES: &str = "missing model metadata must not invent rates";
     const TIERS_COME_FROM_CATALOG: &str =
         "a model the static table does not tier must still bill the catalog's tiers";
     const EMPTY_LADDER_IS_NOT_AN_ANSWER: &str =
@@ -342,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_pricing_is_absent_without_a_catalog() {
+    fn catalog_pricing_is_absent_without_model_metadata() {
         assert!(catalog_pricing(None).is_none(), "{NO_CATALOG_NO_RATES}");
     }
 
@@ -511,7 +507,7 @@ mod tests {
         }
     }
 
-    /// Opencode Zen and Opencode Go come from the fetched catalog and stay
+    /// Opencode Zen and Opencode Go come from the snapshot catalog and stay
     /// hidden until the user is authed, so they never join the inventory.
     const CATALOG_ONLY_SLUGS: &[&str] = &["opencode", "opencode-go"];
 

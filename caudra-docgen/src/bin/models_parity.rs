@@ -1,10 +1,8 @@
 //! `caudra-models-parity`: a deterministic JSON dump of what every built-in
 //! provider resolves its models to, so two builds can be diffed line by line.
 //!
-//! The runtime reads models.dev from its cache file, so the dump runs in a
-//! child process whose home, XDG and temp directories point into a sandbox
-//! seeded with `--catalog`. No user config, no network and no wall clock reach
-//! the output: every dated answer is taken at the fixed instants in [`DATES`].
+//! The dump runs with isolated home, XDG and temp directories. Catalog lookups
+//! use the current snapshot, without config or network access.
 
 use std::env;
 use std::fs;
@@ -19,31 +17,24 @@ use caudra_providers::pricing::Period;
 use caudra_providers::{
     FastPricing, Model, ModelEntry, ModelGeneration, ModelMarker, ModelPricing, ModelPurpose,
     ProviderData, ReasoningOption, ReasoningOptions, StaticReasoningOption, TokenUsage,
-    catalog_providers_if_available, model_meta_if_available, warm_catalog,
+    catalog_providers, model_ids, model_meta,
 };
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 
-const CATALOG_FLAG: &str = "--catalog";
 const SANDBOX_FLAG: &str = "--sandbox";
-const USAGE: &str = "usage: caudra-models-parity --catalog PATH [--sandbox DIR]";
+const USAGE: &str = "usage: caudra-models-parity [--sandbox DIR]";
 const DEFAULT_SANDBOX: &str = "caudra-models-parity";
 /// Proves a sandbox is ours to wipe before a rerun removes it.
 const SANDBOX_MARKER: &str = ".caudra-models-parity";
-/// Set on the child, holding the `--catalog` path.
-const CHILD_ENV: &str = "CAUDRA_MODELS_PARITY_CATALOG";
+/// Marks the isolated child process.
+const CHILD_ENV: &str = "CAUDRA_MODELS_PARITY_CHILD";
 const NAMESPACE_ENV: &str = "CAUDRA_NAMESPACE";
 /// Fixed, so debug and release builds read the same cache directory.
 const NAMESPACE: &str = "caudra-models-parity";
-/// `CATALOG_CACHE_FILE` and `CATALOG_CACHE_VERSION` in
-/// caudra-providers/src/providers/catalog.rs.
-const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
-const CATALOG_CACHE_VERSION: u32 = 2;
-const CACHE_ENV: &str = "XDG_CACHE_HOME";
-const CACHE_DIR: &str = "cache";
 const SANDBOX_DIRS: [(&str, &str); 6] = [
-    (CACHE_ENV, CACHE_DIR),
+    ("XDG_CACHE_HOME", "cache"),
     ("XDG_CONFIG_HOME", "config"),
     ("XDG_DATA_HOME", "data"),
     ("XDG_STATE_HOME", "state"),
@@ -105,25 +96,21 @@ const SAMPLED_FALLBACK_IDS: usize = 5;
 const SHORT_HASH_LEN: usize = 16;
 
 struct Options {
-    catalog: PathBuf,
     sandbox: PathBuf,
 }
 
 fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options> {
-    let mut catalog = None;
     let mut sandbox = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
             .ok_or_else(|| eyre!("{flag} needs a value\n{USAGE}"))?;
         match flag.as_str() {
-            CATALOG_FLAG => catalog = Some(PathBuf::from(value)),
             SANDBOX_FLAG => sandbox = Some(PathBuf::from(value)),
             _ => bail!("unknown flag {flag}\n{USAGE}"),
         }
     }
     Ok(Options {
-        catalog: catalog.ok_or_else(|| eyre!("{CATALOG_FLAG} is required\n{USAGE}"))?,
         sandbox: sandbox.unwrap_or_else(|| env::temp_dir().join(DEFAULT_SANDBOX)),
     })
 }
@@ -147,13 +134,11 @@ fn reset_sandbox(sandbox: &Path) -> Result<()> {
 
 fn run_sandboxed() -> Result<()> {
     let options = parse_options(env::args().skip(1))?;
-    let catalog = fs::read_to_string(&options.catalog)
-        .wrap_err_with(|| format!("reading {}", options.catalog.display()))?;
     reset_sandbox(&options.sandbox)?;
     let mut child = Command::new(env::current_exe()?);
     child
         .env_clear()
-        .env(CHILD_ENV, fs::canonicalize(&options.catalog)?)
+        .env(CHILD_ENV, "1")
         .env(NAMESPACE_ENV, NAMESPACE);
     for (var, dir) in SANDBOX_DIRS {
         let path = options.sandbox.join(dir);
@@ -165,12 +150,6 @@ fn run_sandboxed() -> Result<()> {
             child.env(var, value);
         }
     }
-    let cache = options.sandbox.join(CACHE_DIR).join(NAMESPACE);
-    fs::create_dir_all(&cache)?;
-    fs::write(
-        cache.join(CATALOG_CACHE_FILE),
-        format!(r#"{{"version":{CATALOG_CACHE_VERSION},"index":{catalog}}}"#),
-    )?;
     let status = child.status().wrap_err("starting the sandboxed dump")?;
     if !status.success() {
         bail!("the sandboxed dump failed: {status}");
@@ -178,20 +157,11 @@ fn run_sandboxed() -> Result<()> {
     Ok(())
 }
 
-fn dump(catalog_path: &Path) -> Result<String> {
-    let cache_file =
-        PathBuf::from(env::var_os(CACHE_ENV).ok_or_else(|| eyre!("{CACHE_ENV} unset"))?)
-            .join(NAMESPACE)
-            .join(CATALOG_CACHE_FILE);
-    let seeded = fs::read(&cache_file).wrap_err("reading the seeded catalog cache")?;
-    warm_catalog();
-    if fs::read(&cache_file)? != seeded {
-        bail!("the catalog was fetched instead of read from the seeded cache");
+fn dump() -> Result<String> {
+    let catalog_providers = catalog_providers();
+    if catalog_providers.is_empty() {
+        bail!("the snapshot catalog is empty");
     }
-    let catalog_providers = catalog_providers_if_available()
-        .filter(|providers| !providers.is_empty())
-        .ok_or_else(|| eyre!("the seeded catalog did not load"))?;
-    let raw: Value = serde_json::from_str(&fs::read_to_string(catalog_path)?)?;
     let dates = DATES
         .iter()
         .map(|date| Ok((&date[..DAY_LEN], date.parse::<Timestamp>()?)))
@@ -207,7 +177,7 @@ fn dump(catalog_path: &Path) -> Result<String> {
         })).collect::<Vec<_>>(),
         "providers": ManifestRegistry::builtins()
             .iter()
-            .map(|manifest| provider(manifest, &dates, &raw))
+            .map(|manifest| provider(manifest, &dates))
             .collect::<Vec<_>>(),
         "decision_models": decision_models(),
         "catalog": catalog(catalog_providers, &dates),
@@ -215,7 +185,7 @@ fn dump(catalog_path: &Path) -> Result<String> {
     Ok(format!("{}\n", serde_json::to_string_pretty(&document)?))
 }
 
-fn provider(manifest: &ProviderManifest, dates: &[(&str, Timestamp)], raw: &Value) -> Value {
+fn provider(manifest: &ProviderManifest, dates: &[(&str, Timestamp)]) -> Value {
     json!({
         "slug": manifest.slug,
         "display_name": manifest.display_name,
@@ -251,7 +221,7 @@ fn provider(manifest: &ProviderManifest, dates: &[(&str, Timestamp)], raw: &Valu
             .flat_map(|entry| entry.prefixes)
             .map(|prefix| ((*prefix).to_owned(), resolved(manifest.slug, prefix, dates)))
             .collect::<Map<_, _>>(),
-        "catalog_fallback": catalog_fallback(manifest, dates, raw),
+        "catalog_fallback": catalog_fallback(manifest, dates),
     })
 }
 
@@ -482,30 +452,22 @@ fn short_hash(value: &Value) -> String {
 /// What a built-in borrows from its own catalog entry: metadata for every id
 /// models.dev lists, and the whole resolved model for ids no table prefix
 /// covers, which the catalog alone describes.
-fn catalog_fallback(
-    manifest: &ProviderManifest,
-    dates: &[(&str, Timestamp)],
-    raw: &Value,
-) -> Value {
+fn catalog_fallback(manifest: &ProviderManifest, dates: &[(&str, Timestamp)]) -> Value {
     let Some(catalog_slug) = manifest.catalog_slug else {
         return Value::Null;
     };
-    let mut ids: Vec<&str> = raw[catalog_slug]["models"]
-        .as_object()
-        .map(|models| models.keys().map(String::as_str).collect())
-        .unwrap_or_default();
+    let mut ids = model_ids(catalog_slug);
     ids.sort_unstable();
     let metas: Map<_, _> = ids
         .iter()
         .filter_map(|id| {
-            model_meta_if_available(catalog_slug, id)
-                .map(|meta| ((*id).to_owned(), catalog_meta!(meta)))
+            model_meta(catalog_slug, id).map(|meta| (id.to_owned(), catalog_meta!(meta)))
         })
         .collect();
     let uncovered: Map<_, _> = ids
         .iter()
         .filter(|id| ManifestRegistry::facts_for_model(manifest.slug, id).is_none())
-        .map(|id| ((*id).to_owned(), resolved(manifest.slug, id, dates)))
+        .map(|id| (id.to_owned(), resolved(manifest.slug, id, dates)))
         .collect();
     json!({
         "ids": ids.len(),
@@ -580,7 +542,7 @@ fn catalog(mut providers: Vec<ProviderData>, dates: &[(&str, Timestamp)]) -> Val
 
 fn main() -> ExitCode {
     let result = match env::var_os(CHILD_ENV) {
-        Some(catalog) => dump(Path::new(&catalog)).map(|document| print!("{document}")),
+        Some(_) => dump().map(|document| print!("{document}")),
         None => run_sandboxed(),
     };
     match result {

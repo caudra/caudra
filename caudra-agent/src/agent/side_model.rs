@@ -27,11 +27,7 @@ pub async fn resolve(
     model_policy: &ModelPolicy,
     max_output_tokens: u32,
 ) -> SideModel {
-    let target_model = current_model.clone();
-    let policy = model_policy.clone();
-    // Catalog lookups and `warm_catalog` block, so they stay off the executor
-    // that is currently carrying the turn this job belongs to.
-    let resolved = smol::unblock(move || purpose_model(purpose, &target_model, &policy)).await;
+    let resolved = purpose_model(purpose, current_model, model_policy);
     let mut model = match resolved {
         Ok(model) => model,
         Err(error) => {

@@ -33,6 +33,14 @@ path = "caudra-storage/src/sessions.rs"
 const = "SESSION_VERSION"
 kind = "record"
 
+# Published model files are persisted locally. v1 is additive-only. Breaking
+# changes require format 2 at /v2/, never a format change in a patch release.
+[[tracked]]
+name = "model-file"
+path = "caudra-models/src/lib.rs"
+const = "FORMAT"
+kind = "record"
+
 [[tracked]]
 name = "session-log"
 path = "caudra-storage/src/sessions.rs"
@@ -212,11 +220,6 @@ name = "peer-protocol"
 path = "caudra-agent/src/peers.rs"
 const = "PROTOCOL_VERSION"
 kind = "protocol"
-
-[[exempt]]
-path = "caudra-providers/src/providers/catalog.rs"
-const = "CATALOG_CACHE_VERSION"
-reason = "Model catalog cache, refetched when the version differs"
 
 [[exempt]]
 path = "caudra-config/src/config_version.rs"

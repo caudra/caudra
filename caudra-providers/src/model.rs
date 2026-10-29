@@ -495,12 +495,6 @@ pub struct Model {
     pub billing: Billing,
 }
 
-#[derive(Clone, Copy)]
-enum CatalogAccess {
-    Warm,
-    IfAvailable,
-}
-
 /// `ManifestRegistry::for_slug` resolves a custom slug to its base provider's
 /// manifest so stubs still get thinking, display-name, and window defaults. Those
 /// are transport concerns. Lineage is not: a custom provider's base is its wire
@@ -861,30 +855,7 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        Self::resolve_seen(
-            purpose,
-            anchor,
-            policy,
-            &mut Vec::new(),
-            CatalogAccess::Warm,
-        )
-    }
-
-    /// Non-warming variant of [`Self::resolve`] for latency-sensitive callers.
-    /// An exact binding whose catalog provider is not already available returns
-    /// [`ModelError::UnsupportedProvider`] without loading the catalog.
-    pub fn resolve_if_available(
-        purpose: ModelPurpose,
-        anchor: &Self,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        Self::resolve_seen(
-            purpose,
-            anchor,
-            policy,
-            &mut Vec::new(),
-            CatalogAccess::IfAvailable,
-        )
+        Self::resolve_seen(purpose, anchor, policy, &mut Vec::new())
     }
 
     /// [`Self::resolve`] against a binding the caller already read, so a caller
@@ -895,31 +866,12 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::Warm)
-    }
-
-    /// Non-warming variant of [`Self::resolve_binding`].
-    pub fn resolve_binding_if_available(
-        purpose: ModelPurpose,
-        binding: Option<&Binding>,
-        anchor: &Self,
-        policy: &ModelPolicy,
-    ) -> Result<Self, ModelError> {
-        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::IfAvailable)
-    }
-
-    fn resolve_captured_binding(
-        purpose: ModelPurpose,
-        binding: Option<&Binding>,
-        anchor: &Self,
-        policy: &ModelPolicy,
-        catalog_access: CatalogAccess,
-    ) -> Result<Self, ModelError> {
         let seen = &mut vec![purpose];
         match binding {
-            Some(binding) => Self::follow(binding, anchor, policy, seen, catalog_access),
-            None => Ok(Self::auto(purpose, anchor, policy, seen, catalog_access)?
-                .unwrap_or_else(|| anchor.clone())),
+            Some(binding) => Self::follow(binding, anchor, policy, seen),
+            None => {
+                Ok(Self::auto(purpose, anchor, policy, seen)?.unwrap_or_else(|| anchor.clone()))
+            }
         }
     }
 
@@ -928,12 +880,8 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
-        Ok(
-            Self::resolve_chosen(purpose, anchor, policy, seen, catalog_access)?
-                .unwrap_or_else(|| anchor.clone()),
-        )
+        Ok(Self::resolve_chosen(purpose, anchor, policy, seen)?.unwrap_or_else(|| anchor.clone()))
     }
 
     /// What a binding or the purpose's own rule chooses; `None` when neither
@@ -943,15 +891,14 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Option<Self>, ModelError> {
         if seen.contains(&purpose) {
             return Err(ModelError::PurposeCycle(purpose));
         }
         seen.push(purpose);
         match model_registry::binding(purpose) {
-            Some(binding) => Self::follow(&binding, anchor, policy, seen, catalog_access).map(Some),
-            None => Self::auto(purpose, anchor, policy, seen, catalog_access),
+            Some(binding) => Self::follow(&binding, anchor, policy, seen).map(Some),
+            None => Self::auto(purpose, anchor, policy, seen),
         }
     }
 
@@ -960,21 +907,10 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         match binding {
-            Binding::Exact(spec) => {
-                match (catalog_access, Self::from_spec_with_policy(spec, policy)) {
-                    (CatalogAccess::Warm, Err(ModelError::UnsupportedProvider(_))) => {
-                        crate::warm_catalog();
-                        Self::from_spec_with_policy(spec, policy)
-                    }
-                    (_, result) => result,
-                }
-            }
-            Binding::Same(other) => {
-                Self::resolve_seen(*other, anchor, policy, seen, catalog_access)
-            }
+            Binding::Exact(spec) => Self::from_spec_with_policy(spec, policy),
+            Binding::Same(other) => Self::resolve_seen(*other, anchor, policy, seen),
         }
     }
 
@@ -983,7 +919,6 @@ impl Model {
         anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
-        catalog_access: CatalogAccess,
     ) -> Result<Option<Self>, ModelError> {
         match purpose {
             // A memory line stands in for its notes for months, and a learned
@@ -996,10 +931,10 @@ impl Model {
             | ModelPurpose::Memory
             | ModelPurpose::Learn => Ok(Some(anchor.clone())),
             ModelPurpose::Title | ModelPurpose::Goal | ModelPurpose::Extract => {
-                Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
+                Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen)
             }
             ModelPurpose::Autopilot => {
-                Self::resolve_chosen(ModelPurpose::Best, anchor, policy, seen, catalog_access)
+                Self::resolve_chosen(ModelPurpose::Best, anchor, policy, seen)
             }
             ModelPurpose::Fast | ModelPurpose::Best => {
                 Ok(Self::provider_default(purpose, anchor, policy))
@@ -1119,7 +1054,7 @@ impl Model {
             return Ok(model);
         }
 
-        if let Some(meta) = crate::providers::catalog::model_meta_if_available(slug, model_id) {
+        if let Some(meta) = crate::providers::catalog::model_meta(slug, model_id) {
             return Ok(Self::from_catalog(slug, model_id, meta));
         }
 
@@ -1135,8 +1070,7 @@ impl Model {
     /// reflect catalog prices when discovery hasn't seeded the registry, and
     /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free
-            || crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
+        self.discovered_free || crate::providers::catalog::free_model(&self.provider, &self.id)
     }
 }
 
@@ -1311,8 +1245,8 @@ mod tests {
     const AGGREGATOR: &str = "tensorx";
     const ALIASED_VENDOR_MODEL: &str = "z-ai/glm-4.5-air";
     const UNCLASSIFIABLE: &str = "ollama";
-    const UNKNOWN_CATALOG_PROVIDER: &str = "caudra-cold-catalog-test-provider";
-    const UNKNOWN_CATALOG_SPEC: &str = "caudra-cold-catalog-test-provider/model";
+    const UNKNOWN_CATALOG_PROVIDER: &str = "caudra-unknown-catalog-test-provider";
+    const UNKNOWN_CATALOG_SPEC: &str = "caudra-unknown-catalog-test-provider/model";
 
     const OPENAI_CHAT_SPEC: &str = "openai/gpt-5.6-sol";
 
@@ -1558,10 +1492,8 @@ mod tests {
         let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
 
         let model = Model::resolve(purpose, &anchor, &policy(&[], &[])).unwrap();
-        let non_warming = Model::resolve_if_available(purpose, &anchor, &policy(&[], &[])).unwrap();
 
         assert_eq!(model.spec(), expected);
-        assert_eq!(non_warming.spec(), model.spec());
     }
 
     /// A lane answers inside the anchor's own release line. Anthropic declares
@@ -1584,19 +1516,14 @@ mod tests {
     }
 
     #[test]
-    fn non_warming_resolution_leaves_an_unknown_exact_provider_cold() {
-        assert!(crate::catalog_providers_if_available().is_none());
+    fn resolution_rejects_an_unknown_exact_provider() {
         let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
         let binding = Binding::Exact(UNKNOWN_CATALOG_SPEC.to_string());
         let model_policy = policy(&[], &[]);
 
-        let captured_error = Model::resolve_binding_if_available(
-            ModelPurpose::Plan,
-            Some(&binding),
-            &anchor,
-            &model_policy,
-        )
-        .unwrap_err();
+        let captured_error =
+            Model::resolve_binding(ModelPurpose::Plan, Some(&binding), &anchor, &model_policy)
+                .unwrap_err();
         assert!(matches!(
             captured_error,
             ModelError::UnsupportedProvider(provider)
@@ -1606,35 +1533,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
         model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, &state_dir).unwrap();
-        let purpose_error =
-            Model::resolve_if_available(ModelPurpose::Plan, &anchor, &model_policy).unwrap_err();
+        let purpose_error = Model::resolve(ModelPurpose::Plan, &anchor, &model_policy).unwrap_err();
         assert!(matches!(
             purpose_error,
             ModelError::UnsupportedProvider(provider)
                 if provider == UNKNOWN_CATALOG_PROVIDER
         ));
-        assert!(crate::catalog_providers_if_available().is_none());
         model_registry::clear_binding_and_persist(ModelPurpose::Plan, &state_dir).unwrap();
-    }
-
-    #[test]
-    fn captured_non_warming_resolution_matches_resolution_for_an_available_model() {
-        let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
-        let binding = Binding::Exact("anthropic/claude-haiku-4-5".to_string());
-        let model_policy = policy(&[], &[]);
-
-        let resolved =
-            Model::resolve_binding(ModelPurpose::Fast, Some(&binding), &anchor, &model_policy)
-                .unwrap();
-        let non_warming = Model::resolve_binding_if_available(
-            ModelPurpose::Fast,
-            Some(&binding),
-            &anchor,
-            &model_policy,
-        )
-        .unwrap();
-
-        assert_eq!(non_warming.spec(), resolved.spec());
     }
 
     /// No anchor to read a line from, so these are the provider-wide answers:
@@ -1655,10 +1560,6 @@ mod tests {
 
     #[test]
     fn from_spec_unknown_catalogue_subprovider_is_unsupported() {
-        // The on-disk models.dev cache may populate the catalog in a
-        // developer's environment, so pick a slug that is likely not in any
-        // catalog and confirm it falls through to the generic
-        // unsupported-provider branch.
         let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
         assert!(matches!(err, ModelError::UnsupportedProvider(_)));
     }
@@ -1868,7 +1769,7 @@ mod tests {
         cache_read: 300_000,
     };
 
-    /// An `openai/` session never warms the catalog, so the table alone has to
+    /// The curated table owns these rates, independently of catalog metadata,
     /// know what a prompt past 272K costs.
     #[test_case(false, 0.325 ; "standard")]
     #[test_case(true, 0.650  ; "fast")]

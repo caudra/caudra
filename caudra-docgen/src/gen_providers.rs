@@ -150,7 +150,7 @@ const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+- **Features**: Models from the bundled catalog, including Opencode Go
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 "#;

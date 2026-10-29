@@ -1,8 +1,9 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use caudra_config::decisions::DecisionProtocol;
 use caudra_models::{self as wire, SUPPORTED_REQUIREMENTS};
+use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use tracing::warn;
 
 use crate::decision_pricing::DecisionModelEntry;
@@ -12,12 +13,64 @@ use crate::model::{
     StaticReasoningOption,
 };
 use crate::pricing::{Period, PricePeriod, PricingSchedule, PricingWindow};
+use crate::providers::catalog::{CatalogData, schema};
 
 const INVALID_WINDOW: &str = "pricing window must cover distinct hours within a UTC day";
 const INVALID_SCHEDULE: &str =
     "pricing schedule needs windows and a finite multiplier greater than one";
 const INVALID_PREFIXES: &str =
     "model entries need at least one prefix, and prefixes cannot be empty";
+
+pub(super) fn catalog(providers: BTreeMap<String, wire::CatalogProvider>) -> CatalogData {
+    CatalogData::from_index(
+        providers
+            .into_iter()
+            .map(|(slug, provider)| {
+                let provider = schema::CatalogProvider {
+                    name: provider.name,
+                    env: provider.env,
+                    npm: provider.npm,
+                    api: provider.api,
+                    models: provider
+                        .models
+                        .into_iter()
+                        .map(|(id, model)| (id, catalog_model(model)))
+                        .collect(),
+                };
+                (slug, provider)
+            })
+            .collect(),
+    )
+}
+
+fn catalog_model(model: wire::CatalogModel) -> schema::CatalogModel {
+    let reasoning_options = model.reasoning_options.map(|options| {
+        ReasoningOptions::new(
+            options
+                .into_iter()
+                .filter_map(|option| match option {
+                    wire::ReasoningOption::Toggle => Some(ReasoningOption::Toggle),
+                    wire::ReasoningOption::Effort { values } => {
+                        Some(ReasoningOption::Effort { values })
+                    }
+                    wire::ReasoningOption::BudgetTokens { min, max } => {
+                        Some(ReasoningOption::BudgetTokens { min, max })
+                    }
+                    wire::ReasoningOption::Unknown => None,
+                })
+                .collect(),
+        )
+    });
+    schema::CatalogModel {
+        limit: model.limit,
+        cost: model.cost,
+        provider: model.provider,
+        attachment: model.attachment,
+        reasoning: model.reasoning,
+        modalities: model.modalities,
+        reasoning_options,
+    }
+}
 
 fn strings(values: Vec<String>) -> &'static [&'static str] {
     Box::leak(

@@ -1346,13 +1346,9 @@ impl App {
     pub(super) fn route_model(&self, mode: Mode) -> Option<Cow<'_, Model>> {
         match mode {
             Mode::Build => Some(Cow::Borrowed(&self.state.model)),
-            Mode::Plan => Model::resolve_if_available(
-                ModelPurpose::Plan,
-                &self.state.model,
-                &self.model_policy,
-            )
-            .ok()
-            .map(Cow::Owned),
+            Mode::Plan => Model::resolve(ModelPurpose::Plan, &self.state.model, &self.model_policy)
+                .ok()
+                .map(Cow::Owned),
         }
     }
 
@@ -7560,8 +7556,7 @@ impl App {
         }
         let mode = self.agent_mode();
         let mut model = if self.state.mode == Mode::Plan {
-            Model::resolve_if_available(ModelPurpose::Plan, &self.state.model, &self.model_policy)
-                .ok()?
+            Model::resolve(ModelPurpose::Plan, &self.state.model, &self.model_policy).ok()?
         } else {
             self.state.model.clone()
         };

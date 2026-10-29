@@ -7,7 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::Duration;
 
+use isahc::config::{Configurable, VersionNegotiation};
+use isahc::{HttpClient, ReadResponseExt, Request};
 use jiff::civil::Date;
 use serde::Deserialize;
 
@@ -15,7 +18,12 @@ use crate::AgentError;
 use crate::decision_pricing;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
-use crate::providers::catalog::{self, CatalogMeta, schema::CatalogModel};
+use crate::providers::catalog::{CatalogMeta, config_error, schema::CatalogModel};
+
+const CATALOG_URL: &str = "https://models.dev/api.json";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_BYTES_PER_SECOND: u32 = 1;
 
 /// Catalog slugs whose new models belong in a table. Aggregators relist every
 /// vendor's models, so their additions are someone else's release.
@@ -550,7 +558,30 @@ type Catalog = HashMap<String, HashMap<String, CatalogEntry>>;
 
 /// models.dev's catalog as it is served now, never from the cache.
 pub fn fetch_catalog() -> Result<String, AgentError> {
-    catalog::fetch_catalog_text()
+    let client = caudra_config::https_proxy_route()
+        .apply(HttpClient::builder())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .low_speed_timeout(MIN_BYTES_PER_SECOND, LOW_SPEED_TIMEOUT)
+        .version_negotiation(VersionNegotiation::http11())
+        .build()
+        .map_err(|error| config_error(format!("failed to build catalog HTTP client: {error}")))?;
+    let request = Request::builder()
+        .uri(CATALOG_URL)
+        .header("user-agent", crate::providers::user_agent())
+        .body(())?;
+    let mut response = client
+        .send(request)
+        .map_err(|error| config_error(format!("failed to fetch {CATALOG_URL}: {error}")))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        return Err(AgentError::api(
+            status,
+            format!("catalog fetch returned HTTP {status}"),
+        ));
+    }
+    response
+        .text()
+        .map_err(|error| config_error(format!("failed to read catalog response body: {error}")))
 }
 
 /// Every divergence between the built-in tables and `catalog_json`, minus

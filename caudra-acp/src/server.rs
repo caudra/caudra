@@ -166,7 +166,7 @@ pub(crate) async fn serve_on(
 /// Static manifests miss providers that only list their models over the wire
 /// (OpenRouter and friends), so the same discovery the TUI runs happens here,
 /// in the background. Each batch leaves the moment it lands: the slowest source
-/// is a cold catalog download, and a provider the client could already pick from
+/// is a provider model listing, and a provider the client could already pick from
 /// should not wait behind it.
 fn discover_models(policy: Arc<ModelPolicy>, events: WeakSender<Incoming>) {
     smol::spawn(async move {

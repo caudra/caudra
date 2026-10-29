@@ -23,10 +23,7 @@ use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
 use crate::providers::aperture::{self, Aperture};
-use crate::providers::catalog::{
-    self, OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers,
-    catalog_providers_if_available,
-};
+use crate::providers::catalog::{self, OPENCODE_FAMILY_SLUGS, available, catalog_providers};
 use crate::providers::copilot::auth::CopilotIdentity;
 use crate::providers::copilot::{self, Copilot};
 use crate::providers::custom;
@@ -197,9 +194,7 @@ impl ProviderKind {
             Self::OpenRouter => {
                 Some("300+ models from all providers, prompt caching, provider routing")
             }
-            Self::Opencode => Some(
-                "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
-            ),
+            Self::Opencode => Some("Models from the bundled catalog, including Opencode Zen"),
             Self::Xai => Some(
                 "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
             ),
@@ -599,8 +594,7 @@ pub fn signed_in_defaults(
 }
 
 /// Non-blocking variant of [`provider_available`] for offline model discovery:
-/// catalog-backed slugs consult only the already-warm catalog, so a cold cache
-/// reports them unavailable instead of blocking on a network fetch.
+/// catalog-backed slugs use the snapshot and locally available credentials.
 fn provider_available_offline(slug: &str) -> bool {
     if ProviderKind::from_str(slug).is_ok()
         || dynamic::display_name(slug).is_some()
@@ -608,7 +602,7 @@ fn provider_available_offline(slug: &str) -> bool {
     {
         return provider_available(slug);
     }
-    available_if_warm(slug)
+    available(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -742,8 +736,7 @@ fn static_specs(manifest: &ProviderManifest, at: Timestamp) -> Vec<String> {
 
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
-/// Never blocks on catalog download; catalog-backed providers appear only once
-/// the catalog has warmed in the background.
+/// Catalog-backed providers come from the current snapshot.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = ManifestRegistry::builtins()
         .iter()
@@ -758,23 +751,21 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             specs.push(spec);
         }
     }
-    if let Some(catalog) = catalog_providers_if_available() {
-        for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
-                || dynamic::base_for_slug(&cat.slug).is_some()
-                || crate::providers::custom::base_kind(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            for model_id in cat.models.keys() {
-                let spec = format!("{}/{}", cat.slug, model_id);
-                if !specs.contains(&spec) {
-                    specs.push(spec);
-                }
+    for cat in catalog_providers() {
+        if ProviderKind::from_str(&cat.slug).is_ok()
+            || dynamic::base_for_slug(&cat.slug).is_some()
+            || crate::providers::custom::base_kind(&cat.slug).is_some()
+            || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+        {
+            continue;
+        }
+        if !provider_available(&cat.slug) {
+            continue;
+        }
+        for model_id in cat.models.keys() {
+            let spec = format!("{}/{}", cat.slug, model_id);
+            if !specs.contains(&spec) {
+                specs.push(spec);
             }
         }
     }
@@ -1018,7 +1009,7 @@ mod tests {
     fn inspection_adjusts_bound_plan_metadata(spec: &str, vision: bool, thinking: bool) {
         let anchor = Model::from_spec(TEST_MODEL).unwrap();
         let binding = Binding::Exact(spec.into());
-        let mut model = Model::resolve_binding_if_available(
+        let mut model = Model::resolve_binding(
             ModelPurpose::Plan,
             Some(&binding),
             &anchor,
@@ -1218,10 +1209,6 @@ mod tests {
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(
-            caudra_storage::StateDir::from_path(tmp.path().to_path_buf()),
-        );
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

@@ -1200,7 +1200,7 @@ fn model_job_row(
     anchor: &Model,
     policy: &ModelPolicy,
 ) -> ModelJobRow {
-    let resolved = Model::resolve_binding_if_available(purpose, binding.as_ref(), anchor, policy)
+    let resolved = Model::resolve_binding(purpose, binding.as_ref(), anchor, policy)
         .map(|model| model.spec())
         .unwrap_or_else(|error| format!("{MODEL_RESOLUTION_ERROR}{error}"));
     ModelJobRow {

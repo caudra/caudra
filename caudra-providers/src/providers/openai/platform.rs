@@ -147,7 +147,7 @@ fn coding_plan_models() -> Vec<ModelInfo> {
         .into_iter()
         .flat_map(ProviderManifest::listed_models)
         .flat_map(|e| e.prefixes.iter().copied());
-    let catalog = catalog::model_ids_if_available(CONFIG.slug);
+    let catalog = catalog::model_ids(CONFIG.slug);
     let mut ids: Vec<String> = statics
         .map(str::to_string)
         .chain(catalog)

@@ -38,7 +38,7 @@ use super::cache_warming::{CacheWarmer, WarmerContext, subagent_mode};
 use super::favorites;
 use super::live_switch::{ConversationControl, SettingsChange};
 use super::steering::{SharedSteering, Steering};
-use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model_for_inspection};
+use super::{ModelRoute, resolve_model_for_purpose, resolve_purpose_model};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot, CancelToken};
 use crate::code::CodeSession;
@@ -1683,9 +1683,9 @@ async fn route_subagent(
     }
 }
 
-/// The Subagent model a binding resolves to, without warming the catalog.
+/// The Subagent model a binding resolves to.
 fn inspected_subagent_model(ctx: &ToolContext, binding: Option<&Binding>) -> Option<Model> {
-    resolve_purpose_model_for_inspection(
+    resolve_purpose_model(
         ModelPurpose::Subagent,
         binding,
         &ctx.model,
