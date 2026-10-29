@@ -120,7 +120,7 @@ pub enum EntryOrigin {
 }
 
 impl EntryOrigin {
-    fn storage_name(&self) -> String {
+    pub(crate) fn storage_name(&self) -> String {
         match self {
             Self::Session(id) => format!("{SESSION_ORIGIN_PREFIX}{id}"),
             Self::External => EXTERNAL_ORIGIN.to_owned(),

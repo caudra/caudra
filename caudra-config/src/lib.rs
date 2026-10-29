@@ -1631,6 +1631,7 @@ pub struct AgentFileConfig {
     pub shell_eta: Option<bool>,
     pub generate_titles: Option<bool>,
     pub summarize_memory: Option<bool>,
+    pub memory_nudges: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub tool_json_repair: Option<bool>,
     pub eager_batch_dispatch: Option<bool>,
@@ -1679,6 +1680,7 @@ impl AgentFileConfig {
             shell_eta,
             generate_titles,
             summarize_memory,
+            memory_nudges,
             stale_read_check,
             tool_json_repair,
             eager_batch_dispatch,
@@ -2977,6 +2979,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Remind the main agent to save a memory note after a failed command passes, a long search ends in an edit, the user corrects it, or the context nears compaction. Reminders thin out as the project's notes grow and stop once the agent saves notes without them"
+    )]
+    pub memory_nudges: bool,
+
+    #[config(
+        default = true,
         desc = "Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change"
     )]
     pub stale_read_check: bool,
@@ -3156,6 +3164,7 @@ impl AgentConfig {
                 .unwrap_or(DEFAULT_SHELL_WAIT_NUDGE_MINUTES),
             generate_titles: file.generate_titles.unwrap_or(true),
             summarize_memory: file.summarize_memory.unwrap_or(true),
+            memory_nudges: file.memory_nudges.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             tool_json_repair: file.tool_json_repair.unwrap_or(true),
             eager_tool_dispatch: file

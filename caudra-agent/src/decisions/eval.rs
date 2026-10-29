@@ -37,8 +37,8 @@ use super::output_pointers::{
 use super::state::MAX_STATE_BYTES;
 use super::{
     CodeSymbol, DecisionContext, DecisionFeature, DecisionOutcome, DecisionState, Decisions,
-    PermissionAction, Screening, Withholding, permission, question_tool_nudge, questions,
-    rerank_source_code_context, shell_effect,
+    PermissionAction, Screening, Withholding, memory_nudge, permission, question_tool_nudge,
+    questions, rerank_source_code_context, shell_effect,
 };
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
 use crate::agent::{
@@ -208,6 +208,14 @@ struct QuestionToolCase {
     label: String,
     cohort: String,
     user_request: String,
+    assistant_reply: String,
+    needed: bool,
+}
+
+#[derive(Deserialize)]
+struct MemoryNudgeCase {
+    label: String,
+    user_message: String,
     assistant_reply: String,
     needed: bool,
 }
@@ -415,6 +423,12 @@ fn decision_eval() {
                 |case| question_tool_nudge_case(decisions, case),
             )
             .await,
+            run(
+                "memory_nudge",
+                include_str!("eval/memory_nudge.json"),
+                |case| memory_nudge_case(decisions, case),
+            )
+            .await,
             run_ranked(
                 "memory_search",
                 include_str!("eval/memory_search.json"),
@@ -519,6 +533,7 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.goal_prescreen = FeatureMode::Enforce;
     features.subagent_routing = FeatureMode::Enforce;
     features.question_tool_nudge = FeatureMode::Advise;
+    features.memory_nudge = FeatureMode::Advise;
     features.memory_search = FeatureMode::Enforce;
     features.history_search = FeatureMode::Enforce;
     features.memory_recall = FeatureMode::Advise;
@@ -909,6 +924,54 @@ fn question_tool_quiz_miss_is_not_scored_as_success() {
         question_tool_verdict(&outcome, DECIDED, true),
         Verdict::Undecided
     );
+}
+
+#[test]
+#[ignore = "needs CAUDRA_DECISION_EVAL_URL"]
+fn memory_nudge_eval() {
+    let url = env::var(URL_ENV).expect(URL_MISSING);
+    let temp = tempfile::tempdir().unwrap();
+    let decisions = service(&url, StateDir::from_path(temp.path().into()));
+    let passed = smol::block_on(run(
+        "memory_nudge",
+        include_str!("eval/memory_nudge.json"),
+        |case| memory_nudge_case(&decisions, case),
+    ));
+    assert!(passed, "{REGRESSED}");
+}
+
+async fn memory_nudge_case(decisions: &Decisions, case: MemoryNudgeCase) -> Scored {
+    let questions = questions::MEMORY_NUDGE.as_ref().expect(SET_INVALID);
+    let state = memory_nudge::state(&case.user_message, &case.assistant_reply).expect(UNREACHED);
+    let outcome = evaluate(
+        decisions,
+        DecisionFeature::MemoryNudge,
+        state.value(),
+        questions,
+    )
+    .await;
+    let probability = memory_nudge::probability(&outcome);
+    let threshold = decisions.config().thresholds.routing_confidence;
+    let verdict = matched(
+        probability.is_some(),
+        probability
+            .is_some_and(|probability| probability >= threshold)
+            .then_some(true),
+        case.needed.then_some(true),
+    );
+    scored(case.label, probability, vec![verdict], outcome.latency_ms)
+}
+
+#[test]
+fn memory_nudge_fixture_states_fit_and_labels_are_unique() {
+    let fixture: Fixture<MemoryNudgeCase> =
+        serde_json::from_str(include_str!("eval/memory_nudge.json")).unwrap();
+    let labels: BTreeSet<_> = fixture.cases.iter().map(|case| &case.label).collect();
+    assert_eq!(labels.len(), fixture.cases.len());
+    for case in &fixture.cases {
+        let state = memory_nudge::state(&case.user_message, &case.assistant_reply).unwrap();
+        assert!(state.value().to_string().len() <= MAX_STATE_BYTES);
+    }
 }
 
 async fn permission_case(decisions: &Decisions, case: PermissionCase) -> Scored {

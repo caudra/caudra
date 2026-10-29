@@ -3,6 +3,7 @@ mod admission;
 mod content;
 #[cfg(test)]
 mod eval;
+pub(crate) mod memory_nudge;
 mod note;
 pub(crate) mod output_pointers;
 mod permission;
@@ -106,6 +107,7 @@ pub enum DecisionFeature {
     HistorySearch,
     MemoryRecall,
     MemoryDuplicates,
+    MemoryNudge,
     CompactionRetention,
     OutputPointers,
     SourceCodeContext,
@@ -113,7 +115,7 @@ pub enum DecisionFeature {
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then the script callers.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
@@ -126,6 +128,7 @@ impl DecisionFeature {
         Self::HistorySearch,
         Self::MemoryRecall,
         Self::MemoryDuplicates,
+        Self::MemoryNudge,
         Self::CompactionRetention,
         Self::OutputPointers,
         Self::SourceCodeContext,
@@ -151,6 +154,7 @@ impl DecisionFeature {
             Self::HistorySearch => "history_search",
             Self::MemoryRecall => "memory_recall",
             Self::MemoryDuplicates => "memory_duplicates",
+            Self::MemoryNudge => "memory_nudge",
             Self::CompactionRetention => "compaction_retention",
             Self::OutputPointers => "output_pointers",
             Self::SourceCodeContext => "source_code_context",
@@ -175,6 +179,7 @@ impl DecisionFeature {
             Self::HistorySearch => Some("history_search"),
             Self::MemoryRecall => Some("memory_recall"),
             Self::MemoryDuplicates => Some("memory_duplicates"),
+            Self::MemoryNudge => Some("memory_nudge"),
             Self::CompactionRetention => Some("compaction_retention"),
             Self::OutputPointers => Some("output_pointers"),
             Self::SourceCodeContext => Some("source_code_context"),
@@ -215,6 +220,7 @@ impl DecisionFeature {
             Self::HistorySearch => &features.history_search,
             Self::MemoryRecall => &features.memory_recall,
             Self::MemoryDuplicates => &features.memory_duplicates,
+            Self::MemoryNudge => &features.memory_nudge,
             Self::CompactionRetention => &features.compaction_retention,
             Self::OutputPointers => &features.output_pointers,
             Self::SourceCodeContext => &features.source_code_context,
@@ -241,7 +247,8 @@ impl DecisionFeature {
             | Self::GoalPrescreen
             | Self::SubagentRouting
             | Self::QuestionToolNudge
-            | Self::MemoryRecall => config.timeout_ms,
+            | Self::MemoryRecall
+            | Self::MemoryNudge => config.timeout_ms,
         }
     }
 
@@ -273,7 +280,8 @@ impl DecisionFeature {
             | Self::SkillSuggestions
             | Self::GoalPrescreen
             | Self::SubagentRouting
-            | Self::QuestionToolNudge => None,
+            | Self::QuestionToolNudge
+            | Self::MemoryNudge => None,
         }
     }
 }
@@ -313,6 +321,8 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
             question_tool_nudge::QUESTION.into(),
             config.question_tool_nudge,
         );
+    } else if feature == DecisionFeature::MemoryNudge.name() {
+        overrides.insert(memory_nudge::QUESTION.into(), config.routing_confidence);
     } else if feature == DecisionFeature::ShellEffect.name()
         && let Some(threshold) = config.shell_writes
     {
@@ -2023,6 +2033,7 @@ mod tests {
     #[test_case(DecisionFeature::AutoScreening, false; "auto_screening")]
     #[test_case(DecisionFeature::QuestionToolNudge, false; "question_tool_nudge")]
     #[test_case(DecisionFeature::MemoryRecall, false; "memory_recall_delays_the_turn")]
+    #[test_case(DecisionFeature::MemoryNudge, false; "memory_nudge_delays_the_turn")]
     #[test_case(DecisionFeature::MemorySearch, true; "memory_search")]
     #[test_case(DecisionFeature::HistorySearch, true; "history_search")]
     #[test_case(DecisionFeature::MemoryDuplicates, true; "memory_duplicates")]

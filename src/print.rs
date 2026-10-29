@@ -359,6 +359,8 @@ pub fn run(
     // A generated title arrives as an event a front end saves, and print mode
     // saves its session only as the run ends, so the prompt names it instead.
     config.generate_titles = false;
+    // A scripted run keeps to its prompt, so nothing asks it to save notes.
+    config.memory_nudges = false;
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
     let cwd = remote_environment.as_ref().map_or_else(

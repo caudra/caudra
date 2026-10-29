@@ -1,0 +1,138 @@
+{
+  "baseline": {"right": 22, "wrong": 0, "undecided": 0, "p50_ms": 310, "p95_ms": 1897},
+  "baseline_note": "Measured on jev-latest (TypeSafe) at the routing_confidence threshold. All 22 cases are synthetic and were written alongside the feature, not taken from transcripts, so they say little about real-world precision.",
+  "cases": [
+    {
+      "label": "full_suite_instead_of_fast",
+      "user_message": "No, don't run the whole suite here. It takes twenty minutes. Use make test-fast.",
+      "assistant_reply": "I ran cargo test --workspace and all 3,214 tests pass. The fix is in place.",
+      "needed": true
+    },
+    {
+      "label": "no_unwrap_rule",
+      "user_message": "We don't use unwrap in this codebase. Return a Result and use ? instead.",
+      "assistant_reply": "I added the parser. It calls .unwrap() on the header read, since a missing header is a bug.",
+      "needed": true
+    },
+    {
+      "label": "config_location",
+      "user_message": "That file isn't used anymore. The real deploy config lives in deploy/prod.toml.",
+      "assistant_reply": "I raised the worker count in config/settings.toml from 4 to 8.",
+      "needed": true
+    },
+    {
+      "label": "package_manager",
+      "user_message": "We use pnpm in this repo, never npm. The lockfile is pnpm-lock.yaml.",
+      "assistant_reply": "I ran npm install and added zod to package.json.",
+      "needed": true
+    },
+    {
+      "label": "commit_style",
+      "user_message": "Commit messages here follow conventional commits, like fix(parser): ..., please redo it.",
+      "assistant_reply": "Committed as \"Fixed the parser bug with nested quotes\".",
+      "needed": true
+    },
+    {
+      "label": "no_comments",
+      "user_message": "Stop adding a comment above every function. We keep code uncommented unless something is surprising.",
+      "assistant_reply": "I documented each helper with a short comment so the module is easier to follow.",
+      "needed": true
+    },
+    {
+      "label": "branch_policy",
+      "user_message": "Never push to main directly. Open a branch and a PR, that's how this team works.",
+      "assistant_reply": "Pushed the fix to origin/main.",
+      "needed": true
+    },
+    {
+      "label": "wrong_database",
+      "user_message": "Careful, port 5432 is the production database. Local dev runs Postgres on 5433.",
+      "assistant_reply": "I connected to localhost:5432 and ran the migration.",
+      "needed": true
+    },
+    {
+      "label": "generated_file",
+      "user_message": "Don't edit api_types.rs by hand, it's generated. Change schema.graphql and run make codegen.",
+      "assistant_reply": "I added the missing field to src/api_types.rs.",
+      "needed": true
+    },
+    {
+      "label": "test_framework",
+      "user_message": "Tests in this project use pytest fixtures, not unittest classes. Rewrite it that way.",
+      "assistant_reply": "I added a unittest.TestCase subclass with setUp for the new loader tests.",
+      "needed": true
+    },
+    {
+      "label": "approve_and_commit",
+      "user_message": "Looks good, commit it.",
+      "assistant_reply": "I renamed the flag and updated both callers. All tests pass.",
+      "needed": false
+    },
+    {
+      "label": "follow_up_task",
+      "user_message": "Great. Now add the same validation to the importer.",
+      "assistant_reply": "The exporter now rejects rows with an empty id.",
+      "needed": false
+    },
+    {
+      "label": "pick_an_option",
+      "user_message": "Option B, please.",
+      "assistant_reply": "Two ways to fix this: A caches the result per request, B moves the lookup to startup. Which do you prefer?",
+      "needed": false
+    },
+    {
+      "label": "thanks",
+      "user_message": "Thanks, that fixed it.",
+      "assistant_reply": "The crash came from a stale lock file. I removed it and the server starts.",
+      "needed": false
+    },
+    {
+      "label": "answer_only_feedback",
+      "user_message": "That's too long, give me a one-line summary.",
+      "assistant_reply": "Here is a detailed walkthrough of the request lifecycle, from the router to the handler and back.",
+      "needed": false
+    },
+    {
+      "label": "new_question",
+      "user_message": "How does the cache invalidation work?",
+      "assistant_reply": "I added the retry to the HTTP client with a 3-attempt limit.",
+      "needed": false
+    },
+    {
+      "label": "one_off_typo",
+      "user_message": "You misspelled 'receive' in the log message.",
+      "assistant_reply": "Added a log line: \"recieve failed, retrying\".",
+      "needed": false
+    },
+    {
+      "label": "scope_this_change",
+      "user_message": "Just this file for now, leave the other modules alone.",
+      "assistant_reply": "Should I apply the rename across all eleven modules that use the old name?",
+      "needed": false
+    },
+    {
+      "label": "debug_info",
+      "user_message": "Here's the stack trace from production: thread main panicked at src/queue.rs:88.",
+      "assistant_reply": "I can't reproduce the panic locally. Can you share the trace?",
+      "needed": false
+    },
+    {
+      "label": "revert_request",
+      "user_message": "Undo that last change, I want to try something else first.",
+      "assistant_reply": "I switched the date parsing to chrono and removed the hand-written parser.",
+      "needed": false
+    },
+    {
+      "label": "quoted_instruction",
+      "user_message": "The README says \"always run make lint before committing\". Is that check actually wired into CI?",
+      "assistant_reply": "I added the lint step to the pre-commit hook.",
+      "needed": false
+    },
+    {
+      "label": "yes_continue",
+      "user_message": "Yes, go ahead.",
+      "assistant_reply": "I can migrate the remaining handlers the same way. Should I continue?",
+      "needed": false
+    }
+  ]
+}

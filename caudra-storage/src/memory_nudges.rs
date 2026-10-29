@@ -5,7 +5,7 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::memory_journal::{MemoryJournal, MemoryJournalError};
+use crate::memory_journal::{EntryOrigin, MemoryJournal, MemoryJournalError};
 
 const SESSION_EVENT: &str = "session";
 const NUDGE_EVENT: &str = "nudge";
@@ -57,11 +57,15 @@ impl NudgeEvent {
     }
 }
 
-/// Where a project stands with nudges.
+/// Where a project and one of its sessions stand with nudges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NudgeStanding {
+    pub live_notes: u64,
     /// Nudges sent in every session of the project since the asked time.
     pub nudges_since: u32,
+    pub session_nudges: u32,
+    /// The session wrote or deleted a note, asked or not.
+    pub session_wrote: bool,
     /// The model keeps memory on its own, so the project is never nudged
     /// again.
     pub graduated: bool,
@@ -84,9 +88,9 @@ impl MemoryJournal {
         Ok(())
     }
 
-    /// The project's standing, counting nudges from `since_ms` on. The
-    /// first time graduation holds it is recorded, so it lasts whatever
-    /// later sessions do.
+    /// The standing of the project and of `session_id`, counting the
+    /// project's nudges from `since_ms` on. The first time graduation holds
+    /// it is recorded, so it lasts whatever later sessions do.
     pub fn nudge_standing(
         &self,
         scope: &str,
@@ -95,10 +99,19 @@ impl MemoryJournal {
         now_ms: i64,
     ) -> Result<NudgeStanding, MemoryJournalError> {
         let connection = self.connection();
-        let nudges_since = connection.query_row(
-            "SELECT count(*) FROM memory_nudges WHERE scope = ?1 AND kind = ?2 \
-             AND created_ms >= ?3",
-            params![scope, NUDGE_EVENT, since_ms],
+        let (nudges_since, session_nudges) = connection.query_row(
+            "SELECT count(*) FILTER (WHERE created_ms >= ?3), \
+             count(*) FILTER (WHERE session_id = ?4) \
+             FROM memory_nudges WHERE scope = ?1 AND kind = ?2",
+            params![scope, NUDGE_EVENT, since_ms, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let session_wrote = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM memory_entries WHERE scope = ?1 AND origin = ?2)",
+            params![
+                scope,
+                EntryOrigin::Session(session_id.to_owned()).storage_name()
+            ],
             |row| row.get(0),
         )?;
         let recorded = connection
@@ -124,7 +137,10 @@ impl MemoryJournal {
             )?;
         }
         Ok(NudgeStanding {
+            live_notes: self.live_count(scope)?,
             nudges_since,
+            session_nudges,
+            session_wrote,
             graduated,
         })
     }
@@ -137,9 +153,11 @@ mod tests {
 
     use super::{NudgeEvent, NudgeStanding};
     use crate::StateDir;
-    use crate::memory_journal::MemoryJournal;
+    use crate::memory_journal::{EntryOrigin, JournalChange, MemoryJournal};
 
     const SCOPE: &str = "project-a";
+    const OTHER_SESSION: &str = "other";
+    const NOTE: &str = "build.md";
     const OTHER_SCOPE: &str = "project-b";
     const CURRENT: &str = "current";
     const DAY_START_MS: i64 = 1_000;
@@ -220,6 +238,36 @@ mod tests {
         }
 
         assert_eq!(standing(&journal).nudges_since, 2);
+    }
+
+    #[test]
+    fn session_counts_only_its_own_nudges_and_writes() {
+        let (_root, journal) = fixture();
+        for session in [CURRENT, OTHER_SESSION] {
+            journal
+                .record_nudge_event(SCOPE, session, NudgeEvent::Nudge, NOW_MS)
+                .unwrap();
+        }
+        assert!(!standing(&journal).session_wrote);
+
+        journal
+            .append(
+                SCOPE,
+                JournalChange::Note {
+                    name: NOTE.into(),
+                    body: NOTE.into(),
+                    created_ms: NOW_MS,
+                },
+                &EntryOrigin::Session(CURRENT.into()),
+                || Ok(()),
+            )
+            .unwrap();
+
+        let standing = standing(&journal);
+        assert_eq!(standing.session_nudges, 1);
+        assert_eq!(standing.nudges_since, 2);
+        assert!(standing.session_wrote);
+        assert_eq!(standing.live_notes, 1);
     }
 
     #[test]

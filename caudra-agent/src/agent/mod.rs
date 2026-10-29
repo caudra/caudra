@@ -10,6 +10,7 @@ mod instructions;
 pub(crate) mod judging;
 mod live_switch;
 mod measured;
+mod memory_nudge;
 pub mod mention_preamble;
 mod provider_projection;
 mod refresh;

@@ -41,6 +41,7 @@ use super::history::{
 use super::instructions::LoadedInstructions;
 use super::live_switch::LiveSwitch;
 use super::measured::{MeasuredContext, SentRequest};
+use super::memory_nudge::{self, Trigger};
 use super::mention_preamble;
 use super::provider_projection;
 use super::refresh::{ActiveContext, ContextRefresh, StandingState, favorite_models};
@@ -69,13 +70,13 @@ use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
-    NoteDraft, NoteOutcome, NoteSink, PendingNote, push_fitting, question_tool_nudge,
-    redact_decision_text, redacted_excerpt,
+    NoteDraft, NoteOutcome, NoteSink, PendingNote, memory_nudge as memory_nudge_decision,
+    push_fitting, question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
 use crate::memory::relevance::{Judge, Recall, RecallFocus, RecallQuery, Recalled};
 use crate::memory::search::significant_words;
-use crate::memory::store::MemoryStore;
+use crate::memory::store::{MemoryStore, now_ms};
 use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
@@ -111,6 +112,8 @@ use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::media::MediaStore;
+use caudra_storage::memory_journal::MemoryJournalError;
+use caudra_storage::memory_nudges::NudgeEvent;
 use caudra_storage::now_epoch;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -146,6 +149,9 @@ const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 /// Provider requests a recall the agent starts on its own waits after the
 /// last one, so a burst of todo updates asks the engine once.
 const RECALL_SPACING_REQUESTS: usize = 5;
+const MEMORY_CORRECTED: &str = "reminded the agent to save the correction";
+const MEMORY_CORRECTION_FALLBACK: &str = "left the turn without a memory reminder";
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const STEP_STARTED_CAUSE: &str = "step started";
 const GOAL_UNMET_CAUSE: &str = "goal unmet";
 const COMPACTED_CAUSE: &str = "after compaction";
@@ -586,6 +592,9 @@ pub struct Agent<'h> {
     /// Provider requests since the last recall, which spaces the recalls the
     /// agent starts on its own.
     requests_since_recall: usize,
+    /// The engine judged the user's newest message a correction, which the
+    /// next memory nudge reports.
+    memory_correction: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -752,6 +761,7 @@ impl<'h> Agent<'h> {
             work_reminded: None,
             memory_store: run.memory_store,
             requests_since_recall: 0,
+            memory_correction: false,
         }
     }
 
@@ -1037,14 +1047,26 @@ impl<'h> Agent<'h> {
         let recall = (!peer_wake)
             .then(|| self.memory_recall(RecallTrigger::Request(&message)))
             .flatten();
-        let (skill_suggestion, recalled) = future::zip(self.suggest_skill(&message), async {
-            match recall {
-                Some(recall) => recall.run().await,
-                None => None,
-            }
-        })
+        let nudge_start = (!peer_wake)
+            .then(|| self.memory_nudge_start(&message).map(Box::pin))
+            .flatten();
+        let ((skill_suggestion, recalled), corrected) = future::zip(
+            future::zip(self.suggest_skill(&message), async {
+                match recall {
+                    Some(recall) => recall.run().await,
+                    None => None,
+                }
+            }),
+            async {
+                match nudge_start {
+                    Some(start) => start.await,
+                    None => false,
+                }
+            },
+        )
         .await;
         self.push_recalled(recalled);
+        self.memory_correction = corrected;
 
         info!(
             model = %self.model.id,
@@ -2958,12 +2980,15 @@ impl<'h> Agent<'h> {
         // one by reopening a normal final answer.
         if matches!(outcome, TurnOutcome::Continue) && !compacted {
             self.inject_advisory();
+            let head = self.history.item_head();
             if self
                 .step_in_progress()
                 .is_some_and(|step| step_before.as_ref() != Some(&step))
             {
                 self.recall_while_working(RecallTrigger::StepStarted).await;
             }
+            let recalled = self.history.item_head() != head;
+            Box::pin(self.nudge_memory(recalled)).await;
         }
         self.publish_prepared_context();
         Ok(outcome)
@@ -3525,6 +3550,205 @@ impl<'h> Agent<'h> {
             query,
             rows.caused(trigger.cause()),
         ))
+    }
+
+    /// The project's memory and this session, when this agent may be nudged
+    /// to save notes: the main session building, with the `memory` tool.
+    fn memory_nudge_target(&self) -> Option<(Arc<MemoryStore>, String)> {
+        if !self.config.memory_nudges
+            || !self.is_main_session()
+            || self.mode != AgentMode::Build
+            || !self.tool_filter.matches(MEMORY_TOOL_NAME)
+        {
+            return None;
+        }
+        let store = Arc::clone(self.memory_store.as_ref()?);
+        Some((store, self.session_id.as_ref()?.as_str().to_owned()))
+    }
+
+    /// At a new user message: records the session in the project's nudge
+    /// history, then asks the engine whether the message corrects the agent,
+    /// when a nudge for that could go in at all. Built from owned parts, so
+    /// it runs beside the recall and the skill suggestion.
+    fn memory_nudge_start(&self, message: &str) -> Option<impl Future<Output = bool> + use<>> {
+        let (store, session) = self.memory_nudge_target()?;
+        let responses =
+            memory_nudge::read(self.history, self.tool_name_aliases.as_ref()).responses_since_nudge;
+        let feature = DecisionFeature::MemoryNudge;
+        let check = self
+            .permissions
+            .decisions()
+            .filter(|decisions| decisions.enabled(&feature))
+            .zip(
+                memory_nudge::previous_reply(self.history)
+                    .and_then(|reply| memory_nudge_decision::state(message, reply)),
+            )
+            .zip(decision_questions::MEMORY_NUDGE.as_ref())
+            .map(|((decisions, state), questions)| {
+                (
+                    decisions,
+                    state,
+                    questions,
+                    self.decision_context(),
+                    self.decision_rows(),
+                    Arc::clone(&self.permissions),
+                    self.cancel.clone(),
+                )
+            });
+        Some(async move {
+            let now = now_ms();
+            let standing = smol::unblock(move || {
+                let journal = store.journal();
+                journal.record_nudge_event(store.scope(), &session, NudgeEvent::Session, now)?;
+                journal.nudge_standing(store.scope(), &session, now - DAY_MS, now)
+            })
+            .await;
+            let standing = match standing {
+                Ok(standing) => standing,
+                Err(error) => {
+                    warn!(%error, "memory nudge history could not be read");
+                    return false;
+                }
+            };
+            let Some((decisions, state, questions, context, rows, permissions, cancel)) = check
+            else {
+                return false;
+            };
+            if !memory_nudge::allowed(Trigger::Correction, &standing, responses) {
+                return false;
+            }
+            let pending = rows.begin(&decisions, feature.clone());
+            let Some(outcome) = cancel
+                .race(permissions.run_passive_decision(decisions.evaluate(
+                    feature.clone(),
+                    state.value(),
+                    questions,
+                    &context,
+                )))
+                .await
+                .ok()
+                .flatten()
+                .flatten()
+            else {
+                return false;
+            };
+            let threshold = decisions.config().thresholds.routing_confidence;
+            let probability = memory_nudge_decision::probability(&outcome);
+            match (decisions.mode(&feature), probability) {
+                (FeatureMode::Advise, Some(probability)) if probability >= threshold => {
+                    pending.emit(memory_nudge_note(
+                        &decisions,
+                        NoteOutcome::Acted,
+                        probability,
+                        threshold,
+                    ));
+                    if let Some(receipt) = &outcome.receipt {
+                        decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+                    }
+                    true
+                }
+                (FeatureMode::Shadow, Some(probability)) if probability >= threshold => {
+                    pending.emit(memory_nudge_note(
+                        &decisions,
+                        NoteOutcome::Shadow,
+                        probability,
+                        threshold,
+                    ));
+                    false
+                }
+                (FeatureMode::Advise, None) => {
+                    if let Some(failure) = outcome.fresh_failure() {
+                        pending.emit(NoteDraft::fell_back(
+                            &decisions,
+                            feature,
+                            &failure,
+                            MEMORY_CORRECTION_FALLBACK,
+                        ));
+                    }
+                    false
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// After a response the agent continues from: reminds it to save a note
+    /// when that response, or the user's message before it, showed something
+    /// worth keeping, and records a note it saved without being asked. A
+    /// request that carries a recall holds the nudge back, so one request
+    /// never names memory twice.
+    async fn nudge_memory(&mut self, recalled: bool) {
+        let Some((store, session)) = self.memory_nudge_target() else {
+            return;
+        };
+        let reading = memory_nudge::read(self.history, self.tool_name_aliases.as_ref());
+        let now = now_ms();
+        if reading.wrote {
+            self.memory_correction = false;
+            if reading.responses_since_nudge > memory_nudge::ATTRIBUTION_RESPONSES {
+                let recorded = smol::unblock(move || {
+                    store.journal().record_nudge_event(
+                        store.scope(),
+                        &session,
+                        NudgeEvent::Unprompted,
+                        now,
+                    )
+                })
+                .await;
+                if let Err(error) = recorded {
+                    warn!(%error, "an unprompted memory note could not be recorded");
+                }
+            }
+            return;
+        }
+        if recalled || reading.nudged_this_turn {
+            return;
+        }
+        let trigger = if mem::take(&mut self.memory_correction) {
+            Trigger::Correction
+        } else if let Some(trigger) = reading.trigger {
+            trigger
+        } else if self.nears_compaction() {
+            Trigger::NearCompaction
+        } else {
+            return;
+        };
+        let responses = reading.responses_since_nudge;
+        let sent = smol::unblock(move || {
+            let journal = store.journal();
+            let standing = journal.nudge_standing(store.scope(), &session, now - DAY_MS, now)?;
+            if !memory_nudge::allowed(trigger, &standing, responses) {
+                return Ok(None);
+            }
+            journal.record_nudge_event(store.scope(), &session, NudgeEvent::Nudge, now)?;
+            Ok::<_, MemoryJournalError>(Some(standing.live_notes))
+        })
+        .await;
+        match sent {
+            Ok(Some(live_notes)) => {
+                info!(
+                    trigger = trigger.as_str(),
+                    live_notes, responses, "memory nudge sent"
+                );
+                self.push_injected(memory_nudge::reminder(trigger, live_notes));
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "memory nudge history could not be read"),
+        }
+    }
+
+    fn nears_compaction(&self) -> bool {
+        self.auto_compact
+            && self.context_size().is_some_and(|input| {
+                compaction::nears_overflow(
+                    &TokenUsage {
+                        input,
+                        ..Default::default()
+                    },
+                    &self.model,
+                    self.config.compaction_buffer,
+                )
+            })
     }
 
     /// The todo the agent is working on.
@@ -4555,6 +4779,24 @@ impl SkillSuggestion {
 }
 
 /// The nudge with the probability that crossed the threshold, then both.
+fn memory_nudge_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    probability: f64,
+    threshold: f64,
+) -> NoteDraft {
+    NoteDraft::new(
+        decisions,
+        DecisionFeature::MemoryNudge,
+        outcome,
+        &format!("{MEMORY_CORRECTED} ({probability:.2})"),
+        vec![
+            format!("{probability:.2}  {}", memory_nudge_decision::QUESTION),
+            format!("{threshold:.2}  {THRESHOLD_LABEL}"),
+        ],
+    )
+}
+
 fn question_nudge_note(
     decisions: &Decisions,
     outcome: NoteOutcome,
@@ -6219,6 +6461,184 @@ mod tests {
                 0
             );
             assert_eq!(recall_reminders(&requests[waiting + 1]), reminders);
+        });
+    }
+
+    use crate::tools::{FILE_EDIT_TOOL_NAME, FILE_READ_TOOL_NAME};
+
+    const NUDGE_HEADING: &str = "# Save what you learned";
+    /// Reads before the edit, so the edit is the tenth response: a discovery
+    /// as soon as a project with no notes may be nudged.
+    const NUDGE_READS: usize = 9;
+    const NUDGE_REPLY: &str = "I ran the whole suite.";
+    const NUDGE_CORRECTION: &str = "No, run make test-fast in this project.";
+
+    fn memory_nudges(request: &[Message]) -> usize {
+        request
+            .iter()
+            .filter_map(Message::first_text_content)
+            .filter(|text| text.contains(NUDGE_HEADING))
+            .count()
+    }
+
+    /// A main session on an empty project, with reads and edits that succeed.
+    fn nudged_agent<'h>(
+        history: &'h mut History,
+        state: &Path,
+        provider: MockProvider,
+    ) -> (Agent<'h>, flume::Receiver<Envelope>) {
+        let (mut agent, events) = make_agent(provider, history);
+        agent.config.generate_titles = false;
+        agent.memory_store = Some(note_store(state, &[]));
+        agent.session_id = Some(SessionRef::generate());
+        agent.tools = json!(
+            [FILE_READ_TOOL_NAME, FILE_EDIT_TOOL_NAME]
+                .map(|name| json!({"name": name, "input_schema": {"type": "object"}}))
+        );
+        agent.local_tools = Arc::new(HashMap::from(
+            [FILE_READ_TOOL_NAME, FILE_EDIT_TOOL_NAME].map(|name| {
+                (
+                    name.to_owned(),
+                    audited_local_tool(ToolEffect::Isolated, |_, _| {
+                        Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+                    }),
+                )
+            }),
+        ));
+        (agent, events)
+    }
+
+    fn discovery_script() -> Vec<StreamResponse> {
+        (0..NUDGE_READS)
+            .map(|read| tool_use_response(FILE_READ_TOOL_NAME, json!({"path": read.to_string()})))
+            .chain([
+                tool_use_response(FILE_EDIT_TOOL_NAME, json!({})),
+                answer(FIRST_ANSWER),
+            ])
+            .collect()
+    }
+
+    #[test_case(|_| {}, AgentMode::Build, 1 ; "main_session")]
+    #[test_case(|agent| agent.config.memory_nudges = false, AgentMode::Build, 0 ; "turned_off")]
+    #[test_case(|agent| agent.root_tool_use_id = Some(RECALL_ROOT.into()), AgentMode::Build, 0 ; "subagent_run")]
+    #[test_case(|_| {}, AgentMode::ReadOnly, 0 ; "read_only")]
+    #[test_case(|agent| agent.session_id = None, AgentMode::Build, 0 ; "no_session")]
+    #[test_case(|agent| agent.tool_filter = ToolFilter::All.excluding(&[MEMORY_TOOL_NAME]), AgentMode::Build, 0 ; "memory_tool_filtered_out")]
+    fn a_long_search_ending_in_an_edit_nudges_the_main_session(
+        adjust: fn(&mut Agent<'_>),
+        mode: AgentMode,
+        nudges: usize,
+    ) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(discovery_script());
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            adjust(&mut agent);
+
+            agent
+                .run(AgentInput {
+                    mode,
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+
+            let requests = captured.lock().unwrap();
+            let (last, earlier) = requests.split_last().unwrap();
+            assert_eq!(
+                earlier
+                    .iter()
+                    .map(|request| memory_nudges(request))
+                    .sum::<usize>(),
+                0
+            );
+            assert_eq!(memory_nudges(last), nudges);
+        });
+    }
+
+    #[test]
+    fn a_project_that_keeps_notes_unprompted_is_never_nudged() {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(discovery_script());
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            let store = agent.memory_store.clone().unwrap();
+            for session in ["earlier", "later"] {
+                for event in [NudgeEvent::Session, NudgeEvent::Unprompted] {
+                    store
+                        .journal()
+                        .record_nudge_event(store.scope(), session, event, now_ms())
+                        .unwrap();
+                }
+            }
+
+            agent.run(default_input()).await.unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| memory_nudges(request))
+                    .sum::<usize>(),
+                0
+            );
+        });
+    }
+
+    #[test_case(FeatureMode::Advise, 1 ; "advise_nudges")]
+    #[test_case(FeatureMode::Shadow, 0 ; "shadow_only_asks")]
+    fn a_correction_nudges_the_response_after_it(mode: FeatureMode, nudges: usize) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(vec![
+                tool_use_response(FILE_READ_TOOL_NAME, json!({})),
+                answer(FIRST_ANSWER),
+            ]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let earlier = (0..NUDGE_READS + 1).flat_map(|_| {
+                [
+                    Message::user(UNRELATED_REQUEST.into()),
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: NUDGE_REPLY.into(),
+                        }],
+                        ..Default::default()
+                    },
+                ]
+            });
+            let mut history = History::new(earlier.collect());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut config = qn_config(FeatureMode::Off);
+            config.features.memory_nudge = mode;
+            agent.permissions.set_decisions(Some(qn_service(
+                &state,
+                config,
+                FeatureEngine {
+                    probability: 1.0,
+                    confidence: 1.0,
+                    fail: false,
+                    calls: Arc::clone(&calls),
+                },
+            )));
+
+            agent
+                .run(AgentInput {
+                    message: NUDGE_CORRECTION.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(memory_nudges(&requests[0]), 0);
+            assert_eq!(memory_nudges(&requests[1]), nudges);
         });
     }
 
