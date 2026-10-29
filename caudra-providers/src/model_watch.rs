@@ -46,6 +46,25 @@ const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased b
 const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
 const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
 const XAI_LONG_PROMPT: &str = "xAI bills a prompt of 200,000 tokens or more at the long-context rate (docs.x.ai/developers/models), and a tier's `above` is exclusive, so the table's sits at 199,999.";
+const GEMINI_2_5_LIMITED: &str = "Google limits the 2.5 models to past users and sends new projects to 3.8 Flash or 3.5 Flash-Lite (2026-09-18, https://ai.google.dev/gemini-api/docs/changelog).";
+const GEMINI_LATEST_ALIAS: &str = "A floating alias Google hot-swaps with each release (https://ai.google.dev/gemini-api/docs/models); the table lists the models themselves.";
+const GEMINI_DEEP_RESEARCH: &str = "A Deep Research managed agent, not a chat model, per https://ai.google.dev/gemini-api/docs/deprecations.";
+const GEMINI_3_1_PRO: &str = "A preview overtaken by stable gemini-4-argon, which costs less and which Google calls its most capable model (https://ai.google.dev/gemini-api/docs/pricing).";
+const GEMMA_4: &str = "An open-weight Gemma model the Gemini API also serves (2026-04-02, https://ai.google.dev/gemini-api/docs/changelog); the table lists Gemini models.";
+const OPENAI_GPT_4O: &str = "GPT-4o snapshots shut down Jan 14, 2027, replaced by gpt-6-luna, which the table lists (https://developers.openai.com/api/docs/deprecations).";
+const OPENAI_DEC_2026: &str = "Deprecated, shuts down Dec 11, 2026, replaced by the gpt-5.6 models the table lists (https://developers.openai.com/api/docs/deprecations).";
+const XAI_GROK_4_20: &str = "Superseded by grok-4.3 at the same price and window; xAI sends code to Grok 4.7 (https://docs.x.ai/developers/models).";
+const MINISTRAL_EDGE: &str = "A small edge model; Ministral 3 14B, which the table lists, covers the family (https://docs.mistral.ai/getting-started/models/models_overview/).";
+const CODESTRAL: &str = "A code-completion (FIM) model; Mistral sends coding agents to Medium 3.5, which the table lists (https://docs.mistral.ai/models/codestral-25-08).";
+const VOXTRAL: &str =
+    "An audio-input model with a 32k window (https://docs.mistral.ai/models/voxtral-small-25-07).";
+const ZAI_TURBO: &str = "No longer on Z.AI's pricing page or chat API model list (https://docs.z.ai/guides/overview/pricing).";
+const MISTRAL_ONE_M: &str = "Mistral's model pages say \"1M\" (https://docs.mistral.ai/models.md), and `/v1/models` reports the exact window at runtime.";
+const ZAI_200K: &str =
+    "Z.AI's model pages say 200K and count K as 1,000 (https://docs.z.ai/guides/llm/glm-5).";
+const DEEPSEEK_ONE_M: &str =
+    "DeepSeek's pricing page says 1M (https://api-docs.deepseek.com/quick_start/pricing).";
+const COPILOT_OUTPUT: &str = "GitHub publishes no output limit (https://docs.github.com/en/copilot/reference/ai-models/supported-models); Copilot's `/models` replaces it at runtime.";
 const LEAD_NOT_SOURCE: &str = "models.dev is a lead, not a source: confirm every row on the provider's own model card, pricing, or deprecation page before changing a table. A divergence that is deliberate goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs` with the value shown here and the reason.";
 
 /// What a finding is about. Each one is a column of a table entry, except
@@ -97,49 +116,326 @@ pub struct Accepted {
     pub reason: &'static str,
 }
 
-pub const ACCEPTED: &[Accepted] = &[
+const fn unlisted(
+    provider: &'static str,
+    model: &'static str,
+    released: &'static str,
+    reason: &'static str,
+) -> Accepted {
     Accepted {
-        provider: "google",
-        model: "gemini-2.5-computer-use-preview-10-2025",
+        provider,
+        model,
         field: Field::Unlisted,
-        catalog: "2025-10-07",
-        reason: "Retired July 28, 2026 per https://ai.google.dev/gemini-api/docs/deprecations. Keep the shutdown selector out of the table.",
-    },
+        catalog: released,
+        reason,
+    }
+}
+
+const fn diverges(
+    provider: &'static str,
+    model: &'static str,
+    field: Field,
+    catalog: &'static str,
+    reason: &'static str,
+) -> Accepted {
     Accepted {
-        provider: "google",
-        model: "gemini-4-argon",
-        field: Field::MaxOutput,
-        catalog: "32768",
-        reason: "Google's model page (ai.google.dev/gemini-api/docs/models) gives Gemini 4 Argon 65,536 output tokens.",
-    },
-    Accepted {
-        provider: "xai",
-        model: "grok-4.7",
-        field: Field::Tiers,
-        catalog: "above 200000: 4 / 12 / 1 / 0",
-        reason: XAI_LONG_PROMPT,
-    },
-    Accepted {
-        provider: "xai",
-        model: "grok-4.6",
-        field: Field::Tiers,
-        catalog: "above 200000: 4 / 12 / 1 / 0",
-        reason: XAI_LONG_PROMPT,
-    },
-    Accepted {
-        provider: "xai",
-        model: "grok-4.5",
-        field: Field::Tiers,
-        catalog: "above 200000: 4 / 12 / 0.6 / 0",
-        reason: XAI_LONG_PROMPT,
-    },
-    Accepted {
-        provider: "xai",
-        model: "grok-4.3",
-        field: Field::Tiers,
-        catalog: "above 200000: 2.5 / 5 / 0.4 / 0",
-        reason: XAI_LONG_PROMPT,
-    },
+        provider,
+        model,
+        field,
+        catalog,
+        reason,
+    }
+}
+
+pub const ACCEPTED: &[Accepted] = &[
+    unlisted(
+        "google",
+        "gemini-2.5-computer-use-preview-10-2025",
+        "2025-10-07",
+        "Retired July 28, 2026 per https://ai.google.dev/gemini-api/docs/deprecations. Keep the shutdown selector out of the table.",
+    ),
+    unlisted(
+        "google",
+        "deep-research-max-preview-04-2026",
+        "2026-04-21",
+        GEMINI_DEEP_RESEARCH,
+    ),
+    unlisted(
+        "google",
+        "deep-research-preview-04-2026",
+        "2026-04-21",
+        GEMINI_DEEP_RESEARCH,
+    ),
+    unlisted(
+        "google",
+        "gemini-2.5-flash",
+        "2025-06-17",
+        GEMINI_2_5_LIMITED,
+    ),
+    unlisted(
+        "google",
+        "gemini-2.5-flash-lite",
+        "2025-06-17",
+        GEMINI_2_5_LIMITED,
+    ),
+    unlisted("google", "gemini-2.5-pro", "2025-06-17", GEMINI_2_5_LIMITED),
+    unlisted(
+        "google",
+        "gemini-3-flash-preview",
+        "2025-12-17",
+        "A preview Google replaces with gemini-3.6-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
+    ),
+    unlisted(
+        "google",
+        "gemini-3.1-flash-lite",
+        "2026-05-07",
+        "Shuts down May 7, 2027; Google names gemini-3.5-flash-lite, which the table lists, as its replacement (https://ai.google.dev/gemini-api/docs/deprecations).",
+    ),
+    unlisted(
+        "google",
+        "gemini-3.1-flash-lite-image",
+        "2026-06-30",
+        "Nano Banana 2 Lite, an image generation model (https://ai.google.dev/gemini-api/docs/models).",
+    ),
+    unlisted(
+        "google",
+        "gemini-3.1-flash-live-preview",
+        "2026-03-26",
+        "A Live audio preview that shuts down Nov 17, 2026 (https://ai.google.dev/gemini-api/docs/deprecations).",
+    ),
+    unlisted(
+        "google",
+        "gemini-3.1-pro-preview",
+        "2026-02-19",
+        GEMINI_3_1_PRO,
+    ),
+    unlisted(
+        "google",
+        "gemini-3.1-pro-preview-customtools",
+        "2026-02-19",
+        GEMINI_3_1_PRO,
+    ),
+    unlisted(
+        "google",
+        "gemini-3.5-flash",
+        "2026-05-19",
+        "Deprecated 2026-10-08; the API serves its requests with gemini-3.6-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
+    ),
+    unlisted(
+        "google",
+        "gemini-3.7-flash",
+        "2026-08-13",
+        "Deprecated 2026-10-08; the API serves its requests with gemini-3.8-flash, which the table lists (https://ai.google.dev/gemini-api/docs/deprecations).",
+    ),
+    unlisted(
+        "google",
+        "gemini-flash-latest",
+        "2026-08-13",
+        GEMINI_LATEST_ALIAS,
+    ),
+    unlisted(
+        "google",
+        "gemini-flash-lite-latest",
+        "2026-07-21",
+        GEMINI_LATEST_ALIAS,
+    ),
+    unlisted(
+        "google",
+        "gemini-pro-latest",
+        "2026-02-19",
+        GEMINI_LATEST_ALIAS,
+    ),
+    unlisted("google", "gemma-4-26b-a4b-it", "2026-04-02", GEMMA_4),
+    unlisted("google", "gemma-4-31b-it", "2026-04-02", GEMMA_4),
+    unlisted("openai", "gpt-4o", "2024-05-13", OPENAI_GPT_4O),
+    unlisted("openai", "gpt-4o-2024-08-06", "2024-08-06", OPENAI_GPT_4O),
+    unlisted("openai", "gpt-4o-2024-11-20", "2024-11-20", OPENAI_GPT_4O),
+    unlisted("openai", "gpt-4o-mini", "2024-07-18", OPENAI_GPT_4O),
+    unlisted("openai", "gpt-5", "2025-08-07", OPENAI_DEC_2026),
+    unlisted("openai", "gpt-5-mini", "2025-08-07", OPENAI_DEC_2026),
+    unlisted("openai", "gpt-5-nano", "2025-08-07", OPENAI_DEC_2026),
+    unlisted("openai", "gpt-5-pro", "2025-10-06", OPENAI_DEC_2026),
+    unlisted(
+        "openai",
+        "gpt-5.1",
+        "2025-11-13",
+        "Deprecated, shuts down Apr 1, 2027, replaced by gpt-6-sol, which the table lists (https://developers.openai.com/api/docs/deprecations).",
+    ),
+    unlisted(
+        "openai",
+        "gpt-5.3-codex-spark",
+        "2026-02-05",
+        "A Codex research preview for ChatGPT Pro, absent from https://developers.openai.com/api/docs/models and the API pricing page.",
+    ),
+    unlisted(
+        "openai",
+        "gpt-daybreak-blue-latest",
+        "2026-08-07",
+        "A deprecated cyber alias of gpt-5.6-sol, which the table lists (https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest).",
+    ),
+    unlisted(
+        "openai",
+        "gpt-daybreak-red-latest",
+        "2026-08-07",
+        "A deprecated alias of gpt-5.6-cyber, a model for authorized security research (https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest).",
+    ),
+    unlisted(
+        "openai",
+        "gpt-realtime-2.1",
+        "2026-07-06",
+        "A speech-to-speech model served only on the Realtime endpoint (https://developers.openai.com/api/docs/models/gpt-realtime-2.1).",
+    ),
+    unlisted(
+        "xai",
+        "grok-4.20-0309-non-reasoning",
+        "2026-03-09",
+        XAI_GROK_4_20,
+    ),
+    unlisted(
+        "xai",
+        "grok-4.20-0309-reasoning",
+        "2026-03-09",
+        XAI_GROK_4_20,
+    ),
+    unlisted(
+        "xai",
+        "grok-build-0.1",
+        "2026-04-16",
+        "xAI says \"for everything else, including code, use Grok 4.7\", which the table lists (https://docs.x.ai/developers/models).",
+    ),
+    unlisted("mistral", "codestral-2508", "2025-07-30", CODESTRAL),
+    unlisted("mistral", "codestral-latest", "2024-05-29", CODESTRAL),
+    unlisted("mistral", "ministral-3b-2512", "2025-12-02", MINISTRAL_EDGE),
+    unlisted(
+        "mistral",
+        "ministral-3b-latest",
+        "2024-10-01",
+        MINISTRAL_EDGE,
+    ),
+    unlisted("mistral", "ministral-8b-2512", "2025-12-02", MINISTRAL_EDGE),
+    unlisted(
+        "mistral",
+        "ministral-8b-latest",
+        "2024-10-01",
+        MINISTRAL_EDGE,
+    ),
+    unlisted("mistral", "voxtral-small-2507", "2025-07-15", VOXTRAL),
+    unlisted("mistral", "voxtral-small-latest", "2025-07-15", VOXTRAL),
+    unlisted("zai", "glm-5-turbo", "2026-03-16", ZAI_TURBO),
+    unlisted("zai", "glm-5v-turbo", "2026-04-01", ZAI_TURBO),
+    unlisted(
+        "zai",
+        "glm-4.5v",
+        "2025-08-11",
+        "Zhipu lists no function calling for it (https://docs.bigmodel.cn/cn/guide/models/vlm/glm-4.5v), so it cannot drive tools.",
+    ),
+    diverges(
+        "xai",
+        "grok-4.3",
+        Field::MaxOutput,
+        "30000",
+        "xAI documents no output limit for Grok 4.3 (https://docs.x.ai/developers/models/grok-4.3), so the table asks for at most 131,072.",
+    ),
+    diverges(
+        "mistral",
+        "mistral-large-4",
+        Field::Context,
+        "1048576",
+        MISTRAL_ONE_M,
+    ),
+    diverges(
+        "mistral",
+        "zai-glm-5-3-flash",
+        Field::Context,
+        "1048576",
+        MISTRAL_ONE_M,
+    ),
+    diverges(
+        "mistral",
+        "zai-glm-5-3",
+        Field::Context,
+        "1048576",
+        MISTRAL_ONE_M,
+    ),
+    diverges(
+        "mistral",
+        "glm-5-2",
+        Field::Context,
+        "1048576",
+        MISTRAL_ONE_M,
+    ),
+    diverges(
+        "mistral",
+        "deepseek-v4-1-flash-1017",
+        Field::Context,
+        "1048576",
+        MISTRAL_ONE_M,
+    ),
+    diverges("zai", "glm-5", Field::Context, "204800", ZAI_200K),
+    diverges("zai", "glm-4.7", Field::Context, "204800", ZAI_200K),
+    diverges(
+        "deepseek",
+        "deepseek-flash",
+        Field::Context,
+        "1048576",
+        DEEPSEEK_ONE_M,
+    ),
+    diverges(
+        "deepseek",
+        "deepseek-v4-pro",
+        Field::Context,
+        "1048576",
+        DEEPSEEK_ONE_M,
+    ),
+    diverges(
+        "copilot",
+        "gemini-3.8-flash",
+        Field::MaxOutput,
+        "64000",
+        COPILOT_OUTPUT,
+    ),
+    diverges(
+        "copilot",
+        "claude-sonnet-4.6",
+        Field::MaxOutput,
+        "32000",
+        COPILOT_OUTPUT,
+    ),
+    diverges(
+        "google",
+        "gemini-4-argon",
+        Field::MaxOutput,
+        "32768",
+        "Google's model page (ai.google.dev/gemini-api/docs/models) gives Gemini 4 Argon 65,536 output tokens.",
+    ),
+    diverges(
+        "xai",
+        "grok-4.7",
+        Field::Tiers,
+        "above 200000: 4 / 12 / 1 / 0",
+        XAI_LONG_PROMPT,
+    ),
+    diverges(
+        "xai",
+        "grok-4.6",
+        Field::Tiers,
+        "above 200000: 4 / 12 / 1 / 0",
+        XAI_LONG_PROMPT,
+    ),
+    diverges(
+        "xai",
+        "grok-4.5",
+        Field::Tiers,
+        "above 200000: 4 / 12 / 0.6 / 0",
+        XAI_LONG_PROMPT,
+    ),
+    diverges(
+        "xai",
+        "grok-4.3",
+        Field::Tiers,
+        "above 200000: 2.5 / 5 / 0.4 / 0",
+        XAI_LONG_PROMPT,
+    ),
 ];
 
 /// A limit a table holds below what the model accepts, on purpose: a working
