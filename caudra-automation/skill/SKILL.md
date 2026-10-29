@@ -360,6 +360,8 @@ Every field not marked U is trusted. Goal conditions are trusted because `set_go
 
 These functions are a firing's only way to reach the session.
 
+`done(reason)` records a self-disarm intent, applied only when the firing completes, without dropping its queued messages. It accepts untrusted text, returns `()`, bypasses automation rate limits, counts as one action, and ignores repeated calls in the same firing.
+
 ### `message(text)` and `message(text, options)`
 
 Queues `text` for this session's model. `text` must be trusted. Returns `()`.

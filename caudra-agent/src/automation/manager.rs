@@ -219,6 +219,7 @@ struct Running {
     flight: Option<Task<()>>,
     /// One past the highest sequence number the firing journaled.
     journaled: u64,
+    done_action: Option<u64>,
 }
 
 /// How an action left the actor: answered, or handed to the HTTP client, the session's peers or
@@ -629,7 +630,9 @@ impl Manager {
                     let _ = reply.send(answer);
                 }
                 if let Some(Some(finishing)) = self.starting.remove(&fire_id) {
-                    self.finish_row(&fire_id, finishing.end).await;
+                    if let Some(name) = self.finish_row(&fire_id, finishing.end).await {
+                        self.finish_done(&name).await;
+                    }
                     self.publish(&finishing.automation);
                 }
             }
@@ -2049,6 +2052,7 @@ impl Manager {
                 operations: 0,
                 state_patch: None,
                 commit: None,
+                done_action: None,
             };
             self.finish_row(&fire_id, end).await;
             return;
@@ -2068,6 +2072,7 @@ impl Manager {
                 started,
                 flight: None,
                 journaled,
+                done_action: None,
             },
         );
         self.publish(&name);
@@ -2165,6 +2170,12 @@ impl Manager {
                     Some(fire_id),
                 )
                 .await;
+                Ok(ActionReply::Done)
+            }
+            ActionRequest::Done { .. } => {
+                if let Some(running) = self.running.get_mut(fire_id) {
+                    running.done_action.get_or_insert(seq);
+                }
                 Ok(ActionReply::Done)
             }
             ActionRequest::Log { .. } => Ok(ActionReply::Done),
@@ -2500,16 +2511,24 @@ impl Manager {
         }
     }
 
-    async fn finished(&mut self, fire_id: &str, outcome: FiringOutcome) {
+    async fn finished(&mut self, fire_id: &str, mut outcome: FiringOutcome) {
         let Some(Running {
             queued,
             revision,
             journaled,
+            done_action,
+            stop,
             ..
         }) = self.running.remove(fire_id)
         else {
             return;
         };
+        if let Some(interruption) = stop.get()
+            && outcome.end.commits()
+        {
+            outcome.end = FiringEnd::Interrupted(interruption);
+            outcome.state = None;
+        }
         let name = queued.summary.automation.clone();
         match disposition(&outcome.end, queued.summary.trigger) {
             Disposition::Defer(until) => self.defer(queued, journaled, until).await,
@@ -2525,6 +2544,7 @@ impl Manager {
                         expected_revision: revision,
                         state: change.state.to_string(),
                     }),
+                    done_action: done_action.filter(|_| outcome.end.commits()),
                 };
                 match self.starting.get_mut(fire_id) {
                     Some(finishing) => {
@@ -2533,12 +2553,33 @@ impl Manager {
                             end,
                         });
                     }
-                    None => self.finish_row(fire_id, end).await,
+                    None => {
+                        if let Some(name) = self.finish_row(fire_id, end).await {
+                            self.finish_done(&name).await;
+                        }
+                    }
                 }
                 self.record_outcome(&name, &outcome).await;
             }
         }
         self.publish(&name);
+    }
+
+    async fn finish_done(&mut self, name: &str) {
+        self.parked.retain(|parked| parked.name != name);
+        let Some(armed) = self.armed.remove(name) else {
+            return;
+        };
+        self.work.disarm(name);
+        self.watch();
+        for queued in armed.queue {
+            self.end_waiting(
+                queued.summary,
+                FiringStatus::Dropped,
+                Some(DISARMED.to_owned()),
+            )
+            .await;
+        }
     }
 
     /// Puts a one-shot event a limit refused back at the head of its queue until `until`.
@@ -2615,6 +2656,7 @@ impl Manager {
             operations: 0,
             state_patch: None,
             commit: None,
+            done_action: None,
         };
         self.finish_row(&summary.fire_id, end).await;
     }
@@ -2622,13 +2664,13 @@ impl Manager {
     /// Records a firing's final status and shows the row storage kept, which may have absorbed
     /// the automation's previous quiet skip. An ending that does not keep the firing's consumed
     /// message hands it back.
-    async fn finish_row(&mut self, fire_id: &str, end: AutomationFiringEnd) {
+    async fn finish_row(&mut self, fire_id: &str, end: AutomationFiringEnd) -> Option<String> {
         let store = self.shared.store.clone();
         let finished = match store.finish_firing(fire_id.to_owned(), end).await {
             Ok(finished) => finished,
             Err(error) => {
                 warn!(session = %self.shared.session_id, fire_id, %error, "automation firing not finished");
-                return;
+                return None;
             }
         };
         if let Some(delivery) = finished.release {
@@ -2644,6 +2686,7 @@ impl Manager {
                 warn!(session = %self.shared.session_id, fire_id, %error, "automation firing not reloaded");
             }
         }
+        finished.disarmed
     }
 
     fn show_firing(&mut self, summary: FiringSummary, absorbed: Option<String>) {
@@ -3489,6 +3532,7 @@ mod tests {
     const GOAL: &str = "the tests pass";
     const MESSAGE: &str = "check CI";
     const PAUSE_REASON: &str = "enough";
+    const DONE_REASON: &str = "sent";
     const FAILURE: &str = "boom";
     const SEEN_KEY: &str = "seen";
     const TOOL: &str = "shell";
@@ -5194,6 +5238,325 @@ state.seen = seen;"#
                 seen(&[expected.to_owned()])
             );
             live.stop().await;
+        });
+    }
+
+    #[test_case("", FiringStatus::Completed; "runs_to_end")]
+    #[test_case("return;", FiringStatus::Completed; "returns")]
+    #[test_case(r#"skip("sent");"#, FiringStatus::Skipped; "skips")]
+    fn done_disarms_only_its_caller_and_keeps_deliveries(ending: &str, status: FiringStatus) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(COURIER, &[ARMED, GOAL_FINISHED, CONSUMING], &[], &format!(
+                r#"{RECORD_BODY} message("{MESSAGE}"); done("{DONE_REASON}"); {HOLD_BODY} {ending}"#
+            ));
+            fixture.script(WORKER, &[IDLE], &[], RECORD_BODY);
+            let live = fixture.spawn(&[COURIER, WORKER]).await;
+            let fire_id = live.held().await;
+            let _calls = live.attach(Answers::default());
+            let peer = FakePeer::default();
+            assert_eq!(live.offer(&from_lead(&peer, 0)).as_deref(), Some(COURIER));
+            live.signal(goal_finished());
+            live.barrier().await;
+            assert!(live.snapshot(COURIER).armed.is_some());
+            let queued = live
+                .firings(COURIER)
+                .into_iter()
+                .find(|firing| firing.trigger == TriggerKind::GoalFinished)
+                .unwrap();
+            live.release();
+            live.firing(COURIER, status).await;
+            live.barrier().await;
+            assert!(live.snapshot(COURIER).armed.is_none());
+            assert!(live.snapshot(WORKER).armed.is_some());
+            assert!(live.offer(&from_lead(&peer, 1)).is_none());
+            assert_eq!(
+                live.detail(&queued.fire_id).await.firing.status,
+                FiringStatus::Dropped
+            );
+            assert_eq!(
+                live.action_body(&fire_id, 1).await.request,
+                json!({
+                    "kind": "done", "reason": DONE_REASON
+                })
+            );
+            assert_eq!(live.trace(&fire_id).await[1].kind, ActionKind::Done);
+            assert!(
+                live.claim(DeliveryGate {
+                    settled: false,
+                    ..fixture.gate()
+                })
+                .await
+                .is_none()
+            );
+            live.stop().await;
+
+            let restored = fixture.spawn(&[]).await;
+            assert!(restored.snapshot(COURIER).armed.is_none());
+            assert!(restored.snapshot(WORKER).armed.is_some());
+            assert_eq!(
+                restored.claim(fixture.gate()).await.map(|claim| claim.text),
+                Some(MESSAGE.to_owned())
+            );
+            assert_eq!(
+                restored.state_of(COURIER).await.value,
+                seen(&[spelled(ArmedReason::Launch)])
+            );
+            restored
+                .handle
+                .request(AutomationRequest::Arm {
+                    name: COURIER.into(),
+                    args: None,
+                    origin: ArmOrigin::Manual,
+                })
+                .await
+                .unwrap();
+            restored.held().await;
+            assert!(restored.snapshot(COURIER).armed.is_some());
+            restored.release();
+            restored.firing(COURIER, status).await;
+            assert_eq!(
+                restored.state_of(COURIER).await.value,
+                seen(&[spelled(ArmedReason::Launch), spelled(ArmedReason::Manual)])
+            );
+            restored.stop().await;
+        });
+    }
+
+    #[test_case(r#"throw "boom";"#; "script_failure")]
+    #[test_case("message(event.session.title);"; "stopped")]
+    #[test_case(r#"message("check CI", #{ delivery: "now" });"#; "message_failure")]
+    fn done_is_not_applied_after_a_failure(ending: &str) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(
+                COURIER,
+                &[ARMED],
+                &[],
+                &format!(r#"{RECORD_BODY} done("{DONE_REASON}"); {ending}"#),
+            );
+            let live = fixture.spawn(&[COURIER]).await;
+            let firing = live.firing(COURIER, FiringStatus::Failed).await;
+            live.barrier().await;
+            assert!(live.snapshot(COURIER).armed.is_some());
+            assert_eq!(live.state_of(COURIER).await.value, json!({}));
+            assert_eq!(live.trace(&firing.fire_id).await[0].kind, ActionKind::Done);
+            live.stop().await;
+        });
+    }
+
+    #[test_case(Interruption::Paused; "paused")]
+    #[test_case(Interruption::Shutdown; "shutdown")]
+    fn done_is_not_applied_after_interruption(interruption: Interruption) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(
+                COURIER,
+                &[ARMED],
+                &[],
+                &format!(r#"{RECORD_BODY} done("{DONE_REASON}"); {HOLD_BODY}"#),
+            );
+            let live = fixture.spawn(&[COURIER]).await;
+            let fire_id = live.held().await;
+            if interruption == Interruption::Paused {
+                live.handle
+                    .request(AutomationRequest::Pause {
+                        by: PauseSource::Inspector,
+                    })
+                    .await
+                    .unwrap();
+                live.release();
+                live.firing(COURIER, FiringStatus::Cancelled).await;
+                live.stop().await;
+            } else {
+                live.interrupt().await;
+            }
+            let store =
+                AutomationStore::spawn(fixture.state_dir.clone(), fixture.session.id).unwrap();
+            let binding = store.load_binding(COURIER.into()).await.unwrap().unwrap();
+            assert!(binding.binding.armed);
+            assert_eq!(binding.state.value, json!({}));
+            assert!(
+                !store
+                    .load_summary(fire_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_pending()
+            );
+            store.shutdown().await;
+        });
+    }
+
+    #[test_case(() ; "deferred_attempt")]
+    fn done_from_a_deferred_attempt_does_not_disarm_a_later_completion(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(COURIER, &[ARMED, GOAL_FINISHED], &[COOLDOWN], &format!(
+                r#"if event.trigger != "armed" && !(state.{SEEN_KEY} ?? false) {{ done("{DONE_REASON}"); }}
+{NOTIFY_BODY}"#
+            ));
+            let live = fixture.spawn(&[COURIER]).await;
+            live.firing(COURIER, FiringStatus::Completed).await;
+            live.signal(goal_finished());
+            let deferred = live.firing(COURIER, FiringStatus::Deferred).await;
+            let state = live.state_of(COURIER).await;
+            assert!(live.snapshot(COURIER).armed.is_some());
+            live.handle
+                .request(AutomationRequest::SetState {
+                    name: COURIER.into(),
+                    expected_revision: state.revision,
+                    state: json!({ SEEN_KEY: true }),
+                })
+                .await
+                .unwrap();
+            fixture.clock.advance(COOLDOWN_DELAY);
+            let completed = live.firing(COURIER, FiringStatus::Completed).await;
+            live.barrier().await;
+            assert_eq!(completed.fire_id, deferred.fire_id);
+            assert!(live.snapshot(COURIER).armed.is_some());
+            assert_eq!(
+                live.trace(&completed.fire_id)
+                    .await
+                    .iter()
+                    .map(|action| action.kind)
+                    .collect::<Vec<_>>(),
+                [ActionKind::Done, ActionKind::Notify]
+            );
+            live.stop().await;
+        });
+    }
+
+    #[test_case(false; "before_commit")]
+    #[test_case(true; "after_commit_before_runtime_cleanup")]
+    fn done_survives_restart_iff_its_firing_committed(committed: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(COURIER, &[IDLE, GOAL_FINISHED], &[], "");
+            fixture.script(WORKER, &[IDLE], &[], "");
+            let (mut manager, boot) = Manager::open(fixture.deps(&[])).await.unwrap();
+            manager.rescan();
+            for name in [COURIER, WORKER] {
+                manager
+                    .install(name, None, ArmOrigin::Manual, ArmedReason::Manual)
+                    .await
+                    .unwrap();
+            }
+            let SessionSignal::Settled(idle) = settled() else {
+                unreachable!()
+            };
+            let queued = manager
+                .record(COURIER, 0, EventDetail::Idle(*idle), None, None)
+                .await
+                .unwrap();
+            let fire_id = queued.summary.fire_id;
+            let store = manager.shared.store.clone();
+            store.start_firing(fire_id.clone()).await.unwrap();
+            let requests = [
+                ActionRequest::Message(MessageRequest {
+                    text: MESSAGE.into(),
+                    attach: None,
+                    delivery: DeliveryMode::Next,
+                    expires: None,
+                }),
+                ActionRequest::Done {
+                    reason: DONE_REASON.into(),
+                },
+            ];
+            for (seq, request) in requests.into_iter().enumerate() {
+                let kind = request.kind();
+                let journal = request.to_journal();
+                store
+                    .start_action(NewAutomationAction {
+                        fire_id: fire_id.clone(),
+                        seq: seq as u64,
+                        kind: kind.to_row(),
+                        line: None,
+                        column: None,
+                        request_hash: request_hash(&journal),
+                        request: journal.to_string(),
+                        status: if kind.delivers() {
+                            ActionStatus::Queued
+                        } else {
+                            ActionStatus::Running
+                        }
+                        .to_row(),
+                        delivery: kind.delivers().then_some(DeliveryMode::Next.to_row()),
+                        expires_ms: None,
+                    })
+                    .await
+                    .unwrap();
+                if !kind.delivers() {
+                    store
+                        .finish_action(
+                            fire_id.clone(),
+                            seq as u64,
+                            action_end(ActionStatus::Done, None),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            manager.signal(goal_finished()).await;
+            if committed {
+                let state = seen(&[DONE_REASON.to_owned()]).to_string();
+                let finished = store
+                    .finish_firing(
+                        fire_id.clone(),
+                        AutomationFiringEnd {
+                            status: FiringStatus::Completed.to_row(),
+                            reason: None,
+                            error: None,
+                            operations: 0,
+                            state_patch: Some(state.clone()),
+                            commit: Some(StateCommit {
+                                expected_revision: 0,
+                                state,
+                            }),
+                            done_action: Some(1),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(finished.disarmed.as_deref(), Some(COURIER));
+                assert!(manager.armed.contains_key(COURIER));
+            }
+            store.shutdown().await;
+            drop(manager);
+            drop(boot);
+
+            let restored = fixture.spawn(&[]).await;
+            restored.barrier().await;
+            assert_eq!(restored.snapshot(COURIER).armed.is_none(), committed);
+            assert!(restored.snapshot(WORKER).armed.is_some());
+            assert_eq!(
+                restored.detail(&fire_id).await.firing.status,
+                if committed {
+                    FiringStatus::Completed
+                } else {
+                    FiringStatus::Interrupted
+                }
+            );
+            assert_eq!(
+                restored.state_of(COURIER).await.value,
+                if committed {
+                    seen(&[DONE_REASON.to_owned()])
+                } else {
+                    json!({})
+                }
+            );
+            if committed {
+                assert!(restored.firings(COURIER).iter().any(|firing| {
+                    firing.trigger == TriggerKind::GoalFinished
+                        && firing.status == FiringStatus::Dropped
+                }));
+            }
+            assert_eq!(
+                restored.claim(fixture.gate()).await.map(|claim| claim.text),
+                Some(MESSAGE.into())
+            );
+            restored.stop().await;
         });
     }
 
@@ -8079,6 +8442,7 @@ publish("{STATUS_TOPIC}", "{ANSWER}");
 broadcast("{ANSWER}");
 start_workflow("{WORKFLOW}", #{{}});
 pause_automations("{PAUSE_REASON}");
+done("{DONE_REASON}");
 {HOLD_BODY}"#,
                 get = get_body(API_URL),
             )
@@ -8117,6 +8481,7 @@ pause_automations("{PAUSE_REASON}");
                 operations: 0,
                 state_patch: None,
                 commit: None,
+                done_action: None,
             };
             store.finish_firing(SEEDED.to_owned(), end).await.unwrap();
             store.shutdown().await;
@@ -8290,6 +8655,7 @@ pause_automations("{PAUSE_REASON}");
                             Some(DRY_RUN_ID)
                         ),
                         (ActionKind::Pause, Answer::Recorded, None),
+                        (ActionKind::Done, Answer::Recorded, None),
                         (ActionKind::Log, Answer::Recorded, None),
                     ],
                     "{ANSWERED}"

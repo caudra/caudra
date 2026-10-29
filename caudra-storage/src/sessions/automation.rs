@@ -397,6 +397,7 @@ text_enum! {
         Broadcast = "broadcast",
         StartWorkflow = "start_workflow",
         Pause = "pause",
+        Done = "done",
         Log = "log",
     }
 }
@@ -593,6 +594,8 @@ pub struct AutomationFiringEnd {
     pub operations: u64,
     pub state_patch: Option<String>,
     pub commit: Option<StateCommit>,
+    /// The `done` action from this attempt, never an earlier deferred attempt.
+    pub done_action: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,6 +613,7 @@ pub struct FiringFinished {
     /// The delivery of the consumed message an ending that does not keep it
     /// hands back. The row holds it until the release succeeds.
     pub release: Option<String>,
+    pub disarmed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1268,11 +1272,33 @@ impl SessionDatabase {
         } else {
             None
         };
+        let disarmed = if let Some(seq) = end.done_action.filter(|_| end.status.completes()) {
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE automation_bindings SET armed = 0, updated_ms = {NOW_MS} \
+                 WHERE session_id = ?1 AND automation = ?2 AND EXISTS (\
+                     SELECT 1 FROM automation_actions \
+                     WHERE fire_id = ?3 AND seq = ?4 AND kind = ?5 AND status = ?6)"
+                ),
+                params![
+                    firing.session_id.as_bytes().as_slice(),
+                    firing.automation,
+                    fire_id,
+                    to_i64(seq, "automation_actions.seq")?,
+                    AutomationActionKind::Done.as_str(),
+                    AutomationActionStatus::Done.as_str(),
+                ],
+            )?;
+            (changed > 0).then_some(firing.automation)
+        } else {
+            None
+        };
         transaction.commit()?;
         Ok(FiringFinished {
             state,
             absorbed,
             release: firing.delivery.filter(|_| !keeps),
+            disarmed,
         })
     }
 
@@ -2355,6 +2381,10 @@ mod tests {
         "an ephemeral store and the persistent one must never list each other's sessions";
     const NOT_REFUSED: &str = "expected an invalid input refusal";
     const NOT_MISSING: &str = "expected a not found error";
+    const DONE_REQUEST: &str = r#"{"kind":"done","reason":"sent"}"#;
+    const FAIL_DISARM: &str = "CREATE TEMP TRIGGER fail_disarm BEFORE UPDATE OF armed ON automation_bindings \
+        BEGIN SELECT RAISE(ABORT, 'disarm failed'); END";
+    const ALLOW_DISARM: &str = "DROP TRIGGER fail_disarm";
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct TestMessage(String);
@@ -2456,6 +2486,116 @@ mod tests {
         }
     }
 
+    #[test_case(AutomationFiringStatus::Completed, true; "completed")]
+    #[test_case(AutomationFiringStatus::Skipped, true; "skipped")]
+    #[test_case(AutomationFiringStatus::Released, true; "released")]
+    #[test_case(AutomationFiringStatus::Failed, false; "failed")]
+    #[test_case(AutomationFiringStatus::Cancelled, false; "cancelled")]
+    #[test_case(AutomationFiringStatus::Interrupted, false; "interrupted")]
+    fn done_disarms_only_a_completed_firing(status: AutomationFiringStatus, disarmed: bool) {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        database
+            .upsert_automation_binding(&arming(session_id, OTHER_AUTOMATION))
+            .unwrap();
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        let action = NewAutomationAction {
+            kind: AutomationActionKind::Done,
+            request: DONE_REQUEST.into(),
+            ..http(FIRE_ID, 0)
+        };
+        database.start_automation_action(&action).unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 0, &done(None))
+            .unwrap();
+        let finished = database
+            .finish_automation_firing(
+                FIRE_ID,
+                &AutomationFiringEnd {
+                    done_action: Some(0),
+                    ..end(status)
+                },
+            )
+            .unwrap();
+        assert_eq!(finished.disarmed.as_deref(), disarmed.then_some(AUTOMATION));
+        assert_eq!(
+            database
+                .load_automation_binding(session_id, AUTOMATION)
+                .unwrap()
+                .unwrap()
+                .armed,
+            !disarmed
+        );
+        assert!(
+            database
+                .load_automation_binding(session_id, OTHER_AUTOMATION)
+                .unwrap()
+                .unwrap()
+                .armed
+        );
+        let stored = database
+            .load_automation_action(FIRE_ID, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.summary.kind, AutomationActionKind::Done);
+        assert_eq!(stored.request, DONE_REQUEST);
+    }
+
+    #[test_case(() ; "atomic_commit")]
+    fn a_failed_done_disarm_rolls_back_the_firing_and_state(_: ()) {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .upsert_automation_binding(&arming(session_id, AUTOMATION))
+            .unwrap();
+        running(
+            &database,
+            &firing(session_id, FIRE_ID, AutomationTrigger::Idle),
+        );
+        database
+            .start_automation_action(&NewAutomationAction {
+                kind: AutomationActionKind::Done,
+                request: DONE_REQUEST.into(),
+                ..http(FIRE_ID, 0)
+            })
+            .unwrap();
+        database
+            .finish_automation_action(FIRE_ID, 0, &done(None))
+            .unwrap();
+        let end = AutomationFiringEnd {
+            done_action: Some(0),
+            ..committing(0, STATE)
+        };
+        database.connection().execute_batch(FAIL_DISARM).unwrap();
+        assert!(database.finish_automation_firing(FIRE_ID, &end).is_err());
+        assert_eq!(
+            summary(&database, FIRE_ID).status,
+            AutomationFiringStatus::Running
+        );
+        let binding = database
+            .load_automation_binding(session_id, AUTOMATION)
+            .unwrap()
+            .unwrap();
+        assert!(binding.armed);
+        assert_eq!(binding.state, EMPTY_OBJECT);
+        database.connection().execute_batch(ALLOW_DISARM).unwrap();
+        database.finish_automation_firing(FIRE_ID, &end).unwrap();
+        let binding = database
+            .load_automation_binding(session_id, AUTOMATION)
+            .unwrap()
+            .unwrap();
+        assert!(!binding.armed);
+        assert_eq!(binding.state, STATE);
+        assert_eq!(
+            summary(&database, FIRE_ID).status,
+            AutomationFiringStatus::Completed
+        );
+    }
+
     fn end(status: AutomationFiringStatus) -> AutomationFiringEnd {
         AutomationFiringEnd {
             status,
@@ -2464,6 +2604,7 @@ mod tests {
             operations: 0,
             state_patch: None,
             commit: None,
+            done_action: None,
         }
     }
 

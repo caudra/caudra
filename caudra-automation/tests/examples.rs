@@ -581,6 +581,7 @@ fn success(request: &ActionRequest) -> ActionReply {
         ActionRequest::Message(_)
         | ActionRequest::Notify { .. }
         | ActionRequest::Pause { .. }
+        | ActionRequest::Done { .. }
         | ActionRequest::Log { .. } => ActionReply::Done,
     }
 }

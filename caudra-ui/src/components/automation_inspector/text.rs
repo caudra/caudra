@@ -106,6 +106,7 @@ pub(super) fn action_text(kind: ActionKind) -> &'static str {
         ActionKind::Broadcast => "broadcast",
         ActionKind::StartWorkflow => "start_workflow",
         ActionKind::Pause => "pause_automations",
+        ActionKind::Done => "done",
         ActionKind::Log => "log",
     }
 }

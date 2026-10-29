@@ -158,7 +158,7 @@ mirrored! {
     }
     StateOutcome = AutomationStateOutcome { Committed, Conflict }
     ActionKind = AutomationActionKind {
-        Message, SetGoal, Notify, Http, Reply, Send, Publish, Broadcast, StartWorkflow, Pause, Log,
+        Message, SetGoal, Notify, Http, Reply, Send, Publish, Broadcast, StartWorkflow, Pause, Done, Log,
     }
     ActionStatus = AutomationActionStatus {
         Running, Done, Failed, Refused, Queued, Delivered, Deduplicated, Dropped, Expired,
@@ -1217,6 +1217,7 @@ mod tests {
             operations: OPERATIONS,
             state_patch: None,
             commit: None,
+            done_action: None,
         }
     }
 
