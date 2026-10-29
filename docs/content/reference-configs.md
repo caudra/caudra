@@ -396,6 +396,13 @@ version = 5
 # Type: bool.
 # summarize_memory = true
 
+# Remind the main agent to save a memory note after a failed command passes, a
+# long search ends in an edit, the user corrects it, or the context nears
+# compaction. Reminders thin out as the project's notes grow and stop once the
+# agent saves notes without them.
+# Type: bool.
+# memory_nudges = true
+
 # Block a write to a file that changed on disk since it was read, and point a
 # failed edit or patch at the change.
 # Type: bool.
@@ -1116,6 +1123,13 @@ version = 5
 # notes. Modes: off, shadow, advise.
 # Type: string.
 # memory_duplicates = "off"
+
+# Judge whether a new user message corrects the agent or states a rule for the
+# project. When it does and `agent.memory_nudges` allows a reminder, the agent
+# is reminded to save a note. Sends redacted excerpts of the message and of the
+# reply before it. Modes: off, shadow, advise.
+# Type: string.
+# memory_nudge = "off"
 
 # During compaction, keep the tool results most relevant to the active goal,
 # open todos, and latest request instead of only the newest, and keep the most
