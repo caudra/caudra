@@ -57,8 +57,8 @@ use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
 use crate::tools::native::memory;
 use crate::tools::native::plan::PlanTarget;
 use crate::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalTools, MEMORY_TOOL_NAME, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    Deadline, DescriptionContext, LocalTools, MEMORY_TOOL_NAME, ToolAudience, ToolContext,
+    ToolFilter, ToolLive,
 };
 use crate::types::counted;
 use crate::{
@@ -1977,44 +1977,16 @@ fn build(
         report_ready: None,
         terminal_report: None,
         params: AgentParams {
-            provider: resolved.provider,
-            model: resolved.model,
-            chat_provider: Arc::clone(&ctx.chat_provider),
-            chat_model: Model::clone(&ctx.chat_model),
-            config: ctx.config.clone(),
-            tool_output_lines: caudra_config::ToolOutputLines::default(),
-            tool_output_store: ctx.tool_output_store.clone(),
-            permissions: Arc::clone(&ctx.permissions),
-            session_id: ctx.session_id.clone(),
             cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
-            workspace_session: ctx.workspace_session.clone(),
-            remote_project_context: ctx.remote_project_context.clone(),
-            host_cwd: ctx.host_cwd.clone(),
-            local_documents: ctx.local_documents.clone(),
-            task_environment: ctx.task_environment.clone(),
-            root_tool_use_id: Some(ids.root_tool_use_id.clone()),
-            mailbox: None,
             context_publisher,
-            timeouts: ctx.timeouts,
-            file_tracker: FileReadTracker::fresh(),
-            // Shared, not fresh: a subagent tracks its own reads but must not
-            // write a file a sibling agent is writing.
-            path_locks: Arc::clone(&ctx.path_locks),
             changes: ctx.changes.clone(),
-            prompt_slots: Arc::clone(&ctx.prompt_slots),
-            prompt_profiles: Arc::clone(&ctx.prompt_profiles),
             default_task_prompt_profile_name: resolved.default_task_prompt_profile_name,
             active_prompt_profile_name: resolved.active_prompt_profile_name,
-            subagent_cancels: Arc::new(CancelMap::new()),
             subagent_history: ctx.subagent_history.clone(),
-            registry: Arc::clone(&ctx.registry),
             audience: resolved.audience,
             tool_filter,
             tool_ceiling: resolved.tool_ceiling,
             profile_tool_policy: Arc::clone(&resolved.profile_tool_policy),
-            model_policy: Arc::clone(&ctx.model_policy),
-            workflow: None,
-            background: None,
             jobs: ctx.job_scope().map(|scope| {
                 if ctx.audience == ToolAudience::MAIN
                     && matches!(scope.owner(), JobOwner::Child { .. })
@@ -2026,6 +1998,12 @@ fn build(
                 .for_task(resolved.task_id.as_str())
             }),
             task_id: Some(resolved.task_id.clone()),
+            ..AgentParams::from_context(
+                ctx,
+                resolved.provider,
+                resolved.model,
+                ids.root_tool_use_id.clone(),
+            )
         },
         system: resolved.system,
         tools: resolved.tools,

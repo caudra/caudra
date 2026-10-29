@@ -43,8 +43,9 @@ impl ContextKey {
     }
 }
 
-/// What a task's last request sent ahead of its messages, so a side question
-/// over that task continues the same cached prefix.
+/// What a conversation's last request sent ahead of its messages, so a side
+/// question over it continues the same cached prefix. A task publishes its
+/// own; the main session's host captures the main conversation's.
 pub struct RequestPrefix {
     pub provider: Arc<dyn Provider>,
     pub model: Model,

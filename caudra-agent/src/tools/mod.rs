@@ -357,10 +357,14 @@ pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";
 pub const SKILL_TOOL_NAME: &str = "skill";
+pub const SOURCE_CODE_CONTEXT_TOOL_NAME: &str = "source_code_context";
+pub const SOURCE_CODE_REFS_TOOL_NAME: &str = "source_code_refs";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_TOOL_NAME: &str = "tool_output";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
+pub const WEBFETCH_TOOL_NAME: &str = "webfetch";
+pub const WEBSEARCH_TOOL_NAME: &str = "websearch";
 pub const WORKFLOW_TOOL_NAME: &str = "workflow";
 /// The tools each experiment registers.
 const EXPERIMENTAL_TOOLS: &[(Feature, &[&str])] = &[

@@ -416,6 +416,62 @@ pub struct AgentParams {
     pub workflow: Option<WorkflowHandle>,
 }
 
+impl AgentParams {
+    /// A child run of the session `ctx` serves, on `provider` and `model`,
+    /// rooted at `root_tool_use_id`. It shares the session's stores, policy,
+    /// workspace, and file locks, but tracks its own reads and holds nothing
+    /// that reaches back into the parent run: no mailbox, context publisher,
+    /// change recorder, jobs, workflow, prompt profile, or task history. A
+    /// caller that shares one of those sets it over this.
+    pub fn from_context(
+        ctx: &ToolContext,
+        provider: Arc<dyn Provider>,
+        model: Model,
+        root_tool_use_id: String,
+    ) -> Self {
+        Self {
+            provider,
+            model,
+            chat_provider: Arc::clone(&ctx.chat_provider),
+            chat_model: Model::clone(&ctx.chat_model),
+            config: ctx.config.clone(),
+            tool_output_lines: ToolOutputLines::default(),
+            tool_output_store: ctx.tool_output_store.clone(),
+            permissions: Arc::clone(&ctx.permissions),
+            session_id: ctx.session_id.clone(),
+            cache_key: None,
+            workspace_session: ctx.workspace_session.clone(),
+            remote_project_context: ctx.remote_project_context.clone(),
+            host_cwd: ctx.host_cwd.clone(),
+            local_documents: ctx.local_documents.clone(),
+            task_environment: ctx.task_environment.clone(),
+            root_tool_use_id: Some(root_tool_use_id),
+            mailbox: None,
+            context_publisher: None,
+            timeouts: ctx.timeouts,
+            file_tracker: FileReadTracker::fresh(),
+            path_locks: Arc::clone(&ctx.path_locks),
+            changes: None,
+            prompt_slots: Arc::clone(&ctx.prompt_slots),
+            prompt_profiles: Arc::clone(&ctx.prompt_profiles),
+            default_task_prompt_profile_name: Arc::clone(&ctx.default_task_prompt_profile_name),
+            active_prompt_profile_name: None,
+            subagent_cancels: Arc::new(CancelMap::new()),
+            subagent_history: SubagentHistoryStore::default(),
+            registry: Arc::clone(&ctx.registry),
+            audience: ctx.audience,
+            tool_filter: ctx.tool_filter.clone(),
+            tool_ceiling: ctx.tool_ceiling.clone(),
+            profile_tool_policy: Arc::clone(&ctx.profile_tool_policy),
+            model_policy: Arc::clone(&ctx.model_policy),
+            workflow: None,
+            background: None,
+            jobs: None,
+            task_id: None,
+        }
+    }
+}
+
 /// See [`Agent::conversation_route`].
 pub struct ConversationRoute {
     pub provider: Arc<dyn Provider>,
@@ -583,7 +639,25 @@ pub struct Agent<'h> {
 }
 
 impl<'h> Agent<'h> {
-    pub fn new(mut params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+        Self::build(params, run, false)
+    }
+
+    /// Sends `run.tools` byte for byte, for a run that continues another
+    /// conversation's cached prefix. Nothing is stripped or reconfigured for
+    /// this run, so a declared tool it may not use is refused at dispatch.
+    pub fn new_verbatim(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+        Self::build(
+            params,
+            AgentRunParams {
+                tools_fixed: true,
+                ..run
+            },
+            true,
+        )
+    }
+
+    fn build(mut params: AgentParams, mut run: AgentRunParams<'h>, verbatim: bool) -> Self {
         let peers = if params
             .config
             .features
@@ -603,7 +677,7 @@ impl<'h> Agent<'h> {
         if peers.is_none() {
             let names = crate::tools::native::peers::TOOL_NAMES;
             params.tool_filter = params.tool_filter.excluding(names);
-            if let Some(tools) = run.tools.as_array_mut() {
+            if !verbatim && let Some(tools) = run.tools.as_array_mut() {
                 tools.retain(|tool| {
                     !tool
                         .get("name")
@@ -617,12 +691,14 @@ impl<'h> Agent<'h> {
             .jobs
             .clone()
             .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope()));
-        crate::tools::execution::configure_declared(
-            &mut run.tools,
-            &params.config,
-            params.background.is_some(),
-            jobs.is_some(),
-        );
+        if !verbatim {
+            crate::tools::execution::configure_declared(
+                &mut run.tools,
+                &params.config,
+                params.background.is_some(),
+                jobs.is_some(),
+            );
+        }
         let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
             && params.model.provider == params.chat_model.provider
             && params.model.id == params.chat_model.id;
@@ -755,6 +831,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_compaction_refresh(mut self, refresh: &'h mut dyn ContextRefresh) -> Self {
         self.compaction_refresh = Some(refresh);
+        self
+    }
+
+    pub fn with_auto_compact(mut self, enabled: bool) -> Self {
+        self.auto_compact = enabled;
         self
     }
 

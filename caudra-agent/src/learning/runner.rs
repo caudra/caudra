@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use caudra_config::{CODE_TOOL_NAME, LearningTarget};
 use caudra_providers::ModelPurpose;
-use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
+use caudra_storage::usage_ledger::LedgerPurpose;
 use futures_lite::future;
 use serde_json::Value;
 use tracing::warn;
@@ -19,18 +19,20 @@ use super::digest::Digest;
 use super::targets::{InstructionFile, heading};
 use super::{LearnerActivity, LearnerStep};
 use crate::AgentMode;
+pub use crate::agent::budget::Spend;
+use crate::agent::budget::{Overrun, RunBudget};
 use crate::agent::subagent::{TaskIdentity, TaskModel};
 use crate::agent::task_runner::{SubagentTaskRunner, TaskRequest, TaskRunner, WorkflowHostContext};
 use crate::cancel::CancelToken;
-use crate::memory::compactor::Ledger;
 use crate::subagent_history::{SubagentHistoryStore, SubagentTaskMode};
 use crate::tools::{MEMORY_TOOL_NAME, ToolFilter};
-use crate::types::{AgentEvent, EventSender, TurnCompleteEvent};
+use crate::types::{AgentEvent, EventSender};
 
 /// Tool calls one run may make before it is stopped.
 pub const MAX_TOOL_CALLS: usize = 40;
 /// Input and output tokens one run may spend before it is stopped.
 pub const MAX_TOKENS: u64 = 300_000;
+const BUDGET: RunBudget = RunBudget::new(MAX_TOOL_CALLS, MAX_TOKENS);
 pub const TOO_MANY_CALLS: &str = "the learner made too many tool calls";
 pub const TOO_MANY_TOKENS: &str = "the learner spent too many tokens";
 pub const NO_REPORT: &str = "the learner sent no report";
@@ -112,47 +114,6 @@ pub struct Ran {
     pub transcript: Option<String>,
 }
 
-/// Where a run's spend goes: an event for the runtime, and the ledger when
-/// the runtime keeps none of its own.
-#[derive(Clone)]
-pub struct Spend {
-    pub events: EventSender,
-    pub ledger: Option<Ledger>,
-}
-
-impl Spend {
-    async fn report(&self, turn: &TurnCompleteEvent) {
-        self.events.try_send(AgentEvent::ModelUsage {
-            usage: turn.usage,
-            cost: turn.cost,
-            billing: turn.billing,
-            provider: turn.provider.clone(),
-            model: turn.model.clone(),
-            purpose: LedgerPurpose::Learning,
-            account: turn.account.clone(),
-        });
-        let Some(Ledger { state, cwd }) = self.ledger.clone() else {
-            return;
-        };
-        let row = TurnUsage {
-            provider: turn.provider.clone(),
-            account: turn.account.clone().unwrap_or_default(),
-            model: turn.model.clone(),
-            cwd,
-            purpose: LedgerPurpose::Learning,
-            input: turn.usage.input,
-            output: turn.usage.output,
-            cache_creation: turn.usage.cache_creation,
-            cache_read: turn.usage.cache_read,
-            cost: turn.cost,
-            subscription: turn.billing.is_subscription(),
-        };
-        if let Err(error) = smol::unblock(move || UsageLedger::open(&state)?.record(&row)).await {
-            warn!(%error, model = %turn.model, "learner spend not recorded in the usage ledger");
-        }
-    }
-}
-
 /// Runs the learner on `host` with `prompt`, stopping it at the first cap it
 /// reaches.
 pub async fn run(
@@ -182,8 +143,7 @@ pub async fn run(
     let mut watched = Watched {
         spend,
         run_id,
-        tokens: 0,
-        calls: 0,
+        budget: BUDGET,
         transcript: None,
     };
     let mut stopped: Option<&str> = None;
@@ -212,7 +172,7 @@ pub async fn run(
     Ran {
         report,
         model: outcome.model.unwrap_or_default(),
-        tokens: watched.tokens.max(outcome.tokens_used),
+        tokens: watched.budget.tokens().max(outcome.tokens_used),
         transcript: watched.transcript,
     }
 }
@@ -223,13 +183,13 @@ pub async fn run(
 struct Watched<'a> {
     spend: &'a Spend,
     run_id: i64,
-    tokens: u64,
-    calls: usize,
+    budget: RunBudget,
     transcript: Option<String>,
 }
 
 impl Watched<'_> {
     async fn take(&mut self, event: AgentEvent) {
+        self.budget.observe(&event);
         match &event {
             AgentEvent::SubagentHistory { messages, .. } => {
                 self.transcript = serde_json::to_string(messages)
@@ -239,10 +199,8 @@ impl Watched<'_> {
                     .ok();
                 return;
             }
-            AgentEvent::ToolStart(_) => self.calls += 1,
             AgentEvent::TurnComplete(turn) => {
-                self.tokens += u64::from(turn.usage.input) + u64::from(turn.usage.output);
-                self.spend.report(turn).await;
+                self.spend.report(turn, LedgerPurpose::Learning).await;
             }
             _ => {}
         }
@@ -255,10 +213,9 @@ impl Watched<'_> {
     }
 
     fn over(&self) -> Option<&'static str> {
-        match () {
-            _ if self.calls > MAX_TOOL_CALLS => Some(TOO_MANY_CALLS),
-            _ if self.tokens > MAX_TOKENS => Some(TOO_MANY_TOKENS),
-            _ => None,
-        }
+        self.budget.overrun().map(|overrun| match overrun {
+            Overrun::ToolCalls => TOO_MANY_CALLS,
+            Overrun::Tokens => TOO_MANY_TOKENS,
+        })
     }
 }
