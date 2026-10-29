@@ -1330,6 +1330,7 @@ dependencies = [
  "caudra-models",
  "caudra-storage",
  "fastrand",
+ "flate2",
  "flume",
  "futures",
  "futures-lite",

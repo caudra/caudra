@@ -96,6 +96,19 @@ pub(crate) mod tests {
     const MESSAGE: &[u8] = b"model-file bytes\n";
     const VERIFICATION_MESSAGE: &str = "Ed25519 signature does not match the model-file bytes";
     const UNTRUSTED_MESSAGE: &str = "no trusted signing key matches key id \"21fe31dfa154a261\"";
+    const PRODUCTION_PUBLIC_KEY: &str = "OmFa847Jcms51wq0p3iNnb3Mp012XcdYD00EYH3hKpg=";
+    const PRODUCTION_KEY_ID: &str = "5370f4ad7d3650ee";
+
+    #[test]
+    fn production_trust_matches_publishing_key() {
+        let public: [u8; 32] = STANDARD
+            .decode(PRODUCTION_PUBLIC_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(crate::TRUSTED_KEYS, &[public]);
+        assert_eq!(key_id(&public), PRODUCTION_KEY_ID);
+    }
 
     fn public_key() -> [u8; 32] {
         STANDARD

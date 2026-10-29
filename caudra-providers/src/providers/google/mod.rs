@@ -816,6 +816,8 @@ mod tests {
 
     fn test_model() -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get("google"),
             id: "gemini-2.5-flash".into(),
             provider: Arc::<str>::from("google"),
             family: ModelFamily::Gemini,

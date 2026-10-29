@@ -632,6 +632,13 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Longest the server may send nothing before the request is abandoned (seconds) |
 
+### `models`
+
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `refresh` | bool | `true` | `CAUDRA_MODELS_REFRESH` | Check for signed model updates daily in long-running sessions. Set the environment variable to 0 or 1. Cached models remain usable when disabled |
+| `url` | String | unset | - | Signed model file URL. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart |
+
 ### `storage`
 
 | Field | Type | Default | Env | Min | Description |

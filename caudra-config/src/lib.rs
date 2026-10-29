@@ -113,6 +113,7 @@ pub mod global_file;
 pub mod interpolation;
 pub mod mcp;
 pub mod migration;
+pub mod models;
 mod network;
 pub mod own_writes;
 pub mod profile_tools;
@@ -673,6 +674,8 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Models(#[from] models::ModelsConfigError),
     #[error("invalid project config: {0} is global-only; projects cannot change permission modes")]
     ProjectPermissionMode(&'static str),
     #[error("invalid project config: {0} is global-only; every project shares one message history")]
@@ -829,6 +832,7 @@ impl AlwaysThinking {
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
+    pub models: models::ModelsFileConfig,
     pub decisions: decisions::RawDecisionsConfig,
     pub always_yolo: Option<bool>,
     pub always_auto: Option<bool>,
@@ -975,6 +979,7 @@ impl RawConfig {
     }
 
     fn merge_shared(&mut self, overlay: RawConfig) {
+        self.models.merge(overlay.models);
         merge_option!(self, overlay, always_fast, always_thinking);
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
@@ -1025,6 +1030,7 @@ impl RawConfig {
         let builtin_skills = self.builtin_skills()?;
         let disabled_tools = self.resolve_disabled_tools()?;
         let config = Config {
+            models: self.models.resolve()?,
             decisions: self.decisions.resolve()?,
             always_yolo: self.always_yolo.unwrap_or(false),
             always_auto: self.always_auto.unwrap_or(false),
@@ -2356,6 +2362,7 @@ impl LoadedPermissionSource {
 
 #[derive(Clone)]
 pub struct Config {
+    pub models: models::ModelsConfig,
     pub decisions: DecisionsConfig,
     pub always_yolo: bool,
     pub always_auto: bool,
@@ -4097,6 +4104,7 @@ impl PluginsConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.models.validate_url()?;
         self.decisions.validate()?;
         self.ui.validate_all()?;
         self.agent.validate()?;
@@ -6566,6 +6574,7 @@ mod tests {
     #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
+            models: models::ModelsConfig::default(),
             decisions: DecisionsConfig::default(),
             always_yolo: false,
             always_auto: false,

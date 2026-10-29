@@ -357,10 +357,7 @@ pub(crate) fn exclusive_state_lock(path: &Path, mode: u32) -> Result<File, Stora
     Ok(file)
 }
 
-pub(crate) fn try_exclusive_state_lock(
-    path: &Path,
-    mode: u32,
-) -> Result<Option<File>, StorageError> {
+pub fn try_exclusive_state_lock(path: &Path, mode: u32) -> Result<Option<File>, StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     validate_lock_path(path)?;

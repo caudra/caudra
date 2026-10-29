@@ -1801,6 +1801,8 @@ pub(crate) fn register_native_tools() {
 #[cfg(test)]
 pub(crate) fn test_model() -> caudra_providers::Model {
     caudra_providers::Model {
+        model_revision: caudra_providers::model_data::current().revision,
+        manifest: caudra_providers::manifest::ManifestRegistry::get("anthropic"),
         id: "test-model".into(),
         provider: std::sync::Arc::<str>::from("anthropic"),
         family: caudra_providers::ModelFamily::Claude,

@@ -58,6 +58,27 @@ fast = "qwen3.8-27b"   # covers qwen3.8-27b, qwen3.8-27b-canary, qwen3.8-27b-mat
 
 The first entry also names the model that wins automatic resolution, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist.
 
+## Model list
+
+Caudra ships a model list and can use it offline. At startup it also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
+
+Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
+
+`caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. A failed check keeps the current list.
+
+```toml
+[models]
+refresh = true
+url = "https://models.caudra.ai/v1/models.json"
+```
+
+Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `CAUDRA_MODELS_REFRESH=1` enables them. The environment override comes from the process or global `.env`, never a project `.env`. Cached files still load when refresh is disabled.
+
+`url` can point to a mirror over HTTPS, or HTTP on localhost, 127.0.0.1 or [::1]. Caudra fetches its signature from `<url>.sig`. Changing the URL does not change which signing keys Caudra trusts. Restart after changing these settings.
+
+Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key, incompatible format or built-in routing collision rejects the whole file. Entries that need newer Caudra features stay hidden and cannot be selected. Built-in API endpoints and credentials remain defined by Caudra, not by downloaded model data.
+
+
 ## Auth Reloading
 
 Caudra re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `caudra auth login` in another terminal or change an env var, the next session picks it up without a restart.

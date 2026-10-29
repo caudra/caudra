@@ -230,6 +230,8 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         })
         .unwrap_or_default();
     Model {
+        model_revision: crate::model_data::current().revision,
+        manifest: ManifestRegistry::get(&kind.to_string()),
         id: model_id.to_string(),
         provider: Arc::from(slug),
         // `kind` is the wire protocol, never the weights: an OpenAI-shaped

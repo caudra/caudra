@@ -34,8 +34,10 @@ pub const MAX_TOKENS: u32 = 100_000_000;
 pub const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 pub const BLOCKED_CATALOG_PROVIDERS: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
 pub const SUPPORTED_REQUIREMENTS: &[&str] = &[];
-/// Production publishing is not set up until the operator supplies a trusted public key.
-pub const TRUSTED_KEYS: &[[u8; 32]] = &[];
+pub const TRUSTED_KEYS: &[[u8; 32]] = &[[
+    58, 97, 90, 243, 142, 201, 114, 107, 57, 215, 10, 180, 167, 120, 141, 157, 189, 204, 167, 77,
+    118, 93, 199, 88, 15, 77, 4, 96, 125, 225, 42, 152,
+]];
 
 #[derive(Debug, Error)]
 pub enum ParseError {

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use caudra_models::Snapshot;
 use jiff::Timestamp;
@@ -10,8 +10,24 @@ use crate::providers::catalog::CatalogData;
 
 use super::{bundled, convert};
 
-static CURRENT: LazyLock<RwLock<Arc<Current>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(Current::from_snapshot(bundled::snapshot()))));
+static CURRENT: OnceLock<RwLock<Arc<Current>>> = OnceLock::new();
+
+fn registry() -> &'static RwLock<Arc<Current>> {
+    CURRENT.get_or_init(|| RwLock::new(Arc::new(Current::from_snapshot(initial_snapshot()))))
+}
+
+/// Selects the bundled data before any lookup, for reproducible maintainer tools.
+pub fn initialize_bundled() {
+    CURRENT.get_or_init(|| RwLock::new(Arc::new(Current::from_snapshot(bundled::snapshot()))));
+}
+
+fn initial_snapshot() -> Snapshot {
+    let bundled = bundled::snapshot();
+    #[cfg(not(test))]
+    return super::refresh::startup_snapshot(bundled);
+    #[cfg(test)]
+    bundled
+}
 
 pub struct Current {
     pub revision: u64,
@@ -39,18 +55,15 @@ impl Current {
 }
 
 pub fn current() -> Arc<Current> {
-    CURRENT
+    registry()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
 
-#[allow(
-    dead_code,
-    reason = "snapshot installation is wired to refresh in a later unit"
-)]
+#[cfg(test)]
 pub(crate) fn install(snapshot: Snapshot) {
-    let mut current = CURRENT
+    let mut current = registry()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if snapshot.content_sha256 == current.content_sha256 {
@@ -59,6 +72,21 @@ pub(crate) fn install(snapshot: Snapshot) {
     let mut next = Current::from_snapshot(snapshot);
     next.revision = current.revision + 1;
     *current = Arc::new(next);
+}
+
+pub(super) fn install_newer(snapshot: Snapshot) -> bool {
+    let mut current = registry()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if snapshot.updated_at <= current.snapshot_updated_at
+        || snapshot.content_sha256 == current.content_sha256
+    {
+        return false;
+    }
+    let mut next = Current::from_snapshot(snapshot);
+    next.revision = current.revision + 1;
+    *current = Arc::new(next);
+    true
 }
 
 #[cfg(test)]

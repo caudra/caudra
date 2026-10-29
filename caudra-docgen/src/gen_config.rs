@@ -13,6 +13,7 @@ use caudra_config::example::Entry;
 use caudra_config::files::{self, CONFIG_FILES, Scope};
 use caudra_config::mcp::MCP_FORMAT;
 use caudra_config::migration::{ConfigFormat, Stamp, migrate};
+use caudra_config::models::ModelsConfig;
 use caudra_config::providers::PROVIDERS_FORMAT;
 use caudra_config::sandbox::SANDBOX_FORMAT;
 use caudra_config::shell_env::ShellEnvConfig;
@@ -1381,6 +1382,7 @@ For every setting in one file, with its type, default, and description, see [Ref
     write_shell_env_section(&mut out);
     write_steering_section(&mut out);
     write_section(&mut out, "provider", ProviderConfig::FIELDS);
+    write_section(&mut out, "models", ModelsConfig::FIELDS);
     write_section(&mut out, "storage", StorageConfig::FIELDS);
     write_retention_section(&mut out);
     write_snapshots_section(&mut out);

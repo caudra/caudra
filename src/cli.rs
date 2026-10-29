@@ -559,6 +559,12 @@ impl WorkcellSelectorArgs {
 }
 
 #[derive(Subcommand)]
+pub enum ModelsAction {
+    /// Fetch and verify model updates now, even when automatic refresh is disabled
+    Refresh,
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Manage saved sandbox instances (daemon setup remains an operator action)
     Sandbox {
@@ -570,8 +576,10 @@ pub enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// List all available models
+    /// List available models or refresh the signed model file
     Models {
+        #[command(subcommand)]
+        action: Option<ModelsAction>,
         /// Show the effective model for every model job
         #[arg(long)]
         jobs: bool,
@@ -2082,7 +2090,7 @@ mod tests {
         expected_model: Option<&str>,
     ) {
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Command::Models { jobs }) = cli.command else {
+        let Some(Command::Models { jobs, .. }) = cli.command else {
             panic!("{MODELS_NOT_PARSED}");
         };
 

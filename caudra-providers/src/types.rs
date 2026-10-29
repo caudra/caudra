@@ -2783,6 +2783,8 @@ mod tests {
 
     fn clamp_test_model(provider: crate::provider::ProviderKind) -> crate::model::Model {
         crate::model::Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get(&provider.to_string()),
             id: "test-model".into(),
             provider: std::sync::Arc::<str>::from(provider.to_string()),
             family: provider.family(),

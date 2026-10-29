@@ -92,6 +92,8 @@ struct ScriptModel {
 impl ScriptModel {
     fn to_model(&self, slug: &str, base: ProviderKind, id: String) -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: ManifestRegistry::get(&base.to_string()),
             id,
             provider: Arc::from(slug),
             family: base.family(),

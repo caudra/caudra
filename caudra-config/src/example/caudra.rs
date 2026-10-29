@@ -2,6 +2,7 @@ use crate::config_file::{CONFIG_FILE, CONFIG_VERSION};
 use crate::decisions::{DecisionFeatures, DecisionThresholds, DecisionsConfig, FeatureMode};
 use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
+use crate::models::ModelsConfig;
 use crate::shell_env::ShellEnvConfig;
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
 use crate::websearch::{WEBSEARCH_KEY, WebsearchBackendName, WebsearchConfig};
@@ -125,6 +126,7 @@ fn tables() -> Vec<Table> {
     }));
     tables.extend([
         Table::of(Header::Fixed("provider".into()), ProviderConfig::FIELDS),
+        Table::of(Header::Fixed("models".into()), ModelsConfig::FIELDS),
         Table::of(Header::Fixed("storage".into()), StorageConfig::FIELDS),
         Table::of(
             Header::Fixed("storage.retention".into()),

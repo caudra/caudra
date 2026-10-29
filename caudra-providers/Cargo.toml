@@ -35,6 +35,7 @@ keyring = { workspace = true }
 tiktoken-rs = { workspace = true }
 url = { workspace = true }
 zstd = { workspace = true }
+flate2 = { workspace = true }
 workspace-hack.workspace = true
 
 [build-dependencies]

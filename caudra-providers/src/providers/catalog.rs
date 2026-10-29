@@ -909,6 +909,8 @@ mod tests {
 
     fn catalog_model(id: &str) -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: None,
             id: id.into(),
             provider: Arc::from(OPENCODE_GO),
             family: ModelFamily::Generic,

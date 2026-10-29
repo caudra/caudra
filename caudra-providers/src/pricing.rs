@@ -392,6 +392,8 @@ mod tests {
 
     fn model(id: &str, input_rate: f64) -> Model {
         Model {
+            model_revision: crate::model_data::current().revision,
+            manifest: crate::manifest::ManifestRegistry::get("anthropic"),
             id: id.into(),
             provider: Arc::from("anthropic"),
             family: ModelFamily::Claude,

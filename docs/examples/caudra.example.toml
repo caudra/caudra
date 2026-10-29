@@ -767,6 +767,18 @@ version = 5
 # Type: u64, at least 10.
 # stream_timeout_secs = 300
 
+[models]
+
+# Check for signed model updates daily in long-running sessions. Set the
+# environment variable to 0 or 1. Cached models remain usable when disabled.
+# Type: bool. Env: CAUDRA_MODELS_REFRESH.
+# refresh = true
+
+# Signed model file URL. Requires HTTPS, or HTTP to loopback. The signature is
+# fetched from the same URL with .sig appended. Takes effect after a restart.
+# Type: String. Default: unset.
+# url = <String>
+
 [storage]
 
 # Max total log size (MB).

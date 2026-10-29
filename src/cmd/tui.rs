@@ -736,6 +736,9 @@ fn build_stack(
         warnings.extend(notices);
     }
     super::configure_native_tools(&config);
+    if !cli.print {
+        caudra_providers::model_data::start_refresh(&config.models);
+    }
     super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
     skill::refresh(ToolRegistry::global());
 

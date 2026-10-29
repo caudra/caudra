@@ -425,6 +425,7 @@ pub struct AgentRunParams<'h> {
 pub struct Agent<'h> {
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
+    model_revision: u64,
     chat_provider: Arc<dyn Provider>,
     chat_model: Arc<Model>,
     history: &'h mut History,
@@ -613,6 +614,7 @@ impl<'h> Agent<'h> {
         let code = CodeSession::new(run.history.as_slice());
         Self {
             provider: params.provider,
+            model_revision: model.model_revision,
             model,
             chat_provider: params.chat_provider,
             chat_model,
@@ -2407,6 +2409,7 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         self.apply_live_switch().await?;
+        self.refresh_model_revision().await;
         self.hold_cache_warmer();
         self.drain_decision_spend();
         // Whatever the previous turn started and nobody took is reported
@@ -3819,6 +3822,7 @@ impl<'h> Agent<'h> {
     fn move_to(&mut self, model: Model, provider: Arc<dyn Provider>) {
         let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
         let chat_follows_provider = Arc::ptr_eq(&self.provider, &self.chat_provider);
+        self.model_revision = model.model_revision;
         self.model = Arc::new(model);
         self.provider = provider;
         if chat_follows_model {
@@ -3872,6 +3876,39 @@ impl<'h> Agent<'h> {
             thinking,
         })?;
         Ok(())
+    }
+
+    async fn refresh_model_revision(&mut self) {
+        let revision = caudra_providers::model_data::current().revision;
+        if revision == self.model_revision {
+            return;
+        }
+        self.model_revision = revision;
+        match self.model.refreshed(&self.model_policy) {
+            Ok(mut model) => {
+                let provider = if model.manifest.is_none() {
+                    match provider::from_model_async(&mut model, self.timeouts).await {
+                        Ok(provider) => Arc::from(provider),
+                        Err(error) => {
+                            warn!(model = %self.model.spec(), revision, %error,
+                                "updated catalog route is unavailable; keeping the previous model");
+                            return;
+                        }
+                    }
+                } else {
+                    self.provider.adjust_model(&mut model);
+                    Arc::clone(&self.provider)
+                };
+                self.move_to(model, provider);
+                self.opts.cross =
+                    accounts::cross_route(&self.model, &self.model_policy).map(Arc::new);
+                if let Some(warmer) = &self.cache_warmer {
+                    warmer.stop(WarmStop::PrefixChanged);
+                }
+            }
+            Err(error) => warn!(model = %self.model.spec(), revision, %error,
+                "updated model file cannot resolve the active model; keeping its previous settings"),
+        }
     }
 
     fn emit_turn_complete(
@@ -11566,6 +11603,38 @@ mod tests {
             assert_eq!(
                 thinking.lock().unwrap().as_slice(),
                 [ThinkingConfig::Effort(PICKED_LEVEL.into())]
+            );
+        });
+    }
+
+    #[test_case(false; "refreshes_at_turn_start")]
+    #[test_case(true; "keeps_unresolvable_model")]
+    fn next_turn_refreshes_stale_model_revision(unresolvable: bool) {
+        const MISSING_PROVIDER: &str = "removed-model-provider";
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            let expected = agent.model.context_window;
+            let mut old = (*agent.model).clone();
+            old.context_window += 1;
+            if unresolvable {
+                old.provider = Arc::from(MISSING_PROVIDER);
+            }
+            agent.model = Arc::new(old);
+            let in_flight = Arc::clone(&agent.model);
+            agent.model_revision = u64::MAX;
+            assert_eq!(agent.model.context_window, expected + 1);
+            agent.run(default_input()).await.unwrap();
+            assert_eq!(
+                agent.model.context_window,
+                expected + u32::from(unresolvable)
+            );
+            assert_eq!(in_flight.context_window, expected + 1);
+            assert_eq!(agent.reroutes, 0);
+            assert_eq!(
+                agent.model_revision,
+                caudra_providers::model_data::current().revision
             );
         });
     }

@@ -32,6 +32,7 @@ use caudra_config::providers::{
 use caudra_config::{
     AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy, ToolKey,
 };
+use caudra_lua::PluginHost;
 use caudra_providers::copilot_auth::{CopilotAccount, CopilotIdentity, EnterpriseHost};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{fetch_all_models, seed_setup_thinking};
@@ -1251,7 +1252,18 @@ fn print_model_jobs(model_arg: Option<&str>, config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn models(cli: &Cli, jobs: bool) -> Result<()> {
+pub fn models(cli: &Cli, jobs: bool, refresh: bool) -> Result<()> {
+    if refresh {
+        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+        let config = super::load_config(&PluginHost::disabled(), cli, &cwd, false)?;
+        let result = caudra_providers::model_data::refresh(&config.models, true)
+            .context("could not fetch a verified model update")?;
+        println!(
+            "Previous updated_at: {}\nCurrent updated_at: {}\nSwapped: {}",
+            result.old_updated_at, result.new_updated_at, result.swapped
+        );
+        return Ok(());
+    }
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let storage = StateDir::resolve().context("resolve data directory")?;
     let local = crate::cli::WorkcellSelectorArgs::default();

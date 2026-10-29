@@ -451,6 +451,8 @@ impl Billing {
 
 #[derive(Debug, Clone)]
 pub struct Model {
+    pub model_revision: u64,
+    pub manifest: Option<&'static ProviderManifest>,
     pub id: String,
     pub provider: Arc<str>,
     pub family: ModelFamily,
@@ -520,7 +522,7 @@ impl Model {
     /// When no static entry matches (a freshly released model the table has not
     /// caught up to yet), fall back to the provider defaults so it still resolves.
     fn from_base(
-        manifest: &ProviderManifest,
+        manifest: &'static ProviderManifest,
         slug: &str,
         model_id: &str,
     ) -> Result<Self, ModelError> {
@@ -619,6 +621,8 @@ impl Model {
             .or_else(|| catalog_reasoning_options(catalog))
             .unwrap_or_default();
         let mut model = Self {
+            model_revision: crate::model_data::current().revision,
+            manifest: Some(manifest),
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family,
@@ -670,6 +674,8 @@ impl Model {
         meta: crate::providers::catalog::CatalogMetaView,
     ) -> Self {
         Self {
+            model_revision: crate::model_data::current().revision,
+            manifest: None,
             id: model_id.to_string(),
             provider: Arc::from(slug),
             family: ModelFamily::Generic,
@@ -713,7 +719,7 @@ impl Model {
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
         // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        let Some(manifest) = self.manifest else {
             return false;
         };
         model_registry::discovered(manifest.slug, &self.id)
@@ -733,7 +739,7 @@ impl Model {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let manifest = ManifestRegistry::for_slug(&self.provider);
+        let manifest = self.manifest;
         manifest
             .and_then(|m| {
                 model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
@@ -794,8 +800,7 @@ impl Model {
     /// how an oauth script keeps fast mode. Bedrock separately ignores
     /// `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
-        self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.serves_fast_mode)
+        self.pricing.fast.is_some() && self.manifest.is_some_and(|m| m.serves_fast_mode)
     }
 
     pub fn spec(&self) -> String {
@@ -824,7 +829,7 @@ impl Model {
     ) -> Option<f64> {
         let pricing = self.dated_rates.map_or(&self.pricing, |dated| dated.at(at));
         let cost = (!pricing.is_zero()).then(|| usage.cost(pricing, fast))?;
-        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+        let schedule = self.manifest.and_then(|m| m.pricing_schedule);
         Some(schedule.map_or(cost, |s| cost * s.multiplier_at(at)))
     }
 
@@ -842,7 +847,7 @@ impl Model {
     }
 
     pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
+        self.manifest.map_or("Unknown", |m| m.display_name)
     }
 
     /// Which model serves `purpose` while `anchor` is the caller's current model.
@@ -1024,6 +1029,27 @@ impl Model {
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
+        let revision = crate::model_data::current().revision;
+        let mut model = Self::resolve_spec(spec)?;
+        model.model_revision = revision;
+        Ok(model)
+    }
+
+    pub fn refreshed(&self, policy: &ModelPolicy) -> Result<Self, ModelError> {
+        let model = Self::from_spec_with_policy(&self.spec(), policy)?;
+        let was_curated = self
+            .manifest
+            .is_some_and(|manifest| lookup_entry(manifest.models, &self.id).is_ok());
+        let still_curated = model
+            .manifest
+            .is_some_and(|manifest| lookup_entry(manifest.models, &model.id).is_ok());
+        if was_curated && !still_curated {
+            return Err(ModelError::UnknownModel(self.spec()));
+        }
+        Ok(model)
+    }
+
+    fn resolve_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
         if let Some(&reason) = crate::model_data::current().unsupported_providers.get(slug) {
             return Err(ModelError::NeedsNewerCaudra {
@@ -2326,7 +2352,8 @@ mod tests {
             ..*ManifestRegistry::get("google").unwrap()
         };
 
-        let model = Model::from_base(&manifest, slug, PRICE_PERIOD_MODEL).unwrap();
+        let model =
+            Model::from_base(Box::leak(Box::new(manifest)), slug, PRICE_PERIOD_MODEL).unwrap();
 
         assert_eq!(
             model.pricing.input, expected_rate,

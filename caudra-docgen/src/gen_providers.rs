@@ -14,6 +14,27 @@ use strum::IntoEnumIterator;
 use crate::gen_regions::{footer, keys_table, reference};
 use crate::page_header;
 
+const MODEL_LIST: &str = r#"## Model list
+
+Caudra ships a model list and can use it offline. At startup it also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
+
+Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
+
+`caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. A failed check keeps the current list.
+
+```toml
+[models]
+refresh = true
+url = "https://models.caudra.ai/v1/models.json"
+```
+
+Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `CAUDRA_MODELS_REFRESH=1` enables them. The environment override comes from the process or global `.env`, never a project `.env`. Cached files still load when refresh is disabled.
+
+`url` can point to a mirror over HTTPS, or HTTP on localhost, 127.0.0.1 or [::1]. Caudra fetches its signature from `<url>.sig`. Changing the URL does not change which signing keys Caudra trusts. Restart after changing these settings.
+
+Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key, incompatible format or built-in routing collision rejects the whole file. Entries that need newer Caudra features stay hidden and cannot be selected. Built-in API endpoints and credentials remain defined by Caudra, not by downloaded model data.
+"#;
+
 const MODEL_JOBS_NOTE: &str = r#"## Model jobs
 
 Caudra routes work through eleven jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Extract**, **Memory**, **Autopilot**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
@@ -958,6 +979,7 @@ pub fn generate() -> String {
          which configured or discovered model serves each kind of work.\n"
     );
     let _ = writeln!(out, "{MODEL_JOBS_NOTE}\n");
+    let _ = writeln!(out, "{MODEL_LIST}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

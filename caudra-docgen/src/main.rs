@@ -98,6 +98,7 @@ fn check_file(path: &Path, expected: &str) -> bool {
 }
 
 fn main() -> ExitCode {
+    caudra_providers::model_data::initialize_bundled();
     let check = std::env::args().any(|a| a == "--check");
 
     let pages = thread::scope(|scope| {

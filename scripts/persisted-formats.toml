@@ -33,7 +33,9 @@ path = "caudra-storage/src/sessions.rs"
 const = "SESSION_VERSION"
 kind = "record"
 
-# Published model files are persisted locally. v1 is additive-only. Breaking
+# Published model files are persisted in models/v1/models.json with their signature.
+# state.json holds optional etag, last_modified and checked_at fields, without a
+# separate format integer. v1 is additive-only. Breaking
 # changes require format 2 at /v2/, never a format change in a patch release.
 [[tracked]]
 name = "model-file"
