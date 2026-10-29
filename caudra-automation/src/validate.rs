@@ -14,11 +14,12 @@ use crate::event::{
     SessionView, StartedBy, TurnOutcome, WorkFinishedDetail, WorkState, WorkView,
     WorkflowFinishedDetail, WorkflowStatus,
 };
+use crate::host::GitCompare;
 use crate::meta::{
     AutomationMeta, MessageFilter, MetaError, NAME_WILDCARD, References, Trigger, TriggerKind,
     parse_meta, references,
 };
-use crate::replay::{DryRun, DryRunReport, dry_run};
+use crate::replay::{DryRun, DryRunReport, dry_run_with_git_compare};
 use crate::untrusted::Untrusted;
 
 const MILLIS_PER_SECOND: i64 = 1_000;
@@ -33,6 +34,8 @@ const SMOKE_WORK: &str = "smoke-work";
 const SMOKE_TOPIC: &str = "smoke.topic";
 const SMOKE_WORKFLOW: &str = "smoke-workflow";
 const SMOKE_COUNT: u32 = 1;
+const SMOKE_HEAD: &str = "1111111111111111111111111111111111111111";
+const SMOKE_BASE_HEAD: &str = "2222222222222222222222222222222222222222";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ValidationReport {
@@ -78,17 +81,27 @@ pub fn validate(source: &str, now_ms: i64) -> Result<ValidationReport, Validatio
         .iter()
         .enumerate()
         .map(|(index, trigger)| {
-            let run = dry_run(DryRun {
-                source,
-                meta: &meta,
-                event: &canned_event(&meta, trigger, now_ms),
-                state: &state,
-                args: &args,
-                limits: &limits,
-                now_ms,
-                journal: &[],
-                admission: Ok(()),
-            });
+            let run = dry_run_with_git_compare(
+                DryRun {
+                    source,
+                    meta: &meta,
+                    event: &canned_event(&meta, trigger, now_ms),
+                    state: &state,
+                    args: &args,
+                    limits: &limits,
+                    now_ms,
+                    journal: &[],
+                    admission: Ok(()),
+                },
+                Ok(Some(GitCompare {
+                    branch: Some(Untrusted::text(SMOKE_NAME)),
+                    head: SMOKE_HEAD.to_owned(),
+                    base_head: SMOKE_BASE_HEAD.to_owned(),
+                    ahead: 0,
+                    behind: SMOKE_COUNT,
+                    operation: None,
+                })),
+            );
             match &run.outcome.end {
                 FiringEnd::Failed(error) | FiringEnd::Stopped(error) => {
                     Err(ValidationError::Smoke {

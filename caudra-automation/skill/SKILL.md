@@ -11,9 +11,11 @@ This is the complete reference for authoring automations. It stands on its own, 
 
 An automation is a short Rhai script that reacts to events in one session. Its header lists triggers, such as the session going idle, a goal finishing, a message arriving from another session, a workflow run finishing, or a schedule coming due. When a trigger matches, the body runs once with the event in scope. That run is a firing. A firing decides whether to act, and it acts only through a few host functions: it queues a message for the model, sets a goal, notifies the user, calls an HTTP endpoint its header declares, messages other sessions, starts a workflow its header declares, writes a log line, or pauses every automation in the session.
 
+A firing can also read the time with `now()` and compare its checkout with a local branch through `git_compare(base)`. These queries cost no action or model turn.
+
 The script is trusted. Values from outside it, such as the model's last response, the session title, or another session's message, arrive marked untrusted, and the host refuses to turn them into this session's instructions.
 
-An automation does nothing until the user arms it in a session: with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open and never finishes on its own. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
+An automation does nothing until it is armed in a session. The user can arm it with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. You can arm it with `await automation.arm(name, args)` in `code`, subject to Caudra's permission rules. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open and never finishes on its own. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
 
 Write an automation when:
 
@@ -29,7 +31,7 @@ Write a workflow instead when the job is one multi-agent plan that runs to a res
 
 | Scope | Location | Trust |
 |-------|----------|-------|
-| Project | `<project root>/.caudra/automations/<name>.rhai` | The user must trust the file's exact digest in `/automations`. Changing any byte revokes it. |
+| Project | `<project root>/.caudra/automations/<name>.rhai` | Trust covers the exact digest, approved in `/automations` or through an agent arm permission. Changing any byte revokes it. |
 | User | `<config dir>/automations/<name>.rhai` | Trusted as written |
 | Bundled | Shipped inside Caudra, such as pstack's scripts while pstack is on. No file. | Trusted as shipped |
 
@@ -37,9 +39,9 @@ Run `await automation.list()` in a `code` snippet before writing. Its `project_d
 
 Choosing a scope:
 
-- The automation is about this repository, its paths, commands, or conventions: project scope. The user must trust it in `/automations` before it can be armed, and again after every edit. You cannot trust it. Neither can the script.
+- The automation is about this repository, its paths, commands, or conventions: project scope. Approval of `automation.arm` also trusts the exact digest shown in the permission prompt. The user can instead trust it in `/automations`. Every edit needs fresh trust. A script cannot grant trust or arm another script.
 - The automation is a personal routine for any session: user scope. It can be armed as soon as the file is saved. Only user scripts may use `arm: "always"`.
-- You never write a bundled script. It is already listed in `/automations` and the user arms it there. To change one, write a script with the same name in the user or project directory, and it replaces the bundled one.
+- You never write a bundled script. It is already listed in `/automations` and can be armed there or through `automation.arm`. To change one, write a script with the same name in the user or project directory, and it replaces the bundled one.
 - When scopes hold scripts with the same name, the project script wins over the user script, and either wins over a bundled one. The hidden scripts are listed as shadowed.
 
 File rules:
@@ -79,7 +81,7 @@ These names are in scope:
 |------|---------------|
 | `event` | The event that fired the script, as a read-only map. Section 5 lists its fields. |
 | `state` | The automation's memory in this session, as a map. Section 8 explains when changes are kept. |
-| `args` | The values the user gave when arming, with every declared arg present and defaults filled in |
+| `args` | The values supplied when arming, with every declared arg present and defaults filled in |
 | `meta` | The header, for example `meta.name` |
 
 ## 4. Header reference
@@ -108,7 +110,7 @@ Each trigger is a map with a `kind`. Durations are strings such as `"30s"`, `"2m
 
 | Kind | Options | Fires when |
 |------|---------|------------|
-| `armed` | none | the automation is armed: at launch, on resume, when the user arms it again, and when the pause latch clears |
+| `armed` | none | the automation is armed: at launch, on resume, when the user or agent arms it again, and when the pause latch clears |
 | `idle` | `after`: default `"0s"`, at most `"24h"` | the session settles after a busy period and stays settled for `after` |
 | `needs_input` | `after`: as for `idle`. `inputs`: default `["permission", "question", "plan", "auth", "plugin", "autopilot"]` | the session has waited on a person for one of `inputs` for `after` |
 | `goal_finished` | `verdicts`: default `["met", "impossible", "cleared"]`, and `"stalled"` may join them | the session goal ends with one of `verdicts`, or for `stalled`, the run stops on a goal that stays active |
@@ -213,11 +215,11 @@ Both lists hold at most 16 entries, without repeats.
 | `cooldown` | `"0s"` | At most `"24h"`. The shortest gap between two firings that act. |
 | `max_per_hour` | `12` | 1 to 600. Firings that act, per rolling hour. |
 
-A firing acts when it calls a host function other than `now`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
+A firing acts when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
 
 ### Args
 
-Args let one script serve many sessions with a goal list, a file name, or a test command. The script declares them, and the user gives the values when arming.
+Args let one script serve many sessions with a goal list, a file name, or a test command. The script declares them, and the user or agent gives the values when arming.
 
 ```rhai
 args: #{
@@ -279,7 +281,7 @@ The fields of each trigger follow. Untrusted ones are marked U.
 
 `armed`:
 
-- `reason`: `"launch"` (armed as the session started, or by switching to a profile that lists it), `"resume"` (armed again with its stored args as the session resumed), `"manual"` (the user armed it, or armed it again), or `"unpaused"` (the pause latch cleared)
+- `reason`: `"launch"` (armed as the session started, or by switching to a profile that lists it), `"resume"` (armed again with its stored args as the session resumed), `"manual"` (the user or agent armed it, or armed it again), or `"unpaused"` (the pause latch cleared)
 
 `idle`, about the busy period that just ended:
 
@@ -509,6 +511,33 @@ Adds a line to the firing's trace, which `history` and `/automations` show. Untr
 
 Returns `#{ unix, iso, date, weekday, hour, minute, tz }` in `meta.timezone`, or in the system zone without one. `date` looks like `"2026-10-05"`, `weekday` is `"mon"` to `"sun"`, and `hour` and `minute` are integers.
 
+### `git_compare(base)`
+
+Compares HEAD with `refs/heads/<base>` in the repository discovered from the session's working directory. `base` is a local branch name, such as `"main"`, rather than a revision expression or a remote-tracking ref. Returns `()` outside a repository or when the local base branch is missing. Otherwise it returns a map:
+
+| Field | Meaning |
+|-------|---------|
+| `branch` | The current branch name as untrusted text, or `()` on a detached HEAD |
+| `head` | HEAD's full SHA |
+| `base_head` | The local base branch's full SHA |
+| `ahead` | Commits reachable from HEAD but not the base, capped at 10000 |
+| `behind` | Commits reachable from the base but not HEAD, capped at 10000 |
+| `operation` | `"merge"`, `"rebase"`, `"cherry_pick"`, `"revert"`, `"bisect"`, or `()` when none is in progress |
+
+Every field except `branch` is trusted. Compare the branch name, or show it through `attach`. Never paste it into `message()`.
+
+```rhai
+let comparison = git_compare(args.base);
+if comparison == () { skip("no repository or local base branch"); }
+if comparison.branch == args.base { skip("the base is checked out"); }
+if comparison.behind == 0 { skip("already current"); }
+message("Read the changes on " + args.base + " before continuing.");
+```
+
+The query reads local Git data without fetching or changing the checkout. It runs off the session actor with a five-second timeout. It costs no action, is not journaled, and may be called at most four times per firing. A fifth call stops the firing, even inside `try`.
+
+Catchable failures have kind `timeout` when the deadline expires, `unavailable` when tools run remotely or the repository cannot be read, and `invalid_argument` for a bad base name. Validation supplies a canned comparison one commit behind. Inspector dry runs return `()` without reading the repository, so they cannot reproduce the original Git state.
+
 ### `pause_automations(reason)`
 
 Sets the session's pause latch, as Esc Esc does. Every automation in the session stops: running firings are cancelled, and later events are recorded as `paused`. The calling firing runs on to its end, so it can still notify the user. The automation limits never refuse this call.
@@ -519,7 +548,7 @@ Sets the session's pause latch, as Esc Esc does. Every automation in the session
 
 ### Per-firing limits
 
-A firing may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, and 4 calls to `message` and `set_goal` together. Reaching any of them stops the firing.
+A firing may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, 4 calls to `message` and `set_goal` together, and 4 `git_compare` queries. Reaching any of them stops the firing.
 
 ### Errors
 
@@ -666,13 +695,15 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
 1. Run `await automation.list()` in `code`. Note the two directories and check that the name is free.
 2. Write `<dir>/<name>.rhai` with `file_write`. The header comes first.
 3. Validate with `await automation.validate("<name>")`. Validation parses the header, compiles the script, checks the args the body reads, and runs the body once per trigger against a canned event. Each run gets every arg's default or `example`, an empty `state`, and a session without a goal, a cost, or an engaged autopilot, and it performs nothing. A `message_received` run gets a message its trigger matches, consumed when the trigger consumes. A `workflow_finished` run gets a run of the first workflow its trigger names, or else the first in `meta.workflows`, with the first of its `statuses`. A stop or an uncaught failure fails the validation with its line and column. Each run follows one path, so branches that depend on real event values are not reached. Fix the file and validate again.
-4. Hand over. Trusting a project script, arming it, and choosing its args belong to the user. You can do none of them, so end your turn with what the user must do. A project script needs their trust in `/automations` first. Then give the exact line that arms it, with the args filled in:
+4. Arm the validated script with the args the task needs:
 
-   ```
-   /automations arm goal-chain {"goals": ["The login tests pass", "The signup tests pass"]}
+   ```python
+   await automation.arm("goal-chain", {"goals": ["The login tests pass", "The signup tests pass"]})
    ```
 
-   To arm it at launch instead:
+   Caudra asks for permission unless a rule, YOLO or autopilot approves. The prompt shows the action, name, scope, path, digest, triggers, args, and network, secrets, messaging and workflow capabilities. For an untrusted project script, approval also trusts that exact digest. An edit during approval refuses the call. Tell the user what was armed, with its args, and whether it will start work immediately. If arming is denied or the task only asks for a file, leave it disarmed and give `/automations arm NAME {json}` instead.
+
+   To arm it at launch:
 
    ```
    caudra --automation goal-chain='{"goals": ["The login tests pass", "The signup tests pass"]}'
@@ -684,6 +715,8 @@ Rhai looks like a small JavaScript with Rust flavour. These are the points that 
 
    A workflow script also needs `experimental.workflows`, which only the user can turn on. Every workflow in `meta.workflows` must exist, and the user must approve a project workflow in `/workflows`. Name those workflows in the answer.
 5. Debug with `await automation.history()`. It lists this session's newest firings with their status, only one automation's when you pass `name`. Pass `fire_id` to see one firing's event and its actions, log lines included. A skipped firing shows its reason, and a failed one shows its error and line. When you fix a script that has already fired, add to the hand-over that the user can press `r` on one of its finished firings in `/automations` to replay that event against the edited file, a dry run that performs nothing.
+
+`automation.list`, `.validate` and `.history` never prompt. `automation.disarm(name)` stops the automation in this session and drops queued firings and deliveries. `automation.delete(name)` disarms it here, removes its regular project or user file, and rescans. Both require permission like `arm`, and all three mutations are refused in Plan mode. Delete refuses bundled scripts and symlinks. Other open sessions keep their armed source until disarmed or restarted.
 
 ## 12. Complete examples
 
@@ -1045,6 +1078,8 @@ The trigger consumes every direct message. A message from a script, which has no
 | `` `+=` cannot add an untrusted value to plain text `` | `text += value` | `text = text + value` |
 | `reserved keyword 'print' is disabled` | `print` or `debug` | `log(text)` |
 | `log must be text, got i64` | a number given to `log` | `log("" + count)` |
+| `git_compare` fails with `invalid_argument` | a revision expression or invalid branch name | Pass the local branch name, such as `"main"`, without `refs/heads/`. |
+| `git_compare` fails with `unavailable` | tools run remotely, or local Git data cannot be read | Skip that firing or notify the user. The query never reads the remote machine. |
 | `Function not found: skip ()` | `skip` without a reason | `skip("why")` |
 | `sleep() is unavailable in automation scripts` | waiting inside a firing | `after`, `cooldown`, or a `schedule` trigger |
 | `the firing reached its limit of queued messages and goals` | more than 4 `message` or `set_goal` calls in one firing | Queue one message that lists the work. |
@@ -1079,7 +1114,7 @@ The trigger consumes every direct message. A message from a script, which has no
 | a run is reported twice | a run that is resumed and finishes again fires again, under the same `run_id` | Remove the run's entry from `state` on the status you treat as final, or act on `event.status`. |
 | the session loops on `idle` | a message on every idle without a way out | Add a stop marker, check `event.outcome`, and lower `max_per_hour`. |
 | events show `rate_limited` | `max_per_hour` or `cooldown` refused a recurring event | Raise the limit, or act less often. |
-| a project script cannot be armed | it is not trusted, or it changed since | Ask the user to trust it in `/automations`. |
+| a project script cannot be armed | it is not trusted, or it changed during approval | Review and validate the current file, then retry `automation.arm` for a fresh permission decision, or have the user trust it in `/automations`. |
 
 ## 14. Checklist before you hand it over
 
@@ -1097,6 +1132,6 @@ The trigger consumes every direct message. A message from a script, which has no
 - `state` records what a firing did in the same firing, and correlates by value.
 - Every `skip` has a reason that will make sense in `history`.
 - `validate` passed, and the directory came from `list`.
-- The answer ends with the exact `/automations arm` or `--automation` line, args included, and tells the user to trust a project script in `/automations` first.
+- The answer says what was armed and with which args. If it was left disarmed, give the exact `/automations arm` or `--automation` line, args included, and note any project trust still needed.
 - For a messaging script, the answer also says that cross-session messaging must be on, and gives the launch line with the session's name, topics, and groups.
 - For a workflow script, the answer also says that workflows must be on, and names the workflows it starts or watches.

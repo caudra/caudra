@@ -87,7 +87,6 @@ pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
 /// Tools whose reach is fixed by their own construction rather than by an
 /// argument, so a scope would describe nothing a caller can steer.
 pub(super) const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
-    "automation",
     "batch",
     "code",
     "question",
@@ -161,6 +160,7 @@ pub(super) fn builtin_rules(cwd: &Path, state_dir: Option<&StateDir>) -> Vec<Per
         rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, &root)));
     }
     rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
+    rules.push(allow("automation", "read"));
     rules
 }
 
@@ -2287,6 +2287,33 @@ mod tests {
             mgr.default_effect(&request.tool),
             DefaultEffect::Prompt
         ));
+    }
+
+    #[test_case("read", true; "reads_are_allowed")]
+    #[test_case("arm:x", false; "arm_asks")]
+    #[test_case("disarm:x", false; "disarm_asks")]
+    #[test_case("delete:x", false; "delete_asks")]
+    fn automation_builtin_only_allows_reads(scope: &str, allowed: bool) {
+        let manager = mgr_with(PermissionsConfig::default(), PathBuf::from(SHELL_WORKDIR));
+        let request = legacy_request(&manager, ToolKey::native("automation"), &[scope]);
+        assert_eq!(allows_without_prompt(&manager, &request), allowed);
+        assert!(!denied_by_rule(&manager, &request));
+        assert_eq!(manager.default_effect(&request.tool), DefaultEffect::Prompt);
+    }
+
+    #[test_case("arm:x", true; "matching_arm")]
+    #[test_case("disarm:x", false; "other_action")]
+    fn automation_scopes_support_action_rules(scope: &str, allowed: bool) {
+        let manager = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::native("automation"),
+                scope: Some("arm:*".into()),
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+        let request = legacy_request(&manager, ToolKey::native("automation"), &[scope]);
+        assert_eq!(allows_without_prompt(&manager, &request), allowed);
     }
 
     #[test]

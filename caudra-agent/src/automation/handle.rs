@@ -46,7 +46,12 @@ pub(super) type Reply<T> = flume::Sender<Result<T, AutomationError>>;
 /// to answer them through, the workflow runs that settled, and the ends of what runs off the
 /// actor.
 pub(super) enum Command {
-    Request(AutomationRequest, Reply<AutomationResponse>),
+    Review(AutomationRequest, Reply<AutomationSnapshot>),
+    Request {
+        request: AutomationRequest,
+        reviewed: Option<Box<AutomationSnapshot>>,
+        reply: Reply<AutomationResponse>,
+    },
     Signal(SessionSignal),
     Claim {
         gate: DeliveryGate,
@@ -354,7 +359,32 @@ impl AutomationHandle {
         &self,
         request: AutomationRequest,
     ) -> Result<AutomationResponse, AutomationError> {
-        self.ask(|reply| Command::Request(request, reply)).await
+        self.ask(|reply| Command::Request {
+            request,
+            reviewed: None,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn request_reviewed(
+        &self,
+        request: AutomationRequest,
+        reviewed: AutomationSnapshot,
+    ) -> Result<AutomationResponse, AutomationError> {
+        self.ask(|reply| Command::Request {
+            request,
+            reviewed: Some(Box::new(reviewed)),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn review(
+        &self,
+        request: AutomationRequest,
+    ) -> Result<AutomationSnapshot, AutomationError> {
+        self.ask(|reply| Command::Review(request, reply)).await
     }
 
     /// Never waits; a runtime that stopped ignores it.

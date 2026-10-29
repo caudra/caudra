@@ -1,16 +1,16 @@
-//! `automation`: what the model may read of the session's automation runtime. It lists the
-//! scripts the session can arm, validates one, and reads this session's firings back. Trusting,
-//! arming and choosing args stay with the user, so nothing here changes the runtime.
+//! Session automations, with read-only inspection and permission-gated lifecycle changes.
 
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
-use caudra_automation::args::ArgDecl;
+use caudra_automation::args::{self, ArgDecl};
+use caudra_automation::catalog::Scope;
 use caudra_automation::request::{AutomationError, AutomationRequest, AutomationResponse};
 use caudra_automation::snapshot::{
-    ActionRow, AutomationSnapshot, AutomationStatus, Availability, ErrorView, FiringDetail,
-    FiringSummary, WaitReason,
+    ActionRow, ArmOrigin, AutomationSnapshot, AutomationStatus, Availability, ErrorView,
+    FiringDetail, FiringSummary, WaitReason,
 };
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -20,27 +20,34 @@ use crate::automation::handle::AutomationHandle;
 use crate::automation::manager::spelled;
 use crate::code::hosted::HostedCall;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
-    ToolInvocation,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
+    PermissionScopes, Tool, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{AUTOMATION_TOOL_NAME, DescriptionContext, ToolAudience, ToolContext};
 use crate::types::{TextOutput, ToolOutput, counted};
 
-pub const DESCRIPTION: &str = "Read this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
+pub const DESCRIPTION: &str = "Inspect and manage this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
 
 Actions:
 - `list`: every automation this session can arm, with its scope (`project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack, overridden by a script of the same name), availability, status, triggers, args and warnings, files that cannot load with the reason, and the two directories scripts go in, as resolved for this machine and build.
 - `validate`: parse the header of `name`, compile the script, check the args its body reads, and run the body once per trigger against a canned event, performing nothing.
 - `history`: this session's newest firings with their status, only one automation's when you pass `name`, at most `limit` (20 by default, at most 50). Pass `fire_id` to see one firing's event and its actions, log lines included, with its error and state patch.
 
-Input: { action: \"list\" | \"validate\" | \"history\", name?: string, fire_id?: string, limit?: integer }";
+- `arm`: arm `name`, optionally with `args`, or re-arm it. Approval also trusts the exact reviewed digest of an untrusted project script.
+- `disarm`: stop `name` in this session and drop its queued firings and deliveries.
+- `delete`: disarm `name` in this session and remove its project or user script file. Bundled scripts and symlinks cannot be deleted. Other sessions keep their bindings.
+
+Reads never prompt. Changes ask for permission unless a rule, YOLO or autopilot approves, and are unavailable in Plan mode.
+
+Input: { action: \"list\" | \"validate\" | \"history\" | \"arm\" | \"disarm\" | \"delete\", name?: string, args?: object, fire_id?: string, limit?: integer }";
 
 pub const UNAVAILABLE: &str = "this session has no automation runtime: automations need an \
      interactive session with experimental.automations on";
 
 const ACTION_FIELD: &str = "action";
 const NAME_FIELD: &str = "name";
+const ARGS_FIELD: &str = "args";
 const FIRE_ID_FIELD: &str = "fire_id";
 const LIMIT_FIELD: &str = "limit";
 const AUTOMATIONS_FIELD: &str = "automations";
@@ -49,8 +56,22 @@ const USER_DIR_FIELD: &str = "user_dir";
 const ACTION_LIST: &str = "list";
 const ACTION_VALIDATE: &str = "validate";
 const ACTION_HISTORY: &str = "history";
-const ACTIONS: &[&str] = &[ACTION_LIST, ACTION_VALIDATE, ACTION_HISTORY];
-const NAME_REQUIRED: &str = "name is required for validate";
+const ACTION_ARM: &str = "arm";
+const ACTION_DISARM: &str = "disarm";
+const ACTION_DELETE: &str = "delete";
+const READ_SCOPE: &str = "read";
+const ACTIONS: &[&str] = &[
+    ACTION_LIST,
+    ACTION_VALIDATE,
+    ACTION_HISTORY,
+    ACTION_ARM,
+    ACTION_DISARM,
+    ACTION_DELETE,
+];
+const NAME_REQUIRED: &str = "name is required for validate, arm, disarm and delete";
+const ARGS_ONLY_ARM: &str = "args are only accepted for arm";
+const REVIEW_REQUIRED: &str = "automation changes require a reviewed permission request";
+const DELETED: &str = "deleted";
 const BLANK: &str = "must not be blank";
 const UNKNOWN_ACTION: &str = "unknown action";
 const UNEXPECTED_RESPONSE: &str =
@@ -71,14 +92,13 @@ const TRIGGERS_LABEL: &str = "triggers: ";
 const ARG_LABEL: &str = "arg ";
 const WARNING_LABEL: &str = "warning: ";
 const HIDES_LABEL: &str = "hides the script of the same name in: ";
-const PROJECT_DIR_LABEL: &str =
-    "Project scripts (the user must trust each digest in /automations): ";
+const PROJECT_DIR_LABEL: &str = "Project scripts (arming requires trust in the reviewed digest): ";
 const USER_DIR_LABEL: &str = "User scripts (trusted as written): ";
 const NO_PROJECT_DIR: &str = "Project scripts: none, this session has no local project directory.";
 const NO_USER_DIR: &str = "User scripts: none, no user config directory resolves.";
-const HAND_OVER: &str = "Trusting a project script, arming an automation and choosing its args \
-     belong to the user: give them `/automations arm NAME {json}`, or `--automation NAME='{json}'` \
-     to arm it at launch.";
+const ARM_HINT: &str = "Use automation.arm(name, args) to arm a validated script. Caudra asks for \
+     permission unless a rule, YOLO or autopilot approves. Approval also trusts an untrusted \
+     project script's exact digest. Tell the user what was armed.";
 
 const NO_FIRINGS: &str = "No firings in this session yet.";
 const DETAIL_HINT: &str = "Pass fire_id for one firing's event, actions and state patch.";
@@ -122,7 +142,11 @@ static ACTION_PARAM: ParamSchema = ParamSchema::Enum {
 };
 static NAME_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Automation name: required for validate, and narrows history to one automation.",
+    description: "Required for validate, arm, disarm and delete. Narrows history to one automation.",
+};
+static ARGS_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::Object,
+    description: "Args for arm. Omit to reuse stored args or defaults.",
 };
 static FIRE_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -135,6 +159,7 @@ static LIMIT_PARAM: ParamSchema = ParamSchema::Primitive {
 static PROPERTIES: &[Property] = &[
     (ACTION_FIELD, &ACTION_PARAM, true, &[]),
     (NAME_FIELD, &NAME_PARAM, false, &[]),
+    (ARGS_FIELD, &ARGS_PARAM, false, &[]),
     (FIRE_ID_FIELD, &FIRE_ID_PARAM, false, &[]),
     (LIMIT_FIELD, &LIMIT_PARAM, false, &[]),
 ];
@@ -166,31 +191,139 @@ impl Tool for AutomationTool {
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         Ok(Box::new(AutomationCall {
             request: parse_request(input)?,
+            reviewed: OnceLock::new(),
         }))
     }
 }
 
 struct AutomationCall {
     request: AutomationRequest,
+    reviewed: OnceLock<ReviewedCall>,
+}
+
+struct ReviewedCall {
+    snapshot: AutomationSnapshot,
+    input: Value,
+}
+
+impl AutomationCall {
+    fn mutation(&self) -> Option<(&str, &str)> {
+        match &self.request {
+            AutomationRequest::Arm { name, .. } => Some((ACTION_ARM, name)),
+            AutomationRequest::Disarm { name } => Some((ACTION_DISARM, name)),
+            AutomationRequest::Delete { name } => Some((ACTION_DELETE, name)),
+            _ => None,
+        }
+    }
 }
 
 impl ToolInvocation for AutomationCall {
+    fn call_effect(&self, _registered: ToolEffect) -> ToolEffect {
+        if self.mutation().is_some() {
+            ToolEffect::Mutating
+        } else {
+            ToolEffect::ReadOnly
+        }
+    }
+
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        Box::pin(async {
+            Some(PermissionScopes::single(self.mutation().map_or_else(
+                || READ_SCOPE.to_owned(),
+                |(action, name)| format!("{action}:{name}"),
+            )))
+        })
+    }
+
+    fn permission_input(&self) -> Option<&Value> {
+        self.reviewed.get().map(|reviewed| &reviewed.input)
+    }
+
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
+        Box::pin(async move {
+            let Some((action, name)) = self.mutation() else {
+                return Ok(None);
+            };
+            if self.reviewed.get().is_some() {
+                return Ok(None);
+            }
+            let handle = automation_handle(ctx)?;
+            let snapshot = handle
+                .review(self.request.clone())
+                .await
+                .map_err(|error| ToolError::new(failure_of(&error), error.to_string()))?;
+            let given = match &self.request {
+                AutomationRequest::Arm { args, .. } => args
+                    .as_ref()
+                    .or(snapshot.args.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                _ => snapshot.args.clone().unwrap_or_else(|| json!({})),
+            };
+            let args =
+                if action == ACTION_ARM {
+                    Value::Object(args::resolve(&snapshot.declared_args, &given).map_err(
+                        |error| ToolError::new(ToolFailure::InvalidInput, error.to_string()),
+                    )?)
+                } else {
+                    given
+                };
+            let mut input = json!({
+                "action": action,
+                "name": name,
+                "scope": snapshot.scope,
+                "path": snapshot.path,
+                "digest": snapshot.digest,
+                "triggers": snapshot.triggers,
+                "args": args,
+                "capabilities": snapshot.capabilities,
+            });
+            if action == ACTION_ARM
+                && snapshot.scope == Scope::Project
+                && !snapshot.trust.is_trusted()
+            {
+                input["trust"] = Value::String(format!("trusts digest {}", snapshot.digest));
+            }
+            let _ = self.reviewed.set(ReviewedCall { snapshot, input });
+            Ok(None)
+        })
+    }
+
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(header(&self.request)))
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let Some(handle) = ctx
-                .session_id
-                .as_ref()
-                .and_then(|session| AutomationHandle::lookup(session.id()))
-            else {
-                return error(ToolFailure::Other, UNAVAILABLE.to_owned());
+            let handle = match automation_handle(ctx) {
+                Ok(handle) => handle,
+                Err(failure) => return error(failure.failure, failure.message),
             };
-            render(&handle, self.request, ctx.hosted.as_ref()).await
+            let answer = if self.mutation().is_some() {
+                let Some(reviewed) = self.reviewed.into_inner() else {
+                    return error(ToolFailure::Denied, REVIEW_REQUIRED.to_owned());
+                };
+                let mut request = self.request;
+                if let AutomationRequest::Arm { args, .. } = &mut request {
+                    *args = Some(reviewed.input[ARGS_FIELD].clone());
+                }
+                handle.request_reviewed(request, reviewed.snapshot).await
+            } else {
+                handle.request(self.request).await
+            };
+            render(&handle, answer, ctx.hosted.as_ref())
         })
     }
+}
+
+fn automation_handle(ctx: &ToolContext) -> Result<AutomationHandle, ToolError> {
+    ctx.session_id
+        .as_ref()
+        .and_then(|session| AutomationHandle::lookup(session.id()))
+        .ok_or_else(|| ToolError::new(ToolFailure::Other, UNAVAILABLE))
 }
 
 /// A blank `name` or `fire_id` is refused rather than sent: the runtime would answer it with an
@@ -207,9 +340,23 @@ fn parse_request(input: &Value) -> Result<AutomationRequest, ParseError> {
         .get(ACTION_FIELD)
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if action != ACTION_ARM && input.get(ARGS_FIELD).is_some() {
+        return Err(ParseError::custom(ARGS_ONLY_ARM));
+    }
     Ok(match action {
         ACTION_LIST => AutomationRequest::List,
         ACTION_VALIDATE => AutomationRequest::Validate {
+            name: text(NAME_FIELD)?.ok_or_else(|| ParseError::custom(NAME_REQUIRED))?,
+        },
+        ACTION_ARM => AutomationRequest::Arm {
+            name: text(NAME_FIELD)?.ok_or_else(|| ParseError::custom(NAME_REQUIRED))?,
+            args: input.get(ARGS_FIELD).cloned(),
+            origin: ArmOrigin::Manual,
+        },
+        ACTION_DISARM => AutomationRequest::Disarm {
+            name: text(NAME_FIELD)?.ok_or_else(|| ParseError::custom(NAME_REQUIRED))?,
+        },
+        ACTION_DELETE => AutomationRequest::Delete {
             name: text(NAME_FIELD)?.ok_or_else(|| ParseError::custom(NAME_REQUIRED))?,
         },
         ACTION_HISTORY => AutomationRequest::History {
@@ -227,6 +374,9 @@ fn parse_request(input: &Value) -> Result<AutomationRequest, ParseError> {
 fn header(request: &AutomationRequest) -> String {
     match request {
         AutomationRequest::Validate { name } => format!("{ACTION_VALIDATE} {name}"),
+        AutomationRequest::Arm { name, .. } => format!("{ACTION_ARM} {name}"),
+        AutomationRequest::Disarm { name } => format!("{ACTION_DISARM} {name}"),
+        AutomationRequest::Delete { name } => format!("{ACTION_DELETE} {name}"),
         AutomationRequest::History {
             fire_id: Some(subject),
             ..
@@ -240,12 +390,11 @@ fn header(request: &AutomationRequest) -> String {
     }
 }
 
-async fn render(
+fn render(
     handle: &AutomationHandle,
-    request: AutomationRequest,
+    answer: Result<AutomationResponse, AutomationError>,
     hosted: Option<&HostedCall>,
 ) -> ToolExecResult {
-    let answer = handle.request(request).await;
     if let (Some(hosted), Ok(answer)) = (hosted, &answer) {
         hosted.offer_detail(answer);
     }
@@ -275,6 +424,12 @@ async fn render(
         Ok(AutomationResponse::Firing(detail)) => {
             summarized(render_firing(&detail), detail.firing.status.to_string())
         }
+        Ok(AutomationResponse::Automation(automation)) => {
+            let mut lines = Vec::new();
+            automation_lines(&automation, &mut lines);
+            summarized(lines.join("\n"), status(automation.status))
+        }
+        Ok(AutomationResponse::Ack) => summarized(DELETED.to_owned(), DELETED.to_owned()),
         Ok(_) => error(ToolFailure::Other, UNEXPECTED_RESPONSE.to_owned()),
         Err(failure) => error(failure_of(&failure), failure.to_string()),
     }
@@ -285,7 +440,9 @@ fn failure_of(error: &AutomationError) -> ToolFailure {
         AutomationError::UnknownAutomation { .. } | AutomationError::UnknownFiring { .. } => {
             ToolFailure::NotFound
         }
-        AutomationError::TrustRequired { .. } => ToolFailure::Denied,
+        AutomationError::TrustRequired { .. } | AutomationError::DeleteRefused { .. } => {
+            ToolFailure::Denied
+        }
         AutomationError::Invalid { .. } | AutomationError::Args { .. } => ToolFailure::InvalidInput,
         AutomationError::Unavailable
         | AutomationError::StateConflict { .. }
@@ -297,7 +454,7 @@ fn failure_of(error: &AutomationError) -> ToolFailure {
     }
 }
 
-/// One block per automation, then where scripts go and who arms them: a writer needs the
+/// One block per automation, then where scripts go: a writer needs the
 /// directories even before the first script exists.
 fn render_list(automations: &[AutomationSnapshot], directories: &AutomationDirs) -> String {
     let mut lines = Vec::new();
@@ -317,7 +474,7 @@ fn render_list(automations: &[AutomationSnapshot], directories: &AutomationDirs)
         USER_DIR_LABEL,
         NO_USER_DIR,
     ));
-    lines.push(HAND_OVER.to_owned());
+    lines.push(ARM_HINT.to_owned());
     lines.join("\n")
 }
 
@@ -686,6 +843,10 @@ mod tests {
 
     #[test_case(json!({"action": "list"}), AutomationRequest::List; "list")]
     #[test_case(json!({"action": "validate", "name": GREETER}), AutomationRequest::Validate { name: GREETER.into() }; "validate")]
+    #[test_case(json!({"action": "arm", "name": GREETER}), AutomationRequest::Arm { name: GREETER.into(), args: None, origin: ArmOrigin::Manual }; "arm_defaults")]
+    #[test_case(json!({"action": "arm", "name": GREETER, "args": {"turns": TURNS_DEFAULT}}), AutomationRequest::Arm { name: GREETER.into(), args: Some(json!({"turns": TURNS_DEFAULT})), origin: ArmOrigin::Manual }; "arm_args")]
+    #[test_case(json!({"action": "disarm", "name": GREETER}), AutomationRequest::Disarm { name: GREETER.into() }; "disarm")]
+    #[test_case(json!({"action": "delete", "name": GREETER}), AutomationRequest::Delete { name: GREETER.into() }; "delete")]
     #[test_case(json!({"action": "history"}), AutomationRequest::History { name: None, fire_id: None, limit: None }; "history_of_every_automation")]
     #[test_case(json!({"action": "history", "name": GREETER, "limit": LIMIT}), AutomationRequest::History { name: Some(GREETER.into()), fire_id: None, limit: Some(LIMIT) }; "history_of_one_automation")]
     #[test_case(json!({"action": "history", "fire_id": FIRE_ID}), AutomationRequest::History { name: None, fire_id: Some(FIRE_ID.into()), limit: None }; "one_firing")]
@@ -694,6 +855,10 @@ mod tests {
     }
 
     #[test_case(json!({"action": "validate"}), NAME_REQUIRED; "validate_needs_a_name")]
+    #[test_case(json!({"action": "arm"}), NAME_REQUIRED; "arm_needs_a_name")]
+    #[test_case(json!({"action": "disarm"}), NAME_REQUIRED; "disarm_needs_a_name")]
+    #[test_case(json!({"action": "delete"}), NAME_REQUIRED; "delete_needs_a_name")]
+    #[test_case(json!({"action": "disarm", "name": GREETER, "args": {}}), ARGS_ONLY_ARM; "args_only_apply_to_arm")]
     #[test_case(json!({"action": "validate", "name": " "}), BLANK; "validate_refuses_a_blank_name")]
     #[test_case(json!({"action": "history", "name": ""}), BLANK; "history_refuses_a_blank_name")]
     #[test_case(json!({"action": "history", "fire_id": ""}), BLANK; "history_refuses_a_blank_fire_id")]
@@ -702,11 +867,27 @@ mod tests {
         assert!(error.contains(expected), "{error}");
     }
 
-    #[test_case("arm"; "arm")]
     #[test_case("trust"; "trust")]
     #[test_case("pause"; "pause")]
-    fn the_tool_only_reads(action: &str) {
+    fn unsupported_controls_are_refused(action: &str) {
         assert!(parse_request(&json!({"action": action, "name": GREETER})).is_err());
+    }
+
+    #[test_case(ACTION_LIST, READ_SCOPE, ToolEffect::ReadOnly; "list")]
+    #[test_case(ACTION_VALIDATE, READ_SCOPE, ToolEffect::ReadOnly; "validate")]
+    #[test_case(ACTION_HISTORY, READ_SCOPE, ToolEffect::ReadOnly; "history")]
+    #[test_case(ACTION_ARM, "arm:greeter", ToolEffect::Mutating; "arm")]
+    #[test_case(ACTION_DISARM, "disarm:greeter", ToolEffect::Mutating; "disarm")]
+    #[test_case(ACTION_DELETE, "delete:greeter", ToolEffect::Mutating; "delete")]
+    fn actions_have_scopes_and_effects(action: &str, scope: &str, effect: ToolEffect) {
+        let call = AutomationTool
+            .parse(&json!({"action": action, "name": GREETER}))
+            .unwrap();
+        assert_eq!(call.call_effect(ToolEffect::Mutating), effect);
+        let scopes = smol::block_on(call.permission_scopes()).unwrap();
+        assert_eq!(scopes.scopes, [scope]);
+        assert!(!scopes.force_prompt);
+        assert!(!scopes.plan_scoped);
     }
 
     #[test]
@@ -773,7 +954,7 @@ mod tests {
                 text.contains(&format!("{USER_DIR_LABEL}{}", user_dir.display())),
                 "{text}"
             );
-            assert!(text.ends_with(HAND_OVER), "{text}");
+            assert!(text.ends_with(ARM_HINT), "{text}");
             runtime.shutdown().await;
         });
     }

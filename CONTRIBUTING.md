@@ -166,6 +166,17 @@ Caudra bundles two skill packs: pstack in `caudra-pstack/`, from [cursor/plugins
 
 The `pstack-sync` automation in `.caudra/automations/` runs that routine once a day: it merges `main` into its own branch, pulls your cursor/plugins clone, syncs, retranslates with the skill, validates, and fast-forwards your local `main`. Set it up as `model-watch` above, in its own worktree on a `pstack-sync` branch, and arm it with both paths: `/automations arm pstack-sync {"main_worktree": "/path/to/caudra", "plugins_checkout": "/path/to/cursor-plugins"}`. Each run writes its report to `target/pstack-sync/<date>.md` in the worktree.
 
+## Keeping a worktree current
+
+The experimental `sync-main` automation in `.caudra/automations/` checks local `main` every 15 minutes, when armed, and when the session becomes idle. It spends no model turn while the worktree is current. When `main` moves, it asks an idle session to sync or sends a working session one request to add `Sync with main` after its current todo. The sync policy reads what arrived, adopts work that `main` already implements, merges at a safe point, and runs `make check`. It never pushes or changes the main checkout.
+
+1. Enable `[experimental] automations = true` in your global `caudra.toml` and restart Caudra.
+2. If this worktree branched before the script landed, run one manual `git merge main` to get it.
+3. Trust `sync-main` once in `/automations`. That grant carries to sibling worktrees with the same script.
+4. In each worktree session, run `/automations arm sync-main`.
+
+The optional args are `base` (default `"main"`), `check` (`"make check"`), `brief_over` (`5` commits), and `notice_hours` (`12` hours). A blocked sync notifies once per base SHA and waits until the base moves or you arm it again manually. Editing the script, including receiving an edit through a merge, revokes its trust until you approve the new digest.
+
 ## Working on Workcell
 
 The file, shell, web, Python, and source-code tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.

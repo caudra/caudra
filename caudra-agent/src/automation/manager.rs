@@ -8,6 +8,7 @@
 //! of the session that settle arrive from a forwarder as `workflow_finished` events.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,7 +61,9 @@ use smol::Task;
 use tracing::{debug, warn};
 
 use super::bundled::{BundledAutomation, bundled_automations};
-use super::catalog::{AutomationDirs, Catalog, CatalogError, Frontend, ResolvedAutomation};
+use super::catalog::{
+    AutomationDirs, Catalog, CatalogError, Frontend, OUTSIDE_DELETE, ResolvedAutomation,
+};
 use super::clock::{Clock, millis};
 use super::dry_run::{DryRunJob, DryRuns, replayed_event, replayed_trigger};
 use super::handle::{AutomationHandle, Command, Inbox, Shared};
@@ -113,6 +116,8 @@ pub const PAUSED_BY_SCRIPT: &str = "paused by automation";
 const UNJOURNALED: &str = "the request could not be journaled";
 const NO_THREAD: &str = "the firing's thread could not start";
 const NOT_A_SESSION: &str = "is not a session id";
+const REVIEW_MISMATCH: &str = "request does not match the reviewed automation";
+const SCRIPT_GONE: &str = "the script is no longer in the automation catalog";
 
 pub struct RuntimeDeps {
     pub state_dir: StateDir,
@@ -536,9 +541,25 @@ impl Manager {
 
     async fn handle(&mut self, command: Command) {
         match command {
-            Command::Request(request, reply) => {
+            Command::Review(request, reply) => {
+                let reviewed = if self.stopping.is_some() {
+                    Err(AutomationError::Unavailable)
+                } else {
+                    self.review(&request)
+                };
+                let _ = reply.send(reviewed);
+            }
+            Command::Request {
+                request,
+                reviewed,
+                reply,
+            } => {
                 let answered = if self.stopping.is_some() {
                     Err(AutomationError::Unavailable)
+                } else if let Some(reviewed) = reviewed {
+                    self.request_reviewed(request, &reviewed)
+                        .await
+                        .map(Answered::Now)
                 } else {
                     self.request(request).await
                 };
@@ -861,6 +882,10 @@ impl Manager {
                     .map(automation_response)
             }
             AutomationRequest::Disarm { name } => self.disarm(&name).await.map(automation_response),
+            AutomationRequest::Delete { name } => {
+                self.rescan();
+                self.delete(&name).await
+            }
             AutomationRequest::Trust { name, digest } => self.trust(&name, &digest),
             AutomationRequest::Inspect { name, session_id } => {
                 let session_id = session_id
@@ -1139,7 +1164,77 @@ impl Manager {
         }
     }
 
+    fn review(
+        &mut self,
+        request: &AutomationRequest,
+    ) -> Result<AutomationSnapshot, AutomationError> {
+        self.rescan();
+        let (name, armed) = match request {
+            AutomationRequest::Arm { name, .. } | AutomationRequest::Delete { name } => {
+                (name, None)
+            }
+            AutomationRequest::Disarm { name } => (name, self.armed.get(name)),
+            _ => return Err(AutomationError::Internal(REVIEW_MISMATCH.to_owned())),
+        };
+        self.snapshot_with(name, armed)
+            .ok_or_else(|| AutomationError::UnknownAutomation { name: name.clone() })
+    }
+
+    async fn request_reviewed(
+        &mut self,
+        request: AutomationRequest,
+        reviewed: &AutomationSnapshot,
+    ) -> Result<AutomationResponse, AutomationError> {
+        let current = self.review(&request)?;
+        Catalog::check_reviewed(reviewed, &current).map_err(catalog_error)?;
+        match request {
+            AutomationRequest::Arm { name, args, origin } if name == reviewed.name => {
+                if !reviewed.trust.is_trusted() {
+                    self.trust(&name, &reviewed.digest)?;
+                    let current = self
+                        .snapshot_with(&name, None)
+                        .ok_or_else(|| AutomationError::UnknownAutomation { name: name.clone() })?;
+                    Catalog::check_reviewed(reviewed, &current).map_err(catalog_error)?;
+                }
+                self.arm(&name, args, origin, armed_reason(origin))
+                    .await
+                    .map(automation_response)
+            }
+            AutomationRequest::Disarm { name } if name == reviewed.name => {
+                self.disarm(&name).await.map(automation_response)
+            }
+            AutomationRequest::Delete { name } if name == reviewed.name => self.delete(&name).await,
+            _ => Err(AutomationError::Internal(REVIEW_MISMATCH.to_owned())),
+        }
+    }
+
+    async fn delete(&mut self, name: &str) -> Result<AutomationResponse, AutomationError> {
+        let directories = AutomationDirs::resolve(
+            (!self.remote).then_some(self.cwd.as_path()),
+            self.user_config_dir.as_deref(),
+        );
+        let path = self.catalog.delete_path(name, &directories)?;
+        if self.armed.contains_key(name) || self.parked.iter().any(|parked| parked.name == name) {
+            self.disarm(name).await?;
+        }
+        let checked = self.catalog.delete_path(name, &directories)?;
+        if checked != path {
+            return Err(AutomationError::DeleteRefused {
+                name: name.to_owned(),
+                reason: OUTSIDE_DELETE.to_owned(),
+            });
+        }
+        fs::remove_file(path).map_err(|error| AutomationError::DeleteRefused {
+            name: name.to_owned(),
+            reason: error.to_string(),
+        })?;
+        self.rescan();
+        self.publish_all();
+        Ok(AutomationResponse::Ack)
+    }
+
     async fn disarm(&mut self, name: &str) -> Result<AutomationSnapshot, AutomationError> {
+        let previous = self.snapshot(name);
         self.parked.retain(|parked| parked.name != name);
         if let Some(armed) = self.armed.remove(name) {
             self.work.disarm(name);
@@ -1170,6 +1265,17 @@ impl Manager {
             self.shared.store.disarm(name.to_owned()).await?;
         }
         self.publish(name)
+            .or_else(|| {
+                previous.map(|mut snapshot| {
+                    snapshot.armed = None;
+                    snapshot.status = AutomationStatus::Idle;
+                    snapshot.availability = Availability::Invalid {
+                        reason: SCRIPT_GONE.to_owned(),
+                    };
+                    self.publish_all();
+                    snapshot
+                })
+            })
             .ok_or_else(|| AutomationError::UnknownAutomation {
                 name: name.to_owned(),
             })
@@ -1907,6 +2013,7 @@ impl Manager {
         };
         let stop = Arc::new(Stop::default());
         let host = FiringHost {
+            cwd: (!self.remote).then(|| self.cwd.clone()),
             fire_id: fire_id.clone(),
             commands: self.shared.commands.clone(),
             stop: Arc::clone(&stop),
@@ -2885,7 +2992,10 @@ impl Manager {
     }
 
     fn snapshot(&self, name: &str) -> Option<AutomationSnapshot> {
-        let armed = self.armed.get(name);
+        self.snapshot_with(name, self.armed.get(name))
+    }
+
+    fn snapshot_with(&self, name: &str, armed: Option<&Armed>) -> Option<AutomationSnapshot> {
         let listed = self.catalog.find(name).map(|resolved| &resolved.entry);
         let Some(entry) = armed.map(|armed| armed.entry.as_ref()).or(listed) else {
             return self
@@ -3302,6 +3412,8 @@ mod tests {
     use std::borrow::Cow;
     use std::env;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::Path;
     use std::pin::pin;
     use std::thread;
@@ -3333,7 +3445,9 @@ mod tests {
 
     use super::*;
     use crate::StoredSession;
-    use crate::automation::catalog::UNAVAILABLE_IN_SDK;
+    use crate::automation::catalog::{
+        BUNDLED_DELETE, REGULAR_DELETE, REVIEW_CHANGED, UNAVAILABLE_IN_SDK,
+    };
     use crate::automation::clock::{FakeClock, Wake};
     use crate::automation::host::{HOST_PANICKED, NOT_IN_THIS_BUILD, THREAD_NAME as FIRING_THREAD};
     use crate::automation::http::{
@@ -3393,6 +3507,7 @@ mod tests {
     const CLOCKED: &str = "clocked";
     const BRIEFED: &str = "briefed";
     const ROUTINE: &str = "routine";
+    const REVIEWED_BODY: &str = "state.reason = event.reason;";
 
     const ARMED: &str = r#"#{ kind: "armed" }"#;
     const IDLE: &str = r#"#{ kind: "idle" }"#;
@@ -4213,6 +4328,243 @@ state.seen = seen;"#;
 
     fn disarm(name: &str) -> AutomationRequest {
         AutomationRequest::Disarm { name: name.into() }
+    }
+
+    #[test_case(false; "unarmed")]
+    #[test_case(true; "armed")]
+    fn delete_removes_the_file_and_disarms_the_binding(armed: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(if armed { &[ROUTINE] } else { &[] }).await;
+            let path = live.snapshot(ROUTINE).path;
+            assert_eq!(
+                live.handle
+                    .request(AutomationRequest::Delete {
+                        name: ROUTINE.into()
+                    })
+                    .await,
+                Ok(AutomationResponse::Ack)
+            );
+            assert!(!path.exists());
+            assert!(live.handle.state().find(ROUTINE).is_none());
+            let AutomationResponse::Detail(detail) = live
+                .handle
+                .request(AutomationRequest::Inspect {
+                    name: ROUTINE.into(),
+                    session_id: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("{NOT_A_DETAIL}")
+            };
+            assert!(detail.binding.is_none_or(|binding| !binding.armed));
+            live.stop().await;
+        });
+    }
+
+    #[test_case((); "bundled")]
+    fn delete_refuses_bundled_scripts(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let live = boot(RuntimeDeps {
+                bundled: Some(vec![bundled(ROUTINE, &[IDLE], &[], "")]),
+                ..fixture.deps(&[ROUTINE])
+            })
+            .await;
+            assert_eq!(
+                live.handle
+                    .request(AutomationRequest::Delete {
+                        name: ROUTINE.into()
+                    })
+                    .await,
+                Err(AutomationError::DeleteRefused {
+                    name: ROUTINE.into(),
+                    reason: BUNDLED_DELETE.into()
+                })
+            );
+            assert!(live.snapshot(ROUTINE).armed.is_some());
+            live.stop().await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test_case((); "symlink")]
+    fn delete_refuses_symlinks_without_removing_the_target(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(&[]).await;
+            let path = live.snapshot(ROUTINE).path;
+            let target = fixture.temp.path().join("outside.rhai");
+            fs::rename(&path, &target).unwrap();
+            symlink(&target, &path).unwrap();
+            assert_eq!(
+                live.handle
+                    .request(AutomationRequest::Delete {
+                        name: ROUTINE.into()
+                    })
+                    .await,
+                Err(AutomationError::DeleteRefused {
+                    name: ROUTINE.into(),
+                    reason: REGULAR_DELETE.into()
+                })
+            );
+            assert!(target.is_file());
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            live.stop().await;
+        });
+    }
+
+    #[test_case(false; "trust_request")]
+    #[test_case(true; "approved_arm")]
+    fn a_stale_digest_trusts_nothing(approved_arm: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.project_script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(&[]).await;
+            let reviewed = live.snapshot(ROUTINE);
+            fixture.project_script(ROUTINE, &[IDLE], &[], REVIEWED_BODY);
+            let result = if approved_arm {
+                live.handle
+                    .request_reviewed(
+                        AutomationRequest::Arm {
+                            name: ROUTINE.into(),
+                            args: None,
+                            origin: ArmOrigin::Manual,
+                        },
+                        reviewed.clone(),
+                    )
+                    .await
+            } else {
+                live.handle
+                    .request(AutomationRequest::Trust {
+                        name: ROUTINE.into(),
+                        digest: reviewed.digest.clone(),
+                    })
+                    .await
+            };
+            live.barrier().await;
+            let current = live.snapshot(ROUTINE);
+            let expected = CatalogError::Changed {
+                name: ROUTINE.into(),
+                path: reviewed.path,
+                expected: reviewed.digest,
+                actual: current.digest.clone(),
+            };
+            assert_eq!(result, Err(catalog_error(expected)));
+            assert!(!current.trust.is_trusted());
+            assert!(current.armed.is_none());
+            live.stop().await;
+        });
+    }
+
+    #[test_case((); "project_arm")]
+    fn an_approved_project_arm_trusts_the_reviewed_digest_and_keeps_manual_reason(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.project_script(ROUTINE, &[ARMED], &[], REVIEWED_BODY);
+            let live = fixture.spawn(&[]).await;
+            let request = AutomationRequest::Arm {
+                name: ROUTINE.into(),
+                args: None,
+                origin: ArmOrigin::Manual,
+            };
+            let reviewed = live.handle.review(request.clone()).await.unwrap();
+            live.handle
+                .request_reviewed(request, reviewed.clone())
+                .await
+                .unwrap();
+            live.firing(ROUTINE, FiringStatus::Completed).await;
+            let current = live.snapshot(ROUTINE);
+            assert!(current.trust.is_trusted());
+            assert_eq!(current.digest, reviewed.digest);
+            assert_eq!(current.armed, Some(ArmOrigin::Manual));
+            assert_eq!(
+                live.state_of(ROUTINE).await.value["reason"],
+                spelled(ArmedReason::Manual)
+            );
+            live.stop().await;
+        });
+    }
+
+    #[test_case(false; "edited_source")]
+    #[test_case(true; "missing_source")]
+    fn a_reviewed_disarm_stops_the_active_source_even_after_file_changes(missing: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(&[ROUTINE]).await;
+            let active = live.snapshot(ROUTINE);
+            if missing {
+                fs::remove_file(&active.path).unwrap();
+            } else {
+                fixture.script(ROUTINE, &[IDLE], &[], REVIEWED_BODY);
+            }
+            let request = disarm(ROUTINE);
+            let reviewed = live.handle.review(request.clone()).await.unwrap();
+            assert_eq!(reviewed.digest, active.digest);
+            live.handle
+                .request_reviewed(request, reviewed)
+                .await
+                .unwrap();
+            assert!(
+                live.handle
+                    .state()
+                    .find(ROUTINE)
+                    .is_none_or(|entry| entry.armed.is_none())
+            );
+            live.stop().await;
+        });
+    }
+
+    #[test_case((); "rearm_edited_script")]
+    fn an_arm_reviews_the_current_file_rather_than_the_active_source(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(&[ROUTINE]).await;
+            let old = live.snapshot(ROUTINE);
+            fixture.script(ROUTINE, &[IDLE], &[], REVIEWED_BODY);
+            let request = AutomationRequest::Arm {
+                name: ROUTINE.into(),
+                args: None,
+                origin: ArmOrigin::Manual,
+            };
+            let reviewed = live.handle.review(request.clone()).await.unwrap();
+            assert_ne!(reviewed.digest, old.digest);
+            live.handle
+                .request_reviewed(request, reviewed.clone())
+                .await
+                .unwrap();
+            assert_eq!(live.snapshot(ROUTINE).digest, reviewed.digest);
+            live.stop().await;
+        });
+    }
+
+    #[test_case((); "scope_changed")]
+    fn an_approved_arm_cannot_switch_to_a_shadowing_script(_: ()) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.script(ROUTINE, &[IDLE], &[], "");
+            let live = fixture.spawn(&[]).await;
+            let request = AutomationRequest::Arm {
+                name: ROUTINE.into(),
+                args: None,
+                origin: ArmOrigin::Manual,
+            };
+            let reviewed = live.handle.review(request.clone()).await.unwrap();
+            fixture.project_script(ROUTINE, &[IDLE], &[], "");
+            assert_eq!(
+                live.handle.request_reviewed(request, reviewed).await,
+                Err(AutomationError::Invalid {
+                    name: ROUTINE.into(),
+                    reason: REVIEW_CHANGED.into()
+                })
+            );
+            live.stop().await;
+        });
     }
 
     /// Records as [`RECORD_BODY`] does, but fails on `idle`, which discards the record.

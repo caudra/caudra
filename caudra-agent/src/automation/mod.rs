@@ -18,6 +18,7 @@ pub mod catalog;
 pub mod clock;
 mod dry_run;
 pub mod frontend;
+mod git;
 pub mod handle;
 pub mod host;
 pub mod http;

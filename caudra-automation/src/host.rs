@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::event::Audience;
 use crate::limits::LimitRefusal;
+use crate::untrusted::Untrusted;
 
 /// The longest `expires` a `message` or `set_goal` delivery may wait.
 pub const MAX_EXPIRES: Duration = Duration::from_hours(7 * 24);
@@ -22,6 +23,7 @@ pub const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The longest body an `http` request may send.
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_GIT_COMMITS: u32 = 10_000;
 const JOURNAL_JSON: &str = "a request is plain JSON data";
 /// Between a [`Failure`]'s kind and its message, in its text.
 const FAILURE_SEPARATOR: &str = ": ";
@@ -33,6 +35,8 @@ pub type HostResult<T> = Result<T, HostError>;
 pub trait AutomationHost {
     /// Unix milliseconds. A dry run answers the time of the firing it replays.
     fn now_ms(&self) -> i64;
+    /// A read-only comparison with a local branch. Queries are not actions or journal entries.
+    fn git_compare(&self, base: &str) -> Result<Option<GitCompare>, Failure>;
     /// Polled while the script runs, so a pause, disarm or shutdown ends the firing at once.
     fn interrupted(&self) -> Option<Interruption>;
     /// Asked before the firing's first action that [`ActionKind::charges`]: cooldown,
@@ -40,6 +44,26 @@ pub trait AutomationHost {
     fn admit(&self) -> Result<(), LimitRefusal>;
     /// Performs one request, journaling it as it starts and as it ends.
     fn act(&self, site: CallSite, request: ActionRequest) -> HostResult<ActionReply>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitCompare {
+    pub branch: Option<Untrusted>,
+    pub head: String,
+    pub base_head: String,
+    pub ahead: u32,
+    pub behind: u32,
+    pub operation: Option<GitOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitOperation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
 }
 
 /// Where a request sits in its firing: its place in call order, and the position of the call

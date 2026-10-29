@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::sessions::{RuntimeRetry, SessionDatabase, SessionError, from_i64, to_i64};
 use crate::{StateClass, StateDir, now_epoch};
-use reading::{Reading, decode, encode};
+use reading::{Reading, decode, encode, separate_projects};
 
 pub use host::HostSnapshot;
 
@@ -143,7 +143,8 @@ impl ShellRuns {
 
     /// The newest `limit` runs, oldest first, the order they are learned in.
     /// A reading this build cannot decode is skipped, so a newer build's rows
-    /// never stop an older one from learning.
+    /// never stop an older one from learning. An older reading's project
+    /// leaves its labels where a newer run names it.
     pub fn newest(&self, limit: usize) -> Result<Vec<ShellRun>, SessionError> {
         let mut statement = self.database.connection().prepare(
             "SELECT reading, elapsed_ms, outcome, host FROM shell_runs ORDER BY id DESC LIMIT ?1",
@@ -177,6 +178,7 @@ impl ShellRuns {
             });
         }
         runs.reverse();
+        separate_projects(runs.iter_mut().map(|run| &mut run.reading));
         Ok(runs)
     }
 }
@@ -234,10 +236,11 @@ fn insert(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::reading::{Call, read};
+    use super::reading::{Call, decode, legacy, read};
     use super::{HostSnapshot, MAX_SHELL_RUNS, Prediction, RunOutcome, ShellRun, ShellRuns};
     use crate::StateDir;
     use crate::sessions::SessionError;
@@ -247,6 +250,7 @@ mod tests {
     const UNREADABLE: &[u8] = &[u8::MAX];
     const CORRUPT_HOST: &str = r#"{"version":1,"snapshot":{"cpu_usage":2.0}}"#;
     const OVERSIZED_HOST_BYTES: usize = 513;
+    const OTHER_DIR: &str = "/work/other";
 
     fn store() -> (TempDir, ShellRuns) {
         let temp = TempDir::new().unwrap();
@@ -370,6 +374,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(elapsed(&runs.newest(NEWEST).unwrap()), [0, 2]);
+    }
+
+    #[test]
+    fn older_readings_lose_projects_newer_runs_name() {
+        let (_temp, runs) = store();
+        let named = run(0);
+        let unnamed = ShellRun {
+            reading: read(&Call {
+                command: COMMAND,
+                workdir: Some(OTHER_DIR),
+                cwd: None,
+                timeout_secs: None,
+            }),
+            ..run(1)
+        };
+        for stored in [&named, &unnamed, &run(2)] {
+            runs.append(stored, None).unwrap();
+        }
+        let connection = runs.database.connection();
+        for stored in [&named, &unnamed] {
+            connection
+                .execute(
+                    "UPDATE shell_runs SET reading = ?1 WHERE elapsed_ms = ?2",
+                    params![legacy(&stored.reading), stored.elapsed_ms.cast_signed()],
+                )
+                .unwrap();
+        }
+        let older_unnamed = ShellRun {
+            reading: decode(&legacy(&unnamed.reading)).unwrap(),
+            ..unnamed
+        };
+        assert_eq!(runs.newest(NEWEST).unwrap(), [named, older_unnamed, run(2)]);
     }
 
     #[test]
