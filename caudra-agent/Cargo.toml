@@ -17,6 +17,7 @@ caudra-config = { workspace = true }
 caudra-decision = { workspace = true }
 caudra-diff = { workspace = true }
 caudra-otel = { workspace = true }
+caudra-emil = { workspace = true }
 caudra-mattpocock = { workspace = true }
 caudra-pstack = { workspace = true }
 caudra-skillpack = { workspace = true }

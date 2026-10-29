@@ -33,16 +33,30 @@ pub static MATTPOCOCK: Pack = Pack {
     commanded: |_| true,
 };
 
+pub static EMIL: Pack = Pack {
+    description: caudra_emil::SKILL_DESCRIPTION,
+    library: caudra_emil::library,
+    index: |_| caudra_emil::index(),
+    load: |address, _| {
+        caudra_emil::library()
+            .load(address)
+            .map(|loaded| loaded.text)
+    },
+    commanded: |_| true,
+};
+
 /// Applied at startup and on every settings reload: the skill registry is process-wide.
 pub fn install_all(packs: &SkillPacks) {
     crate::pstack::install(packs.pstack);
     install(&MATTPOCOCK, packs.mattpocock);
+    install(&EMIL, packs.emil);
 }
 
 /// The `/<pack>:` commands of every pack that is on.
 pub fn all_commands(packs: &SkillPacks) -> Vec<CustomCommand> {
     let mut commands = crate::pstack::commands(packs.pstack);
     commands.extend(commands_of(&MATTPOCOCK, packs.mattpocock));
+    commands.extend(commands_of(&EMIL, packs.emil));
     commands
 }
 
@@ -94,48 +108,47 @@ fn skill_commands(pack: &Pack) -> Vec<CustomCommand> {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
-    const GRILL_ME: &str = "grill-me";
     const FIX: &str = "the onboarding flow";
 
-    #[test]
-    fn every_mattpocock_skill_has_a_scoped_command() {
-        let commands = commands_of(&MATTPOCOCK, true);
-        assert_eq!(commands.len(), caudra_mattpocock::library().skills().len());
-        let grill = commands
+    #[test_case(&MATTPOCOCK, "grill-me", "/mattpocock:grill-me", "`mattpocock/grill-me`" ; "mattpocock")]
+    #[test_case(&EMIL, "prototype", "/emil:prototype", "`emil/prototype`" ; "emil_user_only")]
+    fn every_pack_skill_has_a_scoped_command(
+        pack: &Pack,
+        skill: &str,
+        display_name: &str,
+        loaded: &str,
+    ) {
+        let commands = commands_of(pack, true);
+        assert_eq!(commands.len(), (pack.library)().skills().len());
+        let command = commands
             .iter()
-            .find(|command| command.name == GRILL_ME)
+            .find(|command| command.name == skill)
             .unwrap();
-        assert_eq!(grill.display_name(), "/mattpocock:grill-me");
-        let sent = grill.render(FIX);
-        assert!(
-            sent.contains("`mattpocock/grill-me`") && sent.ends_with(FIX),
-            "{sent}"
-        );
+        assert_eq!(command.display_name(), display_name);
+        let sent = command.render(FIX);
+        assert!(sent.contains(loaded) && sent.ends_with(FIX), "{sent}");
     }
 
-    #[test]
-    fn each_pack_follows_its_own_switch() {
-        let scopes = |packs: SkillPacks| -> (bool, bool) {
-            let commands = all_commands(&packs);
-            let has = |scope: &'static str| {
-                commands
-                    .iter()
-                    .any(|command| command.scope == CommandScope::Builtin(scope))
-            };
-            (has(caudra_pstack::NAME), has(caudra_mattpocock::NAME))
+    #[test_case(SkillPacks::default(), (false, false, false) ; "all_off")]
+    #[test_case(SkillPacks { mattpocock: true, ..SkillPacks::default() }, (false, true, false) ; "mattpocock_alone")]
+    #[test_case(SkillPacks { emil: true, ..SkillPacks::default() }, (false, false, true) ; "emil_alone")]
+    #[test_case(SkillPacks { pstack: true, mattpocock: true, emil: true }, (true, true, true) ; "all_on")]
+    fn each_pack_follows_its_own_switch(packs: SkillPacks, expected: (bool, bool, bool)) {
+        let commands = all_commands(&packs);
+        let has = |scope: &'static str| {
+            commands
+                .iter()
+                .any(|command| command.scope == CommandScope::Builtin(scope))
         };
-        assert_eq!(scopes(SkillPacks::default()), (false, false));
-        let mattpocock = SkillPacks {
-            mattpocock: true,
-            ..SkillPacks::default()
-        };
-        assert_eq!(scopes(mattpocock), (false, true));
-        let both = SkillPacks {
-            pstack: true,
-            mattpocock: true,
-        };
-        assert_eq!(scopes(both), (true, true));
+        let scopes = (
+            has(caudra_pstack::NAME),
+            has(caudra_mattpocock::NAME),
+            has(caudra_emil::NAME),
+        );
+        assert_eq!(scopes, expected);
     }
 }

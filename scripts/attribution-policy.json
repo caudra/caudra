@@ -141,6 +141,19 @@
         "supplements/THIRD_PARTY_LICENSES/MattPocockSkills.txt"
       ]
     },
+    "caudra-emil@0.2.0-preview.16": {
+      "expression": "Apache-2.0 AND MIT",
+      "reason": "The Caudra glue and the pages Caudra adds, such as caudra/visual-check.md, remain Apache-2.0. The embedded skills copied from emilkowalski/skills (Emil Kowalski) and their Caudra translations remain MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/EmilKowalskiSkills.txt",
+          "sha256": "4ff5bdb7887ec1435c9cab0e8d1a7caee704d894d65c2a008ccc68b1cc2f260b"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/EmilKowalskiSkills.txt"
+      ]
+    },
     "rmcp@3.7.0": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The published crate includes LICENSE. Its .cargo_vcs_info.json pins upstream revision 5d6a11f2ae022f513aec0f6e0f10f89a57891a7f; the complete shipped LICENSE is preserved: it explicitly retains MIT for contributions without relicensing consent alongside Apache-2.0; documentation is separately CC-BY-4.0.",
