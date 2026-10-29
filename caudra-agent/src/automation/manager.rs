@@ -1907,6 +1907,7 @@ impl Manager {
         };
         let stop = Arc::new(Stop::default());
         let host = FiringHost {
+            cwd: (!self.remote).then(|| self.cwd.clone()),
             fire_id: fire_id.clone(),
             commands: self.shared.commands.clone(),
             stop: Arc::clone(&stop),

@@ -6,6 +6,7 @@
 use std::any::Any;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -15,8 +16,8 @@ use caudra_automation::engine::{
 };
 use caudra_automation::event::Event;
 use caudra_automation::host::{
-    ActionKind, ActionReply, ActionRequest, AutomationHost, CallSite, HostError, HostResult,
-    Interruption,
+    ActionKind, ActionReply, ActionRequest, AutomationHost, CallSite, Failure, FailureKind,
+    GitCompare, HostError, HostResult, Interruption,
 };
 use caudra_automation::limits::LimitRefusal;
 use event_listener::Event as Notify;
@@ -24,7 +25,9 @@ use serde_json::{Map, Value};
 use tracing::warn;
 
 use super::clock::Clock;
+use super::git;
 use super::handle::Command;
+use crate::scratch::tools_run_locally;
 
 pub(super) const THREAD_NAME: &str = "automation-firing";
 /// Why `http()` refuses in a runtime without an HTTP client, and a request that is not a message
@@ -33,6 +36,7 @@ pub const NOT_IN_THIS_BUILD: &str = "is not available in this build";
 /// Opens the error of a firing whose host side panicked.
 pub const HOST_PANICKED: &str = "the automation host panicked";
 const UNKNOWN_PANIC: &str = "unknown panic";
+const GIT_REMOTE: &str = "git_compare is unavailable when tools do not run locally";
 
 /// Why a running firing must stop. The first reason set wins. The firing reads it between
 /// operations and before each request, and a request in flight off the actor awaits it.
@@ -52,6 +56,7 @@ pub(super) struct FiringJob {
 }
 
 pub(super) struct FiringHost {
+    pub(super) cwd: Option<PathBuf>,
     pub(super) fire_id: String,
     pub(super) commands: flume::Sender<Command>,
     pub(super) stop: Arc<Stop>,
@@ -164,6 +169,15 @@ impl Stop {
 impl AutomationHost for FiringHost {
     fn now_ms(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    fn git_compare(&self, base: &str) -> Result<Option<GitCompare>, Failure> {
+        let cwd = self
+            .cwd
+            .as_ref()
+            .filter(|_| tools_run_locally())
+            .ok_or_else(|| Failure::new(FailureKind::Unavailable, GIT_REMOTE))?;
+        git::compare(cwd.clone(), base)
     }
 
     fn interrupted(&self) -> Option<Interruption> {

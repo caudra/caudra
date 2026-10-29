@@ -11,6 +11,8 @@ This is the complete reference for authoring automations. It stands on its own, 
 
 An automation is a short Rhai script that reacts to events in one session. Its header lists triggers, such as the session going idle, a goal finishing, a message arriving from another session, a workflow run finishing, or a schedule coming due. When a trigger matches, the body runs once with the event in scope. That run is a firing. A firing decides whether to act, and it acts only through a few host functions: it queues a message for the model, sets a goal, notifies the user, calls an HTTP endpoint its header declares, messages other sessions, starts a workflow its header declares, writes a log line, or pauses every automation in the session.
 
+A firing can also read the time with `now()` and compare its checkout with a local branch through `git_compare(base)`. These queries cost no action or model turn.
+
 The script is trusted. Values from outside it, such as the model's last response, the session title, or another session's message, arrive marked untrusted, and the host refuses to turn them into this session's instructions.
 
 An automation does nothing until the user arms it in a session: with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open and never finishes on its own. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
@@ -213,7 +215,7 @@ Both lists hold at most 16 entries, without repeats.
 | `cooldown` | `"0s"` | At most `"24h"`. The shortest gap between two firings that act. |
 | `max_per_hour` | `12` | 1 to 600. Firings that act, per rolling hour. |
 
-A firing acts when it calls a host function other than `now`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
+A firing acts when it calls a host function other than `now`, `git_compare`, `log`, `skip`, `release`, `pause_automations`, and the parsers. Section 9 explains what happens when a limit refuses.
 
 ### Args
 
@@ -509,6 +511,33 @@ Adds a line to the firing's trace, which `history` and `/automations` show. Untr
 
 Returns `#{ unix, iso, date, weekday, hour, minute, tz }` in `meta.timezone`, or in the system zone without one. `date` looks like `"2026-10-05"`, `weekday` is `"mon"` to `"sun"`, and `hour` and `minute` are integers.
 
+### `git_compare(base)`
+
+Compares HEAD with `refs/heads/<base>` in the repository discovered from the session's working directory. `base` is a local branch name, such as `"main"`, rather than a revision expression or a remote-tracking ref. Returns `()` outside a repository or when the local base branch is missing. Otherwise it returns a map:
+
+| Field | Meaning |
+|-------|---------|
+| `branch` | The current branch name as untrusted text, or `()` on a detached HEAD |
+| `head` | HEAD's full SHA |
+| `base_head` | The local base branch's full SHA |
+| `ahead` | Commits reachable from HEAD but not the base, capped at 10000 |
+| `behind` | Commits reachable from the base but not HEAD, capped at 10000 |
+| `operation` | `"merge"`, `"rebase"`, `"cherry_pick"`, `"revert"`, `"bisect"`, or `()` when none is in progress |
+
+Every field except `branch` is trusted. Compare the branch name, or show it through `attach`. Never paste it into `message()`.
+
+```rhai
+let comparison = git_compare(args.base);
+if comparison == () { skip("no repository or local base branch"); }
+if comparison.branch == args.base { skip("the base is checked out"); }
+if comparison.behind == 0 { skip("already current"); }
+message("Read the changes on " + args.base + " before continuing.");
+```
+
+The query reads local Git data without fetching or changing the checkout. It runs off the session actor with a five-second timeout. It costs no action, is not journaled, and may be called at most four times per firing. A fifth call stops the firing, even inside `try`.
+
+Catchable failures have kind `timeout` when the deadline expires, `unavailable` when tools run remotely or the repository cannot be read, and `invalid_argument` for a bad base name. Validation supplies a canned comparison one commit behind. Inspector dry runs return `()` without reading the repository, so they cannot reproduce the original Git state.
+
 ### `pause_automations(reason)`
 
 Sets the session's pause latch, as Esc Esc does. Every automation in the session stops: running firings are cancelled, and later events are recorded as `paused`. The calling firing runs on to its end, so it can still notify the user. The automation limits never refuse this call.
@@ -519,7 +548,7 @@ Sets the session's pause latch, as Esc Esc does. Every automation in the session
 
 ### Per-firing limits
 
-A firing may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, and 4 calls to `message` and `set_goal` together. Reaching any of them stops the firing.
+A firing may use at most 1 million operations, 120 seconds of wall time including host calls, 32 actions, 64 log lines, 4 calls to `message` and `set_goal` together, and 4 `git_compare` queries. Reaching any of them stops the firing.
 
 ### Errors
 
@@ -1045,6 +1074,8 @@ The trigger consumes every direct message. A message from a script, which has no
 | `` `+=` cannot add an untrusted value to plain text `` | `text += value` | `text = text + value` |
 | `reserved keyword 'print' is disabled` | `print` or `debug` | `log(text)` |
 | `log must be text, got i64` | a number given to `log` | `log("" + count)` |
+| `git_compare` fails with `invalid_argument` | a revision expression or invalid branch name | Pass the local branch name, such as `"main"`, without `refs/heads/`. |
+| `git_compare` fails with `unavailable` | tools run remotely, or local Git data cannot be read | Skip that firing or notify the user. The query never reads the remote machine. |
 | `Function not found: skip ()` | `skip` without a reason | `skip("why")` |
 | `sleep() is unavailable in automation scripts` | waiting inside a firing | `after`, `cooldown`, or a `schedule` trigger |
 | `the firing reached its limit of queued messages and goals` | more than 4 `message` or `set_goal` calls in one firing | Queue one message that lists the work. |

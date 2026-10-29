@@ -11,8 +11,8 @@ use serde_json::{Map, Value};
 use crate::engine::{Firing, FiringLimits, FiringOutcome, run_firing};
 use crate::event::{Audience, Event};
 use crate::host::{
-    ActionKind, ActionReply, ActionRequest, AutomationHost, CallSite, Failure, GoalSet, HostError,
-    HostResult, HttpResponse, Interruption, PublishReceipt, SendReceipt, SendStatus,
+    ActionKind, ActionReply, ActionRequest, AutomationHost, CallSite, Failure, GitCompare, GoalSet,
+    HostError, HostResult, HttpResponse, Interruption, PublishReceipt, SendReceipt, SendStatus,
     WorkflowStarted, request_hash,
 };
 use crate::limits::LimitRefusal;
@@ -108,6 +108,7 @@ pub enum Answer {
 
 struct DryRunHost<'a> {
     now_ms: i64,
+    comparison: Result<Option<GitCompare>, Failure>,
     /// Entries no request has matched yet, in journal order.
     unmatched: RefCell<Vec<&'a JournalEntry>>,
     actions: RefCell<Vec<DryAction>>,
@@ -115,8 +116,17 @@ struct DryRunHost<'a> {
 
 /// Runs the firing again. Nothing is performed or stored.
 pub fn dry_run(run: DryRun<'_>) -> DryRunReport {
+    dry_run_with_git_compare(run, Ok(None))
+}
+
+/// Replays a read-only git query from a scripted answer, without inspecting a repository.
+pub fn dry_run_with_git_compare(
+    run: DryRun<'_>,
+    comparison: Result<Option<GitCompare>, Failure>,
+) -> DryRunReport {
     let host = DryRunHost {
         now_ms: run.now_ms,
+        comparison,
         unmatched: RefCell::new(run.journal.iter().collect()),
         actions: RefCell::default(),
     };
@@ -166,6 +176,10 @@ pub fn journal_entry(action: StoredAction<'_>) -> Option<JournalEntry> {
 impl AutomationHost for DryRunHost<'_> {
     fn now_ms(&self) -> i64 {
         self.now_ms
+    }
+
+    fn git_compare(&self, _base: &str) -> Result<Option<GitCompare>, Failure> {
+        self.comparison.clone()
     }
 
     fn interrupted(&self) -> Option<Interruption> {
