@@ -22,7 +22,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 ### Changes
 
-- **Images and PDFs are stored once.** Pasted images, images that tools and tasks return, and fetched PDFs are saved as files under `media/` in the state directory, and sessions keep only a reference to each. The same picture in several sessions, forks, or task transcripts takes space once, and the upgrade moves images already saved into the store. Resumed sessions now keep their fetched PDFs. If a file goes missing, the model is told the image is unavailable instead of receiving it. The storage sweep and `caudra storage prune` remove files that no session, archive, or backup refers to after seven days. See [Sessions](/docs/sessions/).
+- **Images and PDFs are stored once.** Pasted images, images that tools and tasks return, and fetched PDFs are saved as files under `media/` in the state directory, and sessions keep only a reference to each. The same picture in several sessions, forks, or task transcripts takes space once, and the upgrade moves images already saved into the store. Resumed sessions now keep their fetched PDFs. If a file goes missing, the model is told the image is unavailable instead of receiving it. The storage sweep and `caudra storage prune` remove files that no session, archive, or backup refers to after seven days. Backups keep the files they refer to, so restoring one needs the `media/` directory beside it. `/storage` and `caudra storage stats` show the store's size, and `caudra storage check` reports missing or damaged files. See [Sessions](/docs/sessions/).
 
 ### Fixes
 

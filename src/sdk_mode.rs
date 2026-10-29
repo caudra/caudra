@@ -81,6 +81,7 @@ use flume::{Receiver, Sender};
 use futures_lite::future;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tracing::warn;
 
 use crate::cli::Cli;
@@ -89,6 +90,8 @@ pub(crate) const AUTO_PERMISSION_MODE: &str = "auto";
 const WORKFLOW_SYSTEM_SUBTYPE: &str = "workflow";
 const TASK_CONTROLS: &[&str] = &["task_list", "task_status", "task_cancel", "task_promote"];
 const STALE_TASK_INVOCATION: &str = "Task invocation is no longer current";
+/// The `type` of an image source that names a file in Caudra's media store.
+const STORED_MEDIA_TYPE: &str = "media";
 const WORKFLOW_LIST: &str = "workflow_list";
 const WORKFLOW_VALIDATE: &str = "workflow_validate";
 const WORKFLOW_START: &str = "workflow_start";
@@ -1950,7 +1953,13 @@ pub fn run(params: SdkParams) -> Result<()> {
                     };
                     let content = user.message.content;
                     let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
-                    let images = content_images(&content);
+                    let images = match content_images(&content) {
+                        Ok(images) => images,
+                        Err(error) => {
+                            eprintln!("warning: ignoring user message: {error}");
+                            continue;
+                        }
+                    };
                     if images.is_empty()
                         && let Some(args) = prompt
                             .strip_prefix("/remote")
@@ -2363,18 +2372,34 @@ fn content_text(content: &Value) -> Option<String> {
     }
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "an image source of type \"media\" names a file in Caudra's media store; send the image as \
+     {{\"type\":\"base64\",\"media_type\":...,\"data\":...}}"
+)]
+struct StoredMediaRefused;
+
 // Claude Code stream-json block shape:
 // {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
 // `source` deserializes straight into ImageSource; malformed blocks are skipped.
-fn content_images(content: &Value) -> Vec<ImageSource> {
+// A reference into the media store is how Caudra saves an image, never how a
+// client sends one, so it is refused rather than loaded.
+fn content_images(content: &Value) -> Result<Vec<ImageSource>, StoredMediaRefused> {
     let Value::Array(blocks) = content else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    blocks
+    let mut images = Vec::new();
+    for source in blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
-        .filter_map(|b| serde_json::from_value::<ImageSource>(b.get("source")?.clone()).ok())
-        .collect()
+        .filter_map(|b| b.get("source"))
+    {
+        if source.get("type").and_then(Value::as_str) == Some(STORED_MEDIA_TYPE) {
+            return Err(StoredMediaRefused);
+        }
+        images.extend(serde_json::from_value::<ImageSource>(source.clone()).ok());
+    }
+    Ok(images)
 }
 
 fn handle_control_request(
@@ -5076,15 +5101,38 @@ mod tests {
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
         ]);
-        let images = content_images(&blocks);
+        let images = content_images(&blocks).unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].data().map(|data| &**data), Some("AAAA"));
         assert_eq!(images[1].data().map(|data| &**data), Some("BBBB"));
 
         // Non-array content and malformed image blocks yield no images.
-        assert!(content_images(&serde_json::json!("hi")).is_empty());
+        assert!(content_images(&serde_json::json!("hi")).unwrap().is_empty());
         let bad = serde_json::json!([{"type": "image", "source": {"data": "x"}}]);
-        assert!(content_images(&bad).is_empty());
+        assert!(content_images(&bad).unwrap().is_empty());
+    }
+
+    #[test]
+    fn content_images_accepts_the_untagged_inline_shape() {
+        let blocks = serde_json::json!([
+            {"type": "image", "source": {"media_type": "image/png", "data": "AAAA"}},
+        ]);
+
+        let images = content_images(&blocks).unwrap();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data().map(|data| &**data), Some("AAAA"));
+    }
+
+    #[test_case(serde_json::json!({"type": "media", "media_type": "image/png", "sha256": "a".repeat(64), "bytes": 4}); "a full reference")]
+    #[test_case(serde_json::json!({"type": "media", "media_type": "image/png", "sha256": "a".repeat(64)}); "a reference without its size")]
+    fn content_images_refuses_a_media_store_reference(source: Value) {
+        let blocks = serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "image", "source": source},
+        ]);
+
+        assert_eq!(content_images(&blocks).unwrap_err(), StoredMediaRefused);
     }
 
     #[test]

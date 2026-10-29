@@ -10,6 +10,7 @@ use caudra_config::{StorageConfig, load_env_files};
 use caudra_providers::{NOT_BILLED_MARK, format_hit_rate, format_tokens_u64};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
+use caudra_storage::media::{MediaCheckReport, MediaHash};
 use caudra_storage::retention::{
     Decision, Duration as RetentionDuration, GroupBy, KeepPolicy, SessionFacts,
 };
@@ -60,6 +61,11 @@ const USAGE_TOTAL: &str = "all recorded spend";
 const UNREPRESENTABLE_DURATION: &str = "duration does not land in the representable range";
 const UNKNOWN_FRAMES: &str = "unknown (another process was checkpointing)";
 const CHECKPOINT_SKIPPED: &str = "WAL checkpoint skipped: another process was checkpointing";
+const MEDIA_SIZE_NOTE: &str = "Rows and Artifacts leave out images and PDFs. Each is stored once \
+    in the media store, counted in media_bytes of `caudra storage stats`, and removed by prune \
+    once nothing refers to it and it is seven days old.";
+/// Hashes named per kind of media problem, so a large failure stays readable.
+const MEDIA_EXAMPLES: usize = 3;
 
 /// One aggregated line of `storage usage`.
 #[derive(Serialize, Default)]
@@ -156,6 +162,8 @@ pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
                 );
                 println!("snapshot_bytes: {}", bytes(stats.snapshot_bytes));
                 println!("archive_bytes: {}", bytes(stats.archive_bytes));
+                println!("media_files: {}", stats.media_files);
+                println!("media_bytes: {}", bytes(stats.media_bytes));
                 println!("pending_cleanup_jobs: {}", stats.pending_cleanup_jobs);
             }
         }
@@ -176,6 +184,10 @@ pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
             let database = SessionDatabase::open_read_only(&state_dir)
                 .context("open session database read-only")?;
             database.quick_check().context("check session database")?;
+            let media = database.check_media().context("check media store")?;
+            if !media.is_intact() {
+                bail!("{}", media_problems(&media));
+            }
             println!("ok");
         }
         StorageAction::Checkpoint { truncate } => {
@@ -746,6 +758,21 @@ fn render_prune(report: &PruneReport) -> String {
         report.unreferenced_media_files,
         bytes(report.unreferenced_media_bytes)
     );
+    if report.backup_only_media_files > 0 {
+        let _ = writeln!(
+            out,
+            "  keep {} media files ({}) that only database backups refer to",
+            report.backup_only_media_files,
+            bytes(report.backup_only_media_bytes)
+        );
+    }
+    if report.orphan_media_sidecars > 0 {
+        let _ = writeln!(
+            out,
+            "  {prefix}remove {} media reference caches of deleted backups",
+            report.orphan_media_sidecars
+        );
+    }
     let _ = writeln!(
         out,
         "  {prefix}release {} change record holders without a session and reclaim {} from \
@@ -960,6 +987,31 @@ fn render_sessions(rows: &[SessionRow<'_>]) -> String {
         );
     }
     let _ = writeln!(out, "{} sessions", rows.len());
+    let _ = writeln!(out, "{MEDIA_SIZE_NOTE}");
+    out
+}
+
+fn media_problems(report: &MediaCheckReport) -> String {
+    let mut out = format!(
+        "media store: {} of {} referenced files missing, {} corrupt",
+        report.missing.len(),
+        report.referenced,
+        report.corrupt.len()
+    );
+    for (label, hashes) in [("missing", &report.missing), ("corrupt", &report.corrupt)] {
+        if hashes.is_empty() {
+            continue;
+        }
+        let named: Vec<&str> = hashes
+            .iter()
+            .take(MEDIA_EXAMPLES)
+            .map(MediaHash::as_str)
+            .collect();
+        let _ = write!(out, "\n{label}: {}", named.join(", "));
+        if hashes.len() > MEDIA_EXAMPLES {
+            let _ = write!(out, " and {} more", hashes.len() - MEDIA_EXAMPLES);
+        }
+    }
     out
 }
 
@@ -1087,6 +1139,7 @@ mod tests {
     const OPEN_RECORDS: u32 = 222;
     const PENDING_REVERTS: u32 = 333;
     const RECLAIMABLE_FIELD: &str = "snapshot_garbage_bytes";
+    const BACKUPS_LINE: &str = "only database backups";
 
     #[test_case(Some(SessionPreview { model: Some("anthropic/claude-opus-4-6".into()), first_prompt: Some("fix the build".into()), last_prompt: None }), json!(["anthropic/claude-opus-4-6", "fix the build", null]); "previewed")]
     #[test_case(None, json!([null, null, null]); "not_previewed")]
@@ -1497,6 +1550,59 @@ mod tests {
         for document in documents {
             assert_eq!(document.unwrap()[RECLAIMABLE_FIELD], RECLAIMABLE);
         }
+    }
+
+    #[test_case(0, None; "nothing kept by backups stays quiet")]
+    #[test_case(2, Some("  keep 2 media files (2.0 KiB) that only database backups refer to"); "kept by backups")]
+    fn prune_names_media_only_backups_keep(files: u64, expected: Option<&str>) {
+        let report = PruneReport {
+            backup_only_media_files: files,
+            backup_only_media_bytes: files * 1024,
+            ..PruneReport::default()
+        };
+
+        let rendered = render_prune(&report);
+
+        assert_eq!(
+            rendered.lines().find(|line| line.contains(BACKUPS_LINE)),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_failed_media_check_names_a_few_hashes_and_counts_the_rest() {
+        let hashes: Vec<MediaHash> = (0..=MEDIA_EXAMPLES as u8)
+            .map(|byte| MediaHash::of(&[byte]))
+            .collect();
+        let report = MediaCheckReport {
+            referenced: 10,
+            missing: hashes.clone(),
+            corrupt: Vec::new(),
+        };
+
+        let message = media_problems(&report);
+
+        let mut lines = message.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                format!(
+                    "media store: {} of 10 referenced files missing, 0 corrupt",
+                    hashes.len()
+                )
+                .as_str()
+            )
+        );
+        let named = lines.next().unwrap();
+        assert!(named.starts_with("missing: "));
+        assert!(named.ends_with(" and 1 more"));
+        assert!(
+            hashes[..MEDIA_EXAMPLES]
+                .iter()
+                .all(|hash| named.contains(hash.as_str()))
+        );
+        assert!(!named.contains(hashes[MEDIA_EXAMPLES].as_str()));
+        assert_eq!(lines.next(), None);
     }
 
     #[test]

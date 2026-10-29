@@ -640,7 +640,7 @@ Prints the same structured log the `/logs` modal shows, formatted for a terminal
 ```bash
 caudra storage path                       # session database path
 caudra storage stats [--json]             # rows, bytes, artifacts, pending cleanup
-caudra storage check                      # integrity check
+caudra storage check                      # database and media store integrity
 caudra storage sessions [--directory DIR] # list sessions with activity, size, state
 caudra storage snapshots [--json] [--records]  # change record stores, largest first
 caudra storage trim   [POLICY | ID...] [--dry-run]
@@ -661,6 +661,10 @@ Application state, peer-message history, and decision logs share `caudra.db`. Th
 `snapshots` lists the [file change record](/docs/sessions/#file-revert) stores largest first, one row per workspace directory with its size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead, and `--json` always gives both. `--records` also lists each holding session with its record count. A store that no existing session holds is reported as orphaned rather than skipped.
 
 `trim` demotes sessions to the transcript tier and `forget` deletes them. Both take a keep policy in `restic forget` terms and fall back to the configured `storage.retention` policy when no `--keep-*` flag is given. Both release the local change records of the sessions they trim or delete, and records that no other session holds are deleted. `prune` reclaims space that no session references. It releases the change records of deleted sessions older than seven days, trims each change store to its size budget, removes stores left empty and unused for seven days once no session's file revert reads them, and deletes the `session-snapshots/` and `workspace-snapshots/` directories of earlier versions. Its `--json` output reports the bytes it reclaimed from the change stores as `record_bytes_reclaimed`. In the `--json` output of `trim` and `forget`, `snapshot_garbage_bytes` reports the bytes that a prune would then reclaim from the change stores. See [Sessions](/docs/sessions/#retention) for the policy rules and what each tier keeps.
+
+Images and PDFs live once in the media store, outside the session rows. The sizes that `sessions`, `trim`, and `forget` show leave them out, and `stats` counts them as `media_files` and `media_bytes`. `prune` removes a media file that no session, archive, or database backup refers to once the file is seven days old. It also deletes the `<backup>.media` reference cache of a backup you deleted. Caudra never deletes a [backup](/docs/configuration/#backups), so media that only backups refer to stays, and `prune` reports it as `backup_only_media_files` and `backup_only_media_bytes`.
+
+`check` runs the SQLite quick check, then reads back every image and PDF the sessions refer to. It fails when a file is missing from the media store or no longer matches its SHA-256, and names up to three files of each kind.
 
 Both also take session IDs instead of a policy. `caudra storage trim <ID>` releases one session's local change records by hand while its conversation stays resumable. Records that another session, such as a fork, still holds stay in the store. IDs and `--keep-*` rules cannot be combined, pinned sessions are still refused, and a session open in another process is skipped rather than raced.
 

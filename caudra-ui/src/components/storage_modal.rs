@@ -29,7 +29,7 @@ const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
 const GRID_CELL_COUNT: usize = 100;
-const CATEGORY_COUNT: usize = 3;
+const CATEGORY_COUNT: usize = 4;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const COLLAPSED_STORES: usize = 6;
 const LEGEND_GAP: &str = "   ";
@@ -248,6 +248,7 @@ enum Consumer {
     Database,
     ChangeRecords,
     Archives,
+    Media,
 }
 
 impl Consumer {
@@ -256,6 +257,7 @@ impl Consumer {
             Self::Database => "D",
             Self::ChangeRecords => "C",
             Self::Archives => "A",
+            Self::Media => "M",
         }
     }
 
@@ -264,6 +266,7 @@ impl Consumer {
             Self::Database => "Database",
             Self::ChangeRecords => "File change records",
             Self::Archives => "Archives",
+            Self::Media => "Images and PDFs",
         }
     }
 
@@ -272,6 +275,7 @@ impl Consumer {
             Self::Database => theme.heading,
             Self::ChangeRecords => theme.accent,
             Self::Archives => theme.todo_pending,
+            Self::Media => theme.todo_completed,
         }
     }
 }
@@ -281,6 +285,7 @@ fn consumers(stats: &SessionStorageStats) -> [(Consumer, u64); CATEGORY_COUNT] {
         (Consumer::Database, database_bytes(stats)),
         (Consumer::ChangeRecords, stats.snapshot_bytes),
         (Consumer::Archives, stats.archive_bytes),
+        (Consumer::Media, stats.media_bytes),
     ]
 }
 
@@ -625,6 +630,8 @@ mod tests {
     const PAGE_SIZE: u64 = 4_096;
     const CHANGE_RECORD_BYTES: u64 = 7 * 1024 * 1024 * 1024;
     const ARCHIVE_BYTES: u64 = 512 * 1024;
+    const MEDIA_FILES: u64 = 961;
+    const MEDIA_BYTES: u64 = 300 * 1024 * 1024;
     const WORKFLOW_RUN_COUNT: u64 = 24;
     const WORKFLOW_CALL_COUNT: u64 = 960;
     const WORKFLOW_BYTES: u64 = 3 * 1024 * 1024;
@@ -675,6 +682,8 @@ mod tests {
             saved_output_bytes: 0,
             snapshot_bytes: CHANGE_RECORD_BYTES,
             archive_bytes: ARCHIVE_BYTES,
+            media_files: MEDIA_FILES,
+            media_bytes: MEDIA_BYTES,
             pending_cleanup_jobs: 0,
         }
     }

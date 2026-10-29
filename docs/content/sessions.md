@@ -263,7 +263,7 @@ Earlier versions kept outputs as files under `tool-output/` in the state directo
 
 ## Fetched PDFs
 
-A PDF that [`webfetch`](/docs/tools/#webfetch) attaches for a model that reads PDFs stays in memory for the live session only. The saved session keeps its URL, file name, and page count, and never its bytes. A resumed or forked session therefore has no file to send, so the model receives a note with those details in its place and can fetch the PDF again to read it.
+A PDF that [`webfetch`](/docs/tools/#webfetch) attaches for a model that reads PDFs goes into the media store under `media/` in the state directory, as an image does. The saved session keeps its URL, file name, page count, and a reference to the stored file, so a resumed or forked session attaches it again. A PDF saved before the media store existed, or one whose file is gone, reaches the model as a note with those details, and the model can fetch the PDF again to read it.
 
 ## Size ceiling
 
@@ -312,6 +312,8 @@ A schema migration prunes as its last step. Rewriting rows puts the pages they o
 
 `caudra storage trim --dry-run` and `caudra storage forget --dry-run` print the plan with the reason each session is kept. `caudra storage sessions` lists sessions with their tier. `caudra storage pin <ID>` keeps a session regardless of policy. See [CLI](/docs/cli/#caudra-storage) for every flag.
 
+Images and PDFs are stored once in the media store, however many sessions refer to them. The Rows and Artifacts sizes that `caudra storage sessions` and the plans show leave them out, and `caudra storage stats` counts them as `media_files` and `media_bytes`. Trimming keeps the files the conversation refers to. After a trim or a forget, prune removes each file the session no longer refers to once no other session, archive, or database [backup](/docs/configuration/#backups) refers to it and the file is seven days old. Caudra never deletes backups, so `caudra storage prune` reports the media that only backups keep.
+
 Retention never removes spending records. What a session cost is written to a separate ledger that no session owns, so `caudra storage usage` still answers after the sessions are gone. See [Lifetime spend](/docs/token-economy/#lifetime-spend).
 
 ## Search past sessions
@@ -345,7 +347,7 @@ The index fills lazily. While the TUI is open, a background thread indexes saved
 
 ## What the state directory holds
 
-`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, which holds retained tool outputs too, file change records, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
+`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, which holds retained tool outputs too, file change records, archives, and the images and PDFs in the media store, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
 
 The change record section lists the stores largest first, one per workspace directory, with their size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead. A store that no existing session holds is marked as orphaned rather than hidden. `/storage all` lists every store instead of the largest few, and the footer command toggles between them. When file revert is unavailable for the current session, the modal says why.
 

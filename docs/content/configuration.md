@@ -956,7 +956,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\caudra\` |
 
-Config holds `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, `init.lua`, `.env` and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records, transfer recovery journals, and the [backups](#backups) Caudra saves before it upgrades a file. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, `init.lua`, `.env` and `commands/`. State holds sessions, the images and PDFs they refer to in `media/`, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records, transfer recovery journals, and the [backups](#backups) Caudra saves before it upgrades a file. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -1040,6 +1040,8 @@ Before Caudra rewrites a file, it copies the original byte for byte into `backup
 | `caudra.db` before `caudra permissions repair-review --apply` | `caudra.db.permission-review-<ID>.bak` |
 
 `<from>` is the version the file had, and `<project-id>` is the same id as in the project's state directory. Database backups that earlier releases made stay beside `caudra.db`.
+
+A database backup from schema 44 on refers to its images and PDFs in `media/` rather than holding them. Prune never removes a media file that a backup refers to, so backups keep their media, and `caudra storage prune` reports the space that only backups keep. To restore such a backup, copy it over `caudra.db` in a state directory that still has the `media/` directory the backup was made with. Prune caches the hashes each backup refers to in `<backup>.media`, and deletes that file once you delete its backup.
 
 ### Rolling back
 
