@@ -118,7 +118,7 @@ inventory::submit!(BuiltInProvider {
             ProviderPlan {
                 display_name: "Coding plan",
                 base_url: "https://api.z.ai/api/coding/paas/v4",
-                default_model: Some("zai/glm-5-code"),
+                default_model: Some("zai/glm-5.3"),
                 login_url: None,
             }
         ),
@@ -145,24 +145,6 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(131072),
             context_window: 1_000_000,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5-code"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.20,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
             reasoning_options: None,
         },
         ModelEntry {
@@ -310,6 +292,60 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: None,
         },
         ModelEntry {
+            prefixes: &["glm-4.6v"],
+            small: false,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.30,
+                output: 0.90,
+                cache_write: 0.00,
+                cache_read: 0.05,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 128_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-4.6v-flashx"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.04,
+                output: 0.40,
+                cache_write: 0.00,
+                cache_read: 0.004,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 128_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-4.6v-flash"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.00,
+                output: 0.00,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: None,
+            context_window: 128_000,
+            reasoning_options: None,
+        },
+        ModelEntry {
             prefixes: &["glm-4.5-flash"],
             small: true,
             family: ModelFamily::Glm,
@@ -338,6 +374,42 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 1.10,
                 cache_write: 0.00,
                 cache_read: 0.03,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(98304),
+            context_window: 131_072,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-4.5-airx"],
+            small: true,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.10,
+                output: 4.50,
+                cache_write: 0.00,
+                cache_read: 0.22,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(98304),
+            context_window: 131_072,
+            reasoning_options: None,
+        },
+        ModelEntry {
+            prefixes: &["glm-4.5-x"],
+            small: false,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.20,
+                output: 8.90,
+                cache_write: 0.00,
+                cache_read: 0.45,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -525,6 +597,33 @@ mod tests {
         assert_eq!(entry.default, default);
         assert_eq!(entry.context_window, 200_000);
         assert_eq!(entry.max_output_tokens, Some(131072));
+    }
+
+    #[test_case("glm-4.6v", 0.30, 0.05, 0.90, true, false, 128_000 ; "glm_4_6v")]
+    #[test_case("glm-4.6v-flashx", 0.04, 0.004, 0.40, true, true, 128_000 ; "glm_4_6v_flashx")]
+    #[test_case("glm-4.6v-flash", 0.00, 0.00, 0.00, true, true, 128_000 ; "glm_4_6v_flash")]
+    #[test_case("glm-4.6", 0.60, 0.11, 2.20, false, false, 200_000 ; "glm_4_6")]
+    #[test_case("glm-4.5-x", 2.20, 0.45, 8.90, false, false, 131_072 ; "glm_4_5_x")]
+    #[test_case("glm-4.5-airx", 1.10, 0.22, 4.50, false, true, 131_072 ; "glm_4_5_airx")]
+    #[test_case("glm-4.5-air", 0.20, 0.03, 1.10, false, true, 131_072 ; "glm_4_5_air")]
+    fn sibling_ids_resolve_to_their_own_entry(
+        id: &str,
+        input: f64,
+        cache_read: f64,
+        output: f64,
+        vision: bool,
+        small: bool,
+        context_window: u32,
+    ) {
+        let entry = lookup_entry(models(), id).unwrap();
+        assert!(entry.prefixes.contains(&id));
+        assert_eq!(entry.pricing.input, input);
+        assert_eq!(entry.pricing.cache_read, cache_read);
+        assert_eq!(entry.pricing.output, output);
+        assert_eq!(entry.vision, vision);
+        assert_eq!(entry.small, small);
+        assert_eq!(entry.context_window, context_window);
+        assert!(!entry.default);
     }
 
     #[test_case("zai/glm-5.3", true ; "glm_5_3_supports_thinking")]
