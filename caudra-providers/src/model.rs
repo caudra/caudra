@@ -337,7 +337,7 @@ pub struct ModelEntry {
     pub window_excludes_output: bool,
     pub unsupported: Option<&'static str>,
     /// Corrects the catalog where it describes the model rather than the
-    /// request caudra sends. `None` defers to discovery and models.dev.
+    /// request caudra sends. `None` defers to discovery and the catalog.
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
     pub api: Option<Api>,
     pub plan_context_window: Option<u32>,
@@ -669,11 +669,10 @@ impl Model {
         self.max_output_tokens = declared.max_output_tokens.or(self.max_output_tokens);
     }
 
-    /// Build a `Model` from a models.dev catalogue sub-provider (nvidia,
-    /// fireworks, groq, ...). The slug is the catalogue sub-provider key, not a
-    /// builtin; metadata is read once from the models.dev catalog and cached on
-    /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
-    /// catalog lookup.
+    /// Build a `Model` from a catalog sub-provider such as nvidia. The slug is
+    /// the catalog's provider key, not a builtin; metadata is read once from the
+    /// catalog and cached on the `Model` so `supports_thinking`/`supports_vision`
+    /// do not need a live catalog lookup.
     fn from_catalog(
         slug: &str,
         model_id: &str,
@@ -1071,7 +1070,7 @@ impl Model {
         }
 
         // Precedence: builtin, then dynamic script, then providers.toml custom,
-        // then models.dev catalogue sub-provider.
+        // then catalog sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
         if let Some(manifest) = ManifestRegistry::get(slug) {

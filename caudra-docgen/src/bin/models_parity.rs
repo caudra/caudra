@@ -568,7 +568,7 @@ fn short_hash(value: &Value) -> String {
 }
 
 /// What a built-in borrows from its own catalog entry: metadata for every id
-/// models.dev lists, and the whole resolved model for ids no table prefix
+/// the catalog lists, and the whole resolved model for ids no table prefix
 /// covers, which the catalog alone describes.
 fn catalog_fallback(manifest: &ProviderManifest, dates: &[(&str, Timestamp)]) -> Value {
     let Some(catalog_slug) = manifest.catalog_slug else {

@@ -102,7 +102,7 @@ fn coding_plan_context_window(model: &Model) -> Option<u32> {
 }
 
 /// Models an OAuth session may run. The subscription sells a different set to
-/// the metered API, and models.dev describes only the latter, so the catalog can
+/// the metered API, and the catalog describes only the latter, so it can
 /// widen the candidates but never decide entitlement: `is_codex_model` does.
 /// Drawing on it anyway means a new `-codex` release needs no edit here.
 fn coding_plan_models() -> Vec<ModelInfo> {
@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(coding_plan_context_window(&model), expected);
     }
 
-    /// The OAuth listing draws on models.dev to pick up releases the static
+    /// The OAuth listing draws on the catalog to pick up releases the curated
     /// table has not reached, but the catalog describes the metered API. An id
     /// it publishes that the subscription cannot run must not be offered.
     #[test]

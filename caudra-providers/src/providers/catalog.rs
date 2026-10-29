@@ -315,7 +315,7 @@ pub(crate) struct CatalogData {
     /// Providers caudra will route requests through. Filtered hard: unsupported
     /// SDK shapes, blocked ids, and anything a built-in already serves.
     providers: HashMap<String, ProviderData>,
-    /// What models.dev knows about every model, including the ones routed by a
+    /// What the catalog knows about every model, including the ones routed by a
     /// built-in provider. Routing eligibility and model facts are different
     /// questions, and only the first justifies a block list.
     metadata: HashMap<String, HashMap<String, CatalogMeta>>,
@@ -528,7 +528,7 @@ pub(crate) async fn send_catalog_request(
 
 /// `Provider` for a single catalog sub-provider. Created with a resolved
 /// `ProviderData` (from `caudra_providers::catalog_provider(slug)`) plus the
-/// auth that the models.dev catalog would have used for that sub-provider.
+/// auth the catalog names for that sub-provider.
 pub struct CatalogProvider {
     data: ProviderData,
     auth: CatalogAuth,
@@ -1206,7 +1206,7 @@ mod tests {
     const TIERS_SURVIVE_THE_VIEW: &str =
         "tiered rates must reach the model, or a long prompt bills at the base rate";
 
-    /// models.dev publishes both a total window and, for a sixth of the catalog,
+    /// The catalog lists both a total window and, for a sixth of the catalog,
     /// the prompt budget inside it. Only the latter is what a conversation is
     /// measured against.
     #[test_case(
@@ -2321,7 +2321,7 @@ mod tests {
 }
 
 pub(crate) mod schema {
-    //! Serde types for the models.dev catalog JSON (`/api.json`).
+    //! Serde types for the model list's catalog section, in the models.dev shape.
 
     use std::collections::HashMap;
 
@@ -2343,8 +2343,8 @@ pub(crate) mod schema {
     }
 
     /// Drops the models caudra cannot read instead of failing the whole catalog
-    /// with them. models.dev describes ~7500 models from every vendor alive; one
-    /// of them carrying a shape this schema has not met yet must cost that one
+    /// with them. The catalog describes thousands of models; one of them
+    /// carrying a shape this schema has not met yet must cost that one
     /// model, not every provider caudra can route to.
     fn deserialize_models<'de, D: serde::Deserializer<'de>>(
         deserializer: D,

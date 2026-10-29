@@ -403,7 +403,7 @@ Click the banner's `×` or run `/update dismiss` to hide it in every session unt
 
 GitHub receives your source IP address and normal request metadata, including a `caudra` user agent. The check sends no session data, machine identifier, or current version.
 
-Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, and it asks GitHub instead of reading the cache, so a release published since the last check shows at once. Its answer refreshes the cache for later starts. An empty value leaves the config in effect. A normal run still contacts your model provider and sends web searches to Exa when the agent uses `websearch`. Model catalog lookups use the bundled snapshot and do not contact models.dev.
+Set `ui.update_check = false` to disable startup checks. `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run. `CAUDRA_ENABLE_UPDATE_CHECK=1` checks even when the config says false, and it asks GitHub instead of reading the cache, so a release published since the last check shows at once. Its answer refreshes the cache for later starts. An empty value leaves the config in effect. A normal run still contacts your model provider and sends web searches to Exa when the agent uses `websearch`. Long-running sessions also check `models.caudra.ai` daily for a newer [model list](/docs/providers/#model-list) unless `models.refresh` is false.
 
 ### `ui.update_channel`
 

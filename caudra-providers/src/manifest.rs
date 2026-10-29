@@ -39,7 +39,7 @@ pub struct ProviderManifest {
     /// When the entries a provider is retiring or has not opened yet are
     /// offered, at most one per entry. An entry without a row always is.
     pub availability: &'static [Availability],
-    /// This provider's id in the models.dev catalog, where it differs from the
+    /// This provider's id in the catalog, where it differs from the
     /// caudra slug. `None` for providers the catalog has no entry for: local
     /// runtimes and gateways that route somewhere else.
     pub catalog_slug: Option<&'static str>,
@@ -112,7 +112,7 @@ pub(crate) fn catalog_reasoning_options(
         .filter(|options| !options.is_empty())
 }
 
-/// Rates models.dev publishes, tiers included.
+/// The catalog's rates, tiers included.
 pub(crate) fn catalog_pricing(meta: Option<&CatalogMetaView>) -> Option<ModelPricing> {
     meta.map(|meta| ModelPricing {
         input: meta.input_price,

@@ -447,8 +447,10 @@ fn write_update_check_section(out: &mut String) {
          since the last check shows at once. Its answer refreshes the cache for \
          later starts. An empty value leaves the config in effect. A normal run \
          still contacts your model provider and sends web searches to Exa when \
-         the agent uses `websearch`. Model catalog lookups use the bundled \
-         snapshot and do not contact models.dev.\n"
+         the agent uses `websearch`. Long-running sessions also check \
+         `models.caudra.ai` daily for a newer \
+         [model list](/docs/providers/#model-list) unless `models.refresh` is \
+         false.\n"
     )
     .unwrap();
     writeln!(out, "### `ui.update_channel`\n").unwrap();

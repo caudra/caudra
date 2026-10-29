@@ -60,7 +60,9 @@ The first entry also names the model that wins automatic resolution, so it has t
 
 ## Model list
 
-Caudra ships a model list and can use it offline. At startup it also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
+Model prices, limits, defaults, and availability come from a signed model list. Every Caudra binary bundles a copy, so the list works offline, and the model tables on this page show that copy. At startup Caudra also reads the signed cache in `models/v1/` under its cache directory. The newer `updated_at` wins as a whole file. The bundled copy wins a tie. Cached files do not expire.
+
+The list also carries a reviewed import of the [models.dev](https://models.dev) catalog. It describes models that have no curated entry, and the providers Caudra reaches only through it, such as NVIDIA. Caudra does not contact models.dev itself.
 
 Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
 
@@ -78,6 +80,7 @@ Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `
 
 Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key, incompatible format or built-in routing collision rejects the whole file. Entries that need newer Caudra features stay hidden and cannot be selected. Built-in API endpoints and credentials remain defined by Caudra, not by downloaded model data.
 
+The list is maintained in [github.com/caudra/models](https://github.com/caudra/models). To report a wrong price or limit, or a missing model, open an issue or a pull request there.
 
 ## Auth Reloading
 
@@ -510,7 +513,7 @@ The file starts with `version = 1`. A file without it counts as version 1, and C
 | `switching` | table | unset | - | When Auto moves a session to another of the provider's accounts |
 | `accounts` | table[] | unset | - | The accounts to sign in with, highest priority first |
 
-A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores `protocol`, `api_key_env`, `discover_models` and `enable_free_models`. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only `context_window` and `max_output_tokens`, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
+A built-in slug keeps its compiled protocol and auth setup, and its models from the [model list](#model-list), so it ignores `protocol`, `api_key_env`, `discover_models` and `enable_free_models`. Opencode still reads `enable_free_models`. From `model_defaults` and `models`, a built-in reads only `context_window` and `max_output_tokens`, see [Model limits on a built-in provider](#model-limits-on-a-built-in-provider).
 
 A `[SLUG.purposes]` table takes these keys:
 
@@ -577,9 +580,9 @@ id = "claude-sonnet-4-6"
 context_window = 200000
 ```
 
-A `models` entry wins over `model_defaults`, and both win over the limits the provider lists, the built-in model table, and models.dev, in that order. A declared window is the total the prompt and the reply share, as on a custom provider, so compaction leaves room in it for the reply. The OpenAI Coding Plan still caps a declared window at the plan's own. On `aperture`, a declared window also wins over [Aperture overrides](#aperture-overrides).
+A `models` entry wins over `model_defaults`, and both win over the limits the provider lists, the model's curated entry in the [model list](#model-list), and the model list's catalog, in that order. A declared window is the total the prompt and the reply share, as on a custom provider, so compaction leaves room in it for the reply. The OpenAI Coding Plan still caps a declared window at the plan's own. On `aperture`, a declared window also wins over [Aperture overrides](#aperture-overrides).
 
-An entry adds no model to the model list, and its `id` has to match the id in the model spec exactly. Every other model key on a built-in slug, such as `supports_vision` or a price, is ignored with a warning. Caudra reads an edit the next time it resolves the model, such as in a new session or after you pick the model again, see [Hot reload](/docs/configuration/#hot-reload).
+An entry adds no model, and its `id` has to match the id in the model spec exactly. Every other model key on a built-in slug, such as `supports_vision` or a price, is ignored with a warning. Caudra reads an edit the next time it resolves the model, such as in a new session or after you pick the model again, see [Hot reload](/docs/configuration/#hot-reload).
 
 ### Aperture overrides
 

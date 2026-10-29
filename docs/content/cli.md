@@ -279,7 +279,7 @@ Docker contexts already work without this: `docker context use` stores the choic
 
 ### Network proxies
 
-Caudra sends its own requests through the proxy that `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` name. This covers model providers and their sign-in, [MCP servers](/docs/mcp/), [decision endpoints](/docs/providers/#decision-endpoints), telemetry, update checks and downloads, the web tools, automations' `http()`, and Lua's `caudra.net`.
+Caudra sends its own requests through the proxy that `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` name. This covers model providers and their sign-in, [MCP servers](/docs/mcp/), [decision endpoints](/docs/providers/#decision-endpoints), telemetry, update checks and downloads, [model list](/docs/providers/#model-list) checks, the web tools, automations' `http()`, and Lua's `caudra.net`.
 
 - An `https://` endpoint uses `HTTPS_PROXY`, and an `http://` endpoint uses `HTTP_PROXY`. Either falls back to `ALL_PROXY`. The uppercase name wins over the lowercase one, and an empty value counts as unset.
 - `NO_PROXY` lists hosts, domains, and address ranges, separated by commas, that Caudra reaches directly.
@@ -493,11 +493,14 @@ The TUI `/login` command offers the same method choice for Anthropic, OpenAI, an
 caudra models
 caudra models --jobs
 caudra models --jobs --model anthropic/claude-sonnet-4-6
+caudra models refresh
 ```
 
 The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
 
 `--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Autopilot, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
+
+`refresh` checks for a newer [model list](/docs/providers/#model-list) now, even when automatic refresh is off.
 
 ### `caudra mcp`
 

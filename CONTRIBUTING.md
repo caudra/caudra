@@ -108,6 +108,7 @@ To work on one test, start the servers once with `eval "$(python3 scripts/mcp-se
 | `docs/navigation.json` | Shared docs navigation groups and ordering |
 | `docs/examples/` | Generated config examples, published at `/docs/*.example.toml` |
 | `workcell/` | Workcell tools and supporting crates, built as local workspace members |
+| `models/` | The model list bundled into every binary, pinned from [github.com/caudra/models](https://github.com/caudra/models) |
 | `plugins/` | Lua plugin sources, kept as examples and as coverage for the Lua API |
 | `scripts/` | Build and maintenance scripts |
 | `vendor/crossterm/` | A patched crossterm, kept until a release includes the fix that `Cargo.toml` describes |
@@ -146,17 +147,34 @@ The website is maintained separately and consumes these canonical sources. Its d
 
 ## Keeping the model list current
 
-The built-in model tables in `caudra-providers/src/providers/` hold each provider's ids, prices, limits, and defaults. `make model-watch` compares them with the [models.dev](https://models.dev) catalog and prints a Markdown report: models that no table names (those released in the last 90 days as new, older ones in a section of their own until each is added or accepted), entries past the shutdown day their table schedules, deprecations, changed prices and limits, table models the catalog does not list, and stale acceptances. Pass `ARGS='-- --since 2026-07-01'` to choose the start date, or `--catalog FILE` to read a saved copy of `api.json`. The prices of decision models, such as TypeSafe Jev and OpenAI's Decisions API, live in `caudra-providers/src/decision_pricing.rs`. models.dev does not list them, so every report restates that table with each entry's source page, to be checked by hand.
+Model prices, limits, defaults, and availability are data, kept in [github.com/caudra/models](https://github.com/caudra/models) rather than in this repository. Its [README](https://github.com/caudra/models#readme) explains how to change a model, refresh the models.dev import, audit the data, and run the daily `model-watch` automation. The data repository publishes a signed file to `https://models.caudra.ai/v1/models.json`, which running Caudra sessions check daily. The [Model list](https://caudra.ai/docs/providers/#model-list) docs describe what users see.
 
-models.dev is a lead, not a source. Confirm every change on the provider's own model, pricing, or deprecation page. A divergence that is deliberate goes into `ACCEPTED` in `caudra-providers/src/model_watch.rs`, and a limit a table caps on purpose goes into `CAPS`, each with its reason. The `model-updates` skill in `.caudra/skills/` lists the sources, the rules for applying a change, and what each table needs.
+`caudra-models/` in this repository holds the file format, its validation and signing, and the `caudra-models` maintainer tool that the data repository builds from a pinned Caudra commit.
 
-The `model-watch` automation in `.caudra/automations/` runs that routine once a day. It merges `main` into its own branch, surveys, applies confirmed changes with the skill, validates, and then fast-forwards your local `main`. It waits while the main checkout is busy, and it never pushes. To set it up:
+### Pin the bundled copy
 
-1. In your global `caudra.toml`, set `[autopilot] max_continuations = 0`.
-2. Create its worktree: `git worktree add ../caudra-model-watch -b model-watch main`.
-3. In that worktree, start `caudra --autopilot` in Build mode, trust the project's automations in `/automations`, and arm it with the path of your main checkout: `/automations arm model-watch {"main_worktree": "/path/to/caudra"}`.
+Every Caudra binary bundles the model list from `models/bundled.json.zst`, and `models/bundled.json.zst.toml` records its `updated_at` and hashes. Before you prepare a release, pin the newest published file so new installs start from current data:
 
-Each run writes its report to `target/model-watch/<date>.md` in the worktree and notifies you when it lands, or when something needs a person.
+```sh
+curl -fsSL --create-dirs -o target/models.json https://models.caudra.ai/v1/models.json
+curl -fsSL -o target/models.json.sig https://models.caudra.ai/v1/models.json.sig
+cargo run --locked -p caudra-models --features cli -- pin target/models.json models/bundled.json.zst --sig target/models.json.sig
+```
+
+`pin` checks the signature against the keys built into Caudra, validates the file, and writes both files. Pin only a file whose `updated_at` is newer than the one in `models/bundled.json.zst.toml`, and commit both files together. The build of `caudra-providers` fails if the two files disagree, if the file does not validate, or if it uses a `requires` token this build does not support. To pin a file you built locally in the data repository, pass `--unsigned` instead of `--sig`.
+
+Unit tests in `caudra-providers` read their own frozen copy, `caudra-providers/src/model_data/fixture.json.zst`, so a new pin does not change their expectations.
+
+### Add a `requires` token
+
+A provider or model entry that needs new Caudra code lists a token in its `requires`. A build that does not know the token hides the entry, and an explicit request for it fails with "needs a newer Caudra". A data change needs a token whenever an older build would misread the entry or send a different request. The format rules in the data repository's README give the details.
+
+1. Add the support for the new data to Caudra.
+2. In the same change, add the token to `SUPPORTED_REQUIREMENTS` in `caudra-models/src/lib.rs`.
+3. Ship a Caudra release with it.
+4. Use the token in the data repository.
+
+A token that only a newer Caudra knows keeps the entry hidden from every older release, so do not use it before step 3.
 
 ## Keeping the skill packs current
 
@@ -164,7 +182,14 @@ Caudra bundles two skill packs: pstack in `caudra-pstack/`, from [cursor/plugins
 
 `translated/translations.json` records the upstream hash each translation was made from. After a sync, the script prints a line for each file that needs work: `TRANSLATE` when upstream changed a translated file, `NEW` when it added or changed one with no translation, `ORPHAN` when a translated file went away, and, for pstack, `PORT` when a script with a Rust port in `caudra-pstack/src/scripts/` changed. `cargo test -p caudra-pstack` and `cargo test -p caudra-mattpocock` fail while any page still names a foreign term or any translation is stale. The `skillpack-translate` skill in `.caudra/skills/` holds the rules for translating, with a reference page per pack, and `make sync-<pack> ARGS='--mark <path>...'` records a finished translation.
 
-The `pstack-sync` automation in `.caudra/automations/` runs that routine once a day: it merges `main` into its own branch, pulls your cursor/plugins clone, syncs, retranslates with the skill, validates, and fast-forwards your local `main`. Set it up as `model-watch` above, in its own worktree on a `pstack-sync` branch, and arm it with both paths: `/automations arm pstack-sync {"main_worktree": "/path/to/caudra", "plugins_checkout": "/path/to/cursor-plugins"}`. Each run writes its report to `target/pstack-sync/<date>.md` in the worktree.
+The `pstack-sync` automation in `.caudra/automations/` runs that routine once a day: it merges `main` into its own branch, pulls your cursor/plugins clone, syncs, retranslates with the skill, validates, and fast-forwards your local `main`. To set it up:
+
+1. In your global `caudra.toml`, set `[experimental] automations = true` and `[autopilot] max_continuations = 0`.
+2. Create its worktree: `git worktree add ../caudra-pstack-sync -b pstack-sync main`.
+3. In that worktree, start `caudra --autopilot` in Build mode and trust the project's automations in `/automations`.
+4. Arm it with the path of your main checkout and of your cursor/plugins clone: `/automations arm pstack-sync {"main_worktree": "/path/to/caudra", "plugins_checkout": "/path/to/cursor-plugins"}`.
+
+Each run writes its report to `target/pstack-sync/<date>.md` in the worktree and notifies you when it lands, or when something needs a person.
 
 ## Keeping a worktree current
 
@@ -208,6 +233,8 @@ The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each p
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
 A tag needs reviewed notes in `release-notes/<version>.md`, written as described in [Release notes](#release-notes).
+
+Before you prepare a release, pin the newest published model list, as [Pin the bundled copy](#pin-the-bundled-copy) describes.
 
 Set the GitHub Actions repository variable `CAUDRA_RUNNER_PROFILE` to select a reviewed runner mapping. An unset value defaults to `github`, using standard GitHub-hosted runners. `blacksmith` selects accelerated runners where supported. `ubicloud-blacksmith` selects Ubicloud for Linux and Blacksmith for Apple Silicon macOS and Windows. Intel macOS and lightweight control jobs remain on GitHub. The mappings live in `scripts/ci-runners.py`. Unknown profiles stop validation.
 
