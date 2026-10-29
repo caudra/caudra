@@ -1277,6 +1277,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "caudra-models"
+version = "0.2.0-preview.16"
+dependencies = [
+ "base64 0.23.1",
+ "jiff",
+ "ring",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "test-case",
+ "thiserror 2.0.21",
+ "url",
+ "workspace-hack",
+]
+
+[[package]]
 name = "caudra-otel"
 version = "0.2.0-preview.16"
 dependencies = [
