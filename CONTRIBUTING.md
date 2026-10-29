@@ -240,7 +240,7 @@ The check only sees version constants. A patch must also not write anything a `v
 
 ### Release notes
 
-Each release's notes live in `release-notes/<version>.md`. The same file is the GitHub release body, what Caudra shows after an update and in `/changelog`, and a section of the generated [Release notes](https://caudra.ai/docs/release-notes/) docs page, so it holds only what changed.
+Each release's notes live in `release-notes/<version>.md`. The same file is the GitHub release body, what Caudra shows after an update and in `/changelog`, and a section of the [Release notes](https://caudra.ai/docs/release-notes/) docs page, so it holds only what changed. The page is never checked in: Caudra builds it from the files for `/docs` and the `caudra-docs` skill, and the website builds its own, so branches that each add notes only conflict in the files they share.
 
 Notes are written as changes land, not at release time. The draft is the newest file in `release-notes/` whose version has no tag yet. After a release, the first user-visible change starts the next file, such as `0.2.0-preview.7.md` after `v0.2.0-preview.6`. The workspace version is bumped only when the release is prepared, so the draft is usually ahead of it, and builds leave it out of `/changelog` until then. The Rust tests allow at most one file ahead of the workspace version.
 
@@ -254,7 +254,7 @@ When you draft:
 - Leave out how it was built and what a user does not notice: internal names, algorithms, every edge case, and the reasoning behind a fix. The docs link carries the details.
 - Write in the voice of [`docs/AGENTS.md`](docs/AGENTS.md): no em dashes, semicolons, or contractions outside code.
 
-Every file follows the same format. Run `make gen-docs` after editing one, because CI fails while the docs page is out of date:
+Every file follows the same format:
 
 1. Start with a bullet list of the release's highlights: one plain line per headline change, no bold lead-in, about three to eight items. Nothing comes before it.
 2. Put anything a user must do in a `> [!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`, `[!NOTE]` or `[!TIP]` alert, and say when it applies, such as "Before you update" or "After you update, restart". A release that upgrades the session database says so in an alert like the one in `0.2.0-preview.6.md`.
@@ -265,6 +265,13 @@ Every file follows the same format. Run `make gen-docs` after editing one, becau
 The Rust tests also hold every file to these limits: at most 8 highlights of up to 35 words each, bullets of up to 180 words, and 3,000 words for the whole release. The test names each bullet over a limit.
 
 The pipeline reads the file from the tagged commit and adds a status line. GitHub shows the title, tag and commit beside the notes, so the notes do not repeat them. Missing notes, unresolved placeholders, and notes that break these rules stop validation, and the Rust tests check every file in `release-notes/` the same way. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
+
+The website reads `release-notes/*.md` from the commit it pins, alongside `docs/content/`, and relies on this contract:
+
+- One file per release, named `<version>.md` with a SemVer version and no `v` prefix. Order releases by SemVer precedence, newest first.
+- A file holds the body only, with no title. The title comes from the version, as `Caudra 0.2 Preview 4` for `0.2.0-preview.4`, and the tag is `v<version>`.
+- Alerts use GitHub's `> [!KIND]` syntax, and links into the docs are absolute `https://caudra.ai/docs/` URLs. The Rust tests check that every docs link resolves.
+- The newest file may be a draft for a release that has no tag yet. There is at most one.
 
 ## Commits and pull requests
 

@@ -23,7 +23,9 @@ RELEASE_TAG = re.compile(
 BRANCH = "automation/docs-source"
 MANIFEST = "docs-source.json"
 SHA = re.compile(r"[0-9a-f]{40}")
-INPUT = re.compile(r"docs/content/[^/]+\.md|docs/examples/[^/]+\.example\.toml")
+INPUT = re.compile(
+    r"docs/content/[^/]+\.md|docs/examples/[^/]+\.example\.toml|release-notes/[^/]+\.md"
+)
 SAFE_PATH = re.compile(r"[a-zA-Z0-9_./-]+")
 REQUIRED_INPUTS = {"docs/navigation.json", "install.sh", "install.ps1"}
 REQUIRED_JOBS = {"Format (Rust)", "Lint", "Test"}
@@ -514,9 +516,11 @@ def inputs(source, revision):
         "Source is missing required publishing inputs",
     )
     require(
-        any(path.startswith("docs/content/") for path in selected)
-        and any(path.startswith("docs/examples/") for path in selected),
-        "Source must contain documentation and example files",
+        all(
+            any(path.startswith(prefix) for path in selected)
+            for prefix in ("docs/content/", "docs/examples/", "release-notes/")
+        ),
+        "Source must contain documentation, example, and release notes files",
     )
     for path, (mode, kind, _) in selected.items():
         require(
