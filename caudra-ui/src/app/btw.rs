@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 
 use caudra_agent::agent::aside::run_aside;
 use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::context::{ContextKey, RequestPrefix};
-use caudra_agent::permissions::AutopilotNote;
 use caudra_agent::{
     AgentEvent, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History,
     HistorySnapshot,
@@ -24,14 +24,14 @@ use crate::components::tooltip::Tip;
 use crate::components::{DisplayMessage, DisplayRole, Overlay};
 use crate::repaint::{Cadence, Dirty};
 
-use super::{App, COPIED_SELECTION, HISTORY_UNREADABLE};
+use super::{App, COPIED_SELECTION, HISTORY_UNREADABLE, PermissionRouting};
 
 const TITLE: &str = " /btw ";
 const ASK_TITLE: &str = " /btw · Side question ";
 const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
 const CHAT_NAME: &str = "/btw";
 /// What the permission prompt says asked, for a call a side question made.
-const PERMISSION_ORIGIN: &str = "/btw";
+pub(super) const PERMISSION_ORIGIN: &str = "/btw";
 const STOPPED_NOTE: &str = "Stopped.";
 pub(super) const RUN_LOST: &str = "The side question stopped without an answer";
 pub(super) const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
@@ -349,7 +349,23 @@ struct AsideRun {
     id: u64,
     usage: TokenUsage,
     reply: Receiver<AsideReply>,
+    /// The approvals it waits on, which go with it.
+    approvals: HashSet<String>,
     _stop: CancelTrigger,
+}
+
+impl AsideRun {
+    fn track_approval(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::PermissionRequest(request) => {
+                self.approvals.insert(request.id.clone());
+            }
+            AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                self.approvals.remove(request_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Every side question: the one shown, or the clarification kept behind its
@@ -976,6 +992,7 @@ impl App {
             id: btw.runs,
             usage: TokenUsage::default(),
             reply,
+            approvals: HashSet::new(),
             _stop: stop,
         });
         if side.context.is_none() {
@@ -1034,85 +1051,74 @@ impl App {
         }
     }
 
-    /// Spend is billed whichever run it came from; the rest is drawn only
-    /// for the run the window shows. Approvals go to the permission prompt
-    /// as a task's do.
     fn drain_btw_events(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         while let Ok(envelope) = self.btw.events.try_recv() {
             dirty = Dirty::YES;
-            let live = self
-                .btw
-                .run
-                .as_mut()
-                .filter(|run| run.id == envelope.run_id);
-            match envelope.event {
-                AgentEvent::ModelUsage {
-                    usage,
-                    cost,
-                    billing,
-                    provider,
-                    model,
-                    purpose,
-                    account,
-                } => {
-                    if let Some(run) = live {
-                        run.usage += usage;
-                    }
-                    self.settle_side_spend(
-                        &provider,
-                        account.as_deref(),
-                        &model,
-                        purpose,
-                        usage,
-                        cost,
-                        billing,
-                    );
-                }
-                AgentEvent::PermissionRequest(request) => {
-                    if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
-                        self.make_way_for_permission_prompt();
-                    }
-                    let call_id = request.id.clone();
-                    if self
-                        .permission_prompt
-                        .enqueue(request, Some(PERMISSION_ORIGIN.to_owned()))
-                        && let Some(side) = self.btw.side.as_mut()
-                    {
-                        side.window.chat_mut().await_approval(&call_id);
-                    }
-                }
-                AgentEvent::PermissionRequestUpdated(request) => {
-                    let escalated = matches!(
-                        request.presentation.autopilot,
-                        Some(AutopilotNote::Escalated { .. })
-                    );
-                    if self.permission_prompt.update(request) && escalated {
-                        self.make_way_for_permission_prompt();
-                    }
-                }
-                AgentEvent::PermissionRequestResolved { request_id, .. } => {
-                    self.permission_prompt.resolve_pending(&request_id);
-                    if let Some(side) = self.btw.side.as_mut() {
-                        side.window.chat_mut().approval_settled(&request_id);
-                    }
-                }
-                event => {
-                    if live.is_some()
-                        && let Some(side) = self.btw.side.as_mut()
-                    {
-                        side.window.handle_event(event);
-                    }
-                }
-            }
+            self.take_btw_event(envelope);
         }
         dirty
     }
 
+    /// Spend is billed whichever run it came from; the rest is drawn only
+    /// for the run the window shows. Approvals go to the permission prompt
+    /// as a task's do, and one a stopped run leaves is taken off it.
+    fn take_btw_event(&mut self, envelope: Envelope) {
+        let live = self
+            .btw
+            .run
+            .as_mut()
+            .filter(|run| run.id == envelope.run_id);
+        match envelope.event {
+            AgentEvent::ModelUsage {
+                usage,
+                cost,
+                billing,
+                provider,
+                model,
+                purpose,
+                account,
+            } => {
+                if let Some(run) = live {
+                    run.usage += usage;
+                }
+                self.settle_side_spend(
+                    &provider,
+                    account.as_deref(),
+                    &model,
+                    purpose,
+                    usage,
+                    cost,
+                    billing,
+                );
+            }
+            AgentEvent::PermissionRequestResolved { request_id, .. } if live.is_none() => {
+                self.permission_prompt.resolve_pending(&request_id);
+            }
+            event => {
+                let Some(run) = live else {
+                    return;
+                };
+                run.track_approval(&event);
+                let Some(side) = self.btw.side.as_mut() else {
+                    return;
+                };
+                let result = side.window.handle_event(event);
+                if let PermissionRouting::Taken(Some(mark)) =
+                    self.route_permission(result, || Some(PERMISSION_ORIGIN.to_owned()))
+                    && let Some(side) = self.btw.side.as_mut()
+                {
+                    mark.apply(side.window.chat_mut());
+                }
+            }
+        }
+    }
+
     fn settle_btw_run(&mut self, (messages, done): AsideReply) {
-        let Some(run) = self.btw.run.take() else {
+        let Some(mut run) = self.btw.run.take() else {
             return;
         };
+        self.withdraw_btw_approvals(mem::take(&mut run.approvals));
         let Some(side) = self.btw.side.as_mut() else {
             return;
         };
@@ -1139,9 +1145,10 @@ impl App {
     /// finished, which settles as it would have on the next tick.
     pub(super) fn stop_btw_run(&mut self) {
         let _ = self.poll_btw_run();
-        let Some(run) = self.btw.run.take() else {
+        let Some(mut run) = self.btw.run.take() else {
             return;
         };
+        self.withdraw_btw_approvals(mem::take(&mut run.approvals));
         let Some(side) = self.btw.side.as_mut() else {
             return;
         };
@@ -1154,6 +1161,24 @@ impl App {
         side.window.push_notice(STOPPED_NOTE);
         side.window.finish_run(Some(run.usage));
     }
+
+    /// Takes a run's approvals off the prompt as the run goes. Stopping the
+    /// run cancels each call still waiting on one, and the permission
+    /// manager drops its request, so none is left for the reader to answer.
+    fn withdraw_btw_approvals(&mut self, approvals: HashSet<String>) {
+        for request_id in approvals {
+            self.permission_prompt.resolve_pending(&request_id);
+            if let Some(side) = self.btw.side.as_mut() {
+                side.window.chat_mut().approval_settled(&request_id);
+            }
+        }
+    }
+
+    /// Whether the permission prompt draws over the open `/btw` and takes
+    /// its input.
+    pub(super) fn prompt_over_btw(&self) -> bool {
+        self.btw.is_open() && self.permission_prompt_holds_input()
+    }
 }
 
 #[cfg(test)]
@@ -1162,6 +1187,10 @@ const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const NO_RUN: &str = "a side question must be running";
 #[cfg(test)]
 const RUN_HUNG: &str = "the side question never finished";
+#[cfg(test)]
+const NEVER_ASKED: &str = "the side question never asked for an approval";
+#[cfg(test)]
+const NEVER_SETTLED: &str = "the side question never let go of its approval";
 
 #[cfg(test)]
 impl App {
@@ -1169,6 +1198,34 @@ impl App {
     pub(super) fn await_btw_run(&mut self) {
         self.await_btw_reply();
         let _ = self.poll_btw_run();
+    }
+
+    /// Shows what the runs report until the prompt holds an approval.
+    pub(super) fn await_btw_approval(&mut self) {
+        let deadline = std::time::Instant::now() + RUN_DEADLINE;
+        while !self.permission_prompt.is_open() {
+            let envelope = self.btw.events.recv_deadline(deadline).expect(NEVER_ASKED);
+            self.take_btw_event(envelope);
+        }
+    }
+
+    /// Waits for a run to report the approval `request_id` gone, as one
+    /// does once it is answered or its call is cancelled.
+    pub(super) fn await_btw_approval_gone(&self, request_id: &str) {
+        let deadline = std::time::Instant::now() + RUN_DEADLINE;
+        loop {
+            let envelope = self
+                .btw
+                .events
+                .recv_deadline(deadline)
+                .expect(NEVER_SETTLED);
+            if matches!(
+                &envelope.event,
+                AgentEvent::PermissionRequestResolved { request_id: gone, .. } if gone == request_id
+            ) {
+                return;
+            }
+        }
     }
 
     /// Waits for the live run to end and leaves it for the next poll, as a

@@ -102,7 +102,7 @@ impl App {
         };
         let below = self.render_picker_overlays(frame, layout.msg_area, above_footer);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        let topmost = self.render_top_modals(frame, below);
+        let topmost = self.render_top_modals(frame, below, layout.bottom_area);
         self.register_zones(&layout, topmost.rect);
         self.render_docs_badge(frame, &topmost);
         self.apply_selection(frame, render_chat);
@@ -165,7 +165,7 @@ impl App {
 
         let prompt = self.render_workbench_prompt(frame, body);
         let below = self.render_picker_overlays(frame, body, frame.area());
-        let topmost = self.render_top_modals(frame, below);
+        let topmost = self.render_top_modals(frame, below, prompt);
         for rect in [prompt, topmost.rect] {
             if rect.width > 0 {
                 self.zones.push_overlay(rect);
@@ -193,11 +193,7 @@ impl App {
             height,
             ..body
         };
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Block::default().style(theme::current().surface_style()),
-            area,
-        );
+        clear_dock(frame, area);
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, area);
         } else {
@@ -661,11 +657,26 @@ impl App {
         }
     }
 
+    /// The permission prompt in `area`, over whatever was drawn there.
+    fn render_prompt_over(&mut self, frame: &mut Frame, area: Rect) {
+        clear_dock(frame, area);
+        self.permission_prompt.view(frame, area);
+    }
+
     /// The docs draw above every modal but the chord list, since a `?` on any
-    /// of them opens the docs over it and closing them returns there.
-    fn render_top_modals(&mut self, frame: &mut Frame, below: Topmost) -> Topmost {
+    /// of them opens the docs over it and closing them returns there. A
+    /// pending permission prompt hides them all but `/btw`, which it draws
+    /// over in `prompt`, where it docks.
+    fn render_top_modals(&mut self, frame: &mut Frame, below: Topmost, prompt: Rect) -> Topmost {
         if self.permission_prompt.is_open() {
-            return below;
+            if !self.btw.is_open() {
+                return below;
+            }
+            let rect = self.btw.view(frame, frame.area());
+            if self.prompt_over_btw() {
+                self.render_prompt_over(frame, prompt);
+            }
+            return Topmost { rect, topic: None };
         }
         let Topmost {
             rect: mut overlay_rect,
@@ -1175,6 +1186,15 @@ fn message_content_area(area: Rect) -> Rect {
         area.width,
         area.height.saturating_sub(padding.saturating_mul(2)),
     )
+}
+
+/// Blanks a docked prompt's rows so nothing drawn under them shows through.
+fn clear_dock(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(theme::current().surface_style()),
+        area,
+    );
 }
 
 #[cfg(test)]

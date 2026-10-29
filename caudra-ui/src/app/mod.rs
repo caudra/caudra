@@ -446,6 +446,26 @@ pub(super) enum PendingInput {
     },
 }
 
+/// What the chat that raised a permission event shows once the prompt has it.
+pub(super) enum ApprovalMark {
+    Awaiting(String),
+    Settled(String),
+}
+
+impl ApprovalMark {
+    pub(super) fn apply(&self, chat: &mut Chat) {
+        match self {
+            Self::Awaiting(call_id) => chat.await_approval(call_id),
+            Self::Settled(request_id) => chat.approval_settled(request_id),
+        }
+    }
+}
+
+pub(super) enum PermissionRouting {
+    Taken(Option<ApprovalMark>),
+    Other(ChatEventResult),
+}
+
 pub enum Msg {
     Key(KeyEvent),
     KeyWithText { key: KeyEvent, text: Option<String> },
@@ -2001,8 +2021,11 @@ impl App {
             Msg::Scroll { column, row, delta } => {
                 self.autoscroll = None;
                 if self.permission_prompt_holds_input() {
-                    if self.permission_prompt.contains(Position::new(column, row)) {
+                    let at = Position::new(column, row);
+                    if self.permission_prompt.contains(at) {
                         self.permission_prompt.scroll(delta);
+                    } else if self.btw.contains(at) {
+                        self.btw.scroll_at(at, delta);
                     } else {
                         self.active_chat().scroll(delta);
                     }
@@ -2143,8 +2166,47 @@ impl App {
         }
     }
 
+    /// Puts a permission event a chat raised on the prompt, as asked by
+    /// whoever `requester` names, and says what that chat should mark. Any
+    /// other result is handed back.
+    pub(super) fn route_permission(
+        &mut self,
+        result: ChatEventResult,
+        requester: impl FnOnce() -> Option<String>,
+    ) -> PermissionRouting {
+        let mark = match result {
+            ChatEventResult::PermissionRequest(request) => {
+                if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
+                    self.make_way_for_permission_prompt();
+                }
+                let call_id = request.id.clone();
+                self.permission_prompt
+                    .enqueue(request, requester())
+                    .then_some(ApprovalMark::Awaiting(call_id))
+            }
+            ChatEventResult::PermissionRequestUpdated(request) => {
+                let escalated = matches!(
+                    request.presentation.autopilot,
+                    Some(AutopilotNote::Escalated { .. })
+                );
+                if self.permission_prompt.update(request) && escalated {
+                    self.make_way_for_permission_prompt();
+                }
+                None
+            }
+            ChatEventResult::PermissionRequestResolved { request_id } => {
+                self.task_interactions.permissions.remove(&request_id);
+                self.permission_prompt.resolve_pending(&request_id);
+                Some(ApprovalMark::Settled(request_id))
+            }
+            result => return PermissionRouting::Other(result),
+        };
+        PermissionRouting::Taken(mark)
+    }
+
     /// A card the user has to answer takes the screen from the views it
-    /// would otherwise sit behind.
+    /// would otherwise sit behind. An open `/btw` stays: the card draws over
+    /// it, and its run may be the one asking.
     fn make_way_for_permission_prompt(&mut self) {
         self.context_modal.close();
         self.tools_modal.close();
@@ -6094,37 +6156,17 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest(request) = result {
-            if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
-                self.make_way_for_permission_prompt();
+        let result = match self.route_permission(result, || {
+            subagent_id.as_ref().map(|id| format!("subtask {id}"))
+        }) {
+            PermissionRouting::Taken(mark) => {
+                if let Some(mark) = mark {
+                    mark.apply(&mut self.chats[chat_idx]);
+                }
+                return vec![];
             }
-            let call_id = request.id.clone();
-            if self
-                .permission_prompt
-                .enqueue(request, subagent_id.map(|id| format!("subtask {id}")))
-            {
-                self.chats[chat_idx].await_approval(&call_id);
-            }
-            return vec![];
-        }
-
-        if let ChatEventResult::PermissionRequestUpdated(request) = result {
-            let escalated = matches!(
-                request.presentation.autopilot,
-                Some(AutopilotNote::Escalated { .. })
-            );
-            if self.permission_prompt.update(request) && escalated {
-                self.make_way_for_permission_prompt();
-            }
-            return vec![];
-        }
-
-        if let ChatEventResult::PermissionRequestResolved { request_id } = result {
-            self.task_interactions.permissions.remove(&request_id);
-            self.permission_prompt.resolve_pending(&request_id);
-            self.chats[chat_idx].approval_settled(&request_id);
-            return vec![];
-        }
+            PermissionRouting::Other(result) => result,
+        };
 
         // A subagent's question routes back through that subagent's own
         // answer channel, so the form remembers which chat asked.

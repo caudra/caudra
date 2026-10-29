@@ -61,7 +61,9 @@ impl App {
             .filter(|overlay| overlay.is_open());
         match (open.count(), self.workbench.is_open()) {
             (0, _) => self.surface_tip(),
-            (1, _) if self.permission_prompt.is_open() => {
+            (open, _)
+                if self.permission_prompt.is_open() && (open == 1 || self.prompt_over_btw()) =>
+            {
                 self.permission_prompt.hover_tip(self.tooltip.pointer()?)
             }
             (1, true) => self

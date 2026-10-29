@@ -71,7 +71,7 @@ use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
 };
-use caudra_agent::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx};
+use caudra_agent::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx, stub_ctx_asking};
 use caudra_agent::tools::{
     DescriptionContext, FILE_READ_TOOL_NAME, PermissionScopes, SHELL_TOOL_NAME,
     TODOWRITE_TOOL_NAME, ToolContext, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
@@ -20726,9 +20726,9 @@ fn btw_billed_model() -> String {
     format!("{TEST_PROVIDER}/{}", test_model().id)
 }
 
-/// Stands in for `file_read`: one scoped read that answers
+/// Stands in for `file_read`: one read of the path it holds that answers
 /// [`MOCK_TOOL_OUTPUT`].
-struct BtwRead;
+struct BtwRead(&'static str);
 
 impl Tool for BtwRead {
     fn name(&self) -> &str {
@@ -20744,7 +20744,7 @@ impl Tool for BtwRead {
     }
 
     fn parse(&self, _: &serde_json::Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        Ok(Box::new(BtwRead))
+        Ok(Box::new(BtwRead(self.0)))
     }
 }
 
@@ -20755,7 +20755,7 @@ impl ToolInvocation for BtwRead {
 
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(Some(PermissionScopes::single(
-            BTW_READ_SCOPE.into(),
+            self.0.into(),
         ))))
     }
 
@@ -20767,9 +20767,24 @@ impl ToolInvocation for BtwRead {
 /// A session's tool context for side questions, whose `file_read` answers
 /// [`MOCK_TOOL_OUTPUT`].
 pub(crate) fn btw_host() -> Arc<WorkflowHostContext> {
-    let ctx = stub_ctx(&AgentMode::Build);
+    btw_host_over(stub_ctx(&AgentMode::Build), BTW_READ_SCOPE)
+}
+
+/// A session's tool context whose `file_read` of `scope` asks `permissions`
+/// first, as a read outside the project does.
+fn btw_asking_host(permissions: Arc<PermissionManager>) -> Arc<WorkflowHostContext> {
+    let (events, _) = flume::unbounded();
+    let ctx = stub_ctx_asking(&AgentMode::Build, permissions, &EventSender::new(events, 0));
+    btw_host_over(ctx, BTW_OUTSIDE_SCOPE)
+}
+
+fn btw_host_over(ctx: ToolContext, scope: &'static str) -> Arc<WorkflowHostContext> {
     ctx.registry
-        .register_audited(Arc::new(BtwRead), NamedMock::source(), ToolEffect::ReadOnly)
+        .register_audited(
+            Arc::new(BtwRead(scope)),
+            NamedMock::source(),
+            ToolEffect::ReadOnly,
+        )
         .unwrap();
     let provider = Arc::clone(&ctx.provider);
     let model = Arc::clone(&ctx.model);
@@ -21391,6 +21406,137 @@ fn has_btw_call(messages: &[Message]) -> bool {
         && blocks().any(|block| {
             matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == BTW_CALL)
         })
+}
+
+const BTW_OUTSIDE_SCOPE: &str = "/etc/btw.rs";
+const BTW_PERMISSION_ID: &str = "main-shell";
+const BTW_PERMISSION_COMMAND: &str = "ls";
+const BTW_PROMPT_HIDDEN: &str = "the approval must draw over the open /btw window";
+const BTW_APPROVAL_LEFT: &str = "leaving /btw must take its approval off the prompt";
+const BTW_APPROVAL_NOT_ASKED: &str = "the read must wait on the prompt";
+
+/// A `/btw` whose run waits on the approval of its `file_read`, and the
+/// request the prompt shows for it.
+fn btw_awaiting_approval() -> (App, BtwScript, String) {
+    let (mut app, script) = btw_scripted_app();
+    app.task_host = Some(btw_asking_host(Arc::clone(&app.permissions)));
+    app.start_btw(BTW_QUESTION.into());
+    script.responses.send(btw_file_read()).unwrap();
+    app.await_btw_approval();
+    let request_id = app
+        .permission_prompt
+        .request_id()
+        .expect(BTW_APPROVAL_NOT_ASKED)
+        .to_owned();
+    (app, script, request_id)
+}
+
+/// What the side run's read handed back to the model.
+fn btw_read_result(requests: &[BtwRequest]) -> Option<(String, bool)> {
+    requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } if tool_use_id == BTW_CALL => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+}
+
+#[test]
+fn a_btw_approval_draws_over_the_open_window() {
+    let (mut app, _script, _) = btw_awaiting_approval();
+
+    assert!(app.btw.is_open() && app.btw.is_running());
+    assert_eq!(
+        app.permission_prompt.requester(),
+        Some(super::btw::PERMISSION_ORIGIN)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    assert!(
+        buffer_text(terminal.backend().buffer()).contains(BTW_QUESTION),
+        "{BTW_PROMPT_HIDDEN}"
+    );
+    let column = TEST_AREA.width / 2;
+    assert!(
+        (TEST_AREA.top()..TEST_AREA.bottom()).any(|row| {
+            let at = Position::new(column, row);
+            app.permission_prompt.contains(at) && app.btw.contains(at)
+        }),
+        "{BTW_PROMPT_HIDDEN}"
+    );
+}
+
+#[test]
+fn keys_reach_the_btw_approval_before_the_window() {
+    let (mut app, _script, _) = btw_awaiting_approval();
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+
+    assert_eq!(btw_input(&app), "", "the prompt holds the keyboard");
+    assert!(app.btw.is_open() && app.permission_prompt.is_open());
+}
+
+#[test_case(PermissionAnswer::AllowOnce, false ; "approve_runs_the_read")]
+#[test_case(PermissionAnswer::Deny, true ; "deny_fails_the_read")]
+fn the_btw_run_goes_on_after_its_approval_is_answered(answer: PermissionAnswer, refused: bool) {
+    let (mut app, script, request_id) = btw_awaiting_approval();
+
+    app.apply_permission_decision(PermissionDecision { request_id, answer });
+    app.finish_permission_jobs();
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+
+    assert!(app.btw.is_open());
+    assert!(!app.permission_prompt.is_open());
+    assert_eq!(
+        app.btw.window().and_then(SideTranscript::text).as_deref(),
+        Some(BTW_ANSWER)
+    );
+    let requests: Vec<BtwRequest> = script.requests.try_iter().collect();
+    let (content, is_error) = btw_read_result(&requests).expect("the read reached the model");
+    assert_eq!(is_error, refused);
+    assert_eq!(content == MOCK_TOOL_OUTPUT, !refused, "{content}");
+}
+
+#[test_case(App::close_btw ; "close")]
+#[test_case(App::close_all_overlays ; "close_all")]
+fn leaving_btw_withdraws_its_approval(leave: fn(&mut App)) {
+    let (mut app, _script, request_id) = btw_awaiting_approval();
+
+    leave(&mut app);
+
+    assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
+    assert!(!app.permission_prompt.is_open(), "{BTW_APPROVAL_LEFT}");
+    assert!(app.task_interactions.permissions.is_empty());
+    app.await_btw_approval_gone(&request_id);
+    assert!(
+        app.permissions.pending_request(&request_id).is_none(),
+        "the cancelled call no longer waits on an answer"
+    );
+}
+
+#[test]
+fn a_main_approval_draws_over_an_open_btw_and_keeps_it() {
+    let mut app = btw_ready_app();
+    app.run_id = 1;
+    app.start_btw(BTW_QUESTION.into());
+
+    app.update(agent_msg(permission_event(
+        BTW_PERMISSION_ID,
+        BTW_PERMISSION_COMMAND,
+    )));
+
+    assert!(app.btw.is_open() && app.btw.is_running());
+    assert_eq!(app.permission_prompt.request_id(), Some(BTW_PERMISSION_ID));
+    assert!(app.prompt_over_btw());
 }
 
 /// A side question reads with real tools, and its window draws each call as
