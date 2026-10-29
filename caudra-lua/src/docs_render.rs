@@ -20,7 +20,7 @@ const NAME: &str = "caudra-plugin-dev";
 const DESCRIPTION: &str = "Write or modify caudra plugins or init.lua config in Lua: custom tools, slash commands, keymaps, UI. Authoring guide, real example, indexed caudra Lua API reference. Load before any caudra plugin work.";
 const REFERENCE_PLACEHOLDER: &str = "__CAUDRA_REFERENCE_PATH__";
 
-const EXAMPLE: &str = include_str!("../../plugins/view_image/init.lua");
+const EXAMPLE: &str = include_str!("../example/view_image.lua");
 
 const PERMISSIONS_ANCHOR: &str = "plugin-permissions";
 const REFERENCE_URL: &str = "/docs/lua-api/";
@@ -130,8 +130,8 @@ run = true
 4. Run `/reload`, then read the log as described below, to see that it loaded
    and what it printed.
 
-Leave `caudra.api.register_options` to bundled plugins: caudra rejects a
-`plugins.<name>` table for a plugin it does not ship, and startup fails. Keep
+Don't call `caudra.api.register_options`. Caudra accepts `plugins.<name>`
+tables only for its built-in tools, and startup fails on any other name. Keep
 settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 {PERMISSIONS}
@@ -158,9 +158,8 @@ the interpreter, with full debug info.
 
 ## A complete real example
 
-The bundled `view_image` tool, verbatim: schema, header and restore hooks, error
-handling, host-managed output limits, collapsible UI view. It is a bundled plugin,
-so it opens with `register_options`, which your own plugin skips:
+A `view_image` tool written as a plugin, verbatim: schema, header and restore
+hooks, error handling, host-managed output limits, collapsible UI view:
 
 ```lua
 "#;
@@ -171,10 +170,10 @@ so it opens with `register_options`, which your own plugin skips:
 /// heading, so leaving it out leaves no hole.
 const AGENT_NOTES: &str = r#"## Notes for the agent
 
-- Never write a plugin into caudra's own source tree. The `plugins/` directory
-  of the caudra repo holds the plugins that ship with caudra, compiled into the
-  binary, so a file dropped there does nothing until caudra is rebuilt. That
-  holds even when the project you have open is a caudra checkout.
+- Never write a plugin into caudra's own source tree. Its Lua files are
+  compiled into the binary, so a file dropped there does nothing until caudra
+  is rebuilt. That holds even when the project you have open is a caudra
+  checkout.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with `file_write` and `file_edit`.
 - You cannot run slash commands or restart caudra, so ask the user to run
@@ -470,7 +469,7 @@ fn skeleton(src: &str) -> String {
 fn helpers() -> Vec<(String, &'static str)> {
     let caudra = lib_dir()
         .get_dir("caudra")
-        .expect("plugins/lib/caudra embedded");
+        .expect("caudra-lua/lua/caudra embedded");
     let mut helpers: Vec<(String, &'static str)> = caudra
         .files()
         .filter_map(|file| {

@@ -68,8 +68,8 @@ run = true
 4. Run `/reload`, then read the log as described below, to see that it loaded
    and what it printed.
 
-Leave `caudra.api.register_options` to bundled plugins: caudra rejects a
-`plugins.<name>` table for a plugin it does not ship, and startup fails. Keep
+Don't call `caudra.api.register_options`. Caudra accepts `plugins.<name>`
+tables only for its built-in tools, and startup fails on any other name. Keep
 settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 ## Permissions and plugin.toml
@@ -100,9 +100,8 @@ the interpreter, with full debug info.
 
 ## A complete real example
 
-The bundled `view_image` tool, verbatim: schema, header and restore hooks, error
-handling, host-managed output limits, collapsible UI view. It is a bundled plugin,
-so it opens with `register_options`, which your own plugin skips:
+A `view_image` tool written as a plugin, verbatim: schema, header and restore
+hooks, error handling, host-managed output limits, collapsible UI view:
 
 ```lua
 local shorten_path = require("caudra.shorten_path")

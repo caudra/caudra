@@ -419,12 +419,6 @@ pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
     ),
 ];
 
-/// Which of [`DEFAULT_BUILTINS`] production still loads from Lua. Empty: every
-/// built-in is native now. The sources stay in the tree as Lua-API coverage
-/// and as worked examples for plugin authors, so tests and docgen can still
-/// load them by name.
-pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
-
 /// Caudra's own native tools: session-shaped work, orchestration, and the
 /// interactive surfaces. Workcell owns everything protocol-neutral.
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
@@ -490,7 +484,6 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = WORKCELL_NATIVE_TOOL_NAMES
         .iter()
         .chain(CAUDRA_NATIVE_TOOL_NAMES)
-        .chain(ACTIVE_DEFAULT_LUA_PLUGINS)
         .chain(INTERNAL_COMPANION_TOOL_NAMES)
         .copied()
         .collect();

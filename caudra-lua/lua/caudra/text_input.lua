@@ -16,7 +16,7 @@
 -- (1, 0), right at end of buffer, etc.). Parents can use that signal to fall
 -- through to their own logic.
 --
--- Parity cases live in plugins/lib/tests/spec.lua (TRACE_CASES). Add one
+-- Parity cases live in caudra-lua/tests/lua/lib_spec.lua (TRACE_CASES). Add one
 -- whenever you change handle_key semantics.
 
 local R = { IGNORED = "ignored", MOVED = "moved", CHANGED = "changed" }

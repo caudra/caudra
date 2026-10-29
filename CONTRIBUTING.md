@@ -108,7 +108,6 @@ To work on one test, start the servers once with `eval "$(python3 scripts/mcp-se
 | `docs/navigation.json` | Shared docs navigation groups and ordering |
 | `docs/examples/` | Generated config examples, published at `/docs/*.example.toml` |
 | `workcell/` | Workcell tools and supporting crates, built as local workspace members |
-| `plugins/` | Lua plugin sources, kept as examples and as coverage for the Lua API |
 | `scripts/` | Build and maintenance scripts |
 | `vendor/crossterm/` | A patched crossterm, kept until a release includes the fix that `Cargo.toml` describes |
 | `tests/` | Integration tests for the binary |
@@ -132,7 +131,7 @@ Put unit tests in a `#[cfg(test)]` module in the same file. Use `#[test_case]` f
 
 - Work on an experimental feature stays behind its `[experimental]` switch. With the switch off, the feature shows no tools, commands, shortcuts, help entries, or status chips, and it does no work at startup.
 - Do not add default key bindings that use Alt. By default, many macOS terminals do not send Option as Alt, so those keys would never arrive.
-- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `make fmt` formats the plugins with stylua.
+- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `make fmt` formats the Lua sources in `caudra-lua` with stylua.
 
 ## Docs
 

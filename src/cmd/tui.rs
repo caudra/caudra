@@ -696,7 +696,7 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
-    let mut plugin_host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
+    let plugin_host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let (fallback_config, fallback_model) = match fallback {
         Some((config, model, profiles, selected, layers)) => {
@@ -704,7 +704,6 @@ fn build_stack(
         }
         None => (None, None),
     };
-    let reloading = fallback_model.is_some();
     let loaded = load_recorded_settings(&plugin_host, &cli.startup, cwd, remote).and_then(
         |(settings, lua_layers)| {
             let config = resolve_config(settings, &ConfigFlags::of(cli), cwd, remote)?;
@@ -739,14 +738,7 @@ fn build_stack(
     super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
     skill::refresh(ToolRegistry::global());
 
-    if let Err(e) = plugin_host.load_production_builtins(&config.plugins) {
-        let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
-        if reloading {
-            warnings.push(format!("{e:#}"));
-        } else {
-            return Err(e);
-        }
-    }
+    plugin_host.warm_jit();
 
     let commands = discover_commands(
         cli.no_commands || remote,

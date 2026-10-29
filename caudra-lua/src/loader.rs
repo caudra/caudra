@@ -1,21 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
-use caudra_agent::permissions::{
-    PluginRuleStore, VerifiedLocalSourceLocator, canonical_json_sha256,
-};
+use caudra_agent::permissions::{PluginRuleStore, VerifiedLocalSourceLocator};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::config_file::{global_init_lua_path, project_init_lua_path};
-use caudra_config::{AgentConfig, PluginsConfig, RawConfig};
+use caudra_config::{AgentConfig, RawConfig};
 use include_dir::{Dir, include_dir};
 
 use crate::api::keymap::KeymapReader;
-use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::options::PluginOpts;
 use crate::api::tool::PermissionRulePolicy;
 use crate::api::util::command::{CompletionRequest, HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
@@ -28,145 +25,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Only a caller whose request died with the host ever waits a whole one: a
 /// live runtime's reply wakes the receive the moment it is sent.
 const HOST_LIVENESS_POLL: Duration = Duration::from_millis(50);
-/// Bundled plugins that load regardless of the user's `plugins` config.
-/// Empty since `tool_output` became a native tool; kept because the mechanism
-/// is how any future non-negotiable builtin would arrive.
-const ALWAYS_LOADED_BUILTINS: &[&str] = &[];
 
-struct BundledPlugin {
-    name: &'static str,
-    dir: Dir<'static>,
-}
-
-fn bundled_implementation_digest() -> String {
-    fn collect(plugin: &str, directory: &Dir<'_>, files: &mut BTreeMap<String, String>) {
-        for file in directory.files() {
-            if file
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "lua")
-            {
-                files.insert(
-                    format!("{plugin}/{}", file.path().display()),
-                    canonical_json_sha256(&serde_json::Value::String(
-                        file.contents_utf8().unwrap_or_default().into(),
-                    )),
-                );
-            }
-        }
-        for child in directory.dirs() {
-            collect(plugin, child, files);
-        }
-    }
-
-    let mut files = BTreeMap::new();
-    for plugin in BUNDLED_PLUGINS {
-        collect(plugin.name, &plugin.dir, &mut files);
-    }
-    canonical_json_sha256(&serde_json::json!(files))
-}
-
-/// `lib` is not a default builtin; it exists so plugins can
-/// `require()` shared modules across boundaries.
-static BUNDLED_PLUGINS: &[BundledPlugin] = &[
-    BundledPlugin {
-        name: "sessions",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
-    },
-    BundledPlugin {
-        name: "index",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
-    },
-    BundledPlugin {
-        name: "webfetch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
-    },
-    BundledPlugin {
-        name: "websearch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
-    },
-    BundledPlugin {
-        name: "bash",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
-    },
-    BundledPlugin {
-        name: "batch",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
-    },
-    BundledPlugin {
-        name: "grep",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
-    },
-    BundledPlugin {
-        name: "glob",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
-    },
-    BundledPlugin {
-        name: "skill",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
-    },
-    BundledPlugin {
-        name: "memory",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
-    },
-    BundledPlugin {
-        name: "question",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
-    },
-    BundledPlugin {
-        name: "todo_write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
-    },
-    BundledPlugin {
-        name: "tool_output",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_output"),
-    },
-    BundledPlugin {
-        name: "read",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
-    },
-    BundledPlugin {
-        name: "write",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
-    },
-    BundledPlugin {
-        name: "edit",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
-    },
-    BundledPlugin {
-        name: "task",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
-    },
-    BundledPlugin {
-        name: "python_execution",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/python_execution"),
-    },
-    BundledPlugin {
-        name: "view_image",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
-    },
-    BundledPlugin {
-        name: "lib",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
-    },
-    BundledPlugin {
-        name: "list",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
-    },
-];
+/// The `caudra.*` modules every plugin can `require()`.
+static LUA_LIB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/lua");
 
 pub(crate) fn lib_dir() -> &'static Dir<'static> {
-    &BUNDLED_PLUGINS
-        .iter()
-        .find(|p| p.name == "lib")
-        .expect("lib plugin bundled")
-        .dir
+    &LUA_LIB
 }
-
-static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
-    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
-    Vec::leak(dirs)
-});
 
 pub struct PluginHost {
     /// `None` when Lua is off for the whole process: no VM, thread, or
@@ -206,7 +71,7 @@ impl PluginHost {
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
-        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
+        let lua = runtime::spawn(registry, &LUA_LIB, jit, Arc::clone(&plugin_rules))?;
         Ok(Self {
             lua: Some(lua),
             plugin_rules,
@@ -284,15 +149,6 @@ impl PluginHost {
         }
     }
 
-    /// Boots the runtime and loads every default bundled plugin into `registry`.
-    /// For callers like tests and docgen that want the full builtin set
-    /// without building a config.
-    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
-        Ok(host)
-    }
-
     /// Runs the global `init.lua` in `config_dir`, if there is one. It is
     /// trusted, and its settings rank with the global `caudra.toml`.
     pub fn run_global_init(&self, config_dir: &Path) -> Result<Option<RawConfig>, PluginError> {
@@ -344,107 +200,11 @@ impl PluginHost {
         )
     }
 
-    pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        self.load_builtins_from(config, None)
-    }
-
-    /// Production runs no Lua built-in on a disabled host, so there is
-    /// nothing to load rather than anything to refuse.
-    pub fn load_production_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        if !self.is_enabled() {
-            return Ok(());
+    /// Every plugin is loaded, so native codegen may start using idle time.
+    pub fn warm_jit(&self) {
+        if let Some(lua) = &self.lua {
+            let _ = lua.tx.send(Request::WarmJit);
         }
-        self.load_builtins_from(config, Some(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS))
-    }
-
-    fn load_builtins_from(
-        &self,
-        config: &PluginsConfig,
-        allowlist: Option<&[&str]>,
-    ) -> Result<(), PluginError> {
-        let lua = self.lua()?;
-        let result = self.send_builtin_loads(config, allowlist);
-        // Armed even when a load failed, so a caller that only warns about the
-        // error is not left interpreting for the rest of the session.
-        let _ = lua.tx.send(Request::WarmJit);
-        result
-    }
-
-    fn send_builtin_loads(
-        &self,
-        config: &PluginsConfig,
-        allowlist: Option<&[&str]>,
-    ) -> Result<(), PluginError> {
-        for (plugin, opts) in &config.opts {
-            if plugin == "index" {
-                continue;
-            }
-            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
-            if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
-                return Err(PluginError::UnknownPluginOptions {
-                    plugin: plugin.clone(),
-                    keys: keys.join(", "),
-                });
-            }
-            if !config.names.contains(plugin) {
-                tracing::warn!(
-                    plugin = plugin.as_str(),
-                    keys = keys.join(", "),
-                    "plugin is disabled; its plugins.{} options are ignored until re-enabled",
-                    plugin
-                );
-            }
-        }
-        let mut builtins: Vec<String> = config
-            .names
-            .iter()
-            .filter(|name| allowlist.is_none_or(|active| active.contains(&name.as_str())))
-            .cloned()
-            .collect();
-        for builtin in ALWAYS_LOADED_BUILTINS {
-            if !builtins.iter().any(|name| name == builtin) {
-                builtins.push((*builtin).to_owned());
-            }
-        }
-        for builtin in &builtins {
-            let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
-                Some(p) => &p.dir,
-                None => {
-                    return Err(PluginError::UnknownPlugin {
-                        plugin: builtin.clone(),
-                    });
-                }
-            };
-            let init = dir
-                .get_file("init.lua")
-                .and_then(|f| f.contents_utf8())
-                .ok_or_else(|| PluginError::Lua {
-                    plugin: builtin.clone(),
-                    source: mlua::Error::runtime("bundled plugin missing init.lua"),
-                })?;
-            let name: Arc<str> = Arc::from(builtin.as_str());
-            let opts = config
-                .opts
-                .get(builtin.as_str())
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            let source = format!(
-                "{init}\n-- caudra bundled implementation {}",
-                bundled_implementation_digest()
-            );
-            self.send_load(
-                name,
-                source,
-                None,
-                true,
-                PluginPermissions::trusted(),
-                PermissionRulePolicy::Trusted,
-                opts,
-                None,
-            )?;
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -453,7 +213,6 @@ impl PluginHost {
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
-        bundled: bool,
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -466,7 +225,6 @@ impl PluginHost {
                 name,
                 source,
                 plugin_dir,
-                bundled,
                 permissions,
                 rule_policy,
                 opts,
@@ -475,17 +233,6 @@ impl PluginHost {
             })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
-    }
-
-    /// Option specs declared by loaded plugins via `caudra.api.register_options`,
-    /// keyed by plugin name. Used by docgen.
-    pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.lua()?
-            .tx
-            .send(Request::CollectPluginOptions { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
     pub fn send_run_init_lua(
@@ -553,7 +300,6 @@ impl PluginHost {
             Arc::from(name),
             source.to_owned(),
             None,
-            false,
             PluginPermissions::trusted(),
             PermissionRulePolicy::Trusted,
             Arc::new(opts),
@@ -571,7 +317,6 @@ impl PluginHost {
             Arc::from(name),
             source.to_owned(),
             None,
-            false,
             permissions,
             PermissionRulePolicy::Trusted,
             PluginOpts::default(),
@@ -600,7 +345,6 @@ impl PluginHost {
             Arc::from("user"),
             source,
             plugin_dir,
-            false,
             permissions,
             if trusted {
                 PermissionRulePolicy::Trusted
@@ -920,59 +664,25 @@ mod tests {
 
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
-    /// interpreter path needs its own coverage.
+    /// interpreter path needs its own coverage, bundled modules included.
     #[test]
-    fn with_jit_off_loads_builtins_and_registers_tools() {
+    fn with_jit_off_requires_bundled_modules_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .unwrap();
-        assert!(matches!(
-            reg.get("glob").unwrap().source,
-            caudra_agent::tools::ToolSource::Lua { bundled: true, .. }
-        ));
-    }
-
-    /// Plugin ids that live in-tree as Lua reference implementations but are
-    /// owned natively in production. Loading one would shadow the native tool,
-    /// fail registration outright on the name conflict, or — where the native
-    /// name has since changed under them — quietly offer the same capability
-    /// twice.
-    const NATIVELY_OWNED: &[&str] = &[
-        "bash",
-        "batch",
-        "python_execution",
-        "edit",
-        "glob",
-        "grep",
-        "index",
-        "list",
-        "memory",
-        "question",
-        "read",
-        "skill",
-        "task",
-        "todo_write",
-        "tool_output",
-        "view_image",
-        "webfetch",
-        "websearch",
-        "write",
-    ];
-
-    #[test]
-    fn production_builtins_leave_natively_owned_tools_alone() {
-        let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .unwrap();
-
-        for name in NATIVELY_OWNED {
-            assert!(reg.get(name).is_none(), "{name} was registered from Lua");
-            assert!(!caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(name));
-        }
-        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"file_index"));
-        assert!(caudra_config::CAUDRA_NATIVE_TOOL_NAMES.contains(&"view_image"));
+        let host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        host.load_source(
+            "jit_off",
+            r#"
+            local truncate = require("caudra.truncate")
+            caudra.api.register_tool({
+                name = "jit_off_tool",
+                description = "t",
+                schema = { type = "object", properties = {} },
+                handler = function() return truncate("ok", 10, 10) end,
+            })
+            "#,
+        )
+        .unwrap();
+        assert!(reg.get("jit_off_tool").is_some());
     }
 
     #[test]
@@ -1241,23 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_builtin_registers_command() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-        let reader = host.command_reader();
-        let snap = reader.load();
-        let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
-        assert!(
-            found,
-            "Expected /memory command, found: {:?}",
-            snap.commands
-                .iter()
-                .map(|c| c.name.as_ref())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn run_command_sends_correct_request() {
         let (prio_tx, prio_rx) = flume::bounded(8);
         let (tx, _rx) = flume::bounded(8);
@@ -1449,10 +1142,9 @@ mod tests {
         assert!(!restoring.load(Ordering::Relaxed));
         assert!(host.ui_action_rx().is_disconnected());
         assert!(host.command_reader().load().commands.is_empty());
-        let plugins = PluginsConfig::from_plugins(HashMap::new());
-        assert!(host.load_production_builtins(&plugins).is_ok());
+        host.warm_jit();
         assert!(matches!(
-            host.load_builtins(&plugins),
+            host.load_source("disabled", ""),
             Err(PluginError::Disabled)
         ));
         host.begin_shutdown();

@@ -577,10 +577,8 @@ mod tests {
         assert!(second.contains("three\nfour"), "{second}");
     }
 
-    /// The size suffix was previously asserted only against the Lua mirror in
-    /// `plugins/tool_output`, so the native footer could change shape with the
-    /// suite still green. Pins both halves: what this page costs, and how much
-    /// output remains behind the ID.
+    /// Pins both halves of the size suffix: what this page costs, and how
+    /// much output remains behind the ID.
     #[test]
     fn a_page_reports_its_own_token_cost_and_the_stored_byte_total() {
         const TEXT: &str = "one\ntwo\nthree\nfour\n";
