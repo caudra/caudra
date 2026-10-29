@@ -19,6 +19,7 @@ use caudra_storage::thinking::{self, StoredThinking};
 use crate::accounts::{AccountCredential, Failover, RoutedAccount, RoutedProvider};
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPurpose, TokenUsage};
+use crate::model_data::Current;
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -346,12 +347,23 @@ impl ProviderKind {
 /// How the accounts of `slug` may be supplied. Fails for a slug no provider
 /// answers to, with the message building one would give.
 pub fn credential_spec(slug: &str) -> Result<CredentialSpec, AgentError> {
+    credential_spec_in(slug, &crate::model_data::current())
+}
+
+pub(crate) fn credential_spec_in(slug: &str, data: &Current) -> Result<CredentialSpec, AgentError> {
     let config = ProvidersConfig::load();
     let definition = config.get(slug);
     let config_key = definition.and_then(|definition| definition.api_key.clone());
     if let Ok(kind) = ProviderKind::from_str(slug) {
         return Ok(CredentialSpec {
-            env_vars: kind.credential_env_vars(slug),
+            env_vars: if kind == ProviderKind::Opencode {
+                data.catalog
+                    .provider(slug)
+                    .map(|provider| provider.env_keys)
+                    .unwrap_or_default()
+            } else {
+                kind.credential_env_vars(slug)
+            },
             keyless: kind.keyless(),
             oauth: kind.signs_in(),
             config_key,
@@ -372,7 +384,11 @@ pub fn credential_spec(slug: &str) -> Result<CredentialSpec, AgentError> {
             config_key,
         });
     }
-    match catalog::credential_env_vars(slug) {
+    match data
+        .catalog
+        .provider(slug)
+        .map(|provider| provider.env_keys)
+    {
         Some(env_vars) => Ok(CredentialSpec {
             env_vars,
             keyless: OPENCODE_FAMILY_SLUGS.contains(&slug),
@@ -390,18 +406,26 @@ pub(crate) fn create_for_account(
     slug: &str,
     account: &AccountCredential,
     timeouts: Timeouts,
+    data: &Arc<Current>,
 ) -> Result<Box<dyn Provider>, AgentError> {
+    if slug == "opencode" {
+        return Ok(Box::new(Opencode::with_catalog(
+            account,
+            timeouts,
+            Arc::clone(data),
+        )?));
+    }
     if let Ok(kind) = ProviderKind::from_str(slug) {
         return kind.create(account, timeouts);
     }
     if dynamic::display_name(slug).is_some() {
-        return dynamic::create(slug, timeouts);
+        return dynamic::create(slug, timeouts, data);
     }
     if custom::base_kind(slug).is_some() {
         return custom::create(slug, account, timeouts);
     }
-    if let Some(catalog) = catalog::try_create(slug, account, timeouts) {
-        return catalog;
+    if let Some(provider) = catalog::try_create(&data.catalog, slug, account, timeouts) {
+        return provider;
     }
     Err(AgentError::Config {
         message: catalog::unresolved_slug_reason(slug),
@@ -447,6 +471,10 @@ pub trait CacheWarm: Send + Sync {
 }
 
 pub trait Provider: Send + Sync {
+    fn same_model_route(&self, _model: &Model, _data: &Current) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
         &'a self,
@@ -606,10 +634,21 @@ fn provider_available_offline(slug: &str) -> bool {
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    let provider = provider_for_slug(&model.provider, timeouts)?;
-    provider.adjust_model(model);
-    debug!(provider = %model.provider, model = %model.id, "provider created");
-    Ok(provider)
+    loop {
+        let revision = crate::model_data::current().revision;
+        if model.model_revision != revision {
+            *model = Model::from_spec(&model.spec()).map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
+        }
+        let provider = provider_for_slug(&model.provider, timeouts)?;
+        if crate::model_data::current().revision != revision {
+            continue;
+        }
+        provider.adjust_model(model);
+        debug!(provider = %model.provider, model = %model.id, "provider created");
+        return Ok(provider);
+    }
 }
 
 /// Adjust a model against its provider's static table without retaining the
@@ -868,7 +907,7 @@ pub async fn fetch_all_models(
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
             };
-            let batch = match dynamic::create(&slug, timeouts) {
+            let batch = match dynamic::create(&slug, timeouts, &crate::model_data::current()) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
                         models: register_listed_models(&slug, models),

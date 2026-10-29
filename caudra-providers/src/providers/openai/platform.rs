@@ -151,7 +151,7 @@ pub struct OpenAi {
     auth_state: Mutex<AuthState>,
     auth_update: async_lock::Mutex<()>,
     rejected_auth_credentials: Mutex<HashSet<String>>,
-    model_context_windows: Mutex<HashMap<String, u32>>,
+    model_context_windows: Mutex<HashMap<(String, u64), u32>>,
     store: Option<AccountStore>,
     system_prefix: Option<String>,
     /// Env / `providers.toml` override for the platform API, resolved once at
@@ -725,7 +725,7 @@ impl Provider for OpenAi {
             .model_context_windows
             .lock()
             .unwrap()
-            .entry(model.id.clone())
+            .entry((model.id.clone(), model.model_revision))
             .or_insert(model.context_window);
         if self.is_oauth()
             && let Some(plan_context_window) = coding_plan_context_window(model)
@@ -943,6 +943,24 @@ mod tests {
         );
         assert_eq!(uses_responses(&model), window.is_some());
         assert!(!uses_responses(&old));
+    }
+
+    #[test_case(false; "api_key")]
+    #[test_case(true; "coding_plan")]
+    fn refreshed_context_window_replaces_the_previous_baseline(oauth: bool) {
+        let provider = provider_with_login(oauth);
+        let mut old = Model::from_spec(CHAT_MODEL).unwrap();
+        provider.adjust_model(&mut old);
+        let previous = old.context_window;
+        edit_model(CONFIG.slug, CHAT_ID, |entry| {
+            entry.context_window = DATA_PLAN_WINDOW
+        });
+        let mut next = old
+            .refreshed(&caudra_config::ModelPolicy::new(&[], &[]).unwrap())
+            .unwrap();
+        provider.adjust_model(&mut next);
+        assert_eq!(next.context_window, DATA_PLAN_WINDOW);
+        assert_eq!(old.context_window, previous);
     }
 
     #[test]

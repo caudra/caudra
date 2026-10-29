@@ -31,7 +31,10 @@ use super::quota::QuotaWindow;
 use super::route::{AccountTier, SelectionMode};
 use crate::AgentError;
 use crate::model::Billing;
-use crate::provider::{CredentialSpec, Provider, create_for_account, credential_spec};
+use crate::model_data::{Current, current};
+use crate::provider::{
+    CredentialSpec, Provider, create_for_account, credential_spec, credential_spec_in,
+};
 use crate::providers::Timeouts;
 use crate::types::ProviderUsage;
 
@@ -46,6 +49,7 @@ const ENV_KEY_SEPARATOR: char = ',';
 const OVERRIDE_SEPARATOR: char = ':';
 const OVERRIDE_LIST_SEPARATOR: char = ',';
 
+#[cfg(test)]
 pub(crate) type ProviderFactory = Arc<
     dyn Fn(&AccountCredential, Timeouts) -> Result<Box<dyn Provider>, AgentError> + Send + Sync,
 >;
@@ -130,7 +134,7 @@ impl PoolSnapshot {
 enum SnapshotSource {
     Live,
     #[cfg(test)]
-    Fixed,
+    Fixed(ProviderFactory),
 }
 
 /// Why requests may not go to an account, beyond its quota.
@@ -142,12 +146,11 @@ struct Failures {
 }
 
 /// (account, credential fingerprint, config digest, connect ms, stream ms)
-type InstanceKey = (String, String, u64, u128, u128);
+type InstanceKey = (String, String, u64, u128, u128, u64);
 
 pub(crate) struct SlugState {
     pub slug: String,
     source: SnapshotSource,
-    factory: ProviderFactory,
     storage: Option<StateDir>,
     snapshot: Mutex<(Arc<PoolSnapshot>, Instant)>,
     pub health: HealthBook,
@@ -159,27 +162,19 @@ pub(crate) struct SlugState {
 impl SlugState {
     fn live(slug: &str) -> Result<Self, AgentError> {
         let storage = registry_storage();
-        let snapshot = build_snapshot(slug, storage.as_ref())?;
-        Ok(Self::new(
-            slug,
-            SnapshotSource::Live,
-            Arc::new(create_for_account_in(slug)),
-            storage,
-            snapshot,
-        ))
+        let snapshot = build_snapshot(slug, storage.as_ref(), &current())?;
+        Ok(Self::new(slug, SnapshotSource::Live, storage, snapshot))
     }
 
     fn new(
         slug: &str,
         source: SnapshotSource,
-        factory: ProviderFactory,
         storage: Option<StateDir>,
         snapshot: PoolSnapshot,
     ) -> Self {
         Self {
             slug: slug.to_owned(),
             source,
-            factory,
             storage,
             snapshot: Mutex::new((Arc::new(snapshot), Instant::now())),
             health: HealthBook::new(slug),
@@ -191,7 +186,7 @@ impl SlugState {
 
     #[cfg(test)]
     pub(crate) fn fixed(slug: &str, factory: ProviderFactory, snapshot: PoolSnapshot) -> Self {
-        Self::new(slug, SnapshotSource::Fixed, factory, None, snapshot)
+        Self::new(slug, SnapshotSource::Fixed(factory), None, snapshot)
     }
 
     #[cfg(test)]
@@ -206,6 +201,10 @@ impl SlugState {
     /// Re-reads the pool when it is older than the refresh interval, or
     /// always with `force`. Returns whether any credential changed.
     pub(crate) fn refresh(&self, force: bool) -> bool {
+        self.refresh_with_data(force, &current())
+    }
+
+    pub(crate) fn refresh_with_data(&self, force: bool, data: &Current) -> bool {
         if !matches!(self.source, SnapshotSource::Live) {
             return false;
         }
@@ -213,7 +212,7 @@ impl SlugState {
         if !due {
             return false;
         }
-        let fresh = match build_snapshot(&self.slug, self.storage.as_ref()) {
+        let fresh = match build_snapshot(&self.slug, self.storage.as_ref(), data) {
             Ok(fresh) => fresh,
             Err(error) => {
                 warn!(provider = %self.slug, %error, "keeping the previous account pool");
@@ -261,6 +260,7 @@ impl SlugState {
         &self,
         credential: &AccountCredential,
         timeouts: Timeouts,
+        data: &Arc<Current>,
     ) -> Result<Arc<dyn Provider>, AgentError> {
         let key = (
             credential.id.name.to_string(),
@@ -268,14 +268,19 @@ impl SlugState {
             self.snapshot().config_digest,
             timeouts.connect.as_millis(),
             timeouts.stream.as_millis(),
+            data.revision,
         );
         if let Some(instance) = self.instances.lock().unwrap().get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let built: Arc<dyn Provider> = Arc::from((self.factory)(credential, timeouts)?);
+        let built: Arc<dyn Provider> = Arc::from(match &self.source {
+            SnapshotSource::Live => create_for_account(&self.slug, credential, timeouts, data)?,
+            #[cfg(test)]
+            SnapshotSource::Fixed(factory) => factory(credential, timeouts)?,
+        });
         let mut instances = self.instances.lock().unwrap();
-        instances.retain(|(name, fingerprint, digest, ..), _| {
-            name != &key.0 || (fingerprint == &key.1 && *digest == key.2)
+        instances.retain(|(name, fingerprint, digest, _, _, revision), _| {
+            name != &key.0 || (fingerprint == &key.1 && *digest == key.2 && *revision == key.5)
         });
         Ok(Arc::clone(instances.entry(key).or_insert(built)))
     }
@@ -349,14 +354,6 @@ fn registry_storage() -> Option<StateDir> {
     } else {
         StateDir::resolve().ok()
     }
-}
-
-fn create_for_account_in(
-    slug: &str,
-) -> impl Fn(&AccountCredential, Timeouts) -> Result<Box<dyn Provider>, AgentError> + Send + Sync + 'static
-{
-    let slug = slug.to_owned();
-    move |credential, timeouts| create_for_account(&slug, credential, timeouts)
 }
 
 /// The slug's shared state, its pool re-read so a caller building a provider
@@ -441,8 +438,12 @@ pub(crate) fn register_pool(state: Arc<SlugState>) {
     POOLS.lock().unwrap().insert(state.slug.clone(), state);
 }
 
-fn build_snapshot(slug: &str, storage: Option<&StateDir>) -> Result<PoolSnapshot, AgentError> {
-    let spec = credential_spec(slug)?;
+fn build_snapshot(
+    slug: &str,
+    storage: Option<&StateDir>,
+    data: &Current,
+) -> Result<PoolSnapshot, AgentError> {
+    let spec = credential_spec_in(slug, data)?;
     let config = ProvidersConfig::load();
     let definition = config.get(slug);
     let stored = storage
@@ -932,7 +933,7 @@ pub async fn fetch_account_usage(
         .ok_or_else(|| AgentError::Config {
             message: format!("{provider} has no signed-in account named `{account}`"),
         })?;
-    let instance = state.instance(&credential, timeouts)?;
+    let instance = state.instance(&credential, timeouts, &current())?;
     let usage = instance.fetch_usage().await?;
     if let Some(usage) = &usage {
         let windows: Vec<QuotaWindow> = usage

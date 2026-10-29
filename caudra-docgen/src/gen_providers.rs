@@ -20,9 +20,9 @@ Model prices, limits, defaults, and availability come from a signed model list. 
 
 The list also carries a reviewed import of the [models.dev](https://models.dev) catalog. It describes models that have no curated entry, and the providers Caudra reaches only through it, such as NVIDIA. Caudra does not contact models.dev itself.
 
-Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
+Long-running sessions check `https://models.caudra.ai/v1/models.json` in the background when the last check is more than 24 hours old, and check daily after that. A missing or invalid cache, or a check timestamp in the future, triggers a new check. Startup does not wait for a request. `--print` uses the cache without starting a refresh. A running session applies new model settings at its next turn, not during a response. If its model no longer resolves, it keeps the previous settings and logs a warning.
 
-`caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. A failed check keeps the current list.
+`caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. If another process is refreshing, it reports that and exits with an error. A failed check keeps the current list. A verified update takes effect even if saving the cache fails.
 
 ```toml
 [models]
@@ -30,11 +30,13 @@ refresh = true
 url = "https://models.caudra.ai/v1/models.json"
 ```
 
-Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `CAUDRA_MODELS_REFRESH=1` enables them. The environment override comes from the process or global `.env`, never a project `.env`. Cached files still load when refresh is disabled.
+Set `refresh = false` or `CAUDRA_MODELS_REFRESH=0` to stop automatic requests. `CAUDRA_MODELS_REFRESH=1` enables them unless the project disables refresh. The environment override also accepts `false` or `true`, `no` or `yes`, and `off` or `on`, without regard to case. Invalid values warn and leave the configured setting unchanged. The override comes from the process or global `.env`, never a project `.env`. Cached files still load when refresh is disabled.
 
-`url` can point to a mirror over HTTPS, or HTTP on localhost, 127.0.0.1 or [::1]. Caudra fetches its signature from `<url>.sig`. Changing the URL does not change which signing keys Caudra trusts. Restart after changing these settings.
+`url` is global-only and can point to a mirror over HTTPS, or HTTP on localhost, 127.0.0.1 or [::1]. A project can only disable refresh. Its URL and attempts to enable refresh are ignored. Caudra fetches the signature from `<url>.sig`. Changing the URL does not change which signing keys Caudra trusts. Restart after changing these settings.
 
-Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key, incompatible format or built-in routing collision rejects the whole file. Entries that need newer Caudra features stay hidden and cannot be selected. Built-in API endpoints and credentials remain defined by Caudra, not by downloaded model data.
+Downloaded and cached files must pass Ed25519 verification with a public key shipped in Caudra, size checks and format validation. An unknown signing key or incompatible format rejects the whole file. Caudra keeps its bundled endpoint, credential names, and protocol for protected catalog providers. It drops new rows that claim protected endpoints or credentials and logs a warning, without rejecting the rest of the file. Entries that need newer Caudra features stay hidden and cannot be selected. An unsupported built-in provider keeps its previous manifest.
+
+An interrupted cache write leaves the previous list in use.
 
 The list is maintained in [github.com/caudra/models](https://github.com/caudra/models). To report a wrong price or limit, or a missing model, open an issue or a pull request there."#;
 

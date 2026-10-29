@@ -199,7 +199,7 @@ impl ProviderData {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CatalogMeta {
     pub context: u32,
     /// Whether [`context`](Self::context) came from `limit.input`, which grants
@@ -311,6 +311,7 @@ impl Authentication {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct CatalogData {
     /// Providers caudra will route requests through. Filtered hard: unsupported
     /// SDK shapes, blocked ids, and anything a built-in already serves.
@@ -322,6 +323,21 @@ pub(crate) struct CatalogData {
 }
 
 impl CatalogData {
+    pub(crate) fn same_route(&self, other: &Self, slug: &str, id: &str) -> bool {
+        match (self.providers.get(slug), other.providers.get(slug)) {
+            (Some(previous), Some(next)) => {
+                previous.base_url == next.base_url
+                    && previous.env_keys == next.env_keys
+                    && previous.npm == next.npm
+                    && previous.models.get(id) == next.models.get(id)
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    pub(crate) fn provider(&self, slug: &str) -> Option<ProviderData> {
+        self.providers.get(slug).cloned()
+    }
     pub(crate) fn from_index(index: schema::CatalogIndex) -> Self {
         let mut providers = HashMap::new();
         let mut metadata = HashMap::new();
@@ -596,26 +612,11 @@ impl CatalogProvider {
                 });
             }
         };
-        let meta = self
-            .data
-            .models
-            .get(&model.id)
-            .ok_or_else(|| AgentError::Config {
-                message: format!(
-                    "model '{}' not found from provider '{}'",
-                    model.id, self.data.slug
-                ),
-            })?;
-        let model = Model {
-            max_output_tokens: Some(meta.output),
-            context_window: meta.context,
-            ..model.clone()
-        };
         let wire = catalog_request(
             &self.chat_compat,
             self.data.api_format,
             auth,
-            &model,
+            model,
             messages,
             system,
             tools,
@@ -693,12 +694,13 @@ pub(crate) fn free_fallback_allowed() -> bool {
         .unwrap_or(false)
 }
 
-pub fn try_create(
+pub(crate) fn try_create(
+    catalog: &CatalogData,
     slug: &str,
     account: &AccountCredential,
     timeouts: Timeouts,
 ) -> Option<Result<Box<dyn Provider>, AgentError>> {
-    let data = catalog_provider(slug)?;
+    let data = catalog.provider(slug)?;
     Some(
         CatalogProvider::new(data, account, timeouts, free_fallback_allowed())
             .map(|provider| Box::new(provider) as Box<dyn Provider>),
@@ -783,7 +785,7 @@ mod tests {
         StateDir, determine_catalog_format,
     };
     use crate::accounts::credential::test_support::{api_key_account, keyless_account};
-    use crate::model::{Model, ModelPricing};
+    use crate::model::Model;
     use crate::provider::Provider;
     use crate::providers::Timeouts;
     use crate::providers::test_support::CREDENTIAL_IN_URL;
@@ -808,6 +810,7 @@ mod tests {
     #[test]
     fn snapshot_provider_builds_a_request_without_a_first_send() {
         let provider = super::try_create(
+            &crate::model_data::current().catalog,
             NVIDIA,
             &api_key_account(NVIDIA, ACCOUNT, CATALOG_CREDENTIAL),
             Timeouts::default(),
@@ -833,6 +836,7 @@ mod tests {
     fn unknown_snapshot_provider_is_rejected_at_construction() {
         assert!(
             super::try_create(
+                &crate::model_data::current().catalog,
                 UNKNOWN_PROVIDER,
                 &keyless_account(UNKNOWN_PROVIDER),
                 Timeouts::default(),
@@ -908,6 +912,8 @@ mod tests {
     }
 
     fn catalog_model(id: &str) -> Model {
+        let data = opencode_go_provider_data(UNSET_KEY_ENV);
+        let meta = &data.models[id];
         Model {
             model_revision: crate::model_data::current().revision,
             manifest: None,
@@ -921,13 +927,14 @@ mod tests {
             supports_vision_override: None,
             supports_cache_breakpoints_override: None,
             supports_pdf: false,
-            pricing: ModelPricing::default(),
+            pricing: meta.pricing(),
             dated_rates: None,
             discovered_free: false,
-            max_output_tokens: None,
-            context_window: 0,
-            window_excludes_output: false,
-            reasoning_options: ReasoningOptions::default(),
+            catalog_free: super::is_free_model(meta),
+            max_output_tokens: Some(meta.output),
+            context_window: meta.context,
+            window_excludes_output: meta.context_excludes_output,
+            reasoning_options: meta.reasoning_options.clone(),
             thinking_fields: None,
         }
     }

@@ -2797,6 +2797,7 @@ mod tests {
             pricing: crate::model::ModelPricing::default(),
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(8192),
             context_window: 200_000,
             window_excludes_output: false,

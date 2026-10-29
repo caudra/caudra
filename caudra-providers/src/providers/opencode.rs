@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::accounts::AccountCredential;
 use crate::model::{Model, ModelInfo};
-use crate::model_data::current;
+use crate::model_data::{Current, current};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::catalog::{
     CatalogData, EndpointType, catalog_provider, catalog_request, config_error,
@@ -34,6 +34,7 @@ pub struct Opencode {
     /// routes to signs with its own.
     zen_key: Option<String>,
     system_prefix: Option<String>,
+    data: Arc<Current>,
 }
 
 /// Where a `sub/model` id sends: the model as its catalog provider names it,
@@ -78,7 +79,16 @@ fn route(
 
 impl Opencode {
     pub fn new(account: &AccountCredential, timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        Self::with_catalog(account, timeouts, current())
+    }
+
+    pub(crate) fn with_catalog(
+        account: &AccountCredential,
+        timeouts: super::Timeouts,
+        data: Arc<Current>,
+    ) -> Result<Self, AgentError> {
         Ok(Self {
+            data,
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth: None,
             zen_key: account.optional_api_key().map(str::to_owned),
@@ -86,8 +96,13 @@ impl Opencode {
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+        data: Arc<Current>,
+    ) -> Self {
         Self {
+            data,
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth: Some(auth),
             zen_key: None,
@@ -113,7 +128,7 @@ impl Opencode {
 
     fn lookup(&self, model: &Model) -> Result<Route, AgentError> {
         route(
-            &current().catalog,
+            &self.data.catalog,
             model,
             self.auth.as_ref(),
             self.zen_key.as_deref(),

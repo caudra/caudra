@@ -3879,26 +3879,60 @@ impl<'h> Agent<'h> {
     }
 
     async fn refresh_model_revision(&mut self) {
-        let revision = caudra_providers::model_data::current().revision;
+        let data = caudra_providers::model_data::current();
+        let revision = data.revision;
         if revision == self.model_revision {
             return;
         }
         self.model_revision = revision;
+        if !Arc::ptr_eq(&self.chat_model, &self.model)
+            && let Ok(mut model) = self.chat_model.refreshed(&self.model_policy)
+        {
+            self.chat_provider.adjust_model(&mut model);
+            if (!self.chat_model.same_configuration(&model)
+                || !self.chat_provider.same_model_route(&model, &data))
+                && let Ok(provider) = provider::from_model_async(&mut model, self.timeouts).await
+            {
+                self.chat_model = Arc::new(model);
+                self.chat_provider = Arc::from(provider);
+            }
+        }
+        if let Some(home) = &self.home_model
+            && let Ok(mut model) = home.refreshed(&self.model_policy)
+        {
+            if model.provider == self.model.provider {
+                self.provider.adjust_model(&mut model);
+            } else if model.provider == self.chat_model.provider {
+                self.chat_provider.adjust_model(&mut model);
+            } else {
+                provider::adjust_model_for_inspection(&mut model);
+                model.billing = home.billing;
+            }
+            if !home.same_configuration(&model) {
+                self.home_model = Some(Arc::new(model));
+            }
+        }
         match self.model.refreshed(&self.model_policy) {
             Ok(mut model) => {
-                let provider = if model.manifest.is_none() {
-                    match provider::from_model_async(&mut model, self.timeouts).await {
-                        Ok(provider) => Arc::from(provider),
-                        Err(error) => {
-                            warn!(model = %self.model.spec(), revision, %error,
+                self.provider.adjust_model(&mut model);
+                if self.model.same_configuration(&model)
+                    && self.provider.same_model_route(&model, &data)
+                {
+                    return;
+                }
+                let provider =
+                    if model.manifest.is_none() || !self.provider.same_model_route(&model, &data) {
+                        match provider::from_model_async(&mut model, self.timeouts).await {
+                            Ok(provider) => Arc::from(provider),
+                            Err(error) => {
+                                warn!(model = %self.model.spec(), revision, %error,
                                 "updated catalog route is unavailable; keeping the previous model");
-                            return;
+                                return;
+                            }
                         }
-                    }
-                } else {
-                    self.provider.adjust_model(&mut model);
-                    Arc::clone(&self.provider)
-                };
+                    } else {
+                        Arc::clone(&self.provider)
+                    };
                 self.move_to(model, provider);
                 self.opts.cross =
                     accounts::cross_route(&self.model, &self.model_policy).map(Arc::new);
@@ -7789,6 +7823,40 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         make_agent_with_output_store(provider, history, None)
+    }
+
+    #[test_case(false; "chat_follows_main")]
+    #[test_case(true; "independent_chat_and_home")]
+    fn unchanged_model_revision_preserves_context_and_instances(independent: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user(GO.into())]);
+            let (mut agent, _) = make_agent(MockProvider::new(vec![]), &mut history);
+            if independent {
+                agent.chat_model = Arc::new((*agent.model).clone());
+                agent.home_model = Some(Arc::new((*agent.model).clone()));
+            }
+            let model = Arc::clone(&agent.model);
+            let provider = Arc::clone(&agent.provider);
+            let chat = Arc::clone(&agent.chat_model);
+            let home = agent.home_model.clone();
+            agent.measured = Some(MeasuredContext {
+                reported: MAIN_REQUEST_USAGE.total_input(),
+                history_len: agent.history.len(),
+                sent: None,
+            });
+            agent.model_revision = u64::MAX;
+            agent.refresh_model_revision().await;
+            assert!(Arc::ptr_eq(&model, &agent.model));
+            assert!(Arc::ptr_eq(&provider, &agent.provider));
+            assert!(Arc::ptr_eq(&chat, &agent.chat_model));
+            if let Some(home) = home {
+                assert!(Arc::ptr_eq(&home, agent.home_model.as_ref().unwrap()));
+            }
+            assert_eq!(
+                agent.measured.as_ref().unwrap().reported,
+                MAIN_REQUEST_USAGE.total_input()
+            );
+        });
     }
 
     fn make_agent_with_output_store(

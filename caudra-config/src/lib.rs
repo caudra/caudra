@@ -943,6 +943,9 @@ impl RawConfig {
                     .max(inbound),
             );
         }
+        self.models.project_disabled |=
+            overlay.models.refresh == Some(false) || overlay.models.project_disabled;
+        overlay.models = models::ModelsFileConfig::default();
         self.merge_shared(overlay);
     }
 

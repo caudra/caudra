@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-#[cfg(not(test))]
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read};
@@ -8,20 +7,22 @@ use std::sync::{LazyLock, Once};
 use std::thread;
 use std::time::Duration;
 
-use caudra_config::atomic_file::{self, AtomicFileError};
+use caudra_config::decisions::DECISION_PRESETS;
 use caudra_config::models::{ModelsConfig, ModelsConfigError};
-use caudra_config::providers::all_builtins;
+use caudra_config::providers::{ProvidersConfig, all_builtins, resolve_api_key_env};
+use caudra_config::websearch::WebsearchBackendName;
 use caudra_models::sign::{Signature, SignatureError, verify};
 use caudra_models::{
     BLOCKED_CATALOG_PROVIDERS, MAX_BYTES, ParseError, Snapshot, TRUSTED_KEYS, parse_bounded,
     validate,
 };
-use caudra_storage::{StorageError, paths, try_exclusive_state_lock};
+use caudra_storage::{StorageError, atomic_write_permissions, paths, try_exclusive_state_lock};
 use flate2::read::GzDecoder;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::{self, Request, StatusCode};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 use url::Url;
@@ -33,14 +34,14 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const TIMEOUT: Duration = Duration::from_secs(30);
 const SMALL_FILE_LIMIT: usize = 16 * 1024;
 const CACHE_PATH: &str = "models/v1";
-const MODELS_FILE: &str = "models.json";
-const SIGNATURE_FILE: &str = "models.json.sig";
 const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = "refresh.lock";
 #[cfg(not(test))]
 const LEGACY_FILE: &str = "models-dev-catalog.json";
 const LOCK_MODE: u32 = 0o600;
 const EXTRA_AUTH_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
     "COPILOT_GITHUB_TOKEN",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -58,8 +59,6 @@ pub enum RefreshError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error(transparent)]
-    Atomic(#[from] AtomicFileError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -80,8 +79,8 @@ pub enum RefreshError {
     Encoding(String),
     #[error("model update validation failed: {0}")]
     Validation(String),
-    #[error("model catalog provider {0:?} conflicts with built-in routing or credentials")]
-    BuiltinCollision(String),
+    #[error("another process is refreshing the model list; try again after it finishes")]
+    Busy,
 }
 
 #[derive(Debug)]
@@ -93,6 +92,8 @@ pub struct RefreshOutcome {
 
 #[derive(Default, Deserialize, Serialize)]
 struct State {
+    #[serde(default)]
+    cached_sha256: Option<String>,
     etag: Option<String>,
     last_modified: Option<String>,
     checked_at: Option<Timestamp>,
@@ -101,7 +102,9 @@ struct State {
 impl State {
     fn stale(&self, now: Timestamp) -> bool {
         self.checked_at.is_none_or(|checked| {
-            now.as_second().saturating_sub(checked.as_second()) > REFRESH_INTERVAL.as_secs() as i64
+            checked > now
+                || now.as_second().saturating_sub(checked.as_second())
+                    > REFRESH_INTERVAL.as_secs() as i64
         })
     }
 }
@@ -122,15 +125,31 @@ impl Cache<'static> {
 
 impl Cache<'_> {
     fn load(&self) -> Result<Option<Snapshot>, RefreshError> {
-        let bytes = match File::open(self.directory.join(MODELS_FILE)) {
+        self.load_state(&self.state())
+    }
+
+    fn load_state(&self, state: &State) -> Result<Option<Snapshot>, RefreshError> {
+        let Some(digest) = state
+            .cached_sha256
+            .as_deref()
+            .filter(|digest| valid_digest(digest))
+        else {
+            return Ok(None);
+        };
+        let bytes = match File::open(self.directory.join(format!("models-{digest}.json"))) {
             Ok(file) => read_bounded(file, MAX_BYTES)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let signature = read_bounded(
-            File::open(self.directory.join(SIGNATURE_FILE))?,
+            File::open(self.directory.join(format!("models-{digest}.json.sig")))?,
             SMALL_FILE_LIMIT,
         )?;
+        if cache_digest(&bytes) != digest {
+            return Err(RefreshError::Validation(
+                "cached model digest does not match its pointer".into(),
+            ));
+        }
         verified_snapshot(&bytes, &signature, self.trusted).map(Some)
     }
 
@@ -162,13 +181,7 @@ impl Cache<'_> {
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), RefreshError> {
-        let path = self.directory.join(name);
-        let previous = match File::open(&path) {
-            Ok(file) => Some(read_bounded(file, MAX_BYTES)?),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        atomic_file::commit(&path, &atomic_file::revision_of(previous.as_deref()), bytes)?;
+        atomic_write_permissions(&self.directory.join(name), bytes, LOCK_MODE)?;
         Ok(())
     }
 
@@ -194,35 +207,72 @@ impl Cache<'_> {
             return Ok(outcome());
         }
         config.validate_url()?;
-        let Some(_lease) = try_exclusive_state_lock(&self.directory.join(LOCK_FILE), LOCK_MODE)?
-        else {
-            return Ok(outcome());
+        let lease = match try_exclusive_state_lock(&self.directory.join(LOCK_FILE), LOCK_MODE) {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) if force => return Err(RefreshError::Busy),
+            Ok(None) => return Ok(outcome()),
+            Err(error) => {
+                warn!(%error, "model cache is unwritable; refreshing in memory only");
+                None
+            }
         };
         let mut state = self.state();
-        if let Some(snapshot) = self.load_or_warn() {
-            install_newer(snapshot);
+        let previous_pair = state.cached_sha256.clone();
+        let cached = self.load_state(&state).unwrap_or_else(|error| {
+            warn!(%error, "ignoring invalid model cache");
+            None
+        });
+        if let Some(snapshot) = &cached {
+            install_newer(snapshot.clone());
         } else {
-            state.etag = None;
-            state.last_modified = None;
+            state = State::default();
         }
         if !force && !state.stale(now) {
             return Ok(outcome());
         }
         state.checked_at = Some(now);
-        self.write(STATE_FILE, &serde_json::to_vec(&state)?)?;
-        let result = self.fetch(config, &mut state);
+        let result = self.fetch(config, &mut state, cached.as_ref(), lease.is_some());
         if let Err(error) = &result {
             warn!(%error, checked_at = %now, "model refresh failed; keeping the current models");
         }
+        if lease.is_some() && state.cached_sha256.is_some() {
+            match self.write(STATE_FILE, &serde_json::to_vec(&state)?) {
+                Err(error) => {
+                    warn!(%error, "could not save model cache state; live models remain available")
+                }
+                Ok(()) if previous_pair != state.cached_sha256 => {
+                    if let Some(digest) = previous_pair.filter(|digest| valid_digest(digest)) {
+                        for suffix in ["json", "json.sig"] {
+                            if let Err(error) = fs::remove_file(
+                                self.directory.join(format!("models-{digest}.{suffix}")),
+                            ) && error.kind() != io::ErrorKind::NotFound
+                            {
+                                warn!(%error, "could not remove previous model cache pair");
+                            }
+                        }
+                    }
+                }
+                Ok(()) => {}
+            }
+        }
         result?;
-        self.write(STATE_FILE, &serde_json::to_vec(&state)?)?;
         Ok(outcome())
     }
 
-    fn fetch(&self, config: &ModelsConfig, state: &mut State) -> Result<(), RefreshError> {
+    fn fetch(
+        &self,
+        config: &ModelsConfig,
+        state: &mut State,
+        cached: Option<&Snapshot>,
+        persist: bool,
+    ) -> Result<(), RefreshError> {
         let response = get(&config.url, Some(state))?;
         if response.status() == StatusCode::NOT_MODIFIED {
-            return Ok(());
+            return if cached.is_some() {
+                Ok(())
+            } else {
+                Err(RefreshError::Status(StatusCode::NOT_MODIFIED))
+            };
         }
         if response.status() != StatusCode::OK {
             return Err(RefreshError::Status(response.status()));
@@ -236,18 +286,40 @@ impl Cache<'_> {
         }
         let signature = response_bytes(signature_response, SMALL_FILE_LIMIT)?;
         let snapshot = verified_snapshot(&bytes, &signature, self.trusted)?;
-        let incumbent = current();
-        if snapshot.updated_at > incumbent.snapshot_updated_at
-            && snapshot.content_sha256 != incumbent.content_sha256
-        {
-            self.write(MODELS_FILE, &bytes)?;
-            self.write(SIGNATURE_FILE, &signature)?;
-            install_newer(snapshot);
+        let cache_newer = cached.is_none_or(|cached| snapshot.updated_at >= cached.updated_at);
+        install_newer(snapshot);
+        if persist && cache_newer {
+            match self.write_pair(&bytes, &signature) {
+                Ok(digest) => {
+                    state.cached_sha256 = Some(digest);
+                    state.etag = etag;
+                    state.last_modified = last_modified;
+                }
+                Err(error) => {
+                    warn!(%error, "could not save model cache pair; live models remain available")
+                }
+            }
         }
-        state.etag = etag;
-        state.last_modified = last_modified;
         Ok(())
     }
+
+    fn write_pair(&self, bytes: &[u8], signature: &[u8]) -> Result<String, RefreshError> {
+        let digest = cache_digest(bytes);
+        self.write(&format!("models-{digest}.json"), bytes)?;
+        self.write(&format!("models-{digest}.json.sig"), signature)?;
+        Ok(digest)
+    }
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cache_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(not(test))]
@@ -367,7 +439,8 @@ fn verified_snapshot(
     }
     let signature: Signature = serde_json::from_slice(signature)?;
     verify(bytes, &signature, trusted)?;
-    let snapshot = parse_bounded(bytes)?;
+    let mut snapshot = parse_bounded(bytes)?;
+    ROUTING.protect(&mut snapshot, &ProvidersConfig::load());
     validate(&snapshot).map_err(|issues| {
         RefreshError::Validation(
             issues
@@ -377,12 +450,11 @@ fn verified_snapshot(
                 .join("; "),
         )
     })?;
-    ROUTING.validate(&snapshot)?;
     Ok(snapshot)
 }
 
 struct ProtectedRouting {
-    catalog: HashMap<String, (Option<String>, Vec<String>)>,
+    catalog: HashMap<String, (Option<String>, Vec<String>, String)>,
     slugs: HashSet<String>,
     env: HashSet<String>,
     hosts: HashSet<String>,
@@ -405,6 +477,17 @@ impl ProtectedRouting {
                 .map(|slug| (*slug).to_owned()),
         );
         let mut env: HashSet<String> = EXTRA_AUTH_ENV.iter().map(|key| (*key).to_owned()).collect();
+        env.extend(
+            DECISION_PRESETS
+                .iter()
+                .map(|preset| preset.api_key_env.to_owned()),
+        );
+        env.extend(WebsearchBackendName::ALL.into_iter().flat_map(|backend| {
+            backend
+                .fields()
+                .iter()
+                .filter_map(|field| field.env.map(str::to_owned))
+        }));
         let mut hosts = HashSet::new();
         for provider in all_builtins() {
             slugs.insert(provider.slug.to_owned());
@@ -428,15 +511,24 @@ impl ProtectedRouting {
                 }
             }
         }
-        for (slug, provider) in &catalog.payload.catalog {
-            if provider.env.iter().any(|key| env.contains(key))
-                || provider
-                    .api
-                    .as_deref()
-                    .and_then(url_host)
-                    .is_some_and(|host| hosts.contains(&host))
-            {
-                slugs.insert(slug.clone());
+        loop {
+            let size = (slugs.len(), env.len(), hosts.len());
+            for (slug, provider) in &catalog.payload.catalog {
+                if slugs.contains(slug)
+                    || provider.env.iter().any(|key| env.contains(key))
+                    || provider
+                        .api
+                        .as_deref()
+                        .and_then(url_host)
+                        .is_some_and(|host| hosts.contains(&host))
+                {
+                    slugs.insert(slug.clone());
+                    env.extend(provider.env.iter().cloned());
+                    hosts.extend(provider.api.as_deref().and_then(url_host));
+                }
+            }
+            if size == (slugs.len(), env.len(), hosts.len()) {
+                break;
             }
         }
         let catalog = catalog
@@ -444,7 +536,7 @@ impl ProtectedRouting {
             .catalog
             .into_iter()
             .filter(|(slug, _)| slugs.contains(slug))
-            .map(|(slug, provider)| (slug, (provider.api, provider.env)))
+            .map(|(slug, provider)| (slug, (provider.api, provider.env, provider.npm)))
             .collect();
         Self {
             catalog,
@@ -454,25 +546,46 @@ impl ProtectedRouting {
         }
     }
 
-    fn validate(&self, snapshot: &Snapshot) -> Result<(), RefreshError> {
-        for (slug, provider) in &snapshot.payload.catalog {
-            let collision = if self.slugs.contains(slug) {
-                self.catalog
-                    .get(slug)
-                    .is_none_or(|(api, env)| &provider.api != api || &provider.env != env)
-            } else {
-                provider.env.iter().any(|key| self.env.contains(key))
-                    || provider
-                        .api
-                        .as_deref()
-                        .and_then(url_host)
-                        .is_some_and(|host| self.hosts.contains(&host))
-            };
-            if collision {
-                return Err(RefreshError::BuiltinCollision(slug.clone()));
+    fn protect(&self, snapshot: &mut Snapshot, config: &ProvidersConfig) {
+        let custom_env: HashSet<_> = config
+            .providers
+            .iter()
+            .map(|(slug, provider)| resolve_api_key_env(slug, Some(provider)))
+            .chain(
+                config
+                    .decisions
+                    .values()
+                    .filter_map(|endpoint| endpoint.api_key_env.clone()),
+            )
+            .collect();
+        snapshot.payload.catalog.retain(|slug, provider| {
+            if let Some((api, env, npm)) = self.catalog.get(slug) {
+                provider.api.clone_from(api);
+                provider.env.clone_from(env);
+                provider.npm.clone_from(npm);
+                return true;
             }
-        }
-        Ok(())
+            let collision = self.slugs.contains(slug)
+                || provider.env.iter().any(|key| {
+                    self.env.contains(key)
+                        || custom_env.contains(key)
+                        || ["CAUDRA_", "WORKCELL_", "ORCA_"]
+                            .iter()
+                            .any(|prefix| key.starts_with(prefix))
+                })
+                || provider
+                    .api
+                    .as_deref()
+                    .and_then(url_host)
+                    .is_some_and(|host| self.hosts.contains(&host));
+            if collision {
+                warn!(
+                    provider = slug,
+                    "dropping model catalog row that claims protected routing or credentials"
+                );
+            }
+            !collision
+        });
     }
 }
 
@@ -498,12 +611,15 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Cache, LOCK_FILE, LOCK_MODE, MAX_BYTES, MODELS_FILE, ModelsConfig, REFRESH_INTERVAL,
-        RefreshError, SIGNATURE_FILE, STATE_FILE, State, Timestamp, bundled, current, select,
-        try_exclusive_state_lock, verified_snapshot,
+        Cache, LOCK_FILE, LOCK_MODE, MAX_BYTES, ModelsConfig, REFRESH_INTERVAL, RefreshError,
+        STATE_FILE, State, Timestamp, bundled, current, select, try_exclusive_state_lock,
+        verified_snapshot,
     };
     use crate::Model;
     use crate::model_data::install;
+    use crate::provider::Provider;
+    use crate::providers::opencode::Opencode;
+    use crate::providers::{ResolvedAuth, Timeouts};
 
     const NOW: &str = "2026-10-29T12:00:00Z";
     const NEWER: &str = "2026-10-30T12:00:00Z";
@@ -520,6 +636,17 @@ mod tests {
     const CATALOG: &str = r#"{"test":{"name":"Test","env":["REFRESH_TEST_KEY"],"api":"https://refresh.example/v1","npm":"@ai-sdk/openai-compatible","models":{}}}"#;
     const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
     const NEW_CONTEXT: u32 = 64000;
+    const MODELS_FILE: &str = "models.json";
+    const PROTECTED_SLUG: &str = "opencode";
+    const COLLISION_SLUG: &str = "new-collision";
+    const CUSTOM_KEY: &str = "CUSTOM_ROUTING_TEST_KEY";
+    const NEWEST: &str = "2026-10-31T12:00:00Z";
+    const TURN_MODEL: &str = "turn-model";
+    const ADDED_MODEL: &str = "added-model";
+    const TURN_KEY: &str = "REFRESH_TEST_KEY";
+    const TEST_KEY: &str = "test-key";
+    const INITIAL_OUTPUT: u32 = 4096;
+    const REFRESHED_OUTPUT: u32 = 8192;
 
     struct Reply {
         status: u16,
@@ -645,8 +772,333 @@ mod tests {
     }
     fn publish(cache: &Cache<'_>, snapshot: &Snapshot) {
         let bytes = to_pretty_bytes(snapshot);
-        cache.write(MODELS_FILE, &bytes).unwrap();
-        cache.write(SIGNATURE_FILE, &signed(&bytes)).unwrap();
+        let cached_sha256 = Some(cache.write_pair(&bytes, &signed(&bytes)).unwrap());
+        cache
+            .write(
+                STATE_FILE,
+                &serde_json::to_vec(&State {
+                    cached_sha256,
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test_case(false; "env_collision")]
+    #[test_case(true; "host_collision")]
+    fn protected_routing_wins_without_rejecting_the_file(host_collision: bool) {
+        install(snapshot(NOW, false));
+        let mut candidate = bundled::snapshot();
+        let expected = candidate.payload.catalog[PROTECTED_SLUG].clone();
+        let mut collision = expected.clone();
+        if host_collision {
+            collision.env.clear();
+        } else {
+            collision.api = None;
+        }
+        candidate
+            .payload
+            .catalog
+            .insert(COLLISION_SLUG.into(), collision);
+        let row = candidate.payload.catalog.get_mut(PROTECTED_SLUG).unwrap();
+        row.api = Some("http://untrusted.example/v1".into());
+        row.env = vec![CUSTOM_KEY.into()];
+        row.npm = "@ai-sdk/anthropic".into();
+        candidate = Snapshot::stamp(candidate.payload, None, NEWER.parse().unwrap());
+        let bytes = to_pretty_bytes(&candidate);
+        let server = Server::new(vec![Reply::ok(bytes.clone()), Reply::ok(signed(&bytes))]);
+        let dir = TempDir::new().unwrap();
+        let keys = [key()];
+        let cache = cache(&dir, &keys);
+        assert!(
+            cache
+                .refresh(&server.config(), true, NOW.parse().unwrap())
+                .unwrap()
+                .swapped
+        );
+        let installed = cache.load().unwrap().unwrap();
+        assert_eq!(installed.payload.catalog[PROTECTED_SLUG], expected);
+        assert!(!installed.payload.catalog.contains_key(COLLISION_SLUG));
+    }
+
+    #[test_case("TYPESAFE_API_KEY")]
+    #[test_case("GH_TOKEN")]
+    #[test_case("GITHUB_TOKEN")]
+    #[test_case("EXA_API_KEY")]
+    #[test_case("BRAVE_API_KEY")]
+    #[test_case("KAGI_API_KEY")]
+    #[test_case("SERPAPI_API_KEY")]
+    #[test_case("SEARXNG_PASSWORD")]
+    #[test_case(CUSTOM_KEY)]
+    fn catalog_cannot_claim_other_credentials(env: &str) {
+        let mut candidate = snapshot(NEWER, true);
+        candidate.payload.catalog = serde_json::from_str(CATALOG).unwrap();
+        candidate.payload.catalog.get_mut("test").unwrap().env = vec![env.into()];
+        let mut config = caudra_config::providers::ProvidersConfig::default();
+        config.upsert(
+            "custom".into(),
+            caudra_config::providers::ProviderDef {
+                api_key_env: Some(CUSTOM_KEY.into()),
+                ..Default::default()
+            },
+        );
+        super::ROUTING.protect(&mut candidate, &config);
+        assert!(candidate.payload.catalog.is_empty());
+    }
+
+    #[test_case(false; "unknown_family")]
+    #[test_case(true; "provider_requirement")]
+    fn unsupported_builtin_keeps_incumbent_manifest(requirement: bool) {
+        let mut baseline = bundled::snapshot();
+        baseline = Snapshot::stamp(baseline.payload, None, NOW.parse().unwrap());
+        install(baseline.clone());
+        let previous = current();
+        let mut candidate = baseline;
+        let provider = candidate
+            .payload
+            .providers
+            .iter_mut()
+            .find(|provider| provider.slug == "openai")
+            .unwrap();
+        if requirement {
+            provider.requires.push(FUTURE.into());
+        } else {
+            provider.family = caudra_models::Family::Unknown(FUTURE.into());
+        }
+        candidate = Snapshot::stamp(candidate.payload, None, NEWER.parse().unwrap());
+        assert!(super::install_newer(candidate));
+        assert_eq!(current().manifests, previous.manifests);
+        assert!(!current().unsupported_providers.contains_key("openai"));
+    }
+
+    #[test_case(false; "same_as_bundle")]
+    #[test_case(true; "older_than_bundle")]
+    fn cache_tracks_response_even_when_bundle_is_newer(older: bool) {
+        let dir = TempDir::new().unwrap();
+        let keys = [key()];
+        let cache = cache(&dir, &keys);
+        let old = snapshot(OLDER, false);
+        publish(&cache, &old);
+        let response = snapshot(NEWER, true);
+        let bundle = if older {
+            let mut payload = response.payload.clone();
+            payload.providers[0].display_name = NOTE.into();
+            Snapshot::stamp(payload, None, NEWEST.parse().unwrap())
+        } else {
+            response.clone()
+        };
+        install(bundle);
+        let bytes = to_pretty_bytes(&response);
+        let mut reply = Reply::ok(bytes.clone());
+        reply.headers = format!("ETag: {ETAG}\r\n");
+        let server = Server::new(vec![reply, Reply::ok(signed(&bytes)), Reply::status(304)]);
+        assert!(
+            !cache
+                .refresh(&server.config(), true, NOW.parse().unwrap())
+                .unwrap()
+                .swapped
+        );
+        assert_eq!(cache.load().unwrap(), Some(response.clone()));
+        install(old);
+        assert!(
+            cache
+                .refresh(&server.config(), true, NOW.parse().unwrap())
+                .unwrap()
+                .swapped
+        );
+        assert_eq!(current().content_sha256, response.content_sha256);
+        assert!(
+            server.requests.lock().unwrap()[2]
+                .to_lowercase()
+                .contains("if-none-match:")
+        );
+    }
+
+    #[test_case(false; "body_only")]
+    #[test_case(true; "whole_pair")]
+    fn interrupted_pair_write_keeps_previous_pointer(whole_pair: bool) {
+        let dir = TempDir::new().unwrap();
+        let keys = [key()];
+        let cache = cache(&dir, &keys);
+        let previous = snapshot(NOW, false);
+        publish(&cache, &previous);
+        let bytes = to_pretty_bytes(&snapshot(NEWER, true));
+        if whole_pair {
+            cache.write_pair(&bytes, &signed(&bytes)).unwrap();
+        } else {
+            cache
+                .write(
+                    &format!("models-{}.json", super::cache_digest(&bytes)),
+                    &bytes,
+                )
+                .unwrap();
+        }
+        assert_eq!(cache.load().unwrap(), Some(previous));
+    }
+
+    #[test_case(false; "unwritable_directory")]
+    #[test_case(true; "oversized_state")]
+    fn cache_failure_does_not_block_live_install(oversized: bool) {
+        install(snapshot(NOW, false));
+        let candidate = snapshot(NEWER, true);
+        let bytes = to_pretty_bytes(&candidate);
+        let server = Server::new(vec![Reply::ok(bytes.clone()), Reply::ok(signed(&bytes))]);
+        let dir = TempDir::new().unwrap();
+        let keys = [key()];
+        let mut cache = cache(&dir, &keys);
+        if oversized {
+            std::fs::write(dir.path().join(STATE_FILE), vec![b' '; MAX_BYTES + 1]).unwrap();
+        } else {
+            cache.directory = dir.path().join(STATE_FILE);
+            std::fs::write(&cache.directory, b"not a directory").unwrap();
+        }
+        assert!(
+            cache
+                .refresh(&server.config(), true, NOW.parse().unwrap())
+                .unwrap()
+                .swapped
+        );
+        assert_eq!(current().content_sha256, candidate.content_sha256);
+        if oversized {
+            assert_eq!(cache.load().unwrap(), Some(candidate));
+        }
+    }
+
+    fn turn_catalog(opencode: bool, output: u32) -> Snapshot {
+        let mut payload = bundled::snapshot().payload;
+        let slug = if opencode { PROTECTED_SLUG } else { "test" };
+        if !opencode {
+            payload.catalog.extend(
+                serde_json::from_str::<
+                    std::collections::BTreeMap<String, caudra_models::CatalogProvider>,
+                >(CATALOG)
+                .unwrap(),
+            );
+        }
+        let row = payload.catalog.get_mut(slug).unwrap();
+        row.models.clear();
+        row.models.insert(
+            TURN_MODEL.into(),
+            serde_json::from_value(
+                serde_json::json!({"limit": {"context": NEW_CONTEXT, "output": output}}),
+            )
+            .unwrap(),
+        );
+        Snapshot::stamp(payload, None, NOW.parse().unwrap())
+    }
+
+    #[test_case(false; "existing_model_limit")]
+    #[test_case(true; "new_catalog_model")]
+    fn account_router_uses_refreshed_catalog_on_next_turn(added: bool) {
+        unsafe {
+            std::env::set_var(TURN_KEY, TEST_KEY);
+        }
+        let baseline = turn_catalog(false, INITIAL_OUTPUT);
+        install(baseline.clone());
+        let mut old = Model::from_spec(&format!("test/{TURN_MODEL}")).unwrap();
+        let old_provider =
+            crate::provider::from_model(&mut old, crate::providers::Timeouts::default()).unwrap();
+        let request = |provider: &dyn crate::provider::Provider, model: &Model| {
+            provider
+                .wire_request(
+                    model,
+                    &[],
+                    "",
+                    &serde_json::Value::Null,
+                    &crate::RequestOptions::default(),
+                    None,
+                )
+                .unwrap()
+        };
+        let previous_request = request(old_provider.as_ref(), &old);
+        let mut candidate = turn_catalog(false, REFRESHED_OUTPUT);
+        let id = if added {
+            let row = candidate.payload.catalog.get_mut("test").unwrap();
+            row.models
+                .insert(ADDED_MODEL.into(), row.models[TURN_MODEL].clone());
+            ADDED_MODEL
+        } else {
+            TURN_MODEL
+        };
+        candidate = Snapshot::stamp(candidate.payload, None, NEWER.parse().unwrap());
+        let bytes = to_pretty_bytes(&candidate);
+        let server = Server::new(vec![Reply::ok(bytes.clone()), Reply::ok(signed(&bytes))]);
+        let dir = TempDir::new().unwrap();
+        let keys = [key()];
+        cache(&dir, &keys)
+            .refresh(&server.config(), true, NOW.parse().unwrap())
+            .unwrap();
+        let mut next = Model::from_spec(&format!("test/{id}")).unwrap();
+        let next_provider =
+            crate::provider::from_model(&mut next, crate::providers::Timeouts::default()).unwrap();
+        let next_request = request(next_provider.as_ref(), &next);
+        assert_eq!(next_request.body["max_tokens"], REFRESHED_OUTPUT);
+        assert_eq!(next_request.body["model"], id);
+        assert_eq!(request(old_provider.as_ref(), &old), previous_request);
+        unsafe {
+            std::env::remove_var(TURN_KEY);
+        }
+    }
+
+    #[test_case(false, false; "limit_changes")]
+    #[test_case(true, false; "model_removed")]
+    #[test_case(false, true; "scripted_limit_changes")]
+    #[test_case(true, true; "scripted_model_removed")]
+    fn opencode_keeps_its_turn_catalog_after_refresh(removed: bool, scripted: bool) {
+        const KEY_ENV: &str = "OPENCODE_API_KEY";
+        unsafe {
+            std::env::set_var(KEY_ENV, TEST_KEY);
+        }
+        install(turn_catalog(true, INITIAL_OUTPUT));
+        let mut model = Model::from_spec(&format!("{PROTECTED_SLUG}/{TURN_MODEL}")).unwrap();
+        let provider: Box<dyn Provider> = if scripted {
+            Box::new(Opencode::with_auth(
+                Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_KEY))),
+                Timeouts::default(),
+                current(),
+            ))
+        } else {
+            crate::provider::from_model(&mut model, Timeouts::default()).unwrap()
+        };
+        let request = || {
+            provider
+                .wire_request(
+                    &model,
+                    &[],
+                    "",
+                    &serde_json::Value::Null,
+                    &crate::RequestOptions::default(),
+                    None,
+                )
+                .unwrap()
+        };
+        let old = request();
+        let was_free = model.is_free();
+        let mut next = turn_catalog(true, REFRESHED_OUTPUT);
+        if removed {
+            next.payload
+                .catalog
+                .get_mut(PROTECTED_SLUG)
+                .unwrap()
+                .models
+                .clear();
+        }
+        next = Snapshot::stamp(next.payload, None, NEWER.parse().unwrap());
+        install(next);
+        assert_eq!(request(), old);
+        assert_eq!(model.is_free(), was_free);
+        assert!(!model.discovered_free);
+        if removed {
+            assert!(
+                model
+                    .refreshed(&caudra_config::ModelPolicy::new(&[], &[]).unwrap())
+                    .is_err()
+            );
+        }
+        unsafe {
+            std::env::remove_var(KEY_ENV);
+        }
     }
 
     #[test_case(NEWER, true; "newer")]
@@ -670,13 +1122,16 @@ mod tests {
         assert_eq!(
             current().content_sha256,
             if swapped {
-                candidate.content_sha256
+                candidate.content_sha256.clone()
             } else {
                 previous.content_sha256.clone()
             }
         );
         if swapped {
-            assert_eq!(std::fs::read(dir.path().join(MODELS_FILE)).unwrap(), bytes);
+            assert_eq!(
+                cache.load().unwrap().unwrap().content_sha256,
+                candidate.content_sha256
+            );
         }
     }
 
@@ -688,9 +1143,6 @@ mod tests {
     #[test_case("validation")]
     #[test_case("url")]
     #[test_case("env")]
-    #[test_case("builtin_env")]
-    #[test_case("builtin_api")]
-    #[test_case("builtin_override")]
     fn rejected_update_keeps_incumbent(case: &str) {
         install(snapshot(NOW, false));
         let previous = current();
@@ -750,7 +1202,7 @@ mod tests {
                 .is_err()
         );
         assert!(Arc::ptr_eq(&previous, &current()));
-        assert_eq!(cache.state().checked_at, Some(NOW.parse().unwrap()));
+        assert_eq!(cache.state().checked_at, None);
         assert!(!dir.path().join(MODELS_FILE).exists());
     }
 
@@ -769,6 +1221,7 @@ mod tests {
             etag: Some(ETAG.to_owned()),
             last_modified: Some(MODIFIED.to_owned()),
             checked_at: Some(EXPIRED.parse().unwrap()),
+            ..cache.state()
         };
         cache
             .write(STATE_FILE, &serde_json::to_vec(&state).unwrap())
@@ -806,12 +1259,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let keys = [key()];
         let cache = cache(&dir, &keys);
+        let digest = super::cache_digest(&bytes);
         if model_present {
-            cache.write(MODELS_FILE, &bytes).unwrap();
+            cache
+                .write(&format!("models-{digest}.json"), &bytes)
+                .unwrap();
         }
         if signature_present {
             cache
-                .write(SIGNATURE_FILE, &signed(&to_pretty_bytes(&previous)))
+                .write(
+                    &format!("models-{digest}.json.sig"),
+                    &signed(&to_pretty_bytes(&previous)),
+                )
                 .unwrap();
         }
         cache
@@ -820,7 +1279,8 @@ mod tests {
                 &serde_json::to_vec(&State {
                     etag: Some(ETAG.to_owned()),
                     last_modified: Some(MODIFIED.to_owned()),
-                    checked_at: Some(EXPIRED.parse().unwrap()),
+                    checked_at: Some(NOW.parse().unwrap()),
+                    cached_sha256: Some(digest),
                 })
                 .unwrap(),
             )
@@ -840,15 +1300,18 @@ mod tests {
 
     #[test]
     fn opt_out_sends_no_request_but_force_fetches() {
-        let server = Server::new(vec![Reply::status(304)]);
+        let candidate = snapshot(NEWER, true);
+        let bytes = to_pretty_bytes(&candidate);
+        let server = Server::new(vec![Reply::ok(bytes.clone()), Reply::ok(signed(&bytes))]);
         let mut config = server.config();
         config.refresh = false;
         let dir = TempDir::new().unwrap();
-        let cache = cache(&dir, &[]);
+        let keys = [key()];
+        let cache = cache(&dir, &keys);
         cache.refresh(&config, false, NOW.parse().unwrap()).unwrap();
         assert_eq!(server.count(), 0);
         cache.refresh(&config, true, NOW.parse().unwrap()).unwrap();
-        assert_eq!(server.count(), 1);
+        assert_eq!(server.count(), 2);
     }
 
     #[test_case(false; "expired_cache")]
@@ -864,13 +1327,18 @@ mod tests {
                 STATE_FILE,
                 &serde_json::to_vec(&State {
                     checked_at: Some(EXPIRED.parse().unwrap()),
-                    ..Default::default()
+                    ..cache.state()
                 })
                 .unwrap(),
             )
             .unwrap();
         if corrupt {
-            cache.write(SIGNATURE_FILE, b"{}").unwrap();
+            cache
+                .write(
+                    &format!("models-{}.json.sig", cache.state().cached_sha256.unwrap()),
+                    b"{}",
+                )
+                .unwrap();
         }
         let bundled = snapshot(NOW, false);
         let expected = if corrupt { &bundled } else { &cached };
@@ -954,9 +1422,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let server = Server::new(vec![]);
-        cache
-            .refresh(&server.config(), true, NOW.parse().unwrap())
-            .unwrap();
+        assert!(matches!(
+            cache.refresh(&server.config(), true, NOW.parse().unwrap()),
+            Err(RefreshError::Busy)
+        ));
         assert_eq!(server.count(), 0);
         assert_eq!(cache.load().unwrap(), Some(candidate));
     }
@@ -976,7 +1445,7 @@ mod tests {
             ),
             Err(RefreshError::Network(_))
         ));
-        assert_eq!(cache.state().checked_at, Some(NOW.parse().unwrap()));
+        assert_eq!(cache.state().checked_at, None);
     }
 
     #[test]
@@ -1026,6 +1495,7 @@ mod tests {
     }
 
     #[test_case(0, false; "fresh")]
+    #[test_case(-1, true; "future_check")]
     #[test_case(86400, false; "exact_day")]
     #[test_case(86401, true; "expired")]
     fn daily_check_uses_elapsed_time(seconds: i64, stale: bool) {

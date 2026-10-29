@@ -636,8 +636,8 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 | Field | Type | Default | Env | Description |
 |-------|------|---------|-----|-------------|
-| `refresh` | bool | `true` | `CAUDRA_MODELS_REFRESH` | Check for signed model updates daily in long-running sessions. Set the environment variable to 0 or 1. Cached models remain usable when disabled |
-| `url` | String | unset | - | Signed model file URL. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart |
+| `refresh` | bool | `true` | `CAUDRA_MODELS_REFRESH` | Check for signed model updates daily in long-running sessions. A project may only disable refresh. The environment variable accepts 0/1, false/true, no/yes or off/on. Cached models remain usable when disabled |
+| `url` | String | unset | - | Global-only signed model file URL. Project values are ignored. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart |
 
 ### `storage`
 

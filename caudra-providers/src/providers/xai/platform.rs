@@ -611,6 +611,7 @@ mod tests {
             pricing: ModelPricing::ZERO,
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(131_072),
             context_window: 500_000,
             window_excludes_output: false,

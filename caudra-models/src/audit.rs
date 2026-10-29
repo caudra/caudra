@@ -6,6 +6,7 @@ use jiff::civil::Date;
 use serde::Deserialize;
 
 use crate::repo::{self, RepoError};
+use crate::routing::{self, RoutingAccepted, RoutingChange};
 use crate::{
     Availability, CatalogCost, CatalogModel, CatalogProvider, DecisionModel, ModelEntry, Payload,
     Pricing, Provider, Tier,
@@ -133,6 +134,9 @@ pub struct Audit {
     pub since: Date,
     pub findings: Vec<Finding>,
     pub stale: Vec<Accepted>,
+    /// Unaccepted changes against the published file, `None` without one.
+    pub routing: Option<Vec<RoutingChange>>,
+    pub stale_routing: Vec<RoutingAccepted>,
     pub decisions: Vec<DecisionModel>,
 }
 
@@ -140,6 +144,29 @@ pub struct Audit {
 pub struct Rules {
     pub accepted: Vec<Accepted>,
     pub caps: Vec<Cap>,
+    #[serde(default)]
+    pub routing: Vec<RoutingAccepted>,
+}
+
+impl Rules {
+    /// The changes no `routing` acceptance covers, and the acceptances no
+    /// change needs any more.
+    pub fn unaccepted_routing(
+        &self,
+        changes: Vec<RoutingChange>,
+    ) -> (Vec<RoutingChange>, Vec<RoutingAccepted>) {
+        let stale = self
+            .routing
+            .iter()
+            .filter(|row| !changes.iter().any(|change| change.matches(row)))
+            .cloned()
+            .collect();
+        let unaccepted = changes
+            .into_iter()
+            .filter(|change| !self.routing.iter().any(|row| change.matches(row)))
+            .collect();
+        (unaccepted, stale)
+    }
 }
 
 pub fn load_rules(dir: &Path, providers: &[Provider]) -> Result<Rules, RepoError> {
@@ -205,12 +232,29 @@ fn validate_rules(rules: &Rules, providers: &[Provider]) -> Result<(), (String, 
             return Err((path, DUPLICATE_RULE));
         }
     }
+    let mut routing = HashSet::new();
+    for (index, row) in rules.routing.iter().enumerate() {
+        let path = format!("/routing/{index}");
+        for (key, value) in [
+            ("provider", &row.provider),
+            ("catalog", &row.catalog),
+            ("reason", &row.reason),
+        ] {
+            if value.trim().is_empty() {
+                return Err((format!("{path}/{key}"), EMPTY_VALUE));
+            }
+        }
+        if !routing.insert((&row.provider, row.field, &row.catalog)) {
+            return Err((path, DUPLICATE_RULE));
+        }
+    }
     Ok(())
 }
 
 pub fn audit(
     payload: &Payload,
     catalog: &BTreeMap<String, CatalogProvider>,
+    published: Option<&Payload>,
     today: Date,
     since: Date,
     rules: &Rules,
@@ -241,13 +285,29 @@ pub fn audit(
         .into_iter()
         .filter(|finding| !accepted.iter().any(|row| finding.matches(row)))
         .collect();
+    let (routing, stale_routing) = published.map_or((None, Vec::new()), |published| {
+        let (unaccepted, stale) = rules.unaccepted_routing(routing_changes(published, payload));
+        (Some(unaccepted), stale)
+    });
     Audit {
         today,
         since,
         findings,
         stale,
+        routing,
+        stale_routing,
         decisions: payload.decision_models.clone(),
     }
+}
+
+/// Routing changes from the published file to `next`, protecting the rows
+/// of every built-in provider either of them names.
+pub fn routing_changes(published: &Payload, next: &Payload) -> Vec<RoutingChange> {
+    routing::changes(
+        &routing::builtin_slugs(published.providers.iter().chain(&next.providers)),
+        &published.catalog,
+        &next.catalog,
+    )
 }
 
 fn availability<'a>(provider: &'a Provider, entry: &ModelEntry) -> Option<&'a Availability> {
@@ -567,11 +627,16 @@ impl fmt::Display for Audit {
             self.today, self.since
         )?;
         writeln!(f, "{LEAD_NOT_SOURCE}\n")?;
-        if self.findings.is_empty() && self.stale.is_empty() {
+        if self.findings.is_empty()
+            && self.stale.is_empty()
+            && self.stale_routing.is_empty()
+            && self.routing.as_ref().is_none_or(Vec::is_empty)
+        {
             writeln!(f, "{NO_DIFFERENCES}\n")?;
         } else {
             self.write_findings(f)?;
         }
+        writeln!(f, "{}", routing::section(self.routing.as_deref()))?;
         write_decision_models(f, &self.decisions)
     }
 }
@@ -695,7 +760,7 @@ impl Audit {
             }
             writeln!(f)?;
         }
-        if !self.stale.is_empty() {
+        if !self.stale.is_empty() || !self.stale_routing.is_empty() {
             writeln!(f, "## Stale acceptances\n")?;
             writeln!(
                 f,
@@ -709,6 +774,16 @@ impl Audit {
                     "| {} | `{}` | {} | {} | {} |",
                     row.provider,
                     row.model,
+                    row.field.label(),
+                    row.catalog,
+                    row.reason
+                )?;
+            }
+            for row in &self.stale_routing {
+                writeln!(
+                    f,
+                    "| {} | {NOT_LISTED} | routing {} | {} | {} |",
+                    row.provider,
                     row.field.label(),
                     row.catalog,
                     row.reason
@@ -731,6 +806,7 @@ mod tests {
         RETIRED_HEADING, Rules, TEXT_OUTPUT, UNKNOWN_PROVIDER, UNUSED_CAP, audit, is_alias,
         validate_rules,
     };
+    use crate::routing::{self, RoutingAccepted, RoutingField};
     use crate::{ModelEntry, Payload, Provider};
     use jiff::civil::Date;
 
@@ -780,6 +856,11 @@ mod tests {
     const WINDOW_KIND: &str =
         "a total window compares with the catalog's context, an input budget with its input limit";
     const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
+    const GATEWAY: &str = "gateway";
+    const GATEWAY_API: &str = "https://gateway.example.com/v1";
+    const MOVED_API: &str = "https://moved.example.com/v1";
+    const ROUTING_REPORTED: &str = "an unaccepted routing change must be reported";
+    const ROUTING_STALE: &str = "a routing acceptance no change needs must be reported as stale";
 
     fn fixture() -> Payload {
         serde_json::from_str(include_str!("audit_fixture.json")).unwrap()
@@ -829,11 +910,13 @@ mod tests {
         Ok(audit(
             &fixture(),
             &serde_json::from_str(json)?,
+            None,
             today,
             since,
             &Rules {
                 accepted: accepted.to_vec(),
                 caps: caps(),
+                routing: Vec::new(),
             },
         ))
     }
@@ -1114,6 +1197,8 @@ mod tests {
             since: SINCE,
             findings: Vec::new(),
             stale: Vec::new(),
+            routing: None,
+            stale_routing: Vec::new(),
             decisions: fixture().decision_models,
         };
         assert!(audit.to_string().contains(NO_DIFFERENCES), "{REPORT_EMPTY}");
@@ -1137,6 +1222,8 @@ mod tests {
             since: SINCE,
             findings,
             stale: Vec::new(),
+            routing: None,
+            stale_routing: Vec::new(),
             decisions: fixture().decision_models,
         }
         .to_string();
@@ -1249,6 +1336,7 @@ mod tests {
         let rules = Rules {
             accepted: vec![serde_json::from_value(row).unwrap()],
             caps: vec![],
+            routing: Vec::new(),
         };
         assert_eq!(
             validate_rules(&rules, &fixture().providers),
@@ -1264,7 +1352,8 @@ mod tests {
             validate_rules(
                 &Rules {
                     accepted,
-                    caps: vec![]
+                    caps: vec![],
+                    routing: Vec::new(),
                 },
                 &fixture().providers
             )
@@ -1286,6 +1375,7 @@ mod tests {
         let rules = Rules {
             accepted,
             caps: vec![],
+            routing: Vec::new(),
         };
         validate_rules(&rules, &fixture().providers).unwrap();
         let audit = audit_with(&catalog, TODAY, SINCE, &rules.accepted).unwrap();
@@ -1307,6 +1397,7 @@ mod tests {
                 reason: ACCEPTANCE_REASON.into(),
             }],
             caps: vec![],
+            routing: Vec::new(),
         };
         validate_rules(&rules, &fixture().providers).unwrap();
         let audit = audit_with(&catalog, TODAY, SINCE, &rules.accepted).unwrap();
@@ -1327,13 +1418,86 @@ mod tests {
             validate_rules(
                 &Rules {
                     accepted: vec![],
-                    caps: vec![cap]
+                    caps: vec![cap],
+                    routing: Vec::new(),
                 },
                 &fixture().providers
             )
             .unwrap_err()
             .1,
             UNUSED_CAP
+        );
+    }
+
+    fn routed(api: &str) -> Payload {
+        let mut payload = fixture();
+        payload.catalog.insert(
+            GATEWAY.into(),
+            serde_json::from_value(serde_json::json!({
+                "name": GATEWAY, "npm": "@ai-sdk/openai-compatible", "api": api
+            }))
+            .unwrap(),
+        );
+        payload
+    }
+
+    fn routing_acceptance(catalog: &str, reason: &str) -> RoutingAccepted {
+        RoutingAccepted {
+            provider: GATEWAY.into(),
+            field: RoutingField::Api,
+            catalog: catalog.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test_case(None, true, false; "unaccepted")]
+    #[test_case(Some(MOVED_API), false, false; "accepted")]
+    #[test_case(Some(GATEWAY_API), true, true; "accepted_another_value")]
+    fn a_routing_change_reports_until_accepted(
+        accepted: Option<&str>,
+        reported: bool,
+        stale: bool,
+    ) {
+        let rules = Rules {
+            routing: accepted
+                .map(|catalog| routing_acceptance(catalog, ACCEPTANCE_REASON))
+                .into_iter()
+                .collect(),
+            ..Rules::default()
+        };
+        let next = routed(MOVED_API);
+        let audit = audit(
+            &next,
+            &next.catalog,
+            Some(&routed(GATEWAY_API)),
+            TODAY,
+            SINCE,
+            &rules,
+        );
+        let report = audit.to_string();
+        let section = report
+            .split_once(routing::HEADING)
+            .and_then(|(_, rest)| rest.split(SECTION_START).next())
+            .expect(ROUTING_REPORTED);
+        assert_eq!(section.contains(MOVED_API), reported, "{ROUTING_REPORTED}");
+        assert_eq!(
+            audit.stale_routing.len(),
+            usize::from(stale),
+            "{ROUTING_STALE}"
+        );
+    }
+
+    #[test_case("", EMPTY_VALUE; "empty_reason")]
+    #[test_case(ACCEPTANCE_REASON, DUPLICATE_RULE; "duplicate")]
+    fn invalid_routing_acceptance_is_rejected(reason: &str, message: &str) {
+        let row = routing_acceptance(MOVED_API, reason);
+        let rules = Rules {
+            routing: vec![row.clone(), row],
+            ..Rules::default()
+        };
+        assert_eq!(
+            validate_rules(&rules, &fixture().providers).unwrap_err().1,
+            message
         );
     }
 }

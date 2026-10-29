@@ -134,7 +134,6 @@ fn runtime_resolver(
                     host.websearch().apply(&config.websearch);
                 }
                 super::configure_native_tools(&config);
-                caudra_providers::model_data::start_refresh(&config.models);
                 super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
                 plugin_host.load_production_builtins(&config.plugins)?;
                 let seed_permission_mode = Some(super::permission_mode_seed(&config));

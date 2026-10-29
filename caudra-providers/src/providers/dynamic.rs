@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
 use crate::model::{Billing, Model, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model_data::Current;
 use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
 use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{
@@ -110,6 +111,7 @@ impl ScriptModel {
             pricing: self.pricing.clone().unwrap_or_default(),
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
             window_excludes_output: false,
@@ -551,7 +553,11 @@ pub fn auth_providers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub(crate) fn create(
+    slug: &str,
+    timeouts: super::Timeouts,
+    data: &Arc<Current>,
+) -> Result<Box<dyn Provider>, AgentError> {
     let meta = find_meta(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown dynamic provider '{slug}'"),
     })?;
@@ -604,7 +610,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
+            Opencode::with_auth(auth.clone(), timeouts, Arc::clone(data))
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Xai => Box::new(

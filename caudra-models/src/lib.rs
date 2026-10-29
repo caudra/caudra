@@ -9,6 +9,8 @@ pub mod cli;
 #[cfg(feature = "cli")]
 mod replay;
 pub mod repo;
+#[cfg(feature = "cli")]
+mod routing;
 pub mod sign;
 mod validate;
 mod wire;
@@ -21,9 +23,9 @@ use thiserror::Error;
 
 pub use catalog::{
     CatalogCost, CatalogCostTier, CatalogLimits, CatalogModalities, CatalogModel, CatalogProvider,
-    CatalogShape, CatalogTierBoundary, import_models_dev,
+    CatalogShape, CatalogTierBoundary, DroppedApi, Import, import_models_dev,
 };
-pub use validate::{Issue, validate};
+pub use validate::{Issue, validate, validate_successor};
 pub use wire::{
     Api, Availability, DecisionModel, Family, FastPricing, Generation, ModelEntry, Payload, Period,
     PricePeriod, Pricing, PricingSchedule, PricingWindow, Provider, ReasoningOption, Snapshot,

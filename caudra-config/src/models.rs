@@ -12,6 +12,8 @@ const REFRESH_ENV: &str = "CAUDRA_MODELS_REFRESH";
 pub struct ModelsFileConfig {
     pub refresh: Option<bool>,
     pub url: Option<String>,
+    #[serde(skip)]
+    pub(crate) project_disabled: bool,
 }
 
 #[derive(Debug, Clone, ConfigSection)]
@@ -21,11 +23,11 @@ pub struct ModelsConfig {
         ty = "bool",
         default = true,
         env = "CAUDRA_MODELS_REFRESH",
-        desc = "Check for signed model updates daily in long-running sessions. Set the environment variable to 0 or 1. Cached models remain usable when disabled"
+        desc = "Check for signed model updates daily in long-running sessions. A project may only disable refresh. The environment variable accepts 0/1, false/true, no/yes or off/on. Cached models remain usable when disabled"
     )]
     pub refresh: bool,
     #[config(ty = "String", default = DEFAULT_URL,
-        desc = "Signed model file URL. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart")]
+        desc = "Global-only signed model file URL. Project values are ignored. Requires HTTPS, or HTTP to loopback. The signature is fetched from the same URL with .sig appended. Takes effect after a restart")]
     pub url: String,
 }
 
@@ -33,8 +35,6 @@ pub struct ModelsConfig {
 pub enum ModelsConfigError {
     #[error("models.url must use HTTPS or HTTP to loopback (localhost, 127.0.0.1 or [::1])")]
     Url,
-    #[error("CAUDRA_MODELS_REFRESH must be 0 or 1")]
-    Refresh,
 }
 
 impl Default for ModelsConfig {
@@ -48,17 +48,34 @@ impl Default for ModelsConfig {
 
 impl ModelsFileConfig {
     pub(crate) fn merge(&mut self, overlay: Self) {
+        self.project_disabled |= overlay.project_disabled;
         self.refresh = overlay.refresh.or(self.refresh);
         self.url = overlay.url.or(self.url.take());
     }
 
     pub(crate) fn resolve(self) -> Result<ModelsConfig, ModelsConfigError> {
-        let refresh = match global_env_value(REFRESH_ENV) {
-            Ok(None) => self.refresh.unwrap_or(true),
-            Ok(Some(value)) if value == "0" => false,
-            Ok(Some(value)) if value == "1" => true,
-            _ => return Err(ModelsConfigError::Refresh),
-        };
+        let refresh = global_env_value(REFRESH_ENV)
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    env = REFRESH_ENV,
+                    "ignoring unreadable boolean environment override"
+                );
+                None
+            })
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => Some(false),
+                "1" | "true" | "yes" | "on" => Some(true),
+                "" => None,
+                _ => {
+                    tracing::warn!(
+                        env = REFRESH_ENV,
+                        "ignoring invalid boolean environment override"
+                    );
+                    None
+                }
+            })
+            .unwrap_or(self.refresh.unwrap_or(true))
+            && !self.project_disabled;
         let config = ModelsConfig {
             refresh,
             url: self.url.unwrap_or_else(|| DEFAULT_URL.to_owned()),
@@ -115,6 +132,10 @@ mod tests {
 
     #[test_case("0", false; "disabled")]
     #[test_case("1", true; "enabled")]
+    #[test_case("false", false; "false_word")]
+    #[test_case(" TRUE ", true; "true_word")]
+    #[test_case("off", false; "off_word")]
+    #[test_case("yes", true; "yes_word")]
     fn environment_overrides_config(value: &str, expected: bool) {
         unsafe {
             std::env::set_var(REFRESH_ENV, value);
@@ -122,6 +143,7 @@ mod tests {
         let config = ModelsFileConfig {
             refresh: Some(!expected),
             url: None,
+            ..Default::default()
         }
         .resolve()
         .unwrap();
@@ -156,8 +178,42 @@ mod tests {
         base.models.refresh = Some(false);
         let mut overlay = RawConfig::default();
         overlay.models.url = Some(DEFAULT_URL.to_owned());
-        base.merge(overlay);
+        base.merge_global(overlay);
         assert_eq!(base.models.refresh, Some(false));
         assert_eq!(base.models.url.as_deref(), Some(DEFAULT_URL));
+    }
+
+    #[test_case(true)]
+    #[test_case(false)]
+    fn invalid_environment_is_ignored(configured: bool) {
+        unsafe {
+            std::env::set_var(REFRESH_ENV, "invalid");
+        }
+        let config = ModelsFileConfig {
+            refresh: Some(configured),
+            ..Default::default()
+        };
+        assert_eq!(config.resolve().unwrap().refresh, configured);
+        unsafe {
+            std::env::remove_var(REFRESH_ENV);
+        }
+    }
+
+    #[test_case(false, true, false; "cannot_enable")]
+    #[test_case(true, false, false; "can_disable")]
+    #[test_case(true, true, true; "cannot_change_url")]
+    fn project_only_disables_refresh(global: bool, project: bool, expected: bool) {
+        unsafe {
+            std::env::remove_var(REFRESH_ENV);
+        }
+        let mut base = RawConfig::default();
+        base.models.refresh = Some(global);
+        let mut overlay = RawConfig::default();
+        overlay.models.refresh = Some(project);
+        overlay.models.url = Some("http://untrusted.example/models.json".into());
+        base.merge(overlay);
+        let config = base.models.resolve().unwrap();
+        assert_eq!(config.url, DEFAULT_URL);
+        assert_eq!(config.refresh, expected);
     }
 }

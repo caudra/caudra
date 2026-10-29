@@ -1815,6 +1815,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         pricing: test_pricing(),
         dated_rates: None,
         discovered_free: false,
+        catalog_free: false,
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
         window_excludes_output: false,

@@ -4,8 +4,8 @@ use thiserror::Error;
 use url::{Host, Url};
 
 use crate::{
-    CatalogProvider, FORMAT, FastPricing, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Period,
-    Pricing, Provider, Snapshot,
+    CatalogProvider, FORMAT, FastPricing, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Payload,
+    Period, Pricing, Provider, Snapshot,
 };
 
 const FORMAT_MESSAGE: &str = "unsupported model-file format; expected 1";
@@ -20,11 +20,13 @@ const PRICE_MESSAGE: &str = "price must be finite and non-negative";
 const TOKEN_MESSAGE: &str = "token limit must not exceed 100000000";
 const REFERENCE_MESSAGE: &str = "prefix must name an entry prefix";
 const GENERATION_MESSAGE: &str = "generation members must not be empty";
-const URL_MESSAGE: &str = "catalog API must use HTTPS or HTTP to loopback";
+pub(crate) const URL_MESSAGE: &str = "catalog API must use HTTPS or HTTP to loopback";
 const ENV_MESSAGE: &str = "environment name must match ^[A-Z0-9][A-Z0-9_]*$";
 const PROVIDER_COUNT_MESSAGE: &str = "provider count must not exceed 1000";
 const CATALOG_COUNT_MESSAGE: &str = "catalog model count must not exceed 50000";
 const MODELS_FROM_MESSAGE: &str = "models_from must be expanded before publishing";
+pub(crate) const PROVIDER_REQUIRES_MESSAGE: &str = "a published provider must not gain provider-level requires, because a Caudra without the token drops the whole provider; put requires on its model entries";
+const FAMILY_CHANGE_MESSAGE: &str = "a published provider must keep its family, because a Caudra that does not know the new family drops the whole provider";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{pointer}: {message}")]
@@ -71,6 +73,43 @@ pub fn validate(snapshot: &Snapshot) -> Result<(), Vec<Issue>> {
             &format!("/catalog/{}", pointer_token(slug)),
             &mut issues,
         );
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(issues)
+    }
+}
+
+/// Checks that every provider `published` served to every Caudra stays
+/// servable in `next`. A provider-level `requires` token or an unknown family
+/// makes an older Caudra drop the whole provider, so only a provider that no
+/// published file served may use them.
+pub fn validate_successor(published: &Payload, next: &Payload) -> Result<(), Vec<Issue>> {
+    let mut issues = Vec::new();
+    for (index, provider) in next.providers.iter().enumerate() {
+        let Some(incumbent) = published
+            .providers
+            .iter()
+            .find(|incumbent| incumbent.slug == provider.slug && incumbent.requires.is_empty())
+        else {
+            continue;
+        };
+        let path = format!("/providers/{index}");
+        if !provider.requires.is_empty() {
+            issue(
+                &mut issues,
+                &format!("{path}/requires"),
+                PROVIDER_REQUIRES_MESSAGE,
+            );
+        }
+        if provider.family != incumbent.family {
+            issue(
+                &mut issues,
+                &format!("{path}/family"),
+                FAMILY_CHANGE_MESSAGE,
+            );
+        }
     }
     if issues.is_empty() {
         Ok(())
@@ -306,7 +345,7 @@ fn validate_catalog(provider: &CatalogProvider, path: &str, issues: &mut Vec<Iss
     }
 }
 
-fn allowed_api(api: &str) -> bool {
+pub(crate) fn allowed_api(api: &str) -> bool {
     let Ok(url) = Url::parse(api) else {
         return false;
     };
@@ -352,7 +391,7 @@ fn issue(issues: &mut Vec<Issue>, pointer: &str, message: &str) {
     });
 }
 
-fn pointer_token(value: &str) -> String {
+pub(crate) fn pointer_token(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
@@ -367,8 +406,9 @@ mod tests {
         PERIOD_MESSAGE, PREFIX_MESSAGE, PRICE_MESSAGE, PROVIDER_COUNT_MESSAGE, REFERENCE_MESSAGE,
         SLUG_MESSAGE, TIER_MESSAGE, TOKEN_MESSAGE, URL_MESSAGE, validate,
     };
+    use super::{FAMILY_CHANGE_MESSAGE, PROVIDER_REQUIRES_MESSAGE, validate_successor};
     use crate::{
-        Availability, CatalogModel, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Period,
+        Availability, CatalogModel, Family, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Period,
         Snapshot, tests::fixture,
     };
 
@@ -376,6 +416,8 @@ mod tests {
     const DEFAULT_POINTER: &str = "/providers/0/models/1/default";
     const PRICE_POINTER: &str = "/providers/0/models/0/pricing/input";
     const DISPLAY_MESSAGE: &str = "/format: unsupported model-file format; expected 1";
+    const REQUIREMENT: &str = "future-transport";
+    const NEW_FAMILY: &str = "future-family";
 
     #[test]
     fn plan_window_obeys_token_bounds() {
@@ -691,5 +733,45 @@ mod tests {
             message: FORMAT_MESSAGE.to_owned(),
         };
         assert_eq!(issue.to_string(), DISPLAY_MESSAGE);
+    }
+
+    #[test_case(false, false, None; "unchanged")]
+    #[test_case(true, false, Some(("/providers/0/requires", PROVIDER_REQUIRES_MESSAGE)); "gains_requires")]
+    #[test_case(false, true, Some(("/providers/0/family", FAMILY_CHANGE_MESSAGE)); "unknown_family")]
+    fn a_published_provider_stays_servable(
+        requires: bool,
+        family: bool,
+        expected: Option<(&str, &str)>,
+    ) {
+        let published = fixture().payload;
+        let mut next = published.clone();
+        if requires {
+            next.providers[0].requires = vec![REQUIREMENT.to_owned()];
+        }
+        if family {
+            next.providers[0].family = Family::Unknown(NEW_FAMILY.to_owned());
+        }
+        let expected = expected.map(|(pointer, message)| {
+            vec![Issue {
+                pointer: pointer.to_owned(),
+                message: message.to_owned(),
+            }]
+        });
+        assert_eq!(validate_successor(&published, &next).err(), expected);
+    }
+
+    #[test_case(true; "staged_with_requires")]
+    #[test_case(false; "never_published")]
+    fn an_unpublished_or_staged_provider_may_require_a_newer_caudra(staged: bool) {
+        let mut published = fixture().payload;
+        if staged {
+            published.providers[0].requires = vec![REQUIREMENT.to_owned()];
+        } else {
+            published.providers.clear();
+        }
+        let mut next = fixture().payload;
+        next.providers[0].requires = vec![REQUIREMENT.to_owned()];
+        next.providers[0].family = Family::Unknown(NEW_FAMILY.to_owned());
+        assert_eq!(validate_successor(&published, &next), Ok(()));
     }
 }

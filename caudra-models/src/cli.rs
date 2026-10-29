@@ -1,5 +1,7 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -7,15 +9,16 @@ use std::path::{Path, PathBuf};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use jiff::{Timestamp, ToSpan, Zoned, civil::Date};
+use jiff::{SignedDuration, Timestamp, ToSpan, Zoned, civil::Date};
 use schemars::schema_for;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Provider, Snapshot, TRUSTED_KEYS, audit, hex, import_models_dev, parse_bounded, replay,
+    CatalogProvider, Provider, Snapshot, TRUSTED_KEYS, audit, hex, import_models_dev,
+    parse_bounded, replay,
     repo::{self, DecisionFile},
-    sign, to_pretty_bytes, validate,
+    routing, sign, to_pretty_bytes, validate, validate_successor,
 };
 
 const SIGNING_KEY_ENV: &str = "CAUDRA_MODELS_SIGNING_KEY";
@@ -25,6 +28,13 @@ const PROVIDER_SCHEMA: &str = "provider.v1.json";
 const MODELS_SCHEMA: &str = "models.v1.json";
 const DECISIONS_SCHEMA: &str = "decision-models.v1.json";
 const DEFAULT_LOOKBACK_DAYS: i64 = 90;
+const MAX_CLOCK_SKEW_MINUTES: i64 = 5;
+const FUTURE_MESSAGE: &str = "minutes ahead of this machine's clock";
+const STAMP_MESSAGE: &str =
+    "the content changed, so updated_at must be later than the committed file's";
+const PIN_MESSAGE: &str = "is not newer than the current pin";
+
+type Files = Vec<(PathBuf, Vec<u8>)>;
 
 #[derive(Parser)]
 #[command(
@@ -46,13 +56,21 @@ enum Command {
         /// Defaults to the repository's reviewed import/models-dev.json.
         #[arg(long)]
         models_dev: Option<PathBuf>,
+        /// The published models.json whose catalog routing the report compares with.
+        #[arg(long)]
+        published: Option<PathBuf>,
         #[arg(long)]
         since: Option<Date>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
     /// Validate a snapshot or check a repository's generated files.
-    Validate { path: PathBuf },
+    Validate {
+        path: PathBuf,
+        /// The published models.json a repository's data must stay compatible with.
+        #[arg(long)]
+        published: Option<PathBuf>,
+    },
     /// Build a snapshot and JSON schemas from an authoring repository.
     Build {
         repo: PathBuf,
@@ -86,6 +104,9 @@ enum Command {
         sig: Option<PathBuf>,
         #[arg(long, conflicts_with = "sig")]
         unsigned: bool,
+        /// Replace a pin whose updated_at is not older than this file's.
+        #[arg(long)]
+        allow_older: bool,
         #[command(flatten)]
         keys: Keys,
     },
@@ -117,10 +138,10 @@ impl Keys {
 }
 
 pub fn run() -> Result<()> {
-    execute(Cli::parse().command)
+    execute(Cli::parse().command, Timestamp::now())
 }
 
-fn execute(command: Command) -> Result<()> {
+fn execute(command: Command, clock: Timestamp) -> Result<()> {
     match command {
         Command::Replay { script, cases } => {
             let source = String::from_utf8(read(&script)?).wrap_err("script must be UTF-8")?;
@@ -132,18 +153,21 @@ fn execute(command: Command) -> Result<()> {
         Command::Audit {
             data_dir,
             models_dev,
+            published,
             since,
             out,
         } => {
             let payload = repo::load(&data_dir)?;
             let rules = audit::load_rules(&data_dir, &payload.providers)?;
             let catalog = models_dev.map(|path| repo::read_json(&path)).transpose()?;
+            let published = published.as_deref().map(read_published).transpose()?;
             let today = Zoned::now().date();
             let since =
                 since.map_or_else(|| today.checked_sub(DEFAULT_LOOKBACK_DAYS.days()), Ok)?;
             let report = audit::audit(
                 &payload,
                 catalog.as_ref().unwrap_or(&payload.catalog),
+                published.as_ref().map(|published| &published.payload),
                 today,
                 since,
                 &rules,
@@ -156,16 +180,25 @@ fn execute(command: Command) -> Result<()> {
                 Ok(())
             }
         }
-        Command::Validate { path } => validate_path(&path),
-        Command::Build { repo, now } => build(&repo, now.unwrap_or_else(Timestamp::now)),
+        Command::Validate { path, published } => validate_path(&path, published.as_deref(), clock),
+        Command::Build { repo, now } => build(&repo, now.unwrap_or(clock), clock),
         Command::ImportModelsDev { api, repo } => {
-            let slugs = repo::load_providers(&repo)?
-                .into_iter()
-                .filter_map(|provider| provider.catalog_slug)
-                .collect();
+            let slugs = routing::builtin_slugs(&repo::load_providers(&repo)?);
+            let path = repo.join(repo::IMPORT);
+            let previous: BTreeMap<String, CatalogProvider> = if path.exists() {
+                repo::read_json(&path)?
+            } else {
+                BTreeMap::new()
+            };
             let imported = import_models_dev(&read(&api)?, &slugs)
                 .wrap_err_with(|| format!("{}: invalid catalog JSON", api.display()))?;
-            write_json(&repo.join(repo::IMPORT), &imported)
+            write_json(&path, &imported.catalog)?;
+            for dropped in &imported.dropped_apis {
+                println!("{dropped}");
+            }
+            let changes = routing::changes(&slugs, &previous, &imported.catalog);
+            print!("{}", routing::section(Some(&changes)));
+            Ok(())
         }
         Command::Schema { dir } => {
             for (name, bytes) in schemas()? {
@@ -197,8 +230,15 @@ fn execute(command: Command) -> Result<()> {
             output,
             sig,
             unsigned: _,
+            allow_older,
             keys,
-        } => pin(&models, &output, sig.as_deref(), &keys.decode()?),
+        } => pin(
+            &models,
+            &output,
+            sig.as_deref(),
+            &keys.decode()?,
+            allow_older,
+        ),
     }
 }
 
@@ -251,16 +291,34 @@ fn schemas() -> Result<Vec<(&'static str, Vec<u8>)>> {
     ])
 }
 
-fn artifacts(dir: &Path, now: Timestamp) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).wrap_err_with(|| format!("reading {}", path.display())),
+    }
+}
+
+fn read_published(path: &Path) -> Result<Snapshot> {
+    parse_bounded(&read(path)?).wrap_err_with(|| format!("{}: invalid snapshot", path.display()))
+}
+
+fn not_in_future(path: &Path, at: Timestamp, clock: Timestamp) -> Result<()> {
+    if at > clock + SignedDuration::from_mins(MAX_CLOCK_SKEW_MINUTES) {
+        bail!(
+            "{}: updated_at {at} is more than {MAX_CLOCK_SKEW_MINUTES} {FUTURE_MESSAGE} ({clock})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The built snapshot and every generated file, stamped against `previous`.
+fn artifacts(dir: &Path, previous: Option<&Snapshot>, now: Timestamp) -> Result<(Snapshot, Files)> {
     let path = dir.join(repo::DIST);
-    let previous = match fs::read(&path) {
-        Ok(bytes) => Some(checked_snapshot(&path, &bytes)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
-    };
     let payload = repo::load(dir)?;
     audit::load_rules(dir, &payload.providers)?;
-    let mut snapshot = Snapshot::stamp(payload, previous.as_ref(), now);
+    let mut snapshot = Snapshot::stamp(payload, previous, now);
     snapshot.schema = Some("schema.json".to_owned());
     let bytes = to_pretty_bytes(&snapshot);
     checked_snapshot(&path, &bytes)?;
@@ -271,33 +329,77 @@ fn artifacts(dir: &Path, now: Timestamp) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         }
         artifacts.push((dir.join("schema").join(name), bytes));
     }
-    Ok(artifacts)
+    Ok((snapshot, artifacts))
 }
 
-fn build(dir: &Path, now: Timestamp) -> Result<()> {
-    for (path, bytes) in artifacts(dir, now)? {
+fn build(dir: &Path, now: Timestamp, clock: Timestamp) -> Result<()> {
+    let path = dir.join(repo::DIST);
+    not_in_future(&path, now, clock)?;
+    let previous = read_optional(&path)?
+        .map(|bytes| checked_snapshot(&path, &bytes))
+        .transpose()?;
+    let (snapshot, files) = artifacts(dir, previous.as_ref(), now)?;
+    if let Some(previous) = &previous
+        && !matches!(
+            snapshot.is_newer_than(previous),
+            Ok(Ordering::Greater | Ordering::Equal)
+        )
+    {
+        bail!(
+            "{}: {STAMP_MESSAGE} ({}); pass a later --now",
+            path.display(),
+            previous.updated_at
+        );
+    }
+    for (path, bytes) in files {
         write(&path, &bytes)?;
     }
     Ok(())
 }
 
-fn validate_path(path: &Path) -> Result<()> {
-    if path.is_dir() {
-        let existing = path.join(repo::DIST);
-        let previous = checked_snapshot(&existing, &read(&existing)?)?;
-        for (file, expected) in artifacts(path, previous.updated_at)? {
-            if read(&file)? != expected {
-                bail!(
-                    "{}: generated file is stale; run build {}",
-                    file.display(),
-                    path.display()
-                );
-            }
-        }
-    } else {
-        checked_snapshot(path, &read(path)?)?;
+fn validate_path(path: &Path, published: Option<&Path>, clock: Timestamp) -> Result<()> {
+    if !path.is_dir() {
+        let snapshot = checked_snapshot(path, &read(path)?)?;
+        return not_in_future(path, snapshot.updated_at, clock);
     }
-    Ok(())
+    let existing = path.join(repo::DIST);
+    let previous = checked_snapshot(&existing, &read(&existing)?)?;
+    not_in_future(&existing, previous.updated_at, clock)?;
+    let (snapshot, files) = artifacts(path, Some(&previous), previous.updated_at)?;
+    for (file, expected) in files {
+        if read(&file)? != expected {
+            bail!(
+                "{}: generated file is stale; run build {}",
+                file.display(),
+                path.display()
+            );
+        }
+    }
+    let Some(published) = published else {
+        return Ok(());
+    };
+    let published = read_published(published)?;
+    let rules = audit::load_rules(path, &snapshot.payload.providers)?;
+    let mut issues = validate_successor(&published.payload, &snapshot.payload)
+        .err()
+        .unwrap_or_default();
+    let (routing, _) = rules.unaccepted_routing(audit::routing_changes(
+        &published.payload,
+        &snapshot.payload,
+    ));
+    issues.extend(routing.iter().map(routing::RoutingChange::issue));
+    if issues.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}:\n{}",
+        existing.display(),
+        issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 fn append_extension(path: &Path, extension: &str) -> PathBuf {
@@ -333,12 +435,34 @@ fn verify_signature(models: &Path, bytes: &[u8], sig: &Path, trusted: &[[u8; 32]
         .wrap_err_with(|| format!("{}: verifying {}", models.display(), sig.display()))
 }
 
-fn pin(models: &Path, output: &Path, sig: Option<&Path>, trusted: &[[u8; 32]]) -> Result<()> {
+fn pin(
+    models: &Path,
+    output: &Path,
+    sig: Option<&Path>,
+    trusted: &[[u8; 32]],
+    allow_older: bool,
+) -> Result<()> {
     let bytes = read(models)?;
     if let Some(sig) = sig {
         verify_signature(models, &bytes, sig, trusted)?;
     }
     let snapshot = checked_snapshot(models, &bytes)?;
+    if !allow_older && let Some(pinned) = read_optional(output)? {
+        let pinned = parse_bounded(&zstd::stream::decode_all(pinned.as_slice())?)
+            .wrap_err_with(|| format!("{}: invalid pin", output.display()))?;
+        if !matches!(
+            snapshot.is_newer_than(&pinned),
+            Ok(Ordering::Greater | Ordering::Equal)
+        ) {
+            bail!(
+                "{}: updated_at {} {PIN_MESSAGE} {} ({}); pass --allow-older to replace it",
+                models.display(),
+                snapshot.updated_at,
+                output.display(),
+                pinned.updated_at
+            );
+        }
+    }
     let compressed = zstd::stream::encode_all(bytes.as_slice(), ZSTD_LEVEL)?;
     let metadata = format!(
         "updated_at = \"{}\"\ncontent_sha256 = \"{}\"\nsha256 = \"{}\"\n",
@@ -358,22 +482,55 @@ mod tests {
     use clap::Parser;
     use test_case::test_case;
 
-    use super::{Cli, append_extension, execute, read, validate_path, write_json};
+    use super::{
+        Cli, FUTURE_MESSAGE, PIN_MESSAGE, STAMP_MESSAGE, append_extension, execute, read,
+        validate_path, write_json,
+    };
     use crate::{
-        Provider, parse_bounded,
+        CatalogProvider, Provider, parse_bounded,
         repo::{self, tests::repo_fixture},
+        routing::{PROTECTED_MESSAGE, UNACCEPTED_MESSAGE},
         sign::{
             self,
             tests::{TEST_PUBLIC_KEY_B64, TEST_SIGNING_KEY_PKCS8_B64},
         },
         tests::NOW,
+        validate::PROVIDER_REQUIRES_MESSAGE,
     };
 
+    const EARLIER: &str = "2026-10-28T12:00:00Z";
     const LATER: &str = "2026-10-30T12:00:00Z";
+    const CLOCK: &str = "2026-10-31T00:00:00Z";
+    const SKEWED: &str = "2026-10-31T00:04:00Z";
+    const FUTURE: &str = "2026-10-31T00:06:00Z";
     const INVALID_PIN: &[&str] = &["caudra-models", "pin", "models.json", "models.zst"];
+    const BUILTIN_ROW: &str = "catalog";
+    const NEW_ROW: &str = "gateway";
+    const NEW_ROW_KEY: &str = "GATEWAY_API_KEY";
+    const MOVED_API: &str = "https://moved.example.com/v1";
+    const REQUIREMENT: &str = "future-transport";
+    const ROUTING_REASON: &str = "confirmed on the provider's page";
+
+    fn try_command(args: &[&str], clock: &str) -> color_eyre::Result<()> {
+        execute(
+            Cli::try_parse_from(args).unwrap().command,
+            clock.parse().unwrap(),
+        )
+    }
 
     fn command(args: &[&str]) {
-        execute(Cli::try_parse_from(args).unwrap().command).unwrap();
+        try_command(args, CLOCK).unwrap();
+    }
+
+    fn error(args: &[&str], clock: &str) -> String {
+        format!("{:?}", try_command(args, clock).unwrap_err())
+    }
+
+    fn edit_provider(dir: &std::path::Path, edit: impl FnOnce(&mut Provider)) {
+        let path = dir.join("providers/example.json");
+        let mut provider: Provider = repo::read_json(&path).unwrap();
+        edit(&mut provider);
+        write_json(&path, &provider).unwrap();
     }
 
     #[test]
@@ -386,11 +543,8 @@ mod tests {
         command(&["caudra-models", "build", root, "--now", LATER]);
         assert_eq!(read(&path).unwrap(), original);
         command(&["caudra-models", "validate", root]);
-        let provider_path = dir.path().join("providers/example.json");
-        let mut provider: Provider = repo::read_json(&provider_path).unwrap();
-        provider.display_name.push('!');
-        write_json(&provider_path, &provider).unwrap();
-        assert!(validate_path(dir.path()).is_err());
+        edit_provider(dir.path(), |provider| provider.display_name.push('!'));
+        assert!(validate_path(dir.path(), None, CLOCK.parse().unwrap()).is_err());
         command(&["caudra-models", "build", root, "--now", LATER]);
         let edited = parse_bounded(&read(&path).unwrap()).unwrap();
         assert_eq!(edited.updated_at, LATER.parse().unwrap());
@@ -400,7 +554,148 @@ mod tests {
         );
         command(&["caudra-models", "validate", root]);
         fs::write(dir.path().join("schema/provider.v1.json"), b"{}").unwrap();
-        assert!(validate_path(dir.path()).is_err());
+        assert!(validate_path(dir.path(), None, CLOCK.parse().unwrap()).is_err());
+    }
+
+    #[test_case(EARLIER; "earlier")]
+    #[test_case(NOW; "equal")]
+    fn build_refuses_a_changed_snapshot_not_after_the_committed_one(now: &str) {
+        let dir = repo_fixture();
+        let root = dir.path().to_str().unwrap();
+        command(&["caudra-models", "build", root, "--now", NOW]);
+        command(&["caudra-models", "build", root, "--now", EARLIER]);
+        edit_provider(dir.path(), |provider| provider.display_name.push('!'));
+        assert!(
+            error(&["caudra-models", "build", root, "--now", now], CLOCK).contains(STAMP_MESSAGE)
+        );
+    }
+
+    #[test_case(SKEWED, true; "within_the_skew")]
+    #[test_case(FUTURE, false; "beyond_the_skew")]
+    fn build_refuses_a_time_in_the_future(now: &str, accepted: bool) {
+        let dir = repo_fixture();
+        let args = [
+            "caudra-models",
+            "build",
+            dir.path().to_str().unwrap(),
+            "--now",
+            now,
+        ];
+        if accepted {
+            try_command(&args, CLOCK).unwrap();
+        } else {
+            assert!(error(&args, CLOCK).contains(FUTURE_MESSAGE));
+        }
+    }
+
+    #[test_case(false; "repository")]
+    #[test_case(true; "file")]
+    fn validate_flags_a_snapshot_stamped_in_the_future(file: bool) {
+        let dir = repo_fixture();
+        let root = dir.path().to_str().unwrap();
+        try_command(&["caudra-models", "build", root, "--now", LATER], LATER).unwrap();
+        let dist = dir.path().join(repo::DIST);
+        let target = if file { dist.to_str().unwrap() } else { root };
+        try_command(&["caudra-models", "validate", target], LATER).unwrap();
+        assert!(error(&["caudra-models", "validate", target], NOW).contains(FUTURE_MESSAGE));
+    }
+
+    #[test]
+    fn pin_refuses_an_older_snapshot_unless_allowed() {
+        let dir = repo_fixture();
+        let root = dir.path().to_str().unwrap();
+        command(&["caudra-models", "build", root, "--now", NOW]);
+        let older = dir.path().join("older.json");
+        fs::copy(dir.path().join(repo::DIST), &older).unwrap();
+        edit_provider(dir.path(), |provider| provider.display_name.push('!'));
+        command(&["caudra-models", "build", root, "--now", LATER]);
+        let output = dir.path().join("bundled.json.zst");
+        let pin = |models: &std::path::Path, extra: &[&str]| {
+            let mut args = vec![
+                "caudra-models",
+                "pin",
+                models.to_str().unwrap(),
+                output.to_str().unwrap(),
+                "--unsigned",
+            ];
+            args.extend(extra);
+            try_command(&args, CLOCK).map_err(|error| format!("{error:?}"))
+        };
+        let newer = dir.path().join(repo::DIST);
+        pin(&newer, &[]).unwrap();
+        pin(&newer, &[]).unwrap();
+        assert!(pin(&older, &[]).unwrap_err().contains(PIN_MESSAGE));
+        pin(&older, &["--allow-older"]).unwrap();
+        pin(&newer, &[]).unwrap();
+    }
+
+    fn published_repo() -> (tempfile::TempDir, String) {
+        let dir = repo_fixture();
+        let root = dir.path().to_str().unwrap().to_owned();
+        command(&["caudra-models", "build", &root, "--now", NOW]);
+        let published = dir.path().join("published.json");
+        fs::copy(dir.path().join(repo::DIST), &published).unwrap();
+        (dir, root)
+    }
+
+    fn validate_published(dir: &tempfile::TempDir, root: &str) -> color_eyre::Result<()> {
+        command(&["caudra-models", "build", root, "--now", LATER]);
+        let published = dir.path().join("published.json");
+        try_command(
+            &[
+                "caudra-models",
+                "validate",
+                root,
+                "--published",
+                published.to_str().unwrap(),
+            ],
+            CLOCK,
+        )
+    }
+
+    #[test_case(BUILTIN_ROW, false, Some(PROTECTED_MESSAGE); "protected_row")]
+    #[test_case(NEW_ROW, false, Some(UNACCEPTED_MESSAGE); "new_row")]
+    #[test_case(BUILTIN_ROW, true, None; "accepted")]
+    fn validate_needs_an_acceptance_for_each_routing_change(
+        row: &str,
+        accepted: bool,
+        expected: Option<&str>,
+    ) {
+        let (dir, root) = published_repo();
+        let import = dir.path().join(repo::IMPORT);
+        let mut catalog: std::collections::BTreeMap<String, CatalogProvider> =
+            repo::read_json(&import).unwrap();
+        let mut moved = catalog[BUILTIN_ROW].clone();
+        moved.api = Some(MOVED_API.to_owned());
+        if row == NEW_ROW {
+            moved.env = vec![NEW_ROW_KEY.to_owned()];
+        }
+        catalog.insert(row.to_owned(), moved);
+        write_json(&import, &catalog).unwrap();
+        if accepted {
+            write_json(
+                &dir.path().join("audit/accepted.json"),
+                &serde_json::json!({"accepted": [], "caps": [], "routing": [
+                    {"provider": row, "field": "api", "catalog": MOVED_API, "reason": ROUTING_REASON}
+                ]}),
+            )
+            .unwrap();
+        }
+        let result = validate_published(&dir, &root).map_err(|error| format!("{error:?}"));
+        match expected {
+            Some(message) => assert!(result.unwrap_err().contains(message)),
+            None => result.unwrap(),
+        }
+    }
+
+    #[test]
+    fn validate_keeps_a_published_provider_servable() {
+        let (dir, root) = published_repo();
+        edit_provider(dir.path(), |provider| {
+            provider.requires = vec![REQUIREMENT.to_owned()];
+        });
+        let error = format!("{:?}", validate_published(&dir, &root).unwrap_err());
+        assert!(error.contains(PROVIDER_REQUIRES_MESSAGE));
     }
 
     #[test_case(false; "unsigned")]
@@ -454,7 +749,7 @@ mod tests {
         assert!(metadata.contains(NOW));
         if signed {
             fs::write(&models, [bytes.as_slice(), b" "].concat()).unwrap();
-            assert!(execute(Cli::try_parse_from(&args).unwrap().command).is_err());
+            assert!(try_command(&args, CLOCK).is_err());
         }
     }
 

@@ -31,8 +31,7 @@ pub(crate) const FLAT_RATE: f64 = 1.0;
 /// constant edit instead of new code.
 ///
 /// One multiplier is enough while providers move all four rates together.
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, PartialEq)]
 pub struct PricingSchedule {
     windows: &'static [PricingWindow],
     multiplier: f64,
@@ -40,8 +39,7 @@ pub struct PricingSchedule {
 
 /// Half-open `[start, end)` in whole UTC hours. `start > end` wraps past
 /// midnight, so a window never needs splitting in two.
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, PartialEq)]
 pub struct PricingWindow {
     start: u8,
     end: u8,
@@ -165,8 +163,7 @@ fn utc_day(at: Timestamp) -> Date {
 /// (`Period::until`), or both. Inside `during` every turn bills at `pricing`,
 /// tiers included, and outside it at the entry's own rates, so a build shipped
 /// before either edge stays right after it.
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, PartialEq)]
 pub struct PricePeriod {
     /// The `ModelEntry` prefix whose rates the period sets.
     pub prefix: &'static str,
@@ -177,7 +174,7 @@ pub struct PricePeriod {
 /// An entry's rates on both sides of its [`PricePeriod`]. A model billed from
 /// the static table carries them while an edge is still ahead, so each turn
 /// pays the side it ends on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DatedRates {
     pub period: &'static PricePeriod,
     pub otherwise: &'static ModelPricing,
@@ -409,6 +406,7 @@ mod tests {
             },
             dated_rates: None,
             discovered_free: false,
+            catalog_free: false,
             max_output_tokens: None,
             context_window: 0,
             window_excludes_output: false,

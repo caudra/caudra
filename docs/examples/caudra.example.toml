@@ -769,13 +769,15 @@ version = 5
 
 [models]
 
-# Check for signed model updates daily in long-running sessions. Set the
-# environment variable to 0 or 1. Cached models remain usable when disabled.
+# Check for signed model updates daily in long-running sessions. A project may
+# only disable refresh. The environment variable accepts 0/1, false/true,
+# no/yes or off/on. Cached models remain usable when disabled.
 # Type: bool. Env: CAUDRA_MODELS_REFRESH.
 # refresh = true
 
-# Signed model file URL. Requires HTTPS, or HTTP to loopback. The signature is
-# fetched from the same URL with .sig appended. Takes effect after a restart.
+# Global-only signed model file URL. Project values are ignored. Requires
+# HTTPS, or HTTP to loopback. The signature is fetched from the same URL with
+# .sig appended. Takes effect after a restart.
 # Type: String. Default: unset.
 # url = <String>
 

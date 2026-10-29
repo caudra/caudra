@@ -262,6 +262,7 @@ fn provider(value: wire::Provider) -> Result<ProviderManifest, String> {
 
 pub(super) fn manifests(
     providers: Vec<wire::Provider>,
+    incumbent: &[ProviderManifest],
 ) -> (&'static [ProviderManifest], HashMap<String, &'static str>) {
     let mut manifests = Vec::new();
     let mut unsupported = HashMap::new();
@@ -270,6 +271,13 @@ pub(super) fn manifests(
         match provider(value) {
             Ok(manifest) => manifests.push(manifest),
             Err(reason) => {
+                if caudra_config::providers::builtin_provider(&slug).is_some()
+                    && let Some(manifest) = incumbent.iter().find(|manifest| manifest.slug == slug)
+                {
+                    warn!(provider = slug, %reason, "keeping incumbent built-in model manifest");
+                    manifests.push(*manifest);
+                    continue;
+                }
                 warn!(provider = slug, %reason, "Skipping unsupported model-file provider");
                 unsupported.insert(slug, &*reason.leak());
             }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use caudra_models::Snapshot;
 use jiff::Timestamp;
@@ -11,6 +11,8 @@ use crate::providers::catalog::CatalogData;
 use super::{bundled, convert};
 
 static CURRENT: OnceLock<RwLock<Arc<Current>>> = OnceLock::new();
+static BUNDLED_MANIFESTS: LazyLock<&'static [ProviderManifest]> =
+    LazyLock::new(|| convert::manifests(bundled::snapshot().payload.providers, &[]).0);
 
 fn registry() -> &'static RwLock<Arc<Current>> {
     CURRENT.get_or_init(|| RwLock::new(Arc::new(Current::from_snapshot(initial_snapshot()))))
@@ -29,6 +31,7 @@ fn initial_snapshot() -> Snapshot {
     bundled
 }
 
+#[derive(Debug)]
 pub struct Current {
     pub revision: u64,
     pub snapshot_updated_at: Timestamp,
@@ -41,7 +44,12 @@ pub struct Current {
 
 impl Current {
     pub(crate) fn from_snapshot(snapshot: Snapshot) -> Self {
-        let (manifests, unsupported_providers) = convert::manifests(snapshot.payload.providers);
+        Self::with_incumbent(snapshot, &BUNDLED_MANIFESTS)
+    }
+
+    fn with_incumbent(snapshot: Snapshot, incumbent: &[ProviderManifest]) -> Self {
+        let (manifests, unsupported_providers) =
+            convert::manifests(snapshot.payload.providers, incumbent);
         Self {
             revision: 0,
             snapshot_updated_at: snapshot.updated_at,
@@ -75,15 +83,28 @@ pub(crate) fn install(snapshot: Snapshot) {
 }
 
 pub(super) fn install_newer(snapshot: Snapshot) -> bool {
-    let mut current = registry()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if snapshot.updated_at <= current.snapshot_updated_at
-        || snapshot.content_sha256 == current.content_sha256
+    install_converted(snapshot, Current::with_incumbent)
+}
+
+fn install_converted(
+    snapshot: Snapshot,
+    convert: impl FnOnce(Snapshot, &[ProviderManifest]) -> Current,
+) -> bool {
+    let previous = current();
+    if snapshot.updated_at <= previous.snapshot_updated_at
+        || snapshot.content_sha256 == previous.content_sha256
     {
         return false;
     }
-    let mut next = Current::from_snapshot(snapshot);
+    let mut next = convert(snapshot, previous.manifests);
+    let mut current = registry()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if next.snapshot_updated_at <= current.snapshot_updated_at
+        || next.content_sha256 == current.content_sha256
+    {
+        return false;
+    }
     next.revision = current.revision + 1;
     *current = Arc::new(next);
     true
@@ -154,6 +175,18 @@ mod tests {
             None,
             NOW.parse().unwrap(),
         )
+    }
+
+    #[test_case(())]
+    fn conversion_does_not_hold_the_registry_write_lock(_: ()) {
+        install(snapshot());
+        let mut next = snapshot();
+        next.payload.providers[0].display_name = UPDATED_NAME.into();
+        next = Snapshot::stamp(next.payload, None, LATER.parse().unwrap());
+        assert!(super::install_converted(next, |snapshot, manifests| {
+            assert!(super::registry().try_read().is_ok());
+            Current::with_incumbent(snapshot, manifests)
+        }));
     }
 
     fn validated(payload: Payload) -> Snapshot {

@@ -100,8 +100,7 @@ pub struct PricingTier {
     pub fast: Option<FastPricing>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -319,8 +318,7 @@ pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -
     )
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, PartialEq)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     /// Whether this is a deliberately small model. False means known non-small,
@@ -483,6 +481,7 @@ pub struct Model {
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
+    pub catalog_free: bool,
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
@@ -524,6 +523,34 @@ fn inherited_lineage(
 }
 
 impl Model {
+    pub fn same_configuration(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.provider == other.provider
+            && self.family == other.family
+            && self.entry == other.entry
+            && self.pricing == other.pricing
+            && self.dated_rates == other.dated_rates
+            && self.max_output_tokens == other.max_output_tokens
+            && self.context_window == other.context_window
+            && self.window_excludes_output == other.window_excludes_output
+            && self.thinking_fields == other.thinking_fields
+            && self.reasoning_options == other.reasoning_options
+            && self.billing == other.billing
+            && self.discovered_free == other.discovered_free
+            && self.catalog_free == other.catalog_free
+            && self.supports_tool_examples_override == other.supports_tool_examples_override
+            && self.thinking_override == other.thinking_override
+            && self.supports_vision_override == other.supports_vision_override
+            && self.supports_cache_breakpoints_override == other.supports_cache_breakpoints_override
+            && self.supports_pdf == other.supports_pdf
+            && self
+                .manifest
+                .map(|m| (m.supports_thinking, m.serves_fast_mode, m.pricing_schedule))
+                == other
+                    .manifest
+                    .map(|m| (m.supports_thinking, m.serves_fast_mode, m.pricing_schedule))
+    }
+
     /// When no static entry matches (a freshly released model the table has not
     /// caught up to yet), fall back to the provider defaults so it still resolves.
     fn from_base(
@@ -640,6 +667,7 @@ impl Model {
             pricing,
             dated_rates,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
+            catalog_free: crate::providers::catalog::free_model(slug, model_id),
             max_output_tokens,
             context_window,
             window_excludes_output,
@@ -700,6 +728,9 @@ impl Model {
             },
             dated_rates: None,
             discovered_free: false,
+            catalog_free: crate::providers::catalog::OPENCODE_FAMILY_SLUGS.contains(&slug)
+                && meta.input_price == 0.0
+                && meta.output_price == 0.0,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
             window_excludes_output: meta.context_excludes_output,
@@ -1040,14 +1071,28 @@ impl Model {
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
-        let revision = crate::model_data::current().revision;
-        let mut model = Self::resolve_spec(spec)?;
-        model.model_revision = revision;
-        Ok(model)
+        loop {
+            let revision = crate::model_data::current().revision;
+            let resolved = Self::resolve_spec(spec);
+            if revision == crate::model_data::current().revision {
+                let mut model = resolved?;
+                model.model_revision = revision;
+                return Ok(model);
+            }
+        }
     }
 
     pub fn refreshed(&self, policy: &ModelPolicy) -> Result<Self, ModelError> {
         let model = Self::from_spec_with_policy(&self.spec(), policy)?;
+        if self
+            .manifest
+            .is_some_and(|manifest| manifest.slug == "opencode")
+        {
+            let (slug, id) = self.id.split_once('/').unwrap_or(("opencode", &self.id));
+            if crate::providers::catalog::model_meta(slug, id).is_none() {
+                return Err(ModelError::UnknownModel(self.spec()));
+            }
+        }
         let was_curated = self
             .manifest
             .is_some_and(|manifest| lookup_entry(manifest.models, &self.id).is_ok());
@@ -1108,12 +1153,8 @@ impl Model {
     /// using the catalog's definition of free (zero input and output price),
     /// the same one that gates `enable_free_models`, plus models a provider's
     /// `/models` call reported at an explicit zero price.
-    ///
-    /// Queries the live catalog rather than `self.pricing`, which may not yet
-    /// reflect catalog prices when discovery hasn't seeded the registry, and
-    /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free || crate::providers::catalog::free_model(&self.provider, &self.id)
+        self.discovered_free || self.catalog_free
     }
 }
 

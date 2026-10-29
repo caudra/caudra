@@ -1,16 +1,43 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::validate::{URL_MESSAGE, allowed_api};
 use crate::{ALLOWED_NPM, BLOCKED_CATALOG_PROVIDERS, ReasoningOption};
+
+#[derive(Debug, PartialEq)]
+pub struct Import {
+    pub catalog: BTreeMap<String, CatalogProvider>,
+    pub dropped_apis: Vec<DroppedApi>,
+}
+
+/// An upstream base URL the import left out, such as models.dev's
+/// `${NEON_AI_GATEWAY_BASE_URL}/v1` template or a public `http://` host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DroppedApi {
+    pub provider: String,
+    pub api: String,
+}
+
+impl fmt::Display for DroppedApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: dropped api {:?}: {URL_MESSAGE}",
+            self.provider, self.api
+        )
+    }
+}
 
 pub fn import_models_dev(
     api_json: &[u8],
     builtin_catalog_slugs: &BTreeSet<String>,
-) -> Result<BTreeMap<String, CatalogProvider>, serde_json::Error> {
+) -> Result<Import, serde_json::Error> {
     let providers: BTreeMap<String, Value> = serde_json::from_slice(api_json)?;
-    providers
+    let mut dropped_apis = Vec::new();
+    let catalog = providers
         .into_iter()
         .filter(|(slug, provider)| {
             builtin_catalog_slugs.contains(slug)
@@ -21,17 +48,19 @@ pub fn import_models_dev(
         })
         .map(|(slug, provider)| {
             let mut provider: CatalogProvider = serde_json::from_value(provider)?;
-            // models.dev also publishes environment templates, not usable base URLs.
-            if provider
-                .api
-                .as_deref()
-                .is_some_and(|api| api.starts_with("${"))
-            {
-                provider.api = None;
+            if let Some(api) = provider.api.take_if(|api| !allowed_api(api)) {
+                dropped_apis.push(DroppedApi {
+                    provider: slug.clone(),
+                    api,
+                });
             }
             Ok((slug, provider))
         })
-        .collect()
+        .collect::<Result<_, serde_json::Error>>()?;
+    Ok(Import {
+        catalog,
+        dropped_apis,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,7 +185,12 @@ mod tests {
     use std::collections::BTreeSet;
     use test_case::test_case;
 
-    use super::{CatalogProvider, import_models_dev};
+    use super::{CatalogProvider, DroppedApi, import_models_dev};
+    use crate::validate::URL_MESSAGE;
+
+    const DROPPED: &str = "gateway";
+    const KEPT: &str = "kept";
+    const KEPT_API: &str = "https://kept.example.com/v1";
 
     #[test]
     fn import_keeps_builtin_metadata_and_every_allowed_model() {
@@ -171,7 +205,8 @@ mod tests {
             &serde_json::to_vec(&input).unwrap(),
             &BTreeSet::from(["builtin".to_owned(), "github-copilot".to_owned()]),
         )
-        .unwrap();
+        .unwrap()
+        .catalog;
         assert_eq!(
             imported.keys().map(String::as_str).collect::<Vec<_>>(),
             ["allowed", "builtin", "github-copilot"]
@@ -180,12 +215,27 @@ mod tests {
         assert_eq!(imported["allowed"].models.len(), 2);
     }
 
-    #[test]
-    fn import_keeps_models_but_not_an_unresolved_endpoint_template() {
-        let input = br#"{"neon":{"name":"Neon","npm":"@ai-sdk/openai-compatible","api":"${NEON_AI_GATEWAY_BASE_URL}/v1","models":{"model":{}}}}"#;
-        let imported = import_models_dev(input, &BTreeSet::new()).unwrap();
-        assert_eq!(imported["neon"].api, None);
-        assert!(imported["neon"].models.contains_key("model"));
+    #[test_case("${NEON_AI_GATEWAY_BASE_URL}/v1"; "unresolved_template")]
+    #[test_case("http://gateway.example.com/v1"; "public_http")]
+    #[test_case("gateway.example.com/v1"; "no_scheme")]
+    fn import_drops_an_unusable_api_and_reports_it(api: &str) {
+        let input = json!({
+            DROPPED: {"name": "Gateway", "npm": "@ai-sdk/openai-compatible", "api": api, "models": {"model": {}}},
+            KEPT: {"name": "Kept", "npm": "@ai-sdk/openai-compatible", "api": KEPT_API},
+        });
+        let imported =
+            import_models_dev(&serde_json::to_vec(&input).unwrap(), &BTreeSet::new()).unwrap();
+        assert_eq!(imported.catalog[DROPPED].api, None);
+        assert!(imported.catalog[DROPPED].models.contains_key("model"));
+        assert_eq!(imported.catalog[KEPT].api.as_deref(), Some(KEPT_API));
+        assert_eq!(
+            imported.dropped_apis,
+            [DroppedApi {
+                provider: DROPPED.to_owned(),
+                api: api.to_owned()
+            }]
+        );
+        assert!(imported.dropped_apis[0].to_string().ends_with(URL_MESSAGE));
     }
 
     #[test_case(json!({"limit": {"context": "unreadable"}}); "invalid_limit")]
