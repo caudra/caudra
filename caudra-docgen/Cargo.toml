@@ -21,17 +21,12 @@ path = "src/bin/model_watch.rs"
 name = "caudra-models-parity"
 path = "src/bin/models_parity.rs"
 
-[[bin]]
-name = "caudra-models-export"
-path = "src/bin/models_export.rs"
-
 [dependencies]
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
 caudra-docs = { workspace = true }
 caudra-lua = { workspace = true }
-caudra-models = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-ui = { workspace = true }
 caudra-workcell = { workspace = true }

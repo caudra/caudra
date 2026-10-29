@@ -8,10 +8,7 @@ use crate::model::{
 };
 use crate::pricing::{Period, PricePeriod, PricingSchedule};
 use crate::providers::catalog::CatalogMetaView;
-use crate::providers::{
-    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, synthetic, tensorx, xai, zai,
-};
+use crate::providers::{custom, dynamic};
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -130,310 +127,6 @@ pub(crate) fn catalog_pricing(meta: Option<&CatalogMetaView>) -> Option<ModelPri
         tiers: Cow::Owned(meta.pricing_tiers.clone()),
     })
 }
-
-const ANTHROPIC: ProviderManifest = ProviderManifest {
-    slug: "anthropic",
-    display_name: "Anthropic",
-    family: ModelFamily::Claude,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
-    models: anthropic::models(),
-    generations: &[],
-    serves_fast_mode: true,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: anthropic::AVAILABILITY,
-    catalog_slug: Some("anthropic"),
-};
-
-const OPENAI: ProviderManifest = ProviderManifest {
-    slug: "openai",
-    display_name: "OpenAI",
-    family: ModelFamily::Gpt,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
-    models: openai::models(),
-    generations: openai::generations(),
-    serves_fast_mode: true,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: openai::AVAILABILITY,
-    catalog_slug: Some("openai"),
-};
-
-const GOOGLE: ProviderManifest = ProviderManifest {
-    slug: "google",
-    display_name: "Google",
-    family: ModelFamily::Gemini,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(65_536),
-    fallback_context_window: 1_000_000,
-    models: google::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: google::PRICE_PERIODS,
-    availability: &[],
-    catalog_slug: Some("google"),
-};
-
-const COPILOT: ProviderManifest = ProviderManifest {
-    slug: copilot::PUBLIC_SLUG,
-    display_name: copilot::PUBLIC_DISPLAY_NAME,
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
-    models: copilot::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: copilot::AVAILABILITY,
-    catalog_slug: Some("github-copilot"),
-};
-
-/// Shares Copilot's model table under its own slug, so discovered metadata
-/// for one account never lands on the other.
-const COPILOT_ENTERPRISE: ProviderManifest = ProviderManifest {
-    slug: copilot::ENTERPRISE_SLUG,
-    display_name: copilot::ENTERPRISE_DISPLAY_NAME,
-    ..COPILOT
-};
-
-const OLLAMA: ProviderManifest = ProviderManifest {
-    slug: "ollama",
-    display_name: "Ollama",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
-    models: ollama::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: None,
-};
-
-const LLAMA_CPP: ProviderManifest = ProviderManifest {
-    slug: "llama-cpp",
-    display_name: "LlamaCpp",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 128_000,
-    models: llama_cpp::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: None,
-};
-
-const MISTRAL: ProviderManifest = ProviderManifest {
-    slug: "mistral",
-    display_name: "Mistral",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 128_000,
-    models: mistral::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: mistral::PRICE_PERIODS,
-    availability: mistral::AVAILABILITY,
-    catalog_slug: Some("mistral"),
-};
-
-const ZAI: ProviderManifest = ProviderManifest {
-    slug: "zai",
-    display_name: "Z.AI",
-    family: ModelFamily::Glm,
-    supports_thinking: false,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(16_000),
-    fallback_context_window: 128_000,
-    models: zai::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("zai"),
-};
-
-const DEEPSEEK: ProviderManifest = ProviderManifest {
-    slug: "deepseek",
-    display_name: "DeepSeek",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(384_000),
-    fallback_context_window: 1_000_000,
-    models: deepseek::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: Some(&deepseek::PEAK_HOURS),
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("deepseek"),
-};
-
-const OPENROUTER: ProviderManifest = ProviderManifest {
-    slug: "openrouter",
-    display_name: "OpenRouter",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
-    models: openrouter::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("openrouter"),
-};
-
-const SYNTHETIC: ProviderManifest = ProviderManifest {
-    slug: "synthetic",
-    display_name: "Synthetic",
-    family: ModelFamily::Synthetic,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(32_000),
-    fallback_context_window: 128_000,
-    models: synthetic::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("synthetic"),
-};
-
-const TENSORX: ProviderManifest = ProviderManifest {
-    slug: "tensorx",
-    display_name: "TensorX",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 200_000,
-    models: tensorx::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("tensorx"),
-};
-
-const OPENCODE: ProviderManifest = ProviderManifest {
-    slug: "opencode",
-    display_name: "Opencode Zen",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 256_000,
-    models: &[],
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("opencode"),
-};
-
-const XAI: ProviderManifest = ProviderManifest {
-    slug: "xai",
-    display_name: "xAI",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(131_072),
-    fallback_context_window: 500_000,
-    models: xai::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("xai"),
-};
-
-const OPENCODE_GO: ProviderManifest = ProviderManifest {
-    slug: "opencode-go",
-    display_name: "Opencode Go",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(64_000),
-    fallback_context_window: 128_000,
-    models: &[],
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: Some("opencode-go"),
-};
-
-const APERTURE: ProviderManifest = ProviderManifest {
-    slug: "aperture",
-    display_name: "Aperture",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
-    models: aperture::models(),
-    generations: &[],
-    serves_fast_mode: false,
-    pricing_schedule: None,
-    price_periods: &[],
-    availability: &[],
-    catalog_slug: None,
-};
-
-#[allow(
-    dead_code,
-    reason = "retained for fixture equivalence until the const tables are removed"
-)]
-pub(crate) const BUILTINS: &[ProviderManifest] = &[
-    ANTHROPIC,
-    OPENAI,
-    GOOGLE,
-    COPILOT,
-    COPILOT_ENTERPRISE,
-    OLLAMA,
-    LLAMA_CPP,
-    MISTRAL,
-    ZAI,
-    DEEPSEEK,
-    OPENROUTER,
-    SYNTHETIC,
-    TENSORX,
-    OPENCODE,
-    OPENCODE_GO,
-    XAI,
-    APERTURE,
-];
 
 pub struct ManifestRegistry;
 
@@ -691,7 +384,7 @@ mod tests {
 
     #[test]
     fn every_builtin_manifest_with_provider_kind_matches_kind_fields() {
-        for manifest in BUILTINS {
+        for manifest in ManifestRegistry::builtins() {
             let Some(kind) = ProviderKind::from_str(manifest.slug).ok() else {
                 continue;
             };
@@ -804,9 +497,9 @@ mod tests {
     fn builtin_count_covers_provider_kind_variants() {
         let kind_count = ProviderKind::iter().count();
         assert!(
-            BUILTINS.len() >= kind_count,
-            "BUILTINS has {} manifests but ProviderKind has {} variants",
-            BUILTINS.len(),
+            ManifestRegistry::builtins().len() >= kind_count,
+            "Registry has {} manifests but ProviderKind has {} variants",
+            ManifestRegistry::builtins().len(),
             kind_count,
         );
         for kind in ProviderKind::iter() {
@@ -826,7 +519,7 @@ mod tests {
     /// provider the user cannot reach. OpenRouter shipped that way for months.
     #[test]
     fn every_builtin_manifest_has_inventory_entry() {
-        for manifest in BUILTINS {
+        for manifest in ManifestRegistry::builtins() {
             if CATALOG_ONLY_SLUGS.contains(&manifest.slug) {
                 continue;
             }

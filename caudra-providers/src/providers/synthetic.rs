@@ -4,7 +4,7 @@ use flume::Sender;
 use serde_json::Value;
 
 use crate::accounts::AccountCredential;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
+use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -12,20 +12,6 @@ use crate::{
 
 use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-
-/// Each ladder is the model's `reasoning_parameters.efforts` on Synthetic's
-/// `/openai/v1/models`. A ladder without `none` cannot be switched off, so off
-/// asks for its lowest level.
-const EFFORT_LOW_HIGH_MAX: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "high", "max"])];
-const EFFORT_NONE_TO_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "high", "xhigh", "max",
-])];
-const EFFORT_NONE_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high",
-])];
-const QWEN_EFFORT: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "medium", "xhigh"])];
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "synthetic",
@@ -46,192 +32,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: Some("https://synthetic.new"),
     needs_url: false,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["hf:moonshotai/Kimi-K3"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.45,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 524_288,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-5.3"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 524_288,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 1.20,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 524_288,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_NONE_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V4.1-Flash"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 1.20,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 524_288,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_NONE_TO_MAX),
-        },
-        ModelEntry {
-            prefixes: &["hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.30,
-                output: 1.00,
-                cache_write: 0.00,
-                cache_read: 0.06,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_NONE_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["hf:openai/gpt-oss-120b"],
-            small: false,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.10,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 131_072,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_NONE_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            small: true,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 196_608,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_NONE_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-5.3-Flash"],
-            small: true,
-            family: ModelFamily::Synthetic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.04,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 524_288,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
-        },
-        ModelEntry {
-            prefixes: &["hf:Qwen/Qwen3.8-27B"],
-            small: true,
-            family: ModelFamily::Synthetic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.45,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.09,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(QWEN_EFFORT),
-        },
-    ];
-    MODELS
-}
 
 pub struct Synthetic {
     compat: OpenAiCompatProvider,
@@ -322,6 +122,7 @@ impl Provider for Synthetic {
 
 #[cfg(test)]
 mod tests {
+    use crate::manifest::ManifestRegistry;
     use test_case::test_case;
 
     use super::*;
@@ -346,7 +147,7 @@ mod tests {
         context_window: u32,
         vision: bool,
     ) {
-        let entry = lookup_entry(models(), id).unwrap();
+        let entry = lookup_entry(ManifestRegistry::get("synthetic").unwrap().models, id).unwrap();
         assert!(entry.prefixes.contains(&id));
         assert_eq!(entry.pricing.input, input);
         assert_eq!(entry.pricing.cache_read, cache_read);

@@ -6,8 +6,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::accounts::AccountCredential;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing};
-use crate::pricing::{PricingSchedule, PricingWindow};
+use crate::model::Model;
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::types::{ProviderUsage, UsageLimit};
 use crate::{
@@ -20,7 +19,6 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 const PAD: &str = "";
 const THINKING_PAD_MARKERS: &[&str] = &["deepseek-v4", "deepseek-flash"];
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
-const MAX_OUTPUT_TOKENS: u32 = 393_216;
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "deepseek",
@@ -41,59 +39,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: Some("https://platform.deepseek.com/api_keys"),
     needs_url: false,
 });
-
-/// Peak hours double every rate, and the tables below quote the off-peak ones.
-/// <https://api-docs.deepseek.com/quick_start/pricing/>
-pub(crate) const PEAK_HOURS: PricingSchedule = PricingSchedule::new(PEAK_WINDOWS, PEAK_MULTIPLIER);
-
-const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
-const PEAK_MULTIPLIER: f64 = 2.0;
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["deepseek-flash", "deepseek-v4-flash"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.003,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["deepseek-v4-pro"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.66,
-                output: 1.98,
-                cache_write: 0.00,
-                cache_read: 0.022,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-    ];
-    MODELS
-}
 
 #[derive(Deserialize)]
 struct BalanceResponse {
@@ -311,18 +256,13 @@ mod tests {
         assert_eq!(model.max_output_tokens, Some(PUBLISHED_OUTPUT_LIMIT));
     }
 
-    /// `PEAK_HOURS` only reaches a bill through the manifest, and a schedule
-    /// that never got hooked up looks exactly like off-peak all day. The
-    /// published hours are pinned here too, since either drifting bills every
-    /// DeepSeek turn at the wrong rate.
     #[test]
     fn the_manifest_bills_the_published_peak_hours() {
         let schedule = ManifestRegistry::get(CONFIG.slug)
             .expect("deepseek is a builtin")
             .pricing_schedule
             .expect("deepseek bills by the clock");
-        assert_eq!(schedule.to_string(), PEAK_HOURS.to_string());
-        assert_eq!(PEAK_HOURS.to_string(), PUBLISHED_PEAK_HOURS);
+        assert_eq!(schedule.to_string(), PUBLISHED_PEAK_HOURS);
     }
 
     fn assistant(content: Vec<ContentBlock>) -> Message {

@@ -1,5 +1,3 @@
-use crate::model::ModelEntry;
-
 use super::local::LLAMACPP;
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
@@ -13,7 +11,3 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: None,
     needs_url: true,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}

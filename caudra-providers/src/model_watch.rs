@@ -15,10 +15,7 @@ use crate::AgentError;
 use crate::decision_pricing;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
-use crate::providers::anthropic::shared::WIDE_CONTEXT_WINDOW;
 use crate::providers::catalog::{self, CatalogMeta, schema::CatalogModel};
-use crate::providers::openai;
-use crate::providers::xai::GROK_MAX_OUTPUT_TOKENS;
 
 /// Catalog slugs whose new models belong in a table. Aggregators relist every
 /// vendor's models, so their additions are someone else's release.
@@ -41,9 +38,11 @@ const NO_TIERS: &str = "none";
 const TIER_SEPARATOR: &str = "; ";
 const NO_DIFFERENCES: &str = "No differences.";
 const NEW_MODELS_HEADING: &str = "## New models\n";
-const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `caudra-providers/src/decision_pricing.rs` when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
+const DECISION_MODELS_HEADING: &str = "## Decision models\n\nmodels.dev does not list decision models, so this audit cannot compare them. Check every row on its source page each run, and change `decision-models.json` in the model data repository when a price, a release, or an alias moves. A new release gets its own prefix, never a broader one.\n";
 const RETIRED_HEADING: &str = "## Retired, remove from the table\n\nPast the shutdown day of their availability row, so every list already leaves them out. Delete each entry and its row.\n";
 const OLDER_MODELS_HEADING: &str = "## Older models no table names\n\nReleased before the survey window, yet still served. Add each one, or accept its omission in `ACCEPTED` as `Field::Unlisted` with the reason.\n";
+const WIDE_CONTEXT_WINDOW: u32 = 372_000;
+const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
 const COPILOT_FALLBACK_WINDOW: u32 = 200_000;
 const COPILOT_FALLBACK_OUTPUT: u32 = 100_000;
 const XAI_LONG_PROMPT: &str = "xAI bills a prompt of 200,000 tokens or more at the long-context rate (docs.x.ai/developers/models), and a tier's `above` is exclusive, so the table's sits at 199,999.";
@@ -465,7 +464,7 @@ pub const CAPS: &[Cap] = &[
     Cap {
         provider: "openai",
         field: Field::Context,
-        ours: openai::WIDE_CONTEXT_WINDOW,
+        ours: WIDE_CONTEXT_WINDOW,
         reason: "The working window of gpt-5.6 and gpt-6, below what the API accepts, because caudra fills it before compacting.",
     },
     Cap {

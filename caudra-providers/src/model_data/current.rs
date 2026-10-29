@@ -64,8 +64,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{Current, current};
-    use crate::decision_pricing::{self, DECISION_MODELS};
-    use crate::manifest::{BUILTINS, ManifestRegistry};
+    use crate::decision_pricing;
+    use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelError, ModelPurpose, TokenUsage, lookup_entry};
     use crate::model_data::{bundled, install};
     use crate::providers::catalog::seed_catalog_for_tests;
@@ -122,21 +122,6 @@ mod tests {
         let snapshot = wire::parse_bounded(&wire::to_pretty_bytes(&snapshot)).unwrap();
         wire::validate(&snapshot).unwrap();
         Current::from_snapshot(snapshot)
-    }
-
-    #[test]
-    fn converted_fixture_equals_every_const_table_field() {
-        let snapshot = bundled::snapshot();
-        wire::validate(&snapshot).unwrap();
-        assert!(snapshot.hash_matches());
-        let converted = Current::from_snapshot(snapshot);
-        assert_eq!(converted.manifests.len(), BUILTINS.len());
-        for (actual, expected) in converted.manifests.iter().zip(BUILTINS) {
-            assert_eq!(actual, expected, "{}", expected.slug);
-        }
-        assert_eq!(converted.decision_models, DECISION_MODELS);
-        assert_eq!(current().manifests, converted.manifests);
-        assert_eq!(current().decision_models, converted.decision_models);
     }
 
     #[test_case(false, FAMILY_REASON; "unknown_family")]
@@ -299,6 +284,6 @@ mod tests {
         );
         install(Current::from_snapshot(bundled::snapshot()));
         assert_eq!(current().revision, previous.revision + 2);
-        assert_eq!(previous.manifests, BUILTINS);
+        assert_eq!(previous.manifests, current().manifests);
     }
 }

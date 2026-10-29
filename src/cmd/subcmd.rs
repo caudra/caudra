@@ -2107,6 +2107,8 @@ fn with_announcements(
 
 #[cfg(test)]
 mod auth_tests {
+    use std::slice;
+
     use super::*;
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::tools::native::plan::SESSION_PLAN_LABEL;
@@ -2116,6 +2118,7 @@ mod auth_tests {
     use caudra_agent::tools::report::{REASON_CODE_MODULE, REASON_CONFIG};
     use caudra_agent::tools::{AUTOMATION_TOOL_NAME, cli_tool_ctx};
     use caudra_config::{Effect, Feature, FeatureFlags, PermissionRule, RawConfig};
+    use caudra_providers::manifest::ManifestRegistry;
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2370,22 +2373,31 @@ mod auth_tests {
         assert!(read_workcell_bearer(input.as_bytes()).is_err());
     }
 
-    const FAST_SPEC: &str = "anthropic/claude-haiku-5-5";
-    const SMALL_SPEC: &str = "openai/gpt-5.4-nano";
-    const BEST_SPEC: &str = "openai/gpt-5.6-sol";
     const UNCURATED_SPEC: &str = "ollama/llama3";
-    const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-5-5";
     const UNAVAILABLE_RESOLUTION: &str = "error: unavailable";
     const INSPECTION_TODO: &str = "todo_write";
     const INSPECTION_TASK: &str = "task";
     const INSPECTION_UNKNOWN: &str = "unregistered_inspection_tool";
     const INSPECTION_BINDING_ERROR: &str = "no registered binding";
 
-    #[test_case(FAST_SPEC, ModelMarker::Fast ; "fast_default")]
-    #[test_case(SMALL_SPEC, ModelMarker::Small ; "small_non_default")]
-    #[test_case(BEST_SPEC, ModelMarker::Best ; "best_default")]
-    fn a_listed_model_carries_its_supply_marker(spec: &str, marker: ModelMarker) {
-        let lines = model_lines(&[spec.into()]);
+    fn marked_spec(marker: ModelMarker) -> String {
+        ManifestRegistry::builtins()
+            .iter()
+            .find_map(|manifest| {
+                manifest.models.iter().find_map(|entry| {
+                    (entry.facts().marker() == Some(marker))
+                        .then(|| format!("{}/{}", manifest.slug, entry.prefixes[0]))
+                })
+            })
+            .unwrap()
+    }
+
+    #[test_case(ModelMarker::Fast ; "fast_default")]
+    #[test_case(ModelMarker::Small ; "small_non_default")]
+    #[test_case(ModelMarker::Best ; "best_default")]
+    fn a_listed_model_carries_its_supply_marker(marker: ModelMarker) {
+        let spec = marked_spec(marker);
+        let lines = model_lines(slice::from_ref(&spec));
         assert_eq!(
             lines,
             vec![format!("{spec}{MODEL_COLUMN_GAP}{}", marker.label())]
@@ -2396,7 +2408,10 @@ mod auth_tests {
     /// from the vendor named in the model id.
     #[test]
     fn an_aggregated_model_borrows_the_upstream_marker() {
-        let lines = model_lines(&[AGGREGATED_SPEC.into()]);
+        let spec = Model::curated_default("anthropic", ModelPurpose::Fast)
+            .unwrap()
+            .spec();
+        let lines = model_lines(&[format!("openrouter/{spec}")]);
         assert!(lines[0].ends_with(ModelMarker::Fast.label()), "{lines:?}");
     }
 
@@ -2412,9 +2427,10 @@ mod auth_tests {
 
     #[test]
     fn a_mixed_batch_aligns_on_the_widest_marked_spec() {
-        let lines = model_lines(&[FAST_SPEC.into(), UNCURATED_SPEC.into()]);
+        let spec = marked_spec(ModelMarker::Fast);
+        let lines = model_lines(&[spec.clone(), UNCURATED_SPEC.into()]);
         assert_eq!(lines[1], UNCURATED_SPEC, "unmarked rows stay bare");
-        assert!(lines[0].starts_with(FAST_SPEC));
+        assert!(lines[0].starts_with(&spec));
     }
 
     #[test]
@@ -2451,16 +2467,17 @@ Title     default       provider/title\n"
 
     #[test]
     fn model_job_resolution_keeps_policy_errors_visible() {
-        let anchor = Model::from_spec(FAST_SPEC).unwrap();
-        let policy = ModelPolicy::new(&[], &[BEST_SPEC.to_string()]).unwrap();
+        let anchor = Model::from_spec(&marked_spec(ModelMarker::Fast)).unwrap();
+        let best = marked_spec(ModelMarker::Best);
+        let policy = ModelPolicy::new(&[], slice::from_ref(&best)).unwrap();
         let row = model_job_row(
             ModelPurpose::Goal,
-            Some(Binding::Exact(BEST_SPEC.into())),
+            Some(Binding::Exact(best.clone())),
             &anchor,
             &policy,
         );
 
-        assert_eq!(row.binding, BEST_SPEC);
+        assert_eq!(row.binding, best);
         assert!(row.resolved.starts_with(MODEL_RESOLUTION_ERROR));
         assert!(row.resolved.contains("not allowed"));
     }
@@ -2488,7 +2505,7 @@ Title     default       provider/title\n"
         if disabled {
             config.agent.disabled_tools.push(INSPECTION_TODO.into());
         }
-        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let model = Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap();
         let filter = ToolFilter::from_config(&config.agent, &model, &[]);
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
             "default": "disabled", "overrides": {INSPECTION_TODO: exposure}
@@ -2546,7 +2563,7 @@ Title     default       provider/title\n"
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
         let config = RawConfig::default().into_config(false).unwrap();
-        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let model = Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap();
         let filter = ToolFilter::from_config(&config.agent, &model, &[]);
         let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
             "default": "disabled", "overrides": {PLAN_TOOL_NAME: exposure}
@@ -2604,7 +2621,7 @@ Title     default       provider/title\n"
                 workflows_available: false,
             },
             &AgentConfig::default(),
-            &Model::from_spec(BEST_SPEC).unwrap(),
+            &Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap(),
             &policy,
             mode.has_session_plan(None),
         )
@@ -2656,7 +2673,7 @@ Title     default       provider/title\n"
                 workflows_available: false,
             },
             &config,
-            &Model::from_spec(BEST_SPEC).unwrap(),
+            &Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap(),
             &policy,
             false,
         )
@@ -2689,7 +2706,7 @@ Title     default       provider/title\n"
                 workflows_available: false,
             },
             &AgentConfig::default(),
-            &Model::from_spec(BEST_SPEC).unwrap(),
+            &Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap(),
             &policy,
             false,
         )
@@ -2710,7 +2727,7 @@ Title     default       provider/title\n"
         .unwrap();
         let mut config = RawConfig::default().into_config(false).unwrap();
         config.agent.features = FeatureFlags::NONE.with(Feature::Automations);
-        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let model = Model::from_spec(&marked_spec(ModelMarker::Best)).unwrap();
         let filter = ToolFilter::from_config(&config.agent, &model, &[]);
         let policy = ProfileToolPolicy::default();
         let definitions = inspection_definitions(

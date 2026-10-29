@@ -124,6 +124,7 @@ fn levels<Level: Borrow<str>>(ladder: &[Level]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::{ReasoningOption, ReasoningOptions, ThinkingSupport};
     use caudra_storage::StateDir;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -135,7 +136,8 @@ mod tests {
     const WITHDRAWN: &str = "an announced list must be withdrawn once none applies";
     const OPUS: &str = "anthropic/claude-opus-5-5";
     const HAIKU: &str = "anthropic/claude-haiku-5-5";
-    const OLD_OPUS: &str = "anthropic/claude-opus-4-5";
+    const UNMARKED: &str = "ollama/test-model";
+    const LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
     fn listing(spec: &str) -> String {
         MODEL_FAVORITES_PROMPT.replace(FAVORITES_SLOT, spec)
@@ -150,16 +152,31 @@ mod tests {
         assert_eq!(levels(ladder), expected);
     }
 
-    #[test_case(OPUS, &[ModelPurpose::Chat, ModelPurpose::Subagent], "- `anthropic/claude-opus-5-5`: lane Best; jobs Chat, Subagent; thinking low–max, never off" ; "lane_jobs_and_a_ladder_that_never_turns_off")]
-    #[test_case(HAIKU, &[], "- `anthropic/claude-haiku-5-5`: lane Fast; thinking off, low–max" ; "no_jobs_and_a_ladder_that_turns_off")]
-    #[test_case(OLD_OPUS, &[], "- `anthropic/claude-opus-4-5`: thinking low–high, never off" ; "no_marker_leaves_the_lane_out")]
+    #[test_case(Some(ModelPurpose::Best), false, &[ModelPurpose::Chat, ModelPurpose::Subagent], "lane Best; jobs Chat, Subagent; thinking low–max, never off" ; "lane_jobs_and_a_ladder_that_never_turns_off")]
+    #[test_case(Some(ModelPurpose::Fast), true, &[], "lane Fast; thinking off, low–max" ; "no_jobs_and_a_ladder_that_turns_off")]
+    #[test_case(None, false, &[], "thinking low–max, never off" ; "no_marker_leaves_the_lane_out")]
     fn a_favorite_line_names_lane_jobs_and_thinking(
-        spec: &str,
+        purpose: Option<ModelPurpose>,
+        toggle: bool,
         jobs: &[ModelPurpose],
         expected: &str,
     ) {
-        let model = Model::from_spec(spec).unwrap();
-        assert_eq!(line(spec, &model, jobs), expected);
+        let mut model = purpose.map_or_else(
+            || Model::from_spec(UNMARKED).unwrap(),
+            |purpose| Model::curated_default("anthropic", purpose).unwrap(),
+        );
+        model.thinking_override = Some(ThinkingSupport::Yes);
+        model.reasoning_options = ReasoningOptions::new(
+            toggle
+                .then_some(ReasoningOption::Toggle)
+                .into_iter()
+                .chain([ReasoningOption::Effort {
+                    values: LADDER.iter().map(|level| (*level).to_owned()).collect(),
+                }])
+                .collect(),
+        );
+        let spec = model.spec();
+        assert_eq!(line(&spec, &model, jobs), format!("- `{spec}`: {expected}"));
     }
 
     #[test]

@@ -106,11 +106,17 @@ mod tests {
 
     use super::*;
 
-    const OPUS: &str = "anthropic/claude-opus-5-5";
-    const OPUS_SHORT: &str = "claude-opus-5-5";
-    const HAIKU: &str = "anthropic/claude-haiku-5-5";
-    const XHIGH: &str = "xhigh";
     const MAX: &str = "max";
+
+    fn best() -> Model {
+        Model::curated_default("anthropic", ModelPurpose::Best).unwrap()
+    }
+
+    fn fast_spec() -> String {
+        Model::curated_default("anthropic", ModelPurpose::Fast)
+            .unwrap()
+            .spec()
+    }
 
     fn state_dir() -> (TempDir, StateDir) {
         let temp = TempDir::new().unwrap();
@@ -119,13 +125,13 @@ mod tests {
     }
 
     fn starred(dir: &StateDir) {
-        for spec in [OPUS, HAIKU] {
-            model_registry::toggle_favorite_and_persist(spec, dir).unwrap();
+        for spec in [best().spec(), fast_spec()] {
+            model_registry::toggle_favorite_and_persist(&spec, dir).unwrap();
         }
     }
 
-    fn only_haiku() -> ModelPolicy {
-        ModelPolicy::new(&[HAIKU.to_owned()], &[]).unwrap()
+    fn only_fast() -> ModelPolicy {
+        ModelPolicy::new(&[fast_spec()], &[]).unwrap()
     }
 
     #[test]
@@ -156,19 +162,19 @@ mod tests {
             .into_iter()
             .map(|favorite| (favorite.spec, favorite.best_lane))
             .collect();
-        assert_eq!(all, [(HAIKU.to_owned(), false), (OPUS.to_owned(), true)]);
-        let kept: Vec<String> = allowed_favorites(&only_haiku())
+        assert_eq!(all, [(fast_spec(), false), (best().spec(), true)]);
+        let kept: Vec<String> = allowed_favorites(&only_fast())
             .into_iter()
             .map(|favorite| favorite.spec)
             .collect();
-        assert_eq!(kept, [HAIKU]);
+        assert_eq!(kept, [fast_spec()]);
     }
 
-    #[test_case(ModelPolicy::default(), Some(OPUS), AutoReason::BestFavorite ; "an_allowed_best_favorite")]
-    #[test_case(only_haiku(), None, AutoReason::NoModel ; "an_excluded_best_favorite")]
+    #[test_case(ModelPolicy::default(), true, AutoReason::BestFavorite ; "an_allowed_best_favorite")]
+    #[test_case(only_fast(), false, AutoReason::NoModel ; "an_excluded_best_favorite")]
     fn the_hardest_kind_follows_the_policy(
         policy: ModelPolicy,
-        model: Option<&str>,
+        has_model: bool,
         reason: AutoReason,
     ) {
         let (_temp, dir) = state_dir();
@@ -176,19 +182,21 @@ mod tests {
         let table = resolve(&StoredRoles::default(), &policy, true);
         let row = table.row(Kind::Hardest).unwrap();
         assert_eq!(row.source, Source::Auto(reason));
-        assert_eq!(row.seats[0].model.as_deref(), model);
+        assert_eq!(row.seats[0].model, has_model.then(|| best().spec()));
     }
 
     #[test]
     fn a_stored_short_name_resolves_through_the_favorites() {
         let (_temp, dir) = state_dir();
         starred(&dir);
+        let model = best();
+        let thinking = favorites::effort_levels(&model).first().cloned();
         let stored = StoredRoles {
             kinds: BTreeMap::from([(
                 Kind::Code,
                 vec![Seat::Model {
-                    model: OPUS_SHORT.to_owned(),
-                    thinking: None,
+                    model: model.id.clone(),
+                    thinking: thinking.clone(),
                 }],
             )]),
             ..StoredRoles::default()
@@ -199,8 +207,8 @@ mod tests {
         assert_eq!(
             row.seats,
             [ResolvedSeat {
-                model: Some(OPUS.to_owned()),
-                thinking: Some(XHIGH.to_owned()),
+                model: Some(model.spec()),
+                thinking,
             }]
         );
     }

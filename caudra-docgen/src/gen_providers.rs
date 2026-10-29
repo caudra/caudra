@@ -984,8 +984,8 @@ mod tests {
     use caudra_config::interpolation::{self, Lookup};
     use caudra_config::migration;
     use caudra_config::providers::{PROVIDERS_FORMAT, ProvidersConfig};
-    use caudra_providers::manifest::{Availability, ManifestRegistry, ProviderManifest};
-    use caudra_providers::model::{ModelEntry, ModelPricing};
+    use caudra_providers::manifest::{Availability, ProviderManifest};
+    use caudra_providers::model::{ModelEntry, ModelFamily, ModelPricing};
     use caudra_providers::pricing::{Period, PricePeriod};
     use jiff::civil::{Date, date};
     use test_case::test_case;
@@ -996,11 +996,9 @@ mod tests {
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
     const DECISION_HEADER: &str = "[decisions.";
-    const COPILOT_HANDOVER: &str =
-        "claude-opus-5 (Best) until 2026-11-16, then claude-opus-5.5 (Best)";
-
-    const ARGON: &str = "gemini-4-argon";
-    const STEADY: &str = "gemini-3.5-flash-lite";
+    const HANDOVER: &str = "retiring (Best) until 2026-12-01, then successor (Best)";
+    const RETIRING: &str = "retiring";
+    const SUCCESSOR: &str = "successor";
     const PERIOD_RATES: ModelPricing = ModelPricing {
         input: 4.00,
         output: 20.00,
@@ -1008,21 +1006,44 @@ mod tests {
     };
     const DECEMBER: Date = date(2026, 12, 1);
     const JANUARY: Date = date(2027, 1, 1);
+    const ENTRY: ModelEntry = ModelEntry {
+        prefixes: &[RETIRING],
+        small: false,
+        default: true,
+        vision: false,
+        family: ModelFamily::Generic,
+        pricing: ModelPricing {
+            input: 0.30,
+            output: 2.50,
+            ..ModelPricing::ZERO
+        },
+        max_output_tokens: Some(8_000),
+        context_window: 32_000,
+        window_excludes_output: false,
+        unsupported: None,
+        reasoning_options: None,
+    };
+    const MANIFEST: ProviderManifest = ProviderManifest {
+        slug: "test",
+        display_name: "Test",
+        family: ModelFamily::Generic,
+        supports_thinking: false,
+        accepts_arbitrary_models: false,
+        fallback_max_output: ENTRY.max_output_tokens,
+        fallback_context_window: ENTRY.context_window,
+        models: &[],
+        generations: &[],
+        serves_fast_mode: false,
+        pricing_schedule: None,
+        price_periods: &[],
+        availability: &[],
+        catalog_slug: None,
+    };
 
-    fn google_entry(prefix: &str) -> &'static ModelEntry {
-        ManifestRegistry::get("google")
-            .unwrap()
-            .models
-            .iter()
-            .find(|entry| entry.prefixes.contains(&prefix))
-            .unwrap()
-    }
-
-    #[test_case(ARGON, "$2.00 / $10.00, then $4.00 / $20.00 from 2026-12-01" ; "an_announced_change_follows_todays_price")]
-    #[test_case(STEADY, "$0.30 / $2.50"                                     ; "a_steady_price_stands_alone")]
-    fn pricing_shows_an_announced_change_with_its_date(prefix: &str, expected: &str) {
-        let google = ManifestRegistry::get("google").unwrap();
-        assert_eq!(format_pricing(google_entry(prefix), google), expected);
+    #[test]
+    fn a_steady_price_stands_alone() {
+        const EXPECTED: &str = "$0.30 / $2.50";
+        assert_eq!(format_pricing(&ENTRY, &MANIFEST), EXPECTED);
     }
 
     #[test_case(Period::from(DECEMBER), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01" ; "from_follows_the_table")]
@@ -1030,15 +1051,15 @@ mod tests {
     #[test_case(Period::between(DECEMBER, JANUARY), "$0.30 / $2.50, then $4.00 / $20.00 from 2026-12-01 until 2027-01-01, then $0.30 / $2.50" ; "between_returns_to_the_table")]
     fn pricing_reads_a_period_in_date_order(during: Period, expected: &str) {
         let periods: &'static [PricePeriod] = Box::leak(Box::new([PricePeriod {
-            prefix: STEADY,
+            prefix: RETIRING,
             during,
             pricing: PERIOD_RATES,
         }]));
         let manifest = ProviderManifest {
             price_periods: periods,
-            ..*ManifestRegistry::get("google").unwrap()
+            ..MANIFEST
         };
-        assert_eq!(format_pricing(google_entry(STEADY), &manifest), expected);
+        assert_eq!(format_pricing(&ENTRY, &manifest), expected);
     }
 
     #[test_case(Period::until(DECEMBER), Some("retires 2026-12-01")                                   ; "a_shutdown")]
@@ -1046,27 +1067,37 @@ mod tests {
     #[test_case(Period::between(DECEMBER, JANUARY), Some("available from 2026-12-01, retires 2027-01-01") ; "both")]
     fn availability_reads_its_dates(during: Period, expected: Option<&str>) {
         let rows: &'static [Availability] = Box::leak(Box::new([Availability {
-            prefix: STEADY,
+            prefix: RETIRING,
             during,
         }]));
         let manifest = ProviderManifest {
             availability: rows,
-            ..*ManifestRegistry::get("google").unwrap()
+            ..MANIFEST
         };
-        assert_eq!(
-            format_availability(google_entry(STEADY), &manifest).as_deref(),
-            expected
-        );
+        assert_eq!(format_availability(&ENTRY, &manifest).as_deref(), expected);
     }
 
     #[test]
     fn a_retiring_default_hands_its_lane_over_in_the_routing_line() {
+        let models = Box::leak(Box::new([
+            ENTRY,
+            ModelEntry {
+                prefixes: &[SUCCESSOR],
+                ..ENTRY
+            },
+        ]));
+        let availability = Box::leak(Box::new([Availability {
+            prefix: RETIRING,
+            during: Period::until(DECEMBER),
+        }]));
+        let manifest = ProviderManifest {
+            models,
+            availability,
+            ..MANIFEST
+        };
         let mut out = String::new();
-        write_model_table(&mut out, ManifestRegistry::get("copilot").unwrap());
-        assert!(
-            out.contains(COPILOT_HANDOVER),
-            "{COPILOT_HANDOVER} missing from:\n{out}"
-        );
+        write_model_table(&mut out, &manifest);
+        assert!(out.contains(HANDOVER), "{HANDOVER} missing from:\n{out}");
     }
 
     #[test]

@@ -1,13 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use jiff::civil;
 use serde_json::{Value, json};
 
 use crate::accounts::AccountCredential;
-use crate::manifest::Availability;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
-use crate::pricing::{Period, PricePeriod};
+use crate::model::{Model, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -15,31 +12,6 @@ use crate::{
 
 use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-
-const LARGE_4: &str = "mistral-large-4";
-const GLM_5_2: &str = "glm-5-2";
-
-/// Mistral Large 4 launched on 2026-10-06 at half price "for 2 weeks"
-/// (docs.mistral.ai/getting-started/changelog), so list price from 2026-10-20,
-/// as <https://docs.mistral.ai/models/mistral-large-4-0> quotes it.
-pub(crate) const PRICE_PERIODS: &[PricePeriod] = &[PricePeriod {
-    prefix: LARGE_4,
-    during: Period::from(civil::date(2026, 10, 20)),
-    pricing: ModelPricing {
-        input: 1.36,
-        output: 4.18,
-        cache_write: 0.00,
-        cache_read: 0.14,
-        fast: None,
-        tiers: ModelPricing::UNTIERED,
-    },
-}];
-
-/// Shutdowns from <https://docs.mistral.ai/getting-started/changelog/>.
-pub(crate) const AVAILABILITY: &[Availability] = &[Availability {
-    prefix: GLM_5_2,
-    during: Period::until(civil::date(2026, 10, 31)),
-}];
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "mistral",
@@ -79,198 +51,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: Some("https://admin.mistral.ai/organization/api-keys"),
     needs_url: false,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &[
-                "mistral-medium-latest",
-                "mistral-medium-3.5",
-                "mistral-medium-3-5",
-                "mistral-medium-2604",
-                "mistral-medium-3",
-            ],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.5,
-                output: 7.5,
-                cache_write: 0.00,
-                cache_read: 0.15,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &[LARGE_4],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.68,
-                output: 2.09,
-                cache_write: 0.00,
-                cache_read: 0.07,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["mistral-large-latest", "mistral-large-2512"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.50,
-                output: 1.50,
-                cache_write: 0.00,
-                cache_read: 0.05,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["zai-glm-5-3-flash"],
-            small: true,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["glm-5-3", "zai-glm-5-3", "zai-glm-5", "zai-glm-latest"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.14,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &[GLM_5_2, "zai-glm-5-2"],
-            small: false,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.14,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["deepseek-v4-1-flash-1017"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.30,
-                output: 1.20,
-                cache_write: 0.00,
-                cache_read: 0.007,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 1_000_000,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.015,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-        ModelEntry {
-            prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
-            small: true,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 0.20,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
-                tiers: ModelPricing::UNTIERED,
-            },
-            max_output_tokens: None,
-            context_window: 262_144,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: None,
-        },
-    ];
-    MODELS
-}
 
 pub struct Mistral {
     compat: OpenAiCompatProvider,
@@ -460,12 +240,14 @@ pub(crate) fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestRegistry;
     use crate::model::lookup_entry;
     use crate::providers::Timeouts;
     use crate::{ContentBlock, Role};
     use serde_json::{Value, json};
     use test_case::test_case;
 
+    const LARGE_4: &str = "mistral-large-4";
     const API_KEY: &str = "sk-mistral";
     const MODEL: &str = "mistral/mistral-medium-latest";
     const SYSTEM_PROMPT: &str = "sys";
@@ -478,7 +260,10 @@ mod tests {
     #[test_case("mistral-large-2512", 0.05 ; "large_3")]
     fn cached_input_pricing(id: &str, expected: f64) {
         assert_eq!(
-            lookup_entry(models(), id).unwrap().pricing.cache_read,
+            lookup_entry(ManifestRegistry::get("mistral").unwrap().models, id)
+                .unwrap()
+                .pricing
+                .cache_read,
             expected
         );
     }
@@ -492,7 +277,7 @@ mod tests {
     #[test_case("mistral-medium-3", "mistral-medium-3-5" ; "medium_3_alias_is_medium_3_5")]
     fn api_names_resolve_to_their_model(id: &str, model: &str) {
         assert!(
-            lookup_entry(models(), id)
+            lookup_entry(ManifestRegistry::get("mistral").unwrap().models, id)
                 .unwrap()
                 .prefixes
                 .contains(&model)
@@ -509,7 +294,7 @@ mod tests {
         output: f64,
         vision: bool,
     ) {
-        let entry = lookup_entry(models(), id).unwrap();
+        let entry = lookup_entry(ManifestRegistry::get("mistral").unwrap().models, id).unwrap();
         assert!(entry.prefixes.contains(&id));
         assert_eq!(entry.pricing.input, input);
         assert_eq!(entry.pricing.cache_read, cache_read);

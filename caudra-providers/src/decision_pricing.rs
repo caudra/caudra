@@ -2,12 +2,9 @@
 //! questions rather than chat, so they live apart from the provider manifests:
 //! they never appear in `/model`, model-watch, or the chat price tables.
 
-use std::borrow::Cow;
-
 use caudra_config::decisions::DecisionProtocol;
 
-use crate::model::{ModelPricing, PricingTier, TokenUsage};
-use crate::providers::openai::LONG_CONTEXT_ABOVE;
+use crate::model::{ModelPricing, TokenUsage};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -19,51 +16,6 @@ pub struct DecisionModelEntry {
     /// because models.dev does not cover decision models.
     pub source: &'static str,
 }
-
-#[allow(
-    dead_code,
-    reason = "retained for fixture equivalence until the const tables are removed"
-)]
-pub(crate) const DECISION_MODELS: &[DecisionModelEntry] = &[
-    // Input at $0.10/M, cache reads and writes at gpt-6-luna's standard cache
-    // rates, no output charge, and the long-context multiplier past 272K.
-    DecisionModelEntry {
-        protocol: DecisionProtocol::OpenAI,
-        prefixes: &["gpt-6-luna"],
-        pricing: ModelPricing {
-            input: 0.10,
-            output: 0.0,
-            cache_write: 0.125,
-            cache_read: 0.01,
-            fast: None,
-            tiers: Cow::Borrowed(&[PricingTier {
-                above: LONG_CONTEXT_ABOVE,
-                input: 0.20,
-                output: 0.0,
-                cache_write: 0.25,
-                cache_read: 0.02,
-                fast: None,
-            }]),
-        },
-        source: "https://developers.openai.com/api/docs/guides/decisions#pricing-and-availability",
-    },
-    // Every Jev release bills input only, at $0.042/M, with no cache charges
-    // and no long-context premium. Versions and aliases are listed one by one
-    // so a future release stays unpriced rather than guessed.
-    DecisionModelEntry {
-        protocol: DecisionProtocol::TypeSafe,
-        prefixes: &["jev-1.14", "jev-1.13", "jev-latest", "jev-preview"],
-        pricing: ModelPricing {
-            input: 0.042,
-            output: 0.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-            fast: None,
-            tiers: ModelPricing::UNTIERED,
-        },
-        source: "https://docs.typesafe.ai/models",
-    },
-];
 
 pub fn entries() -> &'static [DecisionModelEntry] {
     crate::model_data::current().decision_models
@@ -99,8 +51,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{decision_cost, lookup};
+    use crate::manifest::ManifestRegistry;
     use crate::model::{TokenUsage, lookup_entry};
-    use crate::providers::openai;
 
     const TOLERANCE: f64 = 1e-12;
     const MILLION: u32 = 1_000_000;
@@ -155,7 +107,9 @@ mod tests {
     #[test]
     fn luna_cache_rates_follow_the_chat_entry() {
         let decision = &lookup(&DecisionProtocol::OpenAI, LUNA).unwrap().pricing;
-        let chat = &lookup_entry(openai::models(), LUNA).unwrap().pricing;
+        let chat = &lookup_entry(ManifestRegistry::get("openai").unwrap().models, LUNA)
+            .unwrap()
+            .pricing;
         assert_eq!(
             (decision.cache_read, decision.cache_write),
             (chat.cache_read, chat.cache_write),

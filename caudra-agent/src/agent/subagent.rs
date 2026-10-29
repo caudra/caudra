@@ -2146,7 +2146,6 @@ mod tests {
     const ROUTING_BASE_URL: &str = "http://127.0.0.1:1";
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
-    const ROUTING_FAST: &str = "anthropic/claude-haiku-5-5";
     const ROUTING_BASELINE_NAME: &str = "sonnet 4.6";
     const ROUTING_PROFILE: &str = "security";
     const ROUTING_SECRET: &str = "do-not-send-this-value";
@@ -2160,10 +2159,16 @@ mod tests {
     const SUBAGENT_ROOT: &str = "/work/project";
     const LOCAL_READER: &str = "local_reader";
     const LOCAL_RESULT: &str = "local result";
-    const SONNET_NAME: &str = "sonnet";
-    const NEWEST_SONNET: &str = "anthropic/claude-sonnet-5-5";
-    const FAVORITE_SONNET: &str = "anthropic/claude-sonnet-4-5";
-    const OTHER_PROVIDER_SONNET: &str = "copilot/claude-sonnet-4.6";
+    const SONNET_NAME: &str = "fixture-sonnet";
+    const NEWEST_SONNET: &str = "ollama/fixture-sonnet-2";
+    const FAVORITE_SONNET: &str = "ollama/fixture-sonnet-1";
+    const OTHER_PROVIDER_SONNET: &str = "llama-cpp/fixture-sonnet-1";
+
+    fn routing_fast() -> String {
+        Model::curated_default("anthropic", ModelPurpose::Fast)
+            .unwrap()
+            .spec()
+    }
 
     struct RevisionChangingProvider {
         permissions: Arc<PermissionManager>,
@@ -2413,14 +2418,14 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut ctx = routing_context();
             ctx.model = Arc::new(
-                Model::from_spec(if same_model {
-                    ROUTING_FAST
+                Model::from_spec(&if same_model {
+                    routing_fast()
                 } else {
-                    ROUTING_BASELINE
+                    ROUTING_BASELINE.to_owned()
                 })
                 .unwrap(),
             );
-            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
             if let Some(leave_yolo) = leave_yolo {
                 ctx.chat_provider = Arc::new(RevisionChangingProvider {
                     permissions: Arc::clone(&ctx.permissions),
@@ -2461,7 +2466,7 @@ mod tests {
                 assert_eq!(
                     subagent.params.model.spec(),
                     if expected == DecisionEffect::Rerouted {
-                        ROUTING_FAST.into()
+                        routing_fast()
                     } else {
                         ctx.model.spec()
                     }
@@ -2511,7 +2516,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut ctx = routing_context();
             ctx.model = Arc::new(Model::from_spec(ROUTING_BASELINE).unwrap());
-            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
             let calls = Arc::new(AtomicUsize::new(0));
             ctx.permissions.set_decisions(Some(routing_decisions(
                 &directory,
@@ -2550,8 +2555,6 @@ mod tests {
         });
     }
 
-    /// The session runs the newest Sonnet, which a bare `sonnet` names unless
-    /// the user starred another one.
     #[test_case(&[], &[] => NEWEST_SONNET ; "without_favorites_the_newest_wins")]
     #[test_case(&[FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "a_favorite_beats_a_newer_model")]
     #[test_case(&[OTHER_PROVIDER_SONNET, FAVORITE_SONNET], &[] => FAVORITE_SONNET ; "the_session_provider_breaks_a_tie_between_favorites")]
@@ -2599,14 +2602,14 @@ mod tests {
             for _ in 0..ROUTING_ROUNDS {
                 let mut ctx = routing_context();
                 ctx.model = Arc::new(
-                    Model::from_spec(if same_model {
-                        ROUTING_FAST
+                    Model::from_spec(&if same_model {
+                        routing_fast()
                     } else {
-                        ROUTING_BASELINE
+                        ROUTING_BASELINE.to_owned()
                     })
                     .unwrap(),
                 );
-                ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+                ctx.chat_model = Arc::new(Model::from_spec(&routing_fast()).unwrap());
                 ctx.event_tx = EventSender::new(sender.clone(), RUN_ID);
                 ctx.tool_use_id = Some(TOOL_ID.into());
                 ctx.permissions.set_decisions(Some(decisions.clone()));
@@ -2634,8 +2637,9 @@ mod tests {
                     NoteOutcome::Acted | NoteOutcome::Shadow => assert_eq!(
                         note.summary,
                         format!(
-                            "{}{phrase} {ROUTING_FAST} instead of {ROUTING_BASELINE} (difficulty {ROUTINE_BAND}, {:.2})",
+                            "{}{phrase} {} instead of {ROUTING_BASELINE} (difficulty {ROUTINE_BAND}, {:.2})",
                             note.outcome.lead(),
+                            routing_fast(),
                             FAST_LEVELS[0] + FAST_LEVELS[1]
                         )
                     ),

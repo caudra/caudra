@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::accounts::AccountCredential;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
+use crate::model::{Model, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest, adjust_model_metadata};
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -50,10 +50,6 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     login_url: None,
     needs_url: true,
 });
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}
 
 type Overrides = HashMap<String, ProviderOverride>;
 

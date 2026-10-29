@@ -5,18 +5,6 @@ mod usage;
 
 pub use platform::Xai;
 
-use std::borrow::Cow;
-
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, PricingTier, StaticReasoningOption};
-
-const GROK_CONTEXT_WINDOW: u32 = 500_000;
-const GROK_4_3_CONTEXT_WINDOW: u32 = 1_000_000;
-pub(crate) const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
-/// Once a prompt reaches this many tokens, xAI bills every token of the
-/// request at the long-context rate. A tier's `above` is exclusive, so the
-/// tiers sit one token below it.
-const LONG_CONTEXT_FROM: u32 = 200_000;
-
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "xai",
     display_name: "xAI",
@@ -29,139 +17,19 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-/// Levels these models declare, matching the models.dev catalog. The live
-/// `/language-models` response overrides these once it lands.
-const EFFORT_TO_XHIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "low", "medium", "high", "xhigh",
-])];
-const EFFORT_TO_HIGH: &[StaticReasoningOption] =
-    &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
-const EFFORT_WITH_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
-    "none", "low", "medium", "high",
-])];
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["grok-4.7"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_FROM - 1,
-                    input: 4.00,
-                    output: 12.00,
-                    cache_write: 0.00,
-                    cache_read: 1.00,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_CONTEXT_WINDOW,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["grok-4.6"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_FROM - 1,
-                    input: 4.00,
-                    output: 12.00,
-                    cache_write: 0.00,
-                    cache_read: 1.00,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_CONTEXT_WINDOW,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_TO_XHIGH),
-        },
-        ModelEntry {
-            prefixes: &["grok-4.5"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_FROM - 1,
-                    input: 4.00,
-                    output: 12.00,
-                    cache_write: 0.00,
-                    cache_read: 0.60,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_CONTEXT_WINDOW,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_TO_HIGH),
-        },
-        ModelEntry {
-            prefixes: &["grok-4.3"],
-            small: false,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 2.50,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-                tiers: Cow::Borrowed(&[PricingTier {
-                    above: LONG_CONTEXT_FROM - 1,
-                    input: 2.50,
-                    output: 5.00,
-                    cache_write: 0.00,
-                    cache_read: 0.40,
-                    fast: None,
-                }]),
-            },
-            max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
-            context_window: GROK_4_3_CONTEXT_WINDOW,
-            window_excludes_output: false,
-            unsupported: None,
-            reasoning_options: Some(EFFORT_WITH_NONE),
-        },
-    ];
-    MODELS
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::manifest::ManifestRegistry;
     use test_case::test_case;
 
-    use super::*;
+    use crate::model::ModelPricing;
     use crate::model::{Model, ModelInfo, TokenUsage, lookup_entry};
     use crate::model_registry;
 
+    const GROK_CONTEXT_WINDOW: u32 = 500_000;
+    const GROK_4_3_CONTEXT_WINDOW: u32 = 1_000_000;
+    const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
+    const LONG_CONTEXT_FROM: u32 = 200_000;
     const XAI_SLUG: &str = "xai";
     const GROK_4_6: &str = "grok-4.6";
     const LONG_CONTEXT_MULTIPLIER: f64 = 2.0;
@@ -173,7 +41,7 @@ mod tests {
 
     #[test]
     fn every_tier_doubles_the_base_rates_from_200k() {
-        for model in models() {
+        for model in ManifestRegistry::get("xai").unwrap().models {
             let pricing = &model.pricing;
             let [tier] = &*pricing.tiers else {
                 panic!("{}: {LONG_CONTEXT_RULE}", model.prefixes[0]);
@@ -213,7 +81,7 @@ mod tests {
     /// discovery outranks the table.
     #[test]
     fn discovered_rates_keep_the_static_tier() {
-        let entry = lookup_entry(models(), GROK_4_6).unwrap();
+        let entry = lookup_entry(ManifestRegistry::get("xai").unwrap().models, GROK_4_6).unwrap();
         model_registry::set_known_models(
             XAI_SLUG,
             vec![ModelInfo {
@@ -244,7 +112,9 @@ mod tests {
         cache_read: f64,
         context_window: u32,
     ) {
-        let model = models()
+        let model = ManifestRegistry::get("xai")
+            .unwrap()
+            .models
             .iter()
             .find(|model| model.prefixes.contains(&model_id))
             .expect("curated xAI model should be registered");
