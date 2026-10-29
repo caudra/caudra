@@ -35,6 +35,7 @@ use crate::components::rewind_picker::RewindEntry;
 use crate::components::sandbox_manager::SandboxAction;
 #[cfg(unix)]
 use crate::components::sandbox_manager::tests::fixture as sandbox_manager_fixture;
+use crate::components::side_transcript::SideTranscript;
 use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
@@ -68,16 +69,20 @@ use caudra_agent::permissions::{
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
+use caudra_agent::tools::registry::{
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+};
+use caudra_agent::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx};
 use caudra_agent::tools::{
-    PermissionScopes, SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry,
-    VIEW_IMAGE_TOOL_NAME, native,
+    DescriptionContext, FILE_READ_TOOL_NAME, PermissionScopes, SHELL_TOOL_NAME,
+    TODOWRITE_TOOL_NAME, ToolContext, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
 };
 use caudra_agent::types::{
     AnswerKind, AskedQuestion, QUESTION_DISMISSED_REPLY, QuestionEvent, QuestionOption,
     QuestionReply, QuestionSource, TodoItem, TodoPriority, TodoStatus,
 };
 use caudra_agent::{
-    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken,
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelMap, CancelToken,
     ConversationControl, DoneReason, EventSender, GoalResult, GoalStatus, GoalVerdict,
     HistorySnapshot, ImageMediaType, McpConfigErrors, McpPromptInfo, McpServerInfo,
     McpServerStatus, McpSnapshot, McpSnapshotReader, SettingsChange, SharedBuf, SubagentActivity,
@@ -95,10 +100,11 @@ use caudra_lua::{
     BuiltinAction, FloatConfig, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader,
 };
 use caudra_providers::model_registry::{self, Binding};
+use caudra_providers::provider::{BoxFuture, Provider};
 use caudra_providers::{
-    Billing, ContentBlock, HistoryItem, HistoryItemKind, Message, RequestOptions, Role,
-    THINKING_USAGE, TaskEventOrigin, TokenUsage, UserOrigin, expand_message, merge_history_items,
-    project_messages,
+    AgentError, Billing, ContentBlock, HistoryItem, HistoryItemKind, Message, ProviderEvent,
+    RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE, TaskEventOrigin, TokenUsage,
+    UserOrigin, expand_message, merge_history_items, project_messages,
 };
 use caudra_storage::StateClass;
 use caudra_storage::changelog;
@@ -170,8 +176,6 @@ const PROGRAM_STATUS_AUTOMATIC: &str = "Automatic work must not request user int
 const PROGRAM_STATUS_SAVE: &str = "Sandbox save must await durable acknowledgment";
 const QUESTION_BTW_MAIN_DRAFT: &str = "Keep the main composer draft";
 const QUESTION_BTW_REPLACEMENT: &str = "Which replacement?";
-const QUESTION_BTW_MODEL: &str = "question-btw-model";
-const QUESTION_BTW_COST: f64 = 0.25;
 const QUESTION_BTW_INPUT_TOKENS: u32 = 100;
 const QUESTION_BTW_INVOCATION: &str = "question-btw-invocation";
 const QUESTION_BTW_BACK_CONTROL: usize = 0;
@@ -17047,7 +17051,7 @@ fn assistant_message(text: &str) -> Message {
 }
 
 /// A route that never answers, for side requests a test settles by hand.
-struct PendingProvider;
+pub(crate) struct PendingProvider;
 
 impl caudra_providers::provider::Provider for PendingProvider {
     fn stream_message<'a>(
@@ -18326,7 +18330,7 @@ fn session_picker_relocation_keys_request_runtime_preflight(bind: Bind, bulk: bo
     ));
     assert!(!app.session_picker.is_open());
     assert!(!app.session_relocation_picker.is_open());
-    assert!(!app.stream_modal.is_open(), "the picker keeps its F2");
+    assert!(!app.btw.is_open(), "the picker keeps its F2");
 }
 
 fn open_relocation_picker(app: &mut App) {
@@ -20480,32 +20484,20 @@ fn btw_usage_settles_into_the_session_ledger() {
     app.state.goal.set("ship it").unwrap();
     app.chats[0].context_size = 1000;
 
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal.open(
-        " /btw ",
-        "why sqlite?".into(),
-        StreamFooter::FollowUp,
-        rx,
-        trigger,
-    );
-    tx.send(StreamEvent::Done(StreamDone {
-        usage: StreamUsage {
-            usage: TokenUsage {
-                input: 100,
-                output: 40,
-                cache_read: 900,
-                ..Default::default()
-            },
-            cost: Some(BTW_COST),
-            billing: Billing::Api,
-            model: BTW_MODEL.into(),
-            provider: TEST_PROVIDER.into(),
-            purpose: LedgerPurpose::Btw,
+    EventSender::new(app.btw.sender().clone(), 0).try_send(AgentEvent::ModelUsage {
+        usage: TokenUsage {
+            input: 100,
+            output: 40,
+            cache_read: 900,
+            ..Default::default()
         },
-        answer: None,
-    }))
-    .unwrap();
+        cost: Some(BTW_COST),
+        billing: Billing::Api,
+        provider: TEST_PROVIDER.into(),
+        model: BTW_MODEL.into(),
+        purpose: LedgerPurpose::Btw,
+        account: None,
+    });
     let _ = app.tick();
 
     assert_eq!(app.state.token_usage.input, 100);
@@ -20535,40 +20527,51 @@ fn btw_usage_settles_into_the_session_ledger() {
     );
 }
 
+/// The run reports a request's spend once as spend and once with its turn;
+/// only the first is billed.
+#[test]
+fn a_btw_answer_is_billed_once() {
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+
+    app.await_btw_run();
+    let _ = app.tick();
+
+    assert_eq!(app.state.token_usage.input, QUESTION_BTW_INPUT_TOKENS);
+    let billed = &app.state.session.usage_by_model()[&btw_billed_model()];
+    assert_eq!(billed.input, QUESTION_BTW_INPUT_TOKENS);
+    assert_eq!(app.state.cost, billed.cost);
+}
+
 #[test]
 fn btw_modal_key_routing_and_animation() {
-    let mut app = test_app();
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .open(" /btw ", "test".into(), StreamFooter::FollowUp, rx, trigger);
+    let mut app = btw_ready_app();
+    app.start_btw(BTW_QUESTION.into());
 
-    // The spinner carries the wait before the first token; once text flows the
-    // typewriter revealing it wins.
-    assert!(app.stream_modal.is_streaming());
-    assert_eq!(app.stream_modal.cadence(), Cadence::SPINNER);
-    tx.send(StreamEvent::TextDelta("hi".into())).unwrap();
-    assert_eq!(app.stream_modal.poll(), Dirty::YES);
-    assert_eq!(app.stream_modal.cadence(), Cadence::SMOOTH);
+    assert!(app.btw.is_running());
+    assert_eq!(app.btw.cadence(), Cadence::SPINNER);
 
     let actions = app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert!(actions.is_empty());
-    assert!(app.stream_modal.is_open());
+    assert!(app.btw.is_open());
     assert_eq!(
         app.input_box.buffer.value(),
         "",
         "a key typed at the modal never reaches the composer"
     );
-    assert_eq!(app.stream_modal.input_text(), "x");
+    assert_eq!(btw_input(&app), "x");
 
     app.update(Msg::Key(kb::DELETE_WORD.to_key_event()));
-    assert_eq!(app.stream_modal.input_text(), "", "{BTW_CHORD_SWALLOWED}");
-    assert!(app.stream_modal.is_open(), "{BTW_CHORD_SWALLOWED}");
+    assert_eq!(btw_input(&app), "", "{BTW_CHORD_SWALLOWED}");
+    assert!(app.btw.is_open(), "{BTW_CHORD_SWALLOWED}");
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    assert!(!app.stream_modal.is_open());
-    assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+    let _ = app.tick();
+    assert!(!app.btw.is_open());
+    assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
+    assert_eq!(app.btw.cadence(), Cadence::IDLE);
 }
 
 /// A held `Backspace` keeps deleting in the follow-up, as it does in the
@@ -20576,14 +20579,213 @@ fn btw_modal_key_routing_and_animation() {
 #[test_case(KeyEventKind::Press; "legacy_autorepeat")]
 #[test_case(KeyEventKind::Repeat; "reported_autorepeat")]
 fn a_held_backspace_keeps_deleting_the_btw_follow_up(kind: KeyEventKind) {
-    let mut app = btw_awaiting_follow_up();
+    let (mut app, _script) = btw_awaiting_follow_up();
     for _ in 0..2 {
         dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
     }
-    assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP_TRIMMED);
+    assert_eq!(btw_input(&app), BTW_FOLLOW_UP_TRIMMED);
 }
 
-pub(crate) fn btw_ready_app() -> App {
+/// What one side request carried.
+pub(crate) struct BtwRequest {
+    pub(crate) system: String,
+    pub(crate) tools: serde_json::Value,
+    pub(crate) messages: Vec<Message>,
+}
+
+/// The test's end of a [`GatedProvider`]: the responses it gives, in order,
+/// and the requests it was sent.
+pub(crate) struct BtwScript {
+    pub(crate) responses: flume::Sender<StreamResponse>,
+    pub(crate) requests: flume::Receiver<BtwRequest>,
+}
+
+/// Answers each request with the next response the test sends, streaming
+/// its text as the answer arrives.
+struct GatedProvider {
+    responses: flume::Receiver<StreamResponse>,
+    requests: flume::Sender<BtwRequest>,
+}
+
+impl Provider for GatedProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a caudra_providers::Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a serde_json::Value,
+        event_tx: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a CacheKey>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            self.requests
+                .send(BtwRequest {
+                    system: system.to_owned(),
+                    tools: tools.clone(),
+                    messages: messages.to_vec(),
+                })
+                .map_err(|_| AgentError::Channel)?;
+            let response = self
+                .responses
+                .recv_async()
+                .await
+                .map_err(|_| AgentError::Channel)?;
+            for block in &response.message.content {
+                if let ContentBlock::Text { text } = block {
+                    event_tx.send(ProviderEvent::TextDelta { text: text.clone() })?;
+                }
+            }
+            Ok(response)
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Holds every request open, and hands the test a receiver that disconnects
+/// once the request is dropped.
+struct HeldProvider(flume::Sender<flume::Receiver<()>>);
+
+impl Provider for HeldProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a caudra_providers::Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a serde_json::Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a CacheKey>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let (_alive, held) = flume::bounded::<()>(0);
+            self.0.send(held).map_err(|_| AgentError::Channel)?;
+            std::future::pending().await
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+pub(crate) fn gated_provider() -> (Arc<dyn Provider>, BtwScript) {
+    let (responses, gate) = flume::unbounded();
+    let (sent, requests) = flume::unbounded();
+    let provider = GatedProvider {
+        responses: gate,
+        requests: sent,
+    };
+    (
+        Arc::new(provider),
+        BtwScript {
+            responses,
+            requests,
+        },
+    )
+}
+
+/// A side answer saying `text`, which spends [`QUESTION_BTW_INPUT_TOKENS`].
+pub(crate) fn btw_reply(text: &str) -> StreamResponse {
+    StreamResponse {
+        message: assistant_message(text),
+        usage: TokenUsage {
+            input: QUESTION_BTW_INPUT_TOKENS,
+            ..Default::default()
+        },
+        stop_reason: Some(StopReason::EndTurn),
+        ..Default::default()
+    }
+}
+
+fn btw_file_read() -> StreamResponse {
+    StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                BTW_CALL,
+                FILE_READ_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        stop_reason: Some(StopReason::ToolUse),
+        ..Default::default()
+    }
+}
+
+/// The tools the main request declares, which a side question sends as is.
+fn btw_tools() -> serde_json::Value {
+    serde_json::json!([{
+        "name": FILE_READ_TOOL_NAME,
+        "description": MOCK_TOOL_OUTPUT,
+        "input_schema": {"type": "object", "properties": {}},
+    }])
+}
+
+fn btw_billed_model() -> String {
+    format!("{TEST_PROVIDER}/{}", test_model().id)
+}
+
+/// Stands in for `file_read`: one scoped read that answers
+/// [`MOCK_TOOL_OUTPUT`].
+struct BtwRead;
+
+impl Tool for BtwRead {
+    fn name(&self) -> &str {
+        FILE_READ_TOOL_NAME
+    }
+
+    fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+        MOCK_TOOL_OUTPUT.into()
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    fn parse(&self, _: &serde_json::Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(BtwRead))
+    }
+}
+
+impl ToolInvocation for BtwRead {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(MOCK_TOOL_OUTPUT.into()))
+    }
+
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        Box::pin(std::future::ready(Some(PermissionScopes::single(
+            BTW_READ_SCOPE.into(),
+        ))))
+    }
+
+    fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async { ToolExecResult::from(Ok(ToolOutput::Plain(MOCK_TOOL_OUTPUT.into()))) })
+    }
+}
+
+/// A session's tool context for side questions, whose `file_read` answers
+/// [`MOCK_TOOL_OUTPUT`].
+pub(crate) fn btw_host() -> Arc<WorkflowHostContext> {
+    let ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry
+        .register_audited(Arc::new(BtwRead), NamedMock::source(), ToolEffect::ReadOnly)
+        .unwrap();
+    let provider = Arc::clone(&ctx.provider);
+    let model = Arc::clone(&ctx.model);
+    Arc::new(WorkflowHostContext::from_tool_context(
+        &ctx,
+        Arc::new(move || (Arc::clone(&provider), Arc::clone(&model))),
+        Arc::new(|| AgentMode::Build),
+        Arc::new(CancelMap::new()),
+    ))
+}
+
+fn btw_app_over(provider: Arc<dyn Provider>) -> App {
     let mut app = test_app();
     app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         crate::history_items(&[
@@ -20592,14 +20794,44 @@ pub(crate) fn btw_ready_app() -> App {
         ]),
     ))));
     app.btw_prompt = Some(Arc::new(ArcSwap::from_pointee(crate::agent::BtwPrompt {
-        provider: Arc::new(PendingProvider),
+        provider,
         model: test_model(),
-        system: "system".into(),
-        tools: serde_json::json!([]),
-        opts: caudra_providers::RequestOptions::default(),
+        system: BTW_SYSTEM.into(),
+        tools: btw_tools(),
+        opts: RequestOptions::default(),
         profile: None,
     })));
+    app.task_host = Some(btw_host());
     app
+}
+
+/// A session a side question can be asked in, whose provider never answers.
+pub(crate) fn btw_ready_app() -> App {
+    btw_app_over(Arc::new(PendingProvider))
+}
+
+fn btw_scripted_app() -> (App, BtwScript) {
+    let (provider, script) = gated_provider();
+    (btw_app_over(provider), script)
+}
+
+/// The questions the `/btw` window shows, oldest first.
+fn btw_questions(app: &App) -> Vec<String> {
+    app.btw.window().map_or_else(Vec::new, |window| {
+        let chat = window.chat();
+        (0..chat.message_count())
+            .filter_map(|i| chat.message_at(i))
+            .filter(|m| m.role == DisplayRole::User)
+            .map(|m| m.text.clone())
+            .collect()
+    })
+}
+
+fn btw_input(app: &App) -> String {
+    app.btw
+        .window()
+        .map(SideTranscript::input_text)
+        .unwrap_or_default()
 }
 
 fn notice_texts(app: &mut App) -> Vec<String> {
@@ -20618,10 +20850,10 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
     let mut app = btw_ready_app();
     let before = app.main_chat().message_count();
 
-    app.start_btw("why sqlite?".into());
+    app.start_btw(BTW_QUESTION.into());
 
-    assert!(app.stream_modal.is_open());
-    assert!(app.btw_thread.is_some());
+    assert!(app.btw.is_open());
+    assert!(app.btw.thread().is_some());
     assert_eq!(app.main_chat().message_count(), before + 1);
     assert_eq!(
         notice_texts(&mut app),
@@ -20636,7 +20868,7 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
 
-    assert!(app.btw_thread.is_none());
+    assert!(app.btw.thread().is_none());
     assert!(notice_texts(&mut app).is_empty(), "the marker is gone");
     assert_eq!(
         app.main_chat().message_count(),
@@ -20660,21 +20892,18 @@ fn f2_opens_an_empty_btw_that_captures_on_the_first_send() {
     app.input_box.set_input(COMPOSER_DRAFT.into());
 
     press_ask_btw(&mut app);
-    assert!(app.stream_modal.is_open());
-    assert!(!app.stream_modal.is_clarification());
-    assert!(app.stream_modal.headers().is_empty());
-    assert!(app.btw_thread.is_none());
+    assert!(app.btw.is_open());
+    assert!(!app.btw.is_clarifying());
+    assert!(btw_questions(&app).is_empty());
+    assert!(app.btw.thread().is_none());
     assert!(notice_texts(&mut app).is_empty(), "no cutoff before a send");
 
     app.update(Msg::Paste(BTW_QUESTION.into()));
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    assert_eq!(
-        app.btw_thread.as_ref().unwrap().pending(),
-        Some(BTW_QUESTION)
-    );
-    assert!(app.stream_modal.is_streaming());
-    assert_eq!(app.stream_modal.headers(), [BTW_HEADER]);
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_QUESTION));
+    assert!(app.btw.is_running());
+    assert_eq!(btw_questions(&app), [BTW_QUESTION]);
     assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
     assert_eq!(app.input_box.buffer.value(), COMPOSER_DRAFT);
 }
@@ -20685,7 +20914,7 @@ fn f2_before_the_prompt_is_captured_flashes_instead_of_opening() {
 
     press_ask_btw(&mut app);
 
-    assert!(!app.stream_modal.is_open());
+    assert!(!app.btw.is_open());
     assert_eq!(
         app.status_bar.flash_text(),
         Some(super::btw::PROMPT_INITIALIZING)
@@ -20702,7 +20931,7 @@ fn f2_in_a_task_chat_asks_about_that_task(source: TaskSource) {
     app.update(Msg::Paste(BTW_QUESTION.into()));
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
     assert_eq!(chat_notices(&app, 1), [super::btw::BTW_CUTOFF_MARKER]);
     assert!(chat_notices(&app, 0).is_empty(), "main keeps no marker");
@@ -20715,42 +20944,41 @@ fn ask_draft_typed() -> App {
     app
 }
 
+fn follow_up_typed() -> App {
+    btw_awaiting_follow_up().0
+}
+
 /// Esc keeps the thread and what was typed and not yet sent.
 #[test_case(ask_draft_typed, ASK_DRAFT ; "first_question")]
-#[test_case(btw_awaiting_follow_up, BTW_FOLLOW_UP ; "follow_up")]
+#[test_case(follow_up_typed, BTW_FOLLOW_UP ; "follow_up")]
 fn an_unsent_btw_question_comes_back_on_the_next_f2(setup: fn() -> App, unsent: &str) {
     let mut app = setup();
-    let headers: Vec<String> = app
-        .stream_modal
-        .headers()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let questions = btw_questions(&app);
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
-    assert!(!app.stream_modal.is_open());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.thread().is_none());
 
     press_ask_btw(&mut app);
 
-    assert_eq!(app.stream_modal.input_text(), unsent);
-    assert_eq!(app.stream_modal.headers(), headers, "{BTW_THREAD_KEPT}");
+    assert_eq!(btw_input(&app), unsent);
+    assert_eq!(btw_questions(&app), questions, "{BTW_THREAD_KEPT}");
 }
 
 const BTW_THREAD_KEPT: &str = "a closed /btw thread must come back with what it showed";
 const MAIN_MOVED_ON: &str = "the agent kept working";
 const EXTRACT_REQUEST: &str = "Extracting the plan";
 
-fn btw_answered_and_closed() -> App {
-    let mut app = btw_awaiting_follow_up();
+fn btw_answered_and_closed() -> (App, BtwScript) {
+    let (mut app, script) = btw_awaiting_follow_up();
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
-    assert!(app.btw_thread.is_none());
+    assert!(app.btw.thread().is_none());
     assert!(
         notice_texts(&mut app).is_empty(),
         "a closed thread keeps no marker"
     );
-    app
+    (app, script)
 }
 
 /// What the main agent would commit while a closed thread waits: one more
@@ -20777,31 +21005,24 @@ fn advance_main_history(app: &mut App, new_epoch: bool) {
 #[test_case(false ; "f2")]
 #[test_case(true ; "slash_btw")]
 fn a_closed_btw_thread_reopens_on_the_same_lineage(by_command: bool) {
-    let mut app = btw_answered_and_closed();
+    let (mut app, _script) = btw_answered_and_closed();
 
     if by_command {
         app.start_btw(BTW_FOLLOW_UP.into());
     } else {
         press_ask_btw(&mut app);
-        assert_eq!(
-            app.stream_modal.headers(),
-            [BTW_HEADER],
-            "{BTW_THREAD_KEPT}"
-        );
+        assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
         app.update(Msg::Key(key(KeyCode::Enter)));
     }
 
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!((thread.exchange_count(), thread.quoted_count()), (1, 0));
     assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
-    assert!(app.stream_modal.is_streaming());
-    assert_eq!(
-        app.stream_modal.headers(),
-        [BTW_HEADER, BTW_FOLLOW_UP_HEADER]
-    );
+    assert!(app.btw.is_running());
+    assert_eq!(btw_questions(&app), [BTW_QUESTION, BTW_FOLLOW_UP]);
     let draft = if by_command { BTW_FOLLOW_UP } else { "" };
     assert_eq!(
-        app.stream_modal.input_text(),
+        btw_input(&app),
         draft,
         "a command's question leaves the kept draft alone"
     );
@@ -20811,22 +21032,18 @@ fn a_closed_btw_thread_reopens_on_the_same_lineage(by_command: bool) {
 #[test_case(false ; "appended")]
 #[test_case(true ; "new_epoch")]
 fn a_btw_thread_catches_up_with_a_conversation_that_moved_on(new_epoch: bool) {
-    let mut app = btw_answered_and_closed();
+    let (mut app, _script) = btw_answered_and_closed();
     advance_main_history(&mut app, new_epoch);
 
     press_ask_btw(&mut app);
-    assert_eq!(
-        app.stream_modal.headers(),
-        [BTW_HEADER],
-        "{BTW_THREAD_KEPT}"
-    );
+    assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
     assert!(
         notice_texts(&mut app).is_empty(),
         "a thread behind its conversation has no cutoff to mark"
     );
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.quoted_count(), 1);
     assert_eq!(thread.exchange_count(), 0);
     assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
@@ -20837,41 +21054,59 @@ fn a_btw_thread_catches_up_with_a_conversation_that_moved_on(new_epoch: bool) {
 #[test]
 fn closing_mid_answer_keeps_the_thread_without_the_stopped_question() {
     let mut app = btw_ready_app();
-    let _answer = btw_streaming(&mut app);
+    app.start_btw(BTW_QUESTION.into());
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
 
     press_ask_btw(&mut app);
 
-    assert_eq!(
-        app.stream_modal.headers(),
-        [BTW_HEADER],
-        "{BTW_THREAD_KEPT}"
-    );
-    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.exchange_count(), 0);
     assert!(thread.pending().is_none());
 }
 
+/// Closing the window or interrupting the answer drops the request the
+/// provider was answering, rather than leaving it to run unseen.
+#[test_case(key(KeyCode::Esc), false ; "escape_closes")]
+#[test_case(kb::QUIT.to_key_event(), true ; "ctrl_c_interrupts")]
+fn leaving_a_btw_answer_stops_its_run(pressed: KeyEvent, stays_open: bool) {
+    let (held, requests) = flume::unbounded();
+    let mut app = btw_app_over(Arc::new(HeldProvider(held)));
+    app.start_btw(BTW_QUESTION.into());
+    let request = requests.recv_timeout(BTW_RUN_DEADLINE).expect(BTW_NOT_SENT);
+
+    app.update(Msg::Key(pressed));
+    let _ = app.tick();
+
+    assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
+    assert_eq!(
+        request.recv_timeout(BTW_RUN_DEADLINE),
+        Err(flume::RecvTimeoutError::Disconnected),
+        "{BTW_RUN_LEFT}"
+    );
+    assert_eq!(app.btw.is_open(), stays_open);
+}
+
 #[test]
 fn ctrl_l_forgets_the_btw_thread_and_leaves_an_empty_ask() {
-    let mut app = btw_awaiting_follow_up();
+    let (mut app, _script) = btw_awaiting_follow_up();
 
     app.update(Msg::Key(kb::CLEAR_BTW.to_key_event()));
 
-    assert!(app.stream_modal.is_open() && app.stream_modal.headers().is_empty());
-    assert!(app.btw_thread.is_none() && app.parked_btw.is_empty());
+    assert!(app.btw.is_open() && btw_questions(&app).is_empty());
+    assert!(app.btw.thread().is_none() && !app.btw.has_parked());
     assert!(notice_texts(&mut app).is_empty());
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
     press_ask_btw(&mut app);
-    assert!(app.stream_modal.headers().is_empty());
+    assert!(btw_questions(&app).is_empty());
 }
 
 #[test_case(true ; "new_session")]
 #[test_case(false ; "interrupt")]
 fn only_a_session_change_forgets_a_closed_btw_thread(new_session: bool) {
-    let mut app = btw_awaiting_follow_up();
+    let (mut app, _script) = btw_awaiting_follow_up();
 
     if new_session {
         app.reset_session();
@@ -20880,13 +21115,13 @@ fn only_a_session_change_forgets_a_closed_btw_thread(new_session: bool) {
     }
     press_ask_btw(&mut app);
 
-    assert_eq!(app.stream_modal.headers().is_empty(), new_session);
+    assert_eq!(btw_questions(&app).is_empty(), new_session);
 }
 
 #[test]
 fn an_extract_neither_shows_nor_feeds_the_kept_btw_thread() {
-    let mut app = btw_awaiting_follow_up();
-    app.close_stream_modal();
+    let (mut app, _script) = btw_awaiting_follow_up();
+    app.close_btw();
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
     app.stream_modal.open(
@@ -20897,23 +21132,26 @@ fn an_extract_neither_shows_nor_feeds_the_kept_btw_thread() {
         trigger,
     );
     assert_eq!(app.stream_modal.headers(), [EXTRACT_REQUEST]);
-    let StreamEvent::Done(mut done) = btw_answer() else {
-        unreachable!()
-    };
-    done.usage.purpose = LedgerPurpose::Extract;
-    tx.send(StreamEvent::Done(done)).unwrap();
+    tx.send(StreamEvent::Done(StreamDone {
+        usage: StreamUsage {
+            usage: TokenUsage::default(),
+            cost: None,
+            billing: Billing::Api,
+            model: EXTRACT_REQUEST.into(),
+            provider: TEST_PROVIDER.into(),
+            purpose: LedgerPurpose::Extract,
+        },
+        answer: Some(BTW_ANSWER.into()),
+    }))
+    .unwrap();
     let _ = app.tick();
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
 
     press_ask_btw(&mut app);
 
-    assert_eq!(
-        app.stream_modal.headers(),
-        [BTW_HEADER],
-        "{BTW_THREAD_KEPT}"
-    );
-    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+    assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
 }
 
 #[test]
@@ -20922,10 +21160,11 @@ fn a_new_session_forgets_the_unsent_btw_question() {
     app.update(Msg::Key(key(KeyCode::Esc)));
 
     app.reset_session();
+    app.task_host = Some(btw_host());
     press_ask_btw(&mut app);
 
-    assert!(app.stream_modal.is_open());
-    assert!(app.stream_modal.input_text().is_empty());
+    assert!(app.btw.is_open());
+    assert!(btw_input(&app).is_empty());
 }
 
 const CATCHUP_FOCUS: &str = "the migration";
@@ -20956,12 +21195,9 @@ fn catchup_asks_the_canned_question_under_a_short_header(
 
     app.start_catchup(focus);
 
-    assert!(app.stream_modal.is_open());
-    assert_eq!(app.stream_modal.headers(), [header.as_str()]);
-    assert_eq!(
-        app.btw_thread.as_ref().unwrap().pending(),
-        Some(question.as_str())
-    );
+    assert!(app.btw.is_open());
+    assert_eq!(btw_questions(&app), [header]);
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(question.as_str()));
     assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
 }
 
@@ -20974,8 +21210,8 @@ fn catchup_on_an_empty_conversation_flashes_instead_of_asking() {
 
     app.start_catchup("");
 
-    assert!(!app.stream_modal.is_open());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.thread().is_none());
     assert_eq!(app.status_bar.flash_text().unwrap(), NOTHING_TO_CATCH_UP);
 }
 
@@ -21039,6 +21275,7 @@ fn focused_task_btw_app() -> App {
     let ready = btw_ready_app();
     app.shared_history = ready.shared_history;
     app.btw_prompt = ready.btw_prompt;
+    app.task_host = ready.task_host;
     app
 }
 
@@ -21078,8 +21315,8 @@ fn btw_in_a_task_chat_reads_that_tasks_conversation(source: TaskSource, prefixed
 
     ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
 
-    assert!(app.stream_modal.is_open());
-    let thread = app.btw_thread.as_ref().unwrap();
+    assert!(app.btw.is_open());
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
     assert_eq!(thread.route(), (model, Some(cache)));
     assert_eq!(chat_notices(&app, 1), [super::btw::BTW_CUTOFF_MARKER]);
@@ -21088,7 +21325,7 @@ fn btw_in_a_task_chat_reads_that_tasks_conversation(source: TaskSource, prefixed
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
 
-    assert!(app.btw_thread.is_none());
+    assert!(app.btw.thread().is_none());
     assert!(
         chat_notices(&app, 1).is_empty(),
         "the task's marker is gone"
@@ -21102,8 +21339,8 @@ fn btw_over_a_task_with_no_transcript_flashes_instead_of_asking() {
 
     ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
 
-    assert!(!app.stream_modal.is_open());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.thread().is_none());
     assert_eq!(
         app.status_bar.flash_text(),
         Some(super::btw::TASK_HISTORY_UNAVAILABLE)
@@ -21117,82 +21354,136 @@ fn catchup_in_a_task_chat_summarizes_that_task() {
 
     ask_aside(&mut app, "/catchup");
 
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
     assert_eq!(thread.pending(), Some(CATCHUP_PROMPT));
 }
 
 const BTW_QUESTION: &str = "why sqlite?";
-const BTW_HEADER: &str = "Q: why sqlite?";
+const BTW_ANSWER: &str = "it ships in the binary";
 const BTW_FOLLOW_UP: &str = "and postgres?";
 const BTW_FOLLOW_UP_TRIMMED: &str = "and postgre";
 const BTW_CHORD_SWALLOWED: &str = "an editing chord at /btw must edit the follow-up field";
-const BTW_FOLLOW_UP_HEADER: &str = "Q: and postgres?";
-
-fn btw_answer() -> StreamEvent {
-    StreamEvent::Done(StreamDone {
-        usage: StreamUsage {
-            usage: TokenUsage::default(),
-            cost: None,
-            billing: Billing::Api,
-            model: "m".into(),
-            provider: TEST_PROVIDER.into(),
-            purpose: LedgerPurpose::Btw,
-        },
-        answer: Some("it ships in the binary".into()),
-    })
-}
-
-/// A live `/btw` whose answer is stood in for by a channel the test owns: the
-/// stub provider never answers on its own.
-fn btw_streaming(app: &mut App) -> flume::Sender<StreamEvent> {
-    app.start_btw(BTW_QUESTION.into());
-    let (tx, rx) = flume::bounded(1);
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal.open(
-        " /btw ",
-        BTW_HEADER.into(),
-        StreamFooter::FollowUp,
-        rx,
-        trigger,
-    );
-    tx
-}
+const BTW_SYSTEM: &str = "system";
+const BTW_CALL: &str = "btw-read";
+const BTW_READ_SCOPE: &str = "/tmp/btw.rs";
+const BTW_RUN_DEADLINE: Duration = Duration::from_secs(30);
+const BTW_NOT_SENT: &str = "the side question never reached the provider";
+const BTW_RUN_LEFT: &str = "leaving /btw must stop the run it was showing";
+const BTW_TOOL_TURNS_KEPT: &str = "a follow-up must carry the tool turns of the answer before it";
 
 /// A btw whose first answer has landed, with the follow-up typed but not yet
 /// sent.
-fn btw_awaiting_follow_up() -> App {
-    let mut app = btw_ready_app();
-    btw_streaming(&mut app).send(btw_answer()).unwrap();
-    let _ = app.tick();
-    assert!(
-        app.btw_thread.is_some(),
-        "a settled answer keeps the modal's thread"
-    );
-    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+fn btw_awaiting_follow_up() -> (App, BtwScript) {
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
     for c in BTW_FOLLOW_UP.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
-    app
+    (app, script)
 }
 
 fn assert_btw_follow_up_in_flight(app: &App) {
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.exchange_count(), 1);
     assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
-    assert!(
-        app.stream_modal.is_streaming(),
-        "the follow-up is in flight"
-    );
-    assert_eq!(
-        app.stream_modal.headers(),
-        [BTW_HEADER, BTW_FOLLOW_UP_HEADER]
-    );
-    assert_eq!(app.stream_modal.input_text(), "");
+    assert!(app.btw.is_running(), "the follow-up is in flight");
+    assert_eq!(btw_questions(app), [BTW_QUESTION, BTW_FOLLOW_UP]);
+    assert_eq!(btw_input(app), "");
 }
 
-fn question_btw_app() -> (App, flume::Receiver<String>) {
-    let mut app = btw_ready_app();
+/// The tool names of the calls the `/btw` window shows.
+fn btw_tool_calls(app: &App) -> Vec<String> {
+    let chat = app.btw.window().unwrap().chat();
+    (0..chat.message_count())
+        .filter_map(|i| chat.message_at(i))
+        .filter_map(|m| match &m.role {
+            DisplayRole::Tool(tool) => Some(tool.name.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_btw_call(messages: &[Message]) -> bool {
+    let blocks = || messages.iter().flat_map(|message| &message.content);
+    blocks().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == BTW_CALL))
+        && blocks().any(|block| {
+            matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == BTW_CALL)
+        })
+}
+
+/// A side question reads with real tools, and its window draws each call as
+/// the main transcript would, over the main request's own prefix.
+#[test]
+fn a_btw_answer_shows_the_tool_calls_it_made() {
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    script.responses.send(btw_file_read()).unwrap();
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+
+    app.await_btw_run();
+
+    assert_eq!(btw_tool_calls(&app), [FILE_READ_TOOL_NAME]);
+    assert_eq!(
+        app.btw
+            .window()
+            .unwrap()
+            .chat()
+            .last_reply_source()
+            .as_deref(),
+        Some(BTW_ANSWER)
+    );
+    let requests: Vec<BtwRequest> = script.requests.try_iter().collect();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.system, BTW_SYSTEM);
+        assert_eq!(request.tools, btw_tools());
+    }
+}
+
+#[test]
+fn a_btw_follow_up_carries_the_tool_turns_before_it() {
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    script.responses.send(btw_file_read()).unwrap();
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+    assert!(
+        has_btw_call(app.btw.thread().unwrap().messages()),
+        "{BTW_TOOL_TURNS_KEPT}"
+    );
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+
+    app.await_btw_run();
+
+    let follow_up = script.requests.try_iter().last().unwrap();
+    assert!(has_btw_call(&follow_up.messages), "{BTW_TOOL_TURNS_KEPT}");
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 2);
+}
+
+/// A side question needs no idle agent: it runs beside the turn, which it
+/// neither waits for nor touches.
+#[test]
+fn a_btw_is_answered_while_the_main_turn_runs() {
+    let (mut app, script) = btw_scripted_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
+    assert_eq!(app.status, Status::Streaming, "{EXPECT_RUN_LEFT_ALONE}");
+    assert_eq!(app.run_id, 1, "{EXPECT_RUN_LEFT_ALONE}");
+}
+
+fn question_btw_over(mut app: App) -> (App, flume::Receiver<String>) {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.input_box.set_input(QUESTION_BTW_MAIN_DRAFT.into());
@@ -21206,6 +21497,16 @@ fn question_btw_app() -> (App, flume::Receiver<String>) {
     (app, answers)
 }
 
+fn question_btw_app() -> (App, flume::Receiver<String>) {
+    question_btw_over(btw_ready_app())
+}
+
+fn question_btw_scripted() -> (App, flume::Receiver<String>, BtwScript) {
+    let (app, script) = btw_scripted_app();
+    let (app, answers) = question_btw_over(app);
+    (app, answers, script)
+}
+
 fn rendered_question(app: &mut App) -> String {
     let (_, bottom, ..) = app.layout_geometry(TEST_AREA);
     let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
@@ -21215,15 +21516,11 @@ fn rendered_question(app: &mut App) -> String {
     buffer_text(terminal.backend().buffer())
 }
 
-fn question_btw_streaming(app: &mut App) -> flume::Sender<StreamEvent> {
+fn question_btw_streaming(app: &mut App) {
     app.open_question_btw();
     app.continue_btw(BTW_QUESTION.into());
-    let (tx, rx) = flume::unbounded();
-    let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .begin_exchange(BTW_HEADER.into(), rx, trigger);
-    assert!(app.stream_modal.is_clarification());
-    tx
+    assert!(app.btw.is_clarifying());
+    assert!(app.btw.is_running());
 }
 
 #[test_case(false; "transcript")]
@@ -21241,35 +21538,35 @@ fn question_btw_first_composer_owns_keys_and_paste_without_answering(workbench: 
 
     assert_eq!(kb::ASK_BTW.code, KeyCode::F(2));
     assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
-    assert!(app.stream_modal.is_open());
-    assert!(app.stream_modal.is_clarification());
-    assert!(!app.stream_modal.is_streaming());
-    assert!(app.btw_thread.is_none());
+    assert!(app.btw.is_open());
+    assert!(app.btw.is_clarifying());
+    assert!(!app.btw.is_running());
+    assert!(app.btw.thread().is_none());
     assert!(rendered(&mut app).contains(QUESTION_TEXT));
     assert!(app.update(Msg::Paste(BTW_QUESTION.into())).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Char('!')))).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Backspace))).is_empty());
-    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+    assert_eq!(btw_input(&app), BTW_QUESTION);
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
 
     assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
-    assert!(!app.stream_modal.is_open());
-    assert!(app.stream_modal.is_clarification());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.is_clarifying());
+    assert!(app.btw.thread().is_none());
     assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
-    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+    assert_eq!(btw_input(&app), BTW_QUESTION);
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
-    let pending = app.btw_thread.as_ref().unwrap().pending().unwrap();
+    let pending = app.btw.thread().unwrap().pending().unwrap();
     assert!(pending.contains(&app.question_form.clarification_context()));
     assert!(pending.ends_with(BTW_QUESTION));
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
     let _ = app.tick();
 
-    assert!(!app.stream_modal.is_open());
-    assert!(app.stream_modal.is_clarification());
-    assert!(app.btw_thread.is_some());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.is_clarifying());
+    assert!(app.btw.thread().is_some());
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(app.status, Status::Streaming, "{EXPECT_RUN_LEFT_ALONE}");
     assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
@@ -21282,22 +21579,22 @@ fn question_btw_first_composer_owns_keys_and_paste_without_answering(workbench: 
 #[test_case(false; "keyboard_back")]
 #[test_case(true; "footer_back")]
 fn question_btw_back_retains_answer_thread_and_unsent_draft(mouse: bool) {
-    let (mut app, answers) = question_btw_app();
+    let (mut app, answers, script) = question_btw_scripted();
     let before = rendered_question(&mut app);
-    question_btw_streaming(&mut app).send(btw_answer()).unwrap();
-    let _ = app.tick();
-    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
-    let headers: Vec<String> = app
-        .stream_modal
-        .headers()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    question_btw_streaming(&mut app);
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
+    let questions = btw_questions(&app);
     app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
 
     if mouse {
         rendered(&mut app);
-        let back = app.stream_modal.footer_hit(QUESTION_BTW_BACK_CONTROL);
+        let back = app
+            .btw
+            .window()
+            .unwrap()
+            .footer_hit(QUESTION_BTW_BACK_CONTROL);
         assert!(!back.is_empty());
         for kind in [
             MouseEventKind::Down(MouseButton::Left),
@@ -21309,22 +21606,19 @@ fn question_btw_back_retains_answer_thread_and_unsent_draft(mouse: bool) {
         assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
     }
     let _ = app.tick();
-    assert!(!app.stream_modal.is_open());
+    assert!(!app.btw.is_open());
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
 
     app.update(Msg::Key(kb::ASK_BTW.to_key_event()));
-    assert!(app.stream_modal.is_open());
-    assert_eq!(app.stream_modal.headers(), headers);
-    assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP);
-    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+    assert!(app.btw.is_open());
+    assert_eq!(btw_questions(&app), questions);
+    assert_eq!(btw_input(&app), BTW_FOLLOW_UP);
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
     assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
-    assert_eq!(
-        app.btw_thread.as_ref().unwrap().pending(),
-        Some(BTW_FOLLOW_UP)
-    );
+    assert_eq!(app.btw.thread().unwrap().exchange_count(), 1);
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_FOLLOW_UP));
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(app.status, Status::Streaming);
 }
@@ -21352,7 +21646,7 @@ fn question_btw_footer_and_restored_answer_take_input_ahead_of_workbench() {
     ] {
         assert!(app.update(mouse_event(kind, ask.x, ask.y)).is_empty());
     }
-    assert!(app.stream_modal.is_open());
+    assert!(app.btw.is_open());
     app.update(Msg::Key(key(KeyCode::Esc)));
     app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
     assert!(rendered_question(&mut app).contains(&format!("{QUESTION_ANSWER}{BTW_FOLLOW_UP}")));
@@ -21364,12 +21658,13 @@ fn question_btw_footer_and_restored_answer_take_input_ahead_of_workbench() {
 #[test_case(KeyCode::Esc; "dismiss")]
 #[test_case(KeyCode::Char('c'); "cancel")]
 fn question_btw_is_discarded_when_the_form_finishes(code: KeyCode) {
-    let (mut app, answers) = question_btw_app();
-    question_btw_streaming(&mut app).send(btw_answer()).unwrap();
-    let _ = app.tick();
+    let (mut app, answers, script) = question_btw_scripted();
+    question_btw_streaming(&mut app);
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
     app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.stream_modal.is_clarification());
+    assert!(app.btw.is_clarifying());
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     if code == KeyCode::Esc {
         app.update(Msg::Key(key(KeyCode::Esc)));
@@ -21383,10 +21678,10 @@ fn question_btw_is_discarded_when_the_form_finishes(code: KeyCode) {
     let actions = app.update(Msg::Key(event));
 
     assert!(!app.question_form.is_open());
-    assert!(!app.stream_modal.is_open());
-    assert!(!app.stream_modal.is_clarification());
-    assert!(app.stream_modal.input_text().is_empty());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(!app.btw.is_clarifying());
+    assert!(btw_input(&app).is_empty());
+    assert!(app.btw.thread().is_none());
     assert!(notice_texts(&mut app).is_empty());
     match code {
         KeyCode::Enter => {
@@ -21411,7 +21706,7 @@ fn question_btw_is_discarded_when_the_form_finishes(code: KeyCode) {
 #[test_case(true; "retained_clarification")]
 fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
     let (mut app, answers) = question_btw_app();
-    let _tx = question_btw_streaming(&mut app);
+    question_btw_streaming(&mut app);
     app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
     if hidden {
         app.update(Msg::Key(key(KeyCode::Esc)));
@@ -21435,10 +21730,10 @@ fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
 
     assert!(app.question_form.is_open());
     assert!(rendered_question(&mut app).contains(QUESTION_BTW_REPLACEMENT));
-    assert!(!app.stream_modal.is_clarification());
-    assert!(!app.stream_modal.is_open());
-    assert!(app.stream_modal.input_text().is_empty());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_clarifying());
+    assert!(!app.btw.is_open());
+    assert!(btw_input(&app).is_empty());
+    assert!(app.btw.thread().is_none());
     assert!(notice_texts(&mut app).is_empty());
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(app.status, Status::Streaming);
@@ -21462,7 +21757,7 @@ fn question_btw_reads_the_asking_tasks_conversation(task: bool) {
 
     question_btw_streaming(&mut app);
 
-    let thread = app.btw_thread.as_ref().unwrap();
+    let thread = app.btw.thread().unwrap();
     assert_eq!(thread.base_texts(), [TASK_BTW_REQUEST]);
     assert_eq!(
         thread.route(),
@@ -21486,8 +21781,8 @@ fn question_btw_missing_initialization_preserves_the_form() {
     let before = rendered_question(&mut app);
     assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
 
-    assert!(!app.stream_modal.is_open());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.thread().is_none());
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(app.status, Status::Streaming);
@@ -21526,14 +21821,10 @@ fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_th
         })
     };
     let overlap = positions()
-        .find(|position| {
-            app.stream_modal.contains(*position) && app.question_form.contains(*position)
-        })
+        .find(|position| app.btw.contains(*position) && app.question_form.contains(*position))
         .unwrap();
     let outside = positions()
-        .find(|position| {
-            !app.stream_modal.contains(*position) && app.question_form.contains(*position)
-        })
+        .find(|position| !app.btw.contains(*position) && app.question_form.contains(*position))
         .unwrap();
     let before = rendered_question(&mut app);
     assert!(before.contains(QUESTION_ANSWER));
@@ -21560,7 +21851,7 @@ fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_th
                 .is_empty()
         );
     }
-    assert!(app.stream_modal.is_open());
+    assert!(app.btw.is_open());
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     for kind in [
@@ -21573,13 +21864,13 @@ fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_th
         );
     }
 
-    assert!(!app.stream_modal.is_open());
-    assert!(app.stream_modal.is_clarification());
+    assert!(!app.btw.is_open());
+    assert!(app.btw.is_clarifying());
     assert_eq!(rendered_question(&mut app), before);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(app.status, Status::Streaming);
     app.open_question_btw();
-    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+    assert_eq!(btw_input(&app), BTW_QUESTION);
 }
 
 const SWEEP_NOT_COPIED: &str = "letting go of a sweep must copy it under the selection label";
@@ -21629,17 +21920,17 @@ fn assert_selection_copied(app: &App) {
 #[test]
 fn a_sweep_over_a_btw_answer_is_the_modals_to_copy() {
     let mut app = btw_ready_app();
-    let _tx = btw_streaming(&mut app);
-    let (column, row) = drawn_cell(&mut app, BTW_HEADER);
+    app.start_btw(BTW_QUESTION.into());
+    let (column, row) = drawn_cell(&mut app, BTW_QUESTION);
 
     sweep_app(
         &mut app,
         (column, row),
-        (column + BTW_HEADER.width() as u16, row),
+        (column + BTW_QUESTION.width() as u16, row),
     );
 
     assert_selection_copied(&app);
-    assert!(app.stream_modal.is_open());
+    assert!(app.btw.is_open());
 }
 
 #[test_case(false; "transcript")]
@@ -21676,22 +21967,16 @@ fn a_sweep_over_a_question_option_copies_it_and_answers_nothing(workbench: bool)
 #[test_case(false; "escape")]
 #[test_case(true; "ctrl_c")]
 fn question_btw_completion_just_before_back_is_billed_once(interrupt: bool) {
-    let (mut app, answers) = question_btw_app();
-    let tx = question_btw_streaming(&mut app);
-    let StreamEvent::Done(mut done) = btw_answer() else {
-        unreachable!()
-    };
-    done.usage.usage.input = QUESTION_BTW_INPUT_TOKENS;
-    done.usage.cost = Some(QUESTION_BTW_COST);
-    done.usage.model = QUESTION_BTW_MODEL.into();
-    tx.send(StreamEvent::Done(done)).unwrap();
+    let (mut app, answers, script) = question_btw_scripted();
+    question_btw_streaming(&mut app);
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_reply();
 
     app.update(Msg::Key(if interrupt {
         kb::QUIT.to_key_event()
     } else {
         key(KeyCode::Esc)
     }));
-    assert!(!app.stream_modal.is_open());
     let _ = app.tick();
     app.open_question_btw();
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -21700,12 +21985,11 @@ fn question_btw_completion_just_before_back_is_billed_once(interrupt: bool) {
     let _ = app.tick();
 
     assert_eq!(app.state.token_usage.input, QUESTION_BTW_INPUT_TOKENS);
-    assert_eq!(app.state.cost, Some(QUESTION_BTW_COST));
-    assert_eq!(app.chats[0].cost, Some(QUESTION_BTW_COST));
-    let billed =
-        &app.state.session.usage_by_model()[&format!("{TEST_PROVIDER}/{QUESTION_BTW_MODEL}")];
+    let billed = &app.state.session.usage_by_model()[&btw_billed_model()];
     assert_eq!(billed.input, QUESTION_BTW_INPUT_TOKENS);
-    assert_eq!(billed.cost, Some(QUESTION_BTW_COST));
+    assert!(billed.cost.is_some());
+    assert_eq!(app.state.cost, billed.cost);
+    assert_eq!(app.chats[0].cost, billed.cost);
     assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
     assert!(app.question_form.is_open());
     assert_eq!(app.status, Status::Streaming);
@@ -21713,36 +21997,31 @@ fn question_btw_completion_just_before_back_is_billed_once(interrupt: bool) {
 
 #[test]
 fn question_btw_completion_is_billed_to_the_retiring_session() {
-    let (mut app, _) = question_btw_app();
+    let (mut app, _, script) = question_btw_scripted();
     let old_session = app.state.session.id;
-    let tx = question_btw_streaming(&mut app);
-    let StreamEvent::Done(mut done) = btw_answer() else {
-        unreachable!()
-    };
-    done.usage.usage.input = QUESTION_BTW_INPUT_TOKENS;
-    done.usage.cost = Some(QUESTION_BTW_COST);
-    done.usage.model = QUESTION_BTW_MODEL.into();
-    tx.send(StreamEvent::Done(done)).unwrap();
+    question_btw_streaming(&mut app);
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_reply();
     let next = AppSession::new(&app.state.model.spec(), &app.state.session.cwd);
     app.apply_loaded_session(next, &test_model()).unwrap();
     let _ = app.tick();
 
     assert!(!app.question_form.is_open());
-    assert!(!app.stream_modal.is_clarification());
-    assert!(app.btw_thread.is_none());
+    assert!(!app.btw.is_clarifying());
+    assert!(app.btw.thread().is_none());
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.state.cost, None);
     let old = crate::load_app_session(old_session, &app.storage).unwrap();
-    let billed = &old.usage_by_model()[&format!("{TEST_PROVIDER}/{QUESTION_BTW_MODEL}")];
+    let billed = &old.usage_by_model()[&btw_billed_model()];
     assert_eq!(billed.input, QUESTION_BTW_INPUT_TOKENS);
-    assert_eq!(billed.cost, Some(QUESTION_BTW_COST));
+    assert!(billed.cost.is_some());
 }
 
 /// A follow-up typed into the modal extends the same thread: the answered
 /// question is filed, the new one is pending, and a fresh exchange opens.
 #[test]
 fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
-    let mut app = btw_awaiting_follow_up();
+    let (mut app, _script) = btw_awaiting_follow_up();
 
     app.update(Msg::Key(key(KeyCode::Enter)));
 
@@ -21754,22 +22033,22 @@ fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
 /// up has been filed, so the thread extends rather than restarting.
 #[test]
 fn a_btw_question_queued_mid_answer_is_sent_when_the_answer_lands() {
-    let mut app = btw_ready_app();
-    let tx = btw_streaming(&mut app);
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
 
     for c in BTW_FOLLOW_UP.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.stream_modal.input_text(), "", "the question is held");
+    assert_eq!(btw_input(&app), "", "the question is held");
     assert_eq!(
-        app.btw_thread.as_ref().unwrap().exchange_count(),
+        app.btw.thread().unwrap().exchange_count(),
         0,
         "nothing is filed while the first answer is still coming"
     );
 
-    tx.send(btw_answer()).unwrap();
-    let _ = app.tick();
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
 
     assert_btw_follow_up_in_flight(&app);
 }
@@ -21778,9 +22057,9 @@ fn a_btw_question_queued_mid_answer_is_sent_when_the_answer_lands() {
 #[test]
 fn a_btw_follow_up_is_sent_by_clicking_the_footer() {
     const SEND: usize = 0;
-    let mut app = btw_awaiting_follow_up();
+    let (mut app, _script) = btw_awaiting_follow_up();
     let _ = rendered(&mut app);
-    let send = app.stream_modal.footer_hit(SEND);
+    let send = app.btw.window().unwrap().footer_hit(SEND);
     assert!(!send.is_empty());
 
     app.update(mouse_event(
@@ -23276,7 +23555,9 @@ const LAST_PLAN_OPTION: usize = 2;
 /// A ready plan with the form up, and a /btw that can be asked over it.
 pub(crate) fn btw_plan_app() -> App {
     let mut app = plan_app();
-    app.btw_prompt = btw_ready_app().btw_prompt;
+    let ready = btw_ready_app();
+    app.btw_prompt = ready.btw_prompt;
+    app.task_host = ready.task_host;
     app
 }
 
@@ -23297,12 +23578,12 @@ fn plan_form_asks_btw_and_lands_back_on_the_form(click: bool) {
     } else {
         assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
     }
-    assert!(app.stream_modal.is_open(), "{BTW_NOT_ASKED}");
+    assert!(app.btw.is_open(), "{BTW_NOT_ASKED}");
     assert!(app.plan_form.is_visible(), "{PLAN_FORM_LOST}");
 
     app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert!(!app.stream_modal.is_open());
+    assert!(!app.btw.is_open());
     assert!(app.plan_form.is_visible(), "{PLAN_FORM_LOST}");
     assert!(app.plan_form_takes_input(), "{PLAN_FORM_LOST}");
 }
@@ -30805,7 +31086,9 @@ mod autopilot {
     #[test_case(kb::ASK_BTW.to_key_event(), true ; "f2")]
     fn the_first_key_takes_the_question_form_from_autopilot(pressed: KeyEvent, asks_btw: bool) {
         let mut app = running_app();
-        app.btw_prompt = btw_ready_app().btw_prompt;
+        let ready = btw_ready_app();
+        app.btw_prompt = ready.btw_prompt;
+        app.task_host = ready.task_host;
         deciding_question(&mut app);
         let _ = rendered(&mut app);
 
@@ -30815,7 +31098,7 @@ mod autopilot {
         assert!(app.state.autopilot.question_claimed(""), "{CLAIMED}");
         assert_eq!(app.question_form.autopilot_note(), None, "{CLAIMED}");
         assert!(app.question_form.is_open(), "{CLAIMED}");
-        assert_eq!(app.stream_modal.is_open(), asks_btw, "{KEEPS_ITS_EFFECT}");
+        assert_eq!(app.btw.is_open(), asks_btw, "{KEEPS_ITS_EFFECT}");
     }
 
     #[test]
@@ -32092,6 +32375,11 @@ mod theme_colours {
             shown: |app| app.stream_modal.is_open(),
         },
         Surface {
+            name: "btw",
+            open: |app, _| open_btw(app),
+            shown: |app| app.btw.is_open(),
+        },
+        Surface {
             name: "float",
             open: open_float,
             shown: |app| app.float_mgr.is_open(),
@@ -32392,6 +32680,12 @@ mod theme_colours {
         );
         tx.send(StreamEvent::TextDelta(STREAM_ANSWER.into()))
             .unwrap();
+    }
+
+    fn open_btw(app: &mut App) {
+        *app = super::btw_ready_app();
+        app.open_btw_prompt();
+        app.update(Msg::Paste(STREAM_QUESTION.into()));
     }
 
     fn open_float(app: &mut App, held: &mut Held) {

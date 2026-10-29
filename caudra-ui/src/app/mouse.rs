@@ -228,18 +228,18 @@ impl App {
                     self.copy_labelled(&text, COPIED_SELECTION);
                     return Vec::new();
                 }
-                StreamAction::Submit(question) => {
-                    self.continue_btw(question);
-                    return Vec::new();
-                }
-                StreamAction::Clear => {
-                    self.clear_btw_thread();
-                    return Vec::new();
-                }
+                StreamAction::Submit(_) | StreamAction::Clear => return Vec::new(),
+            }
+        }
+        if self.btw.is_open() && !self.permission_prompt_holds_input() {
+            self.clear_control_hovers();
+            if self.handle_btw_mouse(event) {
+                return Vec::new();
             }
         }
         if self.workbench.is_open()
             && !self.stream_modal.is_open()
+            && !self.btw.is_open()
             && !self.permission_prompt_holds_input()
         {
             self.clear_control_hovers();
@@ -632,6 +632,7 @@ impl App {
         // pressing whatever it ended over.
         if self.question_form.is_open()
             && !self.stream_modal.is_open()
+            && !self.btw.is_open()
             && !self.permission_prompt_holds_input()
             && !(event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection())
             && let Some(action) = self.question_form.handle_mouse(event)
@@ -1129,7 +1130,8 @@ impl App {
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.
-        if self.stream_modal.is_open() || self.permission_prompt_holds_input() {
+        if self.stream_modal.is_open() || self.btw.is_open() || self.permission_prompt_holds_input()
+        {
             self.scroll_at(column, row, delta);
             self.clear_selection_unless_pending_copy();
             return;
@@ -1603,6 +1605,10 @@ impl App {
 
         dismiss!(self.stream_modal, {
             self.stream_modal.dismiss();
+            Vec::new()
+        });
+        dismiss!(self.btw, {
+            self.dismiss_btw();
             Vec::new()
         });
         dismiss!(self.help_modal);

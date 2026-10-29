@@ -1649,12 +1649,17 @@ impl AgentLoop {
     /// rebuild of it: the route, system text, and tool array are the ones the
     /// run bound, so a `/btw` continues the same cached prefix and agrees with
     /// the environment reminder the transcript already carries for that model.
+    /// The tools are the ones the run sends, after it drops what it cannot
+    /// use, not the array it was handed.
     fn publish_btw_prompt(&self, slot: &ModelSlot, system: &str, opts: RequestOptions) {
+        let mut tools = self.tools.clone();
+        self.agent_params(slot, slot, ResolvedSlots::default(), ToolFilter::All)
+            .request_tools(&mut tools);
         self.btw_prompt.store(Arc::new(BtwPrompt {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
             system: system.to_owned(),
-            tools: self.tools.clone(),
+            tools,
             opts,
             profile: self.bound_profile.clone(),
         }));

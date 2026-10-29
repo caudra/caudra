@@ -1,28 +1,39 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use caudra_agent::context::ContextKey;
-use caudra_agent::{CancelToken, HistorySnapshot};
-use caudra_providers::{
-    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
-    TokenUsage, project_messages,
+use caudra_agent::agent::aside::run_aside;
+use caudra_agent::agent::task_runner::WorkflowHostContext;
+use caudra_agent::context::{ContextKey, RequestPrefix};
+use caudra_agent::permissions::AutopilotNote;
+use caudra_agent::{
+    AgentEvent, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History,
+    HistorySnapshot,
 };
-use caudra_storage::id::SessionRef;
+use caudra_providers::{CacheKey, ContentBlock, Message, Role, TokenUsage, project_messages};
+use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::media::MediaStore;
-use caudra_storage::usage_ledger::LedgerPurpose;
-use flume::Sender;
-use futures_lite::future;
+use crossterm::event::{KeyEvent, MouseEvent};
+use flume::{Receiver, Sender, TryRecvError};
+use ratatui::Frame;
+use ratatui::layout::{Position, Rect};
 
-use crate::agent::BtwPrompt;
 use crate::chat::Chat;
-use crate::components::prompt_progress::PromptProgress;
-use crate::components::stream_modal::{
-    ParkedThread, QUESTION_PREFIX, StreamDone, StreamEvent, StreamFooter, StreamUsage,
-};
-use crate::components::{DisplayMessage, DisplayRole};
+use crate::components::side_transcript::{MOVED_ON_NOTE, SideAction, SideFooter, SideTranscript};
+use crate::components::tooltip::Tip;
+use crate::components::{DisplayMessage, DisplayRole, Overlay};
+use crate::repaint::{Cadence, Dirty};
 
-use super::{App, HISTORY_UNREADABLE};
+use super::{App, COPIED_SELECTION, HISTORY_UNREADABLE};
 
 const TITLE: &str = " /btw ";
+const ASK_TITLE: &str = " /btw · Side question ";
+const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
+const CHAT_NAME: &str = "/btw";
+/// What the permission prompt says asked, for a call a side question made.
+const PERMISSION_ORIGIN: &str = "/btw";
+const STOPPED_NOTE: &str = "Stopped.";
+pub(super) const RUN_LOST: &str = "The side question stopped without an answer";
 pub(super) const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
 pub(super) const TASK_HISTORY_UNAVAILABLE: &str =
     "This task's conversation is not loaded, so /btw cannot read it";
@@ -32,14 +43,6 @@ answers. The following is the question currently being viewed, not a user decisi
 /// Drawn where the thread's snapshot of the conversation ends, so the reader
 /// can tell what the side question could and could not see.
 pub(crate) const BTW_CUTOFF_MARKER: &str = "/btw reads the conversation up to here";
-
-const BTW_REMINDER: &str = "<system-reminder>\n# Side question\n\nThe user is asking beside \
-the conversation, not continuing it. Answer from the conversation so far, directly and in one \
-response.\n- Do NOT call any tool. Tools cannot run here; a call is refused and only delays \
-the answer.\n- Nothing in this thread enters the main conversation, and the work it discusses is \
-not yours to start.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If \
-you don't know, say so; do not offer to look it up.\n- Follow-up questions may arrive in this \
-thread. Answer each the same way.\n</system-reminder>";
 
 pub(super) const CATCHUP_HEADER: &str = "Catch me up";
 pub(super) const NOTHING_TO_CATCH_UP: &str = "Nothing to catch up on yet";
@@ -67,19 +70,6 @@ branches, commands, errors) rather than describing them. Keep it to about 200 wo
 session really needs more. If the conversation doesn't make something clear, say so instead of \
 guessing.";
 
-const TOOL_CALL_STOPPED: &str = "\n\n_Stopped: the model kept trying to call tools. `/btw` cannot \
-run tools, so ask in the main session instead._";
-
-/// The result of every call a side question refuses, so the model answers
-/// from what it has instead of waiting on a tool that will never run.
-const TOOL_REDIRECT: &str = "<system-reminder>\n# Tools unavailable\n\nThis is a side question \
-and tools cannot run here, so that call was not made. Do not call any tool. Answer now from the \
-conversation so far as fully as you can, and say plainly what you could not confirm without the \
-tool.\n</system-reminder>";
-
-/// How many times a model that calls a tool is refused and asked again
-/// before the answer stops.
-const MAX_TOOL_REDIRECTS: usize = 2;
 const ROUND_SEPARATOR: &str = "\n\n";
 
 /// Leads the first question after the thread caught up with a conversation
@@ -102,24 +92,8 @@ const QUESTION_CLOSE: &str = "\n</question>\n";
 const ANSWER_OPEN: &str = "<answer>\n";
 const ANSWER_CLOSE: &str = "\n</answer>";
 
-/// The reminder leads so the model treats the question as a quick aside, not a task to act on.
-pub(crate) fn btw_question(question: &str) -> Message {
-    Message::user(format!("{BTW_REMINDER}\n\n{question}"))
-}
-
-fn assistant_text(text: &str) -> Message {
-    Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::Text {
-            text: text.to_owned(),
-        }],
-        ..Default::default()
-    }
-}
-
-/// The answer as text alone. Reasoning is the model's own and a tool call
-/// never ran, so neither belongs in the thread the next question extends.
-fn answer_text(message: &Message) -> Option<String> {
+/// The text of a message, without its reasoning or tool calls.
+fn message_text(message: &Message) -> Option<String> {
     let text: Vec<&str> = message
         .content
         .iter()
@@ -132,22 +106,15 @@ fn answer_text(message: &Message) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// Answers every call `message` made with a refusal that tells the model to
-/// answer without it, which keeps each call paired with a result.
-fn refuse_tool_calls(message: &Message) -> Message {
-    Message {
-        role: Role::User,
-        content: message
-            .tool_uses()
-            .map(|(id, _, _)| ContentBlock::ToolResult {
-                tool_use_id: id.to_owned(),
-                content: TOOL_REDIRECT.into(),
-                is_error: true,
-                output_ref: None,
-            })
-            .collect(),
-        ..Default::default()
-    }
+/// What the model said last, which is what a later quote of the exchange
+/// keeps once its tool turns are dropped.
+fn final_answer(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| matches!(message.role, Role::Assistant))
+        .find_map(message_text)
+        .unwrap_or_default()
 }
 
 /// How far a conversation had got when a thread read it. Equal marks mean the
@@ -189,83 +156,56 @@ impl BtwSource {
     }
 }
 
-/// A side conversation forked from the main one: the prefix and history it
-/// opened over, pinned, and the text-only exchanges asked on top of them.
-/// Nothing here is persisted. Closing the modal keeps it until it is cleared
-/// or the session changes.
+/// A side conversation forked from the main one: the prefix it continues,
+/// pinned, and a history that starts as the conversation it forked and grows
+/// with every exchange, tool turns included. The agent projects it exactly as
+/// the live request does, so the provider reads the cached prefix. Nothing
+/// here is persisted. Closing the window keeps it until it is cleared or the
+/// session changes.
 pub(crate) struct BtwThread {
-    prompt: Arc<BtwPrompt>,
-    cache_key: Option<CacheKey>,
-    /// The task whose conversation this forks, `None` for the main one.
-    task: Option<String>,
-    base: Vec<Message>,
+    prefix: Arc<RequestPrefix>,
+    messages: Vec<Message>,
     mark: HistoryMark,
     /// Exchanges asked over an earlier base, quoted rather than replayed.
     earlier: Vec<(String, String)>,
     /// Earlier exchanges too old to quote.
     omitted: usize,
-    exchanges: Vec<(String, String)>,
+    /// The questions answered over the current base, with the answer each
+    /// ended on: what a rebase quotes once their tool turns are dropped.
+    answered: Vec<(String, String)>,
     pending: Option<String>,
     clarification_context: Option<String>,
-}
-
-/// A thread whose modal was closed, with what the modal showed of it.
-pub(crate) struct ParkedBtw {
-    thread: BtwThread,
-    display: ParkedThread,
-}
-
-/// Exactly what the live request sends for `base`, so the provider can reuse
-/// the cached prefix instead of re-reading the whole history as fresh input
-/// tokens. That includes answering a call the mirror caught mid-turn, which a
-/// provider would otherwise reject. The base is projected per request, after
-/// its stored media is loaded, so a PDF a restored session holds only a
-/// reference to goes out attached instead of as a note to fetch it again.
-fn request(prompt: &BtwPrompt, base: &[Message], questions: Vec<Message>) -> Vec<Message> {
-    let mut messages = caudra_agent::project_request(
-        base,
-        &prompt.tools,
-        &prompt.model,
-        prompt.provider.reasoning_transport(&prompt.model),
-    )
-    .into_owned();
-    messages.extend(questions);
-    messages
+    /// The transcript already says the conversation moved on past it.
+    moved_on: bool,
 }
 
 impl BtwThread {
-    fn new(prompt: Arc<BtwPrompt>, history: Vec<Message>) -> Self {
+    fn new(prefix: Arc<RequestPrefix>, messages: Vec<Message>, mark: HistoryMark) -> Self {
         Self {
-            prompt,
-            cache_key: None,
-            task: None,
-            base: history,
-            mark: HistoryMark::default(),
+            prefix,
+            messages,
+            mark,
             earlier: Vec::new(),
             omitted: 0,
-            exchanges: Vec::new(),
+            answered: Vec::new(),
             pending: None,
             clarification_context: None,
+            moved_on: false,
         }
     }
 
     /// Moves the thread onto the conversation as it stands now. The answers
     /// so far were given over the old base, so they become quoted context
-    /// for the next question instead of turns the model would extend.
-    fn rebase(
-        &mut self,
-        (prompt, cache_key): (Arc<BtwPrompt>, Option<CacheKey>),
-        base: Vec<Message>,
-        mark: HistoryMark,
-    ) {
-        self.earlier.append(&mut self.exchanges);
+    /// for the next question, and their tool turns are left behind.
+    fn rebase(&mut self, prefix: Arc<RequestPrefix>, base: Vec<Message>, mark: HistoryMark) {
+        self.earlier.append(&mut self.answered);
         let excess = self.earlier.len().saturating_sub(MAX_REPLAYED_EXCHANGES);
         self.earlier.drain(..excess);
         self.omitted += excess;
-        self.prompt = prompt;
-        self.cache_key = cache_key;
-        self.base = base;
+        self.prefix = prefix;
+        self.messages = base;
         self.mark = mark;
+        self.moved_on = false;
     }
 
     /// The earlier exchanges as the quote that leads the first question.
@@ -288,7 +228,7 @@ impl BtwThread {
         Some(digest)
     }
 
-    /// A question that never settled is replaced rather than kept: the request
+    /// A question that never settled is replaced rather than kept: the run
     /// that carried it failed, so the model never answered it.
     fn ask(&mut self, question: String) {
         self.pending = Some(question);
@@ -297,7 +237,7 @@ impl BtwThread {
     fn ask_clarification(&mut self, question: String, context: String) {
         let changed = self.clarification_context.as_ref() != Some(&context)
             || self.pending.is_some()
-            || self.exchanges.is_empty();
+            || self.answered.is_empty();
         let question = if changed {
             format!("{CLARIFICATION_REMINDER}\n\n{context}\n\n{question}")
         } else {
@@ -307,9 +247,36 @@ impl BtwThread {
         self.ask(question);
     }
 
+    /// The pending question as the model reads it. After a rebase the quoted
+    /// earlier exchanges ride the first question only: a later copy would
+    /// say nothing new and move the cache boundary for every follow-up.
+    fn question(&self) -> String {
+        let question = self.pending.clone().unwrap_or_default();
+        match self.digest().filter(|_| self.answered.is_empty()) {
+            Some(digest) => format!("{digest}{ROUND_SEPARATOR}{question}"),
+            None => question,
+        }
+    }
+
+    /// Files the pending question with the history its run left, which ends
+    /// on the answer. No answer, which is what a failed or stopped run
+    /// leaves, drops the question instead, along with whatever the run did.
+    fn settle(&mut self, answered: Option<Vec<Message>>) {
+        let Some(question) = self.pending.take() else {
+            return;
+        };
+        match answered {
+            Some(messages) => {
+                self.answered.push((question, final_answer(&messages)));
+                self.messages = messages;
+            }
+            None => self.clarification_context = None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn exchange_count(&self) -> usize {
-        self.exchanges.len()
+        self.answered.len()
     }
 
     #[cfg(test)]
@@ -322,89 +289,266 @@ impl BtwThread {
         self.pending.as_deref()
     }
 
-    /// The text of every message the thread opened over.
+    #[cfg(test)]
+    pub(super) fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// The text of every message the next question extends.
     #[cfg(test)]
     pub(super) fn base_texts(&self) -> Vec<String> {
-        request(&self.prompt, &self.base, Vec::new())
-            .iter()
-            .filter_map(answer_text)
-            .collect()
+        self.messages.iter().filter_map(message_text).collect()
     }
 
     /// The model the thread asks and the cache it reads.
     #[cfg(test)]
     pub(super) fn route(&self) -> (String, Option<&CacheKey>) {
-        (self.prompt.model.spec(), self.cache_key.as_ref())
-    }
-
-    /// Files the pending question with its answer. No answer, which is what a
-    /// refused or tool-calling reply leaves, drops the question instead, so the
-    /// thread stays a strict alternation the provider accepts.
-    fn settle(&mut self, answer: Option<String>) {
-        let Some(question) = self.pending.take() else {
-            return;
-        };
-        if let Some(answer) = answer {
-            self.exchanges.push((question, answer));
-        } else {
-            self.clarification_context = None;
-        }
-    }
-
-    #[cfg(test)]
-    fn request_messages(&self) -> Vec<Message> {
-        request(&self.prompt, &self.base, self.questions())
-    }
-
-    /// The reminder rides the first question only: a later block would say
-    /// nothing new and would move the cache boundary for every follow-up.
-    /// After a rebase the quoted earlier exchanges ride it too.
-    fn questions(&self) -> Vec<Message> {
-        let mut messages = Vec::new();
-        let digest = self.digest();
-        let questions = self
-            .exchanges
-            .iter()
-            .map(|(question, answer)| (question.as_str(), Some(answer.as_str())))
-            .chain(self.pending.as_deref().map(|question| (question, None)));
-        for (index, (question, answer)) in questions.enumerate() {
-            messages.push(if index == 0 {
-                match &digest {
-                    Some(digest) => btw_question(&format!("{digest}{ROUND_SEPARATOR}{question}")),
-                    None => btw_question(question),
-                }
-            } else {
-                Message::user(question.to_owned())
-            });
-            if let Some(answer) = answer {
-                messages.push(assistant_text(answer));
-            }
-        }
-        messages
+        (self.prefix.model.spec(), self.prefix.cache_key.as_ref())
     }
 }
 
+/// A side question's window, the conversation it asks about, and the thread
+/// it keeps once the first question is sent.
+pub(crate) struct SideQuestion {
+    /// The task whose conversation it reads, `None` for the main one.
+    task: Option<String>,
+    window: SideTranscript,
+    thread: Option<BtwThread>,
+    /// The question form a clarification is about, as the window last showed
+    /// it. Only a clarification has one.
+    context: Option<String>,
+}
+
+impl SideQuestion {
+    fn new(task: Option<String>, mut window: SideTranscript) -> Self {
+        window.open();
+        Self {
+            task,
+            window,
+            thread: None,
+            context: None,
+        }
+    }
+
+    /// Says once under the last answer that the conversation moved on since.
+    fn note_moved_on(&mut self) {
+        if let Some(thread) = self.thread.as_mut()
+            && !thread.moved_on
+        {
+            thread.moved_on = true;
+            self.window.push_notice(MOVED_ON_NOTE);
+        }
+    }
+}
+
+/// What a run hands back: the history it left and how it ended.
+type AsideReply = (Vec<Message>, Result<DoneReason, String>);
+
+/// The side question being answered. Dropping it stops the run.
+struct AsideRun {
+    id: u64,
+    usage: TokenUsage,
+    reply: Receiver<AsideReply>,
+    _stop: CancelTrigger,
+}
+
+/// Every side question: the one shown, or the clarification kept behind its
+/// form, and the ones closed and kept per conversation. Runs report on one
+/// channel, so a run's spend is billed even after its window has gone.
+pub(crate) struct Btw {
+    side: Option<SideQuestion>,
+    parked: HashMap<Option<String>, SideQuestion>,
+    run: Option<AsideRun>,
+    sender: Sender<Envelope>,
+    events: Receiver<Envelope>,
+    runs: u64,
+}
+
+impl Default for Btw {
+    fn default() -> Self {
+        let (sender, events) = flume::unbounded();
+        Self {
+            side: None,
+            parked: HashMap::new(),
+            run: None,
+            sender,
+            events,
+            runs: 0,
+        }
+    }
+}
+
+impl Btw {
+    pub(crate) fn is_running(&self) -> bool {
+        self.run.is_some()
+    }
+
+    pub(crate) fn is_clarifying(&self) -> bool {
+        self.side
+            .as_ref()
+            .is_some_and(|side| side.context.is_some())
+    }
+
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.side
+            .as_ref()
+            .is_some_and(|side| side.window.text_input_active())
+    }
+
+    pub(crate) fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        self.is_open()
+            && self
+                .side
+                .as_mut()
+                .is_some_and(|side| side.window.handle_text(text, paste))
+    }
+
+    pub(crate) fn contains(&self, pos: Position) -> bool {
+        self.is_open()
+            && self
+                .side
+                .as_ref()
+                .is_some_and(|side| side.window.contains(pos))
+    }
+
+    pub(crate) fn scroll_at(&mut self, at: Position, delta: i32) {
+        if let Some(side) = self.side.as_mut() {
+            side.window.scroll_at(at, delta);
+        }
+    }
+
+    pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.side
+            .as_mut()
+            .map_or_else(Rect::default, |side| side.window.view(frame, area))
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> SideAction {
+        self.side
+            .as_mut()
+            .map_or(SideAction::Ignored, |side| side.window.handle_key(key))
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent, cwd: &Path) -> SideAction {
+        self.side.as_mut().map_or(SideAction::Ignored, |side| {
+            side.window.handle_mouse(event, cwd)
+        })
+    }
+
+    fn thread_mut(&mut self) -> Option<&mut BtwThread> {
+        self.side.as_mut()?.thread.as_mut()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread(&self) -> Option<&BtwThread> {
+        self.side.as_ref()?.thread.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> Option<&SideTranscript> {
+        self.side.as_ref().map(|side| &side.window)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_parked(&self) -> bool {
+        !self.parked.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sender(&self) -> &Sender<Envelope> {
+        &self.sender
+    }
+}
+
+impl Overlay for Btw {
+    fn is_open(&self) -> bool {
+        self.side.as_ref().is_some_and(|side| side.window.is_open())
+    }
+
+    /// Hides the window. What closing means for the thread it shows, the app
+    /// settles on its next tick.
+    fn close(&mut self) {
+        if let Some(side) = self.side.as_mut() {
+            side.window.close();
+        }
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.side
+            .as_ref()
+            .map_or(Cadence::IDLE, |side| side.window.cadence())
+    }
+
+    fn tooltip(&self) -> Option<Tip> {
+        self.side.as_ref()?.window.tooltip()
+    }
+}
+
+/// Answers `question` over `messages` on the agent loop, in a context built
+/// for this run alone. What the stored media of a restored session only
+/// references is loaded first, off the UI thread, so it goes out attached.
+async fn ask_aside(
+    host: Arc<WorkflowHostContext>,
+    prefix: Arc<RequestPrefix>,
+    mut messages: Vec<Message>,
+    store: MediaStore,
+    events: EventSender,
+    cancel: CancelToken,
+    question: String,
+) -> AsideReply {
+    caudra_agent::load_stored_media(&mut messages, &store).await;
+    let mut history = History::new(messages);
+    let call_id = CaudraId::generate().to_string();
+    let done = match crate::agent::task_context(&host, None, cancel, events, &call_id).await {
+        Ok(ctx) => run_aside(&ctx, &prefix, &mut history, question)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    (history.as_slice().to_vec(), done)
+}
+
 impl App {
+    fn btw_window(&self, title: &'static str, footer: SideFooter) -> SideTranscript {
+        let chat = Chat::new(
+            CHAT_NAME.to_owned(),
+            Path::new(&self.state.session.cwd),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        SideTranscript::new(title, footer, chat)
+    }
+
     pub(super) fn open_question_btw(&mut self) {
         if !self.question_form.is_open() {
             return;
         }
-        if self
-            .btw_prompt_for(self.question_asker().as_deref())
-            .is_none()
-        {
+        let asker = self.question_asker();
+        if self.btw_prompt_for(asker.as_deref()).is_none() {
             self.flash(PROMPT_INITIALIZING.into());
             return;
         }
-        if !self.stream_modal.is_clarification() {
-            self.close_stream_modal();
+        self.close_stream_modal();
+        if self.btw.is_clarifying() {
+            let _ = self.poll_btw_run();
         } else {
-            self.settle_stream_modal();
+            self.close_btw();
         }
         self.autoscroll = None;
         self.selection_state = None;
-        self.stream_modal
-            .open_clarification(self.question_form.clarification_context());
+        let context = self.question_form.clarification_context();
+        if self.btw.side.is_none() {
+            let window = self.btw_window(CLARIFICATION_TITLE, SideFooter::Clarify);
+            self.btw.side = Some(SideQuestion::new(asker, window));
+        }
+        let Some(side) = self.btw.side.as_mut() else {
+            return;
+        };
+        if side.context.as_ref() != Some(&context) {
+            side.window.push_notice(context.clone());
+            side.context = Some(context);
+        }
+        side.window.open();
     }
 
     /// `F2`: the thread this conversation kept, or an empty `/btw` that reads
@@ -417,72 +561,128 @@ impl App {
             return;
         }
         self.close_stream_modal();
+        self.close_btw();
         self.autoscroll = None;
         self.selection_state = None;
-        if !self.resume_btw(task) {
-            self.stream_modal.open_ask();
+        if !self.resume_btw(task.clone()) {
+            let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
+            self.btw.side = Some(SideQuestion::new(task, window));
         }
     }
 
     pub(super) fn discard_question_btw(&mut self) {
-        if self.stream_modal.is_clarification() {
-            self.close_stream_modal();
+        if self.btw.is_clarifying() {
+            self.close_btw();
         }
     }
 
-    /// Closes whatever the modal shows. A side thread is kept for its
-    /// conversation; a clarification and `/extract` are not.
-    pub(super) fn close_stream_modal(&mut self) {
-        let keep = self.btw_thread.is_some() && !self.stream_modal.is_clarification();
-        if keep && self.stream_modal.is_open() {
-            self.stream_modal.park();
-        } else {
-            let _ = self.stream_modal.poll();
+    /// Takes the side question off the screen and stops its run. A side
+    /// thread is kept for its conversation; a clarification is not.
+    pub(super) fn close_btw(&mut self) {
+        if self.btw.side.is_none() {
+            return;
         }
-        self.settle_stream_modal();
-        self.stream_modal.close();
-        self.end_btw_thread(keep);
+        self.stop_btw_run();
+        let Some(mut side) = self.btw.side.take() else {
+            return;
+        };
+        side.window.close();
+        self.unmark_btw_cutoff(side.task.as_deref());
+        if side.context.is_none() {
+            self.btw.parked.insert(side.task.clone(), side);
+        }
     }
 
-    /// `Ctrl+L`: forgets the thread the modal shows and leaves an empty
+    /// The window closed itself. A clarification stays behind its form,
+    /// stopped; anything else is closed.
+    fn btw_closed(&mut self) {
+        match self.btw.is_clarifying() {
+            true => self.stop_btw_run(),
+            false => self.close_btw(),
+        }
+    }
+
+    pub(super) fn handle_btw_key(&mut self, key: KeyEvent) {
+        let action = self.btw.handle_key(key);
+        self.handle_btw_action(action);
+    }
+
+    /// Whether the pointer was the window's.
+    pub(super) fn handle_btw_mouse(&mut self, event: MouseEvent) -> bool {
+        let cwd = self.state.session.cwd.clone();
+        let action = self.btw.handle_mouse(event, Path::new(&cwd));
+        let ignored = action == SideAction::Ignored;
+        self.handle_btw_action(action);
+        !ignored
+    }
+
+    /// An outside click hides the window as Esc would.
+    pub(super) fn dismiss_btw(&mut self) {
+        Overlay::close(&mut self.btw);
+        self.btw_closed();
+    }
+
+    fn handle_btw_action(&mut self, action: SideAction) {
+        match action {
+            SideAction::Ignored | SideAction::Consumed => {}
+            SideAction::Close => self.btw_closed(),
+            SideAction::Copy(text) => self.copy_to_clipboard(&text),
+            SideAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
+            SideAction::Submit(question) => self.continue_btw(question),
+            SideAction::Clear => self.clear_btw_thread(),
+            SideAction::Interrupt => self.stop_btw_run(),
+        }
+    }
+
+    /// `Ctrl+L`: forgets the thread the window shows and leaves an empty
     /// `/btw` in its place.
     pub(super) fn clear_btw_thread(&mut self) {
-        let _ = self.stream_modal.poll();
-        self.settle_stream_modal();
-        let task = match &self.btw_thread {
-            Some(thread) => thread.task.clone(),
+        self.stop_btw_run();
+        let task = match self.btw.side.take() {
+            Some(side) => {
+                self.unmark_btw_cutoff(side.task.as_deref());
+                side.task
+            }
             None => self.active_subagent_id().map(str::to_owned),
         };
-        self.stream_modal.close();
-        self.end_btw_thread(false);
-        self.parked_btw.remove(&task);
-        self.stream_modal.open_ask();
+        self.btw.parked.remove(&task);
+        let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
+        self.btw.side = Some(SideQuestion::new(task, window));
     }
 
-    /// Forgets every kept thread, for a session that is going away.
+    /// Forgets every side question, for a session that is going away. What
+    /// their runs spent is billed to it first, and anything a stopped run
+    /// reports later never reaches the next one.
     pub(super) fn discard_btw_threads(&mut self) {
-        self.end_btw_thread(false);
-        self.parked_btw.clear();
-        self.stream_modal.forget_parked_draft();
+        self.stop_btw_run();
+        if let Some(side) = self.btw.side.take() {
+            self.unmark_btw_cutoff(side.task.as_deref());
+        }
+        self.btw = Btw::default();
     }
 
-    /// Reopens the thread `task`'s conversation kept, if it kept one. One
-    /// whose conversation has moved on says so and gets no transcript marker
-    /// until its next question catches it up.
+    /// Reopens what `task`'s conversation kept, if it kept anything. A
+    /// thread whose conversation has moved on says so and gets no transcript
+    /// marker until its next question catches it up.
     fn resume_btw(&mut self, task: Option<String>) -> bool {
-        let Some(parked) = self.parked_btw.remove(&task) else {
+        let Some(mut side) = self.btw.parked.remove(&task) else {
             return false;
         };
-        let Ok(source) = self.btw_source(task.as_deref()) else {
-            return false;
+        let current = match &side.thread {
+            None => true,
+            Some(thread) => match self.btw_source(task.as_deref()) {
+                Ok(source) => source.mark() == thread.mark,
+                Err(_) => return false,
+            },
         };
-        let current = source.mark() == parked.thread.mark;
-        self.stream_modal.resume(parked.display);
-        if current {
-            self.install_btw_thread(parked.thread);
-        } else {
-            self.stream_modal.mark_moved_on();
-            self.btw_thread = Some(parked.thread);
+        side.window.open();
+        if side.thread.is_some() && !current {
+            side.note_moved_on();
+        }
+        let marked = side.thread.is_some() && current;
+        self.btw.side = Some(side);
+        if marked {
+            self.mark_btw_cutoff(task.as_deref());
         }
         true
     }
@@ -491,24 +691,24 @@ impl App {
     /// moved on since the thread read it. False, with the reason flashed,
     /// when the conversation can no longer be read.
     fn catch_up_btw_thread(&mut self) -> bool {
-        let Some(task) = self.btw_thread.as_ref().map(|thread| thread.task.clone()) else {
+        let Some(side) = &self.btw.side else {
             return true;
         };
+        let Some(thread) = &side.thread else {
+            return true;
+        };
+        let task = side.task.clone();
         let caught_up = self.btw_source(task.as_deref()).and_then(|source| {
             let mark = source.mark();
-            if self
-                .btw_thread
-                .as_ref()
-                .is_some_and(|thread| thread.mark == mark)
-            {
+            if thread.mark == mark {
                 return Ok(None);
             }
-            let route = self
+            let prefix = self
                 .btw_prompt_for(task.as_deref())
                 .ok_or_else(|| PROMPT_INITIALIZING.to_owned())?;
-            Ok(Some((route, source.messages()?, mark)))
+            Ok(Some((prefix, source.messages()?, mark)))
         });
-        let (route, base, mark) = match caught_up {
+        let (prefix, base, mark) = match caught_up {
             Ok(None) => return true,
             Ok(Some(caught_up)) => caught_up,
             Err(error) => {
@@ -516,10 +716,12 @@ impl App {
                 return false;
             }
         };
-        if let Some(thread) = self.btw_thread.as_mut() {
-            thread.rebase(route, base, mark);
+        if let Some(side) = self.btw.side.as_mut() {
+            side.note_moved_on();
+            if let Some(thread) = side.thread.as_mut() {
+                thread.rebase(prefix, base, mark);
+            }
         }
-        self.stream_modal.mark_moved_on();
         self.mark_btw_cutoff(task.as_deref());
         true
     }
@@ -537,24 +739,22 @@ impl App {
         })
     }
 
-    /// The prefix a side question over `task` sends, and the cache it reads.
-    /// A task this process ran continues its own prefix. One restored from an
-    /// earlier process has none, so it borrows the main session's.
-    fn btw_prompt_for(&self, task: Option<&str>) -> Option<(Arc<BtwPrompt>, Option<CacheKey>)> {
+    /// The prefix a side question over `task` sends, and the cache it reads,
+    /// once the session can run one. A task this process ran continues its
+    /// own prefix. One restored from an earlier process has none, so it
+    /// borrows the main session's.
+    fn btw_prompt_for(&self, task: Option<&str>) -> Option<Arc<RequestPrefix>> {
+        self.task_host.as_ref()?;
         if let Some(prefix) = task.and_then(|task| {
             self.context_store
                 .as_ref()?
                 .request_prefix(&ContextKey::task(task))
         }) {
-            return Some((
-                Arc::new(BtwPrompt::from(prefix.as_ref())),
-                prefix.cache_key.clone(),
-            ));
+            return Some(prefix);
         }
         let prompt = self.btw_prompt.as_ref()?.load_full();
         (!prompt.system.is_empty()).then(|| {
-            let key = CacheKey::session(&SessionRef::from(self.state.session.id));
-            (prompt, Some(key))
+            Arc::new(prompt.prefix(CacheKey::session(&SessionRef::from(self.state.session.id))))
         })
     }
 
@@ -586,9 +786,9 @@ impl App {
             .ok_or_else(|| TASK_HISTORY_UNAVAILABLE.to_owned())
     }
 
-    fn capture_btw_thread(&mut self, task: Option<String>) -> Option<BtwThread> {
+    fn capture_btw_thread(&mut self, task: Option<&str>) -> Option<BtwThread> {
         let read = self
-            .btw_source(task.as_deref())
+            .btw_source(task)
             .and_then(|source| Ok((source.messages()?, source.mark())));
         let (messages, mark) = match read {
             Ok(read) => read,
@@ -597,15 +797,11 @@ impl App {
                 return None;
             }
         };
-        let Some((prompt, cache_key)) = self.btw_prompt_for(task.as_deref()) else {
+        let Some(prefix) = self.btw_prompt_for(task) else {
             self.status_bar.flash(PROMPT_INITIALIZING.into());
             return None;
         };
-        let mut thread = BtwThread::new(prompt, messages);
-        thread.cache_key = cache_key;
-        thread.task = task;
-        thread.mark = mark;
-        Some(thread)
+        Some(BtwThread::new(prefix, messages, mark))
     }
 
     /// The transcript of the conversation `task` names, while it is open.
@@ -618,8 +814,11 @@ impl App {
     }
 
     fn install_btw_thread(&mut self, thread: BtwThread) {
-        let task = thread.task.clone();
-        self.btw_thread = Some(thread);
+        let Some(side) = self.btw.side.as_mut() else {
+            return;
+        };
+        side.thread = Some(thread);
+        let task = side.task.clone();
         self.mark_btw_cutoff(task.as_deref());
     }
 
@@ -635,12 +834,18 @@ impl App {
         }
     }
 
+    fn unmark_btw_cutoff(&mut self, task: Option<&str>) {
+        if let Some(chat) = self.btw_chat(task) {
+            chat.remove_notice(BTW_CUTOFF_MARKER);
+        }
+    }
+
     pub(crate) fn start_btw(&mut self, question: String) {
-        self.open_btw(format!("{QUESTION_PREFIX}{question}"), question, |_| true);
+        self.open_btw(question.clone(), question, |_| true);
     }
 
     /// A `/btw` with a canned question, headed by a short label rather than
-    /// the prompt, so copying the thread does not repeat the whole prompt.
+    /// the prompt, so the transcript does not repeat the whole prompt.
     pub(crate) fn start_catchup(&mut self, focus: &str) {
         let (header, question) = if focus.is_empty() {
             (CATCHUP_HEADER.to_owned(), CATCHUP_PROMPT.to_owned())
@@ -652,7 +857,7 @@ impl App {
         };
         self.open_btw(header, question, |thread| {
             thread
-                .base
+                .messages
                 .iter()
                 .any(|message| matches!(message.role, Role::User))
         });
@@ -664,343 +869,421 @@ impl App {
     fn open_btw(&mut self, header: String, question: String, answerable: fn(&BtwThread) -> bool) {
         let task = self.active_subagent_id().map(str::to_owned);
         self.close_stream_modal();
-        if self.resume_btw(task.clone()) {
+        self.close_btw();
+        let resumed = self.resume_btw(task.clone());
+        if resumed && self.btw.thread_mut().is_some() {
             if !self.catch_up_btw_thread() {
                 return;
             }
-            if !self.btw_thread.as_ref().is_some_and(answerable) {
-                self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
-                return;
-            }
-            if let Some(thread) = self.btw_thread.as_mut() {
-                thread.ask(question);
-            }
-            self.stream_btw_answer(header);
-            return;
-        }
-        let Some(mut thread) = self.capture_btw_thread(task) else {
-            return;
-        };
-        if !answerable(&thread) {
-            self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
-            return;
-        }
-        self.renew_question_wait();
-        thread.ask(question);
-        self.install_btw_thread(thread);
-
-        let (tx, rx) = flume::bounded(64);
-        let (trigger, cancel) = CancelToken::new();
-        self.stream_modal
-            .open(TITLE, header, StreamFooter::FollowUp, rx, trigger);
-        self.spawn_btw(tx, cancel);
-    }
-
-    /// Asks the next question over the same snapshot and prefix, so the whole
-    /// thread stays one cached lineage, unless the conversation moved on
-    /// since, when the thread catches up with it first.
-    pub(crate) fn continue_btw(&mut self, question: String) {
-        self.settle_stream_modal();
-        let context = self
-            .stream_modal
-            .is_clarification()
-            .then(|| self.question_form.clarification_context());
-        if self.btw_thread.is_none() {
-            let asker = if context.is_some() {
-                self.question_asker()
-            } else {
-                self.active_subagent_id().map(str::to_owned)
-            };
-            let Some(thread) = self.capture_btw_thread(asker) else {
-                self.stream_modal.handle_paste(&question);
+        } else {
+            let Some(thread) = self.capture_btw_thread(task.as_deref()) else {
                 return;
             };
+            if !resumed {
+                let window = self.btw_window(TITLE, SideFooter::FollowUp);
+                self.btw.side = Some(SideQuestion::new(task.clone(), window));
+            }
             self.install_btw_thread(thread);
-        } else if context.is_none() && !self.catch_up_btw_thread() {
-            self.stream_modal.handle_paste(&question);
-            return;
         }
-        let header = format!("{QUESTION_PREFIX}{question}");
-        let Some(thread) = self.btw_thread.as_mut() else {
+        let Some(thread) = self.btw.thread_mut() else {
             return;
         };
-        match context {
-            Some(context) => thread.ask_clarification(question, context),
-            None => thread.ask(question),
+        if !answerable(thread) {
+            self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
+            if !resumed {
+                self.close_btw();
+                self.btw.parked.remove(&task);
+            }
+            return;
         }
+        thread.ask(question);
         self.stream_btw_answer(header);
     }
 
+    /// Asks the next question over the same thread, so it stays one cached
+    /// lineage, unless the conversation moved on since, when the thread
+    /// catches up with it first.
+    pub(crate) fn continue_btw(&mut self, question: String) {
+        let _ = self.poll_btw_run();
+        let Some(side) = &self.btw.side else {
+            return;
+        };
+        let clarifying = side.context.is_some();
+        if side.thread.is_none() {
+            let task = side.task.clone();
+            let Some(thread) = self.capture_btw_thread(task.as_deref()) else {
+                self.restore_btw_draft(&question);
+                return;
+            };
+            self.install_btw_thread(thread);
+        } else if !clarifying && !self.catch_up_btw_thread() {
+            self.restore_btw_draft(&question);
+            return;
+        }
+        let context = clarifying.then(|| self.question_form.clarification_context());
+        let Some(thread) = self.btw.thread_mut() else {
+            return;
+        };
+        match context {
+            Some(context) => thread.ask_clarification(question.clone(), context),
+            None => thread.ask(question.clone()),
+        }
+        self.stream_btw_answer(question);
+    }
+
+    fn restore_btw_draft(&mut self, question: &str) {
+        if let Some(side) = self.btw.side.as_mut() {
+            side.window.set_draft(question);
+        }
+    }
+
+    /// Shows `header` as the question and starts the run that answers the
+    /// thread's pending one.
     fn stream_btw_answer(&mut self, header: String) {
+        let Some(host) = self.task_host.clone() else {
+            self.flash(PROMPT_INITIALIZING.into());
+            if let Some(thread) = self.btw.thread_mut() {
+                thread.settle(None);
+            }
+            return;
+        };
         self.renew_question_wait();
-        let (tx, rx) = flume::bounded(64);
-        let (trigger, cancel) = CancelToken::new();
-        self.stream_modal.begin_exchange(header, rx, trigger);
-        self.spawn_btw(tx, cancel);
-    }
-
-    fn spawn_btw(&self, tx: Sender<StreamEvent>, cancel: CancelToken) {
-        let Some(thread) = &self.btw_thread else {
+        let store = MediaStore::new(&self.storage);
+        let btw = &mut self.btw;
+        let Some(side) = btw.side.as_mut() else {
             return;
         };
-        // A btw forks a conversation, so it shares that conversation's cache key on purpose.
-        smol::spawn(run_btw_over(
-            Arc::clone(&thread.prompt),
-            thread.base.clone(),
-            thread.questions(),
-            MediaStore::new(&self.storage),
-            tx,
-            thread.cache_key.clone(),
+        let Some(thread) = &side.thread else {
+            return;
+        };
+        btw.runs += 1;
+        let (stop, cancel) = CancelToken::new();
+        let (reply_tx, reply) = flume::bounded(1);
+        let asked = ask_aside(
+            host,
+            Arc::clone(&thread.prefix),
+            thread.messages.clone(),
+            store,
+            EventSender::new(btw.sender.clone(), btw.runs),
             cancel,
-        ))
+            thread.question(),
+        );
+        smol::spawn(async move {
+            let _ = reply_tx.send(asked.await);
+        })
         .detach();
+        btw.run = Some(AsideRun {
+            id: btw.runs,
+            usage: TokenUsage::default(),
+            reply,
+            _stop: stop,
+        });
+        if side.context.is_none() {
+            side.window.set_footer(SideFooter::FollowUp);
+        }
+        side.window.chat_mut().show_user_message(header);
+        side.window.begin_run();
     }
 
-    pub(crate) fn settle_btw(&mut self, answer: Option<String>) {
-        if let Some(thread) = self.btw_thread.as_mut() {
-            thread.settle(answer);
+    /// The side question on the clock: a clarification whose form is gone
+    /// goes with it, a finished run settles, and a window something else
+    /// closed is closed properly.
+    pub(super) fn tick_btw(&mut self) -> Dirty {
+        if self.btw.is_clarifying() && !self.question_form.is_open() {
+            self.discard_question_btw();
+            return Dirty::YES;
+        }
+        let dirty = self.poll_btw_run();
+        if self
+            .btw
+            .side
+            .as_ref()
+            .is_some_and(|side| !side.window.is_open() && side.context.is_none())
+        {
+            self.close_btw();
+            return Dirty::YES;
+        }
+        dirty
+            | self
+                .btw
+                .side
+                .as_mut()
+                .map_or(Dirty::NO, |side| side.window.tick())
+    }
+
+    /// Reads what the runs reported and settles the live one if it ended.
+    /// Its reply is taken before its events are read: every event a run
+    /// sends goes out before its reply, so none is left behind.
+    fn poll_btw_run(&mut self) -> Dirty {
+        let reply = self
+            .btw
+            .run
+            .as_ref()
+            .and_then(|run| match run.reply.try_recv() {
+                Ok(reply) => Some(reply),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((Vec::new(), Err(RUN_LOST.to_owned()))),
+            });
+        let dirty = self.drain_btw_events();
+        match reply {
+            Some(reply) => {
+                self.settle_btw_run(reply);
+                Dirty::YES
+            }
+            None => dirty,
         }
     }
 
-    /// Takes the open thread and its marker out of the transcript, keeping
-    /// the thread for its conversation when `keep` says so and the modal set
-    /// its exchanges aside. Every way the modal closes reaches here through
-    /// the tick, so no close path has to know about the marker.
-    pub(crate) fn end_btw_thread(&mut self, keep: bool) {
-        let display = self.stream_modal.take_parked();
-        let Some(mut thread) = self.btw_thread.take() else {
-            return;
-        };
-        if let Some(chat) = self.btw_chat(thread.task.as_deref()) {
-            chat.remove_notice(BTW_CUTOFF_MARKER);
-        }
-        if keep && let Some(display) = display {
-            thread.settle(None);
-            self.parked_btw
-                .insert(thread.task.clone(), ParkedBtw { thread, display });
-        }
-    }
-}
-
-/// Loads what the snapshot holds only references to off the UI thread, then
-/// asks over it.
-async fn run_btw_over(
-    prompt: Arc<BtwPrompt>,
-    mut base: Vec<Message>,
-    questions: Vec<Message>,
-    store: MediaStore,
-    btw_tx: Sender<StreamEvent>,
-    cache_key: Option<CacheKey>,
-    cancel: CancelToken,
-) {
-    caudra_agent::load_stored_media(&mut base, &store).await;
-    let messages = request(&prompt, &base, questions);
-    run_btw(prompt, messages, btw_tx, cache_key, cancel).await;
-}
-
-async fn run_btw(
-    prompt: Arc<BtwPrompt>,
-    messages: Vec<Message>,
-    btw_tx: Sender<StreamEvent>,
-    cache_key: Option<CacheKey>,
-    cancel: CancelToken,
-) {
-    // btw bypasses `stream_with_retry`, the only other place options meet a model, so it has to
-    // clamp for itself or it sends options the live request would have gated away.
-    let opts = prompt.opts.clamped(&prompt.model);
-    let (event_tx, event_rx) = flume::unbounded();
-
-    let forwarder = smol::spawn({
-        let btw_tx = btw_tx.clone();
-        async move {
-            while let Ok(event) = event_rx.recv_async().await {
-                let forwarded = match event {
-                    ProviderEvent::TextDelta { text } => StreamEvent::TextDelta(text),
-                    ProviderEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
-                    ProviderEvent::PromptProgress {
-                        processed,
-                        total,
-                        cache,
-                    } => StreamEvent::Progress(PromptProgress {
-                        processed,
-                        total,
-                        cache,
-                    }),
-                    _ => continue,
-                };
-                if btw_tx.send(forwarded).is_err() {
-                    return;
+    /// Spend is billed whichever run it came from; the rest is drawn only
+    /// for the run the window shows. Approvals go to the permission prompt
+    /// as a task's do.
+    fn drain_btw_events(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        while let Ok(envelope) = self.btw.events.try_recv() {
+            dirty = Dirty::YES;
+            let live = self
+                .btw
+                .run
+                .as_mut()
+                .filter(|run| run.id == envelope.run_id);
+            match envelope.event {
+                AgentEvent::ModelUsage {
+                    usage,
+                    cost,
+                    billing,
+                    provider,
+                    model,
+                    purpose,
+                    account,
+                } => {
+                    if let Some(run) = live {
+                        run.usage += usage;
+                    }
+                    self.settle_side_spend(
+                        &provider,
+                        account.as_deref(),
+                        &model,
+                        purpose,
+                        usage,
+                        cost,
+                        billing,
+                    );
+                }
+                AgentEvent::PermissionRequest(request) => {
+                    if request.presentation.autopilot != Some(AutopilotNote::Deciding) {
+                        self.make_way_for_permission_prompt();
+                    }
+                    let call_id = request.id.clone();
+                    if self
+                        .permission_prompt
+                        .enqueue(request, Some(PERMISSION_ORIGIN.to_owned()))
+                        && let Some(side) = self.btw.side.as_mut()
+                    {
+                        side.window.chat_mut().await_approval(&call_id);
+                    }
+                }
+                AgentEvent::PermissionRequestUpdated(request) => {
+                    let escalated = matches!(
+                        request.presentation.autopilot,
+                        Some(AutopilotNote::Escalated { .. })
+                    );
+                    if self.permission_prompt.update(request) && escalated {
+                        self.make_way_for_permission_prompt();
+                    }
+                }
+                AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                    self.permission_prompt.resolve_pending(&request_id);
+                    if let Some(side) = self.btw.side.as_mut() {
+                        side.window.chat_mut().approval_settled(&request_id);
+                    }
+                }
+                event => {
+                    if live.is_some()
+                        && let Some(side) = self.btw.side.as_mut()
+                    {
+                        side.window.handle_event(event);
+                    }
                 }
             }
         }
-    });
+        dirty
+    }
 
-    let result = future::race(
-        answer_without_tools(&prompt, messages, &event_tx, &opts, cache_key.as_ref()),
-        async {
-            cancel.cancelled().await;
-            Err(AgentError::Cancelled)
-        },
-    )
-    .await;
-    drop(event_tx);
-    forwarder.await;
-
-    match result {
-        Ok(answer) => {
-            if answer.stopped {
-                let _ = btw_tx.send(StreamEvent::TextDelta(TOOL_CALL_STOPPED.into()));
+    fn settle_btw_run(&mut self, (messages, done): AsideReply) {
+        let Some(run) = self.btw.run.take() else {
+            return;
+        };
+        let Some(side) = self.btw.side.as_mut() else {
+            return;
+        };
+        let answered = match done {
+            Ok(DoneReason::Cancelled) => None,
+            Ok(_) => Some(messages),
+            Err(error) => {
+                side.window
+                    .chat_mut()
+                    .push(DisplayMessage::new(DisplayRole::Error, error));
+                None
             }
-            let model = &prompt.model;
-            let _ = btw_tx.send(StreamEvent::Done(StreamDone {
-                usage: StreamUsage {
-                    cost: answer.cost,
-                    billing: model.billing,
-                    usage: answer.usage,
-                    model: model.id.clone(),
-                    provider: model.provider.to_string(),
-                    purpose: LedgerPurpose::Btw,
-                },
-                answer: (!answer.texts.is_empty()).then(|| answer.texts.join(ROUND_SEPARATOR)),
-            }));
+        };
+        if let Some(thread) = side.thread.as_mut() {
+            thread.settle(answered);
         }
-        // The receiver is already gone, which is what cancelled the stream.
-        Err(AgentError::Cancelled) => {}
-        Err(error) => {
-            let _ = btw_tx.send(StreamEvent::Error(error.to_string()));
+        side.window.finish_run(Some(run.usage));
+        if let Some(question) = side.window.take_queued() {
+            self.continue_btw(question);
         }
+    }
+
+    /// Stops the live run and says so where it was cut, unless it already
+    /// finished, which settles as it would have on the next tick.
+    pub(super) fn stop_btw_run(&mut self) {
+        let _ = self.poll_btw_run();
+        let Some(run) = self.btw.run.take() else {
+            return;
+        };
+        let Some(side) = self.btw.side.as_mut() else {
+            return;
+        };
+        if let Some(thread) = side.thread.as_mut() {
+            thread.settle(None);
+        }
+        let chat = side.window.chat_mut();
+        chat.flush();
+        chat.cancel_in_progress();
+        side.window.push_notice(STOPPED_NOTE);
+        side.window.finish_run(Some(run.usage));
     }
 }
 
-/// Every round's text and spend, and whether the model was still calling a
-/// tool when its redirects ran out.
-struct BtwAnswer {
-    texts: Vec<String>,
-    usage: TokenUsage,
-    cost: Option<f64>,
-    stopped: bool,
-}
+#[cfg(test)]
+const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const NO_RUN: &str = "a side question must be running";
+#[cfg(test)]
+const RUN_HUNG: &str = "the side question never finished";
 
-/// Streams the answer, refusing each tool call and asking again, so a model
-/// that reaches for a tool still answers from what it already knows. Each
-/// round is priced on its own: a tiered price depends on one request's size.
-async fn answer_without_tools(
-    prompt: &BtwPrompt,
-    mut messages: Vec<Message>,
-    event_tx: &Sender<ProviderEvent>,
-    opts: &RequestOptions,
-    cache_key: Option<&CacheKey>,
-) -> Result<BtwAnswer, AgentError> {
-    let mut answer = BtwAnswer {
-        texts: Vec::new(),
-        usage: TokenUsage::default(),
-        cost: Some(0.0),
-        stopped: false,
-    };
-    for round in 0..=MAX_TOOL_REDIRECTS {
-        let response = prompt
-            .provider
-            .stream_message(
-                &prompt.model,
-                &messages,
-                &prompt.system,
-                &prompt.tools,
-                event_tx,
-                opts.clone(),
-                cache_key,
-            )
-            .await?;
-        answer.usage += response.usage;
-        answer.cost = answer
-            .cost
-            .zip(prompt.model.billed_cost(&response.usage, opts.fast))
-            .map(|(total, cost)| total + cost);
-        let text = answer_text(&response.message);
-        let streamed_text = text.is_some();
-        answer.texts.extend(text);
-        if response.stop_reason != Some(StopReason::ToolUse) {
-            return Ok(answer);
-        }
-        let refusal = refuse_tool_calls(&response.message);
-        if round == MAX_TOOL_REDIRECTS || refusal.content.is_empty() {
-            break;
-        }
-        messages.push(response.message);
-        messages.push(refusal);
-        if streamed_text {
-            event_tx.send(ProviderEvent::TextDelta {
-                text: ROUND_SEPARATOR.into(),
-            })?;
-        }
+#[cfg(test)]
+impl App {
+    /// Waits for the live run to end, then settles it as a tick would.
+    pub(super) fn await_btw_run(&mut self) {
+        self.await_btw_reply();
+        let _ = self.poll_btw_run();
     }
-    answer.stopped = true;
-    Ok(answer)
+
+    /// Waits for the live run to end and leaves it for the next poll, as a
+    /// run that finished between two ticks is.
+    pub(super) fn await_btw_reply(&mut self) {
+        let run = self.btw.run.as_mut().expect(NO_RUN);
+        let reply = run.reply.recv_timeout(RUN_DEADLINE).expect(RUN_HUNG);
+        let (finished, held) = flume::bounded(1);
+        let _ = finished.send(reply);
+        run.reply = held;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::fs;
-    use std::sync::Mutex;
 
-    use arc_swap::ArcSwap;
-    use caudra_agent::UNAVAILABLE_RESULT;
-    use caudra_providers::provider::{BoxFuture, Provider};
-    use caudra_providers::{
-        DOCUMENT_OMITTED_PREFIX, DocumentSource, Model, ModelInfo, StreamResponse,
-    };
+    use caudra_providers::{DOCUMENT_OMITTED_PREFIX, DocumentSource, RequestOptions};
     use caudra_storage::StateDir;
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use crate::app::tests::{BtwScript, PendingProvider, btw_host, btw_reply, gated_provider};
+    use crate::components::test_model;
 
     const Q: &str = "why sqlite?";
     const FOLLOW_UP: &str = "and why not postgres?";
     const ANSWER: &str = "it ships in the binary";
+    const LOOKING: &str = "the config decides";
     const BASE: &str = "let's pick a database";
-    const FIRST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-    const SECOND_MODEL: &str = "openai/gpt-5.4";
+    const NEWER: &str = "we switched to postgres";
     const SYSTEM: &str = "system";
-    const PREFILL_PROCESSED: u32 = 1_200;
-    const PREFILL_TOTAL: u32 = 4_000;
-    const PREFILL_CACHE: u32 = 900;
     const TOOL: &str = "file_read";
-    const ORPHANED_CALL: &str = "orphaned";
-    const UNANSWERED_CALL: &str = "unanswered";
-    const OPEN_CALLS: [&str; 2] = ["open-first", "open-second"];
-    const THINKING_DELTAS: [&str; 2] = ["considering ", "deployment"];
-    const TEXT_DELTAS: [&str; 2] = ["it ships ", "in the binary"];
-    const EXPECTED_DONE: &str = "expected stream completion after all deltas";
+    const CALL: &str = "call-1";
     const CLARIFY_STORAGE: &str = "About: Q1/2 · Storage\nWhich database?\nSQLite\nPostgreSQL";
     const CLARIFY_DEPLOYMENT: &str = "About: Q2/2 · Deployment\nWhere should it run?\nLocal\nCloud";
-    const LOOKING: &str = "the config decides";
     const PDF_CALL: &str = "fetch-pdf";
     const PDF_URL: &str = "https://example.com/paper.pdf";
     const PDF_DATA: &str = "JVBERi0xLjc=";
-    const ROUND_USAGE: TokenUsage = TokenUsage {
-        input: 1_000,
-        output: 50,
-        cache_creation: 0,
-        cache_read: 200,
-    };
+    const REBASE_MSG: &str =
+        "a caught-up thread quotes its earlier exchanges in its first question";
+
+    fn prefix() -> Arc<RequestPrefix> {
+        Arc::new(RequestPrefix {
+            provider: Arc::new(PendingProvider),
+            model: test_model(),
+            system: SYSTEM.into(),
+            tools: json!([]),
+            opts: RequestOptions::default(),
+            cache_key: None,
+        })
+    }
+
+    fn base() -> Vec<Message> {
+        vec![Message::user(BASE.into())]
+    }
+
+    fn thread() -> BtwThread {
+        BtwThread::new(prefix(), base(), HistoryMark::default())
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+            ..Default::default()
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    /// The history a run leaves when it reads a file before it answers.
+    fn answered(thread: &BtwThread, question: &str) -> Vec<Message> {
+        let mut messages = thread.messages.clone();
+        messages.extend([
+            Message::user(question.into()),
+            assistant(vec![
+                text(LOOKING),
+                ContentBlock::tool_use(CALL, TOOL, json!({})),
+            ]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL.into(),
+                    content: LOOKING.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            },
+            assistant(vec![text(ANSWER)]),
+        ]);
+        messages
+    }
+
+    fn settle_answered(thread: &mut BtwThread) {
+        let question = thread.question();
+        let messages = answered(thread, &question);
+        thread.settle(Some(messages));
+    }
 
     #[test_case(false ; "same_question")]
     #[test_case(true ; "different_question")]
     fn clarification_context_follows_focus_without_repeating_unchanged_questions(changed: bool) {
-        let (called, _requests) = flume::unbounded();
-        let mut thread = BtwThread::new(
-            Arc::new(prompt(FIRST_MODEL, called)),
-            vec![Message::user(BASE.into())],
-        );
+        let mut thread = thread();
         thread.ask_clarification(Q.into(), CLARIFY_STORAGE.into());
-        let initial = thread.request_messages();
-        let initial_question = user_text(initial.last().unwrap());
-        assert!(initial_question.contains(CLARIFICATION_REMINDER));
-        assert!(initial_question.contains(CLARIFY_STORAGE));
-        assert!(initial_question.ends_with(Q));
-        thread.settle(Some(ANSWER.into()));
+        let initial = thread.question();
+        assert!(initial.contains(CLARIFICATION_REMINDER));
+        assert!(initial.contains(CLARIFY_STORAGE));
+        assert!(initial.ends_with(Q));
+        settle_answered(&mut thread);
 
         let context = if changed {
             CLARIFY_DEPLOYMENT
@@ -1008,10 +1291,7 @@ mod tests {
             CLARIFY_STORAGE
         };
         thread.ask_clarification(FOLLOW_UP.into(), context.into());
-        let next = thread.request_messages();
-        assert_eq!(user_text(&next[0]), BASE);
-        assert_eq!(user_text(&next[1]), initial_question);
-        let follow_up = user_text(next.last().unwrap());
+        let follow_up = thread.question();
         if changed {
             assert!(follow_up.contains(CLARIFY_DEPLOYMENT));
         } else {
@@ -1022,424 +1302,63 @@ mod tests {
     #[test_case(false ; "interrupted")]
     #[test_case(true ; "failed")]
     fn clarification_retry_keeps_context_that_never_settled(failed: bool) {
-        let (called, _requests) = flume::unbounded();
-        let mut thread = BtwThread::new(Arc::new(prompt(FIRST_MODEL, called)), Vec::new());
+        let mut thread = thread();
         thread.ask_clarification(Q.into(), CLARIFY_STORAGE.into());
-        thread.settle(Some(ANSWER.into()));
+        settle_answered(&mut thread);
         thread.ask_clarification(FOLLOW_UP.into(), CLARIFY_DEPLOYMENT.into());
         if failed {
             thread.settle(None);
         }
         thread.ask_clarification(FOLLOW_UP.into(), CLARIFY_DEPLOYMENT.into());
-        let messages = thread.request_messages();
-        assert!(user_text(messages.last().unwrap()).contains(CLARIFY_DEPLOYMENT));
+        assert!(thread.question().contains(CLARIFY_DEPLOYMENT));
         assert_eq!(thread.exchange_count(), 1);
     }
 
-    /// Hands over the route and messages of every request it answers.
-    struct RecordingProvider(flume::Sender<(String, Vec<Message>)>);
-
-    impl Provider for RecordingProvider {
-        fn stream_message<'a>(
-            &'a self,
-            model: &'a Model,
-            messages: &'a [Message],
-            _: &'a str,
-            _: &'a serde_json::Value,
-            _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a CacheKey>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async move {
-                self.0.send((model.spec(), messages.to_vec())).unwrap();
-                Ok(StreamResponse {
-                    message: assistant_text(ANSWER),
-                    stop_reason: Some(StopReason::EndTurn),
-                    ..Default::default()
-                })
-            })
-        }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-    }
-
-    /// Reports prefill before it answers, as OpenAI's Responses provider does.
-    struct PrefillingProvider;
-
-    impl Provider for PrefillingProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a serde_json::Value,
-            event_tx: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a CacheKey>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
-                event_tx.send(ProviderEvent::PromptProgress {
-                    processed: PREFILL_PROCESSED,
-                    total: PREFILL_TOTAL,
-                    cache: PREFILL_CACHE,
-                })?;
-                Ok(StreamResponse {
-                    message: assistant_text(ANSWER),
-                    stop_reason: Some(StopReason::EndTurn),
-                    ..Default::default()
-                })
-            })
-        }
-
-        fn list_models(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-    }
-
-    struct ReasoningProvider {
-        interleaved: bool,
-    }
-
-    impl Provider for ReasoningProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            event_tx: &'a Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a CacheKey>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async move {
-                let mut events = [
-                    ProviderEvent::ThinkingDelta {
-                        text: THINKING_DELTAS[0].into(),
-                    },
-                    ProviderEvent::ThinkingDelta {
-                        text: THINKING_DELTAS[1].into(),
-                    },
-                    ProviderEvent::TextDelta {
-                        text: TEXT_DELTAS[0].into(),
-                    },
-                    ProviderEvent::TextDelta {
-                        text: TEXT_DELTAS[1].into(),
-                    },
-                ];
-                if self.interleaved {
-                    events.swap(1, 2);
-                }
-                for event in events {
-                    event_tx.send(event)?;
-                }
-                let mut message = assistant_text(ANSWER);
-                message.content.insert(
-                    0,
-                    ContentBlock::Thinking {
-                        thinking: THINKING_DELTAS.concat(),
-                        signature: None,
-                        duration_ms: None,
-                        interrupted: false,
-                        responses: None,
-                    },
-                );
-                Ok(StreamResponse {
-                    message,
-                    stop_reason: Some(StopReason::EndTurn),
-                    ..Default::default()
-                })
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-    }
-
-    /// Answers each request with the next scripted response, streaming its
-    /// text as deltas, and hands over the messages every request carried.
-    struct ScriptedProvider {
-        responses: Mutex<VecDeque<StreamResponse>>,
-        requests: flume::Sender<Vec<Message>>,
-    }
-
-    impl Provider for ScriptedProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            messages: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            event_tx: &'a Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a CacheKey>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async move {
-                self.requests.send(messages.to_vec()).unwrap();
-                let response = self.responses.lock().unwrap().pop_front().unwrap();
-                if let Some(text) = answer_text(&response.message) {
-                    event_tx.send(ProviderEvent::TextDelta { text })?;
-                }
-                Ok(response)
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-    }
-
-    fn tool_round(text: Option<&str>, calls: &[&str]) -> StreamResponse {
-        let mut content: Vec<ContentBlock> = text
-            .map(|text| ContentBlock::Text { text: text.into() })
-            .into_iter()
-            .collect();
-        content.extend(
-            calls
-                .iter()
-                .map(|id| ContentBlock::tool_use(*id, TOOL, json!({}))),
-        );
-        StreamResponse {
-            message: Message {
-                role: Role::Assistant,
-                content,
-                ..Default::default()
-            },
-            usage: ROUND_USAGE,
-            stop_reason: Some(StopReason::ToolUse),
-            ..Default::default()
-        }
-    }
-
-    /// Runs one scripted question and returns every request it sent, every
-    /// text delta the modal saw, and how it finished.
-    fn run_scripted(
-        responses: Vec<StreamResponse>,
-    ) -> (Vec<Vec<Message>>, Vec<String>, StreamDone) {
-        let (requests_tx, requests) = flume::unbounded();
-        let provider = ScriptedProvider {
-            responses: Mutex::new(responses.into()),
-            requests: requests_tx,
-        };
-        let (event_tx, event_rx) = flume::unbounded();
-        smol::block_on(run_btw(
-            Arc::new(prompt_with(Arc::new(provider), FIRST_MODEL)),
-            vec![btw_question(Q)],
-            event_tx,
-            None,
-            CancelToken::none(),
-        ));
-        let mut deltas = Vec::new();
-        let mut done = None;
-        for event in event_rx.drain() {
-            match event {
-                StreamEvent::TextDelta(text) => deltas.push(text),
-                StreamEvent::Done(finished) => done = Some(finished),
-                _ => {}
-            }
-        }
-        (
-            requests.drain().collect(),
-            deltas,
-            done.expect(EXPECTED_DONE),
-        )
-    }
-
-    fn round_cost(rounds: usize) -> Option<f64> {
-        let model = Model::from_spec(FIRST_MODEL).unwrap();
-        (0..rounds).try_fold(0.0, |total, _| {
-            model
-                .billed_cost(&ROUND_USAGE, false)
-                .map(|cost| total + cost)
-        })
-    }
-
+    /// The thread keeps what the run did, tool turns included, so the next
+    /// question extends the same lineage and the provider reads it cached.
     #[test]
-    fn a_tool_call_is_refused_and_the_model_answers() {
-        let (requests, deltas, done) = run_scripted(vec![
-            tool_round(Some(LOOKING), &OPEN_CALLS),
-            StreamResponse {
-                message: assistant_text(ANSWER),
-                usage: ROUND_USAGE,
-                stop_reason: Some(StopReason::EndTurn),
-                ..Default::default()
-            },
-        ]);
-
-        assert_eq!(requests.len(), 2);
-        let (refusal, rest) = requests[1].split_last().unwrap();
-        let (called, sent_first) = rest.split_last().unwrap();
-        assert_eq!(
-            serde_json::to_value(sent_first).unwrap(),
-            serde_json::to_value(&requests[0]).unwrap(),
-            "the redirect extends the first request"
-        );
-        assert_eq!(
-            serde_json::to_value(called).unwrap(),
-            serde_json::to_value(&tool_round(Some(LOOKING), &OPEN_CALLS).message).unwrap(),
-            "the call goes back exactly as the model made it"
-        );
-        assert!(matches!(refusal.role, Role::User));
-        let results: Vec<(&str, &str, bool)> = refusal
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    ..
-                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            results,
-            OPEN_CALLS
-                .iter()
-                .map(|id| (*id, TOOL_REDIRECT, true))
-                .collect::<Vec<_>>()
-        );
-
-        assert_eq!(deltas, [LOOKING, ROUND_SEPARATOR, ANSWER]);
-        assert_eq!(
-            done.answer,
-            Some([LOOKING, ANSWER].join(ROUND_SEPARATOR)),
-            "the thread keeps what the modal showed"
-        );
-        let mut usage = ROUND_USAGE;
-        usage += ROUND_USAGE;
-        assert_eq!(done.usage.usage, usage);
-        assert_eq!(done.usage.cost, round_cost(2));
-    }
-
-    #[test_case(Some(LOOKING) ; "text_only_in_first")]
-    #[test_case(None ; "no_text")]
-    fn a_model_that_keeps_calling_tools_stops_after_the_redirects(first_text: Option<&str>) {
-        let rounds = MAX_TOOL_REDIRECTS + 1;
-        let responses = (0..rounds)
-            .map(|round| tool_round(first_text.filter(|_| round == 0), &OPEN_CALLS[..1]))
-            .collect();
-        let (requests, deltas, done) = run_scripted(responses);
-
-        assert_eq!(requests.len(), rounds);
-        assert_eq!(deltas.last().map(String::as_str), Some(TOOL_CALL_STOPPED));
-        assert_eq!(done.answer.as_deref(), first_text);
-        assert_eq!(done.usage.cost, round_cost(rounds));
-    }
-
-    fn prompt_with(provider: Arc<dyn Provider>, spec: &str) -> BtwPrompt {
-        BtwPrompt {
-            provider,
-            model: Model::from_spec(spec).unwrap(),
-            system: SYSTEM.into(),
-            tools: json!([]),
-            opts: RequestOptions::default(),
-            profile: None,
-        }
-    }
-
-    fn prompt(spec: &str, called: flume::Sender<(String, Vec<Message>)>) -> BtwPrompt {
-        prompt_with(Arc::new(RecordingProvider(called)), spec)
-    }
-
-    fn thread() -> BtwThread {
-        let (tx, _rx) = flume::unbounded();
-        BtwThread::new(
-            Arc::new(prompt(FIRST_MODEL, tx)),
-            vec![Message::user(BASE.into())],
-        )
-    }
-
-    fn user_text(msg: &Message) -> String {
-        msg.content
-            .iter()
-            .filter_map(|b| match b {
-                caudra_providers::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn injects_reminder_before_question() {
-        let text = user_text(&btw_question(Q));
-        assert!(text.starts_with(BTW_REMINDER), "reminder leads the message");
-        assert!(text.ends_with(Q), "question trails the message");
-    }
-
-    #[test]
-    fn reminder_forbids_tools_without_claiming_they_are_absent() {
-        assert!(
-            BTW_REMINDER.contains("Do NOT call any tool"),
-            "tool definitions are now sent, so the reminder must forbid rather than deny them"
-        );
-        assert!(
-            !BTW_REMINDER.contains("NO tools"),
-            "claiming there are no tools contradicts the definitions on the wire"
-        );
-    }
-
-    #[test]
-    fn a_thread_extends_its_base_with_exchanges_and_the_pending_question() {
+    fn an_answer_files_the_whole_run_and_the_follow_up_extends_it() {
         let mut thread = thread();
         thread.ask(Q.into());
-        thread.settle(Some(ANSWER.into()));
+        let run = answered(&thread, Q);
+        thread.settle(Some(run.clone()));
         thread.ask(FOLLOW_UP.into());
 
-        let messages = thread.request_messages();
-        let texts: Vec<(bool, String)> = messages
-            .iter()
-            .map(|m| (matches!(m.role, Role::Assistant), user_text(m)))
-            .collect();
-        assert_eq!(texts.len(), 4);
-        assert_eq!(texts[0], (false, BASE.to_owned()));
-        assert!(
-            !texts[1].0 && texts[1].1.starts_with(BTW_REMINDER) && texts[1].1.ends_with(Q),
-            "the reminder rides the first question"
-        );
-        assert_eq!(texts[2], (true, ANSWER.to_owned()));
         assert_eq!(
-            texts[3],
-            (false, FOLLOW_UP.to_owned()),
-            "a follow-up carries no second reminder"
+            serde_json::to_value(thread.messages()).unwrap(),
+            serde_json::to_value(&run).unwrap()
         );
+        assert_eq!(thread.exchange_count(), 1);
+        assert_eq!(thread.question(), FOLLOW_UP, "a follow-up is sent as typed");
     }
 
-    #[test_case(None ; "no_answer")]
-    #[test_case(Some("  \n") ; "blank_answer_is_no_answer")]
-    fn an_unanswered_question_leaves_the_thread(answer: Option<&str>) {
+    #[test]
+    fn an_unanswered_question_leaves_the_thread() {
         let mut thread = thread();
         thread.ask(Q.into());
-        thread.settle(
-            answer
-                .map(str::to_owned)
-                .and_then(|a| answer_text(&assistant_text(&a))),
-        );
-        assert!(thread.exchanges.is_empty());
-        assert!(thread.pending.is_none());
-        assert_eq!(thread.request_messages().len(), 1, "only the base remains");
+        thread.settle(None);
+        assert_eq!(thread.exchange_count(), 0);
+        assert!(thread.pending().is_none());
+        assert_eq!(thread.base_texts(), [BASE], "only the base remains");
     }
 
-    const NEWER: &str = "we switched to postgres";
-    const REBASE_MSG: &str =
-        "a caught-up thread quotes its earlier exchanges in its first question";
+    #[test]
+    fn a_question_asked_over_a_failed_one_replaces_it() {
+        let mut thread = thread();
+        thread.ask(Q.into());
+        thread.ask(FOLLOW_UP.into());
+        assert_eq!(thread.pending(), Some(FOLLOW_UP));
+        assert_eq!(thread.question(), FOLLOW_UP);
+    }
 
     fn rebased(exchanges: usize) -> BtwThread {
         let mut thread = thread();
         for _ in 0..exchanges {
             thread.ask(Q.into());
-            thread.settle(Some(ANSWER.into()));
+            settle_answered(&mut thread);
         }
-        let route = (Arc::clone(&thread.prompt), None);
         thread.rebase(
-            route,
+            prefix(),
             vec![Message::user(BASE.into()), Message::user(NEWER.into())],
             HistoryMark {
                 epoch: None,
@@ -1452,40 +1371,35 @@ mod tests {
 
     #[test]
     fn a_rebased_thread_quotes_its_earlier_exchanges_over_the_new_base() {
-        let messages = rebased(1).request_messages();
-        let texts: Vec<String> = messages.iter().map(user_text).collect();
-        assert_eq!(texts.len(), 3, "{REBASE_MSG}");
-        assert_eq!(texts[..2], [BASE, NEWER]);
-        let question = &texts[2];
-        assert!(question.starts_with(BTW_REMINDER), "{REBASE_MSG}");
-        assert!(question.contains(REBASE_REMINDER), "{REBASE_MSG}");
+        let thread = rebased(1);
+        assert_eq!(thread.base_texts(), [BASE, NEWER], "{REBASE_MSG}");
+        let question = thread.question();
+        assert!(question.starts_with(REBASE_REMINDER), "{REBASE_MSG}");
         assert!(question.contains(&format!("{QUESTION_OPEN}{Q}{QUESTION_CLOSE}")));
         assert!(question.contains(&format!("{ANSWER_OPEN}{ANSWER}{ANSWER_CLOSE}")));
+        assert!(
+            !question.contains(LOOKING),
+            "a quote keeps the final answer alone"
+        );
         assert!(question.ends_with(FOLLOW_UP));
         assert!(!question.contains(OMITTED_SUFFIX));
     }
 
     #[test]
-    fn a_rebased_thread_settles_and_extends_its_new_lineage() {
+    fn the_quote_rides_only_the_first_question_after_a_rebase() {
         let mut thread = rebased(1);
-        thread.settle(Some(ANSWER.into()));
-        let first = thread.request_messages();
+        settle_answered(&mut thread);
         thread.ask(Q.into());
-        let next = thread.request_messages();
-        assert_eq!(
-            serde_json::to_value(&next[..first.len()]).unwrap(),
-            serde_json::to_value(&first).unwrap(),
-            "a follow-up after a rebase extends the request before it"
-        );
-        assert_eq!(user_text(next.last().unwrap()), Q);
+        assert_eq!(thread.question(), Q);
+        assert_eq!(thread.quoted_count(), 1);
     }
 
     #[test]
     fn a_long_thread_quotes_only_its_latest_exchanges() {
         let extra = 2;
         let thread = rebased(MAX_REPLAYED_EXCHANGES + extra);
-        let question = user_text(thread.request_messages().last().unwrap());
-        assert_eq!(thread.earlier.len(), MAX_REPLAYED_EXCHANGES);
+        let question = thread.question();
+        assert_eq!(thread.quoted_count(), MAX_REPLAYED_EXCHANGES);
         assert!(question.contains(&format!("{OMITTED_PREFIX}{extra}{OMITTED_SUFFIX}")));
         assert_eq!(
             question.matches(QUESTION_OPEN).count(),
@@ -1494,237 +1408,29 @@ mod tests {
     }
 
     #[test]
-    fn a_question_asked_over_a_failed_one_replaces_it() {
-        let mut thread = thread();
-        thread.ask(Q.into());
-        thread.ask(FOLLOW_UP.into());
-        let messages = thread.request_messages();
-        assert_eq!(messages.len(), 2);
-        assert!(user_text(&messages[1]).ends_with(FOLLOW_UP));
+    fn the_final_answer_is_the_last_assistant_text() {
+        let thread = thread();
+        let mut messages = answered(&thread, Q);
+        assert_eq!(final_answer(&messages), ANSWER);
+        messages.push(assistant(vec![ContentBlock::tool_use(
+            CALL,
+            TOOL,
+            json!({}),
+        )]));
+        assert_eq!(
+            final_answer(&messages),
+            ANSWER,
+            "a turn without text says nothing"
+        );
+        assert_eq!(final_answer(&[]), "");
     }
 
-    #[test]
-    fn answer_text_keeps_text_blocks_only() {
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "hmm".into(),
-                    signature: None,
-                    duration_ms: None,
-                    interrupted: false,
-                    responses: None,
-                },
-                ContentBlock::Text {
-                    text: ANSWER.into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "file_read".into(),
-                    input: json!({}),
-                    thought_signature: None,
-                },
-            ],
-            ..Default::default()
-        };
-        assert_eq!(answer_text(&message).as_deref(), Some(ANSWER));
-        assert_eq!(answer_text(&Message::default()), None);
-    }
-
-    /// The forwarder used to keep text alone, which left the modal with
-    /// nothing to draw for the whole of a long prefill.
-    #[test]
-    fn prefill_progress_reaches_the_modal() {
-        smol::block_on(async {
-            let (event_tx, event_rx) = flume::unbounded();
-            run_btw(
-                Arc::new(prompt_with(Arc::new(PrefillingProvider), FIRST_MODEL)),
-                vec![Message::user(Q.into())],
-                event_tx,
-                None,
-                CancelToken::none(),
-            )
-            .await;
-
-            assert!(matches!(
-                event_rx.try_recv(),
-                Ok(StreamEvent::Progress(progress))
-                    if progress.processed == PREFILL_PROCESSED
-                        && progress.total == PREFILL_TOTAL
-                        && progress.cache == PREFILL_CACHE
-            ));
-        });
-    }
-
-    #[test_case(false; "split_reasoning_before_text")]
-    #[test_case(true; "interleaved_reasoning_and_text")]
-    fn reasoning_streams_separately_and_stays_out_of_follow_up_history(interleaved: bool) {
-        smol::block_on(async {
-            let prompt = Arc::new(prompt_with(
-                Arc::new(ReasoningProvider { interleaved }),
-                FIRST_MODEL,
-            ));
-            let mut thread = BtwThread::new(prompt, vec![Message::user(BASE.into())]);
-            thread.ask(Q.into());
-            let (event_tx, event_rx) = flume::unbounded();
-            run_btw(
-                Arc::clone(&thread.prompt),
-                thread.request_messages(),
-                event_tx,
-                None,
-                CancelToken::none(),
-            )
-            .await;
-
-            let expected = if interleaved {
-                [
-                    (true, THINKING_DELTAS[0]),
-                    (false, TEXT_DELTAS[0]),
-                    (true, THINKING_DELTAS[1]),
-                    (false, TEXT_DELTAS[1]),
-                ]
-            } else {
-                [
-                    (true, THINKING_DELTAS[0]),
-                    (true, THINKING_DELTAS[1]),
-                    (false, TEXT_DELTAS[0]),
-                    (false, TEXT_DELTAS[1]),
-                ]
-            };
-            for (thinking, text) in expected {
-                assert!(matches!(
-                    (event_rx.try_recv().unwrap(), thinking),
-                    (StreamEvent::ThinkingDelta(delta), true)
-                        | (StreamEvent::TextDelta(delta), false) if delta == text
-                ));
-            }
-            let StreamEvent::Done(done) = event_rx.try_recv().unwrap() else {
-                panic!("{EXPECTED_DONE}");
-            };
-            assert_eq!(done.answer.as_deref(), Some(ANSWER));
-            assert!(event_rx.try_recv().is_err());
-
-            thread.settle(done.answer);
-            assert!(thread.pending().is_none());
-            assert_eq!(thread.exchanges, vec![(Q.to_owned(), ANSWER.to_owned())]);
-            thread.ask(FOLLOW_UP.into());
-            let expected = vec![
-                Message::user(BASE.into()),
-                btw_question(Q),
-                assistant_text(ANSWER),
-                Message::user(FOLLOW_UP.into()),
-            ];
-            assert_eq!(
-                serde_json::to_value(thread.request_messages()).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-        });
-    }
-
-    #[test]
-    fn a_captured_prompt_keeps_its_model_provider_pair_across_a_switch() {
-        smol::block_on(async {
-            let (first_tx, first_rx) = flume::unbounded();
-            let (second_tx, second_rx) = flume::unbounded();
-            let shared = ArcSwap::from_pointee(prompt(FIRST_MODEL, first_tx));
-            let captured = shared.load_full();
-            shared.store(Arc::new(prompt(SECOND_MODEL, second_tx)));
-            let (event_tx, event_rx) = flume::unbounded();
-
-            run_btw(
-                Arc::clone(&captured),
-                vec![Message::user(Q.into())],
-                event_tx,
-                None,
-                CancelToken::none(),
-            )
-            .await;
-            assert_eq!(first_rx.try_recv().unwrap().0, FIRST_MODEL);
-            assert!(matches!(
-                event_rx.try_recv(),
-                Ok(StreamEvent::Done(StreamDone { answer: Some(answer), .. })) if answer == ANSWER
-            ));
-
-            let (event_tx, _event_rx) = flume::unbounded();
-            run_btw(
-                captured,
-                vec![Message::user(FOLLOW_UP.into())],
-                event_tx,
-                None,
-                CancelToken::none(),
-            )
-            .await;
-            assert_eq!(
-                first_rx.try_recv().unwrap().0,
-                FIRST_MODEL,
-                "a follow-up rides the same captured route"
-            );
-            assert!(second_rx.try_recv().is_err());
-        });
-    }
-
-    /// A thread goes out exactly as the live request would, repairs included,
-    /// rather than through a hand-rolled copy of the projection that drifts.
-    #[test]
-    fn a_thread_sends_the_request_projection_and_the_question() {
-        smol::block_on(async {
-            let history = vec![
-                Message::user(BASE.into()),
-                Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: ORPHANED_CALL.into(),
-                        content: ANSWER.into(),
-                        is_error: false,
-                        output_ref: None,
-                    }],
-                    ..Default::default()
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::tool_use(UNANSWERED_CALL, TOOL, json!({}))],
-                    ..Default::default()
-                },
-                Message::user(FOLLOW_UP.into()),
-                assistant_text(ANSWER),
-            ];
-            let (called, requests) = flume::unbounded();
-            let mut thread = BtwThread::new(Arc::new(prompt(FIRST_MODEL, called)), history.clone());
-            thread.ask(Q.into());
-            let (event_tx, _event_rx) = flume::unbounded();
-
-            run_btw(
-                Arc::clone(&thread.prompt),
-                thread.request_messages(),
-                event_tx,
-                None,
-                CancelToken::none(),
-            )
-            .await;
-
-            let pinned = &thread.prompt;
-            let mut expected = caudra_agent::project_request(
-                &history,
-                &pinned.tools,
-                &pinned.model,
-                pinned.provider.reasoning_transport(&pinned.model),
-            )
-            .into_owned();
-            expected.push(btw_question(Q));
-            let (_, sent) = requests.try_recv().unwrap();
-            assert_eq!(
-                serde_json::to_value(sent).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-        });
-    }
-
-    /// A resumed session holds only a reference to a PDF. The thread loads it
-    /// before projecting, so the PDF goes out attached while its file exists,
+    /// A resumed session holds only a reference to a PDF. The run loads it
+    /// before it sends, so the PDF goes out attached while its file exists,
     /// and as a note to fetch it again only once the file is gone.
     #[test_case(true ; "stored_file_attaches")]
     #[test_case(false ; "missing_file_becomes_a_note")]
-    fn a_restored_pdf_is_loaded_before_the_thread_sends(file_exists: bool) {
+    fn a_restored_pdf_is_loaded_before_the_side_question_sends(file_exists: bool) {
         let temp = TempDir::new().unwrap();
         let store = MediaStore::new(&StateDir::from_path(temp.path().to_path_buf()));
         let mut document = DocumentSource {
@@ -1752,31 +1458,44 @@ mod tests {
         result
             .tool_result_documents
             .insert(PDF_CALL.into(), vec![document]);
-        let base = vec![
+        let messages = vec![
             Message::user(BASE.into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use(PDF_CALL, TOOL, json!({}))],
-                ..Default::default()
-            },
+            assistant(vec![ContentBlock::tool_use(PDF_CALL, TOOL, json!({}))]),
             result,
         ];
-        let (called, requests) = flume::unbounded();
-        let mut prompt = prompt(FIRST_MODEL, called);
-        prompt.model.supports_pdf = true;
-        let (event_tx, _event_rx) = flume::unbounded();
+        let (
+            provider,
+            BtwScript {
+                responses,
+                requests,
+            },
+        ) = gated_provider();
+        let mut model = test_model();
+        model.supports_pdf = true;
+        let prefix = Arc::new(RequestPrefix {
+            provider,
+            model,
+            system: SYSTEM.into(),
+            tools: json!([]),
+            opts: RequestOptions::default(),
+            cache_key: None,
+        });
+        responses.send(btw_reply(ANSWER)).unwrap();
+        let (events, _received) = flume::unbounded();
+        let (_stop, cancel) = CancelToken::new();
 
-        smol::block_on(run_btw_over(
-            Arc::new(prompt),
-            base,
-            vec![btw_question(Q)],
+        let (_, done) = smol::block_on(ask_aside(
+            btw_host(),
+            prefix,
+            messages,
             store,
-            event_tx,
-            None,
-            CancelToken::none(),
+            EventSender::new(events, 0),
+            cancel,
+            Q.into(),
         ));
 
-        let (_, sent) = requests.try_recv().unwrap();
+        assert_eq!(done, Ok(DoneReason::EndTurn));
+        let sent = requests.try_recv().unwrap().messages;
         let attached: Vec<_> = sent
             .iter()
             .flat_map(Message::result_documents)
@@ -1794,57 +1513,5 @@ mod tests {
             assert!(attached.is_empty());
         }
         assert_eq!(noted, !file_exists);
-    }
-
-    /// Reading the history rejects every broken tool pairing but one: a turn
-    /// caught between its calls and their results. A provider rejects a call
-    /// left unanswered, so the thread closes each one, in the order the turn
-    /// made them.
-    #[test_case(1 ; "one_open_call")]
-    #[test_case(2 ; "two_open_calls")]
-    fn a_thread_closes_the_calls_a_turn_left_open(open: usize) {
-        let calls = &OPEN_CALLS[..open];
-        let (called, _requests) = flume::unbounded();
-        let mut thread = BtwThread::new(
-            Arc::new(prompt(FIRST_MODEL, called)),
-            vec![
-                Message::user(BASE.into()),
-                Message {
-                    role: Role::Assistant,
-                    content: calls
-                        .iter()
-                        .map(|id| ContentBlock::tool_use(*id, TOOL, json!({})))
-                        .collect(),
-                    ..Default::default()
-                },
-            ],
-        );
-        thread.ask(Q.into());
-
-        let messages = thread.request_messages();
-        let (_question, base) = messages.split_last().unwrap();
-        let closing = base.last().unwrap();
-        assert!(matches!(closing.role, Role::User));
-        assert_eq!(closing.display_text.as_deref(), Some(""));
-        let results: Vec<(&str, &str, bool)> = closing
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    ..
-                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            results,
-            calls
-                .iter()
-                .map(|id| (*id, UNAVAILABLE_RESULT, true))
-                .collect::<Vec<_>>()
-        );
     }
 }

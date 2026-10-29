@@ -45,6 +45,7 @@ impl App {
             return;
         }
         self.close_stream_modal();
+        self.close_btw();
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();

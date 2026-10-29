@@ -47,7 +47,9 @@ use jiff::Timestamp;
 
 use self::cancel_map::new_run_cancel_map;
 use caudra_providers::provider::Provider;
-use caudra_providers::{AgentError, HistoryItem, Message, Model, RequestOptions, project_messages};
+use caudra_providers::{
+    AgentError, CacheKey, HistoryItem, Message, Model, RequestOptions, project_messages,
+};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -206,6 +208,19 @@ impl BtwPrompt {
         match (self.profile.as_deref(), current) {
             (Some(bound), Some(current)) => !bound.same_prompt(current),
             (bound, current) => bound.is_some() != current.is_some(),
+        }
+    }
+
+    /// The prefix an aside over the main conversation continues, read from
+    /// `cache_key`'s cache.
+    pub(crate) fn prefix(&self, cache_key: CacheKey) -> RequestPrefix {
+        RequestPrefix {
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            system: self.system.clone(),
+            tools: self.tools.clone(),
+            opts: self.opts.clone(),
+            cache_key: Some(cache_key),
         }
     }
 }

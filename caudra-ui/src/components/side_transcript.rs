@@ -3,11 +3,6 @@
 //! window never runs anything. Its owner feeds it events, starts and settles
 //! runs, and acts on the [`SideAction`] a key or a click hands back.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "/btw and /extract move onto this window next")
-)]
-
 use std::mem;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -137,6 +132,10 @@ pub(crate) enum SideFooter {
     /// Read only: the keys scroll, Esc closes.
     Observe,
     /// `y` copies the answer; Enter, Space, or Esc closes.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "/extract moves onto this window next")
+    )]
     Copy,
     /// A composer takes the keys: Enter sends a follow-up, or queues it while
     /// a run is live, Esc closes and keeps the thread, the clear chord
@@ -303,6 +302,7 @@ impl SideTranscript {
         self.footer_hits.reset();
     }
 
+    #[cfg(test)]
     pub fn chat(&self) -> &Chat {
         &self.chat
     }
@@ -355,6 +355,7 @@ impl SideTranscript {
         self.input.set_text(draft);
     }
 
+    #[cfg(test)]
     pub fn take_draft(&mut self) -> String {
         let draft = self.input.text();
         self.input.clear();

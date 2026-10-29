@@ -775,12 +775,7 @@ pub struct App {
     /// Every finished task's transcript, which a `/btw` over a task reads once
     /// the task is no longer open.
     pub(crate) subagent_history: Option<SubagentHistoryStore>,
-    /// The `/btw` thread behind the stream modal while it is open; `/extract`
-    /// shares the modal and never has one.
-    pub(super) btw_thread: Option<btw::BtwThread>,
-    /// Threads whose modal was closed, by the task whose conversation each
-    /// reads (`None` for the main one), until cleared or the session changes.
-    pub(super) parked_btw: HashMap<Option<String>, btw::ParkedBtw>,
+    pub(super) btw: btw::Btw,
     pub(crate) context_store: Option<ContextStore>,
     pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
     /// The main run's picks and backoff wake, while an agent loop serves it.
@@ -1107,8 +1102,7 @@ impl App {
             shared_history: None,
             btw_prompt: None,
             subagent_history: None,
-            btw_thread: None,
-            parked_btw: HashMap::new(),
+            btw: btw::Btw::default(),
             context_store: None,
             effective_model_slot: None,
             main_control: None,
@@ -1638,7 +1632,10 @@ impl App {
     /// that kept the keys from behind it would implement the plan on the Enter
     /// meant for the text.
     fn plan_form_takes_input(&self) -> bool {
-        self.plan_form_in_view() && !self.workbench.is_open() && !self.stream_modal.is_open()
+        self.plan_form_in_view()
+            && !self.workbench.is_open()
+            && !self.stream_modal.is_open()
+            && !self.btw.is_open()
     }
 
     /// Reconciles the session to a model it was handed. Every live session is
@@ -1943,6 +1940,10 @@ impl App {
                     self.stream_modal.handle_paste(&text);
                     return vec![];
                 }
+                if self.btw.is_open() {
+                    self.btw.handle_text(&text, true);
+                    return vec![];
+                }
                 if self.session_relocation_picker.is_open()
                     || self.worktree_picker.is_open()
                     || self.accounts_modal.is_open()
@@ -2195,6 +2196,10 @@ impl App {
         }
         if self.stream_modal.is_open() {
             self.stream_modal.scroll(delta);
+            return None;
+        }
+        if self.btw.contains(pos) {
+            self.btw.scroll_at(pos, delta);
             return None;
         }
         if self.question_form.is_open() && self.question_form.contains(pos) {
@@ -2743,12 +2748,20 @@ impl App {
             keyboard_text!(stream_modal, self.stream_modal.text_input_active());
             guard_repeat!(self.stream_modal.text_input_active());
             match self.stream_modal.handle_key(key) {
-                StreamAction::Ignored | StreamAction::Consumed => {}
+                StreamAction::Ignored
+                | StreamAction::Consumed
+                | StreamAction::Submit(_)
+                | StreamAction::Clear => {}
                 StreamAction::Copy(text) => self.copy_to_clipboard(&text),
                 StreamAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
-                StreamAction::Submit(question) => self.continue_btw(question),
-                StreamAction::Clear => self.clear_btw_thread(),
             }
+            return Some(vec![]);
+        }
+
+        if self.btw.is_open() {
+            keyboard_text!(btw, self.btw.text_input_active());
+            guard_repeat!(self.btw.text_input_active());
+            self.handle_btw_key(key);
             return Some(vec![]);
         }
 
@@ -7033,7 +7046,7 @@ impl App {
         inline_image::set_local_root(local.then(|| Path::new(&self.state.session.cwd)));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 54] {
+    fn overlays(&self) -> [&dyn Overlay; 55] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -7053,6 +7066,7 @@ impl App {
             &self.goal_panel,
             &self.autopilot_panel,
             &self.stream_modal,
+            &self.btw,
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
@@ -7092,7 +7106,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 54] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 55] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -7112,6 +7126,7 @@ impl App {
             &mut self.goal_panel,
             &mut self.autopilot_panel,
             &mut self.stream_modal,
+            &mut self.btw,
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
@@ -7298,6 +7313,7 @@ impl App {
             || self.chats.iter().any(|chat| chat.retry().is_some())
             || self.restoring.load(Ordering::Relaxed)
             || self.stream_modal.is_streaming()
+            || self.btw.is_running()
     }
 
     /// True while `recoverable_queue` holds user text captured at an agent
@@ -7378,6 +7394,7 @@ impl App {
         self.pending_plan_submission = None;
         self.suspend_permission_editor();
         self.close_stream_modal();
+        self.close_btw();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
         self.settings.parked = None;
     }
@@ -7450,6 +7467,7 @@ impl App {
             | self.tick_error_expiry()
             | self.poll_image_paste()
             | self.tick_stream_modal()
+            | self.tick_btw()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.refresh_mcp_picker()
@@ -7912,55 +7930,48 @@ impl App {
         }
     }
 
-    /// A side request (`/btw`, `/extract`) spends real tokens outside any
-    /// turn, so it settles into the same ledger as compaction and the goal
-    /// evaluator. It deliberately leaves `context_size` alone: the request
-    /// never enters history.
+    pub(super) fn close_stream_modal(&mut self) {
+        let _ = self.tick_stream_modal();
+        self.stream_modal.close();
+    }
+
     fn tick_stream_modal(&mut self) -> Dirty {
-        if self.stream_modal.is_clarification() && !self.question_form.is_open() {
-            self.discard_question_btw();
-            return Dirty::YES;
-        }
         let dirty = self.stream_modal.poll();
-        if self.settle_stream_modal()
-            && self.stream_modal.is_open()
-            && let Some(question) = self.stream_modal.take_queued()
-            && self.btw_thread.is_some()
-        {
-            self.continue_btw(question);
-        }
-        if self.btw_thread.is_some()
-            && !self.stream_modal.is_open()
-            && !self.stream_modal.is_clarification()
-        {
-            self.end_btw_thread(true);
-            return Dirty::YES;
+        if let Some(done) = self.stream_modal.take_done() {
+            let spend = done.usage;
+            self.settle_side_spend(
+                &spend.provider,
+                None,
+                &spend.model,
+                spend.purpose,
+                spend.usage,
+                spend.cost,
+                spend.billing,
+            );
         }
         dirty
     }
 
-    fn settle_stream_modal(&mut self) -> bool {
-        let Some(done) = self.stream_modal.take_done() else {
-            return false;
-        };
-        let spend = done.usage;
-        self.state.token_usage += spend.usage;
-        self.add_session_spend(spend.cost, spend.billing);
-        add_chat_spend(self.main_chat(), spend.cost, spend.billing);
-        self.record_model_usage(
-            &spend.provider,
-            None,
-            &spend.model,
-            spend.purpose,
-            spend.usage,
-            spend.cost,
-            spend.billing,
-        );
-        self.record_external_spend(spend.usage, spend.cost, spend.billing, spend.purpose);
-        if matches!(spend.purpose, LedgerPurpose::Btw) {
-            self.settle_btw(done.answer);
-        }
-        true
+    /// A side request (`/btw`, `/extract`) spends real tokens outside any
+    /// turn, so it settles into the same ledger as compaction and the goal
+    /// evaluator. It deliberately leaves `context_size` alone: the request
+    /// never enters history.
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn settle_side_spend(
+        &mut self,
+        provider: &str,
+        account: Option<&str>,
+        model: &str,
+        purpose: LedgerPurpose,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+    ) {
+        self.state.token_usage += usage;
+        self.add_session_spend(cost, billing);
+        add_chat_spend(self.main_chat(), cost, billing);
+        self.record_model_usage(provider, account, model, purpose, usage, cost, billing);
+        self.record_external_spend(usage, cost, billing, purpose);
     }
 
     /// What moves with the clock alone; changes that come from arriving data
@@ -8078,6 +8089,9 @@ impl App {
             return;
         }
         if self.stream_modal.handle_paste(text) {
+            return;
+        }
+        if self.btw.handle_text(text, true) {
             return;
         }
         if self.logs_modal.is_open() {

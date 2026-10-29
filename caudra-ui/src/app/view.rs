@@ -201,8 +201,11 @@ impl App {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, area);
         } else {
-            self.question_form
-                .view_with_focus(frame, area, !self.stream_modal.is_open());
+            self.question_form.view_with_focus(
+                frame,
+                area,
+                !self.stream_modal.is_open() && !self.btw.is_open(),
+            );
         }
         area
     }
@@ -414,7 +417,7 @@ impl App {
             self.question_form.view_with_focus(
                 frame,
                 layout.bottom_area,
-                !self.stream_modal.is_open(),
+                !self.stream_modal.is_open() && !self.btw.is_open(),
             );
         } else if !self.is_main_chat() {
             let queue_entries = self.active_queue_entries();
@@ -682,6 +685,9 @@ impl App {
             };
         }
         claim!(self.stream_modal.view(frame, full), self.stream_modal);
+        if self.btw.is_open() {
+            claim!(self.btw.view(frame, full), self.btw);
+        }
         claim!(
             self.help_modal.view(frame, full, self.features),
             self.help_modal

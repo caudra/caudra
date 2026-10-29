@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "/btw left this modal; /extract moves off it next, which deletes it"
+    )
+)]
+
 use std::mem;
 use std::ops::Range;
 use std::time::{Duration, Instant};

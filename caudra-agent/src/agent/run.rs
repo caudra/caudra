@@ -470,6 +470,51 @@ impl AgentParams {
             task_id: None,
         }
     }
+
+    /// `tools` as a run on these parameters sends them: without the peer
+    /// tools when it has no peers to reach, and with execution guidance for
+    /// the background work it has. A side question continuing this run's
+    /// cached prefix must send exactly this.
+    pub fn request_tools(&self, tools: &mut Value) {
+        self.declare(tools, self.peer_session().is_some());
+    }
+
+    fn declare(&self, tools: &mut Value, peers: bool) {
+        if !peers && let Some(declared) = tools.as_array_mut() {
+            let names = crate::tools::native::peers::TOOL_NAMES;
+            declared.retain(|tool| {
+                !tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| names.contains(&name))
+            });
+        }
+        crate::tools::execution::configure_declared(
+            tools,
+            &self.config,
+            self.background.is_some(),
+            self.job_scope().is_some(),
+        );
+    }
+
+    /// Only a local main run reaches the session's peers, and only while the
+    /// session is open to messaging.
+    fn peer_session(&self) -> Option<PeerSession> {
+        let local_main = self.config.features.enabled(Feature::CrossSessionMessaging)
+            && self.audience == ToolAudience::MAIN
+            && self.root_tool_use_id.is_none()
+            && self.workspace_session.is_none()
+            && self.host_cwd.is_none();
+        local_main
+            .then(|| PeerSession::lookup(self.session_id.as_ref()?.id()))
+            .flatten()
+    }
+
+    fn job_scope(&self) -> Option<JobScope> {
+        self.jobs
+            .clone()
+            .or_else(|| self.background.as_ref().map(|tasks| tasks.main_scope()))
+    }
 }
 
 /// See [`Agent::conversation_route`].
@@ -658,47 +703,17 @@ impl<'h> Agent<'h> {
     }
 
     fn build(mut params: AgentParams, mut run: AgentRunParams<'h>, verbatim: bool) -> Self {
-        let peers = if params
-            .config
-            .features
-            .enabled(Feature::CrossSessionMessaging)
-            && params.audience == ToolAudience::MAIN
-            && params.root_tool_use_id.is_none()
-            && params.workspace_session.is_none()
-            && params.host_cwd.is_none()
-        {
-            params
-                .session_id
-                .as_ref()
-                .and_then(|id| PeerSession::lookup(id.id()))
-        } else {
-            None
-        };
+        let peers = params.peer_session();
+        if !verbatim {
+            params.declare(&mut run.tools, peers.is_some());
+        }
         if peers.is_none() {
-            let names = crate::tools::native::peers::TOOL_NAMES;
-            params.tool_filter = params.tool_filter.excluding(names);
-            if !verbatim && let Some(tools) = run.tools.as_array_mut() {
-                tools.retain(|tool| {
-                    !tool
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| names.contains(&name))
-                });
-            }
+            params.tool_filter = params
+                .tool_filter
+                .excluding(crate::tools::native::peers::TOOL_NAMES);
         }
         let automation = main_run_automation(&params);
-        let jobs = params
-            .jobs
-            .clone()
-            .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope()));
-        if !verbatim {
-            crate::tools::execution::configure_declared(
-                &mut run.tools,
-                &params.config,
-                params.background.is_some(),
-                jobs.is_some(),
-            );
-        }
+        let jobs = params.job_scope();
         let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
             && params.model.provider == params.chat_model.provider
             && params.model.id == params.chat_model.id;

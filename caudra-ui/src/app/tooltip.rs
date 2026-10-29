@@ -79,7 +79,7 @@ impl App {
     /// A docked form stays drawn under an open `/btw`, which takes its
     /// pointer, so the form has nothing to explain until the modal closes.
     fn docked_under_btw(&self, overlay: &dyn Overlay) -> bool {
-        self.stream_modal.is_open() && !overlay.is_modal()
+        (self.stream_modal.is_open() || self.btw.is_open()) && !overlay.is_modal()
     }
 
     fn docs_badge_tip(&self) -> Option<Tip> {
@@ -213,7 +213,7 @@ mod tests {
     };
     use crate::components::status_bar::{CLICK_MODEL, StatusBarHitTarget};
     use crate::components::tooltip::{TipKey, Tooltip};
-    use crate::components::{Status, key};
+    use crate::components::{Overlay, Status, key};
 
     const WIDE: (u16, u16) = (80, 24);
     const NARROW: (u16, u16) = (40, 12);
@@ -747,7 +747,7 @@ mod tests {
         let form_tip = tip_text(&app).expect(SHOWN);
 
         ask(&mut app);
-        assert!(app.stream_modal.is_open(), "{CONTROL_MISSING}");
+        assert!(app.btw.is_open(), "{CONTROL_MISSING}");
         let _ = rest_at(&mut app, WIDE, control);
 
         assert_ne!(tip_text(&app), Some(form_tip), "{UNDER_BTW}");
