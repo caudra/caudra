@@ -1,8 +1,10 @@
 //! What the shell ETA model reads from a call: a few numbers about the
 //! command's shape, hashed labels of the programs it runs, and its pipelines as
 //! steps. Heredoc bodies and arguments other than flags never reach a label, and
-//! the command itself is never kept.
+//! the command itself is never kept. The project is recorded beside the labels
+//! but is not one of them.
 
+use std::collections::HashSet;
 use std::mem::take;
 use std::sync::LazyLock;
 
@@ -12,7 +14,10 @@ use super::lex;
 use crate::sessions::SessionError;
 
 pub const NUMBERS: usize = 13;
-pub const READING_VERSION: u8 = 1;
+pub const READING_VERSION: u8 = 2;
+/// Readings before [`Reading::project`], whose project token is one of the
+/// labels.
+const PROJECT_IN_TOKENS: u8 = 1;
 const MAX_CHARS: usize = 8192;
 const MAX_STEP_KEY_CHARS: usize = 200;
 const MAX_SUB_CHARS: usize = 25;
@@ -74,8 +79,8 @@ const SPACE: &str = " ";
 const READING_FIELD: &str = "shell_runs.reading";
 const TRUNCATED: &str = "reading ends early";
 const TRAILING: &str = "bytes follow the reading";
-const STEPS_ABSENT: u8 = 0;
-const STEPS_PRESENT: u8 = 1;
+const ABSENT: u8 = 0;
+const PRESENT: u8 = 1;
 
 static SECONDS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)?)([smhd]?)$").expect("literal"));
@@ -100,6 +105,11 @@ pub struct Reading {
     pub numbers: [f32; NUMBERS],
     /// Sorted, distinct FNV-1a hashes of the call's labels.
     pub tokens: Vec<u64>,
+    /// The hashed last component of the directory the call ran in. Kept out of
+    /// the labels, since replaying recorded runs gave better estimates without
+    /// it, and recorded to study again. `None` for an older reading whose
+    /// project is still among its labels.
+    pub project: Option<u64>,
     /// Each step is one pipeline's parts; `None` when loops or backgrounding
     /// make a sum of parts meaningless.
     pub steps: Option<Vec<Vec<Part>>>,
@@ -153,7 +163,8 @@ pub fn read(call: &Call) -> Reading {
     let heredocs = body.matches(HEREDOC_WORD).count();
     Reading {
         numbers: numbers(call, &segments, &loops, &heads, mains.len(), heredocs),
-        tokens: tokens(call, &heads, &mains),
+        tokens: tokens(&heads, &mains),
+        project: Some(fnv1a(&[PROJECT_PREFIX, project(call)])),
         steps: steps(&segments, &loops, &heads),
     }
 }
@@ -212,7 +223,7 @@ fn numbers(
     ]
 }
 
-fn tokens(call: &Call, heads: &[Option<Head>], mains: &[&Head]) -> Vec<u64> {
+fn tokens(heads: &[Option<Head>], mains: &[&Head]) -> Vec<u64> {
     let mut hashes: Vec<u64> = heads
         .iter()
         .flatten()
@@ -232,7 +243,6 @@ fn tokens(call: &Call, heads: &[Option<Head>], mains: &[&Head]) -> Vec<u64> {
         hashes.push(first.hash(FIRST_PREFIX));
         hashes.push(last.hash(LAST_PREFIX));
     }
-    hashes.push(fnv1a(&[PROJECT_PREFIX, project(call)]));
     hashes.sort_unstable();
     hashes.dedup();
     hashes
@@ -487,11 +497,18 @@ pub(crate) fn encode(reading: &Reading) -> Vec<u8> {
     for token in tokens {
         bytes.extend(token.to_le_bytes());
     }
+    match reading.project {
+        Some(project) => {
+            bytes.push(PRESENT);
+            bytes.extend(project.to_le_bytes());
+        }
+        None => bytes.push(ABSENT),
+    }
     let Some(steps) = &reading.steps else {
-        bytes.push(STEPS_ABSENT);
+        bytes.push(ABSENT);
         return bytes;
     };
-    bytes.push(STEPS_PRESENT);
+    bytes.push(PRESENT);
     let steps = &steps[..usize::from(count(steps.len()))];
     bytes.extend(count(steps.len()).to_le_bytes());
     for step in steps {
@@ -513,7 +530,7 @@ fn count(len: usize) -> u16 {
 pub(crate) fn decode(bytes: &[u8]) -> Result<Reading, SessionError> {
     let mut reader = Reader(bytes);
     let [version] = reader.take::<1>()?;
-    if version != READING_VERSION {
+    if version != READING_VERSION && version != PROJECT_IN_TOKENS {
         return Err(corrupt(format!(
             "version {version}, expected {READING_VERSION}"
         )));
@@ -525,9 +542,17 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Reading, SessionError> {
     let tokens = (0..reader.count()?)
         .map(|_| reader.take().map(u64::from_le_bytes))
         .collect::<Result<_, _>>()?;
+    let project = match version {
+        PROJECT_IN_TOKENS => None,
+        _ => match reader.take::<1>()? {
+            [ABSENT] => None,
+            [PRESENT] => Some(u64::from_le_bytes(reader.take()?)),
+            [other] => return Err(corrupt(format!("project marker {other}"))),
+        },
+    };
     let steps = match reader.take::<1>()? {
-        [STEPS_ABSENT] => None,
-        [STEPS_PRESENT] => Some(
+        [ABSENT] => None,
+        [PRESENT] => Some(
             (0..reader.count()?)
                 .map(|_| {
                     (0..reader.count()?)
@@ -549,8 +574,45 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Reading, SessionError> {
     Ok(Reading {
         numbers,
         tokens,
+        project,
         steps,
     })
+}
+
+/// Moves the project of each reading older than [`Reading::project`] out of
+/// its labels, wherever a newer reading names that project. Another older
+/// project cannot be told from a label.
+pub(crate) fn separate_projects<'a>(readings: impl Iterator<Item = &'a mut Reading>) {
+    let (mut older, newer): (Vec<&mut Reading>, Vec<&mut Reading>) =
+        readings.partition(|reading| reading.project.is_none());
+    let named: HashSet<u64> = newer.iter().filter_map(|reading| reading.project).collect();
+    for reading in &mut older {
+        if let Some(at) = reading
+            .tokens
+            .iter()
+            .position(|token| named.contains(token))
+        {
+            reading.project = Some(reading.tokens.remove(at));
+        }
+    }
+}
+
+/// The bytes a build before [`Reading::project`] stored for this reading.
+#[cfg(test)]
+pub(super) fn legacy(reading: &Reading) -> Vec<u8> {
+    let mut tokens = reading.tokens.clone();
+    tokens.extend(reading.project);
+    tokens.sort_unstable();
+    let project_marker =
+        1 + NUMBERS * size_of::<f32>() + size_of::<u16>() + tokens.len() * size_of::<u64>();
+    let mut bytes = encode(&Reading {
+        tokens,
+        project: None,
+        ..reading.clone()
+    });
+    bytes[0] = PROJECT_IN_TOKENS;
+    bytes.remove(project_marker);
+    bytes
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -590,12 +652,15 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Call, HEAD_PREFIX, NUMBERS, Part, READING_VERSION, Reading, decode, encode, fnv1a, read,
+        Call, HEAD_PREFIX, NUMBERS, PROJECT_IN_TOKENS, Part, READING_VERSION, Reading, decode,
+        encode, fnv1a, legacy, read, separate_projects,
     };
 
     const PIPELINE: &str = "cd crate && cargo test -p core >out | tail -5; echo done";
     const SHAPED: &str = "for x in 1 2 3; do sleep 2; done\ntimeout 1m make | head &";
     const PROJECT_DIR: &str = "/work/project/";
+    const PROJECT_LABEL: &str = "P:project";
+    const OTHER_DIR: &str = "/work/other";
     const TIMEOUT_SECS: f64 = 7.0;
 
     fn call(command: &str) -> Call<'_> {
@@ -646,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn tokens_label_programs_flags_and_project() {
+    fn tokens_label_programs_and_flags() {
         let tokens = read(&call(
             "RUST_LOG=debug timeout 60 cargo test --release=x | head -3",
         ))
@@ -658,20 +723,48 @@ mod tests {
             "F:cargo --release",
             "FIRST:cargo test",
             "LAST:cargo test",
-            "P:project",
         ]);
         assert_eq!(tokens, expected);
     }
 
     #[test]
     fn workdir_names_the_project_over_cwd() {
-        let tokens = read(&Call {
+        let reading = read(&Call {
             workdir: Some(PROJECT_DIR),
             cwd: Some("/elsewhere"),
             ..call("ls")
-        })
-        .tokens;
-        assert_eq!(tokens, hashed(&["H:ls", "P:project"]));
+        });
+        assert_eq!(reading.tokens, hashed(&["H:ls"]));
+        assert_eq!(reading.project, Some(fnv1a(&[PROJECT_LABEL])));
+    }
+
+    #[test]
+    fn an_older_reading_keeps_its_project_among_its_labels() {
+        let reading = read(&call(PIPELINE));
+        let bytes = legacy(&reading);
+        assert_eq!(bytes[0], PROJECT_IN_TOKENS);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.project, None);
+        assert!(decoded.tokens.contains(&fnv1a(&[PROJECT_LABEL])));
+        assert!(decoded.tokens.is_sorted());
+        assert_eq!(decoded.steps, reading.steps);
+    }
+
+    #[test]
+    fn a_project_a_newer_reading_names_leaves_older_labels() {
+        let current = read(&call(PIPELINE));
+        let elsewhere = read(&Call {
+            cwd: Some(OTHER_DIR),
+            ..call(PIPELINE)
+        });
+        let mut readings = [
+            decode(&legacy(&current)).unwrap(),
+            decode(&legacy(&elsewhere)).unwrap(),
+            current.clone(),
+        ];
+        let unnamed = readings[1].clone();
+        separate_projects(readings.iter_mut());
+        assert_eq!(readings, [current.clone(), unnamed, current]);
     }
 
     #[test]
@@ -732,6 +825,7 @@ mod tests {
         let mut bytes = encode(&Reading {
             numbers: [0.0; NUMBERS],
             tokens: Vec::new(),
+            project: None,
             steps: None,
         });
         bytes.push(0);
