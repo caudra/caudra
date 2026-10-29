@@ -20,9 +20,13 @@ pub const NODE: usize = 512;
 /// Most bytes the view's lines hold.
 pub const VIEW: usize = 32 * 1024;
 pub const VIEW_DOC: &str = include_str!("../prompts/memory_view.md");
+/// What an empty view explains instead, so a project's first sessions learn
+/// what a note is for before any note shows them.
+pub const EMPTY_DOC: &str = include_str!("../prompts/memory_empty.md");
 /// How the line of an entry not summarized yet begins.
 pub const PENDING: &str = "(not summarized yet)";
 
+const DOCS: [&str; 2] = [VIEW_DOC, EMPTY_DOC];
 const OPEN: &str = "\n<memory>\n";
 const CLOSE: &str = "</memory>\n";
 const CLOSE_LINE: &str = "\n</memory>\n";
@@ -483,10 +487,19 @@ impl Block {
             .map_or(self.hidden, |line| line.part.end())
     }
 
+    fn doc(&self) -> &'static str {
+        if self.hidden == 0 && self.lines.is_empty() {
+            EMPTY_DOC
+        } else {
+            VIEW_DOC
+        }
+    }
+
     pub fn render(&self) -> String {
+        let doc = self.doc();
         let lines: usize = self.lines.iter().map(Line::size).sum();
-        let mut out = String::with_capacity(VIEW_DOC.len() + OPEN.len() + lines + CLOSE.len());
-        out.push_str(VIEW_DOC);
+        let mut out = String::with_capacity(doc.len() + OPEN.len() + lines + CLOSE.len());
+        out.push_str(doc);
         out.push_str(OPEN);
         if self.hidden > 0 {
             out.push_str(&hidden_line(self.hidden));
@@ -501,8 +514,10 @@ impl Block {
 
     /// Reads a rendered block back out of a system prompt.
     pub fn parse(system: &str) -> Option<Self> {
-        let rows = system[Self::range(system)?]
-            .strip_prefix(VIEW_DOC)?
+        let rendered = &system[Self::range(system)?];
+        let rows = DOCS
+            .into_iter()
+            .find_map(|doc| rendered.strip_prefix(doc))?
             .strip_prefix(OPEN)?
             .strip_suffix(CLOSE)?;
         let mut block = Self::default();
@@ -525,7 +540,7 @@ impl Block {
 
     /// Where a rendered block sits in a system prompt.
     pub fn range(system: &str) -> Option<Range<usize>> {
-        let start = system.find(VIEW_DOC)?;
+        let start = DOCS.into_iter().filter_map(|doc| system.find(doc)).min()?;
         let close = start + system[start..].find(CLOSE_LINE)?;
         Some(start..close + CLOSE_LINE.len())
     }
@@ -840,6 +855,21 @@ mod tests {
         let rendered = block.render();
         let system = format!("instructions\n\n{rendered}\nreminders");
 
+        assert_eq!(Block::parse(&system), Some(block));
+        assert_eq!(
+            Block::range(&system).map(|range| &system[range]),
+            Some(rendered.as_str())
+        );
+    }
+
+    #[test_case(Block::default(), EMPTY_DOC ; "empty_view_explains_notes")]
+    #[test_case(Block { hidden: 0, lines: vec![Line::new(Part::leaf(0), NAME)] }, VIEW_DOC ; "view_with_lines_explains_the_tree")]
+    #[test_case(Block { hidden: 3, lines: Vec::new() }, VIEW_DOC ; "view_hiding_entries_explains_the_tree")]
+    fn block_opens_with_the_doc_for_its_lines(block: Block, doc: &str) {
+        let rendered = block.render();
+        let system = format!("instructions\n\n{rendered}\nreminders");
+
+        assert!(rendered.starts_with(doc));
         assert_eq!(Block::parse(&system), Some(block));
         assert_eq!(
             Block::range(&system).map(|range| &system[range]),
