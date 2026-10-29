@@ -6602,6 +6602,7 @@ impl App {
                 vec![]
             }
             "/env" => self.open_env(),
+            "/secrets" => self.open_secrets(),
             "/settings" => self.open_settings(),
             "/permissions" => {
                 let discover = match subcommand(&cmd.args) {

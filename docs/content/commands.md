@@ -63,6 +63,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/view` |  | Cycle transcript: auto / compact / expanded |  |  |
 | `/mcp` |  | Configure MCP servers |  |  |
 | `/env` |  | View environment variables and choose which reach shell commands |  |  |
+| `/secrets` |  | Save, replace, move and delete the secrets shell commands receive |  |  |
 | `/settings` |  | Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml |  |  |
 | `/permissions` | `[discover]` | Inspect active conversation permission rules |  |  |
 | `/login` |  | Authenticate with an LLM provider |  |  |

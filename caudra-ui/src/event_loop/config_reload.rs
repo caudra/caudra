@@ -512,6 +512,27 @@ impl EventLoop<'_> {
         }
     }
 
+    /// Reads the settings again although no watched file changed: a file a `{file:…}` reference
+    /// reads, such as a remembered secret's, now holds something else. Caudra changed it, so
+    /// only problems are shown.
+    pub(super) fn reread_settings(&mut self) {
+        let cwd = env::current_dir().ok();
+        let local = self.ctx.workspace_session.is_none();
+        let mut part = Report::default();
+        if self.reload_settings(cwd.as_deref(), local, &mut part) {
+            self.publish_settings();
+        }
+        let mut report = Report::default();
+        report.merge(part, Change::Own);
+        info!(
+            problems = report.problems.len(),
+            "read settings again for a referenced file"
+        );
+        if let Some(message) = report.render() {
+            self.focused_app().flash(message);
+        }
+    }
+
     /// Applies one changed source, and says whether sessions need the
     /// settings published again.
     fn apply_source(

@@ -610,6 +610,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         LEAF,
     ),
     BuiltinCommand::new(
+        "/secrets",
+        "Save, replace, move and delete the secrets shell commands receive",
+        LEAF,
+    ),
+    BuiltinCommand::new(
         "/settings",
         "Choose web search backends and pstack's model roles, and change plain settings in the global caudra.toml",
         LEAF,

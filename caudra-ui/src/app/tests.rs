@@ -16,7 +16,7 @@ use crate::components::context_modal::{
 };
 use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::document_view::COPIED_SELECTION;
-use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
+use crate::components::env_modal::{EDIT_KEY as ENV_EDIT_KEY, PATTERN_KEY as ENV_PATTERN_KEY};
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_panel::{FooterCommand, GOAL_CLEAR, GOAL_MODEL, PanelCommand};
 use crate::components::help_modal::HelpTarget;
@@ -66,6 +66,8 @@ use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
     PermissionResourceSelector, PermissionRuleRecord, RuleOrigin,
 };
+use caudra_agent::secrets::scope::{ForeignEntry, remember};
+use caudra_agent::secrets::{SecretScope, SecretValue, SecretVaults};
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::secret::SecretReply;
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
@@ -19598,6 +19600,49 @@ fn env_command_writes_a_pass_pattern_to_the_global_config() {
     assert!(written.contains(SECTION), "{written}");
     assert!(written.contains(PATTERN), "{written}");
     assert!(app.env_modal.is_open());
+}
+
+/// `/secrets` replaces a secret in the vault the session's agent reads, without the old or the
+/// new value reaching the screen. A remembered secret's file changed, which no watcher sees, so
+/// the settings are read again.
+#[test_case(SecretScope::Session, false ; "session")]
+#[test_case(SecretScope::Remembered, true ; "remembered")]
+fn secrets_command_replaces_a_secret_in_the_sessions_vault(scope: SecretScope, reread: bool) {
+    const CONFIG_FILE: &str = "caudra.toml";
+    const NAME: &str = "CLOUDFLARE_API_TOKEN";
+    const OLD: &str = "secret-canary-old-4711";
+    const NEW: &str = "secret-canary-new-0815";
+    const SHOWN: &str = "a secret's value must never reach the screen";
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    let mut app = test_app();
+    app.shell_env.config_path = Some(path.clone());
+    let vault = SecretVaults::for_session(&app.storage, app.state.session.id);
+    vault.set(NAME, SecretValue::new(OLD.into())).unwrap();
+    if scope == SecretScope::Remembered {
+        remember(&vault, &path, NAME, ForeignEntry::Refuse).unwrap();
+    }
+
+    app.execute_command(cmd("/secrets"), 0);
+    app.finish_env_work();
+    let screen = rendered(&mut app);
+    assert!(screen.contains(NAME), "{screen}");
+    assert!(!screen.contains(OLD), "{SHOWN}");
+
+    app.update(Msg::Key(key(KeyCode::Char(ENV_EDIT_KEY))));
+    app.update(Msg::Paste(NEW.into()));
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.finish_env_work();
+
+    let injected: Vec<_> = vault
+        .overlay()
+        .into_iter()
+        .map(|(name, value)| (name, value.into_string().unwrap()))
+        .collect();
+    assert_eq!(injected, [(NAME.to_owned(), NEW.to_owned())]);
+    assert_eq!(app.take_settings_stale(), reread);
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
 }
 
 #[test]

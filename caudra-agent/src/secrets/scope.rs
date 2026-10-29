@@ -107,7 +107,8 @@ pub fn forget_to_session(
 }
 
 /// Gives `name` a new value in `scope`. A remembered secret keeps its reference; only its file
-/// changes, which running sessions read at their next config load.
+/// changes, which this session's shell commands read from now on and other sessions at their
+/// next config load.
 pub fn replace(
     secrets: &SessionSecrets,
     config: &Path,
@@ -125,6 +126,7 @@ pub fn replace(
                 return Err(SecretError::NotFound(name.to_owned()));
             }
             save_remembered_secret(state_dir, name, value.expose())?;
+            secrets.note_remembered(name);
             Ok(())
         }
     }
@@ -282,6 +284,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.injected(), None);
+    }
+
+    #[test]
+    fn replacing_a_secret_another_session_remembered_reaches_this_sessions_shells_at_once() {
+        let fixture = Fixture::saved(None);
+        remember(
+            &fixture.secrets,
+            &fixture.config,
+            NAME,
+            ForeignEntry::Refuse,
+        )
+        .unwrap();
+        let other = SecretVaults::for_session(fixture.state_dir(), CaudraId::generate());
+
+        replace(
+            &other,
+            &fixture.config,
+            NAME,
+            SecretScope::Remembered,
+            SecretValue::new(REPLACED.to_owned()),
+        )
+        .unwrap();
+
+        let injected: Vec<_> = other
+            .overlay()
+            .into_iter()
+            .map(|(name, value)| (name, value.into_string().unwrap()))
+            .collect();
+        assert_eq!(injected, [(NAME.to_owned(), REPLACED.to_owned())]);
     }
 
     #[test]

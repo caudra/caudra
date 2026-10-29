@@ -177,9 +177,9 @@ struct Vault {
     state_dir: StateDir,
     session_id: CaudraId,
     entries: RwLock<BTreeMap<String, Entry>>,
-    /// Names this session moved to every session. The running config holds their values only
-    /// from its next reload, which waits for the turn to end, so until then they are read
-    /// from their files.
+    /// Names this session moved to every session or replaced there. The running config holds
+    /// their values only from its next reload, which waits for the turn to end, so until then
+    /// they are read from their files.
     remembered: Mutex<BTreeSet<String>>,
 }
 
