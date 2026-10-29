@@ -39,7 +39,7 @@ use crate::api::create_caudra_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
-use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::SlotStore;
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, PermissionRulePolicy, PermissionScopeSpec,
@@ -110,14 +110,6 @@ static SPAWNED_RUNTIMES: AtomicU64 = AtomicU64::new(0);
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
 
-fn registered_lua_effect(bundled: bool, declared: ToolEffect) -> ToolEffect {
-    if bundled {
-        declared
-    } else {
-        ToolEffect::Unknown
-    }
-}
-
 fn plugin_implementation_digest(source: &str, plugin_dir: Option<&Path>) -> io::Result<String> {
     fn collect(
         root: &Path,
@@ -183,7 +175,6 @@ pub enum Request {
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
-        bundled: bool,
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -243,9 +234,6 @@ pub enum Request {
     CollectPromptSlots {
         config: AgentConfig,
         reply: flume::Sender<ResolvedSlots>,
-    },
-    CollectPluginOptions {
-        reply: flume::Sender<PluginOptionSpecs>,
     },
     Shutdown,
     RestoreToolAsync {
@@ -615,7 +603,7 @@ fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
 /// VM rather than once per plugin.
 #[derive(Clone)]
 struct BundledModules {
-    dirs: &'static [&'static Dir<'static>],
+    dir: &'static Dir<'static>,
     compiler: Compiler,
     bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 }
@@ -626,11 +614,7 @@ impl BundledModules {
         if let Some(cached) = cache.get(rel_path) {
             return Ok(Some(Arc::clone(cached)));
         }
-        let Some(source) = self
-            .dirs
-            .iter()
-            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
-        else {
+        let Some(source) = self.dir.get_file(rel_path).and_then(|f| f.contents_utf8()) else {
             return Ok(None);
         };
         let compiled = Arc::new(self.compiler.compile(source)?);
@@ -1503,7 +1487,7 @@ impl LuaRuntime {
         registry: Arc<ToolRegistry>,
         tx: flume::Sender<Request>,
         shutdown: Arc<AtomicBool>,
-        bundled_dirs: &'static [&'static Dir<'static>],
+        lib: &'static Dir<'static>,
         ui_action_tx: Option<flume::Sender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
@@ -1584,7 +1568,7 @@ impl LuaRuntime {
             tx,
             shutdown,
             bundled: BundledModules {
-                dirs: bundled_dirs,
+                dir: lib,
                 compiler,
                 bytecode: Arc::default(),
             },
@@ -1828,10 +1812,8 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("caudra", caudra)?;
 
-        if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
-            env.set("require", require_fn)?;
-        }
+        let require_fn = self.create_require_fn(&env, require_root)?;
+        env.set("require", require_fn)?;
 
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
@@ -1884,7 +1866,6 @@ impl LuaRuntime {
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
-        bundled: bool,
         permissions: &PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
@@ -1984,7 +1965,7 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     contract: Arc::clone(contract),
-                    bundled,
+                    bundled: false,
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t
@@ -2002,9 +1983,9 @@ impl LuaRuntime {
                     ToolSource::Lua {
                         plugin: Arc::clone(&name),
                         contract: Arc::clone(contract),
-                        bundled,
+                        bundled: false,
                     },
-                    registered_lua_effect(bundled, t.effect),
+                    ToolEffect::Unknown,
                 )
             })
             .collect();
@@ -2158,7 +2139,6 @@ impl LuaRuntime {
             Arc::from(source_name),
             source,
             plugin_dir,
-            false,
             &perms,
             rule_policy,
             PluginOpts::default(),
@@ -2167,52 +2147,6 @@ impl LuaRuntime {
         )
         .await?;
         Ok(config_store.lock().unwrap().take())
-    }
-}
-
-#[cfg(test)]
-mod effect_tests {
-    use super::*;
-    use caudra_config::PluginsConfig;
-
-    #[test]
-    fn unbundled_lua_cannot_claim_a_safe_effect() {
-        assert_eq!(
-            registered_lua_effect(false, ToolEffect::ReadOnly),
-            ToolEffect::Unknown
-        );
-        assert_eq!(
-            registered_lua_effect(true, ToolEffect::ReadOnly),
-            ToolEffect::ReadOnly
-        );
-    }
-
-    /// Every tool the production Lua builtins still own, with the effect that
-    /// read-only mode, plan mode, and the permission defaults rely on. Tools
-    /// leave this table as they move to native Rust; the test below fails in
-    /// both directions so neither side can drift silently.
-    const BUNDLED_EFFECTS: &[(&str, ToolEffect)] = &[];
-
-    const EFFECT_DRIFT: &str = "BUNDLED_EFFECTS must list exactly the tools the \
-         production Lua builtins register";
-
-    #[test]
-    fn production_bundled_tools_have_explicit_effects() {
-        let registry = Arc::new(ToolRegistry::new());
-        let mut host = crate::PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .unwrap();
-
-        let names = registry.names();
-        let mut registered: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
-        registered.sort_unstable();
-        let mut expected: Vec<&str> = BUNDLED_EFFECTS.iter().map(|(n, _)| *n).collect();
-        expected.sort_unstable();
-        assert_eq!(registered, expected, "{EFFECT_DRIFT}");
-
-        for (name, effect) in BUNDLED_EFFECTS {
-            assert_eq!(registry.get(name).unwrap().effect, *effect, "{name}");
-        }
     }
 }
 
@@ -2843,7 +2777,7 @@ pub fn spawned_runtimes() -> u64 {
 /// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
-    bundled_dirs: &'static [&'static Dir<'static>],
+    lib: &'static Dir<'static>,
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
@@ -2866,7 +2800,7 @@ pub fn spawn(
                 registry,
                 tx_clone,
                 shutdown_thread,
-                bundled_dirs,
+                lib,
                 Some(ui_action_tx),
                 command_writer,
                 keymap_writer,
@@ -2969,7 +2903,6 @@ pub fn spawn(
                             name,
                             source,
                             plugin_dir,
-                            bundled,
                             permissions,
                             rule_policy,
                             opts,
@@ -2977,7 +2910,7 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, bundled, &permissions, rule_policy, opts, None, local_source).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, rule_policy, opts, None, local_source).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -3121,9 +3054,6 @@ pub fn spawn(
                         Request::CollectPromptSlots { config, reply } => {
                             let slots = rt.collect_prompt_slots(&config).await;
                             let _ = reply.send(slots);
-                        }
-                        Request::CollectPluginOptions { reply } => {
-                            let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, *item, event_tx);

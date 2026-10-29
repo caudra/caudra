@@ -5,6 +5,7 @@ SHELL := bash
 CARGO ?= cargo
 PYTHON ?= python3
 ARGS ?=
+LUA_SOURCES := caudra-lua/lua caudra-lua/example caudra-lua/tests/lua
 
 include scripts/cargo-cache.mk
 
@@ -91,12 +92,12 @@ lint-fix: code-worker incremental-sweep
 
 fmt-check:
 	$(CARGO) fmt --all -- --check
-	stylua --check plugins/
+	stylua --check $(LUA_SOURCES)
 	ruff format --check scripts/
 
 fmt:
 	$(CARGO) fmt --all
-	stylua plugins/
+	stylua $(LUA_SOURCES)
 	ruff format scripts/
 
 pylint:

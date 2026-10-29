@@ -62,7 +62,6 @@ jobs:
               - "src/**"
               - "caudra-*/**"
               - "workcell/**"
-              - "plugins/**"
               - "scripts/build-code-worker.py"
               - "scripts/test-build-code-worker.py"
               - "scripts/ci-runners.py"
@@ -113,7 +112,7 @@ jobs:
             "https://github.com/JohnnyMorganz/StyLua/releases/download/${STYLUA_VERSION}/stylua-linux-x86_64.zip"
           unzip -o stylua.zip stylua
           rm stylua.zip
-      - run: ./stylua --check plugins/
+      - run: ./stylua --check caudra-lua/lua caudra-lua/example caudra-lua/tests/lua
 
   lint:
     name: Lint

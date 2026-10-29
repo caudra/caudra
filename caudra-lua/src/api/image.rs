@@ -199,8 +199,8 @@ lua_table! {
 mod tests {
     use super::*;
 
-    // Lua-facing behavior is covered by plugins/view_image/tests/spec.lua
-    // and the view_image tests in plugin_host.rs; only the host-side
+    // Lua-facing behavior is covered by tests/lua/view_image_spec.lua and
+    // the view_image tests in plugin_host.rs; only the host-side
     // decode-bomb guard is tested here.
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {

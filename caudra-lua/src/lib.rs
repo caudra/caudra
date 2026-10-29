@@ -8,7 +8,6 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
-pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, CompletionRequest, Dimension, Edge, FloatConfig,
     FloatConfigPatch, HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, LuaCompletion,

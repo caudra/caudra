@@ -117,7 +117,7 @@ fn runtime_resolver(
                         runtime.stored_binding(),
                     )?;
                 }
-                let mut plugin_host = super::plugin_host(runs_lua, no_jit, Arc::clone(&registry))?;
+                let plugin_host = super::plugin_host(runs_lua, no_jit, Arc::clone(&registry))?;
                 let mut config =
                     super::load_settings(&plugin_host, &startup, &cwd, runtime.is_remote())?
                         .into_config(false)?;
@@ -135,7 +135,7 @@ fn runtime_resolver(
                 }
                 super::configure_native_tools(&config);
                 super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
-                plugin_host.load_production_builtins(&config.plugins)?;
+                plugin_host.warm_jit();
                 let seed_permission_mode = Some(super::permission_mode_seed(&config));
                 Ok(AcpRuntime {
                     prompt_slots: Arc::new(
@@ -213,9 +213,7 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     super::configure_native_tools(&config);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 
-    plugin_host
-        .load_production_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    plugin_host.warm_jit();
 
     let timeouts = Timeouts {
         connect: config.provider.connect_timeout,
