@@ -41,6 +41,7 @@ use super::history::{
 use super::instructions::LoadedInstructions;
 use super::live_switch::LiveSwitch;
 use super::measured::{MeasuredContext, SentRequest};
+use super::memory_nudge::{self, Trigger};
 use super::mention_preamble;
 use super::provider_projection;
 use super::refresh::{ActiveContext, ContextRefresh, StandingState, favorite_models};
@@ -69,16 +70,19 @@ use crate::decisions::output_pointers::output_focus;
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, NoteAnchor,
-    NoteDraft, NoteOutcome, NoteSink, PendingNote, push_fitting, question_tool_nudge,
-    redact_decision_text, redacted_excerpt,
+    NoteDraft, NoteOutcome, NoteSink, PendingNote, memory_nudge as memory_nudge_decision,
+    push_fitting, question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::McpSession;
 use crate::memory::relevance::{Judge, Recall, RecallFocus, RecallQuery, Recalled};
 use crate::memory::search::significant_words;
-use crate::memory::store::MemoryStore;
+use crate::memory::store::{MemoryStore, now_ms};
 use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
+use crate::prompt::AUTOMATIONS_MARKER;
+use crate::restart::is_resume_nudge;
+use crate::secrets::SessionSecrets;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
@@ -108,6 +112,8 @@ use caudra_storage::goal_log::GoalEvaluationOutcome;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::media::MediaStore;
+use caudra_storage::memory_journal::MemoryJournalError;
+use caudra_storage::memory_nudges::NudgeEvent;
 use caudra_storage::now_epoch;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -143,6 +149,9 @@ const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 /// Provider requests a recall the agent starts on its own waits after the
 /// last one, so a burst of todo updates asks the engine once.
 const RECALL_SPACING_REQUESTS: usize = 5;
+const MEMORY_CORRECTED: &str = "reminded the agent to save the correction";
+const MEMORY_CORRECTION_FALLBACK: &str = "left the turn without a memory reminder";
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const STEP_STARTED_CAUSE: &str = "step started";
 const GOAL_UNMET_CAUSE: &str = "goal unmet";
 const COMPACTED_CAUSE: &str = "after compaction";
@@ -350,6 +359,8 @@ pub struct AgentParams {
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// The session tree's secrets: the root session's vault, which subagents share.
+    pub secrets: Option<SessionSecrets>,
     /// What the provider routes this conversation's prompt cache by. The
     /// session for the main agent, session-plus-task for a subagent.
     pub cache_key: Option<CacheKey>,
@@ -486,6 +497,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    secrets: Option<SessionSecrets>,
     cache_key: Option<CacheKey>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
@@ -548,6 +560,9 @@ pub struct Agent<'h> {
     /// Provider requests since the last recall, which spaces the recalls the
     /// agent starts on its own.
     requests_since_recall: usize,
+    /// The engine judged the user's newest message a correction, which the
+    /// next memory nudge reports.
+    memory_correction: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -664,6 +679,7 @@ impl<'h> Agent<'h> {
             home_model: None,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            secrets: params.secrets,
             tool_output_store: params.tool_output_store,
             cache_key: params.cache_key,
             workspace_session: params.workspace_session,
@@ -714,6 +730,7 @@ impl<'h> Agent<'h> {
             work_reminded: None,
             memory_store: run.memory_store,
             requests_since_recall: 0,
+            memory_correction: false,
         }
     }
 
@@ -985,7 +1002,11 @@ impl<'h> Agent<'h> {
         }
         if inputs.last().is_some_and(|input| input.resume) {
             let prompted = inputs.iter().any(|input| !input.preamble.is_empty());
-            self.prepare_resume(prompted);
+            let reminded = inputs
+                .iter()
+                .flat_map(|input| &input.preamble)
+                .any(|message| message.first_text_content().is_some_and(is_resume_nudge));
+            self.prepare_resume(prompted, reminded);
         }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
@@ -995,14 +1016,26 @@ impl<'h> Agent<'h> {
         let recall = (!peer_wake)
             .then(|| self.memory_recall(RecallTrigger::Request(&message)))
             .flatten();
-        let (skill_suggestion, recalled) = future::zip(self.suggest_skill(&message), async {
-            match recall {
-                Some(recall) => recall.run().await,
-                None => None,
-            }
-        })
+        let nudge_start = (!peer_wake)
+            .then(|| self.memory_nudge_start(&message).map(Box::pin))
+            .flatten();
+        let ((skill_suggestion, recalled), corrected) = future::zip(
+            future::zip(self.suggest_skill(&message), async {
+                match recall {
+                    Some(recall) => recall.run().await,
+                    None => None,
+                }
+            }),
+            async {
+                match nudge_start {
+                    Some(start) => start.await,
+                    None => false,
+                }
+            },
+        )
         .await;
         self.push_recalled(recalled);
+        self.memory_correction = corrected;
 
         info!(
             model = %self.model.id,
@@ -1182,9 +1215,11 @@ impl<'h> Agent<'h> {
     /// back on the tool result the loop stopped at; when the reply itself was
     /// cut there is no such seam, and an assistant tail would go out as a
     /// prefill, which providers reject once reasoning is on. A `prompted`
-    /// resume brings its own message to answer, so it needs no seam.
-    fn prepare_resume(&mut self, prompted: bool) {
-        self.history.drop_run_marker();
+    /// resume brings its own message to answer, so it needs no seam. One
+    /// `reminded` of the interruption keeps a shutdown marker ahead of that
+    /// reminder, as the record of where the shutdown cut the turn off.
+    fn prepare_resume(&mut self, prompted: bool, reminded: bool) {
+        self.history.drop_run_marker(reminded);
         if !prompted
             && self
                 .history
@@ -1530,7 +1565,7 @@ impl<'h> Agent<'h> {
         if !autopilot.is_engaged() {
             return Err(error);
         }
-        self.prepare_resume(false);
+        self.prepare_resume(false, false);
         let wake = autopilot.sleep(delay);
         let nudged = self.retry_now.listen();
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
@@ -2423,6 +2458,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             }
             .refresh(
                 self.history,
@@ -2432,6 +2468,9 @@ impl<'h> Agent<'h> {
             );
             self.history.as_slice().iter().any(|message| {
                 message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                    || message
+                        .user_text()
+                        .is_some_and(|text| text.contains(AUTOMATIONS_MARKER))
             }) && self.preflight_context().await?
         } else {
             false
@@ -2911,12 +2950,15 @@ impl<'h> Agent<'h> {
         // one by reopening a normal final answer.
         if matches!(outcome, TurnOutcome::Continue) && !compacted {
             self.inject_advisory();
+            let head = self.history.item_head();
             if self
                 .step_in_progress()
                 .is_some_and(|step| step_before.as_ref() != Some(&step))
             {
                 self.recall_while_working(RecallTrigger::StepStarted).await;
             }
+            let recalled = self.history.item_head() != head;
+            Box::pin(self.nudge_memory(recalled)).await;
         }
         self.publish_prepared_context();
         Ok(outcome)
@@ -3478,6 +3520,205 @@ impl<'h> Agent<'h> {
             query,
             rows.caused(trigger.cause()),
         ))
+    }
+
+    /// The project's memory and this session, when this agent may be nudged
+    /// to save notes: the main session building, with the `memory` tool.
+    fn memory_nudge_target(&self) -> Option<(Arc<MemoryStore>, String)> {
+        if !self.config.memory_nudges
+            || !self.is_main_session()
+            || self.mode != AgentMode::Build
+            || !self.tool_filter.matches(MEMORY_TOOL_NAME)
+        {
+            return None;
+        }
+        let store = Arc::clone(self.memory_store.as_ref()?);
+        Some((store, self.session_id.as_ref()?.as_str().to_owned()))
+    }
+
+    /// At a new user message: records the session in the project's nudge
+    /// history, then asks the engine whether the message corrects the agent,
+    /// when a nudge for that could go in at all. Built from owned parts, so
+    /// it runs beside the recall and the skill suggestion.
+    fn memory_nudge_start(&self, message: &str) -> Option<impl Future<Output = bool> + use<>> {
+        let (store, session) = self.memory_nudge_target()?;
+        let responses =
+            memory_nudge::read(self.history, self.tool_name_aliases.as_ref()).responses_since_nudge;
+        let feature = DecisionFeature::MemoryNudge;
+        let check = self
+            .permissions
+            .decisions()
+            .filter(|decisions| decisions.enabled(&feature))
+            .zip(
+                memory_nudge::previous_reply(self.history)
+                    .and_then(|reply| memory_nudge_decision::state(message, reply)),
+            )
+            .zip(decision_questions::MEMORY_NUDGE.as_ref())
+            .map(|((decisions, state), questions)| {
+                (
+                    decisions,
+                    state,
+                    questions,
+                    self.decision_context(),
+                    self.decision_rows(),
+                    Arc::clone(&self.permissions),
+                    self.cancel.clone(),
+                )
+            });
+        Some(async move {
+            let now = now_ms();
+            let standing = smol::unblock(move || {
+                let journal = store.journal();
+                journal.record_nudge_event(store.scope(), &session, NudgeEvent::Session, now)?;
+                journal.nudge_standing(store.scope(), &session, now - DAY_MS, now)
+            })
+            .await;
+            let standing = match standing {
+                Ok(standing) => standing,
+                Err(error) => {
+                    warn!(%error, "memory nudge history could not be read");
+                    return false;
+                }
+            };
+            let Some((decisions, state, questions, context, rows, permissions, cancel)) = check
+            else {
+                return false;
+            };
+            if !memory_nudge::allowed(Trigger::Correction, &standing, responses) {
+                return false;
+            }
+            let pending = rows.begin(&decisions, feature.clone());
+            let Some(outcome) = cancel
+                .race(permissions.run_passive_decision(decisions.evaluate(
+                    feature.clone(),
+                    state.value(),
+                    questions,
+                    &context,
+                )))
+                .await
+                .ok()
+                .flatten()
+                .flatten()
+            else {
+                return false;
+            };
+            let threshold = decisions.config().thresholds.routing_confidence;
+            let probability = memory_nudge_decision::probability(&outcome);
+            match (decisions.mode(&feature), probability) {
+                (FeatureMode::Advise, Some(probability)) if probability >= threshold => {
+                    pending.emit(memory_nudge_note(
+                        &decisions,
+                        NoteOutcome::Acted,
+                        probability,
+                        threshold,
+                    ));
+                    if let Some(receipt) = &outcome.receipt {
+                        decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+                    }
+                    true
+                }
+                (FeatureMode::Shadow, Some(probability)) if probability >= threshold => {
+                    pending.emit(memory_nudge_note(
+                        &decisions,
+                        NoteOutcome::Shadow,
+                        probability,
+                        threshold,
+                    ));
+                    false
+                }
+                (FeatureMode::Advise, None) => {
+                    if let Some(failure) = outcome.fresh_failure() {
+                        pending.emit(NoteDraft::fell_back(
+                            &decisions,
+                            feature,
+                            &failure,
+                            MEMORY_CORRECTION_FALLBACK,
+                        ));
+                    }
+                    false
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// After a response the agent continues from: reminds it to save a note
+    /// when that response, or the user's message before it, showed something
+    /// worth keeping, and records a note it saved without being asked. A
+    /// request that carries a recall holds the nudge back, so one request
+    /// never names memory twice.
+    async fn nudge_memory(&mut self, recalled: bool) {
+        let Some((store, session)) = self.memory_nudge_target() else {
+            return;
+        };
+        let reading = memory_nudge::read(self.history, self.tool_name_aliases.as_ref());
+        let now = now_ms();
+        if reading.wrote {
+            self.memory_correction = false;
+            if reading.responses_since_nudge > memory_nudge::ATTRIBUTION_RESPONSES {
+                let recorded = smol::unblock(move || {
+                    store.journal().record_nudge_event(
+                        store.scope(),
+                        &session,
+                        NudgeEvent::Unprompted,
+                        now,
+                    )
+                })
+                .await;
+                if let Err(error) = recorded {
+                    warn!(%error, "an unprompted memory note could not be recorded");
+                }
+            }
+            return;
+        }
+        if recalled || reading.nudged_this_turn {
+            return;
+        }
+        let trigger = if mem::take(&mut self.memory_correction) {
+            Trigger::Correction
+        } else if let Some(trigger) = reading.trigger {
+            trigger
+        } else if self.nears_compaction() {
+            Trigger::NearCompaction
+        } else {
+            return;
+        };
+        let responses = reading.responses_since_nudge;
+        let sent = smol::unblock(move || {
+            let journal = store.journal();
+            let standing = journal.nudge_standing(store.scope(), &session, now - DAY_MS, now)?;
+            if !memory_nudge::allowed(trigger, &standing, responses) {
+                return Ok(None);
+            }
+            journal.record_nudge_event(store.scope(), &session, NudgeEvent::Nudge, now)?;
+            Ok::<_, MemoryJournalError>(Some(standing.live_notes))
+        })
+        .await;
+        match sent {
+            Ok(Some(live_notes)) => {
+                info!(
+                    trigger = trigger.as_str(),
+                    live_notes, responses, "memory nudge sent"
+                );
+                self.push_injected(memory_nudge::reminder(trigger, live_notes));
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "memory nudge history could not be read"),
+        }
+    }
+
+    fn nears_compaction(&self) -> bool {
+        self.auto_compact
+            && self.context_size().is_some_and(|input| {
+                compaction::nears_overflow(
+                    &TokenUsage {
+                        input,
+                        ..Default::default()
+                    },
+                    &self.model,
+                    self.config.compaction_buffer,
+                )
+            })
     }
 
     /// The todo the agent is working on.
@@ -4190,6 +4431,7 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             plan: self.plan.clone(),
             session_id: self.session_id.clone(),
+            secrets: self.secrets.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
             host_cwd: self.host_cwd.clone(),
@@ -4464,6 +4706,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             },
         )?;
         self.measured = None;
@@ -4574,6 +4817,24 @@ impl SkillSuggestion {
 }
 
 /// The nudge with the probability that crossed the threshold, then both.
+fn memory_nudge_note(
+    decisions: &Decisions,
+    outcome: NoteOutcome,
+    probability: f64,
+    threshold: f64,
+) -> NoteDraft {
+    NoteDraft::new(
+        decisions,
+        DecisionFeature::MemoryNudge,
+        outcome,
+        &format!("{MEMORY_CORRECTED} ({probability:.2})"),
+        vec![
+            format!("{probability:.2}  {}", memory_nudge_decision::QUESTION),
+            format!("{threshold:.2}  {THRESHOLD_LABEL}"),
+        ],
+    )
+}
+
 fn question_nudge_note(
     decisions: &Decisions,
     outcome: NoteOutcome,
@@ -5317,6 +5578,7 @@ mod tests {
     };
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
+    use crate::restart::{StopCause, nudge};
     use crate::tools::native::batch::BatchTool;
     use crate::tools::native::tests::tempdir;
     use crate::tools::native::todo_write::TodoWrite;
@@ -6240,6 +6502,184 @@ mod tests {
         });
     }
 
+    use crate::tools::{FILE_EDIT_TOOL_NAME, FILE_READ_TOOL_NAME};
+
+    const NUDGE_HEADING: &str = "# Save what you learned";
+    /// Reads before the edit, so the edit is the tenth response: a discovery
+    /// as soon as a project with no notes may be nudged.
+    const NUDGE_READS: usize = 9;
+    const NUDGE_REPLY: &str = "I ran the whole suite.";
+    const NUDGE_CORRECTION: &str = "No, run make test-fast in this project.";
+
+    fn memory_nudges(request: &[Message]) -> usize {
+        request
+            .iter()
+            .filter_map(Message::first_text_content)
+            .filter(|text| text.contains(NUDGE_HEADING))
+            .count()
+    }
+
+    /// A main session on an empty project, with reads and edits that succeed.
+    fn nudged_agent<'h>(
+        history: &'h mut History,
+        state: &Path,
+        provider: MockProvider,
+    ) -> (Agent<'h>, flume::Receiver<Envelope>) {
+        let (mut agent, events) = make_agent(provider, history);
+        agent.config.generate_titles = false;
+        agent.memory_store = Some(note_store(state, &[]));
+        agent.session_id = Some(SessionRef::generate());
+        agent.tools = json!(
+            [FILE_READ_TOOL_NAME, FILE_EDIT_TOOL_NAME]
+                .map(|name| json!({"name": name, "input_schema": {"type": "object"}}))
+        );
+        agent.local_tools = Arc::new(HashMap::from(
+            [FILE_READ_TOOL_NAME, FILE_EDIT_TOOL_NAME].map(|name| {
+                (
+                    name.to_owned(),
+                    audited_local_tool(ToolEffect::Isolated, |_, _| {
+                        Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+                    }),
+                )
+            }),
+        ));
+        (agent, events)
+    }
+
+    fn discovery_script() -> Vec<StreamResponse> {
+        (0..NUDGE_READS)
+            .map(|read| tool_use_response(FILE_READ_TOOL_NAME, json!({"path": read.to_string()})))
+            .chain([
+                tool_use_response(FILE_EDIT_TOOL_NAME, json!({})),
+                answer(FIRST_ANSWER),
+            ])
+            .collect()
+    }
+
+    #[test_case(|_| {}, AgentMode::Build, 1 ; "main_session")]
+    #[test_case(|agent| agent.config.memory_nudges = false, AgentMode::Build, 0 ; "turned_off")]
+    #[test_case(|agent| agent.root_tool_use_id = Some(RECALL_ROOT.into()), AgentMode::Build, 0 ; "subagent_run")]
+    #[test_case(|_| {}, AgentMode::ReadOnly, 0 ; "read_only")]
+    #[test_case(|agent| agent.session_id = None, AgentMode::Build, 0 ; "no_session")]
+    #[test_case(|agent| agent.tool_filter = ToolFilter::All.excluding(&[MEMORY_TOOL_NAME]), AgentMode::Build, 0 ; "memory_tool_filtered_out")]
+    fn a_long_search_ending_in_an_edit_nudges_the_main_session(
+        adjust: fn(&mut Agent<'_>),
+        mode: AgentMode,
+        nudges: usize,
+    ) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(discovery_script());
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            adjust(&mut agent);
+
+            agent
+                .run(AgentInput {
+                    mode,
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+
+            let requests = captured.lock().unwrap();
+            let (last, earlier) = requests.split_last().unwrap();
+            assert_eq!(
+                earlier
+                    .iter()
+                    .map(|request| memory_nudges(request))
+                    .sum::<usize>(),
+                0
+            );
+            assert_eq!(memory_nudges(last), nudges);
+        });
+    }
+
+    #[test]
+    fn a_project_that_keeps_notes_unprompted_is_never_nudged() {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(discovery_script());
+            let captured = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            let store = agent.memory_store.clone().unwrap();
+            for session in ["earlier", "later"] {
+                for event in [NudgeEvent::Session, NudgeEvent::Unprompted] {
+                    store
+                        .journal()
+                        .record_nudge_event(store.scope(), session, event, now_ms())
+                        .unwrap();
+                }
+            }
+
+            agent.run(default_input()).await.unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| memory_nudges(request))
+                    .sum::<usize>(),
+                0
+            );
+        });
+    }
+
+    #[test_case(FeatureMode::Advise, 1 ; "advise_nudges")]
+    #[test_case(FeatureMode::Shadow, 0 ; "shadow_only_asks")]
+    fn a_correction_nudges_the_response_after_it(mode: FeatureMode, nudges: usize) {
+        smol::block_on(async {
+            let state = tempdir();
+            let provider = MockProvider::new(vec![
+                tool_use_response(FILE_READ_TOOL_NAME, json!({})),
+                answer(FIRST_ANSWER),
+            ]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let earlier = (0..NUDGE_READS + 1).flat_map(|_| {
+                [
+                    Message::user(UNRELATED_REQUEST.into()),
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: NUDGE_REPLY.into(),
+                        }],
+                        ..Default::default()
+                    },
+                ]
+            });
+            let mut history = History::new(earlier.collect());
+            let (mut agent, _events) = nudged_agent(&mut history, state.path(), provider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut config = qn_config(FeatureMode::Off);
+            config.features.memory_nudge = mode;
+            agent.permissions.set_decisions(Some(qn_service(
+                &state,
+                config,
+                FeatureEngine {
+                    probability: 1.0,
+                    confidence: 1.0,
+                    fail: false,
+                    calls: Arc::clone(&calls),
+                },
+            )));
+
+            agent
+                .run(AgentInput {
+                    message: NUDGE_CORRECTION.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(memory_nudges(&requests[0]), 0);
+            assert_eq!(memory_nudges(&requests[1]), nudges);
+        });
+    }
+
     #[test]
     fn memory_recall_names_a_note_once_per_conversation() {
         smol::block_on(async {
@@ -6550,6 +6990,8 @@ mod tests {
     const GO: &str = "go";
     const RESUME_TOOL_ID: &str = "t1";
     const RESUME_DROPPED_ONLY_MARKER: &str = "a resume drops the cancel marker and nothing else";
+    const RESUMED_SUMMARY: &str = "main turn";
+    const MARKER_SENT_AS_SAVED: &str = "the request and the saved history must agree on the marker";
     const TITLE_PROMPT: &str = "add refresh token support";
     const MODEL_TITLE: &str = "Refresh token support";
     const TITLE_MUST_SURVIVE: &str = "a title is asked for at the start of a turn and answers after it, so the turn ending must not cancel it";
@@ -7902,6 +8344,7 @@ mod tests {
                 Arc::default(),
             )),
             session_id: None,
+            secrets: None,
             cache_key: None,
             workspace_session: None,
             remote_project_context: None,
@@ -10303,6 +10746,66 @@ mod tests {
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             );
         });
+    }
+
+    #[test_case(SHUTDOWN_MARKER, Some(true) => true; "a_reminded_resume_keeps_the_shutdown")]
+    #[test_case(SHUTDOWN_MARKER, Some(false) => false; "another_preamble_drops_the_shutdown")]
+    #[test_case(SHUTDOWN_MARKER, None => false; "an_unprompted_resume_drops_the_shutdown")]
+    #[test_case(CANCEL_MARKER, Some(true) => false; "a_reminded_resume_drops_a_cancel")]
+    fn a_resume_keeps_the_shutdown_marker_only_beside_its_reminder(
+        marker: &str,
+        reminded: Option<bool>,
+    ) -> bool {
+        smol::block_on(async {
+            let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
+            let mut history = History::new(vec![
+                Message::user(GO.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        RESUME_TOOL_ID,
+                        "read",
+                        serde_json::json!({}),
+                    )],
+                    ..Default::default()
+                },
+            ]);
+            if marker == SHUTDOWN_MARKER {
+                sanitize_shutdown_history(&mut history, 0);
+            } else {
+                sanitize_cancelled_history(&mut history, 0);
+            }
+            let (mut agent, _event_rx) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+            let mut input = resume_input();
+            input.preamble.extend(reminded.map(|reminded| {
+                let text = match reminded {
+                    true => nudge(StopCause::Shutdown, true, &[], Some(RESUMED_SUMMARY)).unwrap(),
+                    false => GO.to_owned(),
+                };
+                Message::synthetic(text)
+            }));
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let carries_marker = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(marker))
+            };
+            let sent = carries_marker(&captured.lock().unwrap());
+            assert_eq!(
+                sent,
+                carries_marker(history.as_slice()),
+                "{MARKER_SENT_AS_SAVED}"
+            );
+            sent
+        })
     }
 
     /// An assistant tail has no seam to resume from, and a prefill breaks once

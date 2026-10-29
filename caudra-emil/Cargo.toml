@@ -1,0 +1,18 @@
+[package]
+name = "caudra-emil"
+description = "Emil Kowalski's bundled design-engineering skills: animation, motion review, UI stress tests, prototypes, mobile polish, and Swift, translated for Caudra as addressable pages."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-skillpack = { workspace = true }
+include_dir = { workspace = true }
+workspace-hack.workspace = true
+
+[dev-dependencies]
+caudra-skillpack = { workspace = true, features = ["checks"] }
+regex = { workspace = true }

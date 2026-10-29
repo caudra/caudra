@@ -28,6 +28,7 @@ use crate::selection::Selection;
 use caudra_agent::background::TaskSnapshot;
 use caudra_agent::decisions::{DecisionFeature, DecisionNote, PendingDecision, ScreeningVerdict};
 use caudra_agent::permissions::PermissionRequest;
+use caudra_agent::restart::is_resume_nudge;
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
 use caudra_agent::tools::{
@@ -537,7 +538,7 @@ impl Chat {
                 ..
             } => {
                 self.messages_panel.flush();
-                if self.show_reminders {
+                if self.show_reminders || is_resume_nudge(&text) {
                     let row = DisplayMessage::injected(text, None);
                     match self.stall_pending.then_some(self.stall_row).flatten() {
                         Some(index) => self.messages_panel.replace(index, row),
@@ -1547,7 +1548,10 @@ pub fn interleaved_history_to_display(
                 task_event,
                 ..
             } => {
-                if task_event.is_some() || (show_reminders && text != COMPACTION_ANCHOR) {
+                if task_event.is_some()
+                    || is_resume_nudge(text)
+                    || (show_reminders && text != COMPACTION_ANCHOR)
+                {
                     let row = DisplayMessage::injected(text.clone(), task_event.clone());
                     // A stall left one pair per attempt behind. Restoring it as
                     // one row keeps the record without replaying the repetition
@@ -2042,6 +2046,7 @@ mod tests {
     use caudra_agent::peers::{
         AssignedWork, PeerSummary, PublishReceipt, QueuedWork, RecipientReceipt, SendReceipt,
     };
+    use caudra_agent::restart::{StopCause, nudge};
     use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME, WORK_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::types::{Answerer, TodoPriority, TodoStatus};
@@ -2152,6 +2157,7 @@ mod tests {
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
     const INJECTED_TEXT: &str = "# Environment\n\ncwd: /tmp";
+    const RESUMED_SUMMARY: &str = "main turn";
     const SYNTHETIC_TEXT: &str = "# Goal check-in";
     const BACKGROUND_REMINDER: &str =
         "<system-reminder>\n# Background work\n\nNo active background work.\n</system-reminder>";
@@ -3474,6 +3480,39 @@ mod tests {
             assert_eq!(live.message_at(0).unwrap().role, display[0].role);
             assert_eq!(live.message_at(0).unwrap().text, display[0].text);
         }
+    }
+
+    #[test_case(false; "hidden_reminders")]
+    #[test_case(true; "visible_reminders")]
+    fn a_resume_reminder_shows_live_and_reloaded_whatever_the_setting(show_reminders: bool) {
+        let reminder = nudge(StopCause::Shutdown, true, &[], Some(RESUMED_SUMMARY)).unwrap();
+        let history = crate::history_items(&[Message::synthetic(reminder.clone())]);
+        let display = history_to_display(
+            &history,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            show_reminders,
+        )
+        .0;
+        let mut live = chat();
+        live.show_reminders = show_reminders;
+        live.handle_event(
+            AgentEvent::Injected {
+                text: reminder.clone(),
+                task_event: None,
+                peer_event: None,
+                automation_event: None,
+                autopilot_event: None,
+            },
+            None,
+        );
+
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::Injected);
+        assert_eq!(display[0].text, reminder);
+        assert_eq!(live.message_count(), 1);
+        assert_eq!(live.message_at(0).unwrap().role, DisplayRole::Injected);
+        assert_eq!(live.message_at(0).unwrap().text, reminder);
     }
 
     #[test_case(false; "reminders_hidden")]

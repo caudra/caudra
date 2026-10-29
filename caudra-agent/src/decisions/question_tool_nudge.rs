@@ -42,17 +42,25 @@ pub(crate) fn nudge_probability(outcome: &DecisionOutcome, threshold: f64) -> Op
 }
 
 pub(super) fn probability(outcome: &DecisionOutcome) -> Option<f64> {
+    sole_noul(outcome, QUESTION)
+}
+
+/// The probability `outcome` gives `question`, when that is its only answer
+/// and a valid probability.
+pub(super) fn sole_noul(outcome: &DecisionOutcome, question: &str) -> Option<f64> {
     let response = outcome.result.as_ref().ok()?;
     if response.answers.len() != 1 {
         return None;
     }
-    let Answer::Noul(answer) = response.answers.get(QUESTION)? else {
+    let Answer::Noul(answer) = response.answers.get(question)? else {
         return None;
     };
     (answer.noul.is_finite() && (0.0..=1.0).contains(&answer.noul)).then_some(answer.noul)
 }
 
-fn excerpt(text: &str, budget: usize, head_budget: usize) -> String {
+/// `text` cut to `budget` serialized bytes, keeping its opening and as much
+/// of its end as fits.
+pub(super) fn excerpt(text: &str, budget: usize, head_budget: usize) -> String {
     if fitting_bytes(text.chars(), budget) == text.len() {
         return text.to_owned();
     }

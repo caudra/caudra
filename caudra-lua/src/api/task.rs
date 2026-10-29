@@ -141,8 +141,8 @@ mod tests {
         host.join().unwrap();
     }
 
-    /// `plugins/task/picker_rows.lua` spots the main chat with `if not task.status`,
-    /// so a missing key has to stay missing on the Lua side.
+    /// A plugin spots the main chat with `if not task.status`, so a missing
+    /// key has to stay missing on the Lua side.
     #[test]
     fn list_passes_host_array_through_unchanged() {
         let (tx, rx) = flume::unbounded::<UiAction>();

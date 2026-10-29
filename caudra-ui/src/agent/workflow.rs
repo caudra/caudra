@@ -19,6 +19,7 @@ use caudra_agent::mcp::McpSession;
 use caudra_agent::mcp::elicitor::QuestionForms;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
+use caudra_agent::secrets::SecretVaults;
 use caudra_agent::tools::{FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
 use caudra_agent::{
@@ -154,6 +155,10 @@ impl WorkflowSession {
             tool_output_store: Some(Arc::new(ToolOutputStore::new(spawn.state_dir.clone()))),
             permissions: Arc::clone(spawn.permissions),
             session_id: Some(session_ref.clone()),
+            secrets: Some(SecretVaults::for_session(
+                &spawn.state_dir,
+                spawn.session_id,
+            )),
             cache_key: Some(CacheKey::session(&session_ref)),
             workspace_session: spawn.workspace_session,
             remote_project_context: spawn.remote_project_context.clone(),

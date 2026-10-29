@@ -1,5 +1,6 @@
-//! The small form `/env` opens over its list to set a value or add a pass pattern.
+//! The small form `/env` opens over its list to set a value or a secret, or add a pass pattern.
 
+use caudra_agent::secrets::SecretScope;
 use caudra_workbench::text_field::{FieldKind, TextField};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -14,6 +15,8 @@ use crate::theme;
 
 const VALUE_TITLE: &str = " Set a variable ";
 const PATTERN_TITLE: &str = " Forward a pattern ";
+const SECRET_TITLE: &str = " Save a secret ";
+const REPLACE_SECRET_TITLE: &str = " Replace a secret ";
 const NAME_LABEL: &str = "Name    ";
 const VALUE_LABEL: &str = "Value   ";
 const PATTERN_LABEL: &str = "Pattern ";
@@ -25,6 +28,8 @@ const FIXED_ROWS: u16 = 3;
 pub(super) enum FormKind {
     Value,
     Pattern,
+    /// A secret saved in `scope`; the value field always starts empty.
+    Secret(SecretScope),
 }
 
 pub(super) enum FormKey {
@@ -74,6 +79,20 @@ impl EnvForm {
         }
     }
 
+    /// A new secret, or a new value for the secret `name`, typed masked into an empty field.
+    pub(super) fn secret(name: Option<&str>, scope: SecretScope, hint: &'static str) -> Self {
+        let mut form = Self {
+            kind: FormKind::Secret(scope),
+            ..Self::value(None, true, hint)
+        };
+        if let Some(name) = name {
+            form.name.set_text(name);
+            form.name_locked = true;
+            form.on_value = true;
+        }
+        form
+    }
+
     pub(super) fn pattern(hint: &'static str) -> Self {
         Self {
             kind: FormKind::Pattern,
@@ -110,7 +129,7 @@ impl EnvForm {
             KeyCode::Enter => return FormKey::Submit,
             KeyCode::Esc => return FormKey::Cancel,
             KeyCode::Tab | KeyCode::BackTab => {
-                if matches!(self.kind, FormKind::Value) && !self.name_locked {
+                if self.has_value() && !self.name_locked {
                     self.on_value = !self.on_value;
                 }
                 return FormKey::Consumed;
@@ -131,6 +150,10 @@ impl EnvForm {
 
     pub(super) fn contains(&self, position: Position) -> bool {
         self.area.contains(position)
+    }
+
+    fn has_value(&self) -> bool {
+        matches!(self.kind, FormKind::Value | FormKind::Secret(_))
     }
 
     fn focused(&mut self) -> &mut TextField {
@@ -154,6 +177,8 @@ impl EnvForm {
         let (title, first_label) = match self.kind {
             FormKind::Value => (VALUE_TITLE, NAME_LABEL),
             FormKind::Pattern => (PATTERN_TITLE, PATTERN_LABEL),
+            FormKind::Secret(_) if self.name_locked => (REPLACE_SECRET_TITLE, NAME_LABEL),
+            FormKind::Secret(_) => (SECRET_TITLE, NAME_LABEL),
         };
         let modal = Modal {
             title,
@@ -168,7 +193,7 @@ impl EnvForm {
             !self.on_value,
             inner.width,
         )];
-        if matches!(self.kind, FormKind::Value) {
+        if self.has_value() {
             lines.push(field_line(
                 VALUE_LABEL,
                 &self.value,

@@ -2,6 +2,8 @@
 
 use std::fmt::Display;
 
+use caudra_agent::secrets::SecretScope;
+
 use crate::components::escape_terminal_controls;
 use crate::components::list_picker::PickerItem;
 
@@ -35,6 +37,8 @@ pub(super) enum RowAction {
     Unforward(Unforward),
     SetEntry,
     Pattern(String),
+    /// A secret by name; its value never reaches a row.
+    Secret(SecretScope),
 }
 
 pub(super) struct EnvRow {

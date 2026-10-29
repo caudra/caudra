@@ -879,6 +879,7 @@ dependencies = [
 name = "caudra"
 version = "0.2.0-preview.16"
 dependencies = [
+ "async-lock",
  "async-trait",
  "caudra-acp",
  "caudra-agent",
@@ -959,6 +960,7 @@ dependencies = [
  "caudra-config",
  "caudra-decision",
  "caudra-diff",
+ "caudra-emil",
  "caudra-mattpocock",
  "caudra-otel",
  "caudra-providers",
@@ -1133,6 +1135,16 @@ dependencies = [
  "thiserror 2.0.21",
  "workspace-hack",
  "yaml_serde",
+]
+
+[[package]]
+name = "caudra-emil"
+version = "0.2.0-preview.16"
+dependencies = [
+ "caudra-skillpack",
+ "include_dir",
+ "regex",
+ "workspace-hack",
 ]
 
 [[package]]

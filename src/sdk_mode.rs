@@ -32,7 +32,7 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use caudra_agent::session_fork::{ForkTarget, fork_stored_session};
-use caudra_agent::tools::{QUESTION_TOOL_NAME, ToolRegistry};
+use caudra_agent::tools::{QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME, ToolRegistry};
 use caudra_agent::types::{
     AutopilotEvent, BACKGROUND_EVENT_RUN_ID, TaskProvenance, WorkflowProvenance,
 };
@@ -1806,7 +1806,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_profile,
         system_prompt_profile_name,
         prompt_profiles,
-        excluded_tools: vec![QUESTION_TOOL_NAME],
+        excluded_tools: vec![QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME],
         registry: Arc::clone(ToolRegistry::global_arc()),
         mcp_handle,
         initial_wd: cwd.clone(),

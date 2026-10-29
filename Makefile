@@ -5,6 +5,7 @@ SHELL := bash
 CARGO ?= cargo
 PYTHON ?= python3
 ARGS ?=
+LUA_SOURCES := caudra-lua/lua caudra-lua/example caudra-lua/tests/lua
 
 include scripts/cargo-cache.mk
 
@@ -16,7 +17,7 @@ endif
 
 export WORKCELL_BUNDLED_MONTY_WORKER := $(CURDIR)/target/code-worker/bin/$(MONTY_WORKER_NAME)
 
-.PHONY: help code-worker incremental-sweep install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests formats-lint formats-check gen-docs gen-docs-check sync-pstack sync-mattpocock workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete hakari ci
+.PHONY: help code-worker incremental-sweep install install-fast build check run test test-mcp-servers lint lint-fix fmt-check fmt pylint distribution-tests formats-lint formats-check gen-docs gen-docs-check sync-pstack sync-mattpocock sync-emil workcell-build workcell-run workcell-release workcell-check-native workcell-doc-test machete hakari ci
 
 help:
 	@printf '%s\n' \
@@ -42,6 +43,7 @@ help:
 		'  make gen-docs-check Check generated documentation' \
 		'  make sync-pstack    Refresh the bundled pstack (ARGS="--source <cursor/plugins checkout>")' \
 		'  make sync-mattpocock  Refresh the bundled mattpocock skills (ARGS="--source <mattpocock/skills checkout>")' \
+		'  make sync-emil      Refresh the bundled emil skills (ARGS="--source <emilkowalski/skills checkout>")' \
 		'  make workcell-build Build the standalone Workcell server' \
 		'  make workcell-run   Run Workcell (server flags via ARGS)' \
 		'  make workcell-release  Build the release Workcell server' \
@@ -90,12 +92,12 @@ lint-fix: code-worker incremental-sweep
 
 fmt-check:
 	$(CARGO) fmt --all -- --check
-	stylua --check plugins/
+	stylua --check $(LUA_SOURCES)
 	ruff format --check scripts/
 
 fmt:
 	$(CARGO) fmt --all
-	stylua plugins/
+	stylua $(LUA_SOURCES)
 	ruff format scripts/
 
 pylint:
@@ -130,6 +132,9 @@ sync-pstack:
 
 sync-mattpocock:
 	$(PYTHON) scripts/sync-skillpack.py mattpocock $(ARGS)
+
+sync-emil:
+	$(PYTHON) scripts/sync-skillpack.py emil $(ARGS)
 
 workcell-build: code-worker incremental-sweep
 	$(CARGO) build $(if $(filter --locked,$(ARGS)),,--locked) --package workcell-mcp $(ARGS)

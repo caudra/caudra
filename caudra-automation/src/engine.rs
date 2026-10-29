@@ -73,11 +73,12 @@ const FN_PUBLISH: &str = "publish";
 const FN_BROADCAST: &str = "broadcast";
 const FN_START_WORKFLOW: &str = "start_workflow";
 const FN_PAUSE: &str = "pause_automations";
+const FN_DONE: &str = "done";
 const FN_NOW: &str = "now";
 const FN_GIT_COMPARE: &str = "git_compare";
 const FN_LOG: &str = "log";
 /// Every function the host gives scripts, so an inspector can list the ones a script calls.
-pub const HOST_FUNCTIONS: [&str; 15] = [
+pub const HOST_FUNCTIONS: [&str; 16] = [
     FN_MESSAGE,
     FN_SET_GOAL,
     FN_SKIP,
@@ -90,6 +91,7 @@ pub const HOST_FUNCTIONS: [&str; 15] = [
     FN_BROADCAST,
     FN_START_WORKFLOW,
     FN_PAUSE,
+    FN_DONE,
     FN_NOW,
     FN_GIT_COMPARE,
     FN_LOG,
@@ -336,6 +338,7 @@ struct Session {
     latched: RefCell<Option<Terminal>>,
     operations: Cell<u64>,
     charged: Cell<bool>,
+    done_requested: Cell<bool>,
     actions: Cell<u32>,
     logs: Cell<u32>,
     deliveries: Cell<u32>,
@@ -606,6 +609,7 @@ impl Session {
             latched: RefCell::default(),
             operations: Cell::default(),
             charged: Cell::default(),
+            done_requested: Cell::default(),
             actions: Cell::default(),
             logs: Cell::default(),
             deliveries: Cell::default(),
@@ -927,6 +931,16 @@ impl Session {
         self.done(ctx, ActionRequest::Log { text })
     }
 
+    fn request_done(&self, ctx: &NativeCallContext, reason: &Dynamic) -> ScriptResult<()> {
+        self.enter(ctx)?;
+        let reason = self.text(ctx, reason, FN_DONE)?;
+        if !self.done_requested.get() {
+            self.done(ctx, ActionRequest::Done { reason })?;
+            self.done_requested.set(true);
+        }
+        Ok(())
+    }
+
     fn http(&self, ctx: &NativeCallContext, request: Dynamic) -> ScriptResult<ScriptMap> {
         self.enter(ctx)?;
         let mut options = Options::read(FN_HTTP, Some(request), &HTTP_OPTIONS)?;
@@ -1207,6 +1221,7 @@ impl Session {
             | ActionRequest::SetGoal(_)
             | ActionRequest::Notify { .. }
             | ActionRequest::Pause { .. }
+            | ActionRequest::Done { .. }
             | ActionRequest::Log { .. } => None,
         };
         refusal.map_or(Ok(()), |message| {
@@ -1366,6 +1381,10 @@ fn register_host_api(engine: &mut Engine, session: &Rc<Session>) {
     let s = Rc::clone(session);
     engine.register_fn(FN_PAUSE, move |ctx: NativeCallContext, reason: Dynamic| {
         s.pause(&ctx, &reason)
+    });
+    let s = Rc::clone(session);
+    engine.register_fn(FN_DONE, move |ctx: NativeCallContext, reason: Dynamic| {
+        s.request_done(&ctx, &reason)
     });
     let s = Rc::clone(session);
     engine.register_fn(FN_NOW, move |ctx: NativeCallContext| s.now(&ctx));
@@ -1747,6 +1766,7 @@ mod tests {
             ActionRequest::Message(_)
             | ActionRequest::Notify { .. }
             | ActionRequest::Pause { .. }
+            | ActionRequest::Done { .. }
             | ActionRequest::Log { .. } => ActionReply::Done,
         }
     }
@@ -2183,6 +2203,7 @@ mod tests {
     #[test_case("log(p);"; "log")]
     #[test_case("skip(p);"; "skip")]
     #[test_case("pause_automations(p);"; "pause")]
+    #[test_case("done(p);"; "done")]
     #[test_case(r#"send("@peer-1", p);"#; "send")]
     #[test_case(r#"publish("swarm.status", p);"#; "publish")]
     #[test_case("broadcast(p);"; "broadcast")]
@@ -2383,6 +2404,8 @@ mod tests {
     }
 
     #[test_case(FiringLimits { max_actions: 2, ..FiringLimits::default() }, r#"notify("one"); notify("two"); notify("three");"# => (ACTIONS_EXCEEDED.to_owned(), 2); "actions")]
+    #[test_case(FiringLimits { max_actions: 1, ..FiringLimits::default() }, r#"done("quiet"); notify("one");"# => (ACTIONS_EXCEEDED.to_owned(), 1); "done_counts_as_an_action")]
+    #[test_case(FiringLimits { max_actions: 1, ..FiringLimits::default() }, r#"notify("one"); done("quiet");"# => (ACTIONS_EXCEEDED.to_owned(), 1); "done_obeys_action_ceiling")]
     #[test_case(FiringLimits { max_logs: 1, ..FiringLimits::default() }, r#"log("one"); log("two");"# => (LOGS_EXCEEDED.to_owned(), 1); "log_lines")]
     #[test_case(FiringLimits { max_deliveries: 1, ..FiringLimits::default() }, r#"message("one"); set_goal("two");"# => (DELIVERIES_EXCEEDED.to_owned(), 1); "deliveries")]
     #[test_case(FiringLimits { wall_time: Duration::ZERO, ..FiringLimits::default() }, r#"notify("one");"# => (WALL_TIME_EXCEEDED.to_owned(), 0); "wall_time")]
@@ -2398,11 +2421,70 @@ mod tests {
 
     #[test_case(r#"log("note"); let today = now(); skip("quiet");"# => (false, 0); "logging_and_skipping")]
     #[test_case(r#"pause_automations("spent too much");"# => (false, 0); "pausing")]
+    #[test_case(r#"done("quiet");"# => (false, 0); "finishing")]
     #[test_case(r#"log("note"); notify("one"); notify("two");"# => (true, 1); "acting_twice")]
     fn only_acting_firings_are_charged(body: &str) -> (bool, u32) {
         let probe = probe();
         let outcome = run(&probe, body);
         (outcome.charged, probe.admitted.get())
+    }
+
+    #[test_case(LimitReason::Cooldown; "cooldown")]
+    #[test_case(LimitReason::MaxPerHour; "max_per_hour")]
+    fn done_bypasses_automation_limits(reason: LimitReason) {
+        let probe = Probe {
+            admission: Err(LimitRefusal {
+                reason,
+                until: LIMITED_UNTIL,
+            }),
+            ..probe()
+        };
+        let outcome = run(&probe, r#"done("quiet");"#);
+        assert_eq!(outcome.end, FiringEnd::Completed);
+        assert_eq!(
+            (outcome.charged, outcome.actions, probe.admitted.get()),
+            (false, 1, 0)
+        );
+        assert_eq!(
+            probe.requests(),
+            vec![ActionRequest::Done {
+                reason: QUIET.to_owned()
+            }]
+        );
+    }
+
+    #[test_case("done(event.session.title);", TITLE; "untrusted_reason")]
+    #[test_case(r#"let result = done("quiet"); if result != () { throw "not unit"; } done("ignored");"#, QUIET; "repeated_call_is_a_no_op")]
+    fn done_records_one_reason(body: &str, reason: &str) {
+        let probe = probe();
+        let outcome = fire(
+            &probe,
+            HEADER,
+            body,
+            &armed(),
+            &json!({}),
+            &FiringLimits {
+                max_actions: 1,
+                ..FiringLimits::default()
+            },
+        );
+        assert_eq!(outcome.end, FiringEnd::Completed);
+        assert_eq!(outcome.actions, 1);
+        assert_eq!(
+            probe.requests(),
+            vec![ActionRequest::Done {
+                reason: reason.to_owned()
+            }]
+        );
+    }
+
+    #[test_case("done();"; "missing_reason")]
+    #[test_case("done(42);"; "numeric_reason")]
+    #[test_case("done(());"; "unit_reason")]
+    fn done_requires_text(body: &str) {
+        let probe = probe();
+        assert!(matches!(run(&probe, body).end, FiringEnd::Failed(_)));
+        assert!(probe.requests().is_empty());
     }
 
     #[test]

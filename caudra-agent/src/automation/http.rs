@@ -7,7 +7,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::future::Future;
-use std::mem;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::time::Duration;
@@ -20,12 +19,12 @@ use caudra_automation::meta::{AutomationMeta, private_host};
 use caudra_config::global_env_value;
 use caudra_providers::user_agent;
 use futures_lite::future;
-use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
 use super::clock::Wake;
 use super::host::Stop;
+use crate::secrets::redact::Redactor;
 
 const HTTP: &str = "http";
 const HTTPS: &str = "https";
@@ -52,8 +51,6 @@ pub const BEARER_CONFLICT: &str =
     "bearer_env sets the Authorization header, so headers and secret_headers must not";
 pub const BODY_TOO_LARGE: &str = "the request body is over its limit of";
 pub const TIMED_OUT: &str = "the request ran past its timeout of";
-const SECRET_OPEN: &str = "${";
-const SECRET_CLOSE: &str = "}";
 
 pub type HttpFuture = Pin<Box<dyn Future<Output = Result<HttpAnswer, HttpError>> + Send + 'static>>;
 
@@ -122,13 +119,6 @@ pub(super) struct Prepared {
     pub(super) redactor: Redactor,
 }
 
-/// The secrets a request carries, longest first so a secret that holds another is hidden whole,
-/// each with the text shown in its place.
-#[derive(Default)]
-pub(super) struct Redactor {
-    hidden: Vec<(String, String)>,
-}
-
 impl HttpError {
     pub fn new(kind: HttpErrorKind, message: impl Into<String>) -> Self {
         Self {
@@ -172,89 +162,18 @@ impl HttpAnswer {
     }
 }
 
-impl Redactor {
-    fn hide(&mut self, secret: &str, shown: &str) {
-        if secret.is_empty() || secret == shown {
-            return;
-        }
-        let at = self
-            .hidden
-            .partition_point(|(hidden, _)| hidden.len() >= secret.len());
-        self.hidden
-            .insert(at, (secret.to_owned(), shown.to_owned()));
+/// The response as the firing, its state, its trace and the journal see it: the request's
+/// secrets replaced in `body` and in the strings and keys of `json`, parsed before from the body
+/// as the server sent it.
+fn redacted(redactor: &Redactor, mut response: HttpResponse) -> HttpResponse {
+    if redactor.is_empty() {
+        return response;
     }
-
-    /// `text` with every secret replaced, scanned once per secret, and borrowed when it holds none.
-    pub(super) fn text<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        self.hidden
-            .iter()
-            .fold(Cow::Borrowed(text), |text, (secret, shown)| {
-                replaced(text, secret, shown)
-            })
+    response.body = redactor.owned(response.body);
+    if let Some(json) = &mut response.json {
+        redactor.value(json);
     }
-
-    /// The response as the firing, its state, its trace and the journal see it: the request's
-    /// secrets replaced in `body` and in the strings and keys of `json`, parsed before from the
-    /// body as the server sent it.
-    fn response(&self, mut response: HttpResponse) -> HttpResponse {
-        if self.hidden.is_empty() {
-            return response;
-        }
-        response.body = self.owned(response.body);
-        if let Some(json) = &mut response.json {
-            self.redact(json);
-        }
-        response
-    }
-
-    fn redact(&self, value: &mut Value) {
-        match value {
-            Value::String(text) => *text = self.owned(mem::take(text)),
-            Value::Array(items) => items.iter_mut().for_each(|item| self.redact(item)),
-            Value::Object(entries) => {
-                entries.values_mut().for_each(|item| self.redact(item));
-                if entries.keys().any(|key| self.hides(key)) {
-                    *entries = mem::take(entries)
-                        .into_iter()
-                        .map(|(key, item)| (self.owned(key), item))
-                        .collect();
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) => {}
-        }
-    }
-
-    /// `text` itself, unless it holds a secret.
-    fn owned(&self, text: String) -> String {
-        let replaced = match self.text(&text) {
-            Cow::Owned(replaced) => Some(replaced),
-            Cow::Borrowed(_) => None,
-        };
-        replaced.unwrap_or(text)
-    }
-
-    fn hides(&self, text: &str) -> bool {
-        self.hidden
-            .iter()
-            .any(|(secret, _)| text.contains(secret.as_str()))
-    }
-}
-
-/// `text` with every `secret` in it replaced by `shown`, in one pass.
-fn replaced<'a>(text: Cow<'a, str>, secret: &str, shown: &str) -> Cow<'a, str> {
-    let Some(first) = text.find(secret) else {
-        return text;
-    };
-    let mut replaced = String::with_capacity(text.len());
-    let mut copied = 0;
-    for (found, _) in text[first..].match_indices(secret) {
-        let at = first + found;
-        replaced.push_str(&text[copied..at]);
-        replaced.push_str(shown);
-        copied = at + secret.len();
-    }
-    replaced.push_str(&text[copied..]);
-    Cow::Owned(replaced)
+    response
 }
 
 /// Checks `request` and resolves its secrets before any I/O, every stop ahead of any failure the
@@ -339,7 +258,7 @@ pub(super) async fn perform(
     let answered = async {
         future::or(timed_out, sending)
             .await
-            .map(|answer| redactor.response(answer.into_response()))
+            .map(|answer| redacted(redactor, answer.into_response()))
             .map_err(|error| error.into_failure(redactor).into())
     };
     future::or(
@@ -433,7 +352,7 @@ fn resolve_headers(
                 "header {name} from {variable} {INVALID_HEADER_VALUE}"
             )));
         }
-        redactor.hide(&value, &shown_secret(variable));
+        redactor.hide_variable(variable, &value);
         headers.push((name.clone(), value));
     }
     if let Some(variable) = &request.bearer_env {
@@ -441,7 +360,7 @@ fn resolve_headers(
         if !is_header_value(&token) {
             return Err(invalid(format!("{variable} {INVALID_HEADER_VALUE}")));
         }
-        redactor.hide(&token, &shown_secret(variable));
+        redactor.hide_variable(variable, &token);
         headers.push((AUTHORIZATION.to_owned(), format!("{BEARER_SCHEME} {token}")));
     }
     if matches!(request.payload, Some(HttpPayload::Json(_))) && !has_header(&headers, CONTENT_TYPE)
@@ -476,10 +395,6 @@ fn http_url(text: &str) -> Option<Url> {
         .filter(|url| matches!(url.scheme(), HTTP | HTTPS))
 }
 
-fn shown_secret(variable: &str) -> String {
-    format!("{SECRET_OPEN}{variable}{SECRET_CLOSE}")
-}
-
 fn is_token(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -504,7 +419,7 @@ mod tests {
 
     use caudra_automation::host::MAX_HTTP_TIMEOUT;
     use caudra_automation::meta::parse_meta;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
@@ -543,8 +458,6 @@ mod tests {
     const INVALID_UTF8: &[u8] = b"o\xffk";
     const LOSSY: &str = "o\u{fffd}k";
     const WIDE_CHAR: &str = "é";
-    const SECRET_URL: &str = "https://hooks.example.com/services/hook-4711";
-    const HOOK_ORIGIN: &str = "https://hooks.example.com";
     const TOKEN: &str = "hook-4711";
     const TOKEN_SHOWN: &str = "${HOOK_TOKEN}";
     const LEAK: &str = "the firing must not receive a secret";
@@ -711,28 +624,12 @@ mod tests {
     }
 
     #[test]
-    fn the_redactor_hides_a_secret_whole_before_a_secret_inside_it() {
-        let mut redactor = Redactor::default();
-        redactor.hide(TOKEN, TOKEN_SHOWN);
-        redactor.hide(SECRET_URL, HOOK_ORIGIN);
-
-        let text = format!("{SECRET_URL} sent {TOKEN}, then {TOKEN}");
-
-        let shown = redactor.text(&text);
-
-        assert_eq!(
-            shown,
-            format!("{HOOK_ORIGIN} sent {TOKEN_SHOWN}, then {TOKEN_SHOWN}")
-        );
-    }
-
-    #[test]
     fn the_firing_receives_a_response_without_the_secrets_in_its_body_and_json() {
         let mut redactor = Redactor::default();
         redactor.hide(TOKEN, TOKEN_SHOWN);
         let body = json!({ "echo": TOKEN, TOKEN: [TOKEN] }).to_string();
 
-        let response = redactor.response(answer(body.as_bytes(), false).into_response());
+        let response = redacted(&redactor, answer(body.as_bytes(), false).into_response());
 
         assert_eq!(response.body, body.replace(TOKEN, TOKEN_SHOWN), "{LEAK}");
         assert_eq!(

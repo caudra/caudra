@@ -33,6 +33,7 @@ const HEADING_MARKER: char = '#';
 const KIND_FIELD: &str = "entry kind";
 const ORIGIN_FIELD: &str = "entry origin";
 const SEQ_FIELD: &str = "sequence number";
+const COUNT_FIELD: &str = "note count";
 const INDEX_FIELD: &str = "node index";
 const BODY_BYTES_FIELD: &str = "body size";
 /// Every [`EntryMeta`] column, in the order [`entry_meta`] reads them. The
@@ -119,7 +120,7 @@ pub enum EntryOrigin {
 }
 
 impl EntryOrigin {
-    fn storage_name(&self) -> String {
+    pub(crate) fn storage_name(&self) -> String {
         match self {
             Self::Session(id) => format!("{SESSION_ORIGIN_PREFIX}{id}"),
             Self::External => EXTERNAL_ORIGIN.to_owned(),
@@ -324,6 +325,15 @@ impl MemoryJournal {
             ),
             [scope],
             entry,
+        )
+    }
+
+    /// How many live notes the scope has, without reading them.
+    pub fn live_count(&self, scope: &str) -> Result<u64, MemoryJournalError> {
+        self.connection().query_row_and_then(
+            &format!("SELECT count(*) FROM memory_entries WHERE scope = ?1 AND {LIVE}"),
+            [scope],
+            |row| row_u64(row, 0, COUNT_FIELD),
         )
     }
 
@@ -548,11 +558,12 @@ impl MemoryJournal {
         let entries =
             transaction.execute("DELETE FROM memory_entries WHERE scope = ?1", [scope])?;
         transaction.execute("DELETE FROM memory_nodes WHERE scope = ?1", [scope])?;
+        transaction.execute("DELETE FROM memory_nudges WHERE scope = ?1", [scope])?;
         transaction.commit()?;
         Ok(entries as u64)
     }
 
-    fn connection(&self) -> &Connection {
+    pub(crate) fn connection(&self) -> &Connection {
         self.database.connection()
     }
 
@@ -569,7 +580,7 @@ impl MemoryJournal {
         })?)
     }
 
-    fn write_one(
+    pub(crate) fn write_one(
         &self,
         operation: &'static str,
         sql: &str,
@@ -679,7 +690,11 @@ fn sql_integer(value: u64, field: &'static str) -> Result<i64, MemoryJournalErro
     })
 }
 
-fn row_u64(row: &Row<'_>, column: usize, field: &'static str) -> Result<u64, MemoryJournalError> {
+pub(crate) fn row_u64(
+    row: &Row<'_>,
+    column: usize,
+    field: &'static str,
+) -> Result<u64, MemoryJournalError> {
     let value: i64 = row.get(column)?;
     u64::try_from(value).map_err(|_| MemoryJournalError::Invalid {
         field,

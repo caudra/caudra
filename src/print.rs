@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use caudra_agent::autopilot::{ActionName, AutopilotHandle};
 use caudra_agent::headless::{HeadlessHandle, HeadlessParams};
 use caudra_agent::permissions::PluginRuleStore;
-use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::tools::{QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME};
 use caudra_agent::types::AutopilotEvent;
 use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
@@ -359,6 +359,8 @@ pub fn run(
     // A generated title arrives as an event a front end saves, and print mode
     // saves its session only as the run ends, so the prompt names it instead.
     config.generate_titles = false;
+    // A scripted run keeps to its prompt, so nothing asks it to save notes.
+    config.memory_nudges = false;
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
     let cwd = remote_environment.as_ref().map_or_else(
@@ -404,7 +406,7 @@ pub fn run(
         prompt_slots,
         system_prompt_profile,
         prompt_profiles,
-        excluded_tools: vec![QUESTION_TOOL_NAME],
+        excluded_tools: vec![QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME],
         mcp_handle,
         // `cwd` is the sandbox's path once a remote environment exists, so the
         // host checkout has to be named separately.

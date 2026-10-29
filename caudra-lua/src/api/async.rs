@@ -750,7 +750,7 @@ mod tests {
         )
     }
 
-    /// The composition `plugins/batch` leans on, and the one thing the
+    /// The composition a batching plugin leans on, and the one thing the
     /// runtime's own hook tests cannot show: the handler is parked deep inside
     /// a real `gather` whose child never finishes, so the hook runs on a VM
     /// whose coroutine is suspended. Waiting from there is a plugin bug, raw

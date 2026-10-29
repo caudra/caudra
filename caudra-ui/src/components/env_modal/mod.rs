@@ -1,13 +1,17 @@
 //! `/env`: the variables a shell command of this session receives, and edits that change them
 //! from the next command. Values stay masked until one row is revealed, and are never copied.
+//! Secrets are listed by name only: no row ever holds their value.
 
 mod form;
 mod local;
 mod rows;
 mod sandbox;
+mod secrets;
 
 use std::mem;
 
+use caudra_agent::secrets::scope::ForeignEntry;
+use caudra_agent::secrets::{SecretError, SecretListing, SecretScope, SecretValue, check_name};
 use caudra_config::interpolation::holds_reference;
 use caudra_config::shell_env::{GlobalShellEnvFile, ShellEnvEdit, ShellEnvError};
 use caudra_grab::grab_scope;
@@ -34,6 +38,7 @@ use local::local_rows;
 use rows::{EnvRow, FORWARDED_SECTION, RowAction, Unforward};
 pub(crate) use sandbox::GuestListing;
 use sandbox::sandbox_rows;
+use secrets::{LOCAL_ONLY, SECRETS_SECTION, secret_rows};
 
 pub(crate) const ADD_LABEL: &str = "a";
 pub(crate) const EDIT_LABEL: &str = "e";
@@ -42,14 +47,18 @@ pub(crate) const PATTERN_LABEL: &str = "p";
 pub(crate) const REVEAL_LABEL: &str = "v";
 pub(crate) const FILTER_LABEL: &str = "/";
 pub(crate) const CONFIRM_LABEL: &str = "y";
+pub(crate) const SECRET_LABEL: &str = "s";
+pub(crate) const MOVE_LABEL: &str = "m";
 const TOGGLE_KEY: char = ' ';
 const ADD_KEY: char = ascii_key(ADD_LABEL);
-const EDIT_KEY: char = ascii_key(EDIT_LABEL);
+pub(crate) const EDIT_KEY: char = ascii_key(EDIT_LABEL);
 const DELETE_KEY: char = ascii_key(DELETE_LABEL);
 pub(crate) const PATTERN_KEY: char = ascii_key(PATTERN_LABEL);
 const REVEAL_KEY: char = ascii_key(REVEAL_LABEL);
 const FILTER_KEY: char = ascii_key(FILTER_LABEL);
 const CONFIRM_KEY: char = ascii_key(CONFIRM_LABEL);
+const SECRET_KEY: char = ascii_key(SECRET_LABEL);
+const MOVE_KEY: char = ascii_key(MOVE_LABEL);
 const COMMAND_KEYS: &[char] = &[
     TOGGLE_KEY,
     ADD_KEY,
@@ -58,6 +67,8 @@ const COMMAND_KEYS: &[char] = &[
     PATTERN_KEY,
     REVEAL_KEY,
     FILTER_KEY,
+    SECRET_KEY,
+    MOVE_KEY,
 ];
 const TITLE: &str = " Environment ";
 const LOCAL_TAB: &str = "Local";
@@ -70,8 +81,14 @@ const SAVING: &str = "Saving…";
 const SAVED: &str = "Saved. Applies from the next shell command.";
 const BUSY: &str = "Wait for the last change to finish.";
 const NOT_LOADED: &str = "Wait for the list to load.";
-const EDIT_HINT: &str = "Select a set value to edit it.";
-const DELETE_HINT: &str = "Select a set value or a pass pattern to delete it.";
+const EDIT_HINT: &str = "Select a set value or a secret to edit it.";
+const DELETE_HINT: &str = "Select a set value, a pass pattern or a secret to delete it.";
+const MOVE_HINT: &str = "Select a secret to move it between this session and all sessions.";
+const NO_SECRETS: &str = "No secrets yet. Press s to save one.";
+const EXPIRED_MOVE: &str = "This secret expired. Press e to save a new value first.";
+const SECRET_VALUE_HINT: &str = "Caudra keeps the value out of chat and the transcript. This session's shell commands receive it as a variable with this name. Tab switches fields, Enter saves, Esc cancels.";
+const REPLACE_SECRET_HINT: &str =
+    "Caudra never shows the old value. Type the new one. Enter saves, Esc cancels.";
 const NOTHING_TO_REVEAL: &str = "This row has no value to reveal.";
 const LOCAL_SESSION: &str =
     "This session's shell runs on this machine. Changes apply from the next command.";
@@ -115,6 +132,25 @@ pub(crate) enum EnvRequest {
     },
     LoadSandbox,
     EditSandbox(ShellEnvironmentSelection),
+    Secret(SecretEdit),
+}
+
+/// A write to the session's secrets, run off the interface thread against its vault.
+pub(crate) enum SecretEdit {
+    Save {
+        name: String,
+        scope: SecretScope,
+        value: SecretValue,
+    },
+    Delete {
+        name: String,
+        scope: SecretScope,
+    },
+    Move {
+        name: String,
+        from: SecretScope,
+        foreign: ForeignEntry,
+    },
 }
 
 pub(crate) enum EnvReply {
@@ -125,6 +161,11 @@ pub(crate) enum EnvReply {
     Sandbox {
         listing: Result<GuestListing, String>,
         error: Option<String>,
+    },
+    /// Remembering `name` would replace a `set` entry the user wrote, so the modal asks first.
+    ForeignEntry {
+        environment: Result<Box<LocalEnvironment>, String>,
+        name: String,
     },
 }
 
@@ -143,6 +184,7 @@ enum Change {
     RemoveValue(String),
     AddPattern(EnvPattern),
     RemovePattern(String),
+    Secret(SecretEdit),
 }
 
 struct Pending {
@@ -171,6 +213,8 @@ pub(crate) struct EnvModal {
     error: Option<String>,
     /// The rows no longer match the data or the reveal, so the next settle rebuilds them.
     stale: bool,
+    /// Opened by `/secrets`: the first load selects the first secret.
+    focus_secrets: bool,
 }
 
 impl EnvModal {
@@ -189,15 +233,28 @@ impl EnvModal {
             message: None,
             error: None,
             stale: false,
+            focus_secrets: false,
         }
     }
 
     pub(crate) fn open(&mut self, target: EnvTarget) -> EnvAction {
-        Overlay::close(self);
-        self.tab = match target {
+        let tab = match target {
             EnvTarget::Sandbox(_) => EnvTab::Sandbox,
             EnvTarget::Local | EnvTarget::Remote { .. } => EnvTab::Local,
         };
+        self.start(target, tab)
+    }
+
+    /// `/secrets`: the Local tab, with its first secret selected once the list loads.
+    pub(crate) fn open_secrets(&mut self, target: EnvTarget) -> EnvAction {
+        let action = self.start(target, EnvTab::Local);
+        self.focus_secrets = true;
+        action
+    }
+
+    fn start(&mut self, target: EnvTarget, tab: EnvTab) -> EnvAction {
+        Overlay::close(self);
+        self.tab = tab;
         self.target = target;
         self.picker
             .open_selectively_toggleable(Vec::new(), Vec::new(), Vec::new(), TITLE);
@@ -218,7 +275,8 @@ impl EnvModal {
         if !self.is_open() {
             return;
         }
-        let wrote = self.work == Some(Work::Write);
+        let wrote =
+            self.work == Some(Work::Write) && !matches!(reply, EnvReply::ForeignEntry { .. });
         self.work = None;
         let (failure, error) = match reply {
             EnvReply::Local { environment, error } => (
@@ -228,10 +286,37 @@ impl EnvModal {
             EnvReply::Sandbox { listing, error } => {
                 (listing.map(|guest| self.guest = Some(guest)).err(), error)
             }
+            EnvReply::ForeignEntry { environment, name } => {
+                self.pending = Some(Pending {
+                    prompt: foreign_prompt(&name),
+                    change: Change::Secret(SecretEdit::Move {
+                        name,
+                        from: SecretScope::Session,
+                        foreign: ForeignEntry::Replace,
+                    }),
+                });
+                (
+                    environment.map(|local| self.local = Some(*local)).err(),
+                    None,
+                )
+            }
         };
         self.error = error.or(failure);
         self.message = (wrote && self.error.is_none()).then(|| SAVED.to_owned());
         self.rebuild();
+        if mem::take(&mut self.focus_secrets) && self.local.is_some() {
+            self.select_first_secret();
+        }
+    }
+
+    fn select_first_secret(&mut self) {
+        if !self
+            .picker
+            .select_item_by(|row| row.section == SECRETS_SECTION)
+        {
+            self.message = Some(NO_SECRETS.to_owned());
+        }
+        self.refresh_info();
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
@@ -354,6 +439,8 @@ impl EnvModal {
             Some(EDIT_KEY) => self.open_value_form(true),
             Some(DELETE_KEY) => self.delete_selected(),
             Some(PATTERN_KEY) => self.open_pattern_form(),
+            Some(SECRET_KEY) => self.open_secret_form(),
+            Some(MOVE_KEY) => self.move_selected(),
             Some(REVEAL_KEY) => {
                 self.toggle_reveal();
                 EnvAction::Consumed
@@ -454,7 +541,10 @@ impl EnvModal {
         let change = match &row.action {
             RowAction::Forward => Change::Forward(row.name.clone()),
             RowAction::Unforward(how) => Change::Unforward(row.name.clone(), how.clone()),
-            RowAction::None | RowAction::SetEntry | RowAction::Pattern(_) => {
+            RowAction::None
+            | RowAction::SetEntry
+            | RowAction::Pattern(_)
+            | RowAction::Secret(_) => {
                 return EnvAction::Consumed;
             }
         };
@@ -465,14 +555,18 @@ impl EnvModal {
     }
 
     fn delete_selected(&mut self) -> EnvAction {
-        let change = match self.picker.selected_item().map(|row| &row.action) {
-            Some(RowAction::SetEntry) => self
-                .picker
-                .selected_item()
-                .map(|row| Change::RemoveValue(row.name.clone())),
-            Some(RowAction::Pattern(raw)) => Some(Change::RemovePattern(raw.clone())),
-            _ => None,
-        };
+        let change = self
+            .picker
+            .selected_item()
+            .and_then(|row| match &row.action {
+                RowAction::SetEntry => Some(Change::RemoveValue(row.name.clone())),
+                RowAction::Pattern(raw) => Some(Change::RemovePattern(raw.clone())),
+                RowAction::Secret(scope) => Some(Change::Secret(SecretEdit::Delete {
+                    name: row.name.clone(),
+                    scope: *scope,
+                })),
+                RowAction::None | RowAction::Forward | RowAction::Unforward(_) => None,
+            });
         let Some(change) = change else {
             self.message = Some(DELETE_HINT.to_owned());
             return EnvAction::Consumed;
@@ -485,6 +579,10 @@ impl EnvModal {
 
     fn open_value_form(&mut self, editing: bool) -> EnvAction {
         if self.refuse_if_blocked() {
+            return EnvAction::Consumed;
+        }
+        if editing && let Some((name, scope)) = self.selected_secret() {
+            self.form = Some(EnvForm::secret(Some(&name), scope, REPLACE_SECRET_HINT));
             return EnvAction::Consumed;
         }
         let (secret, hint) = match self.tab {
@@ -507,6 +605,60 @@ impl EnvModal {
             None => self.message = Some(EDIT_HINT.to_owned()),
         }
         EnvAction::Consumed
+    }
+
+    fn open_secret_form(&mut self) -> EnvAction {
+        if !self.holds_secrets() {
+            self.message = Some(LOCAL_ONLY.to_owned());
+            return EnvAction::Consumed;
+        }
+        if !self.refuse_if_blocked() {
+            self.form = Some(EnvForm::secret(
+                None,
+                SecretScope::Session,
+                SECRET_VALUE_HINT,
+            ));
+        }
+        EnvAction::Consumed
+    }
+
+    /// Session to remembered or back. Remembering over a `set` entry the user wrote comes back
+    /// as [`EnvReply::ForeignEntry`], which asks first.
+    fn move_selected(&mut self) -> EnvAction {
+        let Some((name, from)) = self.selected_secret() else {
+            self.message = Some(MOVE_HINT.to_owned());
+            return EnvAction::Consumed;
+        };
+        if self.refuse_if_blocked() {
+            return EnvAction::Consumed;
+        }
+        let expired = self
+            .local
+            .as_ref()
+            .and_then(|local| local.secret(&name, from))
+            .is_some_and(SecretListing::expired);
+        if expired {
+            self.message = Some(EXPIRED_MOVE.to_owned());
+            return EnvAction::Consumed;
+        }
+        self.commit(Change::Secret(SecretEdit::Move {
+            name,
+            from,
+            foreign: ForeignEntry::Refuse,
+        }))
+    }
+
+    /// Whether this tab lists the session's secrets: only a shell on this machine receives them.
+    fn holds_secrets(&self) -> bool {
+        self.tab == EnvTab::Local && matches!(self.target, EnvTarget::Local)
+    }
+
+    fn selected_secret(&self) -> Option<(String, SecretScope)> {
+        let row = self.picker.selected_item()?;
+        match row.action {
+            RowAction::Secret(scope) => Some((row.name.clone(), scope)),
+            _ => None,
+        }
     }
 
     fn open_pattern_form(&mut self) -> EnvAction {
@@ -542,6 +694,13 @@ impl EnvModal {
             FormKind::Pattern => self
                 .check_pattern(&name)
                 .map(|pattern| (Change::AddPattern(pattern), None)),
+            FormKind::Secret(scope) => {
+                let value = SecretValue::new(form.value_text());
+                check_secret(&name, &value).map(|()| {
+                    let save = SecretEdit::Save { name, scope, value };
+                    (Change::Secret(save), None)
+                })
+            }
         };
         match checked {
             Err(error) => form.fail(error),
@@ -609,7 +768,10 @@ impl EnvModal {
                 "Stop forwarding {}? {CONFIRM_SUFFIX}",
                 escape_terminal_controls(raw)
             )),
-            Change::Unforward(_, Unforward::Exact) | Change::SetValue { .. } => None,
+            Change::Secret(SecretEdit::Delete { name, .. }) => Some(delete_secret_prompt(name)),
+            Change::Unforward(_, Unforward::Exact)
+            | Change::SetValue { .. }
+            | Change::Secret(SecretEdit::Save { .. } | SecretEdit::Move { .. }) => None,
         };
         match prompt {
             Some(prompt) => {
@@ -625,10 +787,7 @@ impl EnvModal {
             EnvTab::Local => self
                 .local
                 .as_ref()
-                .map(|local| EnvRequest::EditLocal {
-                    file: Box::new(local.file.clone()),
-                    edit: local_edit(change),
-                })
+                .map(|local| local_request(&local.file, change))
                 .ok_or_else(|| NOT_LOADED.to_owned()),
             EnvTab::Sandbox => self
                 .guest
@@ -692,7 +851,11 @@ impl EnvModal {
             return;
         }
         let mut rows = match self.tab {
-            EnvTab::Local => self.local.as_ref().map(local_rows),
+            EnvTab::Local => self.local.as_ref().map(|local| {
+                let mut rows = secret_rows(&local.secrets, self.holds_secrets());
+                rows.extend(local_rows(local));
+                rows
+            }),
             EnvTab::Sandbox => self.guest.as_ref().map(sandbox_rows),
         }
         .unwrap_or_default();
@@ -788,7 +951,10 @@ impl EnvModal {
     }
 
     fn counts(&self) -> String {
-        let rows: Vec<&EnvRow> = (0..).map_while(|index| self.picker.item(index)).collect();
+        let rows: Vec<&EnvRow> = (0..)
+            .map_while(|index| self.picker.item(index))
+            .filter(|row| row.section != SECRETS_SECTION)
+            .collect();
         let forwarded = rows
             .iter()
             .filter(|row| row.section == FORWARDED_SECTION || row.action == RowAction::SetEntry)
@@ -815,6 +981,8 @@ impl EnvModal {
             filter_footer
         } else if !self.supported() {
             read_only_footer
+        } else if self.selected_secret().is_some() {
+            secret_footer
         } else if matches!(self.target, EnvTarget::Sandbox(_)) {
             tabbed_footer
         } else {
@@ -825,7 +993,14 @@ impl EnvModal {
 
 impl Overlay for EnvModal {
     fn docs_topic(&self) -> Option<DocsTopic> {
-        Some(DocsTopic::ShellEnv)
+        let on_secrets = self
+            .picker
+            .selected_item()
+            .is_some_and(|row| row.section == SECRETS_SECTION);
+        Some(match on_secrets {
+            true => DocsTopic::Secrets,
+            false => DocsTopic::ShellEnv,
+        })
     }
 
     fn is_open(&self) -> bool {
@@ -844,6 +1019,7 @@ impl Overlay for EnvModal {
         self.message = None;
         self.error = None;
         self.stale = false;
+        self.focus_secrets = false;
     }
 
     fn cadence(&self) -> Cadence {
@@ -855,19 +1031,43 @@ impl Overlay for EnvModal {
     }
 }
 
-fn local_edit(change: Change) -> ShellEnvEdit {
-    match change {
+fn local_request(file: &GlobalShellEnvFile, change: Change) -> EnvRequest {
+    let edit = match change {
         Change::Forward(name) => ShellEnvEdit::AddPass(EnvPattern::Exact(name)),
         Change::Unforward(name, _) => ShellEnvEdit::RemovePass(name),
         Change::SetValue { name, value } => ShellEnvEdit::SetValue { name, value },
         Change::RemoveValue(name) => ShellEnvEdit::RemoveValue(name),
         Change::AddPattern(pattern) => ShellEnvEdit::AddPass(pattern),
         Change::RemovePattern(raw) => ShellEnvEdit::RemovePass(raw),
+        Change::Secret(edit) => return EnvRequest::Secret(edit),
+    };
+    EnvRequest::EditLocal {
+        file: Box::new(file.clone()),
+        edit,
     }
 }
 
 fn sensitive_prompt(name: &str) -> String {
     format!("Any command the model runs can read {name}. Forward it? {CONFIRM_SUFFIX}")
+}
+
+/// The refusals the form can show before anything is written; the vault checks the rest.
+fn check_secret(name: &str, value: &SecretValue) -> Result<(), String> {
+    check_name(name).map_err(|error| error.to_string())?;
+    match value.expose().is_empty() {
+        true => Err(SecretError::EmptyValue.to_string()),
+        false => Ok(()),
+    }
+}
+
+fn foreign_prompt(name: &str) -> String {
+    format!(
+        "[agent.shell_env] already sets {name}. Replace that entry with this secret? {CONFIRM_SUFFIX}"
+    )
+}
+
+fn delete_secret_prompt(name: &str) -> String {
+    format!("Delete secret {name}? {CONFIRM_SUFFIX}")
 }
 
 fn literal_warning(name: &str) -> String {
@@ -884,7 +1084,19 @@ fn browse_hints() -> Vec<Hint> {
         Hint::char(DELETE_LABEL, "delete"),
         Hint::char(PATTERN_LABEL, "pattern"),
         Hint::char(REVEAL_LABEL, "reveal"),
+        Hint::char(SECRET_LABEL, "secret"),
         Hint::char(FILTER_LABEL, "filter"),
+    ]
+}
+
+fn secret_footer() -> Vec<Hint> {
+    vec![
+        Hint::char(EDIT_LABEL, "replace"),
+        Hint::char(MOVE_LABEL, "move"),
+        Hint::char(DELETE_LABEL, "delete"),
+        Hint::char(SECRET_LABEL, "new secret"),
+        Hint::char(FILTER_LABEL, "filter"),
+        Hint::bind(key::ESC, "close"),
     ]
 }
 
@@ -923,8 +1135,11 @@ fn confirm_footer() -> Vec<Hint> {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use caudra_config::EnvSource;
+    use caudra_config::interpolation::FILE_OPEN;
     use caudra_workcell::host_contract::{EnvironmentEntry, EnvironmentEntryState};
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
@@ -935,6 +1150,7 @@ mod tests {
     use super::local::{HostVariable, NOT_FORWARDABLE_SECTION, PROJECT_NOTE};
     use super::rows::{BUILT_IN_STATE, MASK};
     use super::sandbox::{STRIPPED_DETAIL, STRIPPED_SECTION};
+    use super::secrets::{ALL_SESSIONS_STATE, EXPIRED_STATE, REMEMBERED_BADGE, SESSION_BADGE};
     use super::*;
     use crate::components::{buffer_text, key};
 
@@ -956,18 +1172,28 @@ mod tests {
     const REVEAL_LEAKED: &str = "revealing one row must not reveal another";
     const REVEAL_STUCK: &str = "moving off a revealed row masks it again";
     const TOGGLED_FIXED: &str = "a fixed row must not turn into an edit";
+    const SESSION_SECRET: &str = "CLOUDFLARE_API_TOKEN";
+    const EXPIRED_SECRET: &str = "HCLOUD_TOKEN";
+    const REMEMBERED_SECRET: &str = "GH_TOKEN";
+    const SECRET_CANARY: &str = "secret-canary-4711";
+    const SECRET_SHOWN: &str = "a secret's value must never reach the screen";
+    const LISTED_TWICE: &str = "a remembered secret is listed once, under Secrets";
+    const SESSION_LEFT: Duration = Duration::from_secs(5 * 60 * 60 + 30 * 60);
+    const EXPIRES_IN_FIVE_HOURS: &str = "expires in 5h";
 
     struct LocalFixture {
+        path: PathBuf,
         _directory: TempDir,
         modal: EnvModal,
     }
 
-    fn local_fixture(config: &str, variables: &[(&str, &str, EnvSource)]) -> LocalFixture {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join(CONFIG_FILE);
-        fs::write(&path, config).unwrap();
-        let environment = LocalEnvironment {
-            file: GlobalShellEnvFile::load(&path).unwrap(),
+    fn environment(
+        path: &Path,
+        variables: &[(&str, &str, EnvSource)],
+        secrets: &[SecretListing],
+    ) -> Box<LocalEnvironment> {
+        Box::new(LocalEnvironment {
+            file: GlobalShellEnvFile::load(path).unwrap(),
             variables: variables
                 .iter()
                 .map(|(name, value, source)| {
@@ -981,20 +1207,64 @@ mod tests {
                 })
                 .collect(),
             credentials: HashSet::new(),
-        };
+            secrets: secrets.to_vec(),
+        })
+    }
+
+    /// `config` gets the directory the config is written to, where a remembered secret's file
+    /// holds [`SECRET_CANARY`].
+    fn opened(
+        config: impl FnOnce(&Path) -> String,
+        variables: &[(&str, &str, EnvSource)],
+        secrets: &[SecretListing],
+        open: impl FnOnce(&mut EnvModal) -> EnvAction,
+    ) -> LocalFixture {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        fs::write(directory.path().join(REMEMBERED_SECRET), SECRET_CANARY).unwrap();
+        fs::write(&path, config(directory.path())).unwrap();
         let mut modal = EnvModal::new();
         assert!(matches!(
-            modal.open(EnvTarget::Local),
+            open(&mut modal),
             EnvAction::Request(EnvRequest::LoadLocal)
         ));
         modal.receive(EnvReply::Local {
-            environment: Ok(Box::new(environment)),
+            environment: Ok(environment(&path, variables, secrets)),
             error: None,
         });
         LocalFixture {
+            path,
             _directory: directory,
             modal,
         }
+    }
+
+    fn local_fixture(config: &str, variables: &[(&str, &str, EnvSource)]) -> LocalFixture {
+        opened(
+            |_| config.to_owned(),
+            variables,
+            &[],
+            |modal| modal.open(EnvTarget::Local),
+        )
+    }
+
+    fn secrets_fixture(
+        config: impl FnOnce(&Path) -> String,
+        secrets: &[SecretListing],
+        target: EnvTarget,
+    ) -> LocalFixture {
+        opened(config, &[], secrets, |modal| modal.open_secrets(target))
+    }
+
+    fn no_config(_: &Path) -> String {
+        String::new()
+    }
+
+    fn remembered_config(directory: &Path) -> String {
+        format!(
+            "[agent.shell_env]\nset = {{ {REMEMBERED_SECRET} = \"{{file:{}}}\" }}\n",
+            directory.join(REMEMBERED_SECRET).display()
+        )
     }
 
     fn sandbox_modal(supported: bool, listing: GuestListing) -> EnvModal {
@@ -1276,5 +1546,261 @@ mod tests {
         ));
         assert!(modal.form.is_none());
         assert!(info(&modal).contains(UNSUPPORTED));
+    }
+
+    fn listing(name: &str, scope: SecretScope, expires_at: Option<SystemTime>) -> SecretListing {
+        SecretListing {
+            name: name.to_owned(),
+            scope,
+            expires_at,
+        }
+    }
+
+    fn every_scope() -> Vec<SecretListing> {
+        let now = SystemTime::now();
+        vec![
+            listing(
+                SESSION_SECRET,
+                SecretScope::Session,
+                Some(now + SESSION_LEFT),
+            ),
+            listing(
+                EXPIRED_SECRET,
+                SecretScope::Session,
+                Some(now - SESSION_LEFT),
+            ),
+            listing(REMEMBERED_SECRET, SecretScope::Remembered, None),
+        ]
+    }
+
+    fn rows(modal: &EnvModal) -> Vec<&EnvRow> {
+        (0..).map_while(|index| modal.picker.item(index)).collect()
+    }
+
+    fn select_secret(modal: &mut EnvModal, name: &str) {
+        assert!(
+            modal.picker.select_item_by(
+                |row| row.name == name && matches!(row.action, RowAction::Secret(_))
+            )
+        );
+        modal.settle();
+    }
+
+    fn secret_edit(action: EnvAction) -> SecretEdit {
+        match action {
+            EnvAction::Request(EnvRequest::Secret(edit)) => edit,
+            _ => panic!("expected a secret edit"),
+        }
+    }
+
+    #[test]
+    fn secret_rows_show_names_badges_and_lifetimes_but_no_value_even_when_revealed() {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        let screen = render(modal);
+        for shown in [
+            SESSION_SECRET,
+            EXPIRED_SECRET,
+            REMEMBERED_SECRET,
+            SESSION_BADGE,
+            REMEMBERED_BADGE,
+            EXPIRES_IN_FIVE_HOURS,
+            EXPIRED_STATE,
+            ALL_SESSIONS_STATE,
+        ] {
+            assert!(screen.contains(shown), "{shown} missing from {screen}");
+        }
+
+        for name in [SESSION_SECRET, EXPIRED_SECRET, REMEMBERED_SECRET] {
+            select_secret(modal, name);
+            press(modal, KeyCode::Char(REVEAL_KEY));
+            let selected = modal.picker.selected_item().unwrap();
+            assert_eq!(selected.detail(), Some(MASK), "{SECRET_SHOWN}");
+            assert!(info(modal).contains(NOTHING_TO_REVEAL));
+            let screen = render(modal);
+            assert!(!screen.contains(SECRET_CANARY), "{SECRET_SHOWN}");
+            assert!(!screen.contains(FILE_OPEN), "{LISTED_TWICE}");
+        }
+    }
+
+    #[test]
+    fn a_remembered_secret_is_listed_once_under_secrets() {
+        let fixture = secrets_fixture(
+            remembered_config,
+            &[listing(REMEMBERED_SECRET, SecretScope::Remembered, None)],
+            EnvTarget::Local,
+        );
+        let listed: Vec<_> = rows(&fixture.modal)
+            .into_iter()
+            .filter(|row| row.name == REMEMBERED_SECRET)
+            .map(|row| row.section)
+            .collect();
+        assert_eq!(listed, [SECRETS_SECTION], "{LISTED_TWICE}");
+    }
+
+    #[test_case(SESSION_SECRET, SecretScope::Session ; "session")]
+    #[test_case(REMEMBERED_SECRET, SecretScope::Remembered ; "remembered")]
+    fn e_opens_an_empty_masked_form_that_saves_in_the_secrets_scope(
+        name: &str,
+        scope: SecretScope,
+    ) {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, name);
+
+        press(modal, KeyCode::Char(EDIT_KEY));
+        let form = modal.form.as_ref().unwrap();
+        assert!(matches!(form.kind, FormKind::Secret(opened) if opened == scope));
+        assert_eq!(form.name(), name);
+        assert!(form.value_text().is_empty());
+
+        modal.handle_text(SECRET_CANARY, true);
+        assert!(!render(modal).contains(SECRET_CANARY), "{SECRET_SHOWN}");
+        match secret_edit(press(modal, KeyCode::Enter)) {
+            SecretEdit::Save {
+                name: saved,
+                scope: saved_scope,
+                value,
+            } => {
+                assert_eq!((saved.as_str(), saved_scope), (name, scope));
+                assert_eq!(value.expose(), SECRET_CANARY);
+            }
+            _ => panic!("expected a save"),
+        }
+    }
+
+    #[test]
+    fn s_opens_a_form_for_a_new_session_secret() {
+        let mut fixture = secrets_fixture(no_config, &[], EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        assert!(!modal.text_key(Some(key(KeyCode::Char(SECRET_KEY)))));
+
+        press(modal, KeyCode::Char(SECRET_KEY));
+
+        let form = modal.form.as_ref().unwrap();
+        assert!(matches!(form.kind, FormKind::Secret(SecretScope::Session)));
+        assert!(form.name().is_empty());
+    }
+
+    #[test_case(SESSION_SECRET, SecretScope::Session ; "session")]
+    #[test_case(REMEMBERED_SECRET, SecretScope::Remembered ; "remembered")]
+    fn d_asks_before_deleting_a_secret(name: &str, scope: SecretScope) {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, name);
+
+        assert!(matches!(
+            press(modal, KeyCode::Char(DELETE_KEY)),
+            EnvAction::Consumed
+        ));
+        assert!(info(modal).contains(&delete_secret_prompt(name)));
+
+        assert!(matches!(
+            secret_edit(press(modal, KeyCode::Char(CONFIRM_KEY))),
+            SecretEdit::Delete { name: deleted, scope: from } if deleted == name && from == scope
+        ));
+    }
+
+    #[test]
+    fn m_asks_before_remembering_over_a_set_entry_the_user_wrote() {
+        let mut fixture = secrets_fixture(no_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, SESSION_SECRET);
+        assert!(!modal.text_key(Some(key(KeyCode::Char(MOVE_KEY)))));
+
+        assert!(matches!(
+            secret_edit(press(modal, KeyCode::Char(MOVE_KEY))),
+            SecretEdit::Move {
+                from: SecretScope::Session,
+                foreign: ForeignEntry::Refuse,
+                ..
+            }
+        ));
+        modal.receive(EnvReply::ForeignEntry {
+            environment: Ok(environment(&fixture.path, &[], &every_scope())),
+            name: SESSION_SECRET.to_owned(),
+        });
+        assert!(info(modal).contains(&foreign_prompt(SESSION_SECRET)));
+
+        assert!(matches!(
+            secret_edit(press(modal, KeyCode::Char(CONFIRM_KEY))),
+            SecretEdit::Move {
+                name,
+                from: SecretScope::Session,
+                foreign: ForeignEntry::Replace,
+            } if name == SESSION_SECRET
+        ));
+    }
+
+    #[test]
+    fn m_keeps_a_remembered_secret_for_this_session_only() {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, REMEMBERED_SECRET);
+
+        assert!(matches!(
+            secret_edit(press(modal, KeyCode::Char(MOVE_KEY))),
+            SecretEdit::Move {
+                from: SecretScope::Remembered,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_expired_secret_is_not_moved() {
+        let mut fixture = secrets_fixture(no_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, EXPIRED_SECRET);
+
+        assert!(matches!(
+            press(modal, KeyCode::Char(MOVE_KEY)),
+            EnvAction::Consumed
+        ));
+        assert!(info(modal).contains(EXPIRED_MOVE));
+    }
+
+    #[test_case(EnvTarget::Remote { label: REMOTE_LABEL.to_owned() } ; "remote")]
+    #[test_case(EnvTarget::Sandbox(SandboxTarget {
+        name: SANDBOX_NAME.to_owned(),
+        profile: None,
+        supported: true,
+    }) ; "sandbox")]
+    fn a_shell_elsewhere_shows_one_note_instead_of_the_secrets(target: EnvTarget) {
+        let mut fixture = secrets_fixture(no_config, &every_scope(), target);
+        let modal = &mut fixture.modal;
+
+        let section: Vec<_> = rows(modal)
+            .into_iter()
+            .filter(|row| row.section == SECRETS_SECTION)
+            .collect();
+        let [note] = section.as_slice() else {
+            panic!("expected one note row");
+        };
+        assert_eq!(note.name, LOCAL_ONLY);
+        assert!(note.is_disabled());
+        assert!(!render(modal).contains(SESSION_SECRET));
+
+        press(modal, KeyCode::Char(SECRET_KEY));
+        assert!(modal.form.is_none());
+        assert!(info(modal).contains(LOCAL_ONLY));
+    }
+
+    #[test]
+    fn secrets_selects_the_first_secret() {
+        let fixture = secrets_fixture(
+            |_| format!("[agent.shell_env]\nset = {{ {PLAIN_NAME} = \"on\" }}\n"),
+            &every_scope(),
+            EnvTarget::Local,
+        );
+        let selected = fixture.modal.picker.selected_item().unwrap();
+        assert_eq!(selected.name, SESSION_SECRET);
+        assert_eq!(fixture.modal.docs_topic(), Some(DocsTopic::Secrets));
+    }
+
+    #[test]
+    fn secrets_without_any_says_how_to_save_one() {
+        let fixture = secrets_fixture(no_config, &[], EnvTarget::Local);
+        assert!(info(&fixture.modal).contains(NO_SECRETS));
     }
 }

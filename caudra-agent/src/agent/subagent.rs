@@ -119,8 +119,10 @@ async fn relay_session_events(
 ) {
     let mut cost = None;
     let mut progress = ProgressRelay::new();
+    let mut stamp = RelayStamp::new(subagent_info);
     while let Ok(mut envelope) = sub_rx.recv_async().await {
-        progress.relay(&envelope, &parent_tx, &subagent_info, live_sink.as_ref());
+        stamp.observe(&envelope);
+        progress.relay(&envelope, &parent_tx, &stamp, live_sink.as_ref());
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -154,8 +156,57 @@ async fn relay_session_events(
             }
             _ => {}
         }
-        envelope.subagent = subagent_info.get().cloned();
+        envelope.subagent = stamp.current();
         let _ = parent_tx.send_envelope(envelope);
+    }
+}
+
+/// The identity a task's envelopes carry: the one it opened with, moved to
+/// whatever model and level its latest request, pick or reroute reported,
+/// so the parent never reads the model it started on as the one in force.
+struct RelayStamp {
+    info: Arc<OnceLock<SubagentInfo>>,
+    model: Option<String>,
+    thinking: Option<Option<String>>,
+}
+
+impl RelayStamp {
+    fn new(info: Arc<OnceLock<SubagentInfo>>) -> Self {
+        Self {
+            info,
+            model: None,
+            thinking: None,
+        }
+    }
+
+    /// Only the task's own events move it: one already stamped is a nested
+    /// task's, whose model is not this one's.
+    fn observe(&mut self, envelope: &Envelope) {
+        if envelope.subagent.is_some() {
+            return;
+        }
+        match &envelope.event {
+            AgentEvent::MessageStarted {
+                model, thinking, ..
+            }
+            | AgentEvent::SettingsChanged { model, thinking } => {
+                self.model = Some(model.clone());
+                self.thinking = Some(thinking.clone());
+            }
+            AgentEvent::ModelRerouted(reroute) => self.model = Some(reroute.to.clone()),
+            _ => {}
+        }
+    }
+
+    fn current(&self) -> Option<SubagentInfo> {
+        let mut info = self.info.get()?.clone();
+        if let Some(model) = &self.model {
+            info.model = Some(model.clone());
+        }
+        if let Some(thinking) = &self.thinking {
+            info.thinking.clone_from(thinking);
+        }
+        Some(info)
     }
 }
 
@@ -433,7 +484,7 @@ impl ProgressRelay {
         &mut self,
         envelope: &Envelope,
         parent_tx: &EventSender,
-        subagent_info: &OnceLock<SubagentInfo>,
+        stamp: &RelayStamp,
         live_sink: Option<&flume::Sender<ToolLive>>,
     ) {
         if envelope.subagent.is_some() {
@@ -460,7 +511,7 @@ impl ProgressRelay {
         }
         let _ = parent_tx.send_envelope(Envelope {
             event: AgentEvent::SubagentProgress { progress },
-            subagent: subagent_info.get().cloned(),
+            subagent: stamp.current(),
             run_id: parent_tx.run_id(),
             workflow: envelope.workflow.clone(),
             task: envelope.task.clone(),
@@ -690,6 +741,11 @@ impl Subagent {
 
     pub fn model_spec(&self) -> String {
         self.params.model.spec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control(&self) -> &ConversationControl {
+        &self.control
     }
 
     /// The level this session's requests carry, snapped to its model. `None`
@@ -1986,6 +2042,7 @@ fn build(
             tool_output_store: ctx.tool_output_store.clone(),
             permissions: Arc::clone(&ctx.permissions),
             session_id: ctx.session_id.clone(),
+            secrets: ctx.secrets.clone(),
             cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),
@@ -2680,6 +2737,9 @@ mod tests {
     const THINKING_LABEL: &str = "thinking";
     const RESPONDING_LABEL: &str = "responding";
     const THOUGHT_TITLE: &str = "Weighing the options";
+    const OPENED_LEVEL: &str = "high";
+    const SWITCHED_LEVEL: &str = "low";
+    const STALE_STAMP: &str = "the parent must read the model the task runs on now";
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
         TokenUsage {
@@ -3525,6 +3585,92 @@ mod tests {
                 (RESPONDING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
                 (THINKING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
             ]
+        );
+    }
+
+    fn opened_on_pinned_model() -> Arc<OnceLock<SubagentInfo>> {
+        let mut info = parent_info().get().unwrap().clone();
+        info.model = Some(PINNED_MODEL_SPEC.into());
+        info.thinking = Some(OPENED_LEVEL.into());
+        Arc::new(OnceLock::from(info))
+    }
+
+    fn settings_changed() -> AgentEvent {
+        AgentEvent::SettingsChanged {
+            model: PLAN_MODEL_SPEC.into(),
+            thinking: Some(SWITCHED_LEVEL.into()),
+        }
+    }
+
+    fn message_started() -> AgentEvent {
+        AgentEvent::MessageStarted {
+            id: CaudraId::generate(),
+            model: PLAN_MODEL_SPEC.into(),
+            thinking: Some(SWITCHED_LEVEL.into()),
+        }
+    }
+
+    fn rerouted() -> AgentEvent {
+        AgentEvent::ModelRerouted(Box::new(caudra_providers::accounts::Reroute {
+            from: PINNED_MODEL_SPEC.into(),
+            to: PLAN_MODEL_SPEC.into(),
+            reason: caudra_providers::accounts::RerouteReason::Spent {
+                window: None,
+                used_percent: None,
+            },
+            cached_tokens: 0,
+        }))
+    }
+
+    fn nested(event: AgentEvent) -> Envelope {
+        let mut envelope = envelope(event);
+        envelope.subagent = Some(session_info(SECOND_SUBAGENT_ID).get().unwrap().clone());
+        envelope
+    }
+
+    fn stamped(envelope: &Envelope) -> (Option<&str>, Option<&str>) {
+        let info = envelope.subagent.as_ref().unwrap();
+        (info.model.as_deref(), info.thinking.as_deref())
+    }
+
+    /// A pick, a reroute, or simply the next request on another model moves
+    /// what every later envelope says the task runs on, its progress
+    /// included, while a nested task's switch leaves it alone.
+    #[test_case(envelope(settings_changed()), PLAN_MODEL_SPEC, SWITCHED_LEVEL; "a_live_switch")]
+    #[test_case(envelope(message_started()), PLAN_MODEL_SPEC, SWITCHED_LEVEL; "a_request_on_another_model")]
+    #[test_case(envelope(rerouted()), PLAN_MODEL_SPEC, OPENED_LEVEL; "a_reroute_keeps_the_level")]
+    #[test_case(nested(settings_changed()), PINNED_MODEL_SPEC, OPENED_LEVEL; "a_nested_tasks_switch")]
+    fn relay_stamps_the_model_the_task_runs_on_now(moved: Envelope, model: &str, level: &str) {
+        let forwarded = relay_hop(
+            opened_on_pinned_model(),
+            vec![
+                envelope(text_delta()),
+                moved,
+                envelope(AgentEvent::ThinkingDelta { text: "hm".into() }),
+            ],
+        );
+
+        let delta = |event: fn(&AgentEvent) -> bool| {
+            forwarded
+                .iter()
+                .find(|envelope| event(&envelope.event))
+                .unwrap()
+        };
+        let before = delta(|event| matches!(event, AgentEvent::TextDelta { .. }));
+        assert_eq!(
+            stamped(before),
+            (Some(PINNED_MODEL_SPEC), Some(OPENED_LEVEL))
+        );
+        let after = delta(|event| matches!(event, AgentEvent::ThinkingDelta { .. }));
+        assert_eq!(stamped(after), (Some(model), Some(level)), "{STALE_STAMP}");
+        let progress = forwarded
+            .iter()
+            .rfind(|envelope| matches!(envelope.event, AgentEvent::SubagentProgress { .. }))
+            .unwrap();
+        assert_eq!(
+            stamped(progress),
+            (Some(model), Some(level)),
+            "{STALE_STAMP}"
         );
     }
 

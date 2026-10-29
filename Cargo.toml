@@ -63,6 +63,7 @@ include_dir = { workspace = true }
 workspace-hack.workspace = true
 
 [dev-dependencies]
+async-lock = { workspace = true }
 caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
@@ -79,6 +80,7 @@ members = [
   "caudra-diff",
   "caudra-docgen",
   "caudra-docs",
+  "caudra-emil",
   "caudra-grab",
   "caudra-highlight",
   "caudra-interpreter",
@@ -166,6 +168,7 @@ caudra-lua-macro = { path = "caudra-lua-macro" }
 caudra-grab = { path = "caudra-grab" }
 caudra-highlight = { path = "caudra-highlight" }
 caudra-markdown = { path = "caudra-markdown" }
+caudra-emil = { path = "caudra-emil" }
 caudra-mattpocock = { path = "caudra-mattpocock" }
 caudra-models = { path = "caudra-models" }
 caudra-otel = { path = "caudra-otel" }

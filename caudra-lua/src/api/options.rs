@@ -81,20 +81,13 @@ impl fmt::Display for OptionType {
     }
 }
 
-/// Single source for user-value validation and the generated config docs.
+/// One declared option, which the user's value is validated against.
 #[derive(Debug, Clone)]
 pub struct OptionSpec {
     pub name: String,
     pub ty: OptionType,
     pub default: Option<JsonValue>,
     pub min: Option<f64>,
-    pub desc: String,
-}
-
-pub(crate) fn collect_plugin_options(lua: &Lua) -> PluginOptionSpecs {
-    lua.app_data_ref::<PluginOptionSpecs>()
-        .map(|store| store.clone())
-        .unwrap_or_default()
 }
 
 fn spec_error(name: &str, msg: &str) -> mlua::Error {
@@ -187,8 +180,7 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
         }
     }
 
-    let desc: String = spec
-        .get::<Option<String>>("desc")?
+    spec.get::<Option<String>>("desc")?
         .filter(|d| !d.is_empty())
         .ok_or_else(|| spec_error(name, "desc is required"))?;
 
@@ -197,7 +189,6 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
         ty,
         default,
         min,
-        desc,
     })
 }
 
@@ -237,13 +228,13 @@ fn validate_user_opts(
 ///
 /// An unknown key, a wrong type, or a value below `min` fails the plugin
 /// load with a clear message, so users catch typos right away. Bad specs
-/// fail the load too. The specs also feed the generated configuration docs.
+/// fail the load too.
 ///
 /// @param spec table Map of option name to a spec table:
 ///   default (boolean|number|string) Optional. Used when the user sets nothing. Its Lua type becomes the option type.
 ///   type    (string) Required when there is no default: "boolean", "integer", "number", or "string".
 ///   min     (number) Optional. Minimum accepted value, numeric options only.
-///   desc    (string) Required. One line shown in the configuration docs.
+///   desc    (string) Required. One line describing the option.
 /// @return (table) Merged options: the user's value where set, otherwise the default, or nil when neither exists.
 /// @example
 /// local opts = caudra.api.register_options({

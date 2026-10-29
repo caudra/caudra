@@ -56,6 +56,7 @@ use crate::context::ContextPublisher;
 use crate::decisions::{DecisionFeature, Decisions, NoteAnchor, NoteDraft, NoteSink, PendingNote};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::secrets::SessionSecrets;
 use crate::template::Vars;
 use crate::tools::native::plan::PlanTarget;
 use crate::workflow::WorkflowHandle;
@@ -355,6 +356,7 @@ pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 const OPENAI_PROVIDER_SLUG: &str = "openai";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
+pub const REQUEST_SECRET_TOOL_NAME: &str = "request_secret";
 pub const SHELL_TOOL_NAME: &str = "shell";
 pub const SKILL_TOOL_NAME: &str = "skill";
 pub const TASK_TOOL_NAME: &str = "task";
@@ -533,6 +535,9 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `caudra index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// The session tree's secrets, which its local shell commands receive. Shared with
+    /// subagents. `None` without a session.
+    pub secrets: Option<SessionSecrets>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     /// The directory Caudra itself runs in. Set only in a sandbox session,
@@ -885,6 +890,7 @@ pub fn interpreter_ctx(
         mode: mode.clone(),
         plan: None,
         session_id: None,
+        secrets: None,
         workspace_session: None,
         remote_project_context: None,
         host_cwd: None,

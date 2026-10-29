@@ -5,14 +5,12 @@ use caudra_agent::tools::report::REASON_CODE_MODULE;
 use caudra_agent::tools::{
     DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource, feature_exclusions,
 };
-use caudra_config::{CODE_HOSTED_TOOLS, Feature, FeatureFlags, PluginsConfig, ProfileToolPolicy};
+use caudra_config::{CODE_HOSTED_TOOLS, Feature, FeatureFlags, ProfileToolPolicy};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
-
-use caudra_lua::{OptionType, PluginHost};
 
 use crate::{page_header, repository_path};
 
@@ -48,6 +46,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "code",
             "execution_environment",
             "question",
+            "request_secret",
         ],
     ),
     (
@@ -244,7 +243,7 @@ fn experiment(name: &str) -> Option<Feature> {
     })
 }
 
-fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
+fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo) {
     let description = info
         .def
         .get("description")
@@ -259,9 +258,6 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     let mut badges = String::new();
     if matches!(info.source, ToolSource::Mcp { .. }) {
         badges.push_str(" <span class=\"badge\">mcp</span>");
-    }
-    if opt_in.contains(name) {
-        badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
     }
     if experiment.is_some() {
         badges.push_str(" <span class=\"badge\">experimental</span>");
@@ -384,30 +380,14 @@ fn collect_tool_info(
     })
 }
 
-/// Loads every builtin with all sub-tools on, so the reference documents
-/// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
-/// option defaulting to false, so the badge cannot drift from the defaults.
-fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
+fn load_builtin_registry() -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     let workcell =
         caudra_workcell::WorkcellHost::new(repository_path(""), None).expect("Workcell host");
     workcell.register(&registry).expect("Workcell tools");
     caudra_agent::tools::native::register(&registry, FeatureFlags::all())
         .expect("native Caudra tools");
-    let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
-
-    host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .expect("loading builtin plugins");
-
-    let opt_in = host
-        .plugin_options()
-        .expect("collecting plugin options")
-        .into_values()
-        .flatten()
-        .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
-        .map(|o| o.name)
-        .collect();
-    (registry, opt_in)
+    registry
 }
 
 pub fn generate() -> String {
@@ -416,7 +396,7 @@ pub fn generate() -> String {
         .set("{platform}", "linux")
         .set("{date}", "YYYY-MM-DD");
 
-    let (registry, opt_in) = load_registry_with_builtins();
+    let registry = load_builtin_registry();
     let defs = registry.definitions_split_with_policy(
         &vars,
         &DescriptionContext {
@@ -450,15 +430,10 @@ pub fn generate() -> String {
 
     let total = tools.len();
     let mut out = page_header("Tools", "Every built-in tool and its parameters.");
-    let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
-    let default_n = total - opt_in_n;
     writeln!(
         out,
-        "Caudra ships with {total} built-in tools in this reference \
-         ({default_n} requiring no plugin opt-in, {opt_in_n} opt-in via plugin options). \
-         Availability depends on the selected workspace backend. \
-         Tools marked **opt-in** are off until you enable them under `plugins` \
-         in [Configuration](/docs/configuration/)."
+        "Caudra ships with {total} built-in tools in this reference. \
+         Availability depends on the selected workspace backend."
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -499,7 +474,7 @@ pub fn generate() -> String {
         }
         for name in present {
             let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info, &opt_in);
+            write_tool_entry(&mut out, name, info);
             rendered.insert(name);
         }
     }
@@ -515,7 +490,7 @@ pub fn generate() -> String {
         writeln!(out, "## Additional tools").unwrap();
         for name in leftovers {
             let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info, &opt_in);
+            write_tool_entry(&mut out, name, info);
         }
     }
 
@@ -532,7 +507,7 @@ static DATE_RE: std::sync::LazyLock<Regex> =
 mod tests {
     use super::{
         CODE_HOSTED_TOOLS, DATE_PLACEHOLDER, DATE_RE, PLAN_REQUIRED, SECTIONS, extract_default,
-        extract_params, generate, load_registry_with_builtins, module_call, redact_path,
+        extract_params, generate, load_builtin_registry, module_call, redact_path,
     };
     use serde_json::{Value, json};
     use std::collections::HashSet;
@@ -657,7 +632,7 @@ mod tests {
 
     #[test]
     fn sections_partition_registered_tools() {
-        let (registry, _) = load_registry_with_builtins();
+        let registry = load_builtin_registry();
         let snapshot = registry.iter();
         let registered: HashSet<&str> = snapshot.iter().map(|e| e.name()).collect();
 

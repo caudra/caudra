@@ -27,6 +27,13 @@ pub(crate) static QUESTION_TOOL_NUDGE: LazyLock<Option<QuestionSet>> = LazyLock:
     )
 });
 
+pub(crate) static MEMORY_NUDGE: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
+    embedded(
+        "memory_nudge.v1",
+        include_str!("questions/memory_nudge.json"),
+    )
+});
+
 fn embedded(id: &str, json: &str) -> Option<QuestionSet> {
     QuestionSet::new(id, serde_json::from_str(json).ok()?).ok()
 }
@@ -37,12 +44,13 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CONTENT, GOAL, LazyLock, PERMISSION, QUESTION_TOOL_NUDGE, QuestionSet, SHELL_EFFECT,
-        SUBAGENT,
+        CONTENT, GOAL, LazyLock, MEMORY_NUDGE, PERMISSION, QUESTION_TOOL_NUDGE, QuestionSet,
+        SHELL_EFFECT, SUBAGENT,
     };
     use crate::agent::GOAL_MET_QUESTION;
     use crate::agent::subagent::DIFFICULTY_QUESTION;
     use crate::decisions::content::{ADDRESSED_TO_AGENT, INJECTION};
+    use crate::decisions::memory_nudge::QUESTION as CORRECTION;
     use crate::decisions::permission::FLAGS;
     use crate::decisions::question_tool_nudge::QUESTION;
     use crate::decisions::shell_effect::{CHANGES_SYSTEM, WRITES};
@@ -55,6 +63,7 @@ mod tests {
     #[test_case(&GOAL, &[(GOAL_MET_QUESTION, QuestionType::Noul)]; "goal")]
     #[test_case(&SUBAGENT, &[(DIFFICULTY_QUESTION, QuestionType::Score)]; "subagent")]
     #[test_case(&QUESTION_TOOL_NUDGE, &[(QUESTION, QuestionType::Noul)]; "question_tool_nudge")]
+    #[test_case(&MEMORY_NUDGE, &[(CORRECTION, QuestionType::Noul)]; "memory_nudge")]
     fn every_embedded_question_set_is_valid(
         set: &LazyLock<Option<QuestionSet>>,
         required: &[(&str, QuestionType)],

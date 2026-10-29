@@ -40,7 +40,7 @@ caudra decisions purge --yes
 
 `status` shows effective configuration without contacting the endpoint, including the active `endpoint` name. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and the shell runs behind shell ETAs intact. It does not erase copies in SQLite free pages, WAL files, or backups.
 
-`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `source_code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
+`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `skill_suggestions`, `goal`, `subagent_routing`, `question_tool_nudge`, `memory_nudge`, `memory_search`, `history_search`, `memory_recall`, `memory_duplicates`, `compaction_retention`, `output_pointers`, `source_code_context`, `code`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 
 Labels are partial evidence, not a complete evaluation dataset. Tool-search actual-use labels and shell-effect observed-filesystem labels are not collected. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Redaction is best effort. Review exported states and question text before sharing them. See [decision engine advice](/docs/permissions/#decision-engine-advice) and [configuration](/docs/configuration/#decisions).
 
@@ -273,7 +273,7 @@ set = { AWS_PROFILE = "readonly", AGENT_TOKEN = "{env:CAUDRA_AGENT_TOKEN}" }
 - The commands [pstack's scripts](/docs/code/#pstack-scripts) run, such as `git` and `gh`, get the same environment.
 - The setting applies to local sessions. A [sandbox](/docs/sandboxes/#shell-environment) forwards its guest's own variables instead, and a [remote Workcell](/docs/remote-workspaces/) uses the environment its operator gives the server.
 
-The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded.
+The `execution_environment` tool lists the forwarded names without their values, so the agent can tell you when a command needs a variable you have not forwarded. When a command needs a token, the agent can ask for it on a private card instead. See [Secrets](/docs/secrets/).
 
 Docker contexts already work without this: `docker context use` stores the choice under `~/.docker`, and `HOME` is forwarded.
 

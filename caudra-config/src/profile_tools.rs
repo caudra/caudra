@@ -37,7 +37,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
     ),
     (
         ToolPolicyGroup::Support,
-        &["batch", "question", "todo_write", "plan"],
+        &["batch", "question", "request_secret", "todo_write", "plan"],
     ),
     (ToolPolicyGroup::Images, &["view_image", "image_generate"]),
     (

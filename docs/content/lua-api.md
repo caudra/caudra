@@ -455,7 +455,7 @@ Call it once, at the top level of your plugin file.
 
 An unknown key, a wrong type, or a value below `min` fails the plugin
 load with a clear message, so users catch typos right away. Bad specs
-fail the load too. The specs also feed the generated configuration docs.
+fail the load too.
 
 **Parameters:**
 
@@ -463,7 +463,7 @@ fail the load too. The specs also feed the generated configuration docs.
   - `default` (`boolean|number|string`) Optional. Used when the user sets nothing. Its Lua type becomes the option type.
   - `type` (`string`) Required when there is no default: "boolean", "integer", "number", or "string".
   - `min` (`number`) Optional. Minimum accepted value, numeric options only.
-  - `desc` (`string`) Required. One line shown in the configuration docs.
+  - `desc` (`string`) Required. One line describing the option.
 
 **Returns:** (`table`) Merged options: the user's value where set, otherwise the default, or nil when neither exists.
 
@@ -5526,7 +5526,7 @@ function M.report()
 -- (1, 0), right at end of buffer, etc.). Parents can use that signal to fall
 -- through to their own logic.
 --
--- Parity cases live in plugins/lib/tests/spec.lua (TRACE_CASES). Add one
+-- Parity cases live in caudra-lua/tests/lua/lib_spec.lua (TRACE_CASES). Add one
 -- whenever you change handle_key semantics.
 TextInput.Result = R
 function TextInput.new()

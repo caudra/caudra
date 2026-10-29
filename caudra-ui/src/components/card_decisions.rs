@@ -337,6 +337,7 @@ pub fn keeps_quiet(subject: &DecisionSubject, feature: &DecisionFeature) -> bool
                 | DecisionFeature::SkillSuggestions
                 | DecisionFeature::GoalPrescreen
                 | DecisionFeature::QuestionToolNudge
+                | DecisionFeature::MemoryNudge
                 | DecisionFeature::CompactionRetention
         )
 }
@@ -733,6 +734,7 @@ fn chip_words(feature: &DecisionFeature) -> ChipWords {
         DecisionFeature::SkillSuggestions => deciding("matching skills", "no skill"),
         DecisionFeature::GoalPrescreen => deciding("checking goal", "goal checked"),
         DecisionFeature::QuestionToolNudge => deciding("checking question", "no nudge"),
+        DecisionFeature::MemoryNudge => deciding("checking for a correction", "no correction"),
         DecisionFeature::CompactionRetention => deciding("picking results to keep", "kept as is"),
         DecisionFeature::Workflow | DecisionFeature::Code | DecisionFeature::PermissionAdvice => {
             DECIDING

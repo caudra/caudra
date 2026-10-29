@@ -74,6 +74,8 @@ The main session's system prompt carries the view: at most 32 KiB of lines, abou
 
 Each new entry appends a line of its own. While the lines add up to more than 32 KiB, the pair of sibling lines that ended longest ago merges into its parent line. Age counts in multiples of the pair's own size, so a pair of 16-entry lines goes first only once it ended 16 times as long ago as a pair of single entries. A pair merges only once its parent line is written, and a merged line is never split again.
 
+While a project has no notes, the view explains what notes are for and when to write one, and gives an example note.
+
 While summaries are still being written, during the first import for example, the lines can add up to more than 32 KiB. The view then keeps only the newest lines that fit. Its first line says how many of the oldest entries are left out until their summaries are written, and that `memory search` finds them.
 
 ## Zoom and search
@@ -112,6 +114,39 @@ Entries written elsewhere, by other sessions or by edits outside the tool, reach
 The model can zoom into a row with `n` = 1 to read the entry whole. At the next rebuild the view includes those entries, and the reminder is withdrawn.
 
 Subagents get the `memory` tool without the view.
+
+## Reminders to save notes
+
+Models seldom write the first notes in a project on their own. While a project has few notes, the main session gets a one-time `# Save what you learned` reminder right after one of these events:
+
+- A shell command that failed earlier in the turn now passes.
+- The turn's first edit comes after at least 8 reads and searches.
+- You corrected the agent or stated a rule for the project. This needs the `memory_nudge` decision feature, described below.
+- The context is within the last tenth of the window before [compaction](/docs/context/#when-the-window-fills).
+
+The reminder names the event and how many notes the project has. The model then saves a note or carries on.
+
+Reminders get rarer as the project's notes grow:
+
+| Notes in the project | Responses since the last reminder | Reminders per session | After a long search |
+|----------------------|-----------------------------------|-----------------------|---------------------|
+| 0 | 10 | 3 | Yes |
+| 1 to 4 | 20 | 2 | Yes |
+| 5 to 14 | 20 | 1 | No |
+| 15 or more | Never | 0 | No |
+
+A project gets at most 3 reminders a day across all its sessions, and a turn gets at most one. A session that wrote or deleted a note gets no more. A request that already carries a [recall](#relevance-from-the-decision-engine) gets no reminder, so one request never mentions memory twice.
+
+Reminders stop for good once the agent saves notes without them. That is when 2 of the project's 3 newest sessions wrote a note more than 5 responses after the last reminder. Notes the [learner](/docs/learning/) writes do not count.
+
+Only the main session in build mode gets reminders, and only when it has the `memory` tool. Subagents, plan mode, `--print` runs, and the learner never do. To turn them off:
+
+```toml
+[agent]
+memory_nudges = false
+```
+
+The `memory_nudge` decision feature is off by default and supports `shadow` and `advise`. At each new message you send, while a reminder could still go in, it asks the [decision engine](/docs/providers/#decision-endpoints) whether the message corrects the agent or states a rule a later session should follow. It sends redacted excerpts of the message and of the agent's reply before it. In `advise`, an answer at or above `routing_confidence` adds the reminder to the turn's next request. `shadow` only records the answer.
 
 ## Relevance from the decision engine
 

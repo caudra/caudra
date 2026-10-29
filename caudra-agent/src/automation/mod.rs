@@ -26,6 +26,7 @@ pub mod manager;
 pub mod messaging;
 pub mod outbox;
 mod registry;
+mod reminder;
 pub mod restore;
 pub mod skill;
 pub mod store;

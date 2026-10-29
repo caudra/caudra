@@ -85,6 +85,7 @@ const TEXT_NOUN: &str = "text";
 const NUMBER_NOUN: &str = "a number";
 const WHOLE_NUMBER_NOUN: &str = "a whole number";
 const BOOLEAN_NOUN: &str = "yes or no";
+const SECRET_NOUN: &str = "a secret, kept out of chat";
 const EMAIL_NOUN: &str = "an email address";
 const URI_NOUN: &str = "a full address (URI)";
 const DATE_NOUN: &str = "a date (YYYY-MM-DD)";
@@ -235,6 +236,7 @@ pub fn describe_answer(kind: &AnswerKind) -> Option<String> {
     match kind {
         AnswerKind::Choice => None,
         AnswerKind::Boolean => Some(BOOLEAN_NOUN.to_owned()),
+        AnswerKind::Secret { .. } => Some(SECRET_NOUN.to_owned()),
         AnswerKind::Text {
             format,
             min_length,
@@ -615,7 +617,7 @@ fn choice_value<'a>(choices: &'a [Choice], picked: &str) -> Result<&'a str, Stri
 fn coerce(kind: &AnswerKind, text: &str) -> Result<Value, String> {
     let text = text.trim();
     match kind {
-        AnswerKind::Choice => Ok(text.into()),
+        AnswerKind::Choice | AnswerKind::Secret { .. } => Ok(text.into()),
         AnswerKind::Boolean => parse_bool(text).map(Value::Bool),
         AnswerKind::Text {
             format,

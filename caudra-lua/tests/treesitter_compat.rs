@@ -434,3 +434,25 @@ assert(found["method_name:greet"], "should find greet method")
 "#,
     );
 }
+
+#[test]
+fn children_lists_every_child_and_extra_marks_comments() {
+    let (_reg, host) = setup();
+    run_lua(
+        &host,
+        "children_extra",
+        r#"
+local source = "fn helper() {}\n// trailing note\n"
+local root = caudra.treesitter.get_parser(source, "rust"):parse()[1]:root()
+local children = root:children()
+assert(#children == root:child_count(), "children() must match child_count()")
+
+local kinds = {}
+for _, child in ipairs(children) do
+    kinds[child:type()] = child:extra()
+end
+assert(kinds.function_item == false, "a function is not an extra node")
+assert(kinds.line_comment == true, "a comment is an extra node")
+"#,
+    );
+}

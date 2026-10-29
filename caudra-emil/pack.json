@@ -1,0 +1,132 @@
+{
+  "repository": "https://github.com/emilkowalski/skills",
+  "roots": [
+    {
+      "from": "",
+      "to": "",
+      "files": [
+        "LICENSE",
+        "ui-cheatsheet.md",
+        "performance-cheatsheet.md"
+      ]
+    },
+    {
+      "from": "skills/animate",
+      "to": "skills/animate",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/animate-expo",
+      "to": "skills/animate-expo",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/animation-performance",
+      "to": "skills/animation-performance",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/animation-vocabulary",
+      "to": "skills/animation-vocabulary",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/apple-design",
+      "to": "skills/apple-design",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/ask-sonner",
+      "to": "skills/ask-sonner",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/break-ui",
+      "to": "skills/break-ui",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/emil-design-eng",
+      "to": "skills/emil-design-eng",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/find-animation-opportunities",
+      "to": "skills/find-animation-opportunities",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/improve-animations",
+      "to": "skills/improve-animations",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/mobile-native",
+      "to": "skills/mobile-native",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/pick-ui-library",
+      "to": "skills/pick-ui-library",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/prototype",
+      "to": "skills/prototype",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/remove-animations",
+      "to": "skills/remove-animations",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/review-animations",
+      "to": "skills/review-animations",
+      "trees": [
+        "."
+      ]
+    },
+    {
+      "from": "skills/write-swift",
+      "to": "skills/write-swift",
+      "trees": [
+        "."
+      ]
+    }
+  ],
+  "skipped_parts": [
+    ".DS_Store"
+  ],
+  "text_suffixes": [
+    ".md"
+  ]
+}

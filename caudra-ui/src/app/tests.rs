@@ -16,7 +16,7 @@ use crate::components::context_modal::{
 };
 use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::document_view::COPIED_SELECTION;
-use crate::components::env_modal::PATTERN_KEY as ENV_PATTERN_KEY;
+use crate::components::env_modal::{EDIT_KEY as ENV_EDIT_KEY, PATTERN_KEY as ENV_PATTERN_KEY};
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_panel::{FooterCommand, GOAL_CLEAR, GOAL_MODEL, PanelCommand};
 use crate::components::help_modal::HelpTarget;
@@ -26,6 +26,7 @@ use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as 
 use crate::components::message_actions::ACTIONS_MAIN_CHAT_ONLY;
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::peer_manager::SubscriptionChange;
+use crate::components::plan_form::ASK_HINT_INDEX as PLAN_ASK_HINT;
 use crate::components::projection_modal::UNPREPARED as PROJECTION_UNPREPARED;
 use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
@@ -65,7 +66,10 @@ use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
     PermissionResourceSelector, PermissionRuleRecord, RuleOrigin,
 };
+use caudra_agent::secrets::scope::{ForeignEntry, remember};
+use caudra_agent::secrets::{SecretScope, SecretValue, SecretVaults};
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
+use caudra_agent::tools::native::secret::SecretReply;
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
     PermissionScopes, SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry,
@@ -8292,7 +8296,7 @@ const QUESTION_ANSWER: &str = "typed answer";
 const QUESTION_ANSWER_HEAD: char = '>';
 const EXPECT_RUN_LEFT_ALONE: &str = "only a cancel may stop the run that asked";
 
-fn open_question(app: &mut App) {
+pub(crate) fn open_question(app: &mut App) {
     app.question_form.open(
         vec![caudra_agent::types::AskedQuestion {
             question: QUESTION_TEXT.into(),
@@ -8551,6 +8555,57 @@ fn a_server_request_is_answered_with_its_reply(press: KeyEvent, reply: &str) {
     assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
     assert!(!app.question_form.is_open());
     assert_eq!(answers.try_recv().unwrap(), reply);
+}
+
+const SECRET_CANARY: &str = "secret-canary-4711";
+const SECRET_VARIABLE: &str = "CLOUDFLARE_API_TOKEN";
+const SECRET_LEAKED: &str = "the secret must reach only the answer channel";
+
+/// The main agent's run, waiting on its `request_secret` card.
+fn secret_request_app() -> (App, flume::Receiver<String>) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    app.update(agent_msg(AgentEvent::Question(Box::new(QuestionEvent {
+        questions: vec![AskedQuestion {
+            question: QUESTION_TEXT.into(),
+            header: QUESTION_HEADER.into(),
+            answer: AnswerKind::Secret {
+                name: SECRET_VARIABLE.into(),
+                placeholder: None,
+                replaces: false,
+            },
+            ..AskedQuestion::default()
+        }],
+        ..QuestionEvent::default()
+    }))));
+    assert!(app.question_form.is_open());
+    (app, answers)
+}
+
+#[test]
+fn a_secret_reaches_only_the_answer_channel() {
+    let (mut app, answers) = secret_request_app();
+    app.update(Msg::Paste(SECRET_CANARY.into()));
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.question_form.is_open());
+    let SecretReply::Save { value, .. } = SecretReply::decode(&answers.try_recv().unwrap()) else {
+        panic!("Enter saves the secret");
+    };
+    assert_eq!(value.expose(), SECRET_CANARY);
+    assert!(app.input_box.is_empty(), "{SECRET_LEAKED}");
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
 }
 
 #[test]
@@ -16262,11 +16317,12 @@ fn remote_cd_persistence_failure_preserves_live_state() {
 
 /// A live skill-pack flip reaches a remote tab, whose commands come from its own project
 /// rather than the ones the event loop rediscovers locally.
-#[test_case(false, false ; "both_off")]
-#[test_case(true, false ; "pstack_on")]
-#[test_case(false, true ; "mattpocock_on")]
-#[test_case(true, true ; "both_on")]
-fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) {
+#[test_case(false, false, false ; "all_off")]
+#[test_case(true, false, false ; "pstack_on")]
+#[test_case(false, true, false ; "mattpocock_on")]
+#[test_case(false, false, true ; "emil_on")]
+#[test_case(true, true, true ; "all_on")]
+fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool, emil: bool) {
     let mut app = test_app();
     let original = remote_workspace_session();
     let workspace = WorkspaceSession::new(
@@ -16297,16 +16353,26 @@ fn a_remote_tab_follows_the_skill_pack_switches(pstack: bool, mattpocock: bool) 
     let grill = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::MATTPOCOCK, true)
         [0]
     .display_name();
-    let packs = SkillPacks { pstack, mattpocock };
+    let animate = caudra_agent::skill_pack::commands_of(&caudra_agent::skill_pack::EMIL, true)[0]
+        .display_name();
+    let packs = SkillPacks {
+        pstack,
+        mattpocock,
+        emil,
+    };
 
     app.set_skill_packs(SkillPacks {
         pstack: !pstack,
         mattpocock: !mattpocock,
+        emil: !emil,
     });
     app.set_skill_packs(packs);
 
     let listed = |name: &str| app.command_palette.find_custom_command(name).is_some();
-    assert_eq!((listed(&poteto), listed(&grill)), (pstack, mattpocock));
+    assert_eq!(
+        (listed(&poteto), listed(&grill), listed(&animate)),
+        (pstack, mattpocock, emil)
+    );
 }
 
 #[test]
@@ -19547,6 +19613,49 @@ fn env_command_writes_a_pass_pattern_to_the_global_config() {
     assert!(app.env_modal.is_open());
 }
 
+/// `/secrets` replaces a secret in the vault the session's agent reads, without the old or the
+/// new value reaching the screen. A remembered secret's file changed, which no watcher sees, so
+/// the settings are read again.
+#[test_case(SecretScope::Session, false ; "session")]
+#[test_case(SecretScope::Remembered, true ; "remembered")]
+fn secrets_command_replaces_a_secret_in_the_sessions_vault(scope: SecretScope, reread: bool) {
+    const CONFIG_FILE: &str = "caudra.toml";
+    const NAME: &str = "CLOUDFLARE_API_TOKEN";
+    const OLD: &str = "secret-canary-old-4711";
+    const NEW: &str = "secret-canary-new-0815";
+    const SHOWN: &str = "a secret's value must never reach the screen";
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    let mut app = test_app();
+    app.shell_env.config_path = Some(path.clone());
+    let vault = SecretVaults::for_session(&app.storage, app.state.session.id);
+    vault.set(NAME, SecretValue::new(OLD.into())).unwrap();
+    if scope == SecretScope::Remembered {
+        remember(&vault, &path, NAME, ForeignEntry::Refuse).unwrap();
+    }
+
+    app.execute_command(cmd("/secrets"), 0);
+    app.finish_env_work();
+    let screen = rendered(&mut app);
+    assert!(screen.contains(NAME), "{screen}");
+    assert!(!screen.contains(OLD), "{SHOWN}");
+
+    app.update(Msg::Key(key(KeyCode::Char(ENV_EDIT_KEY))));
+    app.update(Msg::Paste(NEW.into()));
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.finish_env_work();
+
+    let injected: Vec<_> = vault
+        .overlay()
+        .into_iter()
+        .map(|(name, value)| (name, value.into_string().unwrap()))
+        .collect();
+    assert_eq!(injected, [(NAME.to_owned(), NEW.to_owned())]);
+    assert_eq!(app.take_settings_stale(), reread);
+    assert!(!rendered(&mut app).contains(NEW), "{SHOWN}");
+}
+
 #[test]
 fn mcp_toggle_dispatches_action() {
     let mut app = test_app();
@@ -20582,7 +20691,7 @@ fn a_held_backspace_keeps_deleting_the_btw_follow_up(kind: KeyEventKind) {
     assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP_TRIMMED);
 }
 
-fn btw_ready_app() -> App {
+pub(crate) fn btw_ready_app() -> App {
     let mut app = test_app();
     app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         crate::history_items(&[
@@ -20714,11 +20823,17 @@ fn ask_draft_typed() -> App {
     app
 }
 
-/// Esc throws away the thread, never what was typed and not yet sent.
+/// Esc keeps the thread and what was typed and not yet sent.
 #[test_case(ask_draft_typed, ASK_DRAFT ; "first_question")]
 #[test_case(btw_awaiting_follow_up, BTW_FOLLOW_UP ; "follow_up")]
 fn an_unsent_btw_question_comes_back_on_the_next_f2(setup: fn() -> App, unsent: &str) {
     let mut app = setup();
+    let headers: Vec<String> = app
+        .stream_modal
+        .headers()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
     assert!(!app.stream_modal.is_open());
@@ -20727,7 +20842,186 @@ fn an_unsent_btw_question_comes_back_on_the_next_f2(setup: fn() -> App, unsent: 
     press_ask_btw(&mut app);
 
     assert_eq!(app.stream_modal.input_text(), unsent);
-    assert!(app.stream_modal.headers().is_empty(), "the thread is gone");
+    assert_eq!(app.stream_modal.headers(), headers, "{BTW_THREAD_KEPT}");
+}
+
+const BTW_THREAD_KEPT: &str = "a closed /btw thread must come back with what it showed";
+const MAIN_MOVED_ON: &str = "the agent kept working";
+const EXTRACT_REQUEST: &str = "Extracting the plan";
+
+fn btw_answered_and_closed() -> App {
+    let mut app = btw_awaiting_follow_up();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    assert!(app.btw_thread.is_none());
+    assert!(
+        notice_texts(&mut app).is_empty(),
+        "a closed thread keeps no marker"
+    );
+    app
+}
+
+/// What the main agent would commit while a closed thread waits: one more
+/// message, or a rewrite such as a compaction, which starts a new epoch.
+fn advance_main_history(app: &mut App, new_epoch: bool) {
+    let history = app.shared_history.as_ref().unwrap();
+    let current = history.load_full();
+    let mut messages = Vec::clone(&current.messages);
+    messages.extend(crate::expand_message(
+        &Message::user(MAIN_MOVED_ON.into()),
+        messages.last().map(|item| item.id),
+    ));
+    let next = if new_epoch {
+        HistorySnapshot::new(messages)
+    } else {
+        HistorySnapshot {
+            epoch: current.epoch,
+            messages: Arc::new(messages),
+        }
+    };
+    history.store(Arc::new(next));
+}
+
+#[test_case(false ; "f2")]
+#[test_case(true ; "slash_btw")]
+fn a_closed_btw_thread_reopens_on_the_same_lineage(by_command: bool) {
+    let mut app = btw_answered_and_closed();
+
+    if by_command {
+        app.start_btw(BTW_FOLLOW_UP.into());
+    } else {
+        press_ask_btw(&mut app);
+        assert_eq!(
+            app.stream_modal.headers(),
+            [BTW_HEADER],
+            "{BTW_THREAD_KEPT}"
+        );
+        app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!((thread.exchange_count(), thread.quoted_count()), (1, 0));
+    assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
+    assert!(app.stream_modal.is_streaming());
+    assert_eq!(
+        app.stream_modal.headers(),
+        [BTW_HEADER, BTW_FOLLOW_UP_HEADER]
+    );
+    let draft = if by_command { BTW_FOLLOW_UP } else { "" };
+    assert_eq!(
+        app.stream_modal.input_text(),
+        draft,
+        "a command's question leaves the kept draft alone"
+    );
+    assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
+}
+
+#[test_case(false ; "appended")]
+#[test_case(true ; "new_epoch")]
+fn a_btw_thread_catches_up_with_a_conversation_that_moved_on(new_epoch: bool) {
+    let mut app = btw_answered_and_closed();
+    advance_main_history(&mut app, new_epoch);
+
+    press_ask_btw(&mut app);
+    assert_eq!(
+        app.stream_modal.headers(),
+        [BTW_HEADER],
+        "{BTW_THREAD_KEPT}"
+    );
+    assert!(
+        notice_texts(&mut app).is_empty(),
+        "a thread behind its conversation has no cutoff to mark"
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.quoted_count(), 1);
+    assert_eq!(thread.exchange_count(), 0);
+    assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
+    assert!(thread.base_texts().iter().any(|text| text == MAIN_MOVED_ON));
+    assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
+}
+
+#[test]
+fn closing_mid_answer_keeps_the_thread_without_the_stopped_question() {
+    let mut app = btw_ready_app();
+    let _answer = btw_streaming(&mut app);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    press_ask_btw(&mut app);
+
+    assert_eq!(
+        app.stream_modal.headers(),
+        [BTW_HEADER],
+        "{BTW_THREAD_KEPT}"
+    );
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.exchange_count(), 0);
+    assert!(thread.pending().is_none());
+}
+
+#[test]
+fn ctrl_l_forgets_the_btw_thread_and_leaves_an_empty_ask() {
+    let mut app = btw_awaiting_follow_up();
+
+    app.update(Msg::Key(kb::CLEAR_BTW.to_key_event()));
+
+    assert!(app.stream_modal.is_open() && app.stream_modal.headers().is_empty());
+    assert!(app.btw_thread.is_none() && app.parked_btw.is_empty());
+    assert!(notice_texts(&mut app).is_empty());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    press_ask_btw(&mut app);
+    assert!(app.stream_modal.headers().is_empty());
+}
+
+#[test_case(true ; "new_session")]
+#[test_case(false ; "interrupt")]
+fn only_a_session_change_forgets_a_closed_btw_thread(new_session: bool) {
+    let mut app = btw_awaiting_follow_up();
+
+    if new_session {
+        app.reset_session();
+    } else {
+        app.close_all_overlays();
+    }
+    press_ask_btw(&mut app);
+
+    assert_eq!(app.stream_modal.headers().is_empty(), new_session);
+}
+
+#[test]
+fn an_extract_neither_shows_nor_feeds_the_kept_btw_thread() {
+    let mut app = btw_awaiting_follow_up();
+    app.close_stream_modal();
+    let (tx, rx) = flume::bounded(1);
+    let (trigger, _cancel) = caudra_agent::CancelToken::new();
+    app.stream_modal.open(
+        " /extract ",
+        EXTRACT_REQUEST.into(),
+        StreamFooter::Copy,
+        rx,
+        trigger,
+    );
+    assert_eq!(app.stream_modal.headers(), [EXTRACT_REQUEST]);
+    let StreamEvent::Done(mut done) = btw_answer() else {
+        unreachable!()
+    };
+    done.usage.purpose = LedgerPurpose::Extract;
+    tx.send(StreamEvent::Done(done)).unwrap();
+    let _ = app.tick();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    press_ask_btw(&mut app);
+
+    assert_eq!(
+        app.stream_modal.headers(),
+        [BTW_HEADER],
+        "{BTW_THREAD_KEPT}"
+    );
+    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
 }
 
 #[test]
@@ -23079,6 +23373,88 @@ fn plan_form_implement_toggled_parallel() {
             .iter()
             .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
     );
+}
+
+const BTW_NOT_ASKED: &str = "Ask on the plan form must open /btw";
+const PLAN_FORM_LOST: &str = "the plan form must stay up under /btw and after it";
+const PLAN_FORM_REACHED: &str = "input meant for /btw must never reach the plan form under it";
+/// `Implement plan`, the option drawn lowest and so furthest from the modal.
+const LAST_PLAN_OPTION: usize = 2;
+
+/// A ready plan with the form up, and a /btw that can be asked over it.
+pub(crate) fn btw_plan_app() -> App {
+    let mut app = plan_app();
+    app.btw_prompt = btw_ready_app().btw_prompt;
+    app
+}
+
+#[test_case(false ; "key")]
+#[test_case(true  ; "click")]
+fn plan_form_asks_btw_and_lands_back_on_the_form(click: bool) {
+    let mut app = btw_plan_app();
+    if click {
+        rendered(&mut app);
+        let ask = app.plan_form.footer_hit(PLAN_ASK_HINT);
+        assert!(!ask.is_empty(), "{BTW_NOT_ASKED}");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(app.update(mouse_event(kind, ask.x, ask.y)).is_empty());
+        }
+    } else {
+        assert!(app.update(Msg::Key(kb::ASK_BTW.to_key_event())).is_empty());
+    }
+    assert!(app.stream_modal.is_open(), "{BTW_NOT_ASKED}");
+    assert!(app.plan_form.is_visible(), "{PLAN_FORM_LOST}");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.plan_form.is_visible(), "{PLAN_FORM_LOST}");
+    assert!(app.plan_form_takes_input(), "{PLAN_FORM_LOST}");
+}
+
+#[test_case(KeyCode::Enter ; "enter")]
+#[test_case(KeyCode::Char(' ') ; "space")]
+#[test_case(KeyCode::Up ; "up")]
+#[test_case(KeyCode::Down ; "down")]
+fn keys_under_btw_never_reach_the_plan_form(code: KeyCode) {
+    let mut app = btw_plan_app();
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(kb::ASK_BTW.to_key_event()));
+    let selected = app.plan_form.selected();
+    let parallel = app.plan_form.parallel();
+
+    let actions = app.update(Msg::Key(key(code)));
+
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            Action::ClearAndImplement(_) | Action::SendMessage(_) | Action::RequestNewSession
+        )),
+        "{PLAN_FORM_REACHED}"
+    );
+    assert_eq!(app.plan_form.selected(), selected, "{PLAN_FORM_REACHED}");
+    assert_eq!(app.plan_form.parallel(), parallel, "{PLAN_FORM_REACHED}");
+    assert_eq!(app.state.mode, Mode::Plan, "{PLAN_FORM_REACHED}");
+    assert!(app.plan_form.is_visible(), "{PLAN_FORM_LOST}");
+}
+
+#[test]
+fn the_pointer_under_btw_never_reaches_the_plan_form() {
+    let mut app = btw_plan_app();
+    rendered(&mut app);
+    let last = app
+        .plan_form
+        .row_area(LAST_PLAN_OPTION)
+        .expect(PLAN_FORM_LOST);
+    app.update(Msg::Key(kb::ASK_BTW.to_key_event()));
+    rendered(&mut app);
+
+    app.update(mouse_event(MouseEventKind::Moved, last.x, last.y));
+
+    assert_eq!(app.plan_form.selected(), 0, "{PLAN_FORM_REACHED}");
 }
 
 #[test_case(false, false ; "local")]
@@ -29127,6 +29503,7 @@ pub(crate) mod automation_runtime {
             seq: 0,
             text: COURIER_MESSAGE.into(),
             attach: None,
+            done_reason: None,
             goal: Some(GoalClaim {
                 condition: GOAL.into(),
                 continuation_limit: Some(CONTINUATION_LIMIT),

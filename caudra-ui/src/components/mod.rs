@@ -491,6 +491,16 @@ impl HintBar {
             self.hints.get(index)?.tip_text()
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn hit(&self, index: usize) -> Rect {
+        self.hits.hit(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drawn(&self) -> &[Hint] {
+        &self.hints
+    }
 }
 
 /// The area a modal's horizontal bar is handed: its body plus the border row

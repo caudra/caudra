@@ -52,7 +52,6 @@ jobs:
               - "**.rs"
               - "**.toml"
               - "**.lua"
-              - "plugins/**"
               - "prompts/**"
               - "themes/**"
               - "words/**"

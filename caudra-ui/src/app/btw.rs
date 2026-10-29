@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use caudra_agent::CancelToken;
 use caudra_agent::context::ContextKey;
+use caudra_agent::{CancelToken, HistorySnapshot};
 use caudra_providers::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     TokenUsage, project_messages,
@@ -16,7 +16,7 @@ use crate::agent::BtwPrompt;
 use crate::chat::Chat;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::stream_modal::{
-    QUESTION_PREFIX, StreamDone, StreamEvent, StreamFooter, StreamUsage,
+    ParkedThread, QUESTION_PREFIX, StreamDone, StreamEvent, StreamFooter, StreamUsage,
 };
 use crate::components::{DisplayMessage, DisplayRole};
 
@@ -82,6 +82,26 @@ tool.\n</system-reminder>";
 const MAX_TOOL_REDIRECTS: usize = 2;
 const ROUND_SEPARATOR: &str = "\n\n";
 
+/// Leads the first question after the thread caught up with a conversation
+/// that moved on, over the exchanges it had before. Quoting them in one
+/// message keeps the conversation's cached prefix reachable, and saying they
+/// are older keeps the model from defending an answer the conversation has
+/// since overtaken.
+const REBASE_REMINDER: &str = "<system-reminder>\n# Earlier side questions\n\nThe side \
+questions quoted below were answered from an earlier point in the conversation, which has moved \
+on since. They are quoted for continuity only. Where they disagree with the conversation as it \
+now stands, the conversation is right; say so when a new answer corrects an old one.\n\
+</system-reminder>";
+/// How many earlier exchanges a caught-up thread quotes. Older ones are only
+/// counted, so a long thread cannot grow its request without bound.
+const MAX_REPLAYED_EXCHANGES: usize = 10;
+const OMITTED_PREFIX: &str = "(";
+const OMITTED_SUFFIX: &str = " earlier exchanges left out)";
+const QUESTION_OPEN: &str = "<question>\n";
+const QUESTION_CLOSE: &str = "\n</question>\n";
+const ANSWER_OPEN: &str = "<answer>\n";
+const ANSWER_CLOSE: &str = "\n</answer>";
+
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 pub(crate) fn btw_question(question: &str) -> Message {
     Message::user(format!("{BTW_REMINDER}\n\n{question}"))
@@ -130,18 +150,69 @@ fn refuse_tool_calls(message: &Message) -> Message {
     }
 }
 
+/// How far a conversation had got when a thread read it. Equal marks mean the
+/// thread's base is still the whole conversation; a conversation only grows
+/// or starts a new epoch, and a finished task's never changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryMark {
+    epoch: Option<u64>,
+    len: usize,
+}
+
+/// Where a side question reads a conversation from, held as one load so the
+/// messages and the mark that describes them cannot disagree.
+enum BtwSource {
+    Live(Arc<HistorySnapshot>),
+    Kept(Arc<Vec<Message>>),
+}
+
+impl BtwSource {
+    fn mark(&self) -> HistoryMark {
+        match self {
+            Self::Live(snapshot) => HistoryMark {
+                epoch: Some(snapshot.epoch),
+                len: snapshot.messages.len(),
+            },
+            Self::Kept(messages) => HistoryMark {
+                epoch: None,
+                len: messages.len(),
+            },
+        }
+    }
+
+    fn messages(&self) -> Result<Vec<Message>, String> {
+        match self {
+            Self::Live(snapshot) => project_messages(&snapshot.messages)
+                .map_err(|error| format!("{HISTORY_UNREADABLE}{error}")),
+            Self::Kept(messages) => Ok(Vec::clone(messages)),
+        }
+    }
+}
+
 /// A side conversation forked from the main one: the prefix and history it
 /// opened over, pinned, and the text-only exchanges asked on top of them.
-/// Nothing here is persisted; it lives exactly as long as the modal.
+/// Nothing here is persisted. Closing the modal keeps it until it is cleared
+/// or the session changes.
 pub(crate) struct BtwThread {
     prompt: Arc<BtwPrompt>,
     cache_key: Option<CacheKey>,
     /// The task whose conversation this forks, `None` for the main one.
     task: Option<String>,
     base: Vec<Message>,
+    mark: HistoryMark,
+    /// Exchanges asked over an earlier base, quoted rather than replayed.
+    earlier: Vec<(String, String)>,
+    /// Earlier exchanges too old to quote.
+    omitted: usize,
     exchanges: Vec<(String, String)>,
     pending: Option<String>,
     clarification_context: Option<String>,
+}
+
+/// A thread whose modal was closed, with what the modal showed of it.
+pub(crate) struct ParkedBtw {
+    thread: BtwThread,
+    display: ParkedThread,
 }
 
 /// Exactly what the live request sends for `base`, so the provider can reuse
@@ -169,10 +240,52 @@ impl BtwThread {
             cache_key: None,
             task: None,
             base: history,
+            mark: HistoryMark::default(),
+            earlier: Vec::new(),
+            omitted: 0,
             exchanges: Vec::new(),
             pending: None,
             clarification_context: None,
         }
+    }
+
+    /// Moves the thread onto the conversation as it stands now. The answers
+    /// so far were given over the old base, so they become quoted context
+    /// for the next question instead of turns the model would extend.
+    fn rebase(
+        &mut self,
+        (prompt, cache_key): (Arc<BtwPrompt>, Option<CacheKey>),
+        base: Vec<Message>,
+        mark: HistoryMark,
+    ) {
+        self.earlier.append(&mut self.exchanges);
+        let excess = self.earlier.len().saturating_sub(MAX_REPLAYED_EXCHANGES);
+        self.earlier.drain(..excess);
+        self.omitted += excess;
+        self.prompt = prompt;
+        self.cache_key = cache_key;
+        self.base = base;
+        self.mark = mark;
+    }
+
+    /// The earlier exchanges as the quote that leads the first question.
+    fn digest(&self) -> Option<String> {
+        if self.earlier.is_empty() {
+            return None;
+        }
+        let mut digest = REBASE_REMINDER.to_owned();
+        if self.omitted > 0 {
+            digest.push_str(&format!(
+                "{ROUND_SEPARATOR}{OMITTED_PREFIX}{}{OMITTED_SUFFIX}",
+                self.omitted
+            ));
+        }
+        for (question, answer) in &self.earlier {
+            digest.push_str(&format!(
+                "{ROUND_SEPARATOR}{QUESTION_OPEN}{question}{QUESTION_CLOSE}{ANSWER_OPEN}{answer}{ANSWER_CLOSE}"
+            ));
+        }
+        Some(digest)
     }
 
     /// A question that never settled is replaced rather than kept: the request
@@ -197,6 +310,11 @@ impl BtwThread {
     #[cfg(test)]
     pub(super) fn exchange_count(&self) -> usize {
         self.exchanges.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn quoted_count(&self) -> usize {
+        self.earlier.len()
     }
 
     #[cfg(test)]
@@ -240,8 +358,10 @@ impl BtwThread {
 
     /// The reminder rides the first question only: a later block would say
     /// nothing new and would move the cache boundary for every follow-up.
+    /// After a rebase the quoted earlier exchanges ride it too.
     fn questions(&self) -> Vec<Message> {
         let mut messages = Vec::new();
+        let digest = self.digest();
         let questions = self
             .exchanges
             .iter()
@@ -249,7 +369,10 @@ impl BtwThread {
             .chain(self.pending.as_deref().map(|question| (question, None)));
         for (index, (question, answer)) in questions.enumerate() {
             messages.push(if index == 0 {
-                btw_question(question)
+                match &digest {
+                    Some(digest) => btw_question(&format!("{digest}{ROUND_SEPARATOR}{question}")),
+                    None => btw_question(question),
+                }
             } else {
                 Message::user(question.to_owned())
             });
@@ -284,17 +407,21 @@ impl App {
             .open_clarification(self.question_form.clarification_context());
     }
 
-    /// `F2`: an empty `/btw` that reads the conversation only once the first
-    /// question is sent, so the answer sees everything up to then.
+    /// `F2`: the thread this conversation kept, or an empty `/btw` that reads
+    /// the conversation only once the first question is sent, so the answer
+    /// sees everything up to then.
     pub(super) fn open_btw_prompt(&mut self) {
-        if self.btw_prompt_for(self.active_subagent_id()).is_none() {
+        let task = self.active_subagent_id().map(str::to_owned);
+        if self.btw_prompt_for(task.as_deref()).is_none() {
             self.flash(PROMPT_INITIALIZING.into());
             return;
         }
         self.close_stream_modal();
         self.autoscroll = None;
         self.selection_state = None;
-        self.stream_modal.open_ask();
+        if !self.resume_btw(task) {
+            self.stream_modal.open_ask();
+        }
     }
 
     pub(super) fn discard_question_btw(&mut self) {
@@ -303,11 +430,98 @@ impl App {
         }
     }
 
+    /// Closes whatever the modal shows. A side thread is kept for its
+    /// conversation; a clarification and `/extract` are not.
     pub(super) fn close_stream_modal(&mut self) {
-        let _ = self.stream_modal.poll();
+        let keep = self.btw_thread.is_some() && !self.stream_modal.is_clarification();
+        if keep && self.stream_modal.is_open() {
+            self.stream_modal.park();
+        } else {
+            let _ = self.stream_modal.poll();
+        }
         self.settle_stream_modal();
         self.stream_modal.close();
-        self.end_btw_thread();
+        self.end_btw_thread(keep);
+    }
+
+    /// `Ctrl+L`: forgets the thread the modal shows and leaves an empty
+    /// `/btw` in its place.
+    pub(super) fn clear_btw_thread(&mut self) {
+        let _ = self.stream_modal.poll();
+        self.settle_stream_modal();
+        let task = match &self.btw_thread {
+            Some(thread) => thread.task.clone(),
+            None => self.active_subagent_id().map(str::to_owned),
+        };
+        self.stream_modal.close();
+        self.end_btw_thread(false);
+        self.parked_btw.remove(&task);
+        self.stream_modal.open_ask();
+    }
+
+    /// Forgets every kept thread, for a session that is going away.
+    pub(super) fn discard_btw_threads(&mut self) {
+        self.end_btw_thread(false);
+        self.parked_btw.clear();
+        self.stream_modal.forget_parked_draft();
+    }
+
+    /// Reopens the thread `task`'s conversation kept, if it kept one. One
+    /// whose conversation has moved on says so and gets no transcript marker
+    /// until its next question catches it up.
+    fn resume_btw(&mut self, task: Option<String>) -> bool {
+        let Some(parked) = self.parked_btw.remove(&task) else {
+            return false;
+        };
+        let Ok(source) = self.btw_source(task.as_deref()) else {
+            return false;
+        };
+        let current = source.mark() == parked.thread.mark;
+        self.stream_modal.resume(parked.display);
+        if current {
+            self.install_btw_thread(parked.thread);
+        } else {
+            self.stream_modal.mark_moved_on();
+            self.btw_thread = Some(parked.thread);
+        }
+        true
+    }
+
+    /// Moves the open thread onto its conversation as it stands now, if that
+    /// moved on since the thread read it. False, with the reason flashed,
+    /// when the conversation can no longer be read.
+    fn catch_up_btw_thread(&mut self) -> bool {
+        let Some(task) = self.btw_thread.as_ref().map(|thread| thread.task.clone()) else {
+            return true;
+        };
+        let caught_up = self.btw_source(task.as_deref()).and_then(|source| {
+            let mark = source.mark();
+            if self
+                .btw_thread
+                .as_ref()
+                .is_some_and(|thread| thread.mark == mark)
+            {
+                return Ok(None);
+            }
+            let route = self
+                .btw_prompt_for(task.as_deref())
+                .ok_or_else(|| PROMPT_INITIALIZING.to_owned())?;
+            Ok(Some((route, source.messages()?, mark)))
+        });
+        let (route, base, mark) = match caught_up {
+            Ok(None) => return true,
+            Ok(Some(caught_up)) => caught_up,
+            Err(error) => {
+                self.status_bar.flash(error);
+                return false;
+            }
+        };
+        if let Some(thread) = self.btw_thread.as_mut() {
+            thread.rebase(route, base, mark);
+        }
+        self.stream_modal.mark_moved_on();
+        self.mark_btw_cutoff(task.as_deref());
+        true
     }
 
     /// The task whose question the form shows, `None` for the main agent's.
@@ -346,22 +560,19 @@ impl App {
 
     /// The conversation a side question over `task` reads: an open task's as
     /// it commits, then a finished one's as it was kept.
-    fn btw_history(&self, task: Option<&str>) -> Result<Vec<Message>, String> {
-        let unreadable = |error| format!("{HISTORY_UNREADABLE}{error}");
+    fn btw_source(&self, task: Option<&str>) -> Result<BtwSource, String> {
         let Some(task) = task else {
-            let items = self
-                .shared_history
-                .as_ref()
-                .map(|h| Vec::clone(&h.load().messages))
-                .unwrap_or_default();
-            return project_messages(&items).map_err(unreadable);
+            return Ok(match &self.shared_history {
+                Some(history) => BtwSource::Live(history.load_full()),
+                None => BtwSource::Kept(Arc::default()),
+            });
         };
         if let Some(mirror) = self
             .context_store
             .as_ref()
             .and_then(|store| store.live_history(&ContextKey::task(task)))
         {
-            return project_messages(&mirror.load().messages).map_err(unreadable);
+            return Ok(BtwSource::Live(mirror.load_full()));
         }
         self.subagent_history
             .as_ref()
@@ -370,14 +581,17 @@ impl App {
                 snapshot
                     .records()
                     .get(task)
-                    .map(|record| Vec::clone(record.messages()))
+                    .map(|record| BtwSource::Kept(Arc::clone(record.messages())))
             })
             .ok_or_else(|| TASK_HISTORY_UNAVAILABLE.to_owned())
     }
 
     fn capture_btw_thread(&mut self, task: Option<String>) -> Option<BtwThread> {
-        let messages = match self.btw_history(task.as_deref()) {
-            Ok(messages) => messages,
+        let read = self
+            .btw_source(task.as_deref())
+            .and_then(|source| Ok((source.messages()?, source.mark())));
+        let (messages, mark) = match read {
+            Ok(read) => read,
             Err(error) => {
                 self.status_bar.flash(error);
                 return None;
@@ -390,6 +604,7 @@ impl App {
         let mut thread = BtwThread::new(prompt, messages);
         thread.cache_key = cache_key;
         thread.task = task;
+        thread.mark = mark;
         Some(thread)
     }
 
@@ -403,40 +618,30 @@ impl App {
     }
 
     fn install_btw_thread(&mut self, thread: BtwThread) {
-        // Streaming text is not in history yet and draws below every message,
-        // so a marker appended now lands exactly where the snapshot cuts.
-        if let Some(chat) = self.btw_chat(thread.task.as_deref()) {
+        let task = thread.task.clone();
+        self.btw_thread = Some(thread);
+        self.mark_btw_cutoff(task.as_deref());
+    }
+
+    /// Streaming text is not in history yet and draws below every message,
+    /// so a marker appended now lands exactly where the snapshot cuts.
+    fn mark_btw_cutoff(&mut self, task: Option<&str>) {
+        if let Some(chat) = self.btw_chat(task) {
+            chat.remove_notice(BTW_CUTOFF_MARKER);
             chat.push(DisplayMessage::new(
                 DisplayRole::Notice,
                 BTW_CUTOFF_MARKER.into(),
             ));
         }
-        self.btw_thread = Some(thread);
     }
 
     pub(crate) fn start_btw(&mut self, question: String) {
-        let task = self.active_subagent_id().map(str::to_owned);
-        let Some(thread) = self.capture_btw_thread(task) else {
-            return;
-        };
-        self.open_btw(thread, format!("{QUESTION_PREFIX}{question}"), question);
+        self.open_btw(format!("{QUESTION_PREFIX}{question}"), question, |_| true);
     }
 
     /// A `/btw` with a canned question, headed by a short label rather than
     /// the prompt, so copying the thread does not repeat the whole prompt.
     pub(crate) fn start_catchup(&mut self, focus: &str) {
-        let task = self.active_subagent_id().map(str::to_owned);
-        let Some(thread) = self.capture_btw_thread(task) else {
-            return;
-        };
-        if !thread
-            .base
-            .iter()
-            .any(|message| matches!(message.role, Role::User))
-        {
-            self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
-            return;
-        }
         let (header, question) = if focus.is_empty() {
             (CATCHUP_HEADER.to_owned(), CATCHUP_PROMPT.to_owned())
         } else {
@@ -445,12 +650,42 @@ impl App {
                 format!("{CATCHUP_PROMPT}{CATCHUP_FOCUS_PREFIX}{focus}"),
             )
         };
-        self.open_btw(thread, header, question);
+        self.open_btw(header, question, |thread| {
+            thread
+                .base
+                .iter()
+                .any(|message| matches!(message.role, Role::User))
+        });
     }
 
-    fn open_btw(&mut self, mut thread: BtwThread, header: String, question: String) {
-        self.renew_question_wait();
+    /// Asks `question` in the thread the focused conversation kept, caught
+    /// up with it, or in a new one. `answerable` says whether the thread's
+    /// view of the conversation gives the question anything to answer from.
+    fn open_btw(&mut self, header: String, question: String, answerable: fn(&BtwThread) -> bool) {
+        let task = self.active_subagent_id().map(str::to_owned);
         self.close_stream_modal();
+        if self.resume_btw(task.clone()) {
+            if !self.catch_up_btw_thread() {
+                return;
+            }
+            if !self.btw_thread.as_ref().is_some_and(answerable) {
+                self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
+                return;
+            }
+            if let Some(thread) = self.btw_thread.as_mut() {
+                thread.ask(question);
+            }
+            self.stream_btw_answer(header);
+            return;
+        }
+        let Some(mut thread) = self.capture_btw_thread(task) else {
+            return;
+        };
+        if !answerable(&thread) {
+            self.status_bar.flash(NOTHING_TO_CATCH_UP.into());
+            return;
+        }
+        self.renew_question_wait();
         thread.ask(question);
         self.install_btw_thread(thread);
 
@@ -462,7 +697,8 @@ impl App {
     }
 
     /// Asks the next question over the same snapshot and prefix, so the whole
-    /// thread stays one cached lineage.
+    /// thread stays one cached lineage, unless the conversation moved on
+    /// since, when the thread catches up with it first.
     pub(crate) fn continue_btw(&mut self, question: String) {
         self.settle_stream_modal();
         let context = self
@@ -480,20 +716,26 @@ impl App {
                 return;
             };
             self.install_btw_thread(thread);
+        } else if context.is_none() && !self.catch_up_btw_thread() {
+            self.stream_modal.handle_paste(&question);
+            return;
         }
+        let header = format!("{QUESTION_PREFIX}{question}");
         let Some(thread) = self.btw_thread.as_mut() else {
             return;
         };
-        if let Some(context) = context {
-            thread.ask_clarification(question.clone(), context);
-        } else {
-            thread.ask(question.clone());
+        match context {
+            Some(context) => thread.ask_clarification(question, context),
+            None => thread.ask(question),
         }
+        self.stream_btw_answer(header);
+    }
+
+    fn stream_btw_answer(&mut self, header: String) {
         self.renew_question_wait();
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
-        self.stream_modal
-            .begin_exchange(format!("{QUESTION_PREFIX}{question}"), rx, trigger);
+        self.stream_modal.begin_exchange(header, rx, trigger);
         self.spawn_btw(tx, cancel);
     }
 
@@ -520,14 +762,22 @@ impl App {
         }
     }
 
-    /// Forgets the thread and takes its marker out of the transcript. Every
-    /// way the modal closes reaches here through the tick, so no close path
-    /// has to know about the marker.
-    pub(crate) fn end_btw_thread(&mut self) {
-        if let Some(thread) = self.btw_thread.take()
-            && let Some(chat) = self.btw_chat(thread.task.as_deref())
-        {
+    /// Takes the open thread and its marker out of the transcript, keeping
+    /// the thread for its conversation when `keep` says so and the modal set
+    /// its exchanges aside. Every way the modal closes reaches here through
+    /// the tick, so no close path has to know about the marker.
+    pub(crate) fn end_btw_thread(&mut self, keep: bool) {
+        let display = self.stream_modal.take_parked();
+        let Some(mut thread) = self.btw_thread.take() else {
+            return;
+        };
+        if let Some(chat) = self.btw_chat(thread.task.as_deref()) {
             chat.remove_notice(BTW_CUTOFF_MARKER);
+        }
+        if keep && let Some(display) = display {
+            thread.settle(None);
+            self.parked_btw
+                .insert(thread.task.clone(), ParkedBtw { thread, display });
         }
     }
 }
@@ -1175,6 +1425,72 @@ mod tests {
         assert!(thread.exchanges.is_empty());
         assert!(thread.pending.is_none());
         assert_eq!(thread.request_messages().len(), 1, "only the base remains");
+    }
+
+    const NEWER: &str = "we switched to postgres";
+    const REBASE_MSG: &str =
+        "a caught-up thread quotes its earlier exchanges in its first question";
+
+    fn rebased(exchanges: usize) -> BtwThread {
+        let mut thread = thread();
+        for _ in 0..exchanges {
+            thread.ask(Q.into());
+            thread.settle(Some(ANSWER.into()));
+        }
+        let route = (Arc::clone(&thread.prompt), None);
+        thread.rebase(
+            route,
+            vec![Message::user(BASE.into()), Message::user(NEWER.into())],
+            HistoryMark {
+                epoch: None,
+                len: 2,
+            },
+        );
+        thread.ask(FOLLOW_UP.into());
+        thread
+    }
+
+    #[test]
+    fn a_rebased_thread_quotes_its_earlier_exchanges_over_the_new_base() {
+        let messages = rebased(1).request_messages();
+        let texts: Vec<String> = messages.iter().map(user_text).collect();
+        assert_eq!(texts.len(), 3, "{REBASE_MSG}");
+        assert_eq!(texts[..2], [BASE, NEWER]);
+        let question = &texts[2];
+        assert!(question.starts_with(BTW_REMINDER), "{REBASE_MSG}");
+        assert!(question.contains(REBASE_REMINDER), "{REBASE_MSG}");
+        assert!(question.contains(&format!("{QUESTION_OPEN}{Q}{QUESTION_CLOSE}")));
+        assert!(question.contains(&format!("{ANSWER_OPEN}{ANSWER}{ANSWER_CLOSE}")));
+        assert!(question.ends_with(FOLLOW_UP));
+        assert!(!question.contains(OMITTED_SUFFIX));
+    }
+
+    #[test]
+    fn a_rebased_thread_settles_and_extends_its_new_lineage() {
+        let mut thread = rebased(1);
+        thread.settle(Some(ANSWER.into()));
+        let first = thread.request_messages();
+        thread.ask(Q.into());
+        let next = thread.request_messages();
+        assert_eq!(
+            serde_json::to_value(&next[..first.len()]).unwrap(),
+            serde_json::to_value(&first).unwrap(),
+            "a follow-up after a rebase extends the request before it"
+        );
+        assert_eq!(user_text(next.last().unwrap()), Q);
+    }
+
+    #[test]
+    fn a_long_thread_quotes_only_its_latest_exchanges() {
+        let extra = 2;
+        let thread = rebased(MAX_REPLAYED_EXCHANGES + extra);
+        let question = user_text(thread.request_messages().last().unwrap());
+        assert_eq!(thread.earlier.len(), MAX_REPLAYED_EXCHANGES);
+        assert!(question.contains(&format!("{OMITTED_PREFIX}{extra}{OMITTED_SUFFIX}")));
+        assert_eq!(
+            question.matches(QUESTION_OPEN).count(),
+            MAX_REPLAYED_EXCHANGES
+        );
     }
 
     #[test]

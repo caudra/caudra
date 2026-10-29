@@ -179,6 +179,8 @@ Tool permission prompts arrive as `session/request_permission`. "Allow exact cal
 
 The `question` tool becomes a native form in an editor that supports ACP form elicitation. An editor without it that sets `clientCapabilities._meta["caudra/questionsViaPermission"]: true` gets a question with a single choice list as a `session/request_permission` instead, with the tool call id `interaction_<call id>` and one option per answer, `answer_0`, `answer_1`, and so on. The `openmausbot` client gets this too, matched by its `clientInfo.name`, because it used this convention before the flag existed. If the client supports neither, the tool is dropped and the model asks in plain text. URL-mode MCP elicitations send `elicitation/complete` when they finish.
 
+The `request_secret` card becomes a form with a masked field when the editor supports form elicitation, and is refused otherwise. See [Secrets](/docs/secrets/#where-secrets-work).
+
 ## Subagents and background tasks
 
 Subagents and background shell commands work as they do in the TUI: a task or shell command the model starts with `background: true` runs in the background, and so does a shell command still running at the [foreground limit](/docs/sessions/#execution-policies). Workflows are not available over ACP. Cancelling a turn cancels its subagents and stops the session's background work. Closing a session stops both too.

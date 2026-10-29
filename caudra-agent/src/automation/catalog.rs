@@ -1,5 +1,6 @@
-//! Discovers the automation scripts a session may arm: `<project>/.caudra/automations`, then the
-//! user's `<config>/automations`, then the [`bundled`](super::bundled) ones the binary ships. The
+//! Discovers the automation scripts a session may arm: its own directory, then
+//! `<project>/.caudra/automations`, the user's `<config>/automations`, and the
+//! [`bundled`](super::bundled) ones the binary ships. The
 //! catalog keeps one entry per name: an earlier scope's script hides a later one of the same name
 //! and records its scope in `shadowed`. A script that breaks a rule stays listed as invalid, with
 //! the reason.
@@ -62,7 +63,7 @@ pub struct ResolvedAutomation {
 
 #[derive(Debug, Default)]
 pub struct Catalog {
-    /// One per name, the project scope's first.
+    /// One per name, the session scope's first.
     entries: Vec<ResolvedAutomation>,
     invalid: Vec<InvalidEntry>,
     /// The invalid names that only this frontend refuses: another one serves them.
@@ -81,6 +82,8 @@ pub enum Frontend {
 /// The directories a scan reads, as resolved for this machine and build.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutomationDirs {
+    /// `None` when tools run remotely and cannot write this machine's session files.
+    pub session: Option<PathBuf>,
     /// `None` for a remote session, whose project lives on another machine, or when the working
     /// directory does not resolve.
     pub project: Option<PathBuf>,
@@ -122,12 +125,14 @@ pub enum CatalogError {
 impl Catalog {
     pub fn scan(
         state_dir: &StateDir,
+        session_dir: Option<&Path>,
         cwd: &Path,
         features: FeatureFlags,
         frontend: Frontend,
     ) -> Self {
         Self::scan_with(
             state_dir,
+            session_dir,
             cwd,
             config_dir().ok().as_deref(),
             &bundled_automations(),
@@ -142,6 +147,7 @@ impl Catalog {
     /// that need what only the TUI serves.
     pub fn scan_with(
         state_dir: &StateDir,
+        session_dir: Option<&Path>,
         cwd: &Path,
         user_config: Option<&Path>,
         bundled: &[BundledAutomation],
@@ -157,6 +163,9 @@ impl Catalog {
                 .ok(),
             ..Self::default()
         };
+        if let Some(dir) = session_dir {
+            catalog.scan_directory(dir, Scope::Session, features, frontend, |_, _| false);
+        }
         if let Some(root) = catalog.project_root.clone() {
             catalog.scan_directory(
                 &project_dir(&root),
@@ -250,6 +259,7 @@ impl Catalog {
             reason,
         };
         let directory = match scope {
+            Scope::Session => directories.session.as_deref(),
             Scope::Project => directories.project.as_deref(),
             Scope::User => directories.user.as_deref(),
             Scope::Bundled => return Err(refuse(BUNDLED_DELETE.to_owned())),
@@ -278,7 +288,7 @@ impl Catalog {
         Ok(path)
     }
 
-    /// One loadable script per name, the project scope's first.
+    /// One loadable script per name, the session scope's first.
     pub fn entries(&self) -> &[ResolvedAutomation] {
         &self.entries
     }
@@ -440,8 +450,13 @@ impl Catalog {
 impl AutomationDirs {
     /// `cwd` is the session's working directory, `None` for a remote session; `user_config` is
     /// the user's config directory, as [`Catalog::scan_with`] takes them.
-    pub fn resolve(cwd: Option<&Path>, user_config: Option<&Path>) -> Self {
+    pub fn resolve(
+        session: Option<PathBuf>,
+        cwd: Option<&Path>,
+        user_config: Option<&Path>,
+    ) -> Self {
         Self {
+            session,
             project: cwd
                 .and_then(|cwd| cwd.canonicalize().ok())
                 .map(|root| project_dir(&root)),
@@ -646,6 +661,8 @@ mod tests {
         ALWAYS_OUTSIDE_USER_SCOPE, ALWAYS_WITH_SCHEDULE, STEM_MISMATCH,
     };
     use caudra_automation::meta::MetaError;
+    use caudra_storage::automation::session_dir;
+    use caudra_storage::id::CaudraId;
     use caudra_storage::topics::{INVALID_PATTERN, INVALID_TOPIC};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -688,6 +705,7 @@ mod tests {
         state_dir: StateDir,
         project: PathBuf,
         config: PathBuf,
+        session_id: CaudraId,
     }
 
     impl Fixture {
@@ -701,6 +719,7 @@ mod tests {
                 state_dir: StateDir::from_path(temp.path().join("state")),
                 project: project.canonicalize().unwrap(),
                 config,
+                session_id: CaudraId::generate(),
                 _temp: temp,
             }
         }
@@ -713,9 +732,14 @@ mod tests {
             self.config.join(AUTOMATIONS_SUBDIR)
         }
 
+        fn session_dir(&self) -> PathBuf {
+            session_dir(&self.state_dir, self.session_id)
+        }
+
         /// Writes `source` as `name`'s script in `scope`, or returns it bundled.
         fn place(&self, scope: Scope, name: &str, source: &str) -> Option<BundledAutomation> {
             let dir = match scope {
+                Scope::Session => self.session_dir(),
                 Scope::Project => self.project_dir(),
                 Scope::User => self.user_dir(),
                 Scope::Bundled => return Some(bundled(name, source)),
@@ -738,6 +762,7 @@ mod tests {
         fn scan_in(&self, features: FeatureFlags, frontend: Frontend) -> Catalog {
             Catalog::scan_with(
                 &self.state_dir,
+                Some(&self.session_dir()),
                 &self.project,
                 Some(&self.config),
                 &[],
@@ -749,6 +774,7 @@ mod tests {
         fn scan_bundled(&self, bundled: &[BundledAutomation]) -> Catalog {
             Catalog::scan_with(
                 &self.state_dir,
+                Some(&self.session_dir()),
                 &self.project,
                 Some(&self.config),
                 bundled,
@@ -775,18 +801,24 @@ mod tests {
     }
 
     #[test_case(Scope::Project; "project")]
+    #[test_case(Scope::Session; "session")]
     #[test_case(Scope::User; "user")]
     fn deletion_requires_the_resolved_directory_and_unchanged_file(scope: Scope) {
         let fixture = Fixture::new();
         fixture.place(scope, NAME, &script(NAME, ARMED));
         let catalog = fixture.scan(FeatureFlags::NONE);
         let path = catalog.resolve(NAME).unwrap().entry.path;
-        let directories = AutomationDirs::resolve(Some(&fixture.project), Some(&fixture.config));
+        let directories = AutomationDirs::resolve(
+            Some(fixture.session_dir()),
+            Some(&fixture.project),
+            Some(&fixture.config),
+        );
         assert_eq!(
             catalog.delete_path(NAME, &directories).unwrap(),
             path.canonicalize().unwrap()
         );
         let wrong = AutomationDirs {
+            session: Some(fixture.project.clone()),
             project: Some(fixture.project.clone()),
             user: Some(fixture.config.clone()),
         };
@@ -852,7 +884,11 @@ mod tests {
     #[test]
     fn the_resolved_directories_are_the_ones_the_scan_reads() {
         let fixture = Fixture::new();
-        let dirs = AutomationDirs::resolve(Some(&fixture.project), Some(&fixture.config));
+        let dirs = AutomationDirs::resolve(
+            Some(fixture.session_dir()),
+            Some(&fixture.project),
+            Some(&fixture.config),
+        );
         let project = dirs.project.expect(PROJECT_DIR_RESOLVES);
         let user = dirs.user.expect(USER_DIR_RESOLVES);
         fixture.write(&project, &file_name(NAME), script(NAME, ARMED).as_bytes());
@@ -870,8 +906,9 @@ mod tests {
             Scope::User
         );
         assert_eq!(
-            AutomationDirs::resolve(None, Some(&fixture.config)),
+            AutomationDirs::resolve(None, None, Some(&fixture.config)),
             AutomationDirs {
+                session: None,
                 project: None,
                 user: Some(user),
             },
@@ -1111,6 +1148,7 @@ mod tests {
     }
 
     #[test_case(Scope::User, Ok(vec![ALWAYS_WITH_SCHEDULE.to_owned()]); "user_scope_warns")]
+    #[test_case(Scope::Session, Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "session_scope_is_invalid")]
     #[test_case(Scope::Project, Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "project_scope_is_invalid")]
     #[test_case(Scope::Bundled, Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "bundled_scope_is_invalid")]
     fn arming_always_follows_the_scope(scope: Scope, expected: Result<Vec<String>, String>) {
@@ -1166,6 +1204,10 @@ mod tests {
     }
 
     #[test_case(&[Scope::Bundled] => (Scope::Bundled, Vec::new()); "bundled_alone")]
+    #[test_case(&[Scope::Session, Scope::Project] => (Scope::Session, vec![Scope::Project]); "session_over_project")]
+    #[test_case(&[Scope::Session, Scope::User] => (Scope::Session, vec![Scope::User]); "session_over_user")]
+    #[test_case(&[Scope::Session, Scope::Bundled] => (Scope::Session, vec![Scope::Bundled]); "session_over_bundled")]
+    #[test_case(&[Scope::Session, Scope::Project, Scope::User, Scope::Bundled] => (Scope::Session, vec![Scope::Project, Scope::User, Scope::Bundled]); "session_over_all")]
     #[test_case(&[Scope::User, Scope::Bundled] => (Scope::User, vec![Scope::Bundled]); "user_over_bundled")]
     #[test_case(&[Scope::Project, Scope::Bundled] => (Scope::Project, vec![Scope::Bundled]); "project_over_bundled")]
     #[test_case(&[Scope::Project, Scope::User, Scope::Bundled] => (Scope::Project, vec![Scope::User, Scope::Bundled]); "project_over_both")]
@@ -1256,9 +1298,12 @@ mod tests {
         assert!(!scan());
     }
 
-    #[test]
-    fn the_user_only_scan_reads_the_user_and_bundled_scopes() {
+    #[test_case(Scope::Session; "ignores_session")]
+    #[test_case(Scope::Project; "ignores_project")]
+    fn the_user_only_scan_reads_the_user_and_bundled_scopes(ignored: Scope) {
         let fixture = Fixture::new();
+        fixture.place(ignored, NAME, &script(NAME, ARMED));
+        fixture.place(ignored, OTHER_NAME, &script(OTHER_NAME, ARMED));
         fixture.write(
             &fixture.project_dir(),
             &file_name(NAME),
@@ -1300,6 +1345,7 @@ mod tests {
             fixture.scan(FeatureFlags::NONE),
             Catalog::scan_with(
                 &fixture.state_dir,
+                Some(&fixture.session_dir()),
                 &missing_cwd,
                 None,
                 &[],

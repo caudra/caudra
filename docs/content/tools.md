@@ -3,7 +3,7 @@ title: "Tools"
 description: "Every built-in tool and its parameters."
 ---
 
-Caudra ships with 28 built-in tools in this reference (28 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 29 built-in tools in this reference. Availability depends on the selected workspace backend.
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -242,6 +242,17 @@ Use this tool when you need to ask the user questions during execution. This all
 |-----------|------|----------|-------------|
 | `questions` | array | yes | Questions to ask |
 | `background` | boolean | no | Ask without waiting: return a question ID now, and the answer arrives automatically later, including after you end your turn. Default false waits for the answer. |
+
+### `request_secret` {#request_secret}
+
+Ask the user for a secret, such as an API token, key or password, on a private card. The value never enters the chat. This session's shell commands receive it as the environment variable `name`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | The environment variable shell commands read the secret from, such as CLOUDFLARE_API_TOKEN |
+| `label` | string | yes | Card title naming the secret, such as Cloudflare API token (2-6 words) |
+| `reason` | string | yes | What the secret is for and where the user gets it |
+| `placeholder` | string | no | Hint shown in the empty field, such as the token's usual prefix |
 
 ## Agent & Knowledge
 

@@ -25,7 +25,8 @@ const EXAMPLES_DIR: &str = "../caudra-automation/tests/examples";
 const EXAMPLE_EXTENSION: &str = "rhai";
 /// Every example in [`EXAMPLES_DIR`], in teaching order: one session first,
 /// then unattended sessions and other services, then a swarm.
-const AUTOMATION_EXAMPLES: [&str; 17] = [
+const AUTOMATION_EXAMPLES: [&str; 18] = [
+    "follow-up",
     "retry-overload",
     "keep-going",
     "timebox",

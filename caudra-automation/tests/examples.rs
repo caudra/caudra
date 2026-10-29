@@ -40,6 +40,9 @@ const PROJECT_AUTOMATIONS_DIR: &str = "../.caudra/automations";
 const EXAMPLE_EXTENSION: &str = "rhai";
 const CI_TRIAGE: &str = "ci-triage";
 const CI_WATCH: &str = "ci-watch";
+const FOLLOW_UP: &str = "follow-up";
+const FOLLOW_UP_TEXT: &str = "Check whether the test run has finished.";
+const FOLLOW_UP_SENT: &str = "sent";
 const GOAL_CHAIN: &str = "goal-chain";
 const GOAL_WEBHOOK: &str = "goal-webhook";
 const JOIN_SWARM: &str = "join-swarm";
@@ -55,9 +58,10 @@ const STATUS_DESK: &str = "status-desk";
 const TASK_TRACKER: &str = "task-tracker";
 const TIMEBOX: &str = "timebox";
 const WORK_NUDGE: &str = "work-nudge";
-const EXAMPLES: [&str; 17] = [
+const EXAMPLES: [&str; 18] = [
     CI_TRIAGE,
     CI_WATCH,
+    FOLLOW_UP,
     GOAL_CHAIN,
     GOAL_WEBHOOK,
     JOIN_SWARM,
@@ -535,6 +539,7 @@ fn success(request: &ActionRequest) -> ActionReply {
         ActionRequest::Message(_)
         | ActionRequest::Notify { .. }
         | ActionRequest::Pause { .. }
+        | ActionRequest::Done { .. }
         | ActionRequest::Log { .. } => ActionReply::Done,
     }
 }
@@ -917,6 +922,30 @@ fn every_example_validates_under_its_own_name() {
         })
         .collect::<Vec<_>>();
     assert_eq!(failures, Vec::<String>::new());
+}
+
+#[test_case(FOLLOW_UP_TEXT; "reminder")]
+#[test_case(APPROVE_SHELL; "custom_text")]
+fn follow_up_fires_once(text: &str) {
+    let follow_up = Automation::armed_with(FOLLOW_UP, json!({ "text": text }));
+    let event = scheduled();
+    let host = ScriptedHost::default();
+    assert!(!follow_up.routes(&armed(ArmedReason::Manual)));
+    assert!(follow_up.routes(&event));
+
+    let outcome = follow_up.outcome(&event, &host);
+    assert_eq!(outcome.end, FiringEnd::Completed);
+    assert_eq!(
+        host.requests(),
+        vec![
+            messaged(text),
+            json!({ "kind": "done", "reason": FOLLOW_UP_SENT }),
+        ]
+    );
+
+    let replayed = follow_up.replay(&event, &[]);
+    assert_eq!(replayed.outcome, outcome);
+    assert_eq!(answers(&replayed), host.replay_answers());
 }
 
 #[test]

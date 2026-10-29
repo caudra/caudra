@@ -176,6 +176,11 @@ impl MemoryStore {
         &self.source
     }
 
+    /// How many live notes the project has, as the journal last recorded.
+    pub fn live_count(&self) -> Result<u64, MemoryError> {
+        Ok(self.journal().live_count(&self.scope)?)
+    }
+
     /// The journal, for the reads and leases no method here wraps. Never
     /// held across an await.
     pub fn journal(&self) -> MutexGuard<'_, MemoryJournal> {

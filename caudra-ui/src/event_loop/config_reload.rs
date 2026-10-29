@@ -59,10 +59,11 @@ const WEBSEARCH_REMOTE: &str =
     "[websearch] does not apply here: web tools run on the remote Workcell";
 /// Keys that apply as soon as the file is saved, in a table whose other keys wait. A key
 /// may be a dotted path into the table.
-const NOW_KEYS: [(&str, &str); 3] = [
+const NOW_KEYS: [(&str, &str); 4] = [
     ("ui", "show_decisions"),
     ("plugins", "skill.pstack"),
     ("plugins", "skill.mattpocock"),
+    ("plugins", "skill.emil"),
 ];
 const KEY_PATH_SEPARATOR: char = '.';
 /// The tables whose settings a session adopts at its next turn.
@@ -512,6 +513,27 @@ impl EventLoop<'_> {
         }
     }
 
+    /// Reads the settings again although no watched file changed: a file a `{file:…}` reference
+    /// reads, such as a remembered secret's, now holds something else. Caudra changed it, so
+    /// only problems are shown.
+    pub(super) fn reread_settings(&mut self) {
+        let cwd = env::current_dir().ok();
+        let local = self.ctx.workspace_session.is_none();
+        let mut part = Report::default();
+        if self.reload_settings(cwd.as_deref(), local, &mut part) {
+            self.publish_settings();
+        }
+        let mut report = Report::default();
+        report.merge(part, Change::Own);
+        info!(
+            problems = report.problems.len(),
+            "read settings again for a referenced file"
+        );
+        if let Some(message) = report.render() {
+            self.focused_app().flash(message);
+        }
+    }
+
     /// Applies one changed source, and says whether sessions need the
     /// settings published again.
     fn apply_source(
@@ -942,6 +964,8 @@ mod tests {
     const PSTACK_KEY: &str = "plugins.skill.pstack";
     const MATTPOCOCK_ON: &str = "[plugins.skill]\npstack = false\nmattpocock = true\n";
     const MATTPOCOCK_KEY: &str = "plugins.skill.mattpocock";
+    const EMIL_ON: &str = "[plugins.skill]\npstack = false\nemil = true\n";
+    const EMIL_KEY: &str = "plugins.skill.emil";
     const PLUGINS_TABLE: &str = "plugins";
     const DECISIONS_ADDED: &str = "[agent]\nmax_output_lines = 10\n\n[ui]\ntheme = \"dark\"\n\n[decisions.features]\nmemory_search = \"enforce\"\n";
     const LOADING_PROFILE: (&str, &str) = ("review", "Review carefully.");
@@ -1072,6 +1096,7 @@ mod tests {
 
     #[test_case(PSTACK_OFF, PSTACK_ON, &[(PSTACK_KEY, false)] ; "the_pstack_switch_alone")]
     #[test_case(PSTACK_OFF, MATTPOCOCK_ON, &[(MATTPOCOCK_KEY, false)] ; "the_mattpocock_switch_alone")]
+    #[test_case(PSTACK_OFF, EMIL_ON, &[(EMIL_KEY, false)] ; "the_emil_switch_alone")]
     #[test_case(PSTACK_OFF, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true), (PSTACK_KEY, false)] ; "the_switch_beside_another_skill_flag")]
     #[test_case(PSTACK_ON, PSTACK_ON_DOCS_OFF, &[(PLUGINS_TABLE, true)] ; "another_skill_flag_alone")]
     fn a_nested_key_that_applies_at_once_is_named_by_its_path(

@@ -11,6 +11,7 @@ use super::rows::{
     BUILT_IN_NOTE, BUILT_IN_STATE, EnvRow, FORWARDED_SECTION, PASS_STATE, PATTERN_SECTION,
     RowAction, Unforward, names_state, via, via_note,
 };
+use super::secrets::LOCAL_ONLY;
 
 pub(super) const PROFILE_SET_SECTION: &str = "Set by profile";
 pub(super) const AVAILABLE_SECTION: &str = "Available";
@@ -87,6 +88,7 @@ impl GuestListing {
             Change::RemovePattern(raw) => {
                 selection.pass.retain(|pattern| pattern.to_string() != raw)
             }
+            Change::Secret(_) => return Err(LOCAL_ONLY.to_owned()),
         }
         selection.validate().map_err(|error| error.to_string())?;
         Ok(selection)

@@ -1314,14 +1314,13 @@ pub fn index(cli: &Cli, path: &str) -> Result<()> {
         cli.startup.features,
     )?;
 
-    let mut host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
+    let host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
 
-    host.load_production_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    host.warm_jit();
 
     ensure_index_enabled(&config.agent)?;
     let reg = ToolRegistry::global_arc();
@@ -1710,7 +1709,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     )?;
 
     let reg = ToolRegistry::global_arc();
-    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
+    let host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     if let Some(local) = runtime.local_host() {
         for warning in local.websearch().apply(&config.websearch).warnings() {
@@ -1719,8 +1718,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     }
     super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
-    host.load_production_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    host.warm_jit();
 
     let mut model = resolve_model(
         cli.model.as_deref(),
@@ -1827,11 +1825,10 @@ pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool
     )?;
 
     let reg = ToolRegistry::global_arc();
-    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
+    let host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config);
-    host.load_production_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    host.warm_jit();
 
     if let Some(name) = name {
         let serve = SkillServe {
@@ -1957,15 +1954,14 @@ pub fn prompt(
         template::env_vars()
     };
     let reg = ToolRegistry::global_arc();
-    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
+    let host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     if let Some(local) = runtime.local_host() {
         local.websearch().apply(&config.websearch);
     }
     super::configure_native_tools(&config);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
-    host.load_production_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    host.warm_jit();
 
     let cwd_str = cwd.to_string_lossy();
     let instructions = if let Some(context) = runtime.remote_project_context() {

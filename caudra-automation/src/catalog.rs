@@ -20,6 +20,7 @@ pub const ALWAYS_WITH_SCHEDULE: &str = "arm: \"always\" runs this schedule in ev
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
+    Session,
     User,
     Project,
     /// Shipped in the binary by a provider such as pstack, and listed while it is on.
@@ -29,7 +30,7 @@ pub enum Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
-    /// A user or bundled script, trusted where it lives.
+    /// A session, user or bundled script, trusted where it lives.
     Location,
     /// A project script whose exact digest was approved.
     Approved,
@@ -63,8 +64,8 @@ pub struct InvalidEntry {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AutomationCatalog {
-    /// One per name: a project script hides a user script of the same name, either hides a
-    /// bundled one, and the winner lists the hidden scopes in `shadowed`.
+    /// One per name, in session, project, user, bundled precedence order.
+    /// The winner lists the hidden scopes in `shadowed`.
     pub entries: Vec<CatalogEntry>,
     pub invalid: Vec<InvalidEntry>,
 }
@@ -72,7 +73,7 @@ pub struct AutomationCatalog {
 impl Trust {
     pub const fn assess(scope: Scope, digest_approved: bool) -> Self {
         match (scope, digest_approved) {
-            (Scope::User | Scope::Bundled, _) => Self::Location,
+            (Scope::Session | Scope::User | Scope::Bundled, _) => Self::Location,
             (Scope::Project, true) => Self::Approved,
             (Scope::Project, false) => Self::Required,
         }
@@ -151,6 +152,8 @@ mod tests {
     }
 
     #[test_case(Scope::User, false => Trust::Location; "user_scope")]
+    #[test_case(Scope::Session, false => Trust::Location; "session_scope")]
+    #[test_case(Scope::Session, true => Trust::Location; "approved_session_scope")]
     #[test_case(Scope::User, true => Trust::Location; "approved_user_scope")]
     #[test_case(Scope::Project, true => Trust::Approved; "approved_project")]
     #[test_case(Scope::Project, false => Trust::Required; "unapproved_project")]
@@ -179,6 +182,8 @@ mod tests {
     }
 
     #[test_case(Scope::User, ArmMode::Manual, vec![Trigger::Armed] => Ok(Vec::new()); "manual_user")]
+    #[test_case(Scope::Session, ArmMode::Manual, polling() => Ok(Vec::new()); "manual_session_schedule")]
+    #[test_case(Scope::Session, ArmMode::Always, vec![Trigger::Armed] => Err(ALWAYS_OUTSIDE_USER_SCOPE.to_owned()); "always_session")]
     #[test_case(Scope::Project, ArmMode::Manual, polling() => Ok(Vec::new()); "manual_project_schedule")]
     #[test_case(Scope::User, ArmMode::Always, vec![Trigger::Armed] => Ok(Vec::new()); "always_user")]
     #[test_case(Scope::User, ArmMode::Always, polling() => Ok(vec![ALWAYS_WITH_SCHEDULE.to_owned()]); "always_user_schedule")]

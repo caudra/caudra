@@ -233,6 +233,7 @@ impl DryRunHost<'_> {
             ActionRequest::Message(_)
             | ActionRequest::Notify { .. }
             | ActionRequest::Pause { .. }
+            | ActionRequest::Done { .. }
             | ActionRequest::Log { .. } => ActionReply::Done,
         };
         (Answer::Recorded, Ok(reply))
@@ -549,6 +550,8 @@ mod tests {
             let run = start_workflow("review-changes", #{});
             notify("replayed");
             pause_automations("enough");
+            done("enough");
+            done("ignored");
             log("done");
             state.ids = [goal.condition, sent.message_id, published.message_id, broadcast.audience, run.run_id];"#,
             &[],
@@ -568,6 +571,7 @@ mod tests {
                 ActionKind::StartWorkflow,
                 ActionKind::Notify,
                 ActionKind::Pause,
+                ActionKind::Done,
                 ActionKind::Log,
             ]
             .map(|kind| (kind, Answer::Recorded))
@@ -586,6 +590,7 @@ mod tests {
 
     #[test_case(Err(refusal()), r#"notify("replayed");"# => Some(refusal()); "a_limit_on_an_acting_firing")]
     #[test_case(Err(refusal()), r#"log("replayed");"# => None; "a_limit_on_a_firing_that_does_not_act")]
+    #[test_case(Err(refusal()), r#"done("replayed");"# => None; "done_while_limited")]
     #[test_case(Ok(()), r#"notify("replayed");"# => None; "no_limit")]
     fn automation_limits_are_reported_not_enforced(
         admission: Result<(), LimitRefusal>,

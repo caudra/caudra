@@ -109,7 +109,6 @@ To work on one test, start the servers once with `eval "$(python3 scripts/mcp-se
 | `docs/examples/` | Generated config examples, published at `/docs/*.example.toml` |
 | `workcell/` | Workcell tools and supporting crates, built as local workspace members |
 | `models/` | The model list bundled into every binary, pinned from [github.com/caudra/models](https://github.com/caudra/models) |
-| `plugins/` | Lua plugin sources, kept as examples and as coverage for the Lua API |
 | `scripts/` | Build and maintenance scripts |
 | `vendor/crossterm/` | A patched crossterm, kept until a release includes the fix that `Cargo.toml` describes |
 | `tests/` | Integration tests for the binary |
@@ -133,7 +132,7 @@ Put unit tests in a `#[cfg(test)]` module in the same file. Use `#[test_case]` f
 
 - Work on an experimental feature stays behind its `[experimental]` switch. With the switch off, the feature shows no tools, commands, shortcuts, help entries, or status chips, and it does no work at startup.
 - Do not add default key bindings that use Alt. By default, many macOS terminals do not send Option as Alt, so those keys would never arrive.
-- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `make fmt` formats the plugins with stylua.
+- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `make fmt` formats the Lua sources in `caudra-lua` with stylua.
 
 ## Docs
 
@@ -178,9 +177,9 @@ A token that only a newer Caudra knows keeps the entry hidden from every older r
 
 ## Keeping the skill packs current
 
-Caudra bundles two skill packs: pstack in `caudra-pstack/`, from [cursor/plugins](https://github.com/cursor/plugins), and mattpocock in `caudra-mattpocock/`, from [mattpocock/skills](https://github.com/mattpocock/skills). Each crate's `upstream/` is a verbatim copy of the files Caudra bundles, chosen by its `pack.json`. Never edit it by hand: `make sync-pstack ARGS='--source <cursor/plugins checkout>'` and `make sync-mattpocock ARGS='--source <mattpocock/skills checkout>'` rewrite it, both through `scripts/sync-skillpack.py`. The packs are written for Cursor and Claude Code, so every file that names another agent's tool, path, model, command, or feature has a Caudra translation in the crate's `translated/`, which replaces the upstream page. The agent reads the translated pages as written and never maps names itself.
+Caudra bundles three skill packs: pstack in `caudra-pstack/`, from [cursor/plugins](https://github.com/cursor/plugins), mattpocock in `caudra-mattpocock/`, from [mattpocock/skills](https://github.com/mattpocock/skills), and emil in `caudra-emil/`, from [emilkowalski/skills](https://github.com/emilkowalski/skills). Each crate's `upstream/` is a verbatim copy of the files Caudra bundles, chosen by its `pack.json`. Never edit it by hand: `make sync-pstack ARGS='--source <cursor/plugins checkout>'`, `make sync-mattpocock ARGS='--source <mattpocock/skills checkout>'`, and `make sync-emil ARGS='--source <emilkowalski/skills checkout>'` rewrite it, all through `scripts/sync-skillpack.py`. The packs are written for Cursor, Claude Code, and other agents, so every file that names another agent's tool, path, model, command, or feature has a Caudra translation in the crate's `translated/`, which replaces the upstream page. The agent reads the translated pages as written and never maps names itself.
 
-`translated/translations.json` records the upstream hash each translation was made from. After a sync, the script prints a line for each file that needs work: `TRANSLATE` when upstream changed a translated file, `NEW` when it added or changed one with no translation, `ORPHAN` when a translated file went away, and, for pstack, `PORT` when a script with a Rust port in `caudra-pstack/src/scripts/` changed. `cargo test -p caudra-pstack` and `cargo test -p caudra-mattpocock` fail while any page still names a foreign term or any translation is stale. The `skillpack-translate` skill in `.caudra/skills/` holds the rules for translating, with a reference page per pack, and `make sync-<pack> ARGS='--mark <path>...'` records a finished translation.
+`translated/translations.json` records the upstream hash each translation was made from. After a sync, the script prints a line for each file that needs work: `TRANSLATE` when upstream changed a translated file, `NEW` when it added or changed one with no translation, `ORPHAN` when a translated file went away, and, for pstack, `PORT` when a script with a Rust port in `caudra-pstack/src/scripts/` changed. `cargo test -p caudra-pstack`, `cargo test -p caudra-mattpocock`, and `cargo test -p caudra-emil` fail while any page still names a foreign term or any translation is stale. The `skillpack-translate` skill in `.caudra/skills/` holds the rules for translating, with a reference page per pack, and `make sync-<pack> ARGS='--mark <path>...'` records a finished translation.
 
 The `pstack-sync` automation in `.caudra/automations/` runs that routine once a day: it merges `main` into its own branch, pulls your cursor/plugins clone, syncs, retranslates with the skill, validates, and fast-forwards your local `main`. To set it up:
 
