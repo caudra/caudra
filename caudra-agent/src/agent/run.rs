@@ -79,6 +79,7 @@ use crate::memory::store::MemoryStore;
 use crate::nudge::Nudge;
 use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
+use crate::prompt::AUTOMATIONS_MARKER;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::peers::WORK_NAME;
@@ -2453,6 +2454,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             }
             .refresh(
                 self.history,
@@ -2462,6 +2464,9 @@ impl<'h> Agent<'h> {
             );
             self.history.as_slice().iter().any(|message| {
                 message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                    || message
+                        .user_text()
+                        .is_some_and(|text| text.contains(AUTOMATIONS_MARKER))
             }) && self.preflight_context().await?
         } else {
             false
@@ -4426,6 +4431,7 @@ impl<'h> Agent<'h> {
                 background: self.background.as_ref().filter(|_| main_session),
                 jobs: self.jobs.as_ref(),
                 workflow: self.workflow.as_ref().filter(|_| main_session),
+                automation: self.automation.as_ref().filter(|_| main_session),
             },
         )?;
         self.measured = None;

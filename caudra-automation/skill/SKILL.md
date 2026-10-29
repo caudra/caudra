@@ -17,6 +17,8 @@ The script is trusted. Values from outside it, such as the model's last response
 
 An automation does nothing until it is armed in a session. The user can arm it with `/automations`, with `--automation` at launch, from a prompt profile, or through `arm: "always"` in a user script. You can arm it with `await automation.arm(name, args)` in `code`, subject to Caudra's permission rules. Arming takes args, so one script can serve many sessions. An armed automation runs while its session is open until it is disarmed, including by its own `done(reason)` call. Automations run in TUI sessions and in SDK sessions (`--print --input-format stream-json`), whose client arms them with the `automation_arm` control. An SDK session shows no prompt to wait on and takes no part in cross-session messaging, so a script with a `needs_input`, `message_received`, or `work_finished` trigger, or with `messaging` capabilities in its header, is invalid there and cannot be armed. One-shot `--print` and ACP sessions cannot arm automations.
 
+Before a model request, `# Automations` reports armed scripts, their scopes and triggers, and changes made outside your automation tool calls. Use the latest reminder. An unchanged session adds no new reminder, except after compaction. A quiet session that has not used automations adds none.
+
 Write an automation when:
 
 - The session should keep working without someone typing, through a backlog or a list of goals.
@@ -377,6 +379,8 @@ These functions are a firing's only way to reach the session.
 ### `done(reason)`
 
 Requests disarming of the calling automation only when this firing completes. It leaves other automations armed and keeps messages already queued by this firing for delivery. Call it after the action in a one-shot script. It returns `()` without ending the firing, so later code still runs.
+
+Queued messages wait until the firing finishes. When the disarm applies, each delivered message says that this automation disarmed itself and quotes its reason as data. A failed or stopped firing delivers its queued messages without that notice.
 
 `reason` is required text, may be untrusted, and is recorded in history. The first call counts as one action against the firing's ceiling, but bypasses `cooldown` and `max_per_hour`. Further calls in the same firing do nothing and keep the first reason. A failed, stopped, or cancelled firing does not apply the request. Re-arming enables the automation again with its state intact.
 

@@ -4406,6 +4406,7 @@ mod tests {
                 background: Some(&fixture.tasks),
                 jobs: None,
                 workflow: None,
+                automation: None,
             };
             context.refresh(&mut history, &fixture.ctx.event_tx, 0, false);
             assert!(
@@ -4438,6 +4439,7 @@ mod tests {
                     background: Some(&fixture.tasks),
                     jobs: None,
                     workflow: None,
+                    automation: None,
                 },
                 None,
             );
@@ -4545,6 +4547,7 @@ mod tests {
                 background: Some(&fixture.tasks),
                 jobs: None,
                 workflow: None,
+                automation: None,
             };
             let mut history = History::default();
             context.refresh(&mut history, &fixture.ctx.event_tx, 1, false);
