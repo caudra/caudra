@@ -8,7 +8,6 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
-use caudra_agent::AgentEvent;
 use caudra_agent::history::HistoryProject;
 use caudra_agent::learning::apply::{self, Dropped, Reverted};
 use caudra_agent::learning::pump::FAILED;
@@ -26,7 +25,9 @@ use super::App;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, history_to_display};
 use crate::components::Action;
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::learn_inspector::{LearnAction, LearnRun, LearnSnapshot};
+use crate::components::side_transcript::SideAction;
 use crate::repaint::{Cadence, Dirty};
 
 const RUN_LIMIT: usize = 50;
@@ -227,18 +228,13 @@ impl App {
                 self.learning_changed();
             }
             LearnerStep::Event(event) => {
-                if let Some(chat) = self.learn_transcripts.live_mut(run_id) {
-                    match *event {
-                        AgentEvent::StreamReset => chat.stream_reset(),
-                        event if Chat::routed_before(&event) => {}
-                        event => {
-                            chat.handle_event(event, None);
-                        }
-                    }
+                if let Some(side) = self.learn_transcripts.live_mut(run_id) {
+                    side.handle_event(*event);
                 }
             }
             LearnerStep::Finished { outcome } => {
-                if let Some(chat) = self.learn_transcripts.live_mut(run_id) {
+                if let Some(side) = self.learn_transcripts.live_mut(run_id) {
+                    let chat = side.chat_mut();
                     chat.flush();
                     let ending = match outcome.as_str() {
                         FAILED => TaskOutcome::Error,
@@ -248,6 +244,15 @@ impl App {
                 }
                 self.learning_changed();
             }
+        }
+    }
+
+    /// A learner window only observes, so all it hands back is what to copy.
+    pub(super) fn handle_learn_transcript_action(&mut self, action: SideAction) {
+        match action {
+            SideAction::Copy(text) => self.copy_to_clipboard(&text),
+            SideAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
+            _ => {}
         }
     }
 

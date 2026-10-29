@@ -313,7 +313,8 @@ impl App {
         if self.learn_transcripts.is_open() && !self.permission_prompt_holds_input() {
             self.clear_control_hovers();
             let cwd = PathBuf::from(&self.state.session.cwd);
-            self.learn_transcripts.handle_mouse(event, &cwd);
+            let action = self.learn_transcripts.handle_mouse(event, &cwd);
+            self.handle_learn_transcript_action(action);
             return Vec::new();
         }
         if self.learn_inspector.is_open() && !self.permission_prompt_holds_input() {

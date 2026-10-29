@@ -2694,7 +2694,8 @@ impl App {
         }
 
         if self.learn_transcripts.is_open() {
-            self.learn_transcripts.handle_key(key);
+            let action = self.learn_transcripts.handle_key(key);
+            self.handle_learn_transcript_action(action);
             return Some(vec![]);
         }
 

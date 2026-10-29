@@ -75,6 +75,7 @@ pub(crate) mod session_picker;
 pub(crate) mod session_relocation;
 pub(crate) mod settings_modal;
 pub(crate) mod shell_modal;
+pub(crate) mod side_transcript;
 pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub(crate) mod stash_picker;

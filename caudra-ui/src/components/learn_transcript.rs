@@ -3,44 +3,30 @@
 //! session's chats, so nothing here is saved with the session or searched.
 
 use std::collections::VecDeque;
-use std::mem;
 use std::path::Path;
 
-use caudra_grab::grab_scope;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use crate::chat::Chat;
+use crate::components::Overlay;
 use crate::components::docs_link::DocsTopic;
-use crate::components::modal::Modal;
+use crate::components::side_transcript::{SideAction, SideFooter, SideTranscript};
 use crate::components::tooltip::Tip;
-use crate::components::{Hint, HintBar, Overlay};
 use crate::repaint::{Cadence, Dirty};
 
 const TITLE: &str = " Learner transcript ";
-const PERCENT: u16 = 90;
-const FOOTER_ROWS: u16 = 1;
-const LINE_STEP: i32 = 1;
 /// Runs watched live this session: the one running and the one before it.
 pub(crate) const LIVE_RUNS: usize = 2;
-const HINTS: &[Hint] = &[
-    Hint::inert("\u{2191}\u{2193}", "scroll"),
-    Hint::inert("Home/End", "top/bottom"),
-    Hint::key("Esc", KeyCode::Esc, "back"),
-];
 
+/// Every run is its own read-only window, so closing one never stops the run
+/// it watches.
 #[derive(Default)]
 pub(crate) struct LearnTranscripts {
-    live: VecDeque<(i64, Chat)>,
-    stored: Option<(i64, Chat)>,
+    live: VecDeque<(i64, SideTranscript)>,
+    stored: Option<(i64, SideTranscript)>,
     shown: Option<i64>,
-    footer: HintBar,
-    /// Where the chat was drawn, and whether a press landed in it, so only a
-    /// press and release both on the chat click it.
-    body: Rect,
-    pressed: bool,
-    popup: Rect,
 }
 
 impl LearnTranscripts {
@@ -51,30 +37,39 @@ impl LearnTranscripts {
             && let Some((dropped, _)) = self.live.pop_front()
             && self.shown == Some(dropped)
         {
-            self.close();
+            self.shown = None;
         }
-        self.live.push_back((run_id, chat));
+        self.live.push_back((run_id, window(chat)));
     }
 
-    pub fn live_mut(&mut self, run_id: i64) -> Option<&mut Chat> {
+    pub fn live_mut(&mut self, run_id: i64) -> Option<&mut SideTranscript> {
         self.live
             .iter_mut()
             .find(|(id, _)| *id == run_id)
-            .map(|(_, chat)| chat)
+            .map(|(_, side)| side)
     }
 
     pub fn has(&self, run_id: i64) -> bool {
-        self.chat(run_id).is_some()
+        self.side(run_id).is_some()
     }
 
     /// Keeps a run read back from the store, in place of the last one read.
     pub fn keep(&mut self, run_id: i64, chat: Chat) {
-        self.stored = Some((run_id, chat));
+        if let Some((replaced, _)) = self.stored.replace((run_id, window(chat)))
+            && self.shown == Some(replaced)
+        {
+            self.shown = None;
+        }
     }
 
     pub fn show(&mut self, run_id: i64) {
-        if self.has(run_id) {
-            self.shown = Some(run_id);
+        if !self.has(run_id) {
+            return;
+        }
+        self.close();
+        self.shown = Some(run_id);
+        if let Some(side) = self.shown_side() {
+            side.open();
         }
     }
 
@@ -83,132 +78,74 @@ impl LearnTranscripts {
         self.shown
     }
 
+    #[cfg(test)]
     pub fn chat(&self, run_id: i64) -> Option<&Chat> {
+        self.side(run_id).map(SideTranscript::chat)
+    }
+
+    fn side(&self, run_id: i64) -> Option<&SideTranscript> {
         self.live
             .iter()
             .chain(&self.stored)
             .find(|(id, _)| *id == run_id)
-            .map(|(_, chat)| chat)
+            .map(|(_, side)| side)
     }
 
-    fn shown_chat(&mut self) -> Option<&mut Chat> {
+    fn shown_side(&mut self) -> Option<&mut SideTranscript> {
         let run_id = self.shown?;
         self.live
             .iter_mut()
             .chain(&mut self.stored)
             .find(|(id, _)| *id == run_id)
-            .map(|(_, chat)| chat)
+            .map(|(_, side)| side)
     }
 
     pub fn contains(&self, pos: Position) -> bool {
-        self.popup.contains(pos)
+        self.shown
+            .and_then(|run_id| self.side(run_id))
+            .is_some_and(|side| side.contains(pos))
     }
 
     pub fn tick(&mut self) -> Dirty {
-        self.shown_chat().map_or(Dirty::NO, Chat::tick)
+        self.shown_side().map_or(Dirty::NO, SideTranscript::tick)
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.close();
-            return;
-        }
-        let Some(chat) = self.shown_chat() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => chat.scroll(-LINE_STEP),
-            KeyCode::Down | KeyCode::Char('j') => chat.scroll(LINE_STEP),
-            KeyCode::PageUp => chat.scroll(-chat.half_page()),
-            KeyCode::PageDown => chat.scroll(chat.half_page()),
-            KeyCode::Home | KeyCode::Char('g') => chat.scroll_to_top(),
-            KeyCode::End | KeyCode::Char('G') => chat.enable_auto_scroll(),
-            _ => {}
-        }
+    pub fn handle_key(&mut self, key: KeyEvent) -> SideAction {
+        let action = self
+            .shown_side()
+            .map_or(SideAction::Ignored, |side| side.handle_key(key));
+        self.settle(action)
     }
 
-    /// An armed scroll card under the pointer takes the wheel first, as in
-    /// the main transcript, and hands back what it cannot use.
     pub fn scroll_at(&mut self, at: Position, delta: i32) {
-        let Some(chat) = self.shown_chat() else {
-            return;
-        };
-        let delta = chat.scroll_card_at(at.x, at.y, delta);
-        if delta != 0 {
-            chat.scroll(delta);
+        if let Some(side) = self.shown_side() {
+            side.scroll_at(at, delta);
         }
     }
 
-    /// The chat answers the pointer as the main transcript does: hovering
-    /// marks what a click acts on, a press arms a scroll card, and a click
-    /// folds or opens what it lands on. A footer hint presses its key.
-    pub fn handle_mouse(&mut self, event: MouseEvent, cwd: &Path) {
-        if let Some(key) = self.footer.handle_mouse(event) {
-            self.handle_key(key);
-            return;
+    pub fn handle_mouse(&mut self, event: MouseEvent, cwd: &Path) -> SideAction {
+        let action = self
+            .shown_side()
+            .map_or(SideAction::Ignored, |side| side.handle_mouse(event, cwd));
+        self.settle(action)
+    }
+
+    /// A window that closed itself leaves nothing shown.
+    fn settle(&mut self, action: SideAction) -> SideAction {
+        if action == SideAction::Close {
+            self.shown = None;
         }
-        let body = self.body;
-        let on_body = body.contains(Position::new(event.column, event.row));
-        let pressed = mem::replace(
-            &mut self.pressed,
-            on_body && event.kind == MouseEventKind::Down(MouseButton::Left),
-        );
-        let Some(chat) = self.shown_chat() else {
-            return;
-        };
-        if chat.handle_card_scrollbar(&event) || chat.handle_scrollbar(&event) {
-            return;
-        }
-        match event.kind {
-            MouseEventKind::Moved if on_body => {
-                chat.update_hover(event.row, event.column, body, false, cwd);
-            }
-            MouseEventKind::Moved => {
-                chat.clear_hover();
-                chat.disarm_card();
-            }
-            MouseEventKind::Down(MouseButton::Left) if on_body => {
-                chat.arm_card_at(event.column, event.row);
-            }
-            MouseEventKind::Up(MouseButton::Left)
-                if pressed && on_body && !chat.armed_card_at(event.column, event.row) =>
-            {
-                if !chat.toggle_decisions_at(event.column, event.row, body) {
-                    chat.handle_click(event.row, body);
-                }
-            }
-            MouseEventKind::ScrollUp => chat.scroll(-LINE_STEP),
-            MouseEventKind::ScrollDown => chat.scroll(LINE_STEP),
-            _ => {}
-        }
+        action
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        let Some(chat) = self.shown_chat() else {
-            return Rect::default();
-        };
-        grab_scope!("learn_transcript", area);
-        let modal = Modal {
-            title: TITLE,
-            width_percent: PERCENT,
-            max_height_percent: PERCENT,
-        };
-        let (popup, inner) = modal.render(frame, area, area.height);
-        let body = Rect {
-            height: inner.height.saturating_sub(FOOTER_ROWS),
-            ..inner
-        };
-        chat.view(frame, body, false, false);
-        let footer = Rect {
-            y: inner.bottom().saturating_sub(FOOTER_ROWS),
-            height: FOOTER_ROWS.min(inner.height),
-            ..inner
-        };
-        self.footer.draw(frame, footer, HINTS.to_vec());
-        self.body = body;
-        self.popup = popup;
-        popup
+        self.shown_side()
+            .map_or_else(Rect::default, |side| side.view(frame, area))
     }
+}
+
+fn window(chat: Chat) -> SideTranscript {
+    SideTranscript::new(TITLE, SideFooter::Observe, chat)
 }
 
 impl Overlay for LearnTranscripts {
@@ -217,27 +154,22 @@ impl Overlay for LearnTranscripts {
     }
 
     fn close(&mut self) {
-        if let Some(chat) = self.shown_chat() {
-            chat.clear_hover();
-            chat.disarm_card();
+        if let Some(side) = self.shown_side() {
+            side.close();
         }
         self.shown = None;
-        self.footer.reset();
-        self.body = Rect::default();
-        self.pressed = false;
-        self.popup = Rect::default();
     }
 
     fn tooltip(&self) -> Option<Tip> {
         self.shown
-            .and_then(|run_id| self.chat(run_id))
-            .and_then(Chat::hover_tip)
+            .and_then(|run_id| self.side(run_id))
+            .and_then(SideTranscript::tooltip)
     }
 
     fn cadence(&self) -> Cadence {
         self.shown
-            .and_then(|run_id| self.chat(run_id))
-            .map_or(Cadence::IDLE, Chat::cadence)
+            .and_then(|run_id| self.side(run_id))
+            .map_or(Cadence::IDLE, SideTranscript::cadence)
     }
 
     fn docs_topic(&self) -> Option<DocsTopic> {

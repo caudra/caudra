@@ -13,13 +13,21 @@ use crate::components::messages::{
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::side_transcript::{
+    ASK_PLACEHOLDER, BACK_HINT, CLARIFICATION_PLACEHOLDER, CLEAR_HINT, CLEAR_LABEL, CLOSE_HINT,
+    COMPACT_BACK_HINT, COMPACT_FOOTER_GAP, COMPACT_QUEUE_HINT, COMPACT_SEND_HINT, COPY_HINT,
+    COPY_LABEL, CTRL_COPY_LABEL, DRAFT_SEPARATOR, FOOTER_GAP, FOOTER_ROW, INITIAL_SEND_HINT,
+    INPUT_PREFIX, INPUT_ROW, MOVED_ON_NOTE, QUEUE_HINT, QUEUED_PREFIX, SEND_HINT, SEND_LABEL,
+    STATUS_ROW, SUMMARY_SEPARATOR, TIP_ASK, TIP_BACK, TIP_CLARIFY, TIP_CLEAR, TIP_CLOSE, TIP_COPY,
+    TIP_KEEP, TIP_SEND, WAITING_PLACEHOLDER, usage_summary,
+};
 use crate::components::streaming_content::StreamingContent;
 use crate::components::sweep::{self, Sweep};
 use crate::components::tooltip::{Tip, TipKey};
 use crate::components::{field_styles, input_text_style};
 use crate::theme;
 
-use caudra_agent::{CancelTrigger, format_live_duration, format_settled_duration};
+use caudra_agent::{CancelTrigger, format_live_duration};
 use caudra_grab::grab_scope;
 use caudra_providers::{Billing, TokenUsage};
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -43,64 +51,11 @@ const CONTEXT_HEADING: &str = "Question form";
 const REQUEST_HEADING: &str = "Request";
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
-pub(crate) const COPY_LABEL: &str = "y";
-const CTRL_COPY_LABEL: &str = "⌃Y";
-const COPY_HINT: &str = " Copy";
-const CLOSE_HINT: &str = " Close";
-const FOOTER_GAP: &str = "   ";
-const INPUT_PREFIX: &str = "> ";
-const SEND_LABEL: &str = "Enter";
-const SEND_HINT: &str = " Send a follow-up";
-/// While an answer is still streaming the key does not send: the thread is
-/// one question deep at a time, so what it takes is held until the answer is
-/// in.
-const QUEUE_HINT: &str = " Queue a follow-up";
-const WAITING_PLACEHOLDER: &str = "waiting for the answer…";
-const QUEUED_PREFIX: &str = "queued: ";
 /// A stopped answer says so in its own body, where the truncation is, rather
 /// than only in the header.
 const STOPPED_NOTE: &str = "\n\n_Stopped._";
-const TOKENS_IN: &str = " in";
-const TOKENS_CACHED: &str = " cached";
-const TOKENS_OUT: &str = " out";
-const SUFFIX_SEPARATOR: &str = " · ";
-/// The spinner, the clock and the prefill bar, kept out of the scroll region
-/// so the wait is always visible.
-const STATUS_ROW: u16 = 1;
-/// The input line, kept out of the scroll region so a long thread never
-/// scrolls the prompt away.
-const INPUT_ROW: u16 = 1;
-const FOOTER_ROW: u16 = 1;
 const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
-const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
 const ASK_TITLE: &str = " /btw · Side question ";
-const ASK_PLACEHOLDER: &str = "Ask about this conversation…";
-const BACK_HINT: &str = " Back to questions";
-const COMPACT_BACK_HINT: &str = " Back";
-const INITIAL_SEND_HINT: &str = " Send";
-const COMPACT_SEND_HINT: &str = " Follow-up";
-const COMPACT_QUEUE_HINT: &str = " Queue";
-const COMPACT_FOOTER_GAP: &str = " ";
-const DRAFT_SEPARATOR: &str = " | ";
-const CLEAR_LABEL: &str = key::CLEAR_BTW.label;
-const CLEAR_HINT: &str = " Clear";
-/// Drawn under the last answer a thread kept from before the conversation it
-/// reads moved on, so the reader knows the next answer sees more than it did.
-pub(crate) const MOVED_ON_NOTE: &str =
-    "The conversation moved on since this answer. The next question reads it as it stands now.";
-
-pub(crate) const TIP_SEND: &str = "Ask the next question in this thread. While an answer is still \
-streaming, the question waits until it is in";
-const TIP_ASK: &str = "Ask about the conversation so far. No tool runs and nothing enters history";
-const TIP_CLARIFY: &str = "Ask about these choices. Nothing is answered or submitted";
-pub(crate) const TIP_COPY: &str =
-    "Copy the selection, or the whole answer when nothing is selected";
-const TIP_CLOSE: &str = "Close this window";
-pub(crate) const TIP_KEEP: &str = "Close this side thread. It is kept until you clear it or the \
-session changes, and F2 or /btw reopens it";
-const TIP_BACK: &str = "Return to the question form, unchanged";
-pub(crate) const TIP_CLEAR: &str =
-    "Forget this side thread and start an empty one. Nothing in it is kept";
 
 const CLOSE_CONTROL: StreamControl = StreamControl {
     label: ESC_LABEL,
@@ -365,30 +320,9 @@ impl Exchange {
     /// A reader scrolling back wants the price of the answer beside the
     /// question that bought it.
     fn suffix(&self) -> String {
-        let Some(settled) = self.settled else {
-            return String::new();
-        };
-        let mut suffix = format!("{SUFFIX_SEPARATOR}{}", format_settled_duration(settled));
-        let Some(usage) = self.usage else {
-            return suffix;
-        };
-        let input =
-            u64::from(usage.input) + u64::from(usage.cache_read) + u64::from(usage.cache_creation);
-        suffix.push_str(&format!(
-            "{SUFFIX_SEPARATOR}{}{TOKENS_IN}",
-            super::format_compact(input)
-        ));
-        if usage.cache_read > 0 {
-            suffix.push_str(&format!(
-                "{SUFFIX_SEPARATOR}{}{TOKENS_CACHED}",
-                super::format_compact(u64::from(usage.cache_read))
-            ));
-        }
-        suffix.push_str(&format!(
-            "{SUFFIX_SEPARATOR}{}{TOKENS_OUT}",
-            super::format_compact(u64::from(usage.output))
-        ));
-        suffix
+        self.settled.map_or_else(String::new, |settled| {
+            format!("{SUMMARY_SEPARATOR}{}", usage_summary(settled, self.usage))
+        })
     }
 }
 
@@ -1369,6 +1303,7 @@ mod tests {
     use crate::animation::test_clock::FrozenClock;
     use crate::components::key as key_ev;
     use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
+    use crate::components::side_transcript::{TOKENS_CACHED, TOKENS_IN, TOKENS_OUT};
     use caudra_agent::CancelToken;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::Terminal;
