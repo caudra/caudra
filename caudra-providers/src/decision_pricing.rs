@@ -1,6 +1,6 @@
 //! What the decision endpoints charge per call. Decision models answer typed
 //! questions rather than chat, so they live apart from the provider manifests:
-//! they never appear in `/model`, model-watch, or the chat price tables.
+//! they never appear in `/model` or the chat price tables.
 
 use caudra_config::decisions::DecisionProtocol;
 
@@ -12,8 +12,7 @@ pub struct DecisionModelEntry {
     pub protocol: DecisionProtocol,
     pub prefixes: &'static [&'static str],
     pub pricing: ModelPricing,
-    /// The provider page that states the prices, which model-watch reads
-    /// because models.dev does not cover decision models.
+    /// The provider page that states the prices.
     pub source: &'static str,
 }
 

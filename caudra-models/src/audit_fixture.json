@@ -1,0 +1,322 @@
+{
+  "providers": [
+    {
+      "slug": "anthropic",
+      "display_name": "Anthropic",
+      "family": "claude",
+      "supports_thinking": true,
+      "accepts_arbitrary_models": false,
+      "fallback_max_output": 128000,
+      "fallback_context_window": 200000,
+      "serves_fast_mode": true,
+      "catalog_slug": "anthropic",
+      "models": [
+        {
+          "prefixes": [
+            "claude-opus-4-5"
+          ],
+          "small": false,
+          "default": false,
+          "vision": true,
+          "family": "claude",
+          "pricing": {
+            "input": 5.0,
+            "output": 25.0,
+            "cache_write": 6.25,
+            "cache_read": 0.5
+          },
+          "max_output_tokens": 64000,
+          "context_window": 200000
+        },
+        {
+          "prefixes": [
+            "claude-opus-5-5"
+          ],
+          "small": false,
+          "default": true,
+          "vision": true,
+          "family": "claude",
+          "pricing": {
+            "input": 4.0,
+            "output": 20.0,
+            "cache_write": 5.0,
+            "cache_read": 0.2,
+            "fast": {
+              "input": 8.0,
+              "output": 40.0,
+              "cache_write": 10.0,
+              "cache_read": 0.4
+            }
+          },
+          "max_output_tokens": 128000,
+          "context_window": 372000,
+          "window_excludes_output": true
+        }
+      ],
+      "availability": [],
+      "price_periods": [],
+      "generations": []
+    },
+    {
+      "slug": "openai",
+      "display_name": "OpenAI",
+      "family": "gpt",
+      "supports_thinking": true,
+      "accepts_arbitrary_models": false,
+      "fallback_max_output": 100000,
+      "fallback_context_window": 200000,
+      "serves_fast_mode": true,
+      "catalog_slug": "openai",
+      "generations": [],
+      "models": [
+        {
+          "prefixes": [
+            "gpt-6-luna"
+          ],
+          "small": true,
+          "default": true,
+          "vision": true,
+          "family": "gpt",
+          "pricing": {
+            "input": 0.1,
+            "output": 0.5,
+            "cache_write": 0.125,
+            "cache_read": 0.01,
+            "fast": {
+              "input": 0.2,
+              "output": 1.0,
+              "cache_write": 0.25,
+              "cache_read": 0.02
+            },
+            "tiers": [
+              {
+                "above": 272000,
+                "input": 0.2,
+                "output": 0.75,
+                "cache_write": 0.25,
+                "cache_read": 0.02,
+                "fast": {
+                  "input": 0.4,
+                  "output": 1.5,
+                  "cache_write": 0.5,
+                  "cache_read": 0.04
+                }
+              }
+            ]
+          },
+          "max_output_tokens": 128000,
+          "context_window": 372000
+        },
+        {
+          "prefixes": [
+            "gpt-5.2"
+          ],
+          "small": false,
+          "default": false,
+          "vision": true,
+          "family": "gpt",
+          "pricing": {
+            "input": 1.75,
+            "output": 14.0,
+            "cache_write": 0.0,
+            "cache_read": 0.175
+          },
+          "max_output_tokens": 128000,
+          "context_window": 400000
+        }
+      ],
+      "availability": [],
+      "price_periods": []
+    },
+    {
+      "slug": "copilot",
+      "display_name": "Copilot",
+      "family": "generic",
+      "supports_thinking": false,
+      "accepts_arbitrary_models": true,
+      "fallback_max_output": 100000,
+      "fallback_context_window": 200000,
+      "serves_fast_mode": false,
+      "catalog_slug": "github-copilot",
+      "models": [
+        {
+          "prefixes": [
+            "gpt-6-luna"
+          ],
+          "small": true,
+          "default": false,
+          "vision": true,
+          "family": "generic",
+          "pricing": {
+            "input": 0.1,
+            "output": 0.5,
+            "cache_write": 0.125,
+            "cache_read": 0.01
+          },
+          "max_output_tokens": 100000,
+          "context_window": 200000
+        },
+        {
+          "prefixes": [
+            "claude-opus-5"
+          ],
+          "small": false,
+          "default": true,
+          "vision": true,
+          "family": "generic",
+          "pricing": {
+            "input": 5.0,
+            "output": 25.0,
+            "cache_write": 6.25,
+            "cache_read": 0.5
+          },
+          "max_output_tokens": 64000,
+          "context_window": 200000
+        }
+      ],
+      "availability": [
+        {
+          "prefix": "claude-opus-5",
+          "during": {
+            "until": "2026-11-16"
+          },
+          "note": "Shutdowns from <https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/>.",
+          "source": "https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/"
+        }
+      ],
+      "price_periods": [],
+      "generations": []
+    },
+    {
+      "slug": "xai",
+      "display_name": "xAI",
+      "family": "generic",
+      "supports_thinking": true,
+      "accepts_arbitrary_models": true,
+      "fallback_max_output": 131072,
+      "fallback_context_window": 500000,
+      "serves_fast_mode": false,
+      "catalog_slug": "xai",
+      "models": [
+        {
+          "prefixes": [
+            "grok-4.7"
+          ],
+          "small": false,
+          "default": true,
+          "vision": true,
+          "family": "generic",
+          "pricing": {
+            "input": 2.0,
+            "output": 6.0,
+            "cache_write": 0.0,
+            "cache_read": 0.5,
+            "tiers": [
+              {
+                "above": 199999,
+                "input": 4.0,
+                "output": 12.0,
+                "cache_write": 0.0,
+                "cache_read": 1.0
+              }
+            ]
+          },
+          "max_output_tokens": 131072,
+          "context_window": 500000
+        }
+      ],
+      "price_periods": [],
+      "availability": [],
+      "generations": []
+    },
+    {
+      "slug": "google",
+      "display_name": "Google",
+      "family": "gemini",
+      "supports_thinking": true,
+      "accepts_arbitrary_models": true,
+      "fallback_max_output": 65536,
+      "fallback_context_window": 1000000,
+      "serves_fast_mode": false,
+      "catalog_slug": "google",
+      "models": [
+        {
+          "prefixes": [
+            "gemini-4-argon"
+          ],
+          "small": false,
+          "default": true,
+          "vision": true,
+          "family": "gemini",
+          "pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cache_write": 0.0,
+            "cache_read": 0.1
+          },
+          "max_output_tokens": 65536,
+          "context_window": 1048576
+        }
+      ],
+      "price_periods": [
+        {
+          "prefix": "gemini-4-argon",
+          "during": {
+            "from": "2026-12-01"
+          },
+          "pricing": {
+            "input": 4.0,
+            "output": 20.0,
+            "cache_write": 0.0,
+            "cache_read": 0.2
+          },
+          "note": "Introductory rates Google ends on a set day, from\n<https://ai.google.dev/gemini-api/docs/pricing>.",
+          "source": "https://ai.google.dev/gemini-api/docs/pricing"
+        }
+      ],
+      "availability": [],
+      "generations": []
+    }
+  ],
+  "decision_models": [
+    {
+      "protocol": "openai",
+      "prefixes": [
+        "gpt-6-luna"
+      ],
+      "pricing": {
+        "input": 0.1,
+        "output": 0.0,
+        "cache_write": 0.125,
+        "cache_read": 0.01,
+        "tiers": [
+          {
+            "above": 272000,
+            "input": 0.2,
+            "output": 0.0,
+            "cache_write": 0.25,
+            "cache_read": 0.02
+          }
+        ]
+      },
+      "source": "https://developers.openai.com/api/docs/guides/decisions#pricing-and-availability"
+    },
+    {
+      "protocol": "typesafe",
+      "prefixes": [
+        "jev-1.14",
+        "jev-1.13",
+        "jev-latest",
+        "jev-preview"
+      ],
+      "pricing": {
+        "input": 0.042,
+        "output": 0.0,
+        "cache_write": 0.0,
+        "cache_read": 0.0
+      },
+      "source": "https://docs.typesafe.ai/models"
+    }
+  ],
+  "catalog": {}
+}

@@ -1,9 +1,13 @@
 //! Signatures authenticate exact bytes; runtime treats `content_sha256` as an opaque identity.
 //! Only same-version tooling uses [`Snapshot::hash_matches`], since newer fields may be ignored.
 
+#[cfg(feature = "cli")]
+mod audit;
 mod catalog;
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(feature = "cli")]
+mod replay;
 pub mod repo;
 pub mod sign;
 mod validate;

@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [features]
 schema = ["dep:schemars"]
-cli = ["schema", "dep:clap", "dep:color-eyre", "dep:zstd"]
+cli = ["schema", "dep:caudra-automation", "dep:clap", "dep:color-eyre", "dep:zstd"]
 
 [[bin]]
 name = "caudra-models"
@@ -19,6 +19,7 @@ required-features = ["cli"]
 
 [dependencies]
 base64 = { workspace = true }
+caudra-automation = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 color-eyre = { workspace = true, optional = true }
 jiff = { workspace = true, features = ["serde"] }

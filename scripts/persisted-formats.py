@@ -11,9 +11,10 @@ import importlib.util
 import re
 import subprocess
 import sys
-import tomllib
 from collections import Counter
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 REGISTRY = "scripts/persisted-formats.toml"
@@ -131,7 +132,7 @@ def lint(root: Path) -> list[str]:
     found = {
         (path, name)
         for path in scanned_files(root)
-        for name, _ in declarations((root / path).read_text(encoding="utf-8"))
+        for name, _ in declarations(read(root, None, path) or "")
     }
     problems = [
         f"{path}: {name} is neither tracked nor exempt in {REGISTRY}"

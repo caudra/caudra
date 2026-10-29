@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use jiff::Timestamp;
+use jiff::{Timestamp, ToSpan, Zoned, civil::Date};
 use schemars::schema_for;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Provider, Snapshot, TRUSTED_KEYS, hex, import_models_dev, parse_bounded,
+    Provider, Snapshot, TRUSTED_KEYS, audit, hex, import_models_dev, parse_bounded, replay,
     repo::{self, DecisionFile},
     sign, to_pretty_bytes, validate,
 };
@@ -24,6 +24,7 @@ const HASH_MESSAGE: &str = "content hash does not match payload";
 const PROVIDER_SCHEMA: &str = "provider.v1.json";
 const MODELS_SCHEMA: &str = "models.v1.json";
 const DECISIONS_SCHEMA: &str = "decision-models.v1.json";
+const DEFAULT_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +38,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Replay fixed automation events and check their outcomes without performing actions.
+    Replay { script: PathBuf, cases: PathBuf },
+    /// Compare curated models with a local models.dev catalog. Never downloads data.
+    Audit {
+        data_dir: PathBuf,
+        /// Defaults to the repository's reviewed import/models-dev.json.
+        #[arg(long)]
+        models_dev: Option<PathBuf>,
+        #[arg(long)]
+        since: Option<Date>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Validate a snapshot or check a repository's generated files.
     Validate { path: PathBuf },
     /// Build a snapshot and JSON schemas from an authoring repository.
@@ -108,6 +122,40 @@ pub fn run() -> Result<()> {
 
 fn execute(command: Command) -> Result<()> {
     match command {
+        Command::Replay { script, cases } => {
+            let source = String::from_utf8(read(&script)?).wrap_err("script must be UTF-8")?;
+            let cases = repo::read_json(&cases)?;
+            let count = replay::check(&source, cases)?;
+            println!("{count} replay cases passed");
+            Ok(())
+        }
+        Command::Audit {
+            data_dir,
+            models_dev,
+            since,
+            out,
+        } => {
+            let payload = repo::load(&data_dir)?;
+            let rules = audit::load_rules(&data_dir, &payload.providers)?;
+            let catalog = models_dev.map(|path| repo::read_json(&path)).transpose()?;
+            let today = Zoned::now().date();
+            let since =
+                since.map_or_else(|| today.checked_sub(DEFAULT_LOOKBACK_DAYS.days()), Ok)?;
+            let report = audit::audit(
+                &payload,
+                catalog.as_ref().unwrap_or(&payload.catalog),
+                today,
+                since,
+                &rules,
+            )
+            .to_string();
+            if let Some(path) = out {
+                write(&path, report.as_bytes())
+            } else {
+                print!("{report}");
+                Ok(())
+            }
+        }
         Command::Validate { path } => validate_path(&path),
         Command::Build { repo, now } => build(&repo, now.unwrap_or_else(Timestamp::now)),
         Command::ImportModelsDev { api, repo } => {
@@ -210,7 +258,9 @@ fn artifacts(dir: &Path, now: Timestamp) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
     };
-    let mut snapshot = Snapshot::stamp(repo::load(dir)?, previous.as_ref(), now);
+    let payload = repo::load(dir)?;
+    audit::load_rules(dir, &payload.providers)?;
+    let mut snapshot = Snapshot::stamp(payload, previous.as_ref(), now);
     snapshot.schema = Some("schema.json".to_owned());
     let bytes = to_pretty_bytes(&snapshot);
     checked_snapshot(&path, &bytes)?;
