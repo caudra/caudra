@@ -188,6 +188,10 @@ impl Tool for AutomationTool {
         ToolAudience::MAIN
     }
 
+    fn has_read_only_calls(&self) -> bool {
+        true
+    }
+
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         Ok(Box::new(AutomationCall {
             request: parse_request(input)?,

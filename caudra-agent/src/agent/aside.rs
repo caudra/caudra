@@ -17,16 +17,19 @@ use super::{Agent, AgentParams, AgentRunParams, History};
 use crate::cancel::CancelTrigger;
 use crate::context::RequestPrefix;
 use crate::tools::{
-    BATCH_TOOL_NAME, FILE_GLOB_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME,
-    FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, SKILL_TOOL_NAME, SOURCE_CODE_CONTEXT_TOOL_NAME,
-    SOURCE_CODE_REFS_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, ToolContext, ToolFilter,
-    VIEW_IMAGE_TOOL_NAME, WEBFETCH_TOOL_NAME, WEBSEARCH_TOOL_NAME,
+    AUTOMATION_TOOL_NAME, BATCH_TOOL_NAME, EXECUTION_ENVIRONMENT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
+    FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
+    SKILL_TOOL_NAME, SOURCE_CODE_CONTEXT_TOOL_NAME, SOURCE_CODE_REFS_TOOL_NAME,
+    TOOL_OUTPUT_TOOL_NAME, ToolContext, ToolFilter, VIEW_IMAGE_TOOL_NAME, WEBFETCH_TOOL_NAME,
+    WEBSEARCH_TOOL_NAME,
 };
 use crate::types::{AgentEvent, Envelope};
 use crate::{AgentError, AgentInput, AgentMode, DoneReason};
 
 /// What a side question may call. Each call is also held to read-only
-/// effects when it runs, so `shell` and `code` reach only their reads.
+/// effects when it runs, so `shell` and `code` reach only their reads. The
+/// last two are never declared: `code`'s `host` and `automation` modules call
+/// them.
 pub const ASIDE_TOOLS: &[&str] = &[
     FILE_READ_TOOL_NAME,
     FILE_GLOB_TOOL_NAME,
@@ -42,6 +45,8 @@ pub const ASIDE_TOOLS: &[&str] = &[
     BATCH_TOOL_NAME,
     TOOL_OUTPUT_TOOL_NAME,
     VIEW_IMAGE_TOOL_NAME,
+    EXECUTION_ENVIRONMENT_TOOL_NAME,
+    AUTOMATION_TOOL_NAME,
 ];
 /// Tool calls one side question may make before it is stopped.
 pub const MAX_ASIDE_TOOL_CALLS: usize = 25;
@@ -216,12 +221,14 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::agent::tool_dispatch::TOOL_DISABLED_SUFFIX;
+    use crate::agent::tool_dispatch::{MCP_NAME_SEPARATOR, MCP_THROUGH_CODE, TOOL_DISABLED_SUFFIX};
     use crate::cancel::CancelToken;
+    use crate::code::names::{HOST_MODULE, IMAGE_MODULE};
     use crate::code::runner::{
         RunFuture, ScriptCall, ScriptInvocation, ScriptOutcome, ScriptOutput, ScriptRun,
         ScriptRunner, ScriptStatus, install,
     };
+    use crate::code::tool_module::READ_ONLY_UNAVAILABLE;
     use crate::context::{ContextKey, ContextStore};
     use crate::mcp::recognised_stub_session;
     use crate::permissions::{PermissionManager, PermissionMode};
@@ -266,8 +273,11 @@ mod tests {
     const LOOKUP_METHOD: &str = "lookup";
     const LOOKUP_RESULT: &str = "the kitchen light is on";
     const SNIPPET: &str = "await stub.lookup()";
+    const ENVIRONMENT_METHOD: &str = "environment";
+    const GENERATE_METHOD: &str = "generate";
     const MOCKS: &[(&str, ToolEffect, bool)] = &[
         (FILE_READ_TOOL_NAME, ToolEffect::ReadOnly, false),
+        (EXECUTION_ENVIRONMENT_TOOL_NAME, ToolEffect::ReadOnly, false),
         (FILE_GREP_TOOL_NAME, ToolEffect::ReadOnly, false),
         (FILE_WRITE_TOOL_NAME, ToolEffect::Mutating, false),
         (FILE_EDIT_TOOL_NAME, ToolEffect::Mutating, false),
@@ -389,15 +399,20 @@ mod tests {
         }
     }
 
-    /// Runs any snippet as one `stub.lookup()` and returns what it answered.
-    struct LookupRunner;
+    /// Runs any snippet as one `namespace.method()` call and returns what it
+    /// answered.
+    struct OneCallRunner {
+        namespace: &'static str,
+        method: &'static str,
+    }
 
-    impl ScriptRunner for LookupRunner {
+    impl ScriptRunner for OneCallRunner {
         fn run(&self, run: ScriptRun) -> RunFuture {
+            let (namespace, method) = (self.namespace, self.method);
             Box::pin(async move {
                 let invocation = run.host.call(ScriptCall {
-                    namespace: Some(LOOKUP_NAMESPACE.to_owned()),
-                    name: LOOKUP_METHOD.to_owned(),
+                    namespace: Some(namespace.to_owned()),
+                    name: method.to_owned(),
                     args: Vec::new(),
                     kwargs: Map::new(),
                 });
@@ -702,7 +717,10 @@ mod tests {
     #[test_case(true, true ; "a_read_only_mcp_call_runs")]
     #[test_case(false, false ; "a_writing_mcp_call_is_refused")]
     fn code_reaches_only_read_only_host_calls(annotated_read_only: bool, runs: bool) {
-        install(Arc::new(LookupRunner));
+        install(Arc::new(OneCallRunner {
+            namespace: LOOKUP_NAMESPACE,
+            method: LOOKUP_METHOD,
+        }));
         let mut fixture = Fixture::new(
             calling(CODE_TOOL_NAME, json!({"code": SNIPPET}), 0),
             PermissionMode::Yolo,
@@ -716,6 +734,43 @@ mod tests {
         fixture.ask(&mut history, QUESTION).unwrap();
         let (content, _) = result(&history);
         assert_eq!(content.contains(LOOKUP_RESULT), runs, "{content}");
+    }
+
+    /// MCP tools are never declared, so a call by a server tool's name runs
+    /// nothing, read-only or not, and points the model to `code`.
+    #[test_case(true ; "read_only")]
+    #[test_case(false ; "writing")]
+    fn a_direct_mcp_call_points_to_code(annotated_read_only: bool) {
+        let direct = format!("{LOOKUP_SERVER}{MCP_NAME_SEPARATOR}{LOOKUP_TOOL}");
+        let mut fixture = Fixture::new(calling(&direct, json!({}), 0), PermissionMode::Yolo);
+        fixture.ctx.mcp = Some(recognised_stub_session(
+            LOOKUP_SERVER,
+            &[(LOOKUP_TOOL, annotated_read_only)],
+            json!({"content": [{"type": "text", "text": LOOKUP_RESULT}]}),
+        ));
+        let mut history = forked();
+        fixture.ask(&mut history, QUESTION).unwrap();
+        let (content, is_error) = result(&history);
+        assert!(is_error && content.contains(MCP_THROUGH_CODE), "{content}");
+        assert!(!content.contains(LOOKUP_RESULT), "{content}");
+    }
+
+    #[test_case(HOST_MODULE, ENVIRONMENT_METHOD, RAN ; "host_environment_runs")]
+    #[test_case(IMAGE_MODULE, GENERATE_METHOD, READ_ONLY_UNAVAILABLE ; "image_generate_is_refused")]
+    fn code_modules_reach_only_their_reads(
+        namespace: &'static str,
+        method: &'static str,
+        expected: &str,
+    ) {
+        install(Arc::new(OneCallRunner { namespace, method }));
+        let fixture = Fixture::new(
+            calling(CODE_TOOL_NAME, json!({"code": SNIPPET}), 0),
+            PermissionMode::Yolo,
+        );
+        let mut history = forked();
+        fixture.ask(&mut history, QUESTION).unwrap();
+        let (content, _) = result(&history);
+        assert!(content.contains(expected), "{content}");
     }
 
     #[test]

@@ -613,6 +613,17 @@ impl Gateway {
             input,
         } = plan;
         let name = row.called_as.clone();
+        if self.0.ctx.policy().is_read_only() && changes_state(&self.0.ctx, tool, &input) {
+            let index = self.begin(row);
+            return self.refused(
+                index,
+                Instant::now(),
+                ScriptError::new(
+                    ScriptErrorKind::Permission,
+                    format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"),
+                ),
+            );
+        }
         let hosted = HostedCall::new(tool, prompt_action(&name, &row.input, None));
         row.title = Some(self.0.ctx.registry.resolve_header(tool, &input));
         row.hosted = Some(Box::new(HostedResult::pending(tool)));
@@ -1001,6 +1012,19 @@ fn seconds(delay: Duration) -> String {
     }
 }
 
+/// Whether a hosted tool would call `input` anything but a read. A read-only policy admits only
+/// reads here, stricter than dispatch's gate: a workflow a call starts runs in the session's
+/// mode, not the caller's, so an orchestrating call is no read. An input the tool cannot parse is
+/// left for dispatch to refuse with its own reason.
+fn changes_state(ctx: &ToolContext, tool: &str, input: &Value) -> bool {
+    ctx.registry.get(tool).is_some_and(|entry| {
+        entry
+            .tool
+            .parse(input)
+            .is_ok_and(|invocation| entry.effect_for(invocation.as_ref()) != ToolEffect::ReadOnly)
+    })
+}
+
 /// Holds a call to the session's mode, then asks as its plan says.
 async fn authorize(
     ctx: &ToolContext,
@@ -1108,6 +1132,7 @@ mod tests {
     };
     use caudra_providers::{ContentBlock, Message, Role};
     use caudra_storage::StateDir;
+    use caudra_workflow::WorkflowResponse;
     use caudra_workspace::RecordScope;
     use serde_json::{Map, json};
     use tempfile::TempDir;
@@ -1135,8 +1160,11 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::cancel::CancelToken;
-    use crate::code::names::HOST_MODULE;
+    use crate::code::names::{AUTOMATION_MODULE, HOST_MODULE, IMAGE_MODULE, WORKFLOW_MODULE};
+    use crate::code::tool_module::READ_ONLY_UNAVAILABLE;
     use crate::tools::native::automation::AutomationTool;
+    use crate::tools::native::image_generate::ImageGenerate;
+    use crate::tools::native::workflow::WorkflowTool;
     use crate::tools::registry::{
         ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
         ToolInvocation, ToolRegistry,
@@ -1144,6 +1172,7 @@ mod tests {
     use crate::tools::test_support::{stub_ctx, stub_ctx_with, stub_ctx_with_permissions};
     use crate::tools::{CODE_TOOL_NAME, DescriptionContext, ToolSource};
     use crate::types::ToolOutput;
+    use crate::workflow::WorkflowHandle;
     use crate::{Envelope, EventSender};
 
     const NAMESPACE: &str = "stub";
@@ -1781,14 +1810,12 @@ mod tests {
         invoke(gateway, call).await
     }
 
-    /// `decide()` asks no permission, so it answers while planning too, in the snippet's own
-    /// order and shape, and shows as a row.
-    #[test]
-    fn decide_answers_in_the_snippets_shape_even_while_planning() {
-        let (_dir, gateway) = deciding_gateway(
-            AgentMode::Plan(PathBuf::from(PLAN_FILE)),
-            Some(TypedEngine::default()),
-        );
+    /// `decide()` asks no permission and changes nothing, so it answers while planning and under
+    /// a read-only policy too, in the snippet's own order and shape, and shows as a row.
+    #[test_case(AgentMode::Plan(PathBuf::from(PLAN_FILE)) ; "while_planning")]
+    #[test_case(AgentMode::ReadOnly ; "under_a_read_only_policy")]
+    fn decide_answers_in_the_snippets_shape(mode: AgentMode) {
+        let (_dir, gateway) = deciding_gateway(mode, Some(TypedEngine::default()));
         let reply = smol::block_on(call_helper(
             &gateway,
             DECIDE_HELPER,
@@ -2307,6 +2334,15 @@ mod tests {
     const HOSTED_OWNER: &str = "test";
     const ENVIRONMENT_METHOD: &str = "environment";
     const ENVIRONMENT_CALL: &str = "host.environment()";
+    const WORKFLOW_NAME: &str = "review";
+    const LIST: &str = "list";
+    const STATUS: &str = "status";
+    const HISTORY: &str = "history";
+    const START: &str = "start";
+    const STOP: &str = "stop";
+    const ARM: &str = "arm";
+    const DISARM: &str = "disarm";
+    const DELETE: &str = "delete";
 
     /// Stands in for the Workcell tool `host.environment()` runs.
     struct FakeEnvironment;
@@ -2616,6 +2652,157 @@ mod tests {
         let (reply, calls) = call_environment(&ctx);
         assert!(reply.is_err());
         assert_ne!(calls[0].status, CodeCallStatus::Success);
+    }
+
+    /// A read-only policy runs a hosted read, and hides a module whose tool only changes things,
+    /// saying so rather than blaming the profile.
+    #[test_case(ToolEffect::ReadOnly, None ; "a_read_runs")]
+    #[test_case(ToolEffect::Mutating, Some(HOST_MODULE) ; "a_tool_that_only_changes_is_hidden")]
+    fn a_read_only_policy_reaches_a_hosted_read(effect: ToolEffect, hidden: Option<&str>) {
+        let (reply, calls) = call_environment(&hosted_ctx(&AgentMode::ReadOnly, effect));
+        match hidden {
+            None => {
+                assert_eq!(reply.unwrap()["headline"], HOSTED_HEADLINE);
+                assert_eq!(calls[0].status, CodeCallStatus::Success);
+            }
+            Some(namespace) => {
+                let error = reply.unwrap_err();
+                assert_eq!(
+                    error.message,
+                    format!("{namespace} {READ_ONLY_UNAVAILABLE}")
+                );
+                assert!(calls.is_empty());
+            }
+        }
+    }
+
+    #[test_case(AgentMode::Build, false ; "build_reaches_it")]
+    #[test_case(AgentMode::ReadOnly, true ; "a_read_only_policy_hides_it")]
+    fn image_generation_is_hidden_under_a_read_only_policy(mode: AgentMode, hidden: bool) {
+        let mut ctx = stub_ctx(&mode);
+        ctx.config.features = FeatureFlags::all();
+        ctx.registry = native_registry(Arc::new(ImageGenerate), ToolEffect::Mutating);
+        let module = ToolModule::image(&ctx);
+        assert_eq!(
+            module.unavailable(),
+            hidden.then(|| format!("{IMAGE_MODULE} {READ_ONLY_UNAVAILABLE}"))
+        );
+    }
+
+    fn native_registry(tool: Arc<dyn Tool>, effect: ToolEffect) -> Arc<ToolRegistry> {
+        let registry = Arc::new(ToolRegistry::new());
+        let contract: Arc<str> = Arc::from(tool.name());
+        registry
+            .register_audited(
+                tool,
+                ToolSource::Native {
+                    owner: crate::tools::native::OWNER.into(),
+                    contract,
+                    trusted: true,
+                },
+                effect,
+            )
+            .unwrap();
+        registry
+    }
+
+    /// A read-only policy runs a workflow's reads and refuses every call that starts or ends a
+    /// run, since a run works in the session's mode rather than the caller's: the runtime never
+    /// hears of it.
+    #[test_case(AgentMode::ReadOnly, LIST, None, true ; "read_only_lists")]
+    #[test_case(AgentMode::ReadOnly, STATUS, None, true ; "read_only_reads_a_status")]
+    #[test_case(AgentMode::ReadOnly, START, Some(WORKFLOW_NAME), false ; "read_only_refuses_a_start")]
+    #[test_case(AgentMode::ReadOnly, STOP, Some(RUN_ID), false ; "read_only_refuses_a_stop")]
+    #[test_case(AgentMode::Build, START, Some(WORKFLOW_NAME), true ; "build_starts")]
+    fn a_read_only_policy_reaches_only_workflow_reads(
+        mode: AgentMode,
+        method: &str,
+        argument: Option<&str>,
+        runs: bool,
+    ) {
+        let (_dir, permissions) = permissions(PermissionsConfig::default(), PermissionMode::Yolo);
+        let mut ctx = stub_ctx_with_permissions(&mode, permissions);
+        ctx.config.features = FeatureFlags::all();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&requests);
+        ctx.workflow = Some(WorkflowHandle::scripted(move |_| {
+            received.fetch_add(1, Ordering::SeqCst);
+            Ok(WorkflowResponse::Ack)
+        }));
+        ctx.registry = native_registry(Arc::new(WorkflowTool), ToolEffect::Orchestrator);
+        let gateway = Gateway::new(ctx.clone(), vec![Arc::new(ToolModule::workflow(&ctx))]);
+        help(&gateway, Some(WORKFLOW_MODULE)).unwrap();
+        let reply = smol::block_on(invoke(
+            &gateway,
+            ScriptCall {
+                namespace: Some(WORKFLOW_MODULE.to_owned()),
+                name: method.to_owned(),
+                args: argument.into_iter().map(Value::from).collect(),
+                kwargs: Map::new(),
+            },
+        ));
+        assert_eq!(reply.is_ok(), runs, "{reply:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), usize::from(runs));
+        if let Err(error) = reply {
+            assert_eq!(error.kind, ScriptErrorKind::Permission);
+            assert!(
+                error.message.starts_with(READ_ONLY_TOOL_RESTRICTED),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// A read-only policy reads automations and refuses to arm, disarm or delete one, even in
+    /// Yolo, leaving the script unarmed and on disk.
+    #[test_case(LIST, None, true ; "list_runs")]
+    #[test_case(HISTORY, None, true ; "history_runs")]
+    #[test_case(ARM, Some(AUTOMATION_NAME), false ; "arm_is_refused")]
+    #[test_case(DISARM, Some(AUTOMATION_NAME), false ; "disarm_is_refused")]
+    #[test_case(DELETE, Some(AUTOMATION_NAME), false ; "delete_is_refused")]
+    fn a_read_only_policy_reaches_only_automation_reads(
+        method: &str,
+        argument: Option<&str>,
+        runs: bool,
+    ) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            let path = fixture.script(
+                &fixture.project_scripts(),
+                AUTOMATION_NAME,
+                AUTOMATION_FIELDS,
+                "",
+            );
+            let runtime = fixture.spawn(&[]).await;
+            let (_dir, permissions) =
+                permissions(PermissionsConfig::default(), PermissionMode::Yolo);
+            let mut ctx = stub_ctx_with_permissions(&AgentMode::ReadOnly, permissions);
+            ctx.config.features = FeatureFlags::all();
+            ctx.session_id = Some(fixture.session_id().into());
+            ctx.registry = native_registry(Arc::new(AutomationTool), ToolEffect::Mutating);
+            let gateway = Gateway::new(ctx.clone(), vec![Arc::new(ToolModule::automation(&ctx))]);
+            let reply = invoke(
+                &gateway,
+                ScriptCall {
+                    namespace: Some(AUTOMATION_MODULE.to_owned()),
+                    name: method.to_owned(),
+                    args: argument.into_iter().map(Value::from).collect(),
+                    kwargs: Map::new(),
+                },
+            )
+            .await;
+            assert_eq!(reply.is_ok(), runs, "{reply:?}");
+            if let Err(error) = reply {
+                assert_eq!(error.kind, ScriptErrorKind::Permission);
+                assert!(
+                    error.message.starts_with(READ_ONLY_TOOL_RESTRICTED),
+                    "{error:?}"
+                );
+            }
+            let state = runtime.handle().state();
+            assert!(state.find(AUTOMATION_NAME).unwrap().armed.is_none());
+            assert!(path.exists());
+            runtime.shutdown().await;
+        });
     }
 
     /// Calling a hosted tool directly, at the top level or inside `batch`, names the module call.

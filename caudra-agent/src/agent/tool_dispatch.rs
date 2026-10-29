@@ -79,7 +79,7 @@ impl Emit<'_> {
 #[cfg(test)]
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
-const MCP_THROUGH_CODE: &str =
+pub(crate) const MCP_THROUGH_CODE: &str =
     ". MCP tools are called from the `code` tool: `await <server>.<tool>(...)`";
 pub(crate) const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
@@ -89,7 +89,7 @@ const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
 /// How a direct MCP tool was named on the wire, before code mode.
-const MCP_NAME_SEPARATOR: &str = "__";
+pub(crate) const MCP_NAME_SEPARATOR: &str = "__";
 const BASH_TOOL: &str = "bash";
 const SHELL_TOOL: &str = "shell";
 const BASH_COMMAND_FIELD: &str = "command";
