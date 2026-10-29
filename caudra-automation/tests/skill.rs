@@ -20,7 +20,8 @@ const HEADING: &str = "# Writing Caudra automations";
 const EXAMPLES_DIR: &str = "tests/examples";
 const EXAMPLE_EXTENSION: &str = "rhai";
 /// The tested examples the guide embeds, in the order it shows them.
-const EMBEDDED_EXAMPLES: [&str; 13] = [
+const EMBEDDED_EXAMPLES: [&str; 14] = [
+    "follow-up",
     "keep-going",
     "goal-chain",
     "timebox",

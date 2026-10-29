@@ -29,6 +29,8 @@ use crate::types::{TextOutput, ToolOutput, counted};
 
 pub const DESCRIPTION: &str = "Inspect and manage this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
 
+Automations can manage this session with reminders, steps after a goal finishes, or checks while waiting. When a trigger fits better than a todo or goal, load `caudra-automation-dev` first and write a short script to the `session_dir` that `list` reports. Only this session sees it, it needs no trust, and deleting the session removes it. If `session_dir` is absent, report that instead of writing elsewhere. Validate, then `arm`, which asks unless a rule, YOLO, or autopilot approves. A one-shot calls `done(reason)` after acting. Session disarm and delete need no prompt by default, though user deny or ask rules still win.
+
 Actions:
 - `list`: every automation this session can arm, with its scope (`session`, `project`, `user`, or `bundled`: shipped with Caudra by an enabled provider such as pstack, overridden by a script of the same name), availability, status, triggers, args and warnings, files that cannot load with the reason, and the resolved script directories. The structured result includes `session_dir`, `project_dir` and `user_dir`; `session_dir` is absent when tools run remotely.
 - `validate`: parse the header of `name`, compile the script, check the args its body reads, and run the body once per trigger against a canned event, performing nothing.
@@ -36,9 +38,9 @@ Actions:
 
 - `arm`: arm `name`, optionally with `args`, or re-arm it. Approval also trusts the exact reviewed digest of an untrusted project script.
 - `disarm`: stop `name` in this session and drop its queued firings and deliveries.
-- `delete`: disarm `name` in this session and remove its project or user script file. Bundled scripts and symlinks cannot be deleted. Other sessions keep their bindings.
+- `delete`: disarm `name` in this session and remove its session, project or user script file. Bundled scripts and symlinks cannot be deleted. Other sessions keep their bindings.
 
-Reads never prompt. Changes ask for permission unless a rule, YOLO or autopilot approves, and are unavailable in Plan mode.
+Reads never prompt. Except for session disarm and delete, changes ask for permission unless a rule, YOLO or autopilot approves. All changes are unavailable in Plan mode.
 
 Input: { action: \"list\" | \"validate\" | \"history\" | \"arm\" | \"disarm\" | \"delete\", name?: string, args?: object, fire_id?: string, limit?: integer }";
 

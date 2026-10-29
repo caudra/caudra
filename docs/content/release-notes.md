@@ -13,6 +13,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 - Images and PDFs are stored once as files beside the session database, which shrinks it, and resumed sessions keep their PDFs.
 - A task whose transcript is too large to save no longer stops every background task, and a result lost that way is delivered after a restart.
+- The agent can write reminders and follow-ups for its own session, and one-shot automations can disarm themselves after acting.
 
 > **Important**
 >
@@ -32,7 +33,7 @@ To install Caudra, follow the [Quick Start](/docs/quick-start/). To update, run 
 
 - **Git-aware automations.** Experimental automations can use `git_compare(base)` to compare a checkout with a local branch without a model turn. Caudra's contributor checkout includes `sync-main`, which asks for a merge at a safe point when local `main` moves and skips when the worktree is current. See [Automations](/docs/automations/#compare-local-git-branches).
 
-- **Agent-managed automations.** The agent can arm, disarm and delete automations through a permission prompt, which autopilot can answer. YOLO approves after deny rules. Approving an arm also trusts an untrusted project script's exact reviewed digest, with its triggers, args and capabilities shown before approval. Reading and validating automations need no prompt.
+- **Agent-managed automations.** With experimental automations on, the agent can write ad-hoc reminders and follow-ups visible only to its session. These session scripts need no digest trust and disappear when the session is deleted. Arming asks for permission unless a rule, YOLO, or autopilot approves. Session disarm and delete need no prompt by default, though your deny or ask rules still win. Project and user disarm and delete still require permission. Approving an arm also trusts an untrusted project script's exact reviewed digest, with its triggers, args and capabilities shown before approval. Reading and validating automations need no prompt. A one-shot script can call `done(reason)` to disarm itself when its firing completes, without dropping its queued message. See [Automations](/docs/automations/).
 
 - **Images and PDFs are stored once.** Pasted images, images that tools and tasks return, and fetched PDFs are saved as files under `media/` in the state directory, and sessions keep only a reference to each. The same picture in several sessions, forks, or task transcripts takes space once, and the upgrade moves images already saved into the store. Resumed sessions now keep their fetched PDFs. If a file goes missing, the model is told the image is unavailable instead of receiving it. The storage sweep and `caudra storage prune` remove files that no session, archive, or backup refers to after seven days. Backups keep the files they refer to, so restoring one needs the `media/` directory beside it. `/storage` and `caudra storage stats` show the store's size, and `caudra storage check` reports missing or damaged files. See [Sessions](/docs/sessions/).
 

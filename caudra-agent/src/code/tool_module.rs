@@ -211,7 +211,7 @@ run[\"status\"], run.get(\"result\")\n\
 pub static AUTOMATION_DOC: ModuleDoc = ModuleDoc {
     namespace: AUTOMATION_MODULE,
     summary: "`automation`: inspect and manage this session's automations (Rhai scripts reacting to session events); `automation.list`, `.validate`, `.history`, `.arm`, `.disarm`, `.delete`.",
-    page: "automation: this session's automations, short Rhai scripts that react to events such as the session going idle, a goal finishing or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one. Reads never prompt. Arm, disarm and delete require permission unless a rule, YOLO or autopilot approves. They are unavailable in Plan mode. Approval to arm also trusts an untrusted project script's exact reviewed digest. Tell the user what you armed.\n\
+    page: "automation: this session's automations, short Rhai scripts that react to events such as the session going idle, a goal finishing or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one. For an ad-hoc reminder or follow-up, write to the `session_dir` that `list` reports, validate, then arm. Session scripts need no digest trust and disappear when the session is deleted. If `session_dir` is absent, report that instead of writing elsewhere. A one-shot calls `done(reason)` after acting. Reads never prompt. Arm requires permission unless a rule, YOLO or autopilot approves. Disarm and delete do too, except in session scope, where they need no prompt by default. User deny or ask rules still win. All changes are unavailable in Plan mode. Approval to arm also trusts an untrusted project script's exact reviewed digest. Tell the user what you armed.\n\
 Answers are the runtime's own records as dicts.",
     members: &[
         MemberDoc {
@@ -247,14 +247,14 @@ Answers are the runtime's own records as dicts.",
             signature: "disarm(name: str) -> dict[str, Any]",
             awaited: true,
             read_first: false,
-            page: "Disarms the automation in this session and drops queued firings and deliveries, after permission approval. Returns its automation snapshot.",
+            page: "Disarms the automation in this session and drops queued firings and deliveries. Session scope needs no prompt by default, subject to user deny or ask rules. Other scopes require permission approval. Returns its automation snapshot.",
         },
         MemberDoc {
             name: "delete",
             signature: "delete(name: str) -> Any",
             awaited: true,
             read_first: false,
-            page: "Disarms the automation in this session, removes its project or user script file, and rescans, after permission approval. Refuses bundled scripts and symlinks. Other open sessions keep their bindings.",
+            page: "Disarms the automation in this session, removes its session, project or user script file, and rescans. Session scope needs no prompt by default, subject to user deny or ask rules. Other scopes require permission approval. Refuses bundled scripts and symlinks. Other open sessions keep their bindings.",
         },
     ],
 };
