@@ -34,7 +34,6 @@ const PER_MILLION: f64 = 1_000_000.0;
 const TOKEN_THOUSAND: u64 = 1_000;
 const TOKEN_MILLION: u64 = 1_000_000;
 const TOKEN_TENTHS: u128 = 10;
-pub(crate) const ANTHROPIC_SLUG: &str = "anthropic";
 const GPT_PREFIX: &str = "gpt-";
 const GPT_4_PREFIX: &str = "gpt-4";
 const OPEN_WEIGHTS_PREFIX: &str = "gpt-oss";
@@ -67,6 +66,8 @@ pub enum ModelError {
     UnsupportedProvider(String),
     #[error("unknown model '{0}'")]
     UnknownModel(String),
+    #[error("model '{model}' needs a newer Caudra ({reason}). Upgrade Caudra to use this model.")]
+    NeedsNewerCaudra { model: String, reason: &'static str },
     #[error(transparent)]
     InvalidPurpose(#[from] UnknownPurpose),
     #[error("model '{0}' is not allowed by provider model policy")]
@@ -99,6 +100,7 @@ pub struct PricingTier {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -317,6 +319,7 @@ pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     /// Whether this is a deliberately small model. False means known non-small,
@@ -330,6 +333,8 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    pub window_excludes_output: bool,
+    pub unsupported: Option<&'static str>,
     /// Corrects the catalog where it describes the model rather than the
     /// request caudra sends. `None` defers to discovery and models.dev.
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
@@ -342,6 +347,7 @@ pub struct ModelEntry {
 /// `members` are id prefixes. The longest match wins, so a line can be spelled
 /// as broadly as `gpt-6-` without capturing a narrower line declared beside it.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ModelGeneration {
     pub label: &'static str,
     pub members: &'static [&'static str],
@@ -519,8 +525,18 @@ fn inherited_lineage(
 impl Model {
     /// When no static entry matches (a freshly released model the table has not
     /// caught up to yet), fall back to the provider defaults so it still resolves.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
+    fn from_base(
+        manifest: &ProviderManifest,
+        slug: &str,
+        model_id: &str,
+    ) -> Result<Self, ModelError> {
         let static_entry = lookup_entry(manifest.models, model_id).ok();
+        if let Some(reason) = static_entry.and_then(|entry| entry.unsupported) {
+            return Err(ModelError::NeedsNewerCaudra {
+                model: format!("{slug}/{model_id}"),
+                reason,
+            });
+        }
         // A wrapper's own listing wins. Before it has listed, metadata already
         // discovered through the builtin remains a useful fallback.
         let discovered = model_registry::discovered(slug, model_id).or_else(|| {
@@ -585,12 +601,7 @@ impl Model {
             })
             .or_else(|| anthropic::shared::long_context_window(model_id).map(|w| (w, false)))
             .or_else(|| {
-                static_entry.map(|entry| {
-                    (
-                        entry.context_window,
-                        anthropic::shared::declares_input_budget(manifest.slug, entry),
-                    )
-                })
+                static_entry.map(|entry| (entry.context_window, entry.window_excludes_output))
             })
             .or_else(|| catalog.map(|meta| (meta.context, meta.context_excludes_output)))
             .unwrap_or((manifest.fallback_context_window, false));
@@ -633,7 +644,7 @@ impl Model {
             billing: Billing::default(),
         };
         model.apply_declared_limits();
-        model
+        Ok(model)
     }
 
     /// Lay the limits `providers.toml` declares for this model over every other
@@ -1079,13 +1090,19 @@ impl Model {
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
+        if let Some(&reason) = crate::model_data::current().unsupported_providers.get(slug) {
+            return Err(ModelError::NeedsNewerCaudra {
+                model: spec.to_owned(),
+                reason,
+            });
+        }
 
         // Precedence: builtin, then dynamic script, then providers.toml custom,
         // then models.dev catalogue sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
         if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
+            return Self::from_base(manifest, slug, model_id);
         }
 
         if let Some(model) = dynamic::lookup_model(slug, model_id) {
@@ -1095,7 +1112,7 @@ impl Model {
         if let Some(base) = dynamic::base_for_slug(slug)
             && let Some(manifest) = ManifestRegistry::get(&base.to_string())
         {
-            return Ok(Self::from_base(manifest, slug, model_id));
+            return Self::from_base(manifest, slug, model_id);
         }
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
@@ -2046,7 +2063,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-nonexistent-99",
-        );
+        )
+        .unwrap();
         assert_eq!(model.provider, Arc::<str>::from("anthropic"));
         assert_eq!(model.id, "claude-nonexistent-99");
         assert_eq!(model.spec(), "anthropic/claude-nonexistent-99");
@@ -2090,7 +2108,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
-        );
+        )
+        .unwrap();
         assert_eq!(model.supports_fast(), expected);
     }
 
@@ -2113,6 +2132,7 @@ mod tests {
             "anthropic",
             model_id,
         )
+        .unwrap()
         .pricing;
         assert_eq!(
             (
@@ -2134,7 +2154,8 @@ mod tests {
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-opus-5-5",
-        );
+        )
+        .unwrap();
         let usage = TokenUsage {
             cache_read: 1_000_000,
             ..Default::default()
@@ -2150,7 +2171,8 @@ mod tests {
             ManifestRegistry::get("google").unwrap(),
             "google",
             "gemini-4-argon",
-        );
+        )
+        .unwrap();
         model.pricing.fast = Some(FastPricing::derived(30.0, 150.0));
         assert!(!model.supports_fast());
     }
@@ -2260,7 +2282,8 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model =
+            Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id).unwrap();
         assert_eq!(model.context_window, expected_window);
 
         // A dynamic/custom slug shares its base provider's discovery.
@@ -2268,7 +2291,8 @@ mod tests {
             ManifestRegistry::get("ollama").unwrap(),
             "my-ollama-wrap",
             model_id,
-        );
+        )
+        .unwrap();
         assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
         assert_eq!(wrapped.context_window, expected_window);
     }
@@ -2298,7 +2322,8 @@ mod tests {
             ManifestRegistry::get("openai").unwrap(),
             wrapper_slug,
             model_id,
-        );
+        )
+        .unwrap();
 
         assert_eq!(model.spec(), format!("{wrapper_slug}/{model_id}"));
         assert_eq!(model.context_window, wrapper_window);
@@ -2319,7 +2344,8 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model =
+            Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id).unwrap();
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
@@ -2346,6 +2372,8 @@ mod tests {
         pricing: input_only(TABLE_INPUT_RATE),
         max_output_tokens: None,
         context_window: 1_000,
+        window_excludes_output: false,
+        unsupported: None,
         reasoning_options: None,
     }];
     /// One date the suite never reaches and one long gone, so the real clock
@@ -2397,7 +2425,7 @@ mod tests {
             ..*ManifestRegistry::get("google").unwrap()
         };
 
-        let model = Model::from_base(&manifest, slug, PRICE_PERIOD_MODEL);
+        let model = Model::from_base(&manifest, slug, PRICE_PERIOD_MODEL).unwrap();
 
         assert_eq!(
             model.pricing.input, expected_rate,

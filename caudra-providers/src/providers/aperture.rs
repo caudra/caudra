@@ -11,7 +11,6 @@ use crate::accounts::AccountCredential;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest, adjust_model_metadata};
-use crate::providers::anthropic::shared::declares_input_budget;
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::anthropic::Anthropic;
@@ -449,7 +448,7 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
             if let Ok(entry) = lookup_entry(manifest.models, model_id) {
                 model.context_window = entry.context_window;
                 model.max_output_tokens = entry.max_output_tokens;
-                model.window_excludes_output = declares_input_budget(manifest.slug, entry);
+                model.window_excludes_output = entry.window_excludes_output;
                 model.supports_vision_override =
                     model.supports_vision_override.or(Some(entry.vision));
             }

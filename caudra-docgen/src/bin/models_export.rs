@@ -231,7 +231,7 @@ fn provider(value: &ProviderManifest) -> wire::Provider {
                 pricing: pricing(&entry.pricing),
                 max_output_tokens: entry.max_output_tokens,
                 context_window: entry.context_window,
-                window_excludes_output: value.window_excludes_output(entry),
+                window_excludes_output: entry.window_excludes_output,
                 reasoning_options: entry
                     .reasoning_options
                     .map(|options| options.iter().map(reasoning).collect()),

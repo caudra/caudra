@@ -65,6 +65,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 524_288,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
         },
         ModelEntry {
@@ -83,6 +85,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 524_288,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
         },
         ModelEntry {
@@ -101,6 +105,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 524_288,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_NONE_TO_MAX),
         },
         ModelEntry {
@@ -119,6 +125,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 524_288,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_NONE_TO_MAX),
         },
         ModelEntry {
@@ -137,6 +145,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 262_144,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_NONE_TO_HIGH),
         },
         ModelEntry {
@@ -155,6 +165,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 131_072,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_NONE_TO_HIGH),
         },
         ModelEntry {
@@ -173,6 +185,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 196_608,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_NONE_TO_HIGH),
         },
         ModelEntry {
@@ -191,6 +205,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 524_288,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_LOW_HIGH_MAX),
         },
         ModelEntry {
@@ -209,6 +225,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(65_536),
             context_window: 262_144,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(QWEN_EFFORT),
         },
     ];

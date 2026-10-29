@@ -15,7 +15,7 @@ use crate::AgentError;
 use crate::decision_pricing;
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{ModelEntry, ModelPricing, PricingTier, lookup_entry};
-use crate::providers::anthropic::shared::{WIDE_CONTEXT_WINDOW, declares_input_budget};
+use crate::providers::anthropic::shared::WIDE_CONTEXT_WINDOW;
 use crate::providers::catalog::{self, CatalogMeta, schema::CatalogModel};
 use crate::providers::openai;
 use crate::providers::xai::GROK_MAX_OUTPUT_TOKENS;
@@ -737,7 +737,7 @@ fn entry_findings(
         }
     }
     let limit = listed.model.limit.as_ref();
-    let input_budget = declares_input_budget(manifest.slug, entry);
+    let input_budget = entry.window_excludes_output;
     let limits = [
         (
             Field::Context,

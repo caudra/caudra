@@ -32,6 +32,7 @@ pub(crate) const FLAT_RATE: f64 = 1.0;
 ///
 /// One multiplier is enough while providers move all four rates together.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct PricingSchedule {
     windows: &'static [PricingWindow],
     multiplier: f64,
@@ -40,6 +41,7 @@ pub struct PricingSchedule {
 /// Half-open `[start, end)` in whole UTC hours. `start > end` wraps past
 /// midnight, so a window never needs splitting in two.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct PricingWindow {
     start: u8,
     end: u8,
@@ -61,6 +63,11 @@ impl PricingWindow {
         assert!(end <= HOURS_PER_DAY, "window ends after the day ends");
         assert!(start != end, "window covers no time at all");
         Self { start, end }
+    }
+
+    pub(crate) fn try_hours(start: u8, end: u8) -> Option<Self> {
+        (start < HOURS_PER_DAY && end <= HOURS_PER_DAY && start != end)
+            .then_some(Self { start, end })
     }
 
     fn contains(&self, hour: u8) -> bool {
@@ -101,6 +108,13 @@ impl PricingSchedule {
             windows,
             multiplier,
         }
+    }
+
+    pub(crate) fn try_new(windows: &'static [PricingWindow], multiplier: f64) -> Option<Self> {
+        (!windows.is_empty() && multiplier.is_finite() && multiplier > FLAT_RATE).then_some(Self {
+            windows,
+            multiplier,
+        })
     }
 
     pub(crate) fn multiplier_at(&self, at: Timestamp) -> f64 {
@@ -192,6 +206,7 @@ fn utc_day(at: Timestamp) -> Date {
 /// tiers included, and outside it at the entry's own rates, so a build shipped
 /// before either edge stays right after it.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct PricePeriod {
     /// The `ModelEntry` prefix whose rates the period sets.
     pub prefix: &'static str,

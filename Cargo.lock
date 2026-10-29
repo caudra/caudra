@@ -1356,6 +1356,7 @@ dependencies = [
  "wait-timeout",
  "workspace-hack",
  "yaml_serde",
+ "zstd",
 ]
 
 [[package]]

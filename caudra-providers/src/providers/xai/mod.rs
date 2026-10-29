@@ -65,6 +65,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_CONTEXT_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
@@ -90,6 +92,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_CONTEXT_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_XHIGH),
         },
         ModelEntry {
@@ -115,6 +119,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_CONTEXT_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_HIGH),
         },
         ModelEntry {
@@ -140,6 +146,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_4_3_CONTEXT_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_WITH_NONE),
         },
     ];

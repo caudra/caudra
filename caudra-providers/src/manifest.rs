@@ -14,6 +14,7 @@ use crate::providers::{
 };
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ProviderManifest {
     pub slug: &'static str,
     pub display_name: &'static str,
@@ -48,10 +49,6 @@ pub struct ProviderManifest {
 }
 
 impl ProviderManifest {
-    pub fn window_excludes_output(&self, entry: &ModelEntry) -> bool {
-        anthropic::shared::declares_input_budget(self.slug, entry)
-    }
-
     /// What models.dev publishes about this model. Never triggers a fetch, so a
     /// cold catalog simply leaves every decision to the static table and
     /// discovery. Returned whole rather than field by field because each lookup
@@ -76,8 +73,10 @@ impl ProviderManifest {
     }
 
     pub fn is_listed_at(&self, entry: &ModelEntry, at: Timestamp) -> bool {
-        self.availability(entry)
-            .is_none_or(|row| row.during.contains(at))
+        entry.unsupported.is_none()
+            && self
+                .availability(entry)
+                .is_none_or(|row| row.during.contains(at))
     }
 
     /// The entries model lists and lane defaults offer at `at`, in table order.
@@ -104,6 +103,7 @@ impl ProviderManifest {
 /// by itself. An explicit id still resolves and prices as before, so stored
 /// sessions and configs keep their costs.
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Availability {
     /// Any prefix of the `ModelEntry` this dates.
     pub prefix: &'static str,
@@ -411,7 +411,11 @@ const APERTURE: ProviderManifest = ProviderManifest {
     catalog_slug: None,
 };
 
-const BUILTINS: &[ProviderManifest] = &[
+#[allow(
+    dead_code,
+    reason = "retained for fixture equivalence until the const tables are removed"
+)]
+pub(crate) const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
     GOOGLE,
@@ -435,7 +439,7 @@ pub struct ManifestRegistry;
 
 impl ManifestRegistry {
     pub fn get(slug: &str) -> Option<&'static ProviderManifest> {
-        BUILTINS.iter().find(|m| m.slug == slug)
+        Self::builtins().iter().find(|m| m.slug == slug)
     }
 
     /// Like `get`, but resolves dynamic and custom (providers.toml) slugs to
@@ -450,7 +454,7 @@ impl ManifestRegistry {
     }
 
     pub fn builtins() -> &'static [ProviderManifest] {
-        BUILTINS
+        crate::model_data::current().manifests
     }
 
     fn model_supply_manifest(slug: &str) -> Option<&'static ProviderManifest> {

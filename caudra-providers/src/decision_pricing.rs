@@ -10,6 +10,7 @@ use crate::model::{ModelPricing, PricingTier, TokenUsage};
 use crate::providers::openai::LONG_CONTEXT_ABOVE;
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct DecisionModelEntry {
     pub protocol: DecisionProtocol,
     pub prefixes: &'static [&'static str],
@@ -19,7 +20,11 @@ pub struct DecisionModelEntry {
     pub source: &'static str,
 }
 
-const DECISION_MODELS: &[DecisionModelEntry] = &[
+#[allow(
+    dead_code,
+    reason = "retained for fixture equivalence until the const tables are removed"
+)]
+pub(crate) const DECISION_MODELS: &[DecisionModelEntry] = &[
     // Input at $0.10/M, cache reads and writes at gpt-6-luna's standard cache
     // rates, no output charge, and the long-context multiplier past 272K.
     DecisionModelEntry {
@@ -60,8 +65,8 @@ const DECISION_MODELS: &[DecisionModelEntry] = &[
     },
 ];
 
-pub const fn entries() -> &'static [DecisionModelEntry] {
-    DECISION_MODELS
+pub fn entries() -> &'static [DecisionModelEntry] {
+    crate::model_data::current().decision_models
 }
 
 /// The cost of one decision call, priced by the first of `models` the table
@@ -79,7 +84,7 @@ pub fn decision_cost(
 }
 
 fn lookup(protocol: &DecisionProtocol, model: &str) -> Option<&'static DecisionModelEntry> {
-    DECISION_MODELS
+    entries()
         .iter()
         .filter(|entry| entry.protocol == *protocol)
         .flat_map(|entry| entry.prefixes.iter().map(move |prefix| (prefix, entry)))

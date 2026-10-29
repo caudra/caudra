@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::model::{
-    ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, PricingTier,
-    StaticReasoningOption,
+    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, PricingTier, StaticReasoningOption,
 };
 use crate::{
     AgentError, ContentBlock, DocumentSource, EMPTY_RESPONSE_MARKER, InvalidToolInput, Message,
@@ -86,15 +85,6 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
     model_id
         .ends_with(LONG_CONTEXT_SUFFIX)
         .then_some(LONG_CONTEXT_WINDOW)
-}
-
-/// Whether a static entry's own declared window is an input budget rather than
-/// the API total. Only the window caudra caps itself is one, and only this table
-/// declares any, so the question is scoped to an entry the manifest owns: a
-/// window discovered from a provider or published by models.dev answers for
-/// itself and never reaches here.
-pub(crate) fn declares_input_budget(manifest_slug: &str, entry: &ModelEntry) -> bool {
-    manifest_slug == ANTHROPIC_SLUG && entry.context_window == WIDE_CONTEXT_WINDOW
 }
 
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
@@ -988,6 +978,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1006,6 +998,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(BUDGET_ONLY),
         },
         ModelEntry {
@@ -1024,6 +1018,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(BUDGET_ONLY),
         },
         ModelEntry {
@@ -1042,6 +1038,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
@@ -1060,6 +1058,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1078,6 +1078,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1096,6 +1098,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(64000),
             context_window: 200_000,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_HIGH_WITH_BUDGET),
         },
         ModelEntry {
@@ -1115,6 +1119,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
@@ -1134,6 +1140,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1157,6 +1165,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1180,6 +1190,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1203,6 +1215,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1221,6 +1235,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
         ModelEntry {
@@ -1239,6 +1255,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128000),
             context_window: WIDE_CONTEXT_WINDOW,
+            window_excludes_output: true,
+            unsupported: None,
             reasoning_options: Some(EFFORT_TO_MAX),
         },
     ];

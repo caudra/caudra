@@ -132,6 +132,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: ONE_MILLION_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(LEVELS_LOW_TO_HIGH),
         },
         ModelEntry {
@@ -144,6 +146,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             pricing: FLASH_PROMO_PRICE,
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: ONE_MILLION_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(LEVELS_LOW_TO_HIGH),
         },
         ModelEntry {
@@ -156,6 +160,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             pricing: FLASH_PROMO_PRICE,
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: ONE_MILLION_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
         },
         ModelEntry {
@@ -174,6 +180,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: ONE_MILLION_WINDOW,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: Some(LEVELS_MINIMAL_TO_HIGH),
         },
     ];

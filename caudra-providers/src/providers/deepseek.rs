@@ -67,6 +67,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: 1_000_000,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: None,
         },
         ModelEntry {
@@ -85,6 +87,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             context_window: 1_000_000,
+            window_excludes_output: false,
+            unsupported: None,
             reasoning_options: None,
         },
     ];

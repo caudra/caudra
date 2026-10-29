@@ -11,6 +11,8 @@ use crate::{
 const FORMAT_MESSAGE: &str = "unsupported model-file format; expected 1";
 const SLUG_MESSAGE: &str = "provider slug must be unique";
 const PREFIX_MESSAGE: &str = "model prefix must be unique within its provider";
+const EMPTY_PREFIXES_MESSAGE: &str = "model entry must have at least one prefix";
+const EMPTY_PREFIX_MESSAGE: &str = "model prefix must not be empty";
 const DEFAULT_MESSAGE: &str = "at most one undated default is allowed per generation and size lane";
 const PERIOD_MESSAGE: &str = "period from must be before until";
 const TIER_MESSAGE: &str = "tier thresholds must be strictly ascending";
@@ -100,7 +102,21 @@ fn validate_provider(provider: &Provider, path: &str, issues: &mut Vec<Issue>) {
     let mut defaults = HashSet::new();
     for (index, model) in provider.models.iter().enumerate() {
         let model_path = format!("{path}/models/{index}");
+        if model.prefixes.is_empty() {
+            issue(
+                issues,
+                &format!("{model_path}/prefixes"),
+                EMPTY_PREFIXES_MESSAGE,
+            );
+        }
         for (index, prefix) in model.prefixes.iter().enumerate() {
+            if prefix.is_empty() {
+                issue(
+                    issues,
+                    &format!("{model_path}/prefixes/{index}"),
+                    EMPTY_PREFIX_MESSAGE,
+                );
+            }
             if !prefixes.insert(prefix.as_str()) {
                 issue(
                     issues,
@@ -343,10 +359,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CATALOG_COUNT_MESSAGE, DEFAULT_MESSAGE, ENV_MESSAGE, FORMAT_MESSAGE, GENERATION_MESSAGE,
-        Issue, MODELS_FROM_MESSAGE, PERIOD_MESSAGE, PREFIX_MESSAGE, PRICE_MESSAGE,
-        PROVIDER_COUNT_MESSAGE, REFERENCE_MESSAGE, SLUG_MESSAGE, TIER_MESSAGE, TOKEN_MESSAGE,
-        URL_MESSAGE, validate,
+        CATALOG_COUNT_MESSAGE, DEFAULT_MESSAGE, EMPTY_PREFIX_MESSAGE, EMPTY_PREFIXES_MESSAGE,
+        ENV_MESSAGE, FORMAT_MESSAGE, GENERATION_MESSAGE, Issue, MODELS_FROM_MESSAGE,
+        PERIOD_MESSAGE, PREFIX_MESSAGE, PRICE_MESSAGE, PROVIDER_COUNT_MESSAGE, REFERENCE_MESSAGE,
+        SLUG_MESSAGE, TIER_MESSAGE, TOKEN_MESSAGE, URL_MESSAGE, validate,
     };
     use crate::{
         Availability, CatalogModel, MAX_CATALOG_MODELS, MAX_PROVIDERS, MAX_TOKENS, Period,
@@ -449,6 +465,16 @@ mod tests {
             "/providers/0/models/1/prefixes/0",
             PREFIX_MESSAGE,
         );
+    }
+
+    #[test_case(&[], "/providers/0/models/0/prefixes", EMPTY_PREFIXES_MESSAGE; "no_prefixes")]
+    #[test_case(&[""], "/providers/0/models/0/prefixes/0", EMPTY_PREFIX_MESSAGE; "empty_prefix")]
+    fn model_prefixes_must_be_nonempty(prefixes: &[&str], pointer: &str, message: &str) {
+        let mut snapshot = fixture();
+        let provider = &mut snapshot.payload.providers[0];
+        provider.models[0].prefixes = prefixes.iter().map(|prefix| (*prefix).to_owned()).collect();
+        provider.price_periods.clear();
+        assert_issue(&snapshot, pointer, message);
     }
 
     #[test_case(false; "normal_lane")]
