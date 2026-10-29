@@ -433,7 +433,7 @@ The `bash`, `code`, and `task` entries apply only when `ui.scroll_card_lines` is
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
+| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `request_secret`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 

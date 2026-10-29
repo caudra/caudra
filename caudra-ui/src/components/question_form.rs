@@ -21,8 +21,10 @@ use url::Url;
 
 use caudra_agent::mcp::elicitation::{REQUIRED, describe_answer, validate_answer};
 use caudra_agent::permissions::AutopilotNote;
+use caudra_agent::secrets::{SecretScope, SecretValue};
+use caudra_agent::tools::native::secret::{SecretReply, kept_note, replaces_note};
 use caudra_agent::types::{
-    AskedQuestion, QuestionDelivery, QuestionEvent, QuestionReply, QuestionSource,
+    AnswerKind, AskedQuestion, QuestionDelivery, QuestionEvent, QuestionReply, QuestionSource,
 };
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
@@ -58,6 +60,15 @@ const DECLINE: &str = "Decline";
 /// The consent rows: accepting, then declining.
 const ACCEPT_ROW: usize = 0;
 const DECLINE_ROW: usize = 1;
+/// The secret card's rows under its field: keep for this session, keep for
+/// every session, and decline.
+const SAVE: &str = "Save";
+const REMEMBER: &str = "Remember for all sessions";
+const SAVE_ROW: usize = 0;
+const REMEMBER_ROW: usize = 1;
+const SECRET_DECLINE_ROW: usize = 2;
+const EMPTY_SECRET: &str = "Type or paste the secret first";
+const SECRET_MANAGE: &str = "Manage it in /secrets.";
 const NO_ANSWER: &str = "(no answer)";
 const REVIEW_HEADING: &str = " Review your answers:";
 /// A description sits under its label, past the pointer and the mark.
@@ -93,6 +104,11 @@ const TIP_DECLINE: &str = "Turn the server's request down";
 const TIP_DEFER: &str = "Let the agent carry on now and answer this later";
 const TIP_NEXT_DEFERRED: &str = "Show the next question waiting for an answer";
 const TIP_PUT_ASIDE: &str = "Hide the form and keep what you picked for later";
+const TIP_SAVE_SECRET: &str = "Hand the secret to this session's shell commands";
+const TIP_SECRET_ROWS: &str = "Go to Save, Remember for all sessions and Decline";
+const TIP_SECRET_ROW: &str = "Save, remember or decline, whichever row is highlighted";
+const TIP_SECRET_FIELD: &str = "Go back to the secret's field";
+const TIP_DECLINE_SECRET: &str = "Tell the agent you will not provide this secret";
 
 const ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask /btw").tip(TIP_ASK);
 const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask").tip(TIP_ASK);
@@ -100,6 +116,8 @@ const COMPACT_ASK_HINT: Hint = Hint::bind(key::ASK_BTW, "Ask").tip(TIP_ASK);
 const ASK_HINT_INDEX: usize = 1;
 const NOTE_HINT: Hint = Hint::bind(key::QUESTION_NOTE, "note").tip(TIP_NOTE);
 const DECLINE_HINT: Hint = Hint::bind(key::QUESTION_DECLINE, "decline").tip(TIP_DECLINE);
+const SECRET_DECLINE_HINT: Hint =
+    Hint::bind(key::QUESTION_DECLINE, "decline").tip(TIP_DECLINE_SECRET);
 const DEFER_HINT: Hint = Hint::bind(key::QUESTION_LATER, "later").tip(TIP_DEFER);
 const NEXT_HINT: Hint = Hint::bind(key::QUESTION_LATER, "next").tip(TIP_NEXT_DEFERRED);
 const PUT_ASIDE_HINT: Hint = Hint::bind(key::ESC, "later").tip(TIP_PUT_ASIDE);
@@ -165,6 +183,20 @@ const SINGLE_SELECT_HINTS: [Hint; 5] = [
     DISMISS_HINT,
     CANCEL_HINT,
 ];
+const SECRET_HINTS: [Hint; 5] = [
+    Hint::bind(key::ENTER, "save").tip(TIP_SAVE_SECRET),
+    ASK_HINT,
+    Hint::bind(key::TAB, "options").tip(TIP_SECRET_ROWS),
+    DISMISS_HINT,
+    CANCEL_HINT,
+];
+const SECRET_ROW_HINTS: [Hint; 5] = [
+    Hint::bind(key::ENTER, "select").tip(TIP_SECRET_ROW),
+    ASK_HINT,
+    Hint::bind(key::SHIFT_TAB, "field").tip(TIP_SECRET_FIELD),
+    DISMISS_HINT,
+    CANCEL_HINT,
+];
 const CONSENT_HINTS: [Hint; 3] = [
     Hint::bind(key::ENTER, "select").tip(TIP_CONSENT),
     DISMISS_HINT,
@@ -182,6 +214,8 @@ pub enum QuestionFormAction {
     Accept,
     /// Turn a server's request down outright.
     Decline,
+    /// The secret card's answer, which only the asking tool ever reads.
+    Secret(SecretReply),
     /// Answer nothing and let the asking agent carry on.
     Dismiss,
     /// Stop the agent that asked, so only a new message moves it again.
@@ -407,6 +441,7 @@ impl QuestionForm {
         self.source = source;
         self.mode = Mode::Selecting;
         self.custom.clear();
+        self.custom.set_secret(self.is_secret());
         self.note.clear();
         self.editing_note = false;
         self.scroll = 0;
@@ -424,7 +459,8 @@ impl QuestionForm {
     }
 
     pub(crate) fn text_input_active(&self) -> bool {
-        self.is_open() && (self.editing_note || self.mode == Mode::EditingCustom)
+        self.is_open()
+            && (self.editing_note || self.mode == Mode::EditingCustom || self.is_secret())
     }
 
     /// What goes down the answer channel: the label lists, or `None` for a
@@ -492,6 +528,7 @@ impl QuestionForm {
         self.source = None;
         self.error = None;
         self.answers.clear();
+        self.custom.clear();
         self.note.clear();
         self.editing_note = false;
         self.row_hits.clear();
@@ -520,6 +557,9 @@ impl QuestionForm {
             self.mouse_down = None;
             return QuestionFormAction::AskBtw;
         }
+        if key::QUESTION_DECLINE.matches(key) && self.is_secret() {
+            return QuestionFormAction::Secret(SecretReply::Decline);
+        }
         if key::QUESTION_DECLINE.matches(key) && self.source.is_some() {
             return QuestionFormAction::Decline;
         }
@@ -533,6 +573,9 @@ impl QuestionForm {
         }
         if self.is_consent() {
             return self.key_consent(key);
+        }
+        if self.is_secret() {
+            return self.key_secret(key);
         }
         if self.editing_note {
             return self.key_note(key);
@@ -548,7 +591,12 @@ impl QuestionForm {
         self.handle_text(text, true)
     }
 
+    /// The secret card takes every keystroke and paste whichever row it is on,
+    /// so none of it can fall through to the composer.
     pub fn handle_text(&mut self, text: &str, paste: bool) -> bool {
+        if self.is_secret() {
+            self.mode = Mode::EditingCustom;
+        }
         if self.editing_note {
             self.note.handle_text(text, paste);
         } else if self.mode == Mode::EditingCustom {
@@ -608,6 +656,9 @@ impl QuestionForm {
         let title = match (&self.source, self.place) {
             (Some(source), _) => format!(" {} {ASKS} ", source.asker()),
             (None, Some((place, of))) => format!(" {DEFERRED_TITLE} {place} of {of} "),
+            (None, None) if self.is_secret() && !self.question().header.is_empty() => {
+                format!(" {} ", self.question().header)
+            }
             (None, None) => TITLE.to_owned(),
         };
         let mut lines = body.lines;
@@ -836,8 +887,10 @@ impl QuestionForm {
         if !matches!(hit.target, FormTarget::Hint(_)) {
             self.editing_note = matches!(hit.target, FormTarget::Note(_));
         }
-        if let FormTarget::Option(index) = hit.target {
-            self.cursor = index;
+        match hit.target {
+            FormTarget::Option(index) => self.cursor = index,
+            FormTarget::Editor(_) => self.mode = Mode::EditingCustom,
+            _ => {}
         }
         if let Some((field, prompt, line)) = self.text_box(hit.target) {
             field.set_cursor(editor_cursor(prompt, line, hit.area, event), false);
@@ -896,6 +949,13 @@ impl QuestionForm {
                 _ => QuestionFormAction::Decline,
             };
         }
+        if self.is_secret() {
+            return match self.cursor {
+                SAVE_ROW => self.save_secret(SecretScope::Session),
+                REMEMBER_ROW => self.save_secret(SecretScope::Remembered),
+                _ => QuestionFormAction::Secret(SecretReply::Decline),
+            };
+        }
         self.error = None;
         let Some(label) = self
             .question()
@@ -943,7 +1003,15 @@ impl QuestionForm {
     /// answer or as a note: a server checks every answer against the choices
     /// it listed, and has nowhere to put a note.
     fn offers_custom(&self) -> bool {
-        self.source.is_none()
+        self.source.is_none() && !self.is_secret()
+    }
+
+    /// The `request_secret` card: one masked field, whose text only ever
+    /// leaves the form as a [`SecretReply`].
+    fn is_secret(&self) -> bool {
+        self.questions
+            .first()
+            .is_some_and(|question| question.answer.is_secret())
     }
 
     /// The custom-answer row always sits one past the offered options, so a
@@ -1010,7 +1078,7 @@ impl QuestionForm {
     /// A typed answer is kept as it stands when the user moves off it, checked
     /// or not: the review checks every answer again before anything is sent.
     fn keep_draft(&mut self) {
-        if self.mode != Mode::EditingCustom || !self.is_typed() {
+        if self.mode != Mode::EditingCustom || !self.is_typed() || self.is_secret() {
             return;
         }
         let text = self.custom.text().trim().to_owned();
@@ -1059,6 +1127,51 @@ impl QuestionForm {
             _ => {}
         }
         QuestionFormAction::Consumed
+    }
+
+    /// The field has the keys until `Tab` or `Down` moves to the rows under
+    /// it, and any key the rows do not take goes back to the field.
+    fn key_secret(&mut self, key: KeyEvent) -> QuestionFormAction {
+        let on_rows = self.mode == Mode::Selecting;
+        match key.code {
+            KeyCode::Esc => return self.dismiss(),
+            KeyCode::Enter if on_rows => return self.activate_cursor(),
+            KeyCode::Enter => return self.save_secret(SecretScope::Session),
+            KeyCode::Tab | KeyCode::Down if !on_rows => {
+                self.mode = Mode::Selecting;
+                self.cursor = SAVE_ROW;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.cursor = (self.cursor + 1).min(SECRET_DECLINE_ROW);
+            }
+            KeyCode::BackTab => self.mode = Mode::EditingCustom,
+            KeyCode::Up if on_rows && self.cursor == SAVE_ROW => self.mode = Mode::EditingCustom,
+            KeyCode::Up if on_rows => self.cursor -= 1,
+            _ => {
+                self.mode = Mode::EditingCustom;
+                let outcome = self.custom.handle_key(key);
+                if outcome.changed() {
+                    self.error = None;
+                }
+                return box_action(outcome, key);
+            }
+        }
+        QuestionFormAction::Consumed
+    }
+
+    /// Hands the typed secret out once, and empties the field behind it.
+    fn save_secret(&mut self, scope: SecretScope) -> QuestionFormAction {
+        let value = self.custom.text().trim().to_owned();
+        if value.is_empty() {
+            self.mode = Mode::EditingCustom;
+            self.error = Some(EMPTY_SECRET.to_owned());
+            return QuestionFormAction::Consumed;
+        }
+        self.custom.clear();
+        QuestionFormAction::Secret(SecretReply::Save {
+            value: SecretValue::new(value),
+            scope,
+        })
     }
 
     /// `Esc` lets the asking agent carry on without an answer, except on a
@@ -1240,6 +1353,8 @@ impl QuestionForm {
     fn hint_pairs(&self) -> Vec<Hint> {
         let pairs: &[Hint] = match self.mode {
             _ if self.is_consent() => &CONSENT_HINTS,
+            Mode::Selecting if self.is_secret() => &SECRET_ROW_HINTS,
+            _ if self.is_secret() => &SECRET_HINTS,
             _ if self.editing_note => &NOTE_HINTS,
             Mode::EditingCustom if self.is_typed() => &TYPED_HINTS,
             Mode::EditingCustom => &EDITING_HINTS,
@@ -1253,6 +1368,8 @@ impl QuestionForm {
         }
         if self.source.is_some() {
             hints.insert(hints.len() - CLOSING_HINTS, DECLINE_HINT);
+        } else if self.is_secret() {
+            hints.insert(hints.len() - CLOSING_HINTS, SECRET_DECLINE_HINT);
         }
         match self.delivery {
             QuestionDelivery::Blocking => {}
@@ -1294,6 +1411,7 @@ impl QuestionForm {
     fn body(&self, width: u16, focused: bool) -> Body {
         match self.mode {
             _ if self.is_consent() => self.consent_body(),
+            _ if self.is_secret() => self.secret_body(focused),
             Mode::Confirming => self.review_body(width, focused),
             _ => self.selecting_body(width, focused),
         }
@@ -1433,6 +1551,62 @@ impl QuestionForm {
             let line = self.option_line(row == self.cursor, false, label);
             body.push(FormTarget::Option(row), vec![line]);
         }
+        body
+    }
+
+    /// Why the agent asks, the masked field, and the three answers, with
+    /// where the secret goes underneath.
+    fn secret_body(&self, focused: bool) -> Body {
+        let t = theme::current();
+        let AnswerKind::Secret {
+            name,
+            placeholder,
+            replaces,
+        } = &self.question().answer
+        else {
+            return Body::default();
+        };
+        let mut body = self.noted_body();
+        for line in self.question().question.lines() {
+            body.lines.push(Line::raw(format!(" {line}")));
+        }
+        if *replaces {
+            body.lines.push(marked_line(
+                WARNING_MARK,
+                &replaces_note(name),
+                t.tool_warning,
+            ));
+        }
+        body.lines.push(Line::default());
+        let editing = self.mode == Mode::EditingCustom;
+        let mut lines = box_lines(&self.custom, CUSTOM_PROMPT, focused && editing);
+        if let Some(placeholder) = placeholder.as_deref()
+            && self.custom.text().is_empty()
+        {
+            lines[0]
+                .spans
+                .push(Span::styled(placeholder.to_owned(), t.tool_dim));
+        }
+        for (index, line) in lines.into_iter().enumerate() {
+            body.push(FormTarget::Editor(index), vec![line]);
+        }
+        if let Some(error) = &self.error {
+            body.lines.push(marked_line(ERROR_MARK, error, t.error));
+        }
+        body.lines.push(Line::default());
+        for (row, label) in [
+            (SAVE_ROW, SAVE),
+            (REMEMBER_ROW, REMEMBER),
+            (SECRET_DECLINE_ROW, DECLINE),
+        ] {
+            let line = self.option_line(!editing && row == self.cursor, false, label);
+            body.push(FormTarget::Option(row), vec![line]);
+        }
+        body.lines.push(Line::default());
+        body.lines.push(Line::styled(
+            format!(" {} {SECRET_MANAGE}", kept_note(name)),
+            t.tool_dim,
+        ));
         body
     }
 
@@ -1611,7 +1785,7 @@ fn caret_spans(
 ) -> Vec<Span<'static>> {
     let overlays = field.overlays(index, styles, focused);
     Row {
-        text: &field.lines()[index],
+        text: &field.shown_line(index),
         segments: None,
         base: styles.text,
         fill: None,
@@ -3955,6 +4129,8 @@ mod tests {
     #[test_case(consent ; "consent")]
     #[test_case(deferrable ; "deferrable")]
     #[test_case(deferred_among_others ; "deferred_among_others")]
+    #[test_case(secret_card ; "secret_field")]
+    #[test_case(secret_rows ; "secret_rows")]
     fn every_drawn_hint_explains_itself_where_it_is_drawn(build: fn() -> QuestionForm) {
         for width in [TERMINAL_WIDTH, COMPACT_WIDTH] {
             let mut form = build();
@@ -3980,5 +4156,195 @@ mod tests {
                 assert!(!tip.text.is_empty(), "{NO_TIP}");
             }
         }
+    }
+
+    const SECRET_NAME: &str = "CLOUDFLARE_API_TOKEN";
+    const SECRET_LABEL: &str = "Cloudflare API token";
+    const SECRET_REASON: &str = "wrangler deploys with it";
+    const CANARY: &str = "secret-canary-4711";
+    const LEAKED: &str = "the secret's value must never leave the card except as its reply";
+
+    fn secret_question(replaces: bool) -> AskedQuestion {
+        AskedQuestion {
+            question: SECRET_REASON.into(),
+            header: SECRET_LABEL.into(),
+            answer: AnswerKind::Secret {
+                name: SECRET_NAME.into(),
+                placeholder: None,
+                replaces,
+            },
+            ..AskedQuestion::default()
+        }
+    }
+
+    fn secret_card() -> QuestionForm {
+        opened(vec![secret_question(false)])
+    }
+
+    fn secret_rows() -> QuestionForm {
+        let mut form = secret_card();
+        press(&mut form, KeyCode::Tab);
+        form
+    }
+
+    fn typed_secret() -> QuestionForm {
+        let mut form = secret_card();
+        type_text(&mut form, CANARY);
+        form
+    }
+
+    #[test]
+    fn a_secret_card_paints_its_field_masked() {
+        let mut form = typed_secret();
+
+        let screen = painted(&mut form).join("\n");
+
+        assert!(!screen.contains(CANARY), "{LEAKED}: {screen}");
+        assert!(screen.contains(SECRET_LABEL), "{screen}");
+        assert!(screen.contains(SECRET_REASON), "{screen}");
+        let text = body_text(&form);
+        assert!(text.contains(&kept_note(SECRET_NAME)), "{text}");
+        assert!(!text.contains(&replaces_note(SECRET_NAME)), "{text}");
+    }
+
+    /// The body's lines unwrapped, so a check never trips over a fold.
+    fn body_text(form: &QuestionForm) -> String {
+        form.body(TERMINAL_WIDTH, true)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_secret_card_warns_when_it_replaces_a_live_secret() {
+        let form = opened(vec![secret_question(true)]);
+
+        let text = body_text(&form);
+
+        assert!(text.contains(&replaces_note(SECRET_NAME)), "{text}");
+    }
+
+    #[test_case('c' ; "copy")]
+    #[test_case('x' ; "cut")]
+    fn a_secret_field_hands_nothing_to_the_clipboard(command: char) {
+        let mut form = typed_secret();
+        chord(&mut form, KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        let action = chord(&mut form, KeyCode::Char(command), KeyModifiers::CONTROL);
+
+        assert!(
+            !matches!(
+                action,
+                QuestionFormAction::Copy(_) | QuestionFormAction::CopySelection(_)
+            ),
+            "{LEAKED}"
+        );
+        assert_eq!(form.custom.text(), CANARY);
+    }
+
+    #[test]
+    fn a_sweep_over_a_secret_card_copies_only_the_mask() {
+        let mut form = typed_secret();
+        let area = render(&mut form);
+        let (_, field_row) = target_cell(&form, FormTarget::Editor(0));
+        let (top, bottom) = (area.y + 1, field_row);
+        form.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 1,
+            top,
+        ));
+        form.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.right() - 2,
+            bottom,
+        ));
+
+        let action = form.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            area.right() - 2,
+            bottom,
+        ));
+
+        let Some(QuestionFormAction::CopySelection(text)) = action else {
+            panic!("a sweep over the card copies what it painted");
+        };
+        assert!(!text.contains(CANARY), "{LEAKED}: {text}");
+        assert!(text.contains(SECRET_REASON), "{text}");
+    }
+
+    #[test_case(&[KeyCode::Enter], Some(SecretScope::Session) ; "enter_saves")]
+    #[test_case(&[KeyCode::Tab, KeyCode::Enter], Some(SecretScope::Session) ; "save_row")]
+    #[test_case(&[KeyCode::Tab, KeyCode::Down, KeyCode::Enter], Some(SecretScope::Remembered) ; "remember_row")]
+    #[test_case(&[KeyCode::Tab, KeyCode::Down, KeyCode::Down, KeyCode::Enter], None ; "decline_row")]
+    #[test_case(&[KeyCode::F(3)], None ; "decline_key")]
+    fn a_secret_card_answers_with_its_rows(keys: &[KeyCode], saved: Option<SecretScope>) {
+        let mut form = typed_secret();
+        let (last, before) = keys.split_last().unwrap();
+        for code in before {
+            press(&mut form, *code);
+        }
+
+        let QuestionFormAction::Secret(reply) = press(&mut form, *last) else {
+            panic!("the card answers with a secret reply");
+        };
+        match (reply, saved) {
+            (SecretReply::Save { value, scope }, Some(expected)) => {
+                assert_eq!(value.expose(), CANARY);
+                assert_eq!(scope, expected);
+                assert!(form.custom.text().is_empty(), "{LEAKED}");
+            }
+            (SecretReply::Decline, None) => {}
+            (reply, expected) => panic!("{reply:?} where {expected:?} was due"),
+        }
+    }
+
+    #[test]
+    fn a_click_on_remember_keeps_the_secret_for_all_sessions() {
+        let mut form = typed_secret();
+        render(&mut form);
+        let (column, row) = option_row(&form, REMEMBER_ROW);
+
+        let action = click(&mut form, column, row);
+
+        assert!(matches!(
+            action,
+            QuestionFormAction::Secret(SecretReply::Save {
+                scope: SecretScope::Remembered,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_empty_secret_is_not_saved() {
+        let mut form = secret_card();
+
+        let action = press(&mut form, KeyCode::Enter);
+
+        assert!(matches!(action, QuestionFormAction::Consumed));
+        assert_eq!(form.error.as_deref(), Some(EMPTY_SECRET));
+    }
+
+    #[test]
+    fn typing_on_the_rows_goes_into_the_field() {
+        let mut form = secret_rows();
+
+        assert!(form.text_input_active());
+        assert!(form.handle_text(CANARY, true));
+
+        assert_eq!(form.mode, Mode::EditingCustom);
+        assert_eq!(form.custom.text(), CANARY);
+    }
+
+    #[test]
+    fn esc_dismisses_a_secret_card() {
+        let mut form = typed_secret();
+
+        assert!(matches!(
+            press(&mut form, KeyCode::Esc),
+            QuestionFormAction::Dismiss
+        ));
     }
 }

@@ -7,7 +7,7 @@
 pub mod redact;
 pub mod scope;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -20,8 +20,8 @@ use caudra_config::shell_env::{ShellEnvConfig, ShellEnvFileError};
 use caudra_storage::auth::now_millis;
 use caudra_storage::id::CaudraId;
 use caudra_storage::secrets::{
-    StoredSecret, delete_session_secret, is_remembered_secret, load_session_secrets,
-    save_session_secret,
+    StoredSecret, delete_session_secret, is_remembered_secret, load_remembered_secret,
+    load_session_secrets, save_session_secret,
 };
 use caudra_storage::{StateDir, StorageError};
 use thiserror::Error;
@@ -177,6 +177,10 @@ struct Vault {
     state_dir: StateDir,
     session_id: CaudraId,
     entries: RwLock<BTreeMap<String, Entry>>,
+    /// Names this session moved to every session. The running config holds their values only
+    /// from its next reload, which waits for the turn to end, so until then they are read
+    /// from their files.
+    remembered: Mutex<BTreeSet<String>>,
 }
 
 struct Entry {
@@ -215,6 +219,7 @@ impl Vault {
             state_dir,
             session_id,
             entries: RwLock::new(entries),
+            remembered: Mutex::default(),
         }
     }
 }
@@ -262,11 +267,18 @@ impl SessionSecrets {
     /// What a local shell command receives, after `[agent.shell_env]` so a session secret wins.
     pub fn overlay(&self) -> Vec<(String, OsString)> {
         let now = now_millis();
-        self.read()
+        let mut overlay: Vec<_> = self
+            .read()
             .iter()
             .filter(|(_, entry)| !entry.expired(now))
             .map(|(name, entry)| (name.clone(), OsString::from(entry.value.expose())))
-            .collect()
+            .collect();
+        overlay.extend(
+            self.remembered_here()
+                .into_iter()
+                .map(|(name, value)| (name, OsString::from(value))),
+        );
+        overlay
     }
 
     /// The session's secrets by name, expired ones included so an editor can show them.
@@ -293,7 +305,40 @@ impl SessionSecrets {
                 redactor.hide_variable(name, value);
             }
         }
+        for (name, value) in self.remembered_here() {
+            redactor.hide_variable(&name, &value);
+        }
         redactor
+    }
+
+    pub(crate) fn note_remembered(&self, name: &str) {
+        self.0
+            .remembered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned());
+    }
+
+    /// The values of the secrets this session remembered, from their files. A name whose file
+    /// is gone was moved back or deleted since.
+    fn remembered_here(&self) -> Vec<(String, String)> {
+        let names = self
+            .0
+            .remembered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        names
+            .iter()
+            .filter_map(
+                |name| match load_remembered_secret(&self.0.state_dir, name) {
+                    Ok(value) => value.map(|value| (name.clone(), value)),
+                    Err(error) => {
+                        warn!(%name, %error, "a remembered secret did not load");
+                        None
+                    }
+                },
+            )
+            .collect()
     }
 
     pub(crate) fn value(&self, name: &str) -> Option<SecretValue> {

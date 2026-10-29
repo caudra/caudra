@@ -2029,6 +2029,7 @@ impl App {
             QuestionFormAction::Submit(_)
                 | QuestionFormAction::Accept
                 | QuestionFormAction::Decline
+                | QuestionFormAction::Secret(_)
                 | QuestionFormAction::Dismiss
                 | QuestionFormAction::Cancel
         );
@@ -2089,6 +2090,7 @@ impl App {
             }
             QuestionFormAction::Decline => QUESTION_DECLINED_REPLY.to_owned(),
             QuestionFormAction::Accept => QUESTION_ACCEPTED_REPLY.to_owned(),
+            QuestionFormAction::Secret(reply) => reply.encode(),
             QuestionFormAction::Submit(answers) => self.question_form.reply(Some(answers)),
         };
         let subagent = self.question_subagent.take();

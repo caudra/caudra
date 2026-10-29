@@ -356,6 +356,7 @@ pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 const OPENAI_PROVIDER_SLUG: &str = "openai";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
+pub const REQUEST_SECRET_TOOL_NAME: &str = "request_secret";
 pub const SHELL_TOOL_NAME: &str = "shell";
 pub const SKILL_TOOL_NAME: &str = "skill";
 pub const TASK_TOOL_NAME: &str = "task";

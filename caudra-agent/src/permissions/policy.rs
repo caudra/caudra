@@ -90,6 +90,7 @@ pub(super) const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "batch",
     "code",
     "question",
+    "request_secret",
     "skill",
     "task",
     "todo_write",

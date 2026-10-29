@@ -51,8 +51,9 @@ fn is_remembered(state_dir: &StateDir, set: &BTreeMap<String, String>, name: &st
 }
 
 /// Moves the session's `name` to every session: writes the remembered file, points `set` at it,
-/// then drops the session copy. Refuses with [`SecretError::ForeignEntry`] when `set` already
-/// holds another value for `name`, unless `foreign` is [`ForeignEntry::Replace`].
+/// then drops the session copy, whose shell commands read the file until the config reloads.
+/// Refuses with [`SecretError::ForeignEntry`] when `set` already holds another value for `name`,
+/// unless `foreign` is [`ForeignEntry::Replace`].
 pub fn remember(
     secrets: &SessionSecrets,
     config: &Path,
@@ -81,6 +82,7 @@ pub fn remember(
         delete_remembered_secret(state_dir, name)?;
         return Err(error.into());
     }
+    secrets.note_remembered(name);
     secrets.remove(name)?;
     Ok(())
 }
@@ -239,6 +241,47 @@ mod tests {
                 .value(NAME)
                 .map(|value| value.expose().to_owned())
         }
+
+        /// What this session's shell commands receive under `NAME`, besides the config.
+        fn injected(&self) -> Option<String> {
+            self.secrets
+                .overlay()
+                .into_iter()
+                .find(|(name, _)| name == NAME)
+                .map(|(_, value)| value.into_string().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_remembered_secret_reaches_this_sessions_shells_before_the_config_reloads() {
+        let fixture = Fixture::saved(None);
+        remember(
+            &fixture.secrets,
+            &fixture.config,
+            NAME,
+            ForeignEntry::Refuse,
+        )
+        .unwrap();
+        assert_eq!(fixture.injected().as_deref(), Some(VALUE));
+
+        replace(
+            &fixture.secrets,
+            &fixture.config,
+            NAME,
+            SecretScope::Remembered,
+            SecretValue::new(REPLACED.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(fixture.injected().as_deref(), Some(REPLACED));
+
+        delete(
+            &fixture.secrets,
+            &fixture.config,
+            NAME,
+            SecretScope::Remembered,
+        )
+        .unwrap();
+        assert_eq!(fixture.injected(), None);
     }
 
     #[test]

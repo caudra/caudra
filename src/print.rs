@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use caudra_agent::autopilot::{ActionName, AutopilotHandle};
 use caudra_agent::headless::{HeadlessHandle, HeadlessParams};
 use caudra_agent::permissions::PluginRuleStore;
-use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::tools::{QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME};
 use caudra_agent::types::AutopilotEvent;
 use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
@@ -404,7 +404,7 @@ pub fn run(
         prompt_slots,
         system_prompt_profile,
         prompt_profiles,
-        excluded_tools: vec![QUESTION_TOOL_NAME],
+        excluded_tools: vec![QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME],
         mcp_handle,
         // `cwd` is the sandbox's path once a remote environment exists, so the
         // host checkout has to be named separately.

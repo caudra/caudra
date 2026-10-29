@@ -645,6 +645,12 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("skill", '→', LOAD_SKILL, &["name"]),
     tool_row("question", '?', ASK, &["questions"]),
     tool_row(
+        "request_secret",
+        '*',
+        ASK,
+        &["name", "label", "reason", "placeholder"],
+    ),
+    tool_row(
         REPORT_TOOL_NAME,
         '↑',
         REPORT,

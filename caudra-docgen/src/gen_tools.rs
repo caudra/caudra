@@ -46,6 +46,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "code",
             "execution_environment",
             "question",
+            "request_secret",
         ],
     ),
     (

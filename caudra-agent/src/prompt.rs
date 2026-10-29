@@ -361,6 +361,11 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
         Slot::ToolUsage,
         crate::tools::native::memory::TOOL_USAGE,
     ),
+    (
+        crate::tools::REQUEST_SECRET_TOOL_NAME,
+        Slot::ToolUsage,
+        crate::tools::native::secret::TOOL_USAGE,
+    ),
 ];
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Caudra, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.

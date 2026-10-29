@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use agent_client_protocol_schema::v1::{
     ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
     ElicitationContentValue, ElicitationFormMode, ElicitationId, ElicitationPropertySchema,
-    ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, EnumOption,
+    ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode, EnumOption, Meta,
     MultiSelectPropertySchema, PermissionOption, PermissionOptionId, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     StringPropertySchema, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
@@ -16,6 +16,8 @@ use agent_client_protocol_schema::v1::{
 use caudra_agent::ElicitAction;
 use caudra_agent::mcp::call::{ElicitMode, ElicitRequest, ElicitResponse};
 use caudra_agent::mcp::elicitation::ElicitForm;
+use caudra_agent::secrets::{SecretScope, SecretValue};
+use caudra_agent::tools::native::secret::{SecretReply, SecretRequest, kept_note, replaces_note};
 use caudra_agent::types::Answerer;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,6 +33,17 @@ const QUESTION_TOOL_CALL_PREFIX: &str = "interaction_";
 const ANSWER_OPTION_PREFIX: &str = "answer_";
 const UNSUPPORTED_FORM: &str =
     "this client renders one multiple-choice question at a time; ask the rest in prose";
+const ACCEPT_ACTION: &str = "accept";
+pub(crate) const SECRET_FIELD: &str = "secret";
+/// Asks a client that reads it to mask the field, as ACP has no password format.
+const MASKED_META: &str = "caudra/masked";
+const KEEP_FIELD: &str = "keep";
+const KEEP_TITLE: &str = "Keep it for";
+const KEEP_SESSION: &str = "session";
+const KEEP_SESSION_TITLE: &str = "This session";
+const KEEP_ALL_SESSIONS: &str = "all_sessions";
+const KEEP_ALL_SESSIONS_TITLE: &str = "Remember for all sessions";
+const PARAGRAPH: &str = "\n\n";
 
 #[derive(Deserialize)]
 struct Question {
@@ -311,6 +324,74 @@ pub fn format_response(input: &Value, raw_result: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The `request_secret` card as a form: a masked field for the value and a
+/// choice of how long to keep it. The value never comes back in a summary.
+pub fn secret_request(
+    session_id: &str,
+    tool_call_id: Option<String>,
+    request: &SecretRequest,
+    replaces: bool,
+) -> CreateElicitationRequest {
+    let masked = Meta::from_iter([(MASKED_META.to_owned(), Value::Bool(true))]);
+    let secret = StringPropertySchema::new()
+        .title(request.label.clone())
+        .description(request.placeholder.clone())
+        .min_length(1)
+        .meta(masked);
+    let keep = StringPropertySchema::new()
+        .title(KEEP_TITLE)
+        .one_of(vec![
+            EnumOption::new(KEEP_SESSION, KEEP_SESSION_TITLE),
+            EnumOption::new(KEEP_ALL_SESSIONS, KEEP_ALL_SESSIONS_TITLE),
+        ])
+        .default_value(KEEP_SESSION.to_owned());
+    let mut schema = ElicitationSchema::new();
+    schema.properties = BTreeMap::from([
+        (
+            SECRET_FIELD.to_owned(),
+            ElicitationPropertySchema::String(secret),
+        ),
+        (
+            KEEP_FIELD.to_owned(),
+            ElicitationPropertySchema::String(keep),
+        ),
+    ]);
+    schema.required = Some(vec![SECRET_FIELD.to_owned()]);
+    let scope = ElicitationSessionScope::new(SessionId::from(session_id.to_owned()))
+        .tool_call_id(tool_call_id.map(ToolCallId::from));
+    let mut message = request.reason.clone();
+    if replaces {
+        message.push_str(PARAGRAPH);
+        message.push_str(&replaces_note(&request.name));
+    }
+    message.push_str(PARAGRAPH);
+    message.push_str(&kept_note(&request.name));
+    CreateElicitationRequest::new(ElicitationFormMode::new(scope, schema), message)
+}
+
+/// The client's answer to [`secret_request`]. Anything but an accepted,
+/// non-empty value declines.
+pub fn secret_reply(raw_result: &str) -> SecretReply {
+    let Ok(response) = serde_json::from_str::<Value>(raw_result) else {
+        return SecretReply::Decline;
+    };
+    let content = &response["content"];
+    let value = content[SECRET_FIELD]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (response["action"].as_str(), value) {
+        (Some(ACCEPT_ACTION), Some(value)) => SecretReply::Save {
+            value: SecretValue::new(value.to_owned()),
+            scope: match content[KEEP_FIELD].as_str() {
+                Some(KEEP_ALL_SESSIONS) => SecretScope::Remembered,
+                _ => SecretScope::Session,
+            },
+        },
+        _ => SecretReply::Decline,
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +692,55 @@ mod tests {
     fn supports_url_requires_url_capability(caps: Value, expected: bool) {
         let caps: ClientCapabilities = serde_json::from_value(caps).unwrap();
         assert_eq!(supports_url(&caps), expected);
+    }
+
+    const SECRET_NAME: &str = "GH_TOKEN";
+    const SECRET_LABEL: &str = "GitHub token";
+    const SECRET_REASON: &str = "gh needs it to open the pull request";
+
+    fn secret_ask() -> SecretRequest {
+        SecretRequest::parse(&serde_json::json!({
+            "name": SECRET_NAME,
+            "label": SECRET_LABEL,
+            "reason": SECRET_REASON,
+        }))
+        .unwrap()
+    }
+
+    #[test_case(false ; "a_new_secret")]
+    #[test_case(true ; "a_replacement")]
+    fn a_secret_is_asked_for_in_one_masked_required_field(replaces: bool) {
+        let request = secret_request(SESSION, Some(TOOL_CALL.into()), &secret_ask(), replaces);
+
+        let json = serde_json::to_value(&request).unwrap();
+        let schema = &json["requestedSchema"];
+        assert_eq!(schema["required"], serde_json::json!([SECRET_FIELD]));
+        assert_eq!(schema["properties"][SECRET_FIELD]["title"], SECRET_LABEL);
+        assert_eq!(
+            schema["properties"][SECRET_FIELD]["_meta"][MASKED_META],
+            true
+        );
+        assert_eq!(schema["properties"][KEEP_FIELD]["default"], KEEP_SESSION);
+        let message = json["message"].as_str().unwrap();
+        assert!(message.starts_with(SECRET_REASON), "{message}");
+        assert!(message.contains(&kept_note(SECRET_NAME)), "{message}");
+        assert_eq!(message.contains(&replaces_note(SECRET_NAME)), replaces);
+    }
+
+    #[test_case(serde_json::json!({"action": "accept", "content": {SECRET_FIELD: SECRET}}), Some(SecretScope::Session) ; "accepted")]
+    #[test_case(serde_json::json!({"action": "accept", "content": {SECRET_FIELD: SECRET, KEEP_FIELD: KEEP_ALL_SESSIONS}}), Some(SecretScope::Remembered) ; "remembered")]
+    #[test_case(serde_json::json!({"action": "accept", "content": {SECRET_FIELD: "  "}}), None ; "blank")]
+    #[test_case(serde_json::json!({"action": "decline"}), None ; "declined")]
+    #[test_case(serde_json::json!({"action": "cancel"}), None ; "cancelled")]
+    #[test_case(Value::Null, None ; "an_error_response")]
+    fn a_secret_answer_saves_only_an_accepted_value(raw: Value, saved: Option<SecretScope>) {
+        match (secret_reply(&raw.to_string()), saved) {
+            (SecretReply::Save { value, scope }, Some(expected)) => {
+                assert_eq!(value.expose(), SECRET);
+                assert_eq!(scope, expected);
+            }
+            (SecretReply::Decline, None) => {}
+            (reply, expected) => panic!("{reply:?} where {expected:?} was due"),
+        }
     }
 }

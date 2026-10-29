@@ -15,9 +15,10 @@ use caudra_agent::mcp::transport::BoxFuture;
 use caudra_agent::permissions::{
     EngineFlag, PermissionAdvisory, PermissionAnswer, PermissionRequest as CaudraPermissionRequest,
 };
+use caudra_agent::tools::native::secret::{self, SecretRequest};
 use caudra_agent::tools::{
-    LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolContext, ToolEffect, ToolError, ToolFailure,
-    typed_local_tool,
+    LocalToolFn, LocalTools, QUESTION_TOOL_NAME, REQUEST_SECRET_TOOL_NAME, ToolContext, ToolEffect,
+    ToolError, ToolFailure, typed_local_tool,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -98,17 +99,27 @@ impl ClientProfile {
     /// a TUI that does not exist, so it is dropped and the model asks in plain
     /// text instead. A form renders the whole thing, so it wins when both are
     /// offered.
+    ///
+    /// `request_secret` needs a masked field, which only a form has, so a
+    /// client without one gets the refusal a session without a front end does.
     pub(crate) fn question_tools(
         &self,
         outbound: &Outbound,
         pending: &PendingState,
     ) -> (Vec<&'static str>, LocalTools) {
+        let secret = match self.elicits_form {
+            true => secret_tool(outbound.clone(), Arc::clone(pending)),
+            false => typed_local_tool(ToolEffect::Isolated, |_, _| {
+                Box::pin(async { Err(ToolError::new(ToolFailure::Other, secret::NO_UI)) })
+            }),
+        };
+        let mut tools = HashMap::from([(REQUEST_SECRET_TOOL_NAME.to_owned(), secret)]);
         if !self.elicits_form && !self.asks_via_permission {
-            return (vec![QUESTION_TOOL_NAME], LocalTools::default());
+            return (vec![QUESTION_TOOL_NAME], Arc::new(tools));
         }
-        let tool = question_tool(outbound.clone(), Arc::clone(pending), !self.elicits_form);
-        let tools: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
-        (Vec::new(), tools)
+        let question = question_tool(outbound.clone(), Arc::clone(pending), !self.elicits_form);
+        tools.insert(QUESTION_TOOL_NAME.to_owned(), question);
+        (Vec::new(), Arc::new(tools))
     }
 
     /// `None` for a client that renders no elicitation, so every MCP server's
@@ -172,6 +183,52 @@ fn question_tool(outbound: Outbound, pending: PendingState, via_permission: bool
             } else {
                 elicitation::format_response(&input, &raw)
             })
+        })
+    })
+}
+
+/// Shadows the native `request_secret`: the same checks and the same vault,
+/// with the card rendered as the client's form. The client's answer settles on
+/// the interactive answer channel like a question's, and the value goes
+/// straight into the vault.
+fn secret_tool(outbound: Outbound, pending: PendingState) -> LocalToolFn {
+    typed_local_tool(ToolEffect::Isolated, move |input, ctx| {
+        let outbound = outbound.clone();
+        let pending = Arc::clone(&pending);
+        Box::pin(async move {
+            let request = SecretRequest::parse(&input)
+                .map_err(|error| ToolError::new(ToolFailure::InvalidInput, error.to_string()))?;
+            let secrets = secret::local_vault(&ctx)
+                .map_err(|refusal| ToolError::new(ToolFailure::Other, refusal))?;
+            let session_id = ctx
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .ok_or(NO_SESSION)?;
+            let rx = ctx
+                .user_response_rx
+                .as_ref()
+                .ok_or_else(|| ToolError::new(ToolFailure::Other, secret::NO_UI))?;
+            let create = elicitation::secret_request(
+                &session_id,
+                shown_tool_call(&ctx),
+                &request,
+                secrets.contains(&request.name),
+            );
+            let guard = rx.lock().await;
+            let id = outbound.ask(
+                &pending,
+                AskKind::Elicitation,
+                AgentRequest::CreateElicitationRequest(create),
+            );
+            let response = ctx.cancel.race(guard.recv_async()).await;
+            let _ = locked(&pending).asks.remove(&id);
+            drop(guard);
+            let Ok(Ok(raw)) = response else {
+                return Err(ToolError::new(ToolFailure::Cancelled, secret::CANCELLED));
+            };
+            secret::store(secrets, &request.name, elicitation::secret_reply(&raw))
+                .map_err(|error| ToolError::new(ToolFailure::InvalidInput, error.to_string()))
         })
     })
 }
@@ -532,10 +589,13 @@ pub(crate) fn withdraw_asks(session: &SessionState, outbound: &Outbound) {
 #[cfg(test)]
 mod tests {
     use caudra_agent::permissions::PermissionLifetime;
+    use caudra_agent::secrets::SecretVaults;
     use caudra_agent::tools::test_support::stub_ctx;
     use caudra_agent::{AgentMode, McpCallFacts, McpServerKind};
-    use caudra_storage::id::SessionRef;
+    use caudra_storage::StateDir;
+    use caudra_storage::id::{CaudraId, SessionRef};
     use serde_json::json;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -809,5 +869,90 @@ mod tests {
         let profile = ClientProfile::from_initialize(&serde_json::from_value(request).unwrap());
         let (_, tools) = profile.question_tools(&Outbound::channel().0, &PendingState::default());
         tools.contains_key(QUESTION_TOOL_NAME)
+    }
+
+    const SECRET_NAME: &str = "GH_TOKEN";
+    const SECRET_CANARY: &str = "secret-canary-4711";
+    const SECRET_LEAKED: &str = "the secret's value must reach only the vault";
+    const FORM_MODE: &str = "form";
+
+    fn secret_input() -> Value {
+        json!({
+            "name": SECRET_NAME,
+            "label": "GitHub token",
+            "reason": "gh needs it to open the pull request",
+        })
+    }
+
+    /// A session context with a vault and an answer channel, and the sender
+    /// the client's answers settle on.
+    fn secret_ctx(state: &StateDir) -> (ToolContext, flume::Sender<String>) {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.session_id = Some(SessionRef::generate());
+        ctx.tool_use_id = Some(MCP_TOOL_CALL.into());
+        ctx.secrets = Some(SecretVaults::for_session(state, CaudraId::generate()));
+        let (answers, rx) = flume::unbounded();
+        ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(rx)));
+        (ctx, answers)
+    }
+
+    #[test]
+    fn a_secret_asked_through_a_form_lands_only_in_the_vault() {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let (outbound, out_rx) = Outbound::channel();
+        let pending = PendingState::default();
+        let client = ClientProfile {
+            elicits_form: true,
+            ..ClientProfile::default()
+        };
+        let (_, tools) = client.question_tools(&outbound, &pending);
+        let (ctx, answers) = secret_ctx(&state);
+        let secrets = ctx.secrets.clone().unwrap();
+
+        let (result, asked) = smol::block_on(smol::future::zip(
+            tools[REQUEST_SECRET_TOOL_NAME].call(secret_input(), ctx),
+            async {
+                let asked = out_rx.recv_async().await.unwrap().message;
+                let answer = json!({
+                    "action": "accept",
+                    "content": {elicitation::SECRET_FIELD: SECRET_CANARY},
+                });
+                answers.send(answer.to_string()).unwrap();
+                asked
+            },
+        ));
+
+        let text = result.unwrap();
+        assert_eq!(asked["params"]["mode"], FORM_MODE, "{asked}");
+        assert!(!text.contains(SECRET_CANARY), "{SECRET_LEAKED}: {text}");
+        assert!(text.contains(SECRET_NAME), "{text}");
+        let injected = secrets
+            .overlay()
+            .into_iter()
+            .find(|(name, _)| name == SECRET_NAME)
+            .map(|(_, value)| value.into_string().unwrap());
+        assert_eq!(injected.as_deref(), Some(SECRET_CANARY));
+    }
+
+    #[test_case(false ; "a_plain_client")]
+    #[test_case(true ; "a_permission_only_client")]
+    fn a_client_without_a_form_refuses_a_secret_unasked(via_permission: bool) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let (outbound, out_rx) = Outbound::channel();
+        let client = ClientProfile {
+            asks_via_permission: via_permission,
+            ..ClientProfile::default()
+        };
+        let (_, tools) = client.question_tools(&outbound, &PendingState::default());
+        let (ctx, _answers) = secret_ctx(&state);
+
+        let error =
+            smol::block_on(tools[REQUEST_SECRET_TOOL_NAME].call(secret_input(), ctx)).unwrap_err();
+
+        assert_eq!(error.message, secret::NO_UI);
+        assert_eq!(error.failure, ToolFailure::Other);
+        assert!(out_rx.is_empty());
     }
 }

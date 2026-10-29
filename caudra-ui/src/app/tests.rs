@@ -67,6 +67,7 @@ use caudra_agent::permissions::{
     PermissionResourceSelector, PermissionRuleRecord, RuleOrigin,
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
+use caudra_agent::tools::native::secret::SecretReply;
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
     PermissionScopes, SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry,
@@ -8552,6 +8553,57 @@ fn a_server_request_is_answered_with_its_reply(press: KeyEvent, reply: &str) {
     assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
     assert!(!app.question_form.is_open());
     assert_eq!(answers.try_recv().unwrap(), reply);
+}
+
+const SECRET_CANARY: &str = "secret-canary-4711";
+const SECRET_VARIABLE: &str = "CLOUDFLARE_API_TOKEN";
+const SECRET_LEAKED: &str = "the secret must reach only the answer channel";
+
+/// The main agent's run, waiting on its `request_secret` card.
+fn secret_request_app() -> (App, flume::Receiver<String>) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    app.update(agent_msg(AgentEvent::Question(Box::new(QuestionEvent {
+        questions: vec![AskedQuestion {
+            question: QUESTION_TEXT.into(),
+            header: QUESTION_HEADER.into(),
+            answer: AnswerKind::Secret {
+                name: SECRET_VARIABLE.into(),
+                placeholder: None,
+                replaces: false,
+            },
+            ..AskedQuestion::default()
+        }],
+        ..QuestionEvent::default()
+    }))));
+    assert!(app.question_form.is_open());
+    (app, answers)
+}
+
+#[test]
+fn a_secret_reaches_only_the_answer_channel() {
+    let (mut app, answers) = secret_request_app();
+    app.update(Msg::Paste(SECRET_CANARY.into()));
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.question_form.is_open());
+    let SecretReply::Save { value, .. } = SecretReply::decode(&answers.try_recv().unwrap()) else {
+        panic!("Enter saves the secret");
+    };
+    assert_eq!(value.expose(), SECRET_CANARY);
+    assert!(app.input_box.is_empty(), "{SECRET_LEAKED}");
+    assert!(
+        !rendered(&mut app).contains(SECRET_CANARY),
+        "{SECRET_LEAKED}"
+    );
 }
 
 #[test]

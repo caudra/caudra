@@ -244,6 +244,7 @@ impl App {
             QuestionFormAction::Later => self.rotate_questions(),
             QuestionFormAction::Accept
             | QuestionFormAction::Decline
+            | QuestionFormAction::Secret(_)
             | QuestionFormAction::Dismiss
             | QuestionFormAction::PutAside => self.put_questions_aside(),
             // Stopping the run withdraws every deferred question with it.
