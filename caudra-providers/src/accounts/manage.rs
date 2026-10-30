@@ -12,7 +12,7 @@ use caudra_storage::accounts::{
     persist_account_selection, read_account_selection, rename_account_health,
 };
 
-use super::registry::{AccountKind, AccountStatus, invalidate, pool_status};
+use super::registry::{AccountKind, AccountStatus, follow_rename, invalidate, pool_status};
 use crate::AgentError;
 
 /// What signing out of an account undid besides its credential.
@@ -25,7 +25,8 @@ pub struct SignedOut {
 }
 
 /// Renames the stored credential, its quota readings, its `providers.toml`
-/// entry, and the pin on it, whichever of them exist.
+/// entry, and the pin on it, whichever of them exist. Conversations on it
+/// stay on it.
 pub fn rename_account(
     dir: &StateDir,
     provider: &str,
@@ -55,6 +56,7 @@ pub fn rename_account(
     if read_account_selection(dir, provider) == AccountSelection::Pinned(from.clone()) {
         persist_account_selection(dir, provider, &AccountSelection::Pinned(to.clone()))?;
     }
+    follow_rename(provider, from, to);
     invalidate(Some(provider));
     Ok(())
 }

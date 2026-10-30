@@ -13,7 +13,7 @@ use crate::animation::spinner_frame;
 use crate::config_problems::ConfigProblem;
 use crate::theme;
 
-use caudra_providers::accounts::AccountTier;
+use caudra_providers::accounts::{AccountTier, WindowKind};
 use caudra_providers::{NOT_BILLED_MARK, format_tokens};
 use caudra_storage::sessions::PermissionMode;
 use ratatui::Frame;
@@ -151,7 +151,8 @@ const TIP_DECISIONS_OFFLINE: &str = "\nUnreachable on the last attempt";
 const TIP_ACCOUNT: &str = "Requests go to account ";
 const TIP_ACCOUNT_AUTO: &str = "\nAuto moves them when it runs low";
 const TIP_ACCOUNT_PINNED: &str = "\nPinned: they stay on it";
-const TIP_ACCOUNT_LEFT: &str = "% left in its tightest window";
+const TIP_ACCOUNT_LEFT: &str = "% left in ";
+const TIP_TIGHTEST_WINDOW: &str = "its tightest window";
 const TIP_CONFIG_PROBLEMS: &str = "Config failed to load";
 const TIP_TRUST_REVIEW: &str = "Project config is waiting for your trust";
 const TIP_QUESTIONS: &str = "unanswered questions";
@@ -466,6 +467,8 @@ pub struct AccountChip<'a> {
     pub name: &'a str,
     pub auto: bool,
     pub left_percent: Option<u8>,
+    /// The window `left_percent` was read from.
+    pub window: Option<&'a WindowKind>,
     pub tier: AccountTier,
 }
 
@@ -930,9 +933,9 @@ impl Fit {
     /// the chip that warns. An account without a reading has no shorter form.
     fn account_label(self, ctx: &StatusBarContext<'_>) -> Option<String> {
         let chip = ctx.account.as_ref()?;
-        match (self.account, chip.left_percent) {
+        match (self.account, account_share(chip)) {
             (AccountSlot::Hidden, _) => None,
-            (AccountSlot::Share, Some(left)) => Some(format!("[{left}%]")),
+            (AccountSlot::Share, Some(share)) => Some(format!("[{share}]")),
             (AccountSlot::Named | AccountSlot::Share, _) => Some(account_label(chip)),
         }
     }
@@ -2215,16 +2218,30 @@ fn account_style(ctx: &StatusBarContext<'_>, chip: &AccountChip<'_>) -> Style {
 
 fn account_label(chip: &AccountChip<'_>) -> String {
     let mode = if chip.auto { ACCOUNT_AUTO_PREFIX } else { "" };
-    match chip.left_percent {
-        Some(left) => format!("[{mode}{} {left}%]", chip.name),
+    match account_share(chip) {
+        Some(share) => format!("[{mode}{} {share}]", chip.name),
         None => format!("[{mode}{}]", chip.name),
     }
+}
+
+/// What is left and the window it is left in, as `41% wk`.
+fn account_share(chip: &AccountChip<'_>) -> Option<String> {
+    let left = chip.left_percent?;
+    Some(match chip.window {
+        Some(window) => format!("{left}% {}", window.short_label()),
+        None => format!("{left}%"),
+    })
 }
 
 fn account_tip(chip: &AccountChip<'_>) -> String {
     let mut tip = format!("{TIP_ACCOUNT}{}", chip.name);
     if let Some(left) = chip.left_percent {
-        tip.push_str(&format!(", {left}{TIP_ACCOUNT_LEFT}"));
+        let window = chip
+            .window
+            .map_or(TIP_TIGHTEST_WINDOW.to_owned(), |window| {
+                format!("the {} window", window.label())
+            });
+        tip.push_str(&format!(", {left}{TIP_ACCOUNT_LEFT}{window}"));
     }
     tip.push_str(match chip.auto {
         true => TIP_ACCOUNT_AUTO,
@@ -6047,30 +6064,48 @@ mod tests {
     }
 
     const ACCOUNT_NAME: &str = "personal";
+    const WEEKLY_TIP: &str = "41% left in the weekly window";
+    static FIVE_HOUR: WindowKind = WindowKind::FiveHour;
+    static WEEKLY: WindowKind = WindowKind::Weekly;
+
+    const OPUS_SCOPE: &str = "opus";
+
+    fn opus_week() -> &'static WindowKind {
+        Box::leak(Box::new(WindowKind::WeeklyScoped(OPUS_SCOPE.into())))
+    }
 
     fn account_chip(
         auto: bool,
         left_percent: Option<u8>,
+        window: Option<&'static WindowKind>,
         tier: AccountTier,
     ) -> AccountChip<'static> {
         AccountChip {
             name: ACCOUNT_NAME,
             auto,
             left_percent,
+            window,
             tier,
         }
     }
 
-    #[test_case(true, Some(41), "[auto\u{b7}personal 41%]" ; "auto_with_a_reading")]
-    #[test_case(false, Some(41), "[personal 41%]" ; "pinned")]
-    #[test_case(true, None, "[auto\u{b7}personal]" ; "no_reading_yet")]
+    #[test_case(true, Some(41), Some(&WEEKLY), "[auto\u{b7}personal 41% wk]" ; "auto_with_a_weekly_reading")]
+    #[test_case(false, Some(12), Some(&FIVE_HOUR), "[personal 12% 5h]" ; "pinned_with_a_five_hour_reading")]
+    #[test_case(true, Some(41), Some(opus_week()), "[auto\u{b7}personal 41% wk]" ; "a_model_scoped_week_reads_wk")]
+    #[test_case(true, None, None, "[auto\u{b7}personal]" ; "no_reading_yet")]
     fn the_account_chip_names_the_account_and_what_is_left(
         auto: bool,
         left_percent: Option<u8>,
+        window: Option<&'static WindowKind>,
         expected: &str,
     ) {
         let (text, hits, _) = render_at(Fixture {
-            account: Some(account_chip(auto, left_percent, AccountTier::Healthy)),
+            account: Some(account_chip(
+                auto,
+                left_percent,
+                window,
+                AccountTier::Healthy,
+            )),
             ..Default::default()
         });
 
@@ -6085,7 +6120,7 @@ mod tests {
     #[test_case(AccountTier::Spent ; "spent")]
     fn an_account_running_out_is_not_drawn_as_a_plain_control(tier: AccountTier) {
         let drawn = render_rows(Fixture {
-            account: Some(account_chip(true, Some(3), tier)),
+            account: Some(account_chip(true, Some(3), Some(&FIVE_HOUR), tier)),
             ..Default::default()
         });
         let hit = drawn.hit(StatusBarHitTarget::Account);
@@ -6108,12 +6143,18 @@ mod tests {
         let tip = tip_for(
             StatusBarHitTarget::Account,
             Fixture {
-                account: Some(account_chip(auto, Some(41), AccountTier::Healthy)),
+                account: Some(account_chip(
+                    auto,
+                    Some(41),
+                    Some(&WEEKLY),
+                    AccountTier::Healthy,
+                )),
                 ..Default::default()
             },
         );
 
         assert!(tip.contains(ACCOUNT_NAME), "{TIP_MISSING}: {tip}");
+        assert!(tip.contains(WEEKLY_TIP), "{TIP_MISSING}: {tip}");
         assert!(tip.contains(meaning), "{TIP_MISSING}: {tip}");
         assert!(tip.ends_with(CLICK_ACCOUNT), "{TIP_MISSING}: {tip}");
     }
@@ -6159,10 +6200,10 @@ mod tests {
     const QUESTIONS_CHIP: &str = "[? 2]";
     const FOLDED_CHIP: &str = "[+2]";
     const ACCOUNT_LEFT: u8 = 41;
-    const FULL_ACCOUNT_CHIP: &str = "[auto\u{b7}personal 41%]";
-    const SHORT_ACCOUNT_CHIP: &str = "[41%]";
-    /// The live row fits the context share, the price and `[41%]`, not the
-    /// account's name.
+    const FULL_ACCOUNT_CHIP: &str = "[auto\u{b7}personal 41% wk]";
+    const SHORT_ACCOUNT_CHIP: &str = "[41% wk]";
+    /// The live row fits the context share, the price and `[41% wk]`, not
+    /// the account's name.
     const SHORT_ACCOUNT_WIDTH: u16 = 25;
     /// The live row fits the context share and the price alone.
     const NO_ACCOUNT_WIDTH: u16 = 12;
@@ -6395,7 +6436,12 @@ mod tests {
     fn the_account_gives_way_before_the_price(width: u16, expected: Option<&str>) {
         let drawn = render_rows(Fixture {
             width,
-            account: Some(account_chip(true, Some(ACCOUNT_LEFT), AccountTier::Healthy)),
+            account: Some(account_chip(
+                true,
+                Some(ACCOUNT_LEFT),
+                Some(&WEEKLY),
+                AccountTier::Healthy,
+            )),
             ..Default::default()
         });
         let row = drawn.row(LIVE_ROW);

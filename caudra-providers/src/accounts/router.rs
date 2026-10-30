@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::across::{self, CrossRoute, Departure};
-use super::credential::AccountCredential;
+use super::credential::{AccountCredential, CredentialSource};
 use super::health::{
     AccountHealth, BLOCKED_BILLING, BLOCKED_RATE_LIMITED, QUOTA_STALE, QuotaSource,
 };
@@ -72,6 +73,8 @@ struct LineageState {
     pending: Option<(String, SwitchReason)>,
     /// Where the conversation may go once this provider runs out.
     cross: Option<Arc<CrossRoute>>,
+    /// The account was renamed since the last request, which reports it.
+    followed: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +104,21 @@ impl Lineages {
     fn parent_account(&self, key: &str) -> Option<String> {
         let (parent, _) = key.rsplit_once(LINEAGE_SEPARATOR)?;
         self.map.get(parent).map(|lineage| lineage.account.clone())
+    }
+
+    /// Conversations on `from` stay on it under its new name `to`.
+    pub(crate) fn follow(&mut self, from: &str, to: &str) {
+        for lineage in self.map.values_mut() {
+            if lineage.account == from {
+                lineage.account = to.to_owned();
+                lineage.followed = true;
+            }
+            if let Some((left, _)) = &mut lineage.pending
+                && left == from
+            {
+                *left = to.to_owned();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -519,15 +537,32 @@ impl RoutedProvider {
         Some(reroute)
     }
 
-    fn take_pending(&self, key: Option<&str>) -> Option<(String, SwitchReason)> {
-        let key = key?;
+    /// A failover's switch to report, and whether the account was renamed.
+    fn take_pending(&self, key: Option<&str>) -> (Option<(String, SwitchReason)>, bool) {
+        let mut lineages = self.state.lineages.lock().unwrap();
+        match key.and_then(|key| lineages.map.get_mut(key)) {
+            Some(lineage) => (lineage.pending.take(), mem::take(&mut lineage.followed)),
+            None => (None, false),
+        }
+    }
+
+    /// Re-reads the pool after a refusal to learn whether another process
+    /// renamed the conversation's stored account, which then answers to its
+    /// old name no more.
+    async fn followed_rename(&self, key: Option<&str>) -> bool {
+        let Some(key) = key else {
+            return false;
+        };
+        let state = Arc::clone(&self.state);
+        let data = Arc::clone(&self.model_data);
+        smol::unblock(move || state.refresh_with_data(true, &data)).await;
         self.state
             .lineages
             .lock()
             .unwrap()
             .map
-            .get_mut(key)
-            .and_then(|lineage| lineage.pending.take())
+            .get(key)
+            .is_some_and(|lineage| lineage.followed)
     }
 
     fn exhaustion(
@@ -707,7 +742,7 @@ impl Provider for RoutedProvider {
         Box::pin(async move {
             let key = cache_key.map(CacheKey::as_str);
             let system_hash = hash_text(system);
-            let standing = self.standing(key, model, system_hash, messages.len());
+            let mut standing = self.standing(key, model, system_hash, messages.len());
             if !matches!(standing, Standing::Warm { .. }) {
                 let state = Arc::clone(&self.state);
                 let data = Arc::clone(&self.model_data);
@@ -716,6 +751,7 @@ impl Provider for RoutedProvider {
                     state.reload_health();
                 })
                 .await;
+                standing = self.standing(key, model, system_hash, messages.len());
             }
             if let Some(cross) = opts.cross.clone()
                 && let Some(reroute) = self
@@ -735,7 +771,7 @@ impl Provider for RoutedProvider {
             let routed = self.resolve(&snapshot, decision, &model.id)?;
             let name = routed.credential.id.name.to_string();
             let before = self.routed_account(&snapshot, routed.index, &model.id, now_ms);
-            let pending = self.take_pending(key);
+            let (pending, followed) = self.take_pending(key);
             let moved_from = standing
                 .current()
                 .filter(|current| *current != name)
@@ -754,9 +790,10 @@ impl Provider for RoutedProvider {
                         prompt_tokens: standing.prompt_tokens(),
                         pending: None,
                         cross: opts.cross.clone(),
+                        followed: false,
                     },
                 );
-                if moved_from.is_some() || matches!(standing, Standing::New { .. }) {
+                if moved_from.is_some() || followed || matches!(standing, Standing::New { .. }) {
                     let switch = moved_from.map(|from| AccountSwitch {
                         reason: routed
                             .switch
@@ -791,7 +828,7 @@ impl Provider for RoutedProvider {
                 .stream_message(model, messages, system, tools, event_tx, opts, cache_key)
                 .await?;
             let now_ms = self.state.now_ms();
-            let quota = std::mem::take(&mut response.quota);
+            let quota = mem::take(&mut response.quota);
             let observed = self
                 .state
                 .health
@@ -1055,6 +1092,13 @@ impl Provider for RoutedProvider {
             let Some(refusal) = self.classify(error, &snapshot, current, &model_id, now_ms) else {
                 return Failover::STAY;
             };
+            let stored = snapshot.accounts[current]
+                .credential
+                .as_ref()
+                .is_some_and(|credential| credential.source == CredentialSource::Stored);
+            if matches!(refusal, Refusal::Auth) && stored && self.followed_rename(key).await {
+                return Failover::Switched;
+            }
             let until_ms = match &refusal {
                 Refusal::RateLimited { until_ms } | Refusal::Billing { until_ms } => {
                     let reason = match refusal {

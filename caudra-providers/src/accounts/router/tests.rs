@@ -10,7 +10,7 @@ use super::*;
 use crate::accounts::credential::{AccountSecret, CredentialSource};
 use crate::accounts::quota::{QuotaWindow, WindowKind};
 use crate::accounts::registry::test_support::{slot, snapshot};
-use crate::accounts::registry::{ProviderFactory, register_pool};
+use crate::accounts::registry::{AccountSlot, ProviderFactory, follow_rename, register_pool};
 use crate::accounts::route::RerouteReason;
 use crate::accounts::route::SelectionMode;
 
@@ -38,12 +38,19 @@ const WARM_TTL: Duration = Duration::from_secs(300);
 const WARM_STAYS: &str = "a warm goes to the lineage's account, never another";
 const WARM_KEEPS_LINEAGE_WARM: &str = "a warm counts as a use, so the lineage stays warm";
 const WARM_SPARES_LOW_ACCOUNT: &str = "an account nearly out of quota is not warmed";
+const RENAMED: &str = "renamed";
+const TWIN: &str = "twin";
+const RENAME_SLUG: &str = "test-rename";
+const SIGNED_OUT: &str = "signed out";
+const RENAME_KEEPS_ACCOUNT: &str = "a renamed account is the same account, never a refused one";
 
 #[derive(Default)]
 struct Script {
     replies: HashMap<String, VecDeque<StreamResponse>>,
     served: Vec<String>,
     warmed: Vec<String>,
+    /// Accounts whose credential is gone from storage, so reloading it fails.
+    gone: Vec<String>,
 }
 
 struct FakeWarm {
@@ -108,6 +115,17 @@ impl Provider for FakeAccount {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn reload_auth_if_changed(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async move {
+            match self.script.lock().unwrap().gone.contains(&self.name) {
+                true => Err(AgentError::Config {
+                    message: SIGNED_OUT.into(),
+                }),
+                false => Ok(false),
+            }
+        })
     }
 }
 
@@ -228,6 +246,13 @@ impl Harness {
             .elapsed()
     }
 
+    fn lineage_account(&self, key: &str) -> String {
+        let key = CacheKey::task(None, key);
+        self.state.lineages.lock().unwrap().map[key.as_str()]
+            .account
+            .clone()
+    }
+
     fn served(&self) -> Vec<String> {
         self.script.lock().unwrap().served.clone()
     }
@@ -263,6 +288,13 @@ fn subscription_on(slug: &str, name: &str) -> AccountCredential {
         source: CredentialSource::Stored,
         identity: AccountIdentity::default(),
     }
+}
+
+/// A login whose provider names its account `subject`, so a rename finds it.
+fn identified(name: &str, subject: &str) -> AccountSlot {
+    let mut credential = subscription(name);
+    credential.identity.subject = Some(subject.to_owned());
+    slot(credential, false)
 }
 
 fn pinned(name: &str) -> AccountSelection {
@@ -764,4 +796,117 @@ fn an_account_nearly_out_of_quota_is_not_warmed() {
         harness.script.lock().unwrap().warmed.is_empty(),
         "{WARM_SPARES_LOW_ACCOUNT}"
     );
+}
+
+#[test]
+fn a_rename_elsewhere_keeps_the_conversation_on_its_account() {
+    let harness = Harness::new(&[PRIMARY, SECONDARY], AccountSelection::Auto);
+    harness.state.replace_snapshot(snapshot(
+        vec![
+            identified(PRIMARY, PRIMARY),
+            identified(SECONDARY, SECONDARY),
+        ],
+        AccountSelection::Auto,
+    ));
+    harness.send(SESSION).unwrap();
+    harness.state.replace_snapshot(snapshot(
+        vec![
+            identified(RENAMED, PRIMARY),
+            identified(SECONDARY, SECONDARY),
+        ],
+        AccountSelection::Auto,
+    ));
+
+    let failover = harness.failover(SESSION, &refusal(STATUS_UNAUTHORIZED, None));
+    harness.send(SESSION).unwrap();
+
+    assert_eq!(failover, Failover::Switched, "{RENAME_KEEPS_ACCOUNT}");
+    assert_eq!(
+        harness.served(),
+        vec![PRIMARY, RENAMED],
+        "{RENAME_KEEPS_ACCOUNT}"
+    );
+    assert_eq!(
+        harness.switches(),
+        vec![None, None],
+        "{RENAME_KEEPS_ACCOUNT}"
+    );
+    assert!(
+        harness
+            .state
+            .unusable(&identified(RENAMED, PRIMARY), &harness.model.id)
+            .is_none(),
+        "{RENAME_KEEPS_ACCOUNT}"
+    );
+}
+
+#[test]
+fn an_ambiguous_rename_is_not_followed() {
+    let harness = Harness::new(&[PRIMARY, SECONDARY], AccountSelection::Auto);
+    harness.state.replace_snapshot(snapshot(
+        vec![
+            identified(PRIMARY, PRIMARY),
+            identified(SECONDARY, SECONDARY),
+        ],
+        AccountSelection::Auto,
+    ));
+    harness.send(SESSION).unwrap();
+    harness.state.replace_snapshot(snapshot(
+        vec![
+            identified(RENAMED, PRIMARY),
+            identified(TWIN, PRIMARY),
+            identified(SECONDARY, SECONDARY),
+        ],
+        AccountSelection::Auto,
+    ));
+
+    let failover = harness.failover(SESSION, &refusal(STATUS_UNAUTHORIZED, None));
+
+    assert_eq!(
+        (failover, harness.lineage_account(SESSION)),
+        (Failover::STAY, PRIMARY.to_owned())
+    );
+}
+
+#[test]
+fn follow_rename_moves_lineage_failures_and_health() {
+    let harness = Harness::on(RENAME_SLUG, &[PRIMARY, SECONDARY], AccountSelection::Auto);
+    register_pool(Arc::clone(&harness.state));
+    harness.send(SESSION).unwrap();
+    harness.state.mark_auth_failed(PRIMARY);
+    harness.observe(PRIMARY, LOW_PERCENT);
+
+    follow_rename(
+        RENAME_SLUG,
+        &AccountName::new(PRIMARY).unwrap(),
+        &AccountName::new(RENAMED).unwrap(),
+    );
+
+    let renamed = slot(subscription_on(RENAME_SLUG, RENAMED), false);
+    assert_eq!(harness.lineage_account(SESSION), RENAMED);
+    assert!(matches!(
+        harness.state.unusable(&renamed, &harness.model.id),
+        Some(Unusable::AuthFailed)
+    ));
+    assert_eq!(
+        (
+            harness.state.health.get(RENAMED).windows.len(),
+            harness.state.health.get(PRIMARY).windows.len()
+        ),
+        (1, 0)
+    );
+}
+
+#[test]
+fn reload_auth_skips_accounts_that_left_the_pool() {
+    let harness = Harness::new(&[PRIMARY, SECONDARY], AccountSelection::Auto);
+    harness.send(SESSION).unwrap();
+    harness.script.lock().unwrap().gone.push(PRIMARY.to_owned());
+
+    harness.state.replace_snapshot(snapshot(
+        vec![slot(subscription(SECONDARY), false)],
+        AccountSelection::Auto,
+    ));
+
+    assert!(smol::block_on(harness.router.reload_auth_if_changed()).is_ok());
 }
