@@ -21,7 +21,6 @@ path = "src/bin/models_parity.rs"
 caudra-agent = { workspace = true }
 caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
-caudra-docs = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-storage = { workspace = true }
@@ -30,7 +29,6 @@ caudra-workcell = { workspace = true }
 color-eyre = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 smol = { workspace = true }
 strum = { workspace = true }
