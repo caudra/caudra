@@ -11,10 +11,9 @@ import importlib.util
 import re
 import subprocess
 import sys
+import tomllib
 from collections import Counter
 from pathlib import Path
-
-import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 REGISTRY = "scripts/persisted-formats.toml"
