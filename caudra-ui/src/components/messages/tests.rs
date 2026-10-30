@@ -17,6 +17,7 @@ use crate::inline_image::tests::{PIXEL_SYMBOL, decode_queued, png_bytes, png_sou
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
+use caudra_agent::agent::subagent::STRUCTURED_OUTPUT_TOOL;
 use caudra_agent::code::output::{CodeCallStatus, CodeOutput};
 use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::tools::native::plan;
@@ -9285,6 +9286,40 @@ fn an_mcp_card_rests_whole(view: ViewMode, whole: bool) {
         text.contains(MCP_ARGUMENT_ROW) && text.contains(MCP_LAST_ANSWER_ROW),
         whole,
         "{MCP_WHOLE_MSG}: {text:?}"
+    );
+}
+
+const RESULT_FIELDS: usize = 12;
+const RESULT_LAST_VALUE: &str = "value 12";
+const RESULT_WHOLE_MSG: &str = "a returned result rests open as its whole tree, latest or not";
+
+#[test_case(ViewMode::Auto, true ; "auto")]
+#[test_case(ViewMode::Expanded, true ; "expanded")]
+#[test_case(ViewMode::Compact, false ; "compact")]
+fn a_returned_result_rests_whole(view: ViewMode, whole: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    let result: serde_json::Map<_, _> = (1..=RESULT_FIELDS)
+        .map(|n| (format!("field_{n}"), format!("value {n}").into()))
+        .collect();
+    panel.tool_start(ToolStartEvent {
+        effect: ToolEffect::ReadOnly,
+        raw_input: Some(serde_json::Value::Object(result)),
+        ..start(TOOL_ID, STRUCTURED_OUTPUT_TOOL)
+    });
+    panel.tool_done(ToolDoneEvent {
+        tool: STRUCTURED_OUTPUT_TOOL.into(),
+        ..done(TOOL_ID)
+    });
+    panel.tool_start(start(LATER_TOOL_ID, UNLISTED_READ_TOOL));
+    panel.tool_done(done(LATER_TOOL_ID));
+    rebuild(&mut panel);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert_eq!(
+        text.contains(RESULT_LAST_VALUE),
+        whole,
+        "{RESULT_WHOLE_MSG}: {text:?}"
     );
 }
 
