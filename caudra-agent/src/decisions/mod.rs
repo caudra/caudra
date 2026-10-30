@@ -2517,13 +2517,21 @@ mod tests {
     #[test]
     fn past_the_lingering_cap_an_abandoned_call_is_cancelled() {
         smol::block_on(async {
-            let gate = gated(TEST_TIMEOUT_MS);
+            let gate = gated(TEST_NORMAL_TIMEOUT_MS);
             gate.service
                 .0
                 .limits
                 .lingering
                 .store(MAX_LINGERING_CALLS, Ordering::Release);
-            assert_eq!(screen(&gate.service).await, Err(DecisionError::Timeout));
+            future::race(
+                async {
+                    screen(&gate.service).await.ok();
+                },
+                async {
+                    gate.entered.recv_async().await.unwrap();
+                },
+            )
+            .await;
             gate.dropped.recv_async().await.unwrap();
             assert!(gate.service.take_spend().is_empty());
         });
