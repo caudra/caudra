@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from urllib.parse import quote
 
 SOURCE = "caudra/caudra"
-WEBSITE = "caudra/website"
+WEBSITE = "caudra/infra"
 WORKFLOW = ".github/workflows/rust.yml"
 RELEASE_WORKFLOW = ".github/workflows/release.yml"
 RELEASE_TAG = re.compile(
@@ -21,7 +21,7 @@ RELEASE_TAG = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
 )
 BRANCH = "automation/docs-source"
-MANIFEST = "docs-source.json"
+MANIFEST = "apps/site/docs-source.json"
 SHA = re.compile(r"[0-9a-f]{40}")
 INPUT = re.compile(
     r"docs/content/[^/]+\.md|docs/examples/[^/]+\.example\.toml|release-notes/[^/]+\.md"
@@ -457,7 +457,7 @@ def merge_verified_pull(source, website, run_id, bot, main, branch, pull, guard)
     method = "squash" if repo.get("allow_squash_merge") is True else "merge"
     require(
         method == "squash" or repo.get("allow_merge_commit") is True,
-        "Enable squash or merge commits for caudra/website; no rebase or bypass is used",
+        f"Enable squash or merge commits for {WEBSITE}; no rebase or bypass is used",
     )
     require(
         verified_website_ci(website, pull["number"], main, branch) == verified,
@@ -566,6 +566,10 @@ def descendant(source, old, new):
 
 
 def changed_paths(old, new):
+    old, new = (
+        {path: entry for path, entry in tree.items() if entry[1] != "tree"}
+        for tree in (old, new)
+    )
     return sorted(
         path for path in old.keys() | new.keys() if old.get(path) != new.get(path)
     )
