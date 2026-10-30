@@ -12,17 +12,15 @@ use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use jiff::{SignedDuration, Timestamp, ToSpan, Zoned, civil::Date};
 use schemars::schema_for;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::{
-    CatalogProvider, Provider, Snapshot, TRUSTED_KEYS, audit, hex, import_models_dev,
-    parse_bounded, replay,
+    CatalogProvider, Provider, Snapshot, TRUSTED_KEYS, audit, import_models_dev, parse_bounded,
+    replay,
     repo::{self, DecisionFile},
     routing, sign, to_pretty_bytes, validate, validate_successor,
 };
 
 const SIGNING_KEY_ENV: &str = "CAUDRA_MODELS_SIGNING_KEY";
-const ZSTD_LEVEL: i32 = 19;
 const HASH_MESSAGE: &str = "content hash does not match payload";
 const PROVIDER_SCHEMA: &str = "provider.v1.json";
 const MODELS_SCHEMA: &str = "models.v1.json";
@@ -92,7 +90,7 @@ enum Command {
         #[command(flatten)]
         keys: Keys,
     },
-    /// Validate and compress a snapshot for bundling in a release.
+    /// Validate a snapshot and copy its exact bytes for bundling in a release.
     Pin {
         models: PathBuf,
         output: PathBuf,
@@ -448,7 +446,7 @@ fn pin(
     }
     let snapshot = checked_snapshot(models, &bytes)?;
     if !allow_older && let Some(pinned) = read_optional(output)? {
-        let pinned = parse_bounded(&zstd::stream::decode_all(pinned.as_slice())?)
+        let pinned = parse_bounded(&pinned)
             .wrap_err_with(|| format!("{}: invalid pin", output.display()))?;
         if !matches!(
             snapshot.is_newer_than(&pinned),
@@ -463,15 +461,7 @@ fn pin(
             );
         }
     }
-    let compressed = zstd::stream::encode_all(bytes.as_slice(), ZSTD_LEVEL)?;
-    let metadata = format!(
-        "updated_at = \"{}\"\ncontent_sha256 = \"{}\"\nsha256 = \"{}\"\n",
-        snapshot.updated_at,
-        snapshot.content_sha256,
-        hex(&Sha256::digest(&bytes))
-    );
-    write(output, &compressed)?;
-    write(&append_extension(output, "toml"), metadata.as_bytes())
+    write(output, &bytes)
 }
 
 #[cfg(test)]
@@ -503,7 +493,7 @@ mod tests {
     const CLOCK: &str = "2026-10-31T00:00:00Z";
     const SKEWED: &str = "2026-10-31T00:04:00Z";
     const FUTURE: &str = "2026-10-31T00:06:00Z";
-    const INVALID_PIN: &[&str] = &["caudra-models", "pin", "models.json", "models.zst"];
+    const INVALID_PIN: &[&str] = &["caudra-models", "pin", "models.json", "bundled.json"];
     const BUILTIN_ROW: &str = "catalog";
     const NEW_ROW: &str = "gateway";
     const NEW_ROW_KEY: &str = "GATEWAY_API_KEY";
@@ -609,7 +599,7 @@ mod tests {
         fs::copy(dir.path().join(repo::DIST), &older).unwrap();
         edit_provider(dir.path(), |provider| provider.display_name.push('!'));
         command(&["caudra-models", "build", root, "--now", LATER]);
-        let output = dir.path().join("bundled.json.zst");
+        let output = dir.path().join("bundled.json");
         let pin = |models: &std::path::Path, extra: &[&str]| {
             let mut args = vec![
                 "caudra-models",
@@ -710,7 +700,7 @@ mod tests {
             NOW,
         ]);
         let models = dir.path().join(repo::DIST);
-        let output = dir.path().join("models.json.zst");
+        let output = dir.path().join("bundled.json");
         let bytes = read(&models).unwrap();
         let signature = append_extension(&models, "sig");
         write_json(
@@ -739,14 +729,7 @@ mod tests {
             args.push("--unsigned");
         }
         command(&args);
-        assert_eq!(
-            zstd::stream::decode_all(read(&output).unwrap().as_slice()).unwrap(),
-            bytes
-        );
-        let snapshot = parse_bounded(&bytes).unwrap();
-        let metadata = fs::read_to_string(append_extension(&output, "toml")).unwrap();
-        assert!(metadata.contains(&snapshot.content_sha256));
-        assert!(metadata.contains(NOW));
+        assert_eq!(read(&output).unwrap(), bytes);
         if signed {
             fs::write(&models, [bytes.as_slice(), b" "].concat()).unwrap();
             assert!(try_command(&args, CLOCK).is_err());

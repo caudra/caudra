@@ -883,7 +883,10 @@ mod tests {
         redirected.api = Some("https://untrusted.example/v1".into());
         candidate.payload.catalog.insert(GROQ.into(), redirected);
         routing.protect(&mut candidate, &ProvidersConfig::default());
-        assert_eq!(candidate.payload.catalog, BTreeMap::from([(GROQ.into(), groq)]));
+        assert_eq!(
+            candidate.payload.catalog,
+            BTreeMap::from([(GROQ.into(), groq)])
+        );
     }
 
     #[test_case(false; "unknown_family")]

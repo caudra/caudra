@@ -66,6 +66,7 @@
             || (builtins.match ".*/caudra-automation/(skill|tests/examples)/.*" path != null)
             || (builtins.match ".*/docs/(content|examples)/.*" path != null)
             || (lib.hasSuffix "/docs/navigation.json" path)
+            || (lib.hasSuffix "/models/bundled.json" path)
             || (builtins.match ".*/release-notes/.*" path != null)
             || (builtins.match ".*/workcell/.*/(queries|rules.*|fixtures|evals)/.*" path != null)
             || (builtins.match ".*/workcell/fixtures/.*" path != null)

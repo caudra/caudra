@@ -152,17 +152,17 @@ Model prices, limits, defaults, and availability are data, kept in [github.com/c
 
 ### Pin the bundled copy
 
-Every Caudra binary bundles the model list from `models/bundled.json.zst`, and `models/bundled.json.zst.toml` records its `updated_at` and hashes. Before you prepare a release, pin the newest published file so new installs start from current data:
+Every Caudra binary bundles the model list from `models/bundled.json`. The build of `caudra-providers` compresses it into the binary. Before you prepare a release, pin the newest published file so new installs start from current data:
 
 ```sh
 curl -fsSL --create-dirs -o target/models.json https://models.caudra.ai/v1/models.json
 curl -fsSL -o target/models.json.sig https://models.caudra.ai/v1/models.json.sig
-cargo run --locked -p caudra-models --features cli -- pin target/models.json models/bundled.json.zst --sig target/models.json.sig
+cargo run --locked -p caudra-models --features cli -- pin target/models.json models/bundled.json --sig target/models.json.sig
 ```
 
-`pin` checks the signature against the keys built into Caudra, validates the file, and writes both files. Pin only a file whose `updated_at` is newer than the one in `models/bundled.json.zst.toml`, and commit both files together. The build of `caudra-providers` fails if the two files disagree, if the file does not validate, or if it uses a `requires` token this build does not support. To pin a file you built locally in the data repository, pass `--unsigned` instead of `--sig`.
+`pin` checks the signature against the keys built into Caudra, validates the file, and copies it byte for byte. It refuses a file whose `updated_at` is older than the current pin unless you pass `--allow-older`. The build of `caudra-providers` fails if the file does not validate, if its content hash does not match, or if it uses a `requires` token this build does not support. To pin a file you built locally in the data repository, pass `--unsigned` instead of `--sig`.
 
-Unit tests in `caudra-providers` read their own frozen copy, `caudra-providers/src/model_data/fixture.json.zst`, so a new pin does not change their expectations.
+Unit tests in `caudra-providers` read their own frozen copy, `caudra-providers/src/model_data/fixture.json`, so a new pin does not change their expectations.
 
 ### Add a `requires` token
 

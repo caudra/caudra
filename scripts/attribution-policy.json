@@ -143,7 +143,7 @@
     },
     "caudra-providers@0.2.0-preview.16": {
       "expression": "Apache-2.0 AND MIT",
-      "reason": "The provider code remains Apache-2.0. The embedded model list (models/bundled.json.zst) carries a reviewed import of the models.dev catalog (copyright (c) 2025 models.dev) in its catalog section, which remains MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
+      "reason": "The provider code remains Apache-2.0. The embedded model list (models/bundled.json) carries a reviewed import of the models.dev catalog (copyright (c) 2025 models.dev) in its catalog section, which remains MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
       "files": [
         {
           "path": "THIRD_PARTY_LICENSES/ModelsDev.txt",
