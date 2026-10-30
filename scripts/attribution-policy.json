@@ -92,7 +92,7 @@
         "verification": "The published archive SHA-256 matches Cargo.lock. All 22 original packaged files match the exact upstream revision or its pinned generated submodule's IOKit directory; the remaining three are Cargo's generated manifest, lockfile and VCS metadata. The root LICENSE.md is the only upstream legal file; no separate NOTICE or copyright notice was found in the crate source or generated submodule. The full Apache-2.0 text comes from the explicit link in that declaration, not from SPDX or author metadata. Preserve the upstream Apple SDK licensing caveat without claiming to resolve it."
       }
     },
-    "caudra-highlight@0.2.0-preview.16": {
+    "caudra-highlight@0.2.0-preview.17": {
       "expression": "Apache-2.0 AND MIT AND MPL-2.0",
       "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. The TLA+, PlusCal and TLC config grammars converted from vscode-tlaplus remain MIT; preserve its upstream license. This aggregate expression does not relicense individual files.",
       "files": [
@@ -110,7 +110,7 @@
         "supplements/THIRD_PARTY_LICENSES/VscodeTlaplus.txt"
       ]
     },
-    "caudra-pstack@0.2.0-preview.16": {
+    "caudra-pstack@0.2.0-preview.17": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The Caudra glue and library remain Apache-2.0. The embedded pstack (Lauren Tan) and cursor-team-kit skills (Cursor) copied from cursor/plugins, their Caudra translations, and the Rust ports of pstack's scripts, remain MIT. Preserve both upstream licenses. This aggregate expression does not relicense individual files.",
       "files": [
@@ -128,7 +128,7 @@
         "supplements/THIRD_PARTY_LICENSES/CursorTeamKit.txt"
       ]
     },
-    "caudra-mattpocock@0.2.0-preview.16": {
+    "caudra-mattpocock@0.2.0-preview.17": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The Caudra glue and the page served in place of upstream's setup skill remain Apache-2.0. The embedded skills copied from mattpocock/skills (Matt Pocock) and their Caudra translations remain MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
       "files": [
@@ -141,7 +141,7 @@
         "supplements/THIRD_PARTY_LICENSES/MattPocockSkills.txt"
       ]
     },
-    "caudra-providers@0.2.0-preview.16": {
+    "caudra-providers@0.2.0-preview.17": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The provider code remains Apache-2.0. The embedded model list (models/bundled.json) carries a reviewed import of the models.dev catalog (copyright (c) 2025 models.dev) in its catalog section, which remains MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
       "files": [
@@ -154,7 +154,7 @@
         "supplements/THIRD_PARTY_LICENSES/ModelsDev.txt"
       ]
     },
-    "caudra-emil@0.2.0-preview.16": {
+    "caudra-emil@0.2.0-preview.17": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "The Caudra glue and the pages Caudra adds, such as caudra/visual-check.md, remain Apache-2.0. The embedded skills copied from emilkowalski/skills (Emil Kowalski) and their Caudra translations remain MIT. Preserve the upstream license. This aggregate expression does not relicense individual files.",
       "files": [

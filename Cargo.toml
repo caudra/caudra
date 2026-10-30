@@ -131,7 +131,7 @@ resolver = "3"
 ignored = ["workspace-hack"]
 
 [workspace.package]
-version = "0.2.0-preview.16"
+version = "0.2.0-preview.17"
 edition = "2024"
 authors = [
   "Thorsten Born <tensorninja@caudra.ai>",
