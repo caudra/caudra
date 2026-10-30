@@ -15,6 +15,9 @@ pub(super) const ALL_SESSIONS_STATE: &str = "all sessions";
 pub(super) const LOCAL_ONLY: &str = "Secrets reach this machine's shell commands only.";
 const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
+const HOURS_PER_DAY: u64 = 24;
+/// Under two days, hours say more than a rounded-down day.
+const MIN_DAYS_SHOWN: u64 = 2;
 
 pub(super) fn secret_rows(secrets: &[SecretListing], local: bool) -> Vec<EnvRow> {
     if !local {
@@ -42,7 +45,7 @@ fn secret_row(listing: &SecretListing) -> EnvRow {
             .badge(SESSION_BADGE)
             .state(listing.expires_at.map(expires_in).unwrap_or_default())
             .note(format!(
-                "This session's shell commands receive it as ${name}. e replaces it, m keeps it for all sessions, d deletes it."
+                "This session's shell commands receive it as ${name}. e replaces it, r adds 24 hours, m keeps it for all sessions, d deletes it."
             )),
     }
 }
@@ -52,9 +55,14 @@ fn expires_in(expires_at: SystemTime) -> String {
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO);
     let minutes = (remaining.as_secs() / SECONDS_PER_MINUTE).max(1);
-    match minutes / MINUTES_PER_HOUR {
-        0 => format!("expires in {minutes}m"),
-        hours => format!("expires in {hours}h"),
+    let hours = minutes / MINUTES_PER_HOUR;
+    let days = hours / HOURS_PER_DAY;
+    if days >= MIN_DAYS_SHOWN {
+        format!("expires in {days}d")
+    } else if hours > 0 {
+        format!("expires in {hours}h")
+    } else {
+        format!("expires in {minutes}m")
     }
 }
 
@@ -66,7 +74,11 @@ mod tests {
 
     const HOUR: Duration = Duration::from_secs(SECONDS_PER_MINUTE * MINUTES_PER_HOUR);
     const MINUTE: Duration = Duration::from_secs(SECONDS_PER_MINUTE);
+    const DAY: Duration =
+        Duration::from_secs(SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY);
 
+    #[test_case(DAY * 3 + HOUR * 5, "expires in 3d" ; "days")]
+    #[test_case(DAY + HOUR * 23 + MINUTE * 30, "expires in 47h" ; "hours_under_two_days")]
     #[test_case(HOUR * 5 + MINUTE * 30, "expires in 5h" ; "hours")]
     #[test_case(MINUTE * 42 + Duration::from_secs(30), "expires in 42m" ; "minutes")]
     #[test_case(Duration::from_secs(5), "expires in 1m" ; "under_a_minute")]

@@ -247,8 +247,10 @@ impl App {
         }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
-            if let PasteEditorAction::Copy(text) = self.paste_editor.handle_mouse(&event) {
-                self.copy_to_clipboard(&text);
+            match self.paste_editor.handle_mouse(&event) {
+                PasteEditorAction::Copy(text) => self.copy_to_clipboard(&text),
+                PasteEditorAction::Cancel => self.paste_editor.close(),
+                _ => {}
             }
             return Vec::new();
         }
@@ -1554,8 +1556,8 @@ impl App {
     /// they are answered, and the transcript behind them stays live, so they
     /// own no outside to press.
     fn dismiss_at(&mut self, pos: Position) -> Option<Vec<Action>> {
-        // Both take the mouse ahead of everything else, and the paste editor
-        // holds edits that no stray press should throw away.
+        // Both take the mouse ahead of everything else. The paste editor
+        // answers a press outside itself, asking first when it holds edits.
         if self.paste_editor.is_open() || self.permission_prompt_holds_input() {
             return None;
         }

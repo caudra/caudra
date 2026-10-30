@@ -19,10 +19,10 @@ use super::card_decisions::{self, ChildDecisions};
 use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
-    append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
-    header_workdir, inflected_header, keeps_clock, label_spans, names_job, names_tool,
-    progress_lines, raw_toggle_label, repeats_tool, report_header, report_markdown, report_message,
-    scroll_footer_text, subagent_annotation, title,
+    append_annotation, batch_sigil_style, call_header, compact_args_for, header_spans,
+    header_timeout, header_workdir, inflected_header, keeps_clock, label_spans, names_job,
+    names_tool, progress_lines, raw_toggle_label, repeats_tool, report_markdown, report_message,
+    returned_result, scroll_footer_text, subagent_annotation, title,
 };
 use super::{
     ToolProgress, code_card, environment_card, is_collapsible, json_text, json_tree, mcp_card,
@@ -1172,8 +1172,8 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         };
         let body_indent = format!("{continuation}{body_pad}");
         let (sigil, label, tense) = title(&entry.tool, entry.status.into(), entry.status.stage());
-        let report_title = report_header(&entry.tool, &entry.summary, entry.raw_input.as_ref());
-        let inflected = inflected_header(&entry.tool, &report_title, tense);
+        let call_title = call_header(&entry.tool, &entry.summary, entry.raw_input.as_ref());
+        let inflected = inflected_header(&entry.tool, &call_title, tense);
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
@@ -1571,6 +1571,7 @@ pub struct ChildChips {
 fn holds_a_body(entry: &BatchToolEntry) -> bool {
     entry.input.is_some()
         || report_message(&entry.tool, entry.raw_input.as_ref()).is_some()
+        || returned_result(&entry.tool, entry.raw_input.as_ref()).is_some()
         || entry
             .output
             .as_ref()
@@ -1684,6 +1685,22 @@ fn child_body(
             span: None,
             images: Vec::new(),
         };
+    }
+    if let Some(result) = returned_result(&entry.tool, entry.raw_input.as_ref()) {
+        let mut body = ChildBody::from(render_tree_content(result, &folds, limits));
+        if let Some(output) = output.filter(|_| entry.status == BatchToolStatus::Error) {
+            let (lines, source) = plain_body(&output.as_text(), limits.width);
+            let mut trace = SourceTrace::default();
+            if let Some(tree) = body.source.take() {
+                trace.record(0, tree);
+            }
+            trace.record(body.lines.len(), source);
+            body.rows.resize(body.lines.len() + lines.len(), None);
+            body.links.rows.extend(LinkMap::none_for(&lines).rows);
+            body.lines.extend(lines);
+            body.source = trace.finish(&body.lines);
+        }
+        return body;
     }
     if entry.status != BatchToolStatus::Error
         && let Some(picture) = output.and_then(|output| picture_body(output, limits.width))
@@ -3536,14 +3553,16 @@ pub(crate) fn nested_child_rests_open(
 }
 
 /// Whether a child rests whole: a recognised server's answer, which Caudra
-/// draws to be read and three rows of which say next to nothing, or a picture,
-/// which is what the call was for. Unlike [`always_whole`] a click still folds
-/// it, and compact and the always-collapsed list fold it the way they fold its
-/// own card.
+/// draws to be read and three rows of which say next to nothing, a picture,
+/// which is what the call was for, or a returned result, whose tree is all the
+/// call said. Unlike [`always_whole`] a click still folds it, and compact and
+/// the always-collapsed list fold it the way they fold its own card.
 pub(crate) fn rests_open(policy: &CardPolicy, entry: &BatchToolEntry) -> bool {
-    !policy.compact
-        && !policy.stays_collapsed(&entry.tool, entry.effect)
-        && match &entry.output {
+    if policy.compact || policy.stays_collapsed(&entry.tool, entry.effect) {
+        return false;
+    }
+    returned_result(&entry.tool, entry.raw_input.as_ref()).is_some()
+        || match &entry.output {
             Some(ToolOutput::Mcp(McpOutput { kind: Some(_), .. })) => true,
             Some(ToolOutput::Image { .. } | ToolOutput::SavedImage { .. }) => {
                 entry.status == BatchToolStatus::Success
@@ -4607,6 +4626,40 @@ pub(crate) fn render_mcp_content(
     (content, card.has_raw_view)
 }
 
+/// `value` as one tree that rests whole, each row the node a click on it folds or opens.
+pub(crate) fn render_tree_content(
+    value: &Value,
+    folds: &TreeFolds,
+    limits: &RenderLimits,
+) -> ToolContent {
+    let (lines, source, nodes) =
+        tree_body(value, &folds.folded(0, false), limits.width).unwrap_or_default();
+    let rows = nodes
+        .into_iter()
+        .map(|node| {
+            node.map(|node| RowTarget::Node {
+                child: STANDALONE_CHILD,
+                tree: 0,
+                node,
+            })
+        })
+        .collect();
+    wrapped_content(
+        ToolContent {
+            highlights: Vec::new(),
+            links: LinkMap::none_for(&lines),
+            rows,
+            truncation: false,
+            scroll_spans: Vec::new(),
+            source: Some(source),
+            chips: Vec::new(),
+            images: Vec::new(),
+            lines,
+        },
+        limits.width,
+    )
+}
+
 /// Rows that all stand for `text` as a whole, so a selection touching any of them copies all of it,
 /// once.
 fn whole_source(text: String, lines: &[Line<'static>]) -> BodySource {
@@ -4735,6 +4788,7 @@ mod tests {
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use crate::provenance::Provenance;
+    use caudra_agent::agent::subagent::STRUCTURED_OUTPUT_TOOL;
     use caudra_agent::code::output::{CodeCall, CodeCallStatus, CodeOutput, HostedResult};
     use caudra_agent::tools::native::peers::{LIST_NAME, READ_NAME};
     use caudra_agent::tools::profile_policy::PLAN_TOOL_NAME;
@@ -6387,6 +6441,40 @@ mod tests {
 
     fn limits(views: BatchViews) -> RenderLimits {
         RenderLimits::new(false, PARENT_BUDGET, views, TOOL_LINES)
+    }
+
+    const RESULT_SUMMARY: &str = "Writer lock found";
+    const RESULT_ACK: &str = "Output recorded.";
+    const RESULT_REJECTED: &str = "Input does not match the required schema.";
+
+    #[test_case(BatchToolStatus::Success, RESULT_ACK, false; "accepted")]
+    #[test_case(BatchToolStatus::Error, RESULT_REJECTED, true; "rejected")]
+    fn a_returned_result_child_rests_open_as_its_tree(
+        status: BatchToolStatus,
+        answer: &str,
+        shows_answer: bool,
+    ) {
+        let entry = BatchToolEntry {
+            summary: STRUCTURED_OUTPUT_TOOL.into(),
+            status,
+            raw_input: Some(serde_json::json!({ "summary": RESULT_SUMMARY })),
+            output: Some(ToolOutput::Plain(answer.into())),
+            ..batch_entry(STRUCTURED_OUTPUT_TOOL, 0)
+        };
+        let limits = limits(BatchViews::default()).with_width(200);
+        assert!(rests_open(&limits.policy, &entry));
+        let card = render_batch(from_ref(&entry), false, &limits);
+        let text: String = card.lines.iter().map(line_text).collect();
+        assert!(text.contains(RESULT_SUMMARY), "{text}");
+        assert!(!text.contains(STRUCTURED_OUTPUT_TOOL), "{text}");
+        assert_eq!(text.contains(answer), shows_answer, "{text}");
+        assert!(card.rows.contains(&Some(RowTarget::Node {
+            child: 0,
+            tree: 0,
+            node: json_tree::ROOT,
+        })));
+        assert_eq!(card.rows.len(), card.lines.len());
+        assert_eq!(card.links.rows.len(), card.lines.len());
     }
 
     const REPORT_TOOL: &str = "report_to_parent";

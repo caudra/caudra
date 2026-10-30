@@ -57,6 +57,8 @@ pub enum SecretError {
     Nul,
     #[error("no secret named {0} is saved here")]
     NotFound(String),
+    #[error("{0} expired, so it needs a new value")]
+    Expired(String),
     /// `remember` would replace a `[agent.shell_env] set` entry it does not own. The UI asks
     /// before calling again with [`scope::ForeignEntry::Replace`].
     #[error("[agent.shell_env] already sets {0}")]
@@ -185,7 +187,8 @@ struct Vault {
 
 struct Entry {
     value: SecretValue,
-    /// Unix milliseconds.
+    /// Where its lifetime starts, in Unix milliseconds: the last save, one lifetime later for
+    /// each extension.
     saved_at: u64,
 }
 
@@ -233,20 +236,40 @@ impl SessionSecrets {
     pub fn set(&self, name: &str, value: SecretValue) -> Result<(), SecretError> {
         check_name(name)?;
         value.check()?;
+        let saved_at = now_millis();
+        let mut entries = self.write();
+        self.save(name, &value, saved_at)?;
+        entries.insert(name.to_owned(), Entry { value, saved_at });
+        Ok(())
+    }
+
+    /// Adds [`SESSION_SECRET_TTL`] to what is left of a live secret. An expired one needs a new
+    /// value instead.
+    pub fn extend(&self, name: &str) -> Result<(), SecretError> {
+        let mut entries = self.write();
+        let entry = entries
+            .get_mut(name)
+            .ok_or_else(|| SecretError::NotFound(name.to_owned()))?;
+        if entry.expired(now_millis()) {
+            return Err(SecretError::Expired(name.to_owned()));
+        }
+        let saved_at = entry.saved_at.saturating_add(SESSION_SECRET_TTL_MS);
+        self.save(name, &entry.value, saved_at)?;
+        entry.saved_at = saved_at;
+        Ok(())
+    }
+
+    fn save(&self, name: &str, value: &SecretValue, saved_at: u64) -> Result<(), SecretError> {
         let stored = StoredSecret {
             value: value.expose().to_owned(),
-            saved_at: now_millis(),
+            saved_at,
         };
-        let mut entries = self.write();
-        save_session_secret(&self.0.state_dir, self.0.session_id, name, &stored)?;
-        entries.insert(
-            name.to_owned(),
-            Entry {
-                value,
-                saved_at: stored.saved_at,
-            },
-        );
-        Ok(())
+        Ok(save_session_secret(
+            &self.0.state_dir,
+            self.0.session_id,
+            name,
+            &stored,
+        )?)
     }
 
     /// Whether `name` was there to remove.
@@ -463,6 +486,55 @@ mod tests {
         assert_eq!(listing.name, NAME);
         assert_eq!(listing.scope, SecretScope::Session);
         assert!(listing.expired());
+    }
+
+    #[test]
+    fn extending_adds_a_lifetime_to_what_is_left_and_survives_a_resume() {
+        let (_temp, state) = state();
+        let session = CaudraId::generate();
+        let secrets = SecretVaults::for_session(&state, session);
+        secrets.set(NAME, secret(VALUE)).unwrap();
+        let [before] = secrets.listing().try_into().unwrap();
+
+        secrets.extend(NAME).unwrap();
+        secrets.extend(NAME).unwrap();
+
+        let [after] = secrets.listing().try_into().unwrap();
+        let expected = before.expires_at.unwrap() + SESSION_SECRET_TTL * 2;
+        assert_eq!(after.expires_at, Some(expected));
+        drop(secrets);
+        let resumed = SecretVaults::for_session(&state, session);
+        let [reloaded] = resumed.listing().try_into().unwrap();
+        assert_eq!(reloaded.expires_at, Some(expected));
+        assert_eq!(
+            overlay_values(&resumed),
+            [(NAME.to_owned(), VALUE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_expired_secret_is_not_extended() {
+        let (_temp, state) = state();
+        let secrets = SecretVaults::for_session(&state, CaudraId::generate());
+        secrets.set(NAME, secret(VALUE)).unwrap();
+        secrets.write().get_mut(NAME).unwrap().saved_at -= SESSION_SECRET_TTL_MS;
+        let [before] = secrets.listing().try_into().unwrap();
+
+        let refused = secrets.extend(NAME).unwrap_err();
+
+        assert!(matches!(refused, SecretError::Expired(name) if name == NAME));
+        assert_eq!(secrets.listing(), [before]);
+        assert!(!secrets.contains(NAME));
+    }
+
+    #[test]
+    fn extending_an_unknown_name_says_so() {
+        let (_temp, state) = state();
+        let secrets = SecretVaults::for_session(&state, CaudraId::generate());
+
+        let refused = secrets.extend(NAME).unwrap_err();
+
+        assert!(matches!(refused, SecretError::NotFound(name) if name == NAME));
     }
 
     #[test_case("1TOKEN", SecretError::InvalidName("1TOKEN".into()); "not_a_variable")]

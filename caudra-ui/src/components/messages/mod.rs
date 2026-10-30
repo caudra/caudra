@@ -14,8 +14,8 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     AUTOPILOT_BODY_INDENT, DECISION_PREFIX, RenderCtx, ScrollTail, ToolLines, append_annotation,
     assistant_style, autopilot_style, build_instructions_lines, build_tool_lines, clock_ticks,
-    done_style, draws_live_script, error_style, keeps_clock, names_tool, notice_style, shell_job,
-    thinking_style, truncate_to_header, user_style,
+    done_style, draws_live_script, error_style, keeps_clock, names_tool, notice_style,
+    returned_result, shell_job, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, GoalTone, ToolProgress, ToolRole, ToolStatus,
@@ -1363,12 +1363,17 @@ impl MessagesPanel {
     /// blocks were kept has only text, and keeps resting at the budget.
     ///
     /// A card with a picture rests open too, since the picture is what the
-    /// call was for.
+    /// call was for, and so does a returned result, whose tree is all the
+    /// call said.
     fn rests_whole(&self, msg_index: usize) -> bool {
+        let msg = &self.messages[msg_index];
         matches!(
-            self.messages[msg_index].tool_output.as_deref(),
+            msg.tool_output.as_deref(),
             Some(ToolOutput::Mcp(_) | ToolOutput::Image { .. } | ToolOutput::SavedImage { .. })
-        )
+        ) || msg
+            .role
+            .tool_name()
+            .is_some_and(|tool| returned_result(tool, msg.tool_raw_input.as_deref()).is_some())
     }
 
     /// Resolved from the message rather than tracked alongside it, so a

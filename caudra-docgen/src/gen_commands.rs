@@ -6,13 +6,17 @@ use crate::page_header;
 
 const MAIN_ONLY_MARK: &str = "Main only";
 
-const ARGUMENT_COMPLETION: &str = r#"### Arguments
+const ARGUMENT_COMPLETION: &str = r#"### Cycling with Tab
+
+`Tab` completes as the fish shell does. When one row matches, `Tab` takes it. When every row starts with more than you typed, `Tab` fills in the shared part. Otherwise `Tab` puts the highlighted row in the draft, and each further `Tab` replaces it with the next row. `Shift+Tab`, `Up`, and `Down` step through the rows the same way. `Enter` keeps the row in the draft without running it, `Esc` puts back what you typed, and typing anything else keeps the row and goes on from there. If you move the highlight with `Up` or `Down` before the first `Tab`, `Tab` starts from that row.
+
+### Arguments
 
 Each row shows the arguments its command takes, dimmed, as in the Arguments column below: `<name>` must be given, `[name]` may be left out, and `a|b` lists the words a slot accepts. A verb such as `/goal clear` or `/stash pop` has a row of its own once you type a letter, and a dash finds it too, so `/goal-c` reaches `/goal clear`.
 
 After the command and a space, the palette lists what the slot under the cursor takes, with a description for each: subcommands, levels, task ids, workflow runs, automations, docs pages, and directories. The first row repeats the signature with the current slot in bold. A slot that takes free text shows its name as a dimmed placeholder, and the composer shows the rest of the highlighted value, or the slot name, after the cursor.
 
-`Tab` takes the highlighted value, `Up` and `Down` move, and `Esc` closes the list. `Enter` runs a word the slot accepts as typed. On a slot with a fixed set of words, `Enter` on any other word runs the highlighted one, so a typo such as `/thinking hg` runs `/thinking high`. When nothing matches, the draft stays and the usage line is shown. Free text always runs as typed. The `Ctrl+P` command modal shows the same rows and the same list under its argument field."#;
+`Tab` completes the value as it completes a command, see [Cycling with Tab](#cycling-with-tab). `Up` and `Down` move, and `Esc` closes the list. `Enter` runs a word the slot accepts as typed. On a slot with a fixed set of words, `Enter` on any other word runs the highlighted one, so a typo such as `/thinking hg` runs `/thinking high`. When nothing matches, the draft stays and the usage line is shown. Free text always runs as typed. The `Ctrl+P` command modal shows the same rows and the same list under its argument field."#;
 
 const MODEL_JOBS: &str = r#"## Model jobs
 

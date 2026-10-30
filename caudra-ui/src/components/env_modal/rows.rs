@@ -53,6 +53,8 @@ pub(super) struct EnvRow {
     pub(super) checked: bool,
     inert: bool,
     pub(super) note: Option<String>,
+    /// The info area as it reads with this row selected, which only sizes it.
+    info: Option<String>,
 }
 
 impl EnvRow {
@@ -79,6 +81,7 @@ impl EnvRow {
             checked: false,
             inert: false,
             note: None,
+            info: None,
         }
     }
 
@@ -110,6 +113,11 @@ impl EnvRow {
     pub(super) fn inert(mut self) -> Self {
         self.inert = true;
         self
+    }
+
+    /// The info area shows `header`, then the selected row's note: the tallest pair sizes it.
+    pub(super) fn size_info(&mut self, header: &str) {
+        self.info = self.note.as_ref().map(|note| format!("{header}\n{note}"));
     }
 
     pub(super) fn toggleable(&self) -> bool {
@@ -161,6 +169,10 @@ impl PickerItem for EnvRow {
 
     fn is_disabled(&self) -> bool {
         self.inert
+    }
+
+    fn info(&self) -> Option<&str> {
+        self.info.as_deref()
     }
 }
 

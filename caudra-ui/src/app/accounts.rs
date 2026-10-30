@@ -16,7 +16,7 @@ use caudra_providers::accounts::{
 };
 use caudra_providers::{AgentError, Billing, Timeouts};
 use caudra_storage::account_switches::StoredAccountSwitch;
-use caudra_storage::accounts::AccountSelection;
+use caudra_storage::accounts::{AccountName, AccountSelection};
 use caudra_storage::sessions::SessionDatabase;
 use crossterm::event::{KeyEvent, MouseEvent};
 use tracing::warn;
@@ -119,7 +119,9 @@ impl App {
             }
             AccountsAction::Rename { from, to } => {
                 keep = Some(to.to_string());
-                rename_account(&self.storage, &provider, &from, &to)
+                rename_account(&self.storage, &provider, &from, &to).map(|()| {
+                    follow_rename(self.routed_account.as_mut(), &provider, &from, &to);
+                })
             }
             AccountsAction::Remove(name) => {
                 forget_account(&self.storage, &provider, &name).map(drop)
@@ -399,8 +401,23 @@ pub(super) fn account_chip<'a>(
             name: &account.name,
             auto: account.mode == SelectionMode::Auto,
             left_percent: account.left_percent,
+            window: account.tightest_window.as_ref(),
             tier: account.tier,
         })
+}
+
+/// The chip names a renamed account by its new name before the next request.
+fn follow_rename(
+    routed: Option<&mut RoutedAccount>,
+    provider: &str,
+    from: &AccountName,
+    to: &AccountName,
+) {
+    if let Some(account) =
+        routed.filter(|account| account.provider == provider && account.name == from.as_str())
+    {
+        account.name = to.to_string();
+    }
 }
 
 /// Whether the quota reading, if any, is older than [`OPEN_REFRESH_AGE`].
@@ -584,6 +601,7 @@ mod tests {
     const MINUTE_MS: u64 = 60_000;
     const PROVIDER: &str = "anthropic";
     const DISPLAY: &str = "Anthropic";
+    const OPENAI: &str = "openai";
     const OPENAI_DISPLAY: &str = "OpenAI";
     const PERSONAL: &str = "personal";
     const WORK: &str = "work";
@@ -713,6 +731,28 @@ mod tests {
     )]
     fn an_exhausted_row_offers_the_alternatives(exhaustion: AccountExhaustion, expected: &str) {
         assert_eq!(exhausted_row(DISPLAY, &exhaustion, NOW_MS), expected);
+    }
+
+    #[test_case(PROVIDER, PERSONAL, WORK ; "the_routed_account_takes_its_new_name")]
+    #[test_case(OPENAI, PERSONAL, PERSONAL ; "another_providers_account_is_left_alone")]
+    #[test_case(PROVIDER, API, API ; "another_account_is_left_alone")]
+    fn a_rename_moves_the_chip(provider: &str, routed_name: &str, expected: &str) {
+        let mut routed = RoutedAccount {
+            provider: PROVIDER.into(),
+            name: routed_name.into(),
+            billing: Billing::Subscription,
+            mode: SelectionMode::Auto,
+            left_percent: None,
+            tightest_window: None,
+            tier: AccountTier::Healthy,
+            pool_size: 2,
+        };
+        let from = AccountName::new(PERSONAL).unwrap();
+        let to = AccountName::new(WORK).unwrap();
+
+        follow_rename(Some(&mut routed), provider, &from, &to);
+
+        assert_eq!(routed.name, expected);
     }
 
     fn status(name: &str, kind: AccountKind, observed_at: u64) -> AccountStatus {

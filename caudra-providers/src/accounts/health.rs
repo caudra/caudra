@@ -232,6 +232,14 @@ impl HealthBook {
         claimable
     }
 
+    /// Storage renames its own row, so this moves only what this process holds.
+    pub(crate) fn rename(&self, from: &str, to: &str) {
+        let mut book = self.book.lock().unwrap();
+        if let Some(entry) = book.entries.remove(from) {
+            book.entries.insert(to.to_owned(), entry);
+        }
+    }
+
     pub(crate) fn mark_no_usage(&self, account: &str) {
         self.book
             .lock()

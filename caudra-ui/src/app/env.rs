@@ -342,6 +342,7 @@ fn edit_secret(path: Option<PathBuf>, vault: &SessionSecrets, edit: SecretEdit) 
             from: SecretScope::Remembered,
             ..
         } => forget_to_session(vault, &path, &name),
+        SecretEdit::Extend { name } => vault.extend(&name),
     };
     let settings_stale = remembered_file && written.is_ok();
     let environment = capture(&path, vault);
@@ -398,8 +399,8 @@ fn persist(
 mod tests {
     use std::fs;
 
-    use caudra_agent::secrets::SecretValue;
     use caudra_agent::secrets::scope::ForeignEntry;
+    use caudra_agent::secrets::{SESSION_SECRET_TTL, SecretValue};
     use caudra_config::config_file::{CONFIG_FILE, CONFIG_VERSION};
     use caudra_storage::StateDir;
     use caudra_storage::id::CaudraId;
@@ -461,5 +462,39 @@ mod tests {
         };
         assert_eq!((listed.name.as_str(), listed.scope), (NAME, scope));
         assert!(!completion.settings_stale);
+    }
+
+    #[test]
+    fn extending_lists_the_later_expiry() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(CONFIG_FILE);
+        fs::write(&path, format!("version = {CONFIG_VERSION}\n")).unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let vault = SecretVaults::for_session(&state, CaudraId::generate());
+        vault.set(NAME, SecretValue::new(VALUE.to_owned())).unwrap();
+        let [before] = vault.listing().try_into().unwrap();
+
+        let completion = edit_secret(
+            Some(path),
+            &vault,
+            SecretEdit::Extend {
+                name: NAME.to_owned(),
+            },
+        );
+
+        let EnvReply::Local {
+            environment,
+            error: None,
+        } = completion.reply
+        else {
+            panic!("unexpected reply");
+        };
+        let [listed] = environment.unwrap().secrets.try_into().unwrap();
+        assert_eq!(
+            listed.expires_at,
+            before
+                .expires_at
+                .map(|expires_at| expires_at + SESSION_SECRET_TTL)
+        );
     }
 }

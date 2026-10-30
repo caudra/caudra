@@ -33,7 +33,7 @@ const INVALID_NAME: &str = "a secret name holds only ASCII letters, digits and _
 #[derive(Serialize, Deserialize)]
 pub struct StoredSecret {
     pub value: String,
-    /// Unix milliseconds.
+    /// Where its lifetime starts, in Unix milliseconds: the last save, or later once extended.
     pub saved_at: u64,
 }
 

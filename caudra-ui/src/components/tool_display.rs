@@ -37,6 +37,7 @@ use caudra_providers::{TokenScale, token_label};
 
 use crate::inline_image::ImageSpan;
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
+use caudra_agent::agent::subagent::STRUCTURED_OUTPUT_TOOL;
 use caudra_agent::decisions::NoteOutcome;
 use caudra_agent::prompt::profile::BUILTIN_PROFILE_NAME;
 use caudra_agent::tools::native::peers::{
@@ -67,6 +68,7 @@ const REPORT_TOOL_NAME: &str = "report_to_parent";
 const TASK_CONTROL_TOOL_NAME: &str = "task_control";
 const REPORT_BLOCKED: &str = "Blocked";
 const REPORT_TITLE_MAX_CHARS: usize = 80;
+const FIELD_LIST_SEPARATOR: &str = ", ";
 
 pub(crate) fn task_details(task: &TaskCard) -> String {
     let mut lines = Vec::new();
@@ -529,6 +531,7 @@ const UPDATE: Inflection = ("Update", "Updating", "Updated");
 const LOAD_SKILL: Inflection = ("Load skill", "Loading skill", "Skill loaded");
 const ASK: Inflection = ("Ask", "Asking", "Asked");
 const REPORT: Inflection = ("Report", "Reporting", "Reported");
+const RETURN_RESULT: Inflection = ("Return result", "Returning result", "Returned result");
 const VIEW: Inflection = ("View", "Viewing", "Viewed");
 const DRAW: Inflection = ("Generate image", "Generating image", "Generated image");
 /// A store reached by sub-command. The verb is the `command` argument, which
@@ -656,6 +659,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
         REPORT,
         &["title", "message", "blocked"],
     ),
+    tool_row(STRUCTURED_OUTPUT_TOOL, '↵', RETURN_RESULT, &[]),
     // `command` is folded by name rather than left to the containment check,
     // because the header spells the verb in a tense the argument never had.
     tool_row(
@@ -1097,14 +1101,7 @@ pub(super) fn report_header<'a>(
         text.lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
-            .map(|line| {
-                let mut title = escape_terminal_controls(line);
-                if let Some((cut, _)) = title.char_indices().nth(REPORT_TITLE_MAX_CHARS) {
-                    title.truncate(cut);
-                    title.push(ELLIPSIS);
-                }
-                title
-            })
+            .map(bounded_title)
     };
     let title = raw_input
         .and_then(|input| input.get("title"))
@@ -1127,6 +1124,40 @@ pub(super) fn report_header<'a>(
         Some(true) => format!("{REPORT_BLOCKED}{ACTIVITY_SEPARATOR}{title}"),
         _ => title,
     })
+}
+
+/// What a card's header says after its label. A report is named by its
+/// title and a returned result by the fields it holds, since the tool's own
+/// name is all the dispatcher gives either of them.
+pub(super) fn call_header<'a>(
+    tool: &str,
+    header: &'a str,
+    raw_input: Option<&Value>,
+) -> Cow<'a, str> {
+    if names_tool(STRUCTURED_OUTPUT_TOOL, tool) {
+        return Cow::Owned(result_fields(raw_input).unwrap_or_default());
+    }
+    report_header(tool, header, raw_input)
+}
+
+fn result_fields(raw_input: Option<&Value>) -> Option<String> {
+    let fields = raw_input?.as_object().filter(|fields| !fields.is_empty())?;
+    let names: Vec<&str> = fields.keys().map(String::as_str).collect();
+    Some(bounded_title(&names.join(FIELD_LIST_SEPARATOR)))
+}
+
+/// The value a returned result's card draws as a tree.
+pub(super) fn returned_result<'a>(tool: &str, raw_input: Option<&'a Value>) -> Option<&'a Value> {
+    raw_input.filter(|input| names_tool(STRUCTURED_OUTPUT_TOOL, tool) && input.is_object())
+}
+
+fn bounded_title(line: &str) -> String {
+    let mut title = escape_terminal_controls(line);
+    if let Some((cut, _)) = title.char_indices().nth(REPORT_TITLE_MAX_CHARS) {
+        title.truncate(cut);
+        title.push(ELLIPSIS);
+    }
+    title
 }
 
 pub(super) fn report_message<'a>(tool: &str, raw_input: Option<&'a Value>) -> Option<&'a str> {
@@ -1366,6 +1397,10 @@ fn compact_args(
     header_keys: &[&str],
     output: Option<&ToolOutput>,
 ) -> Option<String> {
+    // A returned result's header names its fields and its tree shows them.
+    if tool == Some(STRUCTURED_OUTPUT_TOOL) {
+        return None;
+    }
     let fields = raw_input?.as_object()?;
     let result_keys = match (tool, output) {
         (Some(FILE_READ_TOOL_NAME), Some(ToolOutput::ReadCode { .. })) => READ_RESULT_KEYS,
@@ -3249,8 +3284,8 @@ pub fn build_tool_lines(
     {
         header = "";
     }
-    let report_title = report_header(tool_name, header, msg.tool_raw_input.as_deref());
-    let header = report_title.as_ref();
+    let call_title = call_header(tool_name, header, msg.tool_raw_input.as_deref());
+    let header = call_title.as_ref();
     let is_report = names_tool(REPORT_TOOL_NAME, tool_name);
     let expanded = expansion.unwrap_or_default();
     // The card's own record of what is running, until a snapshot supersedes
@@ -3390,6 +3425,32 @@ pub fn build_tool_lines(
             false,
         );
         b.push_resolved_output(&resolved);
+        return b.finish(None, None);
+    }
+    // A returned result is the value the call was given, so the tree is the
+    // whole card. Its acknowledgement says nothing, but a rejection names what
+    // the schema refused.
+    if let Some(result) = returned_result(tool_name, msg.tool_raw_input.as_deref()) {
+        let folds = b.limits.views.tree_folds(STANDALONE_CHILD);
+        b.push_content(code_view::render_tree_content(result, &folds, &b.limits));
+        if let Ok(text) = serde_json::to_string_pretty(result) {
+            b.push_search_text(&text);
+        }
+        if status == ToolStatus::Error {
+            let resolved = resolve_output(
+                msg.tool_output.as_deref(),
+                body,
+                None,
+                msg.truncated_lines,
+                RenderLimits {
+                    budget: usize::MAX,
+                    scroll: None,
+                    ..b.limits.clone()
+                },
+                false,
+            );
+            b.push_resolved_output(&resolved);
+        }
         return b.finish(None, None);
     }
     let mcp_call = is_mcp_call(tool_name, header, msg.tool_output.as_deref());
@@ -3800,6 +3861,7 @@ mod tests {
     use crate::components::command_text::tests::{
         NOT_TOLD_APART, assert_command_coloured, coloured,
     };
+    use crate::components::json_tree;
     use crate::components::{DisplayRole, ToolRole};
     use crate::inline_image::tests::{png_bytes, png_source};
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
@@ -4393,6 +4455,123 @@ mod tests {
             report_header(REPORT_TOOL_NAME, header, raw.as_ref()),
             expected
         );
+    }
+
+    const RESULT_ACK: &str = "Output recorded.";
+    const RESULT_REJECTED: &str = "Input does not match the required schema.";
+    const RESULT_SUMMARY: &str = "Writer lock found";
+    const RESULT_FINDING: &str = "pool.rs:42";
+    const RESULT_FIELDS: &str = "Returned result summary, findings, confidence";
+
+    fn result_input() -> Value {
+        serde_json::json!({
+            "summary": RESULT_SUMMARY,
+            "findings": [RESULT_FINDING],
+            "confidence": 0.9,
+        })
+    }
+
+    fn result_msg(status: ToolStatus) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                effect: ToolEffect::ReadOnly,
+                status,
+                name: STRUCTURED_OUTPUT_TOOL.into(),
+            })),
+            tool_raw_input: Some(Arc::new(result_input())),
+            ..bash_msg(
+                STRUCTURED_OUTPUT_TOOL,
+                status,
+                None,
+                match status {
+                    ToolStatus::Success => Some(ToolOutput::Plain(RESULT_ACK.into())),
+                    ToolStatus::Error => Some(ToolOutput::Plain(RESULT_REJECTED.into())),
+                    ToolStatus::InProgress => None,
+                },
+            )
+        }
+    }
+
+    #[test_case(Some(result_input()), "summary, findings, confidence"; "fields_in_order")]
+    #[test_case(Some(serde_json::json!({"a\u{1b}[31m": 1})), "a\\u{1b}[31m"; "escapes_controls")]
+    #[test_case(Some(serde_json::json!([1])), ""; "array")]
+    #[test_case(Some(serde_json::json!("text")), ""; "scalar")]
+    #[test_case(Some(serde_json::json!({})), ""; "empty_object")]
+    #[test_case(None, ""; "missing_input")]
+    fn returned_results_are_named_by_their_fields(raw: Option<Value>, expected: &str) {
+        assert_eq!(
+            call_header(STRUCTURED_OUTPUT_TOOL, STRUCTURED_OUTPUT_TOOL, raw.as_ref()),
+            expected
+        );
+    }
+
+    #[test]
+    fn returned_result_fields_are_bounded() {
+        let raw = serde_json::json!({"界".repeat(REPORT_TITLE_MAX_CHARS + 1): 1});
+        assert_eq!(
+            call_header(STRUCTURED_OUTPUT_TOOL, STRUCTURED_OUTPUT_TOOL, Some(&raw)),
+            format!("{}{ELLIPSIS}", "界".repeat(REPORT_TITLE_MAX_CHARS))
+        );
+    }
+
+    #[test_case(false; "normal")]
+    #[test_case(true; "compact")]
+    fn returned_results_draw_their_value_as_an_open_tree(compact: bool) {
+        let card = build_tool_lines(
+            &result_msg(ToolStatus::Success),
+            ToolStatus::Success,
+            &RenderCtx {
+                compact,
+                ..test_rctx(UNBROKEN)
+            },
+            Some(exp(false)),
+        );
+        let header = line_text(&card.lines[0]);
+        let text = lines_text(&card);
+        assert!(header.contains(RESULT_FIELDS), "{header}");
+        assert!(!header.contains('['), "{header}");
+        assert!(text.contains(RESULT_SUMMARY), "{text}");
+        assert!(text.contains(RESULT_FINDING), "{text}");
+        assert!(!text.contains(RESULT_ACK), "{text}");
+        assert!(!text.contains(STRUCTURED_OUTPUT_TOOL), "{text}");
+        assert!(card.search_text.contains(RESULT_FINDING));
+        assert!(card.rows.contains(&Some(RowTarget::Node {
+            child: STANDALONE_CHILD,
+            tree: 0,
+            node: json_tree::ROOT,
+        })));
+    }
+
+    #[test]
+    fn a_rejected_result_shows_the_schema_errors_under_its_tree() {
+        let text = lines_text(&build_tool_lines(
+            &result_msg(ToolStatus::Error),
+            ToolStatus::Error,
+            &test_rctx(UNBROKEN),
+            Some(exp(false)),
+        ));
+        let tree = text.find(RESULT_SUMMARY);
+        let errors = text.find(RESULT_REJECTED);
+        assert!(tree.is_some() && errors > tree, "{text}");
+    }
+
+    #[test]
+    fn a_click_on_its_root_folds_a_returned_result() {
+        let views = HashMap::from([(
+            "t1".into(),
+            BatchViews::default().node_toggled(STANDALONE_CHILD, 0, json_tree::ROOT),
+        )]);
+        let text = lines_text(&build_tool_lines(
+            &result_msg(ToolStatus::Success),
+            ToolStatus::Success,
+            &RenderCtx {
+                batch_views: &views,
+                ..test_rctx(UNBROKEN)
+            },
+            Some(exp(false)),
+        ));
+        assert!(!text.contains(RESULT_SUMMARY), "{text}");
     }
 
     #[test_case(false, ToolStatus::Success, "Reported", REPORT_ACK; "normal_success")]

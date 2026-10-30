@@ -5334,6 +5334,31 @@ fn tab_in_palette_completes_command() {
 }
 
 #[test]
+fn palette_tab_cycles_until_enter_keeps_the_row() {
+    let mut app = test_app();
+    type_slash(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('s'))));
+    let thinking = app.state.thinking.clone();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    let first = app.input_box.buffer.value();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_ne!(app.input_box.buffer.value(), first);
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    assert_eq!(
+        (app.input_box.buffer.value(), &app.state.thinking),
+        (first.clone(), &thinking)
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), first);
+    assert!(!app.command_palette.is_cycling());
+}
+
+#[test]
 fn chat_navigation_actions() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -23288,10 +23313,7 @@ fn a_press_leaves_the_plan_form_standing() {
     assert!(app.plan_form.is_visible(), "{FORM_STANDING}");
 }
 
-/// It holds edits nothing else has a copy of, so a stray press must not be able
-/// to throw them away.
-#[test]
-fn a_press_leaves_the_paste_editor_standing() {
+fn app_with_paste_editor_open() -> App {
     let mut app = test_app();
     app.update(Msg::Paste("a\nb\nc".into()));
     app.update(Msg::Key(key(KeyCode::Left)));
@@ -23299,15 +23321,41 @@ fn a_press_leaves_the_paste_editor_standing() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     let _ = rendered(&mut app);
     assert!(app.paste_editor.is_open());
+    app
+}
 
+fn press_outside_modal(app: &mut App) {
     let (column, row) = OUTSIDE_MODAL;
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
         column,
         row,
     ));
+}
 
-    assert!(app.paste_editor.is_open(), "{FORM_STANDING}");
+#[test]
+fn a_press_outside_an_unedited_paste_editor_closes_it() {
+    let mut app = app_with_paste_editor_open();
+
+    press_outside_modal(&mut app);
+
+    assert!(!app.paste_editor.is_open(), "{LEFT_STANDING}");
+}
+
+/// It holds edits nothing else has a copy of, so a stray press asks before
+/// throwing them away.
+#[test]
+fn a_press_outside_an_edited_paste_editor_asks_before_discarding() {
+    let mut app = app_with_paste_editor_open();
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+
+    press_outside_modal(&mut app);
+    let _ = rendered(&mut app);
+    assert!(app.paste_editor.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.paste_editor.is_open());
+    assert_eq!(app.input_box.buffer.expanded_text(), "a\nb\nc ");
 }
 
 #[test]

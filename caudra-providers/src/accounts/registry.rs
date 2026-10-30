@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::hash::{Hash, Hasher};
+use std::mem;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -191,7 +192,50 @@ impl SlugState {
 
     #[cfg(test)]
     pub(crate) fn replace_snapshot(&self, snapshot: PoolSnapshot) {
-        *self.snapshot.lock().unwrap() = (Arc::new(snapshot), Instant::now());
+        self.install(snapshot);
+    }
+
+    /// Takes a fresh pool, following each account that only changed its name
+    /// and dropping the instances of every name that left. Returns whether
+    /// any credential changed.
+    fn install(&self, fresh: PoolSnapshot) -> bool {
+        let fresh = Arc::new(fresh);
+        let (previous, _) = mem::replace(
+            &mut *self.snapshot.lock().unwrap(),
+            (Arc::clone(&fresh), Instant::now()),
+        );
+        for (from, to) in renamed(&previous, &fresh) {
+            self.follow(&from, &to);
+        }
+        self.instances
+            .lock()
+            .unwrap()
+            .retain(|(name, ..), _| fresh.position(name).is_some());
+        previous.fingerprints() != fresh.fingerprints()
+    }
+
+    /// Moves what this process knows of `from` over to `to`, the same
+    /// account under a new name.
+    fn follow(&self, from: &str, to: &str) {
+        self.lineages.lock().unwrap().follow(from, to);
+        {
+            let mut failures = self.failures.lock().unwrap();
+            if failures.auth.remove(from) {
+                failures.auth.insert(to.to_owned());
+            }
+            failures.models = mem::take(&mut failures.models)
+                .into_iter()
+                .map(|(account, model)| {
+                    let account = if account == from {
+                        to.to_owned()
+                    } else {
+                        account
+                    };
+                    (account, model)
+                })
+                .collect();
+        }
+        self.health.rename(from, to);
     }
 
     pub(crate) fn snapshot(&self) -> Arc<PoolSnapshot> {
@@ -220,10 +264,7 @@ impl SlugState {
                 return false;
             }
         };
-        let mut current = self.snapshot.lock().unwrap();
-        let changed = current.0.fingerprints() != fresh.fingerprints();
-        *current = (Arc::new(fresh), Instant::now());
-        changed
+        self.install(fresh)
     }
 
     /// Quota readings are shared through storage only once there is more
@@ -484,6 +525,59 @@ fn build_snapshot(
     })
 }
 
+/// `(from, to)` for each stored account that left the pool under one name
+/// while exactly one arrival is the same account, and no other leaver claims
+/// that arrival.
+fn renamed(before: &PoolSnapshot, after: &PoolSnapshot) -> Vec<(String, String)> {
+    let arrived = stored_only_in(after, before);
+    let pairs: Vec<(&AccountCredential, &AccountCredential)> = stored_only_in(before, after)
+        .into_iter()
+        .filter_map(|left| {
+            let mut matches = arrived.iter().filter(|arrival| same_account(left, arrival));
+            let arrival = matches.next()?;
+            matches.next().is_none().then_some((left, *arrival))
+        })
+        .collect();
+    pairs
+        .iter()
+        .filter(|(_, arrival)| {
+            pairs
+                .iter()
+                .filter(|(_, other)| other.id == arrival.id)
+                .count()
+                == 1
+        })
+        .map(|(left, arrival)| (left.id.name.to_string(), arrival.id.name.to_string()))
+        .collect()
+}
+
+fn stored_only_in<'a>(
+    snapshot: &'a PoolSnapshot,
+    other: &PoolSnapshot,
+) -> Vec<&'a AccountCredential> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|slot| other.position(slot.name.as_str()).is_none())
+        .filter_map(|slot| slot.credential.as_ref())
+        .filter(|credential| credential.source == CredentialSource::Stored)
+        .collect()
+}
+
+/// A login is the same account when the provider names the same identity;
+/// a key, when it is the same key.
+fn same_account(left: &AccountCredential, right: &AccountCredential) -> bool {
+    match (&left.secret, &right.secret) {
+        (AccountSecret::OAuth(_), AccountSecret::OAuth(_)) => {
+            left.identity.same_as(&right.identity)
+        }
+        (AccountSecret::ApiKey { .. }, AccountSecret::ApiKey { .. }) => {
+            left.fingerprint() == right.fingerprint()
+        }
+        _ => false,
+    }
+}
+
 fn config_digest(definition: Option<&ProviderDef>) -> u64 {
     let mut hasher = DefaultHasher::new();
     serde_json::to_string(&definition)
@@ -739,6 +833,20 @@ pub fn select_account(
     Ok(())
 }
 
+/// Keeps this process's conversations, refusals, quota readings and
+/// `--account` pin on a renamed account, so its prompt cache stays warm.
+pub(crate) fn follow_rename(provider: &str, from: &AccountName, to: &AccountName) {
+    if let Some(selection) = OVERRIDES.write().unwrap().get_mut(provider)
+        && *selection == AccountSelection::Pinned(from.clone())
+    {
+        *selection = AccountSelection::Pinned(to.clone());
+    }
+    let state = POOLS.lock().unwrap().get(provider).cloned();
+    if let Some(state) = state {
+        state.follow(from.as_str(), to.as_str());
+    }
+}
+
 /// Makes the next request of the slug, or of every slug, re-read its pool:
 /// after a login, a logout, a config change, or a selection.
 pub fn invalidate(provider: Option<&str>) {
@@ -986,6 +1094,14 @@ mod tests {
 
     const SLUG: &str = "test-provider";
     const KEYLESS_SLUG: &str = "ollama";
+    const PIN_SLUG: &str = "test-pin-follows-rename";
+    const PERSONAL: &str = "personal";
+    const WORK: &str = "work";
+    const TEAM: &str = "team";
+    const ALICE: &str = "alice";
+    const BOB: &str = "bob";
+    const KEY: &str = "sk-1";
+    const OTHER_KEY: &str = "sk-2";
 
     fn spec(env_vars: &[&str], keyless: bool, config_key: Option<&str>) -> CredentialSpec {
         CredentialSpec {
@@ -1121,5 +1237,69 @@ mod tests {
             parse_account_overrides(spec),
             Err(AccountOverrideError::Shape(spec.to_owned()))
         );
+    }
+
+    fn key_slot(name: &str, key: &str) -> AccountSlot {
+        test_support::slot(stored_credential(SLUG, stored(name, key, 1)), false)
+    }
+
+    fn login_slot(name: &str, subject: &str) -> AccountSlot {
+        let account = StoredAccount {
+            secret: StoredSecret::OAuth(caudra_storage::auth::OAuthTokens {
+                access: name.to_owned(),
+                refresh: name.to_owned(),
+                expires: u64::MAX,
+                account_id: None,
+            }),
+            identity: AccountIdentity {
+                subject: Some(subject.to_owned()),
+                ..AccountIdentity::default()
+            },
+            created_at: 1,
+        };
+        test_support::slot(
+            stored_credential(SLUG, (AccountName::new(name).unwrap(), account)),
+            false,
+        )
+    }
+
+    fn pool(accounts: Vec<AccountSlot>) -> PoolSnapshot {
+        test_support::snapshot(accounts, AccountSelection::Auto)
+    }
+
+    #[test_case(vec![login_slot(PERSONAL, ALICE)], vec![login_slot(WORK, ALICE)], &[(PERSONAL, WORK)] ; "a_login_follows_its_identity")]
+    #[test_case(vec![key_slot(PERSONAL, KEY)], vec![key_slot(WORK, KEY)], &[(PERSONAL, WORK)] ; "a_key_follows_itself")]
+    #[test_case(vec![login_slot(PERSONAL, ALICE)], vec![login_slot(WORK, ALICE), login_slot(TEAM, ALICE)], &[] ; "two_matches_follow_neither")]
+    #[test_case(vec![login_slot(PERSONAL, ALICE), login_slot(TEAM, ALICE)], vec![login_slot(WORK, ALICE)], &[] ; "two_leavers_claim_one_arrival")]
+    #[test_case(vec![login_slot(PERSONAL, ALICE)], vec![login_slot(WORK, BOB)], &[] ; "another_identity_is_new")]
+    #[test_case(vec![key_slot(PERSONAL, KEY)], vec![key_slot(WORK, OTHER_KEY)], &[] ; "another_key_is_new")]
+    #[test_case(vec![login_slot(PERSONAL, ALICE)], vec![login_slot(PERSONAL, ALICE), login_slot(WORK, ALICE)], &[] ; "an_account_that_stayed_is_not_renamed")]
+    fn a_renamed_account_is_found_by_what_it_is(
+        before: Vec<AccountSlot>,
+        after: Vec<AccountSlot>,
+        expected: &[(&str, &str)],
+    ) {
+        let expected: Vec<(String, String)> = expected
+            .iter()
+            .map(|(from, to)| ((*from).to_owned(), (*to).to_owned()))
+            .collect();
+        assert_eq!(renamed(&pool(before), &pool(after)), expected);
+    }
+
+    #[test_case(PERSONAL, WORK ; "a_pin_on_the_account_follows_it")]
+    #[test_case(TEAM, TEAM ; "a_pin_on_another_account_stays")]
+    fn a_rename_carries_the_process_pin(pinned: &str, expected: &str) {
+        let pin = |name: &str| AccountSelection::Pinned(AccountName::new(name).unwrap());
+        let slug = format!("{PIN_SLUG}-{pinned}");
+        set_process_selection(&slug, Some(pin(pinned)));
+
+        follow_rename(
+            &slug,
+            &AccountName::new(PERSONAL).unwrap(),
+            &AccountName::new(WORK).unwrap(),
+        );
+
+        let selection = OVERRIDES.write().unwrap().remove(&slug);
+        assert_eq!(selection, Some(pin(expected)));
     }
 }

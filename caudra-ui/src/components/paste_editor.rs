@@ -1,7 +1,7 @@
 use caudra_grab::grab_scope;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -18,6 +18,9 @@ const MODAL_MAX_HEIGHT_PERCENT: u16 = 80;
 const META_ROWS: u16 = 1;
 const HINT_ROWS: u16 = 1;
 const MIN_EDITOR_ROWS: u16 = 5;
+const DISCARD_PROMPT: &str = "Discard your edits?";
+const DISCARD_HINT: &str = "discard";
+const KEEP_EDITING_HINT: &str = "keep editing";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PasteEditorTarget {
@@ -45,6 +48,9 @@ pub(crate) struct PasteEditor {
     id: Option<PasteId>,
     editor: TextEditor,
     hints: HintBar,
+    original: String,
+    popup: Rect,
+    confirm_discard: bool,
 }
 
 impl PasteEditor {
@@ -54,19 +60,41 @@ impl PasteEditor {
             id: None,
             editor: TextEditor::new(),
             hints: HintBar::default(),
+            original: String::new(),
+            popup: Rect::ZERO,
+            confirm_discard: false,
         }
     }
 
     pub fn open(&mut self, target: PasteEditorTarget, id: PasteId, text: String) {
         self.target = Some(target);
         self.id = Some(id);
-        self.editor.set_text(text);
+        self.editor.set_text(text.clone());
+        self.original = text;
+    }
+
+    fn contains(&self, pos: Position) -> bool {
+        self.is_open() && self.popup.contains(pos)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.editor.text() != self.original
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PasteEditorAction {
         let (Some(target), Some(id)) = (self.target.clone(), self.id) else {
             return PasteEditorAction::Consumed;
         };
+        if self.confirm_discard {
+            return match key.code {
+                KeyCode::Enter => PasteEditorAction::Cancel,
+                KeyCode::Esc => {
+                    self.confirm_discard = false;
+                    PasteEditorAction::Consumed
+                }
+                _ => PasteEditorAction::Consumed,
+            };
+        }
         if key.code == KeyCode::Esc {
             return PasteEditorAction::Cancel;
         }
@@ -93,13 +121,30 @@ impl PasteEditor {
         if self.id.is_none() {
             return false;
         }
-        self.editor.handle_text(text, paste);
+        if !self.confirm_discard {
+            self.editor.handle_text(text, paste);
+        }
         true
     }
 
     pub fn handle_mouse(&mut self, event: &MouseEvent) -> PasteEditorAction {
         if self.id.is_none() {
             return PasteEditorAction::Passthrough;
+        }
+        if self.confirm_discard {
+            return match self.hints.handle_mouse(*event) {
+                Some(key) => self.handle_key(key),
+                None => PasteEditorAction::Consumed,
+            };
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && !self.contains(Position::new(event.column, event.row))
+        {
+            if !self.is_dirty() {
+                return PasteEditorAction::Cancel;
+            }
+            self.confirm_discard = true;
+            return PasteEditorAction::Consumed;
         }
         if let Some(key) = self.hints.handle_mouse(*event) {
             return self.handle_key(key);
@@ -142,21 +187,30 @@ impl PasteEditor {
 
         self.render_meta(frame, meta_area);
         self.editor.view(frame, editor_area);
-        self.hints.draw(
-            frame,
-            hint_area,
-            vec![
+        let hints = match self.confirm_discard {
+            true => vec![
+                Hint::bind(key::ENTER, DISCARD_HINT),
+                Hint::bind(key::ESC, KEEP_EDITING_HINT),
+            ],
+            false => vec![
                 Hint::bind(key::SAVE, "save"),
                 Hint::bind(key::SELECT_ALL, "select all"),
                 Hint::bind(key::UNDO, "undo"),
                 Hint::bind(key::ESC, "cancel"),
             ],
-        );
+        };
+        self.hints.draw(frame, hint_area, hints);
+        self.popup = popup;
         popup
     }
 
     fn render_meta(&self, frame: &mut Frame, area: Rect) {
         grab_scope!("paste_editor_meta", area);
+        if self.confirm_discard {
+            let prompt = Span::styled(format!(" {DISCARD_PROMPT}"), theme::current().error);
+            frame.render_widget(Paragraph::new(Line::from(prompt)), area);
+            return;
+        }
         let text = self.editor.text();
         let line = Line::from(vec![
             Span::styled(
@@ -182,17 +236,29 @@ impl Overlay for PasteEditor {
         self.id = None;
         self.editor = TextEditor::new();
         self.hints.reset();
+        self.original.clear();
+        self.popup = Rect::ZERO;
+        self.confirm_discard = false;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use test_case::test_case;
 
-    use super::{PasteEditor, PasteEditorAction, PasteEditorTarget};
+    use super::{DISCARD_PROMPT, PasteEditor, PasteEditorAction, PasteEditorTarget};
+    use crate::components::{Overlay, buffer_text};
     use crate::input_document::InputDocument;
 
     const MULTILINE: &str = "a\nb\nc";
+    const EDITED: &str = "!a\nb\nc";
+    const SCREEN: (u16, u16) = (80, 24);
+    const OUTSIDE: (u16, u16) = (0, 0);
 
     fn paste_id() -> crate::input_document::PasteId {
         let mut document = InputDocument::new();
@@ -207,6 +273,78 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn render(editor: &mut PasteEditor) -> String {
+        let (width, height) = SCREEN;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                editor.view(frame, frame.area());
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn press_outside(editor: &mut PasteEditor) -> PasteEditorAction {
+        let (column, row) = OUTSIDE;
+        editor.handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn armed() -> PasteEditor {
+        let mut editor = editor(MULTILINE);
+        editor.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        render(&mut editor);
+        assert!(matches!(
+            press_outside(&mut editor),
+            PasteEditorAction::Consumed
+        ));
+        editor
+    }
+
+    #[test]
+    fn a_press_outside_unedited_text_cancels() {
+        let mut editor = editor(MULTILINE);
+        render(&mut editor);
+        assert!(matches!(
+            press_outside(&mut editor),
+            PasteEditorAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn a_press_outside_edited_text_asks_and_enter_discards() {
+        let mut editor = armed();
+        assert!(editor.is_open());
+        assert!(render(&mut editor).contains(DISCARD_PROMPT));
+        let action = editor.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, PasteEditorAction::Cancel));
+    }
+
+    #[test]
+    fn esc_keeps_editing_with_the_edit_intact() {
+        let mut editor = armed();
+        let action = editor.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action, PasteEditorAction::Consumed));
+        assert!(!render(&mut editor).contains(DISCARD_PROMPT));
+        let action = editor.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            action,
+            PasteEditorAction::Save { text, .. } if text == EDITED
+        ));
+    }
+
+    #[test_case(|editor| { editor.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)); }; "typed_key")]
+    #[test_case(|editor| { editor.handle_paste("x"); }; "paste")]
+    fn the_prompt_holds_the_text(input: fn(&mut PasteEditor)) {
+        let mut editor = armed();
+        input(&mut editor);
+        assert_eq!(editor.editor.text(), EDITED);
     }
 
     #[test]
