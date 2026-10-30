@@ -21,10 +21,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_lock::OnceCell;
-use caudra_storage::StateDir;
+use caudra_storage::deferred::{self, DeferredRow};
 use caudra_storage::sessions::SessionError;
 use caudra_storage::shell_runs::reading::{Call, NUMBERS, Reading, read};
 use caudra_storage::shell_runs::{HostSnapshot, Prediction, RunOutcome, ShellRun, ShellRuns};
+use caudra_storage::{StateDir, now_epoch};
 
 use crate::ToolOutput;
 use crate::tools::{Deadline, ToolExecResult, humanize_duration};
@@ -435,13 +436,14 @@ impl ShellEta {
             elapsed_ms,
             outcome,
         };
-        let dir = self.0.state_dir.clone();
-        let prediction = guess.prediction;
-        if let Err(error) =
-            smol::unblock(move || ShellRuns::open(&dir)?.append(&run, prediction.as_ref())).await
-        {
-            tracing::warn!(%error, "shell run could not be recorded");
-        }
+        deferred::hold(
+            &self.0.state_dir,
+            DeferredRow::ShellRun {
+                run,
+                prediction: guess.prediction,
+                at: now_epoch(),
+            },
+        );
         let due = {
             let mut model = lock(model);
             let due = model.retrain_due();
@@ -468,6 +470,7 @@ impl ShellEta {
         let dir = self.0.state_dir.clone();
         let started = Instant::now();
         let trained = smol::unblock(move || {
+            deferred::flush(&dir)?;
             let runs = ShellRuns::open(&dir)?.newest(MAX_TRAINING_RUNS)?;
             Ok::<_, SessionError>((runs.len(), Model::trained(&runs)))
         })

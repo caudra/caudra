@@ -26,6 +26,10 @@ use startup::Startup;
 /// How long a final telemetry export may take before caudra stops waiting.
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the rows held for a deferred write may take to reach the
+/// database before caudra stops waiting.
+const DEFERRED_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long the queued log records may take to reach the file before caudra
 /// stops waiting.
 const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,6 +55,7 @@ fn main() -> ExitCode {
     };
     progress::install();
     let result = cmd::dispatch(cli, startup);
+    caudra_storage::deferred::flush_all(DEFERRED_FLUSH_TIMEOUT);
     // Detached export tasks die with the process, so drain them once every
     // command has released its resources.
     caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);

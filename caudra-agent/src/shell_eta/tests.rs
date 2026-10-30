@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use caudra_storage::StateDir;
+use caudra_storage::deferred;
 use caudra_storage::shell_runs::reading::{Call, Reading, read};
 use caudra_storage::shell_runs::{HostSnapshot, Prediction, RunOutcome, ShellRun, ShellRuns};
 use tempfile::TempDir;
@@ -117,6 +118,7 @@ fn the_first_forecast_trains_on_the_log_and_runs_are_recorded() {
         eta.observe(forecast.guess, RunOutcome::Completed, BUILD_MS)
             .await;
     });
+    deferred::flush(&state).unwrap();
     let stored = runs.newest(2 * REPEATS + 2).unwrap();
     assert_eq!(stored.len(), 2 * REPEATS + 1);
     assert_eq!(stored.last().map(|run| run.elapsed_ms), Some(BUILD_MS));
@@ -185,6 +187,7 @@ fn sleep_forecast_without_training_is_recorded() {
         eta.observe(forecast.guess, RunOutcome::Completed, SLEEP_MS)
             .await;
     });
+    deferred::flush(&state).unwrap();
     let mut expected = run(SLEEP, SLEEP_MS);
     expected.host = Some(host);
     assert_eq!(
@@ -292,6 +295,7 @@ fn sleep_adds_the_standalone_remainder_estimate(command: &str) {
         eta.observe(forecast.guess, RunOutcome::Completed, ADDITIVE_MS)
             .await;
     });
+    deferred::flush(&state).unwrap();
     let stored = ShellRuns::open(&state).unwrap().newest(2).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].reading, reading(command));

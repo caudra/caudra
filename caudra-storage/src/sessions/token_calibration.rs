@@ -6,7 +6,7 @@
 //! can lose each other's latest samples. The row is an estimate's correction
 //! and converges again from the next ones, so that is cheaper than merging.
 
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::sessions::{SessionDatabase, SessionError, from_i64, to_i64};
@@ -72,23 +72,30 @@ impl TokenCalibrationStore {
     }
 
     pub fn upsert(&self, calibration: &StoredCalibration) -> Result<(), SessionError> {
-        self.database.connection().execute(
-            "INSERT INTO token_calibration (provider, model, ratio, weight, samples, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(provider, model) DO UPDATE SET \
-             ratio = excluded.ratio, weight = excluded.weight, samples = excluded.samples, \
-             updated_at = excluded.updated_at",
-            params![
-                calibration.provider,
-                calibration.model,
-                calibration.ratio,
-                calibration.weight,
-                to_i64(calibration.samples, SAMPLES_FIELD)?,
-                to_i64(calibration.updated_at, UPDATED_AT_FIELD)?,
-            ],
-        )?;
-        Ok(())
+        upsert(self.database.connection(), calibration)
     }
+}
+
+pub(crate) fn upsert(
+    connection: &Connection,
+    calibration: &StoredCalibration,
+) -> Result<(), SessionError> {
+    connection.execute(
+        "INSERT INTO token_calibration (provider, model, ratio, weight, samples, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(provider, model) DO UPDATE SET \
+         ratio = excluded.ratio, weight = excluded.weight, samples = excluded.samples, \
+         updated_at = excluded.updated_at",
+        params![
+            calibration.provider,
+            calibration.model,
+            calibration.ratio,
+            calibration.weight,
+            to_i64(calibration.samples, SAMPLES_FIELD)?,
+            to_i64(calibration.updated_at, UPDATED_AT_FIELD)?,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

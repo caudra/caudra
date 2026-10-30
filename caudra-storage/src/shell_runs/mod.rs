@@ -132,11 +132,7 @@ impl ShellRuns {
             )?)
         })?;
         insert(&transaction, now_epoch(), run, prediction)?;
-        transaction.execute(
-            "DELETE FROM shell_runs WHERE id <= \
-             (SELECT id FROM shell_runs ORDER BY id DESC LIMIT 1 OFFSET ?1)",
-            [to_i64(MAX_SHELL_RUNS, RECORDED_FIELD)?],
-        )?;
+        prune(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -198,7 +194,17 @@ pub(crate) fn migrate(transaction: &Transaction) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn insert(
+/// Drops all but the newest [`MAX_SHELL_RUNS`].
+pub(crate) fn prune(connection: &Connection) -> Result<(), SessionError> {
+    connection.execute(
+        "DELETE FROM shell_runs WHERE id <= \
+         (SELECT id FROM shell_runs ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+        [to_i64(MAX_SHELL_RUNS, RECORDED_FIELD)?],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn insert(
     connection: &Connection,
     recorded_at: u64,
     run: &ShellRun,

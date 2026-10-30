@@ -18,6 +18,7 @@ pub mod changelog;
 pub mod checkout;
 pub mod decision_log;
 pub mod decisions;
+pub mod deferred;
 pub mod digest_trust;
 #[path = "sessions/engine_decisions.rs"]
 pub mod engine_decisions;

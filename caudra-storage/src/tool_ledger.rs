@@ -13,10 +13,11 @@
 
 use std::collections::BTreeMap;
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::sessions::{
-    SessionDatabase, SessionError, StoredToolUsage, ToolBucket, ToolLedgerEntry,
+    SessionDatabase, SessionError, StoredToolUsage, ToolBucket, ToolLedgerEntry, merge_tool_bucket,
 };
 use crate::usage_ledger::bucket_for;
 use crate::{StateClass, StateDir, now_epoch};
@@ -261,17 +262,8 @@ impl ToolLedger {
     }
 
     pub fn record_at(&self, call: &ToolCall, now: u64) -> Result<(), SessionError> {
-        self.database.record_tool_call(&ToolLedgerEntry {
-            bucket_start: bucket_for(now),
-            tool: &call.tool,
-            source: &call.source,
-            cwd: &call.cwd,
-            outcome: call.outcome,
-            calls: 1,
-            duration_ms: call.duration_ms,
-            tokens: u64::from(call.tokens),
-            latency: &Latency::of(call.duration_ms),
-        })
+        self.database
+            .record_tool_call(&entry(call, now, &Latency::of(call.duration_ms)))
     }
 
     pub fn buckets(
@@ -294,6 +286,33 @@ impl ToolLedger {
     /// Everything recorded against one exact working directory.
     pub fn project(&self, cwd: &str) -> Result<ToolStats, SessionError> {
         Ok(summarize(&self.buckets(None, Some(cwd))?))
+    }
+}
+
+/// Folds `call`, made at `now`, into its bucket within the caller's
+/// transaction.
+pub(crate) fn merge_call(
+    connection: &Connection,
+    call: &ToolCall,
+    now: u64,
+) -> Result<(), SessionError> {
+    merge_tool_bucket(
+        connection,
+        &entry(call, now, &Latency::of(call.duration_ms)),
+    )
+}
+
+fn entry<'a>(call: &'a ToolCall, now: u64, latency: &'a Latency) -> ToolLedgerEntry<'a> {
+    ToolLedgerEntry {
+        bucket_start: bucket_for(now),
+        tool: &call.tool,
+        source: &call.source,
+        cwd: &call.cwd,
+        outcome: call.outcome,
+        calls: 1,
+        duration_ms: call.duration_ms,
+        tokens: u64::from(call.tokens),
+        latency,
     }
 }
 

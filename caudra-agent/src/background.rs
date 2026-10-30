@@ -95,7 +95,10 @@ const RUNNING_STATE: &str = "running";
 const INTERRUPTED_STATE: &str = "interrupted";
 const INTERRUPTED_TASK_REQUIRED: &str =
     "only an interrupted managed agent task owned by this session can be resumed";
-const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a running task's transcript is looked at, and the longest a
+/// changed one waits for its write: a change reaches disk within twice this,
+/// the window [`caudra_storage::deferred::PERSIST_WITHIN`] gives other rows.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
 const BUSY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const BUSY_RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTCOME_SAVE: &str = "background outcome save";
@@ -295,6 +298,8 @@ struct State {
     /// Settled tasks whose terminal save has yet to commit, by invocation.
     /// Their resident records stay active until it does.
     terminals: HashMap<String, Terminal>,
+    /// Transcripts of running tasks not yet written, by invocation.
+    checkpoints: HashMap<String, HeldCheckpoint>,
     steering: Option<SharedSteering>,
     #[cfg(test)]
     permits: Option<Arc<Semaphore>>,
@@ -312,6 +317,17 @@ struct State {
     save_checked: Option<flume::Sender<()>>,
     #[cfg(test)]
     transcript_max_stored: Option<usize>,
+}
+
+struct HeldCheckpoint {
+    items: Arc<Vec<HistoryItem>>,
+    due: Instant,
+}
+
+impl HeldCheckpoint {
+    fn is_due(&self) -> bool {
+        self.due <= Instant::now()
+    }
 }
 
 #[derive(Clone)]
@@ -745,6 +761,7 @@ impl BackgroundTasks {
                 interrupting: false,
                 failure: None,
                 terminals: HashMap::new(),
+                checkpoints: HashMap::new(),
                 steering: None,
                 #[cfg(test)]
                 permits: None,
@@ -1085,13 +1102,15 @@ impl BackgroundTasks {
             .await?)
     }
 
-    /// Saves the running task's transcript into its record at most once per
-    /// [`CHECKPOINT_INTERVAL`], so a restart continues it from where it was
-    /// rather than from its admission. When `stop` closes, it saves once more
-    /// only if a shutdown cut the run off: a run that ended on its own keeps
-    /// its transcript elsewhere, and saving it would hold up its outcome.
+    /// Holds the running task's transcript whenever it changed, so a restart
+    /// continues it from where it was rather than from its admission. A held
+    /// transcript is written once due, in one transaction with every other
+    /// one the session holds, or sooner by the next save of its record. When
+    /// `stop` closes, it writes at once only if a shutdown cut the run off: a
+    /// run that ended on its own keeps its transcript elsewhere, and its
+    /// outcome save takes the held one along.
     async fn keep_checkpoint(&self, invocation: &str, mirror: SharedHistory, stop: Receiver<()>) {
-        let mut saved = Arc::clone(&mirror.load().messages);
+        let mut sampled = Arc::clone(&mirror.load().messages);
         loop {
             let running = async {
                 Timer::after(CHECKPOINT_INTERVAL).await;
@@ -1106,58 +1125,123 @@ impl BackgroundTasks {
                 return;
             }
             let items = Arc::clone(&mirror.load().messages);
-            if !Arc::ptr_eq(&saved, &items) {
-                self.checkpoint_transcript(invocation, &items).await;
-                saved = items;
+            if !Arc::ptr_eq(&sampled, &items) {
+                self.hold_checkpoint(invocation, Arc::clone(&items));
+                sampled = items;
             }
+            self.write_checkpoints(!running).await;
             if !running {
                 return;
             }
         }
     }
 
-    async fn checkpoint_transcript(&self, invocation: &str, items: &[HistoryItem]) {
-        let history = match project_messages(items)
-            .map_err(|error| error.to_string())
-            .and_then(|messages| {
-                serde_json::to_string(&messages).map_err(|error| error.to_string())
-            }) {
-            Ok(history) => history,
-            Err(error) => {
-                warn!(invocation, %error, "task checkpoint skipped: transcript unreadable");
+    /// A newer transcript replaces the held one but keeps its deadline, so a
+    /// transcript that never stops changing is still written on time.
+    fn hold_checkpoint(&self, invocation: &str, items: Arc<Vec<HistoryItem>>) {
+        let now = Instant::now();
+        self.lock()
+            .checkpoints
+            .entry(invocation.to_owned())
+            .and_modify(|held| held.items = Arc::clone(&items))
+            .or_insert(HeldCheckpoint {
+                items,
+                due: now + CHECKPOINT_INTERVAL,
+            });
+    }
+
+    /// Writes every held transcript of a running task in one transaction once
+    /// the oldest is due, or at once when `now` is set.
+    async fn write_checkpoints(&self, now: bool) {
+        if !now && !self.lock().checkpoints.values().any(HeldCheckpoint::is_due) {
+            return;
+        }
+        let _gate = self.0.gate.lock().await;
+        let held = {
+            let mut state = self.lock();
+            let state = &mut *state;
+            state
+                .checkpoints
+                .retain(|invocation, _| state.records.contains_key(invocation));
+            if !now && !state.checkpoints.values().any(HeldCheckpoint::is_due) {
                 return;
             }
+            state
+                .checkpoints
+                .iter()
+                .filter_map(|(invocation, held)| {
+                    let record = state
+                        .records
+                        .get(invocation)
+                        .filter(|record| record.active())?;
+                    Some((record.clone(), Arc::clone(&held.items)))
+                })
+                .collect::<Vec<_>>()
         };
-        let bytes = history.len();
-        if bytes > MAX_CHECKPOINT_BYTES {
-            warn!(
-                invocation,
-                bytes, "task checkpoint skipped: transcript too large"
-            );
+        if held.is_empty() {
             return;
         }
         let max_stored = self.max_stored_transcript();
-        let invocation_id = invocation.to_owned();
-        let fitted = smol::unblock(move || fit_transcript(&history, max_stored, &invocation_id));
-        let Some(stored) = fitted.await else {
-            return;
-        };
-        let _gate = self.0.gate.lock().await;
-        let record = {
-            let state = self.lock();
-            match state.records.get(invocation) {
-                Some(record) if record.active() => record.clone(),
-                _ => return,
+        let dir = self.0.dir.clone();
+        let session = self.0.session;
+        let (unwritable, saved) = smol::unblock(move || {
+            let mut unwritable = Vec::new();
+            let mut saves = Vec::new();
+            for (mut record, items) in held {
+                match checkpoint(&record.invocation_id, &items, max_stored) {
+                    Some(transcript) => {
+                        record.updated_at = now_epoch();
+                        saves.push((record, items, transcript));
+                    }
+                    None => unwritable.push((record.invocation_id, items)),
+                }
             }
-        };
-        if let Err(error) = self
-            .persist_record(record, None, TranscriptWrite::Save(stored))
-            .await
+            let rows = saves
+                .iter()
+                .map(|(record, _, transcript)| (record, transcript))
+                .collect::<Vec<_>>();
+            let saved = save_records(&dir, session, &rows);
+            (unwritable, saved.map(|()| saves))
+        })
+        .await;
         {
-            warn!(invocation, %error, "task checkpoint save failed");
+            let mut state = self.lock();
+            for (invocation, items) in unwritable {
+                forget_checkpoint(&mut state, &invocation, &items);
+            }
+        }
+        match saved {
+            Ok(saves) => self.adopt_saved(
+                saves
+                    .into_iter()
+                    .map(|(record, items, _)| (record, Some(items))),
+            ),
+            Err(error) => warn!(%session, %error, "task checkpoints kept for the next write"),
         }
     }
 
+    /// Takes in records whose save committed, and forgets each held
+    /// transcript it wrote unless a newer one replaced it meanwhile.
+    fn adopt_saved(
+        &self,
+        saved: impl IntoIterator<Item = (TaskRecord, Option<Arc<Vec<HistoryItem>>>)>,
+    ) {
+        {
+            let mut state = self.lock();
+            for (record, written) in saved {
+                if let Some(written) = written {
+                    forget_checkpoint(&mut state, &record.invocation_id, &written);
+                }
+                *state.revisions.entry(record.owner.clone()).or_default() += 1;
+                state.records.insert(record.invocation_id.clone(), record);
+            }
+        }
+        self.0.changed.notify(usize::MAX);
+    }
+
+    /// Saves `record`. A save that keeps its transcript writes the one held
+    /// for it in the same transaction, since the record is what a restart
+    /// continues the run from.
     async fn persist_record(
         &self,
         mut record: TaskRecord,
@@ -1174,11 +1258,24 @@ impl BackgroundTasks {
                 state.admission_committed.clone()
             }
         };
+        let held = self
+            .lock()
+            .checkpoints
+            .get(&record.invocation_id)
+            .map(|held| Arc::clone(&held.items));
+        let max_stored = self.max_stored_transcript();
         let dir = self.0.dir.clone();
         let session = self.0.session;
         #[cfg(test)]
         let save_checked = self.lock().save_checked.clone();
-        let saved = smol::unblock(move || {
+        let (saved, held) = smol::unblock(move || {
+            let transcript = match transcript {
+                TranscriptWrite::Keep => held
+                    .as_ref()
+                    .and_then(|items| checkpoint(&record.invocation_id, items, max_stored))
+                    .unwrap_or(TranscriptWrite::Keep),
+                write => write,
+            };
             let stage = if admission.is_some() {
                 "background admission save"
             } else if record.outcome.is_some() {
@@ -1211,15 +1308,10 @@ impl BackgroundTasks {
                 let _ = committed.send(());
                 let _ = resume.recv();
             }
-            Ok::<_, SaveError>(record)
+            Ok::<_, SaveError>((record, held))
         })
         .await?;
-        {
-            let mut state = self.lock();
-            *state.revisions.entry(saved.owner.clone()).or_default() += 1;
-            state.records.insert(saved.invocation_id.clone(), saved);
-        }
-        self.0.changed.notify(usize::MAX);
+        self.adopt_saved([(saved, held)]);
         Ok(())
     }
 
@@ -3468,6 +3560,59 @@ fn close_checkpoint_calls(
     Ok((messages, dangling, write))
 }
 
+/// The transcript a checkpoint of `items` writes, or `None`, with a warning,
+/// when it cannot be written.
+fn checkpoint(
+    invocation: &str,
+    items: &[HistoryItem],
+    max_stored: usize,
+) -> Option<TranscriptWrite> {
+    let history = match project_messages(items)
+        .map_err(|error| error.to_string())
+        .and_then(|messages| serde_json::to_string(&messages).map_err(|error| error.to_string()))
+    {
+        Ok(history) => history,
+        Err(error) => {
+            warn!(invocation, %error, "task checkpoint skipped: transcript unreadable");
+            return None;
+        }
+    };
+    let bytes = history.len();
+    if bytes > MAX_CHECKPOINT_BYTES {
+        warn!(
+            invocation,
+            bytes, "task checkpoint skipped: transcript too large"
+        );
+        return None;
+    }
+    fit_transcript(&history, max_stored, invocation).map(TranscriptWrite::Save)
+}
+
+/// Forgets the held checkpoint of `invocation` if it is still `items`: a
+/// newer one held meanwhile has yet to be written.
+fn forget_checkpoint(state: &mut State, invocation: &str, items: &Arc<Vec<HistoryItem>>) {
+    if state
+        .checkpoints
+        .get(invocation)
+        .is_some_and(|held| Arc::ptr_eq(&held.items, items))
+    {
+        state.checkpoints.remove(invocation);
+    }
+}
+
+/// Writes `rows` in one transaction.
+fn save_records(
+    dir: &StateDir,
+    session: CaudraId,
+    rows: &[(&TaskRecord, &TranscriptWrite)],
+) -> Result<(), SessionError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let retry = RuntimeRetry::new(None, &|| false);
+    SessionDatabase::open_runtime(dir, &retry)?.save_background_tasks_runtime(session, rows, &retry)
+}
+
 /// The stored form of `text`, or `None` with a warning when its row could not
 /// hold it, so the task's transcript is dropped rather than its whole save.
 /// Continuing the task then reads the session's copy of its history.
@@ -3559,9 +3704,9 @@ mod tests {
     use async_lock::Semaphore;
     use caudra_config::FeatureFlags;
     use caudra_providers::{
-        AgentError, CacheKey, ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions,
-        Role, StandingReminderKind, StopReason, StreamResponse, TaskEventOrigin, TokenUsage,
-        model::Model, provider::Provider,
+        AgentError, CacheKey, ContentBlock, HistoryItem, Message, ModelInfo, ProviderEvent,
+        RequestOptions, Role, StandingReminderKind, StopReason, StreamResponse, TaskEventOrigin,
+        TokenUsage, model::Model, provider::Provider,
     };
     use caudra_storage::{
         StateDir,
@@ -3585,7 +3730,7 @@ mod tests {
         RETRY_MISMATCH, RUNNING_STATE, SELECTED_HISTORY_MISSING, STALE_INVOCATION, StopCause,
         TASK_DURATION_FIELD, TASK_OUTPUT_LABEL, TASK_SETTLING, TRANSCRIPT_UNAVAILABLE, TRANSITION,
         TaskDelivery, TaskReporter, TaskStatus, Terminal, close_checkpoint_calls, deliverable,
-        ran_on,
+        forget_checkpoint, ran_on,
     };
     use super::{
         GUIDANCE_CANCELLING, GUIDANCE_SETTLED, GUIDANCE_UNAVAILABLE, RECOVERED_FIELD,
@@ -7162,6 +7307,93 @@ mod tests {
                 fixture.tasks.execute(&fixture.ctx, continuation(TASK), true).await,
                 Err(error) if error == TRANSCRIPT_UNAVAILABLE
             ));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    fn running_record(fixture: &Fixture, task_id: &str, invocation_id: &str) -> TaskRecord {
+        let mut record = projection_record();
+        record.generation = fixture.tasks.generation();
+        record.state = RUNNING_STATE.into();
+        record.task_id = task_id.into();
+        record.invocation_id = invocation_id.into();
+        record
+    }
+
+    fn transcript_of(text: &str) -> (Vec<Message>, Arc<Vec<HistoryItem>>) {
+        let messages = vec![Message::user(text.into())];
+        let items = Arc::clone(&History::new(messages.clone()).snapshot().messages);
+        (messages, items)
+    }
+
+    #[test]
+    fn a_record_save_writes_the_checkpoint_it_holds() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let record = running_record(&fixture, TASK, INVOCATION);
+            fixture.tasks.persist(record.clone()).await.unwrap();
+            let (messages, items) = transcript_of(PROMPT);
+            fixture.tasks.hold_checkpoint(INVOCATION, items);
+            assert_eq!(saved_transcript(&fixture, INVOCATION), Value::Null);
+
+            fixture.tasks.persist(record).await.unwrap();
+
+            assert_eq!(saved_transcript(&fixture, INVOCATION), wire(&messages));
+            assert!(fixture.tasks.lock().checkpoints.is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn held_checkpoints_wait_for_their_deadline_and_are_written_together() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let tasks = [
+                (TASK, INVOCATION, PROMPT),
+                (SECOND_TASK, NEXT_INVOCATION, REPORT),
+            ];
+            for (task_id, invocation_id, text) in tasks {
+                let record = running_record(&fixture, task_id, invocation_id);
+                fixture.tasks.persist(record).await.unwrap();
+                fixture
+                    .tasks
+                    .hold_checkpoint(invocation_id, transcript_of(text).1);
+            }
+
+            fixture.tasks.write_checkpoints(false).await;
+            for (_, invocation_id, _) in tasks {
+                assert_eq!(saved_transcript(&fixture, invocation_id), Value::Null);
+            }
+
+            fixture.tasks.write_checkpoints(true).await;
+            for (_, invocation_id, text) in tasks {
+                assert_eq!(
+                    saved_transcript(&fixture, invocation_id),
+                    wire(&transcript_of(text).0)
+                );
+            }
+            assert!(fixture.tasks.lock().checkpoints.is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_write_forgets_only_the_checkpoint_it_wrote() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let record = running_record(&fixture, TASK, INVOCATION);
+            fixture.tasks.persist(record).await.unwrap();
+            let written = transcript_of(PROMPT).1;
+            fixture
+                .tasks
+                .hold_checkpoint(INVOCATION, Arc::clone(&written));
+            fixture
+                .tasks
+                .hold_checkpoint(INVOCATION, transcript_of(REPORT).1);
+
+            forget_checkpoint(&mut fixture.tasks.lock(), INVOCATION, &written);
+
+            assert!(fixture.tasks.lock().checkpoints.contains_key(INVOCATION));
             fixture.tasks.shutdown().await.unwrap();
         });
     }

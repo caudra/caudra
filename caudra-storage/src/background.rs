@@ -716,6 +716,30 @@ impl SessionDatabase {
         self.save_background_task_inner(session, record, &TranscriptWrite::Keep, None)
     }
 
+    /// Saves every record in one transaction, so all of them commit or none
+    /// does.
+    pub fn save_background_tasks_runtime(
+        &self,
+        session: CaudraId,
+        saves: &[(&TaskRecord, &TranscriptWrite)],
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<(), SessionError> {
+        let saves = saves
+            .iter()
+            .map(|(record, transcript)| TaskSave::new(record, transcript))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.runtime_transaction(
+            retry,
+            RUNTIME_BACKGROUND_SAVE,
+            Some(session),
+            |transaction| {
+                saves
+                    .iter()
+                    .try_for_each(|save| save.write(transaction, session))
+            },
+        )
+    }
+
     fn save_background_task_inner(
         &self,
         session: CaudraId,
@@ -723,75 +747,15 @@ impl SessionDatabase {
         transcript: &TranscriptWrite,
         retry: Option<&RuntimeRetry<'_>>,
     ) -> Result<(), SessionError> {
-        let payload = serde_json::to_string(record).map_err(StorageError::from)?;
-        Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
-        let transcript = match transcript {
-            TranscriptWrite::Keep => None,
-            TranscriptWrite::Save(stored) => Some(Some((&stored.compressed, stored.len))),
-            TranscriptWrite::Remove => Some(None),
-        };
-        let last_sequence = sql_integer(
-            record
-                .events
-                .iter()
-                .map(|event| event.sequence)
-                .max()
-                .unwrap_or_default()
-                .max(record.sequence),
-        )?;
-        let write = |transaction: &Transaction<'_>| {
-            let count: i64 = transaction.query_row(
-                "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2",
-                params![session.as_bytes().as_slice(), record.invocation_id],
-                |row| row.get(0),
-            )?;
-            Self::validate_len(
-                "background resident invocations",
-                count as usize + 1,
-                MAX_INVOCATIONS,
-            )?;
-            let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
-            Self::validate_len(
-                "background resident bytes",
-                (bytes as usize).saturating_add(payload.len()),
-                MAX_SESSION_BYTES,
-            )?;
-            let changed = transaction.execute(
-                "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes, last_sequence) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes, last_sequence = excluded.last_sequence WHERE background_tasks.archived = 0",
-                params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64, last_sequence],
-            )?;
-            if changed != 1 {
-                return Err(SessionError::CorruptDatabaseValue {
-                    field: "background archive",
-                    reason: "archived invocations are read-only".into(),
-                });
-            }
-            match &transcript {
-                None => {}
-                Some(Some((stored, bytes))) => {
-                    transaction.execute(
-                        "INSERT INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, byte_count = excluded.byte_count",
-                        params![session.as_bytes().as_slice(), record.invocation_id, stored, *bytes as i64],
-                    )?;
-                }
-                Some(None) => {
-                    transaction.execute(
-                        "DELETE FROM background_transcripts WHERE session_id = ?1 AND invocation_id = ?2",
-                        params![session.as_bytes().as_slice(), record.invocation_id],
-                    )?;
-                }
-            }
-            Ok(())
-        };
         if let Some(retry) = retry {
-            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, Some(session), write)
-        } else {
-            let transaction =
-                Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
-            write(&transaction)?;
-            transaction.commit()?;
-            Ok(())
+            return self.save_background_tasks_runtime(session, &[(record, transcript)], retry);
         }
+        let save = TaskSave::new(record, transcript)?;
+        let transaction =
+            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+        save.write(&transaction, session)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn background_event_accepted(
@@ -838,6 +802,93 @@ impl SessionDatabase {
         }
         transaction.commit()?;
         Ok(accepted)
+    }
+}
+
+/// One record's save, encoded and checked before its transaction opens.
+struct TaskSave<'a> {
+    record: &'a TaskRecord,
+    payload: String,
+    /// `None` keeps the transcript; `Some(None)` removes it.
+    transcript: Option<Option<(&'a Vec<u8>, usize)>>,
+    last_sequence: i64,
+}
+
+impl<'a> TaskSave<'a> {
+    fn new(record: &'a TaskRecord, transcript: &'a TranscriptWrite) -> Result<Self, SessionError> {
+        let payload = serde_json::to_string(record).map_err(StorageError::from)?;
+        SessionDatabase::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
+        let transcript = match transcript {
+            TranscriptWrite::Keep => None,
+            TranscriptWrite::Save(stored) => Some(Some((&stored.compressed, stored.len))),
+            TranscriptWrite::Remove => Some(None),
+        };
+        let last_sequence = sql_integer(
+            record
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or_default()
+                .max(record.sequence),
+        )?;
+        Ok(Self {
+            record,
+            payload,
+            transcript,
+            last_sequence,
+        })
+    }
+
+    fn write(&self, transaction: &Transaction<'_>, session: CaudraId) -> Result<(), SessionError> {
+        let Self {
+            record,
+            payload,
+            transcript,
+            last_sequence,
+        } = self;
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2",
+            params![session.as_bytes().as_slice(), record.invocation_id],
+            |row| row.get(0),
+        )?;
+        SessionDatabase::validate_len(
+            "background resident invocations",
+            count as usize + 1,
+            MAX_INVOCATIONS,
+        )?;
+        let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
+        SessionDatabase::validate_len(
+            "background resident bytes",
+            (bytes as usize).saturating_add(payload.len()),
+            MAX_SESSION_BYTES,
+        )?;
+        let changed = transaction.execute(
+            "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes, last_sequence) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes, last_sequence = excluded.last_sequence WHERE background_tasks.archived = 0",
+            params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64, last_sequence],
+        )?;
+        if changed != 1 {
+            return Err(SessionError::CorruptDatabaseValue {
+                field: "background archive",
+                reason: "archived invocations are read-only".into(),
+            });
+        }
+        match transcript {
+            None => {}
+            Some(Some((stored, bytes))) => {
+                transaction.execute(
+                    "INSERT INTO background_transcripts(session_id, invocation_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, byte_count = excluded.byte_count",
+                    params![session.as_bytes().as_slice(), record.invocation_id, stored, *bytes as i64],
+                )?;
+            }
+            Some(None) => {
+                transaction.execute(
+                    "DELETE FROM background_transcripts WHERE session_id = ?1 AND invocation_id = ?2",
+                    params![session.as_bytes().as_slice(), record.invocation_id],
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -7503,7 +7503,10 @@ fn tool_bucket_from_row(row: &rusqlite::Row<'_>) -> Result<ToolBucket, SessionEr
 /// counters on conflict but cannot add two histograms, so the existing one is
 /// read and merged here, and the caller supplies the transaction that makes the
 /// pair atomic.
-fn merge_tool_bucket(connection: &Connection, entry: &ToolLedgerEntry) -> Result<(), SessionError> {
+pub(crate) fn merge_tool_bucket(
+    connection: &Connection,
+    entry: &ToolLedgerEntry,
+) -> Result<(), SessionError> {
     let outcome = entry.outcome.storage_name();
     let stored: Option<Vec<u8>> = connection
         .query_row(

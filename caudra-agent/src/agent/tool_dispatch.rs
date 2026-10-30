@@ -2284,6 +2284,7 @@ mod tests {
     };
     use caudra_providers::{ContentBlock, INVALID_TOOL_JSON_KEY, InvalidToolInput, Message, Role};
     use caudra_storage::StateDir;
+    use caudra_storage::deferred;
     use caudra_storage::id::SessionRef;
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::shell_history::ShellExecutionState;
@@ -2697,6 +2698,7 @@ mod tests {
         }
 
         fn recorded_runs(&self) -> Vec<ShellRun> {
+            deferred::flush(&self.dir).unwrap();
             ShellRuns::open(&self.dir)
                 .unwrap()
                 .newest(SEEDED_RUNS + 1)

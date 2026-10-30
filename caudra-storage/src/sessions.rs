@@ -50,7 +50,7 @@ mod types;
 pub use crate::media::StoredImage;
 pub(crate) use database::{
     AFTER_SEPARATOR, MAX_SQLITE_VALUE_BYTES, WriteTiming, compress_payload, decompress_payload,
-    deserialize_json, from_i64, from_i64_usize, id_from_row, to_i64,
+    deserialize_json, from_i64, from_i64_usize, id_from_row, merge_tool_bucket, to_i64,
 };
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,

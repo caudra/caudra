@@ -23,6 +23,7 @@ use caudra_storage::autopilot::{
     DecisionOutcome, StoredAutopilotDecision, StoredAutopilotEngagement,
 };
 use caudra_storage::cache_warming::{CacheWarmEpisode, CacheWarmLedger, HitSamples};
+use caudra_storage::deferred::{self, DeferredRow};
 use caudra_storage::engine_decisions::StoredEngineDecision;
 use caudra_storage::goal_log::GoalLogWrite;
 use caudra_storage::id::CaudraId;
@@ -37,8 +38,8 @@ use caudra_storage::sessions::{
     WAL_RETENTION_LIMIT_BYTES, eager_load_limit,
 };
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
-use caudra_storage::token_calibration::{StoredCalibration, TokenCalibrationStore};
-use caudra_storage::tool_ledger::{ToolCall, ToolLedger};
+use caudra_storage::token_calibration::StoredCalibration;
+use caudra_storage::tool_ledger::ToolCall;
 use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
 use caudra_storage::{StateClass, StateDir, StorageError, now_epoch};
 use tracing::warn;
@@ -68,7 +69,6 @@ const DECISION_ROW: &str = "decision";
 const ACCOUNT_SWITCH_ROW: &str = "account switch";
 const WRITER_DRAIN_FAILED: &str = "storage writer stopped with unsaved session operations";
 const USAGE_DRAIN_FAILED: &str = "storage writer stopped with unsaved usage contributions";
-const TOOL_DRAIN_FAILED: &str = "storage writer stopped with unsaved tool activity";
 const PERMISSION_QUEUE_CAPACITY: usize = 16;
 const PERMISSION_QUEUE_FULL: &str = "permission mutation queue is full; nothing was enqueued";
 const AUTOPILOT_LOG: &str = "autopilot";
@@ -82,15 +82,10 @@ type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
 /// Turns accumulate rather than coalescing: the ledger sums spend, so a
 /// dropped turn is money the lifetime total never learns about.
 type PendingUsage = Arc<Mutex<Vec<QueuedUsage>>>;
-/// The same, for the ledger that sums what tools did.
-type PendingToolCalls = Arc<Mutex<Vec<QueuedToolCall>>>;
 /// Written after the snapshots queued with them, so the session row a
 /// row references is on disk first.
 type PendingRows<R> = Arc<Mutex<Vec<QueuedRow<R>>>>;
 type PendingWarming = Arc<Mutex<Vec<WarmingWrite>>>;
-/// Each row is a model's whole learned state, so only the newest per model
-/// needs writing.
-type PendingCalibrations = Arc<Mutex<HashMap<(String, String), StoredCalibration>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -195,12 +190,6 @@ struct QueuedUsage {
     enqueued_at: u64,
 }
 
-#[cfg_attr(test, derive(Debug, Clone, PartialEq))]
-struct QueuedToolCall {
-    call: ToolCall,
-    enqueued_at: u64,
-}
-
 #[derive(Clone)]
 struct QueuedRow<R> {
     session_id: CaudraId,
@@ -230,13 +219,13 @@ pub struct StorageWriter {
     wake: Arc<flume::Sender<()>>,
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
-    tool_calls: PendingToolCalls,
     autopilot_writes: PendingRows<AutopilotWrite>,
     goal_writes: PendingRows<GoalLogWrite>,
     engine_decisions: PendingRows<StoredEngineDecision>,
     account_switches: PendingRows<StoredAccountSwitch>,
     warming: PendingWarming,
-    calibrations: PendingCalibrations,
+    /// Where tool activity and calibrations are held for their deferred write.
+    dir: StateDir,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
@@ -255,8 +244,6 @@ impl StorageWriter {
         let writer_workspace_tabs = Arc::clone(&workspace_tabs);
         let usage: PendingUsage = Arc::default();
         let writer_usage = Arc::clone(&usage);
-        let tool_calls: PendingToolCalls = Arc::default();
-        let writer_tool_calls = Arc::clone(&tool_calls);
         let autopilot_writes: PendingRows<AutopilotWrite> = Arc::default();
         let writer_autopilot_writes = Arc::clone(&autopilot_writes);
         let goal_writes: PendingRows<GoalLogWrite> = Arc::default();
@@ -267,8 +254,6 @@ impl StorageWriter {
         let writer_account_switches = Arc::clone(&account_switches);
         let warming: PendingWarming = Arc::default();
         let writer_warming = Arc::clone(&warming);
-        let calibrations: PendingCalibrations = Arc::default();
-        let writer_calibrations = Arc::clone(&calibrations);
         let (wake, wake_rx) = flume::bounded::<()>(1);
         let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
@@ -277,15 +262,15 @@ impl StorageWriter {
         let (permission_mutations, permission_mutations_rx) =
             flume::bounded(PERMISSION_QUEUE_CAPACITY);
 
+        let writer_dir = dir.clone();
         let thread = std::thread::Builder::new()
             .name("storage-writer".into())
             .spawn(move || {
                 let mut writer = Writer {
-                    dir,
+                    dir: writer_dir,
                     warn_tx,
                     database: None,
                     ledger: None,
-                    tool_ledger: None,
                     cursors: HashMap::new(),
                     seeded_cursors: writer_seeded_cursors,
                     autopilot_writes: writer_autopilot_writes,
@@ -294,8 +279,6 @@ impl StorageWriter {
                     account_switches: writer_account_switches,
                     warming: writer_warming,
                     warm_ledger: None,
-                    calibrations: writer_calibrations,
-                    calibration_store: None,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -308,19 +291,9 @@ impl StorageWriter {
                     permission_mutations: permission_mutations_rx,
                 };
                 while wake_rx.recv().is_ok() {
-                    writer.drain(
-                        &writer_pending,
-                        &writer_workspace_tabs,
-                        &writer_usage,
-                        &writer_tool_calls,
-                    );
+                    writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
                 }
-                let result = writer.finish(
-                    &writer_pending,
-                    &writer_workspace_tabs,
-                    &writer_usage,
-                    &writer_tool_calls,
-                );
+                let result = writer.finish(&writer_pending, &writer_workspace_tabs, &writer_usage);
                 drop(writer);
                 let _ = done_tx.send(result);
             })
@@ -332,13 +305,12 @@ impl StorageWriter {
             wake,
             workspace_tabs,
             usage,
-            tool_calls,
             autopilot_writes,
             goal_writes,
             engine_decisions,
             account_switches,
             warming,
-            calibrations,
+            dir,
             done_rx,
             thread,
             generation,
@@ -385,23 +357,16 @@ impl StorageWriter {
         }
     }
 
-    /// Records what one finished tool call did. Never coalesced, for the reason
-    /// [`Self::record_usage`] is not: the ledger sums, so two calls in one hour
-    /// must both reach the total.
+    /// Records what one finished tool call did. Held for a deferred write: a
+    /// crash may lose the last second of activity, never count a call twice.
     pub fn record_tool_call(&self, call: ToolCall) {
-        self.tool_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(QueuedToolCall {
+        deferred::hold(
+            &self.dir,
+            DeferredRow::ToolCall {
                 call,
-                enqueued_at: now_epoch(),
-            });
-        match self.wake.try_send(()) {
-            Ok(()) | Err(flume::TrySendError::Full(())) => {}
-            Err(flume::TrySendError::Disconnected(())) => {
-                warn!("storage writer unavailable; tool activity may not be recorded");
-            }
-        }
+                at: now_epoch(),
+            },
+        );
     }
 
     /// Changes the autopilot log of `session_id`, whose row must already exist
@@ -479,16 +444,7 @@ impl StorageWriter {
     }
 
     pub fn record_calibration(&self, calibration: StoredCalibration) {
-        self.calibrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                (calibration.provider.clone(), calibration.model.clone()),
-                calibration,
-            );
-        if let Err(flume::TrySendError::Disconnected(())) = self.wake.try_send(()) {
-            warn!("storage writer unavailable; a token calibration may not be kept");
-        }
+        deferred::hold(&self.dir, DeferredRow::Calibration(calibration));
     }
 
     fn queue_row<T>(&self, rows: &PendingRows<T>, session_id: CaudraId, row: T, kind: &str) {
@@ -716,7 +672,6 @@ struct Writer {
     warn_tx: flume::Sender<String>,
     database: Option<SessionDatabase>,
     ledger: Option<UsageLedger>,
-    tool_ledger: Option<ToolLedger>,
     cursors: HashMap<CaudraId, SessionCursor>,
     seeded_cursors: SeededCursors,
     autopilot_writes: PendingRows<AutopilotWrite>,
@@ -725,8 +680,6 @@ struct Writer {
     account_switches: PendingRows<StoredAccountSwitch>,
     warming: PendingWarming,
     warm_ledger: Option<CacheWarmLedger>,
-    calibrations: PendingCalibrations,
-    calibration_store: Option<TokenCalibrationStore>,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -878,40 +831,6 @@ impl Writer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(turns);
-        }
-    }
-
-    fn flush_tool_calls(&mut self, pending: &PendingToolCalls) {
-        let mut calls = mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
-        if calls.is_empty() {
-            return;
-        }
-        let ledger = match &self.tool_ledger {
-            Some(ledger) => ledger,
-            None => match ToolLedger::open(&self.dir) {
-                Ok(ledger) => self.tool_ledger.insert(ledger),
-                Err(error) => {
-                    warn!(%error, calls = calls.len(), "tool ledger unavailable; activity retained for retry");
-                    pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend(calls);
-                    return;
-                }
-            },
-        };
-        calls.retain(|queued| match ledger.record_at(&queued.call, queued.enqueued_at) {
-            Ok(()) => false,
-            Err(error) => {
-                warn!(%error, tool = queued.call.tool, "tool ledger write failed; activity retained for retry");
-                true
-            }
-        });
-        if !calls.is_empty() {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(calls);
         }
     }
 
@@ -1067,30 +986,6 @@ impl Writer {
         }
     }
 
-    /// Dropped with a warning on failure: a lost row only means the next run
-    /// learns that model again.
-    fn write_calibrations(&mut self) {
-        let rows = mem::take(&mut *self.calibrations.lock().unwrap_or_else(|e| e.into_inner()));
-        if rows.is_empty() {
-            return;
-        }
-        let store = match &self.calibration_store {
-            Some(store) => store,
-            None => match TokenCalibrationStore::open(&self.dir) {
-                Ok(store) => self.calibration_store.insert(store),
-                Err(error) => {
-                    warn!(%error, rows = rows.len(), "token calibration store unavailable");
-                    return;
-                }
-            },
-        };
-        for row in rows.into_values() {
-            if let Err(error) = store.upsert(&row) {
-                warn!(%error, provider = %row.provider, model = %row.model, "token calibration write failed");
-            }
-        }
-    }
-
     /// One pass over everything queued. The tabs request is claimed before the
     /// snapshots are written, because `write_workspace_tabs` keeps only the ids
     /// the database still holds and the slot is emptied by the claim. Reading
@@ -1102,13 +997,7 @@ impl Writer {
     /// Autopilot's and the goal log's changes leave their queues only once
     /// written, for [`StorageWriter::unwritten_autopilot`] and
     /// [`StorageWriter::unwritten_goal_log`].
-    fn drain(
-        &mut self,
-        pending: &Pending,
-        tabs: &PendingWorkspaceTabs,
-        usage: &PendingUsage,
-        tool_calls: &PendingToolCalls,
-    ) {
+    fn drain(&mut self, pending: &Pending, tabs: &PendingWorkspaceTabs, usage: &PendingUsage) {
         let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
         let autopilot_writes = snapshot(&self.autopilot_writes);
         let goal_writes = snapshot(&self.goal_writes);
@@ -1126,9 +1015,7 @@ impl Writer {
             self.flush_workspace_tabs(request);
         }
         self.flush_usage(usage);
-        self.flush_tool_calls(tool_calls);
         self.write_warming();
-        self.write_calibrations();
     }
 
     fn finish(
@@ -1136,9 +1023,9 @@ impl Writer {
         pending: &Pending,
         tabs: &PendingWorkspaceTabs,
         usage: &PendingUsage,
-        tool_calls: &PendingToolCalls,
     ) -> Result<(), SessionError> {
-        self.drain(pending, tabs, usage, tool_calls);
+        self.drain(pending, tabs, usage);
+        let held = deferred::flush(&self.dir);
         let checkpoint = self
             .database
             .as_ref()
@@ -1152,17 +1039,10 @@ impl Writer {
         if !usage.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             return Err(StorageError::Io(io::Error::other(USAGE_DRAIN_FAILED)).into());
         }
-        if !tool_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-        {
-            return Err(StorageError::Io(io::Error::other(TOOL_DRAIN_FAILED)).into());
-        }
         if let Some((_, error)) = self.workspace_tabs_errors.drain().next() {
             return Err(error);
         }
-        checkpoint
+        held.and(checkpoint)
     }
 
     fn flush_workspace_tabs(&mut self, request: WorkspaceTabsRequest) {
@@ -1730,7 +1610,7 @@ mod tests {
                 deleted.send(result).unwrap();
             })),
         );
-        writer.drain(&pending, &Arc::default(), &Arc::default(), &Arc::default());
+        writer.drain(&pending, &Arc::default(), &Arc::default());
         deletion.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
         assert!(matches!(
             acknowledgment.recv_timeout(DRAIN_TIMEOUT).unwrap(),
@@ -1750,7 +1630,7 @@ mod tests {
                 .is_none()
         );
         writer
-            .finish(&pending, &Arc::default(), &Arc::default(), &Arc::default())
+            .finish(&pending, &Arc::default(), &Arc::default())
             .unwrap();
     }
 
@@ -1866,7 +1746,6 @@ mod tests {
             warn_tx,
             database: None,
             ledger: None,
-            tool_ledger: None,
             cursors: HashMap::new(),
             seeded_cursors: Arc::default(),
             autopilot_writes: Arc::default(),
@@ -1875,8 +1754,6 @@ mod tests {
             account_switches: Arc::default(),
             warming: Arc::default(),
             warm_ledger: None,
-            calibrations: Arc::default(),
-            calibration_store: None,
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),
@@ -2120,12 +1997,7 @@ mod tests {
             tabs: WorkspaceTabs::default(),
         });
 
-        let result = writer.finish(
-            &Arc::default(),
-            &Arc::default(),
-            &Arc::default(),
-            &Arc::default(),
-        );
+        let result = writer.finish(&Arc::default(), &Arc::default(), &Arc::default());
 
         assert_eq!(result.is_err(), other_workspace);
     }
@@ -2605,11 +2477,11 @@ mod tests {
         let turns = vec![queued_spend(Some(1.0), 0), queued_spend(Some(2.0), 0)];
         let usage: PendingUsage = Arc::new(Mutex::new(turns.clone()));
 
-        writer.drain(&Arc::default(), &Arc::default(), &usage, &Arc::default());
+        writer.drain(&Arc::default(), &Arc::default(), &usage);
         assert_eq!(*usage.lock().unwrap(), turns);
         assert!(writer.ledger.is_none());
         let error = writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap_err();
         assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
         assert_eq!(*usage.lock().unwrap(), turns);
@@ -2617,11 +2489,11 @@ mod tests {
         fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
         usage.lock().unwrap().push(queued_spend(None, 0));
         if !final_drain {
-            writer.drain(&Arc::default(), &Arc::default(), &usage, &Arc::default());
+            writer.drain(&Arc::default(), &Arc::default(), &usage);
             assert!(usage.lock().unwrap().is_empty());
         }
         writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap();
         assert!(usage.lock().unwrap().is_empty());
         let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
@@ -2648,7 +2520,7 @@ mod tests {
         assert_eq!(usage.lock().unwrap().len(), 1);
         assert!(usage.lock().unwrap()[0].turn.cost.unwrap().is_nan());
         let error = writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap_err();
         assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
         let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
@@ -2659,7 +2531,7 @@ mod tests {
         usage.lock().unwrap()[0].turn.cost = Some(3.0);
         writer.flush_usage(&usage);
         writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap();
 
         assert!(usage.lock().unwrap().is_empty());
@@ -2697,7 +2569,7 @@ mod tests {
         assert_eq!(usage.lock().unwrap().len(), 1);
         assert_eq!(usage.lock().unwrap()[0].enqueued_at, enqueued_at);
         let error = writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap_err();
         assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
         assert_eq!(usage.lock().unwrap()[0].enqueued_at, enqueued_at);
@@ -2713,7 +2585,7 @@ mod tests {
             .push(queued_spend(Some(2.0), boundary));
         writer.flush_usage(&usage);
         writer
-            .finish(&Arc::default(), &Arc::default(), &usage, &Arc::default())
+            .finish(&Arc::default(), &Arc::default(), &usage)
             .unwrap();
 
         assert!(usage.lock().unwrap().is_empty());
