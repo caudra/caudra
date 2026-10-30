@@ -4039,7 +4039,7 @@ impl App {
         // so the navigation keys go back with it.
         self.key_focus = KeyFocus::Composer;
 
-        if key::THINKING.matches(key) || is_shift_tab(key) {
+        if key::THINKING.matches(key) || (is_shift_tab(key) && !self.command_palette.is_cycling()) {
             self.cycle_reasoning_effort();
             return vec![];
         }

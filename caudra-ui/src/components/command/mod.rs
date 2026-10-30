@@ -12,7 +12,7 @@ use caudra_agent::{McpPromptInfo, McpSnapshotReader};
 use caudra_config::FeatureFlags;
 use caudra_grab::grab_scope;
 use caudra_lua::{CompletionRequest, EventHandle, LuaCommandInfo, LuaCommandReader, LuaCompletion};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -156,6 +156,29 @@ impl Completion {
         let start = char_to_byte(input, self.range.start);
         let end = char_to_byte(input, self.range.end);
         format!("{}{}{}", &input[..start], self.text, &input[end..])
+    }
+}
+
+/// Tab stepping through the rows, as fish does: each Tab puts the next row
+/// in the line, Enter keeps it, and Esc puts back what was typed. The rows
+/// hold still while the line is the one the last step left.
+struct Cycle {
+    /// The row in the line, as an edit of the text the cycle started from.
+    shown: Completion,
+    /// The line showing it left, and the caret in it in chars.
+    line: String,
+    caret: usize,
+}
+
+impl Cycle {
+    /// `text` over the row in the line, the caret `caret` chars past its start.
+    fn over_shown(&self, text: String, caret: usize) -> Completion {
+        let start = self.shown.range.start;
+        Completion {
+            range: start..start + self.shown.text.chars().count(),
+            text,
+            caret,
+        }
     }
 }
 
@@ -359,6 +382,7 @@ pub struct CommandPalette {
     /// whose directories this machine cannot list.
     working_directory: Option<PathBuf>,
     home: Option<PathBuf>,
+    cycle: Option<Cycle>,
 }
 
 impl CommandPalette {
@@ -407,6 +431,7 @@ impl CommandPalette {
             asking: AsyncAsk::default(),
             working_directory: None,
             home: caudra_storage::paths::home(),
+            cycle: None,
         }
     }
 
@@ -546,25 +571,124 @@ impl CommandPalette {
             return CommandAction::Passthrough;
         }
         let rows = self.row_count();
+        let backwards = key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Up if rows > 0 => {
                 self.move_up();
-                CommandAction::Consumed
+                self.follow_selection()
             }
             KeyCode::Down if rows > 0 => {
                 self.move_down();
-                CommandAction::Consumed
+                self.follow_selection()
             }
-            KeyCode::Esc => {
-                self.close();
-                CommandAction::Consumed
+            KeyCode::Esc => match self.cycle.take() {
+                Some(cycle) => CommandAction::Complete(self.as_before(&cycle)),
+                None => {
+                    self.close();
+                    CommandAction::Consumed
+                }
+            },
+            KeyCode::Enter => match self.cycle.take() {
+                Some(cycle) => CommandAction::Complete(
+                    cycle.over_shown(cycle.shown.text.clone(), cycle.shown.caret),
+                ),
+                None => self.activate(),
+            },
+            KeyCode::Tab | KeyCode::BackTab if backwards && self.cycle.is_some() => {
+                self.move_up();
+                self.show_selected()
             }
-            KeyCode::Enter => self.activate(),
-            KeyCode::Tab => self
-                .completion()
-                .map_or(CommandAction::Consumed, CommandAction::Complete),
+            KeyCode::Tab if !backwards => self.tab(),
             _ => CommandAction::Passthrough,
         }
+    }
+
+    /// Whether Tab is stepping through the rows, so Shift+Tab steps back.
+    pub fn is_cycling(&self) -> bool {
+        self.cycle.is_some()
+    }
+
+    /// Tab, as fish takes it: one row is taken at once. Rows that all start
+    /// with more than was typed have that much filled in, unless another row
+    /// than the first was picked. Otherwise each Tab shows the next row in
+    /// the line.
+    fn tab(&mut self) -> CommandAction {
+        if self.cycle.is_some() {
+            self.move_down();
+            return self.show_selected();
+        }
+        if self.row_count() < 2 {
+            return self
+                .completion()
+                .map_or(CommandAction::Consumed, CommandAction::Complete);
+        }
+        match self.shared_prefix().filter(|_| self.selected == 0) {
+            Some(prefix) => CommandAction::Complete(prefix),
+            None => self.show_selected(),
+        }
+    }
+
+    /// While Tab cycles, the line shows the row the arrows move to.
+    fn follow_selection(&mut self) -> CommandAction {
+        match self.cycle {
+            Some(_) => self.show_selected(),
+            None => CommandAction::Consumed,
+        }
+    }
+
+    /// The selected row in the line, in place of the row shown before it.
+    fn show_selected(&mut self) -> CommandAction {
+        let Some(row) = self.completion() else {
+            return CommandAction::Consumed;
+        };
+        let edit = match &self.cycle {
+            Some(cycle) => cycle.over_shown(row.text.clone(), row.caret),
+            None => row.clone(),
+        };
+        self.cycle = Some(Cycle {
+            line: row.applied_to(&self.input),
+            caret: row.range.start + row.caret,
+            shown: row,
+        });
+        CommandAction::Complete(edit)
+    }
+
+    /// What was typed before `cycle` began, back over the row it shows.
+    fn as_before(&self, cycle: &Cycle) -> Completion {
+        let range = &cycle.shown.range;
+        let typed = &self.input
+            [char_to_byte(&self.input, range.start)..char_to_byte(&self.input, range.end)];
+        let caret = self.input[..self.caret].chars().count();
+        cycle.over_shown(typed.to_owned(), caret.saturating_sub(range.start))
+    }
+
+    /// What every row starts with, over the word typed, when that is more
+    /// than the word.
+    fn shared_prefix(&self) -> Option<Completion> {
+        let (range, values): (Range<usize>, Vec<String>) = match &self.arguments {
+            Some(arguments) => (
+                arguments.token.clone(),
+                arguments
+                    .suggestions
+                    .iter()
+                    .map(|suggestion| suggestion.value.clone())
+                    .collect(),
+            ),
+            None => (
+                0..self.token_end,
+                self.filtered
+                    .iter()
+                    .map(|row| self.item_name(row))
+                    .collect(),
+            ),
+        };
+        let (first, rest) = values.split_first()?;
+        let shared = rest
+            .iter()
+            .fold(first.as_str(), |shared, value| common_prefix(shared, value));
+        rest_of(shared, &self.input[range.clone()])?;
+        Some(self.splice(range, shared, false))
     }
 
     /// What Tab takes: the selected suggestion over the word under the caret.
@@ -663,6 +787,11 @@ impl CommandPalette {
     /// A click runs a command row, as Enter does, and takes a suggestion, as
     /// Tab does.
     fn click(&mut self) -> CommandAction {
+        if self.cycle.is_some() {
+            let shown = self.show_selected();
+            self.cycle = None;
+            return shown;
+        }
         match self.arguments {
             Some(_) => self
                 .completion()
@@ -749,7 +878,11 @@ impl CommandPalette {
     /// suggestion when the word typed is its start, or the name of an empty
     /// slot. Only offered while the caret ends the line.
     pub fn ghost(&self) -> Option<String> {
-        if !self.is_active() || self.caret != self.input.len() || self.input.contains('\n') {
+        if !self.is_active()
+            || self.cycle.is_some()
+            || self.caret != self.input.len()
+            || self.input.contains('\n')
+        {
             return None;
         }
         match &self.arguments {
@@ -984,8 +1117,17 @@ impl CommandPalette {
     /// caret, so a command typed in front of a written prompt matches on what
     /// was typed, not on the prompt it touches. Once the word names a command
     /// and the caret is past it, it follows the slot under the caret, and
-    /// returns the source the app is asked to [`Self::provide`] for it.
+    /// returns the source the app is asked to [`Self::provide`] for it. The
+    /// line a Tab cycle left keeps the rows it cycles through.
     pub fn sync(&mut self, input: &str, caret: usize, task_focused: bool) -> Option<Source> {
+        if self
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.line == input && cycle.caret == caret)
+        {
+            return None;
+        }
+        self.cycle = None;
         self.invalidate_mouse_geometry();
         self.refresh_sources();
         self.task_focused = task_focused;
@@ -1237,6 +1379,7 @@ impl CommandPalette {
     }
 
     pub fn close(&mut self) {
+        self.cycle = None;
         self.filtered.clear();
         self.current_arg_count = 0;
         self.scroll_offset = 0;
@@ -1689,6 +1832,17 @@ fn rest_of(value: &str, typed: &str) -> Option<String> {
     let head = value.get(..typed.len())?;
     (head.eq_ignore_ascii_case(typed) && value.len() > typed.len())
         .then(|| value[typed.len()..].to_owned())
+}
+
+/// The longest start `left` and `right` share.
+fn common_prefix<'a>(left: &'a str, right: &str) -> &'a str {
+    let end = left
+        .char_indices()
+        .zip(right.chars())
+        .take_while(|((_, left), right)| left == right)
+        .last()
+        .map_or(0, |((index, char), _)| index + char.len_utf8());
+    &left[..end]
 }
 
 /// An argument hint such as `<file>` as a slot name. One with several parts
@@ -2883,5 +3037,111 @@ mod tests {
     fn a_server_without_completions_is_never_asked() {
         let palette = synced_with_prompts("/myserver:code-review ma");
         assert!(palette.asking.pending().is_none());
+    }
+
+    const CYCLE_LOST: &str = "Tab must step through the rows it started from";
+    const CYCLE_TYPED: &str = "/s";
+
+    fn press(palette: &mut CommandPalette, key: KeyEvent) -> Completion {
+        match palette.handle_key(key) {
+            CommandAction::Complete(completion) => completion,
+            _ => panic!("{CYCLE_LOST}"),
+        }
+    }
+
+    /// `completion` made in `line`, and the palette synced with the result,
+    /// as the composer does after every edit.
+    fn follow(
+        palette: &mut CommandPalette,
+        line: &str,
+        completion: &Completion,
+    ) -> (String, usize) {
+        let caret = completion.range.start + completion.caret;
+        let line = completion.applied_to(line);
+        palette.sync(&line, caret, false);
+        (line, caret)
+    }
+
+    fn row_names(palette: &CommandPalette) -> Vec<String> {
+        palette
+            .filtered
+            .iter()
+            .map(|row| palette.item_name(row))
+            .collect()
+    }
+
+    #[test]
+    fn tab_steps_through_the_rows_and_enter_keeps_one() {
+        let mut palette = synced(CYCLE_TYPED);
+        let names = row_names(&palette);
+        let mut line = CYCLE_TYPED.to_owned();
+        for name in &names[..3] {
+            let completion = press(&mut palette, KeyEvent::from(KeyCode::Tab));
+            (line, _) = follow(&mut palette, &line, &completion);
+            assert_eq!(line.trim_end(), name, "{CYCLE_LOST}");
+        }
+        let kept = press(&mut palette, KeyEvent::from(KeyCode::Enter));
+        (line, _) = follow(&mut palette, &line, &kept);
+        assert_eq!(
+            (line.trim_end(), palette.is_cycling()),
+            (names[2].as_str(), false)
+        );
+    }
+
+    #[test_case(KeyEvent::from(KeyCode::BackTab) ; "back_tab")]
+    #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT) ; "shifted_tab")]
+    #[test_case(KeyEvent::from(KeyCode::Up) ; "up")]
+    fn stepping_back_shows_the_row_before(back: KeyEvent) {
+        let mut palette = synced(CYCLE_TYPED);
+        let names = row_names(&palette);
+        let mut line = CYCLE_TYPED.to_owned();
+        for key in [
+            KeyEvent::from(KeyCode::Tab),
+            KeyEvent::from(KeyCode::Tab),
+            back,
+        ] {
+            let completion = press(&mut palette, key);
+            (line, _) = follow(&mut palette, &line, &completion);
+        }
+        assert_eq!(line.trim_end(), names[0], "{CYCLE_LOST}");
+    }
+
+    #[test]
+    fn escape_puts_back_what_was_typed() {
+        let mut palette = synced(CYCLE_TYPED);
+        let mut shown = (CYCLE_TYPED.to_owned(), 0);
+        for key in [KeyCode::Tab, KeyCode::Tab, KeyCode::Esc] {
+            let completion = press(&mut palette, KeyEvent::from(key));
+            shown = follow(&mut palette, &shown.0, &completion);
+        }
+        assert_eq!(shown, (CYCLE_TYPED.to_owned(), CYCLE_TYPED.len()));
+        assert!(!palette.is_cycling());
+    }
+
+    #[test]
+    fn typing_on_ends_the_cycle() {
+        let mut palette = synced(CYCLE_TYPED);
+        let completion = press(&mut palette, KeyEvent::from(KeyCode::Tab));
+        let (line, caret) = follow(&mut palette, CYCLE_TYPED, &completion);
+        palette.sync(&format!("{line}x"), caret + 1, false);
+        assert!(!palette.is_cycling());
+    }
+
+    #[test]
+    fn tab_fills_in_what_every_suggestion_starts_with() {
+        let mut palette = completing_palette();
+        let input = "/stub:review ma";
+        palette.sync_typed(input, false);
+        answered(&mut palette);
+        let shared = SUGGESTED[0];
+        assert_eq!(
+            press(&mut palette, KeyEvent::from(KeyCode::Tab)),
+            Completion {
+                range: "/stub:review ".len()..input.len(),
+                caret: shared.len(),
+                text: shared.to_owned(),
+            }
+        );
+        assert!(!palette.is_cycling());
     }
 }

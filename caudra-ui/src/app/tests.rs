@@ -5332,6 +5332,31 @@ fn tab_in_palette_completes_command() {
 }
 
 #[test]
+fn palette_tab_cycles_until_enter_keeps_the_row() {
+    let mut app = test_app();
+    type_slash(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('s'))));
+    let thinking = app.state.thinking.clone();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    let first = app.input_box.buffer.value();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_ne!(app.input_box.buffer.value(), first);
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    assert_eq!(
+        (app.input_box.buffer.value(), &app.state.thinking),
+        (first.clone(), &thinking)
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), first);
+    assert!(!app.command_palette.is_cycling());
+}
+
+#[test]
 fn chat_navigation_actions() {
     let mut app = test_app();
     app.status = Status::Streaming;

@@ -5,7 +5,7 @@
 
 use caudra_grab::grab_scope;
 use caudra_workbench::buffer::Cursor;
-use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
+use caudra_workbench::text_field::{EditCommand, FieldKind, TextCommand, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -127,8 +127,10 @@ impl CommandModal {
             }
             Stage::Args { input, row, .. } => match key_event.code {
                 KeyCode::Enter => Self::enter(key_event, input, row, palette),
-                KeyCode::Esc => StageAction::Back,
-                KeyCode::Tab | KeyCode::Up | KeyCode::Down if palette.is_active() => {
+                KeyCode::Esc if !palette.is_cycling() => StageAction::Back,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down | KeyCode::Esc
+                    if palette.is_active() =>
+                {
                     if let CommandAction::Complete(completion) = palette.handle_key(key_event) {
                         take(input, row, &completion);
                     }
@@ -147,10 +149,11 @@ impl CommandModal {
 
     /// Enter as the composer's palette takes it, on the line the prompt
     /// stands for: a word a closed slot does not list runs the highlighted
-    /// suggestion, and nothing it could mean keeps the prompt open.
+    /// suggestion, nothing it could mean keeps the prompt open, and a row Tab
+    /// is cycling through is kept.
     fn enter(
         key_event: KeyEvent,
-        input: &TextField,
+        input: &mut TextField,
         row: &CommandRow,
         palette: &mut CommandPalette,
     ) -> StageAction {
@@ -161,9 +164,11 @@ impl CommandModal {
             }
             CommandAction::Usage(usage) => StageAction::Usage(usage),
             CommandAction::Consumed => StageAction::None,
-            CommandAction::Complete(_) | CommandAction::Passthrough => {
-                StageAction::Run(palette.parse(&line))
+            CommandAction::Complete(completion) => {
+                take(input, row, &completion);
+                StageAction::None
             }
+            CommandAction::Passthrough => StageAction::Run(palette.parse(&line)),
         }
     }
 
@@ -436,7 +441,10 @@ fn take(input: &mut TextField, row: &CommandRow, completion: &Completion) {
     let end = completion.range.end.saturating_sub(prefix);
     input.set_cursor(Cursor::new(0, start), false);
     input.set_cursor(Cursor::new(0, end), true);
-    input.insert_text(&completion.text);
+    match completion.text.is_empty() && start < end {
+        true => input.perform(TextCommand::Edit(EditCommand::Delete), 1),
+        false => input.insert_text(&completion.text),
+    };
     input.set_cursor_offset(start + completion.caret);
 }
 
@@ -845,6 +853,27 @@ mod tests {
         let action = modal.handle_key(key(KeyCode::Tab));
         assert!(matches!(action, CommandModalAction::Consumed));
         assert_eq!(modal.argument(), expected);
+    }
+
+    #[test]
+    fn enter_keeps_the_row_tab_cycled_to_without_running() {
+        let mut modal = stash_prompt();
+        modal.handle_key(key(KeyCode::Tab));
+        modal.handle_key(key(KeyCode::Tab));
+        let action = modal.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, CommandModalAction::Consumed));
+        assert_eq!(modal.argument(), LIST_ARG);
+    }
+
+    #[test]
+    fn escape_while_cycling_puts_back_what_was_typed() {
+        let mut modal = stash_prompt();
+        modal.handle_key(key(KeyCode::Tab));
+        modal.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            (stage_name(&modal), modal.argument()),
+            ("args", String::new())
+        );
     }
 
     #[test_case(LIST_ARG ; "a_listed_word")]
