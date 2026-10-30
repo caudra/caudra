@@ -530,6 +530,8 @@ pub struct App {
     subagent_input_task: Option<String>,
     subagent_drafts: HashMap<String, InputState>,
     pub(super) command_palette: CommandPalette,
+    /// The slash palette of the `/btw` composer.
+    pub(super) btw_palette: CommandPalette,
     pub(crate) no_commands: bool,
     pub(super) command_modal: CommandModal,
     pub(super) theme_picker: ThemePicker,
@@ -924,6 +926,7 @@ impl App {
             subagent_input_box,
             subagent_input_task: None,
             subagent_drafts: HashMap::new(),
+            btw_palette: CommandPalette::aside(Arc::clone(&custom_commands), features),
             command_palette: CommandPalette::new(
                 custom_commands,
                 mcp_reader.clone(),
@@ -1962,7 +1965,7 @@ impl App {
                     return vec![];
                 }
                 if self.btw.is_open() {
-                    self.btw.handle_text(&text, true);
+                    self.handle_btw_text(&text, true);
                     return vec![];
                 }
                 if self.session_relocation_picker.is_open()
@@ -2816,7 +2819,14 @@ impl App {
         }
 
         if self.btw.is_open() {
-            keyboard_text!(btw, self.btw.text_input_active());
+            if self.btw.text_input_active()
+                && let Some(text) = generated
+            {
+                if !text.is_empty() {
+                    self.handle_btw_text(text, false);
+                }
+                return Some(vec![]);
+            }
             guard_repeat!(self.btw.text_input_active());
             self.handle_btw_key(key);
             return Some(vec![]);
@@ -6970,8 +6980,13 @@ impl App {
         commands: Arc<[caudra_agent::command::CustomCommand]>,
     ) {
         if self.workspace_session.is_none() {
-            self.command_palette.set_custom_commands(commands);
+            self.set_custom_commands(commands);
         }
+    }
+
+    fn set_custom_commands(&mut self, commands: Arc<[caudra_agent::command::CustomCommand]>) {
+        self.btw_palette.set_custom_commands(Arc::clone(&commands));
+        self.command_palette.set_custom_commands(commands);
     }
 
     /// `builtin_skills.packs()` as saved now. A remote tab reads its commands from its own
@@ -6984,9 +6999,9 @@ impl App {
         if !self.no_commands
             && let Some(context) = &self.remote_project_context
         {
-            self.command_palette.set_custom_commands(Arc::from(
-                caudra_agent::command::discover_remote_commands(context, &self.skill_packs),
-            ));
+            let commands =
+                caudra_agent::command::discover_remote_commands(context, &self.skill_packs);
+            self.set_custom_commands(Arc::from(commands));
         }
     }
 
@@ -7030,15 +7045,14 @@ impl App {
         self.commit_popup.close();
         self.state.session = candidate;
         self.sync_transcript_cwd();
-        self.command_palette
-            .set_custom_commands(if self.no_commands {
-                Arc::from([])
-            } else {
-                Arc::from(caudra_agent::command::discover_remote_commands(
-                    &change.context,
-                    &self.skill_packs,
-                ))
-            });
+        self.set_custom_commands(if self.no_commands {
+            Arc::from([])
+        } else {
+            Arc::from(caudra_agent::command::discover_remote_commands(
+                &change.context,
+                &self.skill_packs,
+            ))
+        });
         self.workspace_session = Some(change.workspace);
         self.bind_change_recorder();
         self.refresh_record_index();
@@ -8118,7 +8132,7 @@ impl App {
         if self.float_mgr.handle_paste(text) {
             return;
         }
-        if self.btw.handle_text(text, true) {
+        if self.handle_btw_text(text, true) {
             return;
         }
         if self.logs_modal.is_open() {

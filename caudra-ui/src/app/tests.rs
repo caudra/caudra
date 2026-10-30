@@ -10,7 +10,9 @@ use crate::app::tooltip::ChordTopic;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::audit_log::PanelTab;
 use crate::components::changelog_modal::fixture as changelog_fixture;
-use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
+use crate::components::command::{
+    ASIDE_CATCHUP, ASIDE_COMMANDS, ASIDE_NEW, BUILTIN_COMMANDS, CommandPalette, ParsedCommand,
+};
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
@@ -7611,22 +7613,17 @@ fn slash_noncommand_still_steers_a_task() {
 }
 
 fn with_custom_command(app: &mut App, name: &str, content: &str) {
-    app.command_palette = CommandPalette::new(
-        Arc::from([CustomCommand {
-            name: name.to_string(),
-            description: String::new(),
-            content: content.to_string(),
-            scope: caudra_agent::command::CommandScope::Project,
-            accepts_args: false,
-            argument_hint: None,
-            source: caudra_agent::command::CommandSource::Local(PathBuf::from(
-                "/project/.caudra/commands/custom.md",
-            )),
-        }]),
-        McpSnapshotReader::empty(),
-        LuaCommandReader::empty(),
-        FeatureFlags::all(),
-    );
+    app.set_custom_commands(Arc::from([CustomCommand {
+        name: name.to_string(),
+        description: String::new(),
+        content: content.to_string(),
+        scope: caudra_agent::command::CommandScope::Project,
+        accepts_args: false,
+        argument_hint: None,
+        source: caudra_agent::command::CommandSource::Local(PathBuf::from(
+            "/project/.caudra/commands/custom.md",
+        )),
+    }]));
 }
 
 #[test]
@@ -21530,6 +21527,132 @@ fn chat_notices(app: &App, index: usize) -> Vec<String> {
         .collect()
 }
 
+const BTW_CUSTOM_NAME: &str = "audit";
+const BTW_CUSTOM_TEXT: &str = "check the retry path";
+const BTW_SESSION_COMMAND: &str = "/model";
+const BTW_PATH_QUESTION: &str = "/etc/hosts is read when?";
+
+fn type_into_btw(app: &mut App, line: &str) {
+    for c in line.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+}
+
+#[test]
+fn a_slash_in_btw_offers_only_what_runs_there() {
+    let mut app = btw_ready_app();
+    with_custom_command(&mut app, BTW_CUSTOM_NAME, BTW_CUSTOM_TEXT);
+    press_ask_btw(&mut app);
+
+    type_into_btw(&mut app, "/");
+
+    assert!(app.btw_palette.is_active());
+    let mut offered: Vec<String> = app
+        .btw_palette
+        .rows(false)
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    offered.sort();
+    let mut expected: Vec<String> = ASIDE_COMMANDS
+        .iter()
+        .map(|command| command.name.to_owned())
+        .chain([format!("/project:{BTW_CUSTOM_NAME}")])
+        .collect();
+    expected.sort();
+    assert_eq!(offered, expected);
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    assert!(
+        buffer_text(terminal.backend().buffer()).contains(&format!("/project:{BTW_CUSTOM_NAME}")),
+        "the palette draws over the /btw composer"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.btw.is_open() && !app.btw_palette.is_active());
+    assert_eq!(btw_input(&app), "/");
+}
+
+#[test]
+fn slash_new_in_btw_starts_a_new_side_conversation() {
+    let (mut app, _script) = btw_awaiting_follow_up();
+    while !btw_input(&app).is_empty() {
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+    }
+
+    type_into_btw(&mut app, ASIDE_NEW);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(app.btw.is_open());
+    assert!(app.btw.thread().is_none() && btw_questions(&app).is_empty());
+    assert_eq!(btw_input(&app), "");
+}
+
+#[test]
+fn slash_catchup_in_btw_asks_for_a_summary_in_the_thread() {
+    let (mut app, _script) = btw_awaiting_follow_up();
+    while !btw_input(&app).is_empty() {
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+    }
+
+    type_into_btw(&mut app, ASIDE_CATCHUP);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(app.btw.is_running());
+    assert_eq!(
+        btw_questions(&app),
+        [BTW_QUESTION, super::btw::CATCHUP_HEADER]
+    );
+    assert_eq!(
+        app.btw.thread().unwrap().exchange_count(),
+        1,
+        "{BTW_THREAD_KEPT}"
+    );
+}
+
+#[test]
+fn a_custom_command_in_btw_asks_its_text_under_the_line_typed() {
+    let mut app = btw_ready_app();
+    with_custom_command(&mut app, BTW_CUSTOM_NAME, BTW_CUSTOM_TEXT);
+    press_ask_btw(&mut app);
+    let line = format!("/project:{BTW_CUSTOM_NAME}");
+
+    type_into_btw(&mut app, &line);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(app.btw.is_running());
+    assert_eq!(btw_questions(&app), [line]);
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_CUSTOM_TEXT));
+}
+
+#[test]
+fn a_session_command_in_btw_says_it_does_not_run_there() {
+    let mut app = btw_ready_app();
+    press_ask_btw(&mut app);
+
+    type_into_btw(&mut app, BTW_SESSION_COMMAND);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.btw.is_running());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("{BTW_SESSION_COMMAND}{}", super::btw::NOT_IN_BTW).as_str())
+    );
+    assert_eq!(btw_input(&app), BTW_SESSION_COMMAND);
+}
+
+#[test]
+fn a_slash_line_naming_no_command_is_asked_as_written() {
+    let mut app = btw_ready_app();
+    press_ask_btw(&mut app);
+
+    type_into_btw(&mut app, BTW_PATH_QUESTION);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(app.btw.is_running());
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_PATH_QUESTION));
+}
+
 /// The header row under the window's intro, which says where it forks.
 fn btw_fork_row(app: &App) -> String {
     let header = app
@@ -21991,7 +22114,7 @@ fn rendered_question(app: &mut App) -> String {
 
 fn question_btw_streaming(app: &mut App) {
     app.open_question_btw();
-    app.continue_btw(BTW_QUESTION.into());
+    app.continue_btw(BTW_QUESTION.into(), BTW_QUESTION.into());
     assert!(app.btw.is_clarifying());
     assert!(app.btw.is_running());
 }

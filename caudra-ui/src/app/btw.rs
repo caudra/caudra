@@ -14,12 +14,13 @@ use caudra_agent::{
 use caudra_providers::{CacheKey, ContentBlock, Message, Role, format_tokens, project_messages};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::media::MediaStore;
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use flume::{Receiver, Sender, TryRecvError};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use crate::chat::Chat;
+use crate::components::command::{ASIDE_CATCHUP, ASIDE_NEW, CommandAction};
 use crate::components::keybindings::key;
 use crate::components::side_transcript::{MOVED_ON_NOTE, SideAction, SideFooter, SideTranscript};
 use crate::components::status_bar::context_share;
@@ -35,6 +36,7 @@ const CHAT_NAME: &str = "/btw";
 /// What the permission prompt says asked, for a call a side question made.
 pub(super) const PERMISSION_ORIGIN: &str = "/btw";
 const STOPPED_NOTE: &str = "Stopped.";
+pub(super) const NOT_IN_BTW: &str = " does not run in /btw";
 pub(super) const STILL_ANSWERING: &str = "/btw is still answering. Send this once it finishes.";
 pub(super) const BACKGROUND_ANSWERED: &str = "/btw answered in the background";
 pub(super) const BACKGROUND_FAILED: &str = "/btw stopped in the background without an answer";
@@ -582,9 +584,12 @@ impl Btw {
         self.side.as_ref()?.thread.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn window(&self) -> Option<&SideTranscript> {
         self.side.as_ref().map(|side| &side.window)
+    }
+
+    fn window_mut(&mut self) -> Option<&mut SideTranscript> {
+        self.side.as_mut().map(|side| &mut side.window)
     }
 
     #[cfg(test)]
@@ -745,6 +750,7 @@ impl App {
         if self.btw.runs_shown() && (self.btw.is_clarifying() || self.btw.awaits_approval()) {
             self.stop_btw_run();
         }
+        self.btw_palette.close();
         let Some(mut side) = self.btw.side.take() else {
             return;
         };
@@ -765,13 +771,106 @@ impl App {
         }
     }
 
+    /// The palette takes the keys it has a use for while the line names a
+    /// command; the window takes the rest.
     pub(super) fn handle_btw_key(&mut self, key: KeyEvent) {
-        let action = self.btw.handle_key(key);
-        self.handle_btw_action(action);
+        match self.btw_palette.handle_key(key) {
+            CommandAction::Passthrough => {
+                let action = self.btw.handle_key(key);
+                self.handle_btw_action(action);
+                self.sync_btw_palette();
+            }
+            action => self.handle_btw_palette_action(action),
+        }
     }
 
-    /// Whether the pointer was the window's.
+    /// Typed or pasted text, which the palette then follows.
+    pub(super) fn handle_btw_text(&mut self, text: &str, paste: bool) -> bool {
+        let taken = self.btw.handle_text(text, paste);
+        self.sync_btw_palette();
+        taken
+    }
+
+    /// Follows the composer's line with the slash palette. A clarification
+    /// has none: its line is about the form.
+    fn sync_btw_palette(&mut self) {
+        let line = self
+            .btw
+            .side
+            .as_ref()
+            .filter(|side| side.context.is_none())
+            .and_then(|side| side.window.composer_line());
+        match line {
+            Some((line, caret)) => {
+                let _ = self.btw_palette.sync(&line, caret, false);
+            }
+            None => self.btw_palette.close(),
+        }
+    }
+
+    /// A command the palette ran goes in as the window's Enter would send
+    /// it, so a line sent while an answer streams waits behind it.
+    fn handle_btw_palette_action(&mut self, action: CommandAction) {
+        let Some(window) = self.btw.window_mut() else {
+            return;
+        };
+        match action {
+            CommandAction::Consumed | CommandAction::Passthrough => return,
+            CommandAction::Complete(completion) => window.complete(&completion),
+            CommandAction::Run(completion) => {
+                window.complete(&completion);
+                let action = window.handle_key(KeyEvent::from(KeyCode::Enter));
+                self.handle_btw_action(action);
+            }
+            CommandAction::Usage(usage) => return self.flash(usage),
+        }
+        self.sync_btw_palette();
+    }
+
+    /// The window, and the palette over its composer.
+    pub(super) fn view_btw(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        let rect = self.btw.view(frame, area);
+        if let Some(composer) = self.btw.window().and_then(SideTranscript::composer_area)
+            && self.btw_palette.is_active()
+        {
+            self.btw_palette.view(frame, composer);
+        }
+        rect
+    }
+
+    /// Runs a command typed in the `/btw` composer, or asks the line. A
+    /// command that acts on the session says it does not run here.
+    fn submit_btw(&mut self, line: String) {
+        if self.btw.is_clarifying() || !line.starts_with('/') {
+            return self.continue_btw(line.clone(), line);
+        }
+        let command = self.btw_palette.parse(&line);
+        match command.name.as_str() {
+            ASIDE_NEW => self.clear_btw_thread(),
+            ASIDE_CATCHUP => self.start_catchup(command.args.trim()),
+            name => {
+                if let Some(custom) = self.btw_palette.find_custom_command(name) {
+                    let question = custom.render(&command.args);
+                    self.continue_btw(line, question);
+                } else if self.command_palette.resolve(name).is_some() {
+                    self.flash(format!("{name}{NOT_IN_BTW}"));
+                    self.restore_btw_draft(&line);
+                } else {
+                    self.continue_btw(line.clone(), line);
+                }
+            }
+        }
+    }
+
+    /// Whether the pointer was the window's or its palette's.
     pub(super) fn handle_btw_mouse(&mut self, event: MouseEvent) -> bool {
+        match self.btw_palette.handle_mouse(event) {
+            CommandAction::Passthrough => {}
+            action => {
+                self.handle_btw_palette_action(action);
+                return true;
+            }
+        }
         let cwd = self.state.session.cwd.clone();
         let action = self.btw.handle_mouse(event, Path::new(&cwd));
         let ignored = action == SideAction::Ignored;
@@ -791,7 +890,7 @@ impl App {
             SideAction::Close => self.btw_closed(),
             SideAction::Copy(text) => self.copy_to_clipboard(&text),
             SideAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
-            SideAction::Submit(question) => self.continue_btw(question),
+            SideAction::Submit(line) => self.submit_btw(line),
             SideAction::Clear => self.clear_btw_thread(),
             SideAction::Interrupt => self.stop_btw_run(),
         }
@@ -816,6 +915,7 @@ impl App {
         {
             self.stop_btw_run();
         }
+        self.btw_palette.close();
         if let Some(side) = self.btw.side.take() {
             self.unmark_btw_cutoff(side.task.as_deref());
         }
@@ -1165,7 +1265,7 @@ impl App {
     /// Asks the next question over the same thread, so it stays one cached
     /// lineage, unless the conversation moved on since, when the thread
     /// catches up with it first.
-    pub(crate) fn continue_btw(&mut self, question: String) {
+    pub(crate) fn continue_btw(&mut self, header: String, question: String) {
         let _ = self.poll_btw_run();
         let Some(side) = &self.btw.side else {
             return;
@@ -1187,16 +1287,17 @@ impl App {
             return;
         };
         match context {
-            Some(context) => thread.ask_clarification(question.clone(), context),
-            None => thread.ask(question.clone()),
+            Some(context) => thread.ask_clarification(question, context),
+            None => thread.ask(question),
         }
-        self.stream_btw_answer(question);
+        self.stream_btw_answer(header);
     }
 
     fn restore_btw_draft(&mut self, question: &str) {
         if let Some(side) = self.btw.side.as_mut() {
             side.window.set_draft(question);
         }
+        self.sync_btw_palette();
     }
 
     /// Shows `header` as the question and starts the run that answers the
@@ -1395,8 +1496,8 @@ impl App {
             thread.settle(answered);
         }
         side.window.finish_run();
-        if let Some(question) = side.window.take_queued().filter(|_| shown) {
-            self.continue_btw(question);
+        if let Some(line) = side.window.take_queued().filter(|_| shown) {
+            self.submit_btw(line);
         }
     }
 

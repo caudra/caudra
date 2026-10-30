@@ -34,7 +34,7 @@ pub(crate) mod grammar;
 pub(crate) mod suggest;
 pub(crate) mod words;
 
-pub(crate) use builtins::SEARCH_COMMAND;
+pub(crate) use builtins::{ASIDE_CATCHUP, ASIDE_COMMANDS, ASIDE_NEW, SEARCH_COMMAND};
 pub use builtins::{BUILTIN_COMMANDS, BuiltinCommand, disabled_feature};
 use grammar::{Arg, Node, SIGNATURE_WIDTH, Source, Subcommand, truncate};
 pub(crate) use suggest::SourceValue;
@@ -312,6 +312,8 @@ impl PaletteAsk {
 }
 
 pub struct CommandPalette {
+    /// The built-ins offered: every one, or the few a side conversation runs.
+    builtins: &'static [BuiltinCommand],
     selected: usize,
     filtered: Vec<Match>,
     custom: Arc<[CustomCommand]>,
@@ -368,6 +370,35 @@ impl CommandPalette {
         lua_reader: LuaCommandReader,
         features: FeatureFlags,
     ) -> Self {
+        Self::over(
+            BUILTIN_COMMANDS,
+            custom_commands,
+            mcp_reader,
+            lua_reader,
+            features,
+        )
+    }
+
+    /// The palette of a side conversation's composer: its own built-ins and
+    /// the custom commands, whose text it can send as a question. MCP prompts
+    /// expand only in the main loop, and plugin commands act on the session.
+    pub(crate) fn aside(custom_commands: Arc<[CustomCommand]>, features: FeatureFlags) -> Self {
+        Self::over(
+            ASIDE_COMMANDS,
+            custom_commands,
+            McpSnapshotReader::empty(),
+            LuaCommandReader::empty(),
+            features,
+        )
+    }
+
+    fn over(
+        builtins: &'static [BuiltinCommand],
+        custom_commands: Arc<[CustomCommand]>,
+        mcp_reader: McpSnapshotReader,
+        lua_reader: LuaCommandReader,
+        features: FeatureFlags,
+    ) -> Self {
         let snap = mcp_reader.load();
         let mcp_generation = snap.generation;
         let prompts = snap.prompts.clone();
@@ -376,8 +407,15 @@ impl CommandPalette {
         let lua_generation = lua_snap.generation;
         let lua_commands = lua_snap.commands.clone();
 
-        let nucleo = Self::build_nucleo(features, &custom_commands, &prompts, &lua_commands);
+        let nucleo = Self::build_nucleo(
+            builtins,
+            features,
+            &custom_commands,
+            &prompts,
+            &lua_commands,
+        );
         Self {
+            builtins,
             selected: 0,
             filtered: Vec::new(),
             custom: custom_commands,
@@ -441,6 +479,7 @@ impl CommandPalette {
 
     fn reindex(&mut self) {
         self.nucleo = Self::build_nucleo(
+            self.builtins,
             self.features,
             &self.custom,
             &self.mcp_prompts,
@@ -454,12 +493,13 @@ impl CommandPalette {
     /// enumerates the four sources: matching and name lookup both read it, so
     /// a built-in whose experiment is off is neither suggested nor resolved.
     fn items<'a>(
+        builtins: &'static [BuiltinCommand],
         features: FeatureFlags,
         custom_commands: &'a [CustomCommand],
         mcp_prompts: &'a [McpPromptInfo],
         lua_commands: &'a [LuaCommandInfo],
     ) -> impl Iterator<Item = CommandItem> + 'a {
-        let builtins = BUILTIN_COMMANDS
+        let builtins = builtins
             .iter()
             .filter(move |cmd| cmd.available(features))
             .map(|cmd| CommandItem {
@@ -522,6 +562,7 @@ impl CommandPalette {
     }
 
     fn build_nucleo(
+        builtins: &'static [BuiltinCommand],
         features: FeatureFlags,
         custom_commands: &[CustomCommand],
         mcp_prompts: &[McpPromptInfo],
@@ -530,8 +571,14 @@ impl CommandPalette {
         let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
 
-        for item in Self::items(features, custom_commands, mcp_prompts, lua_commands)
-            .flat_map(Self::with_subcommands)
+        for item in Self::items(
+            builtins,
+            features,
+            custom_commands,
+            mcp_prompts,
+            lua_commands,
+        )
+        .flat_map(Self::with_subcommands)
         {
             injector.push(item, |item, cols| {
                 cols[0] = Utf32String::from(Self::search_name(item));
@@ -815,6 +862,7 @@ impl CommandPalette {
         self.lua_generation = lua_snap.generation;
         self.lua_commands = lua_snap.commands.clone();
         self.nucleo = Self::build_nucleo(
+            self.builtins,
             self.features,
             &self.custom,
             &self.mcp_prompts,
@@ -829,6 +877,7 @@ impl CommandPalette {
     pub fn rows(&mut self, task_focused: bool) -> Vec<CommandRow> {
         self.refresh_sources();
         let mut items: Vec<CommandItem> = Self::items(
+            self.builtins,
             self.features,
             &self.custom,
             &self.mcp_prompts,
@@ -895,6 +944,7 @@ impl CommandPalette {
     /// The command `name` names exactly, ignoring case.
     fn command_named(&self, name: &str) -> Option<CommandType> {
         Self::items(
+            self.builtins,
             self.features,
             &self.custom,
             &self.mcp_prompts,
@@ -1364,6 +1414,7 @@ impl CommandPalette {
     /// typo should report itself instead of running the closest neighbor.
     pub fn resolve(&self, name: &str) -> Option<String> {
         Self::items(
+            self.builtins,
             self.features,
             &self.custom,
             &self.mcp_prompts,

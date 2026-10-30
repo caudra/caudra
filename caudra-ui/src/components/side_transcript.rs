@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{live_elapsed, spinner_str};
 use crate::chat::{Chat, ChatEventResult};
+use crate::components::command::Completion;
 use crate::components::input::control_tip;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
@@ -269,6 +270,8 @@ pub(crate) struct SideTranscript {
     header: Vec<String>,
     chat: Chat,
     input: TextField,
+    /// Where the composer was drawn, which is where the slash palette opens.
+    composer: Rect,
     spend: RunSpend,
     /// A question taken while a run was live, held until the owner can send it.
     queued: Option<String>,
@@ -296,6 +299,7 @@ impl SideTranscript {
             header: Vec::new(),
             chat,
             input: TextField::new(FieldKind::Line),
+            composer: Rect::default(),
             spend: RunSpend::default(),
             queued: None,
             started: None,
@@ -396,6 +400,26 @@ impl SideTranscript {
         let draft = self.input.text();
         self.input.clear();
         draft
+    }
+
+    /// What the composer holds and where its caret is, in chars, while keys
+    /// type into it.
+    pub fn composer_line(&self) -> Option<(String, usize)> {
+        self.text_input_active()
+            .then(|| (self.input.text(), self.input.cursor_offset()))
+    }
+
+    /// Where the composer was last drawn, while it was.
+    pub fn composer_area(&self) -> Option<Rect> {
+        (self.text_input_active() && self.composer.width > 0).then_some(self.composer)
+    }
+
+    /// Makes the slash palette's edit to the composer.
+    pub fn complete(&mut self, completion: &Completion) {
+        let text = completion.applied_to(&self.input.text());
+        self.input.set_text(&text);
+        self.input
+            .set_cursor_offset(completion.range.start + completion.caret);
     }
 
     /// The last answer, as its source.
@@ -844,7 +868,9 @@ impl SideTranscript {
                 ..inner
             },
         );
-        self.chat.view(frame, body, self.sweeping, false);
+        if self.chat.message_count() > 0 {
+            self.chat.view(frame, body, self.sweeping, false);
+        }
         if let Some(sweep) = self.sweep
             && let Some(screen) = sweep.to_screen(self.chat.scroll_top())
         {
@@ -856,6 +882,7 @@ impl SideTranscript {
         if let Some(input) = input {
             frame.render_widget(Paragraph::new(self.input_line(input.width)), input);
         }
+        self.composer = input.unwrap_or_default();
         let footer = self.footer_line(footer_row.width);
         self.footer_hits.set(footer.hits(footer_row, 0, 1));
         frame.render_widget(
@@ -893,6 +920,7 @@ impl Overlay for SideTranscript {
         self.footer_hits.reset();
         self.popup = Rect::default();
         self.body = Rect::default();
+        self.composer = Rect::default();
         self.pressed = false;
         self.sweep = None;
         self.sweeping = false;
@@ -1275,6 +1303,13 @@ mod tests {
             assert!(rows[0].contains(HEADER_TOP), "{rows:?}");
             assert!(rows[1].contains(HEADER_FORK), "{rows:?}");
         }
+    }
+
+    #[test]
+    fn an_empty_window_shows_no_start_screen() {
+        let mut side = window(SideFooter::Ask);
+        let screen = buffer_text(&draw(&mut side, WIDE));
+        assert!(!screen.contains(crate::splash::TAGLINE), "{screen}");
     }
 
     #[test]

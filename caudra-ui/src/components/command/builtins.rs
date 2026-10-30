@@ -8,6 +8,8 @@ use super::grammar::{Arg, Choice, Node, Source, Subcommand};
 use super::words;
 
 pub(crate) const SEARCH_COMMAND: &str = "/search";
+pub(crate) const ASIDE_NEW: &str = "/new";
+pub(crate) const ASIDE_CATCHUP: &str = "/catchup";
 const LEAF: Node = Node::args(&[]);
 
 pub struct BuiltinCommand {
@@ -428,6 +430,21 @@ const SANDBOX_SUBS: &[Subcommand] = &[
         words::RECONCILE_NETWORK_ARG,
         "Inspect durable outcomes, then reconcile saved networks",
         LEAF,
+    ),
+];
+
+/// What the `/btw` composer runs. Custom commands join these, since their
+/// text can be sent as a side question.
+pub(crate) const ASIDE_COMMANDS: &[BuiltinCommand] = &[
+    BuiltinCommand::new(
+        ASIDE_NEW,
+        "Forget this side conversation and start a new one",
+        LEAF,
+    ),
+    BuiltinCommand::new(
+        ASIDE_CATCHUP,
+        "Ask for a summary of the conversation /btw reads",
+        Node::args(&[Arg::text("focus", "What to narrow the summary to", None)]),
     ),
 ];
 

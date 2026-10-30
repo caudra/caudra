@@ -672,7 +672,7 @@ impl App {
             if !self.btw.is_open() {
                 return below;
             }
-            let rect = self.btw.view(frame, frame.area());
+            let rect = self.view_btw(frame, frame.area());
             if self.prompt_over_btw() {
                 self.render_prompt_over(frame, prompt);
             }
@@ -697,7 +697,7 @@ impl App {
         }
         claim!(self.extract.view(frame, full), self.extract);
         if self.btw.is_open() {
-            claim!(self.btw.view(frame, full), self.btw);
+            claim!(self.view_btw(frame, full), self.btw);
         }
         claim!(
             self.help_modal.view(frame, full, self.features),
