@@ -303,6 +303,12 @@ fn spend(billed: Option<f64>, subscription: Option<f64>) -> Option<SpendFigure> 
     Some(SpendFigure { full, short })
 }
 
+/// The larger of what was billed and what a subscription covered, marked as
+/// the status bar marks it when it is narrow.
+pub(crate) fn short_spend(billed: Option<f64>, subscription: Option<f64>) -> Option<String> {
+    spend(billed, subscription).map(|figure| figure.short)
+}
+
 fn compact_price(value: f64) -> String {
     let fixed = format!("{value:.3}");
     if value > 0.0 && fixed == "0.000" {

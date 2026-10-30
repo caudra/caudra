@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use caudra_agent::agent::aside::run_aside;
 use caudra_agent::agent::task_runner::WorkflowHostContext;
@@ -10,29 +11,37 @@ use caudra_agent::{
     AgentEvent, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History,
     HistorySnapshot,
 };
-use caudra_providers::{CacheKey, ContentBlock, Message, Role, TokenUsage, project_messages};
+use caudra_providers::{CacheKey, ContentBlock, Message, Role, format_tokens, project_messages};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::media::MediaStore;
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use flume::{Receiver, Sender, TryRecvError};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use crate::chat::Chat;
+use crate::components::command::{ASIDE_CATCHUP, ASIDE_NEW, CommandAction};
+use crate::components::keybindings::key;
 use crate::components::side_transcript::{MOVED_ON_NOTE, SideAction, SideFooter, SideTranscript};
+use crate::components::status_bar::context_share;
 use crate::components::tooltip::Tip;
 use crate::components::{DisplayMessage, DisplayRole, Overlay};
 use crate::repaint::{Cadence, Dirty};
 
 use super::{App, COPIED_SELECTION, HISTORY_UNREADABLE, PermissionRouting};
 
-const TITLE: &str = " /btw ";
-const ASK_TITLE: &str = " /btw · Side question ";
+const TITLE: &str = " /btw · Side conversation ";
 const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
 const CHAT_NAME: &str = "/btw";
 /// What the permission prompt says asked, for a call a side question made.
 pub(super) const PERMISSION_ORIGIN: &str = "/btw";
 const STOPPED_NOTE: &str = "Stopped.";
+pub(super) const NOT_IN_BTW: &str = " does not run in /btw";
+pub(super) const STILL_ANSWERING: &str = "/btw is still answering. Send this once it finishes.";
+pub(super) const BACKGROUND_ANSWERED: &str = "/btw answered in the background";
+pub(super) const BACKGROUND_FAILED: &str = "/btw stopped in the background without an answer";
+const REOPEN_PREFIX: &str = ". Press ";
+const REOPEN_SUFFIX: &str = " in its chat to read it";
 pub(super) const RUN_LOST: &str = "The side question stopped without an answer";
 pub(super) const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
 pub(super) const TASK_HISTORY_UNAVAILABLE: &str =
@@ -43,6 +52,16 @@ answers. The following is the question currently being viewed, not a user decisi
 /// Drawn where the thread's snapshot of the conversation ends, so the reader
 /// can tell what the side question could and could not see.
 pub(crate) const BTW_CUTOFF_MARKER: &str = "/btw reads the conversation up to here";
+/// The window's pinned header: what the window is, then where it forks.
+pub(super) const HEADER_INTRO: &str =
+    "Side conversation · read-only tools · nothing here enters the conversation it reads";
+const HEADER_SEPARATOR: &str = " · ";
+pub(super) const MAIN_SOURCE: &str = "main";
+pub(super) const TASK_SOURCE_PREFIX: &str = "task ";
+pub(super) const PENDING_PREFIX: &str = "Forks ";
+pub(super) const PENDING_SUFFIX: &str = " when you send";
+pub(super) const FORKED_PREFIX: &str = "Forked from ";
+pub(super) const MOVED_ON_SUFFIX: &str = " has moved on since";
 
 pub(super) const CATCHUP_HEADER: &str = "Catch me up";
 pub(super) const NOTHING_TO_CATCH_UP: &str = "Nothing to catch up on yet";
@@ -70,6 +89,8 @@ branches, commands, errors) rather than describing them. Keep it to about 200 wo
 session really needs more. If the conversation doesn't make something clear, say so instead of \
 guessing.";
 
+/// How often a run nobody is watching is drained.
+pub(super) const BACKGROUND_POLL: Duration = Duration::from_millis(250);
 const ROUND_SEPARATOR: &str = "\n\n";
 
 /// Leads the first question after the thread caught up with a conversation
@@ -115,6 +136,45 @@ fn final_answer(messages: &[Message]) -> String {
         .filter(|message| matches!(message.role, Role::Assistant))
         .find_map(message_text)
         .unwrap_or_default()
+}
+
+/// Where a side thread forks: the conversation it reads, how full that
+/// conversation's window is, and the model the thread asks.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ForkPoint {
+    source: String,
+    context: Option<(u32, u32)>,
+    model: String,
+}
+
+pub(super) enum ForkState {
+    /// No question sent yet: the thread reads the conversation when one is.
+    Pending,
+    Forked,
+    /// The conversation grew past what the thread read.
+    MovedOn,
+}
+
+/// The rows pinned above a side thread.
+pub(super) fn fork_header(fork: &ForkPoint, state: ForkState) -> Vec<String> {
+    let source = &fork.source;
+    let mut where_from = match state {
+        ForkState::Pending => format!("{PENDING_PREFIX}{source}{PENDING_SUFFIX}"),
+        ForkState::Forked | ForkState::MovedOn => format!("{FORKED_PREFIX}{source}"),
+    };
+    if let Some((used, window)) = fork.context {
+        where_from.push_str(&format!(
+            "{HEADER_SEPARATOR}{}/{} ({}%)",
+            format_tokens(used),
+            format_tokens(window),
+            context_share(used, window)
+        ));
+    }
+    where_from.push_str(&format!("{HEADER_SEPARATOR}{}", fork.model));
+    if matches!(state, ForkState::MovedOn) {
+        where_from.push_str(&format!("{HEADER_SEPARATOR}{source}{MOVED_ON_SUFFIX}"));
+    }
+    vec![HEADER_INTRO.to_owned(), where_from]
 }
 
 /// How far a conversation had got when a thread read it. Equal marks mean the
@@ -166,6 +226,8 @@ pub(crate) struct BtwThread {
     prefix: Arc<RequestPrefix>,
     messages: Vec<Message>,
     mark: HistoryMark,
+    /// Where it forked, as its base was read.
+    fork: ForkPoint,
     /// Exchanges asked over an earlier base, quoted rather than replayed.
     earlier: Vec<(String, String)>,
     /// Earlier exchanges too old to quote.
@@ -180,11 +242,17 @@ pub(crate) struct BtwThread {
 }
 
 impl BtwThread {
-    fn new(prefix: Arc<RequestPrefix>, messages: Vec<Message>, mark: HistoryMark) -> Self {
+    fn new(
+        prefix: Arc<RequestPrefix>,
+        messages: Vec<Message>,
+        mark: HistoryMark,
+        fork: ForkPoint,
+    ) -> Self {
         Self {
             prefix,
             messages,
             mark,
+            fork,
             earlier: Vec::new(),
             omitted: 0,
             answered: Vec::new(),
@@ -197,7 +265,13 @@ impl BtwThread {
     /// Moves the thread onto the conversation as it stands now. The answers
     /// so far were given over the old base, so they become quoted context
     /// for the next question, and their tool turns are left behind.
-    fn rebase(&mut self, prefix: Arc<RequestPrefix>, base: Vec<Message>, mark: HistoryMark) {
+    fn rebase(
+        &mut self,
+        prefix: Arc<RequestPrefix>,
+        base: Vec<Message>,
+        mark: HistoryMark,
+        fork: ForkPoint,
+    ) {
         self.earlier.append(&mut self.answered);
         let excess = self.earlier.len().saturating_sub(MAX_REPLAYED_EXCHANGES);
         self.earlier.drain(..excess);
@@ -205,6 +279,7 @@ impl BtwThread {
         self.prefix = prefix;
         self.messages = base;
         self.mark = mark;
+        self.fork = fork;
         self.moved_on = false;
     }
 
@@ -344,10 +419,29 @@ impl SideQuestion {
 /// What a run hands back: the history it left and how it ended.
 type AsideReply = (Vec<Message>, Result<DoneReason, String>);
 
-/// The side question being answered. Dropping it stops the run.
+/// The side question a run answers: a clarification, which is only ever
+/// shown, or the thread a conversation keeps, shown or closed.
+#[derive(Clone, PartialEq, Eq)]
+struct RunOwner {
+    task: Option<String>,
+    clarifying: bool,
+}
+
+impl RunOwner {
+    fn of(side: &SideQuestion) -> Self {
+        Self {
+            task: side.task.clone(),
+            clarifying: side.context.is_some(),
+        }
+    }
+}
+
+/// The side question being answered. Dropping it stops the run. Closing the
+/// window of a thread does not: the run goes on and settles into the thread
+/// its conversation keeps.
 struct AsideRun {
     id: u64,
-    usage: TokenUsage,
+    owner: RunOwner,
     reply: Receiver<AsideReply>,
     /// The approvals it waits on, which go with it.
     approvals: HashSet<String>,
@@ -397,6 +491,36 @@ impl Default for Btw {
 impl Btw {
     pub(crate) fn is_running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// The side question `owner` names, shown or kept.
+    fn owner_mut(&mut self, owner: &RunOwner) -> Option<&mut SideQuestion> {
+        match self.side.as_mut() {
+            Some(side) if RunOwner::of(side) == *owner => Some(side),
+            _ if owner.clarifying => None,
+            _ => self.parked.get_mut(&owner.task),
+        }
+    }
+
+    /// The side question the live run answers.
+    fn run_side_mut(&mut self) -> Option<&mut SideQuestion> {
+        let owner = self.run.as_ref()?.owner.clone();
+        self.owner_mut(&owner)
+    }
+
+    /// Whether the live run answers the side question shown.
+    fn runs_shown(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| {
+            self.side
+                .as_ref()
+                .is_some_and(|side| RunOwner::of(side) == run.owner)
+        })
+    }
+
+    fn awaits_approval(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| !run.approvals.is_empty())
     }
 
     pub(crate) fn is_clarifying(&self) -> bool {
@@ -460,9 +584,12 @@ impl Btw {
         self.side.as_ref()?.thread.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn window(&self) -> Option<&SideTranscript> {
         self.side.as_ref().map(|side| &side.window)
+    }
+
+    fn window_mut(&mut self) -> Option<&mut SideTranscript> {
+        self.side.as_mut().map(|side| &mut side.window)
     }
 
     #[cfg(test)]
@@ -489,15 +616,31 @@ impl Overlay for Btw {
         }
     }
 
+    /// A run whose window is closed still reports, so the app keeps
+    /// reading it.
     fn cadence(&self) -> Cadence {
-        self.side
-            .as_ref()
-            .map_or(Cadence::IDLE, |side| side.window.cadence())
+        Cadence::any([
+            self.side
+                .as_ref()
+                .map_or(Cadence::IDLE, |side| side.window.cadence()),
+            Cadence::when(
+                self.run.is_some() && !self.runs_shown(),
+                Cadence::polling(BACKGROUND_POLL),
+            ),
+        ])
     }
 
     fn tooltip(&self) -> Option<Tip> {
         self.side.as_ref()?.window.tooltip()
     }
+}
+
+/// What the status bar says when a run ends behind a closed window.
+pub(super) fn background_flash(outcome: &str) -> String {
+    format!(
+        "{outcome}{REOPEN_PREFIX}{}{REOPEN_SUFFIX}",
+        key::ASK_BTW.label
+    )
 }
 
 /// Answers `question` over `messages` on the agent loop, in a context built
@@ -566,6 +709,7 @@ impl App {
             side.context = Some(context);
         }
         side.window.open();
+        let _ = self.refresh_btw_header();
     }
 
     /// `F2`: the thread this conversation kept, or an empty `/btw` that reads
@@ -584,11 +728,12 @@ impl App {
         match self.resume_btw(task.clone()) {
             Ok(true) => {}
             Ok(false) => {
-                let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
+                let window = self.btw_window(TITLE, SideFooter::Ask);
                 self.btw.side = Some(SideQuestion::new(task, window));
             }
             Err(error) => self.status_bar.flash(error),
         }
+        let _ = self.refresh_btw_header();
     }
 
     pub(super) fn discard_question_btw(&mut self) {
@@ -597,13 +742,15 @@ impl App {
         }
     }
 
-    /// Takes the side question off the screen and stops its run. A side
-    /// thread is kept for its conversation; a clarification is not.
+    /// Takes the side question off the screen. A side thread is kept for its
+    /// conversation, and its answer goes on streaming into it, unless it
+    /// waits on an approval nobody would see. A clarification is not kept,
+    /// so its run stops.
     pub(super) fn close_btw(&mut self) {
-        if self.btw.side.is_none() {
-            return;
+        if self.btw.runs_shown() && (self.btw.is_clarifying() || self.btw.awaits_approval()) {
+            self.stop_btw_run();
         }
-        self.stop_btw_run();
+        self.btw_palette.close();
         let Some(mut side) = self.btw.side.take() else {
             return;
         };
@@ -618,18 +765,112 @@ impl App {
     /// stopped; anything else is closed.
     fn btw_closed(&mut self) {
         match self.btw.is_clarifying() {
-            true => self.stop_btw_run(),
+            true if self.btw.runs_shown() => self.stop_btw_run(),
+            true => {}
             false => self.close_btw(),
         }
     }
 
+    /// The palette takes the keys it has a use for while the line names a
+    /// command; the window takes the rest.
     pub(super) fn handle_btw_key(&mut self, key: KeyEvent) {
-        let action = self.btw.handle_key(key);
-        self.handle_btw_action(action);
+        match self.btw_palette.handle_key(key) {
+            CommandAction::Passthrough => {
+                let action = self.btw.handle_key(key);
+                self.handle_btw_action(action);
+                self.sync_btw_palette();
+            }
+            action => self.handle_btw_palette_action(action),
+        }
     }
 
-    /// Whether the pointer was the window's.
+    /// Typed or pasted text, which the palette then follows.
+    pub(super) fn handle_btw_text(&mut self, text: &str, paste: bool) -> bool {
+        let taken = self.btw.handle_text(text, paste);
+        self.sync_btw_palette();
+        taken
+    }
+
+    /// Follows the composer's line with the slash palette. A clarification
+    /// has none: its line is about the form.
+    fn sync_btw_palette(&mut self) {
+        let line = self
+            .btw
+            .side
+            .as_ref()
+            .filter(|side| side.context.is_none())
+            .and_then(|side| side.window.composer_line());
+        match line {
+            Some((line, caret)) => {
+                let _ = self.btw_palette.sync(&line, caret, false);
+            }
+            None => self.btw_palette.close(),
+        }
+    }
+
+    /// A command the palette ran goes in as the window's Enter would send
+    /// it, so a line sent while an answer streams waits behind it.
+    fn handle_btw_palette_action(&mut self, action: CommandAction) {
+        let Some(window) = self.btw.window_mut() else {
+            return;
+        };
+        match action {
+            CommandAction::Consumed | CommandAction::Passthrough => return,
+            CommandAction::Complete(completion) => window.complete(&completion),
+            CommandAction::Run(completion) => {
+                window.complete(&completion);
+                let action = window.handle_key(KeyEvent::from(KeyCode::Enter));
+                self.handle_btw_action(action);
+            }
+            CommandAction::Usage(usage) => return self.flash(usage),
+        }
+        self.sync_btw_palette();
+    }
+
+    /// The window, and the palette over its composer.
+    pub(super) fn view_btw(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        let rect = self.btw.view(frame, area);
+        if let Some(composer) = self.btw.window().and_then(SideTranscript::composer_area)
+            && self.btw_palette.is_active()
+        {
+            self.btw_palette.view(frame, composer);
+        }
+        rect
+    }
+
+    /// Runs a command typed in the `/btw` composer, or asks the line. A
+    /// command that acts on the session says it does not run here.
+    fn submit_btw(&mut self, line: String) {
+        if self.btw.is_clarifying() || !line.starts_with('/') {
+            return self.continue_btw(line.clone(), line);
+        }
+        let command = self.btw_palette.parse(&line);
+        match command.name.as_str() {
+            ASIDE_NEW => self.clear_btw_thread(),
+            ASIDE_CATCHUP => self.start_catchup(command.args.trim()),
+            name => {
+                if let Some(custom) = self.btw_palette.find_custom_command(name) {
+                    let question = custom.render(&command.args);
+                    self.continue_btw(line, question);
+                } else if self.command_palette.resolve(name).is_some() {
+                    self.flash(format!("{name}{NOT_IN_BTW}"));
+                    self.restore_btw_draft(&line);
+                } else {
+                    self.continue_btw(line.clone(), line);
+                }
+            }
+        }
+    }
+
+    /// Whether the pointer was the window's or its palette's.
     pub(super) fn handle_btw_mouse(&mut self, event: MouseEvent) -> bool {
+        match self.btw_palette.handle_mouse(event) {
+            CommandAction::Passthrough => {}
+            action => {
+                self.handle_btw_palette_action(action);
+                return true;
+            }
+        }
         let cwd = self.state.session.cwd.clone();
         let action = self.btw.handle_mouse(event, Path::new(&cwd));
         let ignored = action == SideAction::Ignored;
@@ -649,7 +890,7 @@ impl App {
             SideAction::Close => self.btw_closed(),
             SideAction::Copy(text) => self.copy_to_clipboard(&text),
             SideAction::CopySelection(text) => self.copy_labelled(&text, COPIED_SELECTION),
-            SideAction::Submit(question) => self.continue_btw(question),
+            SideAction::Submit(line) => self.submit_btw(line),
             SideAction::Clear => self.clear_btw_thread(),
             SideAction::Interrupt => self.stop_btw_run(),
         }
@@ -658,17 +899,30 @@ impl App {
     /// `Ctrl+L`: forgets the thread the window shows and leaves an empty
     /// `/btw` in its place.
     pub(super) fn clear_btw_thread(&mut self) {
-        self.stop_btw_run();
-        let task = match self.btw.side.take() {
-            Some(side) => {
-                self.unmark_btw_cutoff(side.task.as_deref());
-                side.task
-            }
+        let task = match &self.btw.side {
+            Some(side) => side.task.clone(),
             None => self.active_subagent_id().map(str::to_owned),
         };
+        let cleared = RunOwner {
+            task: task.clone(),
+            clarifying: false,
+        };
+        if self
+            .btw
+            .run
+            .as_ref()
+            .is_some_and(|run| run.owner == cleared)
+        {
+            self.stop_btw_run();
+        }
+        self.btw_palette.close();
+        if let Some(side) = self.btw.side.take() {
+            self.unmark_btw_cutoff(side.task.as_deref());
+        }
         self.btw.parked.remove(&task);
-        let window = self.btw_window(ASK_TITLE, SideFooter::Ask);
+        let window = self.btw_window(TITLE, SideFooter::Ask);
         self.btw.side = Some(SideQuestion::new(task, window));
+        let _ = self.refresh_btw_header();
     }
 
     /// Forgets every side question, for a session that is going away. What
@@ -731,9 +985,10 @@ impl App {
             let prefix = self
                 .btw_prompt_for(task.as_deref())
                 .ok_or_else(|| PROMPT_INITIALIZING.to_owned())?;
-            Ok(Some((prefix, source.messages()?, mark)))
+            let fork = self.btw_fork_point(task.as_deref(), &prefix);
+            Ok(Some((prefix, source.messages()?, mark, fork)))
         });
-        let (prefix, base, mark) = match caught_up {
+        let (prefix, base, mark, fork) = match caught_up {
             Ok(None) => return true,
             Ok(Some(caught_up)) => caught_up,
             Err(error) => {
@@ -744,7 +999,7 @@ impl App {
         if let Some(side) = self.btw.side.as_mut() {
             side.note_moved_on();
             if let Some(thread) = side.thread.as_mut() {
-                thread.rebase(prefix, base, mark);
+                thread.rebase(prefix, base, mark, fork);
             }
         }
         self.mark_btw_cutoff(task.as_deref());
@@ -826,7 +1081,68 @@ impl App {
             self.status_bar.flash(PROMPT_INITIALIZING.into());
             return None;
         };
-        Some(BtwThread::new(prefix, messages, mark))
+        let fork = self.btw_fork_point(task, &prefix);
+        Some(BtwThread::new(prefix, messages, mark, fork))
+    }
+
+    /// Where a thread over `task` forks, read as the status bar reads that
+    /// conversation now.
+    fn btw_fork_point(&self, task: Option<&str>, prefix: &RequestPrefix) -> ForkPoint {
+        let (source, context) = match task {
+            None => {
+                let model = self.status_main_model();
+                let snapshot = self.main_context_snapshot();
+                let context =
+                    self.context_usage(&self.chats[0], model.as_deref(), snapshot.as_deref());
+                (MAIN_SOURCE.to_owned(), Some(context))
+            }
+            Some(task) => match self.chat_for_task(task) {
+                Some(index) => {
+                    let chat = &self.chats[index];
+                    let context = self.context_usage(chat, None, None);
+                    (format!("{TASK_SOURCE_PREFIX}{}", chat.name), Some(context))
+                }
+                None => (format!("{TASK_SOURCE_PREFIX}{task}"), None),
+            },
+        };
+        ForkPoint {
+            source,
+            context: context.filter(|(_, window)| *window > 0),
+            model: prefix.model.id.clone(),
+        }
+    }
+
+    /// Pins where the shown side question forks. Before its first question
+    /// it follows the conversation as it grows; after, it names what the
+    /// thread read, and says once the conversation moved past it.
+    fn refresh_btw_header(&mut self) -> Dirty {
+        let Some(side) = &self.btw.side else {
+            return Dirty::NO;
+        };
+        let task = side.task.as_deref();
+        let header = match &side.thread {
+            Some(thread) => {
+                let moved_on = thread.moved_on
+                    || self
+                        .btw_source(task)
+                        .is_ok_and(|source| source.mark() != thread.mark);
+                let state = match moved_on {
+                    true => ForkState::MovedOn,
+                    false => ForkState::Forked,
+                };
+                fork_header(&thread.fork, state)
+            }
+            None => match self.btw_prompt_for(task) {
+                Some(prefix) => {
+                    fork_header(&self.btw_fork_point(task, &prefix), ForkState::Pending)
+                }
+                None => vec![HEADER_INTRO.to_owned()],
+            },
+        };
+        self.btw
+            .side
+            .as_mut()
+            .map_or(Dirty::NO, |side| side.window.set_header(header))
     }
 
     /// The transcript of the conversation `task` names, while it is open.
@@ -912,6 +1228,10 @@ impl App {
                 return false;
             }
         };
+        if resumed && self.btw.runs_shown() {
+            self.status_bar.flash(STILL_ANSWERING.into());
+            return false;
+        }
         if resumed && self.btw.thread_mut().is_some() {
             if !self.catch_up_btw_thread() {
                 return false;
@@ -945,7 +1265,7 @@ impl App {
     /// Asks the next question over the same thread, so it stays one cached
     /// lineage, unless the conversation moved on since, when the thread
     /// catches up with it first.
-    pub(crate) fn continue_btw(&mut self, question: String) {
+    pub(crate) fn continue_btw(&mut self, header: String, question: String) {
         let _ = self.poll_btw_run();
         let Some(side) = &self.btw.side else {
             return;
@@ -967,16 +1287,17 @@ impl App {
             return;
         };
         match context {
-            Some(context) => thread.ask_clarification(question.clone(), context),
-            None => thread.ask(question.clone()),
+            Some(context) => thread.ask_clarification(question, context),
+            None => thread.ask(question),
         }
-        self.stream_btw_answer(question);
+        self.stream_btw_answer(header);
     }
 
     fn restore_btw_draft(&mut self, question: &str) {
         if let Some(side) = self.btw.side.as_mut() {
             side.window.set_draft(question);
         }
+        self.sync_btw_palette();
     }
 
     /// Shows `header` as the question and starts the run that answers the
@@ -990,6 +1311,7 @@ impl App {
             return;
         };
         self.renew_question_wait();
+        self.stop_btw_run();
         let store = MediaStore::new(&self.storage);
         let btw = &mut self.btw;
         let Some(side) = btw.side.as_mut() else {
@@ -1016,7 +1338,7 @@ impl App {
         .detach();
         btw.run = Some(AsideRun {
             id: btw.runs,
-            usage: TokenUsage::default(),
+            owner: RunOwner::of(side),
             reply,
             approvals: HashSet::new(),
             _stop: stop,
@@ -1026,6 +1348,7 @@ impl App {
         }
         side.window.chat_mut().show_user_message(header);
         side.window.begin_run();
+        let _ = self.refresh_btw_header();
     }
 
     /// The side question on the clock: a clarification whose form is gone
@@ -1047,6 +1370,7 @@ impl App {
             return Dirty::YES;
         }
         dirty
+            | self.refresh_btw_header()
             | self
                 .btw
                 .side
@@ -1093,8 +1417,8 @@ impl App {
         let live = self
             .btw
             .run
-            .as_mut()
-            .filter(|run| run.id == envelope.run_id);
+            .as_ref()
+            .is_some_and(|run| run.id == envelope.run_id);
         match envelope.event {
             AgentEvent::ModelUsage {
                 usage,
@@ -1105,8 +1429,8 @@ impl App {
                 purpose,
                 account,
             } => {
-                if let Some(run) = live {
-                    run.usage += usage;
+                if live && let Some(side) = self.btw.run_side_mut() {
+                    side.window.record_request(usage, cost, billing);
                 }
                 self.settle_side_spend(
                     &provider,
@@ -1118,21 +1442,21 @@ impl App {
                     billing,
                 );
             }
-            AgentEvent::PermissionRequestResolved { request_id, .. } if live.is_none() => {
+            AgentEvent::PermissionRequestResolved { request_id, .. } if !live => {
                 self.permission_prompt.resolve_pending(&request_id);
             }
             event => {
-                let Some(run) = live else {
+                let Some(run) = self.btw.run.as_mut().filter(|_| live) else {
                     return;
                 };
                 run.track_approval(&event);
-                let Some(side) = self.btw.side.as_mut() else {
+                let Some(side) = self.btw.run_side_mut() else {
                     return;
                 };
                 let result = side.window.handle_event(event);
                 if let PermissionRouting::Taken(Some(mark)) =
                     self.route_permission(result, || Some(PERMISSION_ORIGIN.to_owned()))
-                    && let Some(side) = self.btw.side.as_mut()
+                    && let Some(side) = self.btw.run_side_mut()
                 {
                     mark.apply(side.window.chat_mut());
                 }
@@ -1140,12 +1464,22 @@ impl App {
         }
     }
 
+    /// Files the answer in the thread it answers. One that finished behind
+    /// a closed window says so, since nothing on screen shows it.
     fn settle_btw_run(&mut self, (messages, done): AsideReply) {
+        let shown = self.btw.runs_shown();
         let Some(mut run) = self.btw.run.take() else {
             return;
         };
-        self.withdraw_btw_approvals(mem::take(&mut run.approvals));
-        let Some(side) = self.btw.side.as_mut() else {
+        self.withdraw_btw_approvals(&run.owner, mem::take(&mut run.approvals));
+        if !shown && !run.owner.clarifying {
+            let outcome = match done {
+                Ok(DoneReason::Cancelled) | Err(_) => BACKGROUND_FAILED,
+                Ok(_) => BACKGROUND_ANSWERED,
+            };
+            self.status_bar.flash(background_flash(outcome));
+        }
+        let Some(side) = self.btw.owner_mut(&run.owner) else {
             return;
         };
         let answered = match done {
@@ -1161,9 +1495,9 @@ impl App {
         if let Some(thread) = side.thread.as_mut() {
             thread.settle(answered);
         }
-        side.window.finish_run(Some(run.usage));
-        if let Some(question) = side.window.take_queued() {
-            self.continue_btw(question);
+        side.window.finish_run();
+        if let Some(line) = side.window.take_queued().filter(|_| shown) {
+            self.submit_btw(line);
         }
     }
 
@@ -1171,15 +1505,15 @@ impl App {
     /// finished, which settles as it would have on the next tick. Either
     /// way the question queued behind it goes back to the composer unsent.
     pub(super) fn stop_btw_run(&mut self) {
-        if let Some(side) = self.btw.side.as_mut() {
+        if let Some(side) = self.btw.run_side_mut() {
             side.window.unqueue();
         }
         let _ = self.poll_btw_run();
         let Some(mut run) = self.btw.run.take() else {
             return;
         };
-        self.withdraw_btw_approvals(mem::take(&mut run.approvals));
-        let Some(side) = self.btw.side.as_mut() else {
+        self.withdraw_btw_approvals(&run.owner, mem::take(&mut run.approvals));
+        let Some(side) = self.btw.owner_mut(&run.owner) else {
             return;
         };
         if let Some(thread) = side.thread.as_mut() {
@@ -1189,16 +1523,16 @@ impl App {
         chat.flush();
         chat.cancel_in_progress();
         side.window.push_notice(STOPPED_NOTE);
-        side.window.finish_run(Some(run.usage));
+        side.window.finish_run();
     }
 
     /// Takes a run's approvals off the prompt as the run goes. Stopping the
     /// run cancels each call still waiting on one, and the permission
     /// manager drops its request, so none is left for the reader to answer.
-    fn withdraw_btw_approvals(&mut self, approvals: HashSet<String>) {
+    fn withdraw_btw_approvals(&mut self, owner: &RunOwner, approvals: HashSet<String>) {
         for request_id in approvals {
             self.permission_prompt.resolve_pending(&request_id);
-            if let Some(side) = self.btw.side.as_mut() {
+            if let Some(side) = self.btw.owner_mut(owner) {
                 side.window.chat_mut().approval_settled(&request_id);
             }
         }
@@ -1212,7 +1546,7 @@ impl App {
 }
 
 #[cfg(test)]
-const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const RUN_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const NO_RUN: &str = "a side question must be running";
 #[cfg(test)]
@@ -1297,6 +1631,8 @@ mod tests {
     const PDF_CALL: &str = "fetch-pdf";
     const PDF_URL: &str = "https://example.com/paper.pdf";
     const PDF_DATA: &str = "JVBERi0xLjc=";
+    const CONTEXT_USED: u32 = 143_500;
+    const CONTEXT_WINDOW: u32 = 372_000;
     const REBASE_MSG: &str =
         "a caught-up thread quotes its earlier exchanges in its first question";
 
@@ -1315,8 +1651,50 @@ mod tests {
         vec![Message::user(BASE.into())]
     }
 
+    fn fork(context: Option<(u32, u32)>) -> ForkPoint {
+        ForkPoint {
+            source: MAIN_SOURCE.to_owned(),
+            context,
+            model: test_model().id,
+        }
+    }
+
     fn thread() -> BtwThread {
-        BtwThread::new(prefix(), base(), HistoryMark::default())
+        BtwThread::new(prefix(), base(), HistoryMark::default(), fork(None))
+    }
+
+    #[test_case(ForkState::Pending, PENDING_PREFIX, false ; "pending")]
+    #[test_case(ForkState::Forked, FORKED_PREFIX, false ; "forked")]
+    #[test_case(ForkState::MovedOn, FORKED_PREFIX, true ; "moved_on")]
+    fn the_header_says_where_the_thread_forks(state: ForkState, opens: &str, moved_on: bool) {
+        let header = fork_header(&fork(Some((CONTEXT_USED, CONTEXT_WINDOW))), state);
+        assert_eq!(header[0], HEADER_INTRO);
+        let row = &header[1];
+        assert!(row.starts_with(opens), "{row}");
+        for part in [
+            format!(
+                "{}/{}",
+                format_tokens(CONTEXT_USED),
+                format_tokens(CONTEXT_WINDOW)
+            ),
+            format!("({}%)", context_share(CONTEXT_USED, CONTEXT_WINDOW)),
+            test_model().id,
+        ] {
+            assert!(row.contains(&part), "{row} must name {part}");
+        }
+        assert_eq!(row.ends_with(MOVED_ON_SUFFIX), moved_on, "{row}");
+    }
+
+    #[test]
+    fn an_unmeasured_conversation_leaves_the_context_out() {
+        let header = fork_header(&fork(None), ForkState::Forked);
+        assert_eq!(
+            header[1],
+            format!(
+                "{FORKED_PREFIX}{MAIN_SOURCE}{HEADER_SEPARATOR}{}",
+                test_model().id
+            )
+        );
     }
 
     fn assistant(content: Vec<ContentBlock>) -> Message {
@@ -1451,6 +1829,7 @@ mod tests {
                 epoch: None,
                 len: 2,
             },
+            fork(None),
         );
         thread.ask(FOLLOW_UP.into());
         thread

@@ -18,7 +18,7 @@ use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use workcell_tool_contract::shell_env::{
     EnvPattern, EnvPatternError, ShellEnvironmentSelection, is_shell_startup_variable,
     is_valid_variable_name, looks_secret, validate_literal,
@@ -49,6 +49,7 @@ pub(crate) const FILTER_LABEL: &str = "/";
 pub(crate) const CONFIRM_LABEL: &str = "y";
 pub(crate) const SECRET_LABEL: &str = "s";
 pub(crate) const MOVE_LABEL: &str = "m";
+const RENEW_LABEL: &str = "r";
 const TOGGLE_KEY: char = ' ';
 const ADD_KEY: char = ascii_key(ADD_LABEL);
 pub(crate) const EDIT_KEY: char = ascii_key(EDIT_LABEL);
@@ -59,6 +60,7 @@ const FILTER_KEY: char = ascii_key(FILTER_LABEL);
 const CONFIRM_KEY: char = ascii_key(CONFIRM_LABEL);
 const SECRET_KEY: char = ascii_key(SECRET_LABEL);
 const MOVE_KEY: char = ascii_key(MOVE_LABEL);
+const RENEW_KEY: char = ascii_key(RENEW_LABEL);
 const COMMAND_KEYS: &[char] = &[
     TOGGLE_KEY,
     ADD_KEY,
@@ -69,6 +71,7 @@ const COMMAND_KEYS: &[char] = &[
     FILTER_KEY,
     SECRET_KEY,
     MOVE_KEY,
+    RENEW_KEY,
 ];
 const TITLE: &str = " Environment ";
 const LOCAL_TAB: &str = "Local";
@@ -84,8 +87,10 @@ const NOT_LOADED: &str = "Wait for the list to load.";
 const EDIT_HINT: &str = "Select a set value or a secret to edit it.";
 const DELETE_HINT: &str = "Select a set value, a pass pattern or a secret to delete it.";
 const MOVE_HINT: &str = "Select a secret to move it between this session and all sessions.";
+const RENEW_HINT: &str = "Select a session secret to add 24 hours to it.";
+const NEVER_EXPIRES: &str = "A remembered secret never expires.";
 const NO_SECRETS: &str = "No secrets yet. Press s to save one.";
-const EXPIRED_MOVE: &str = "This secret expired. Press e to save a new value first.";
+const EXPIRED_HINT: &str = "This secret expired. Press e to save a new value first.";
 const SECRET_VALUE_HINT: &str = "Caudra keeps the value out of chat and the transcript. This session's shell commands receive it as a variable with this name. Tab switches fields, Enter saves, Esc cancels.";
 const REPLACE_SECRET_HINT: &str =
     "Caudra never shows the old value. Type the new one. Enter saves, Esc cancels.";
@@ -150,6 +155,10 @@ pub(crate) enum SecretEdit {
         name: String,
         from: SecretScope,
         foreign: ForeignEntry,
+    },
+    /// Adds a lifetime to a live session secret.
+    Extend {
+        name: String,
     },
 }
 
@@ -441,6 +450,7 @@ impl EnvModal {
             Some(PATTERN_KEY) => self.open_pattern_form(),
             Some(SECRET_KEY) => self.open_secret_form(),
             Some(MOVE_KEY) => self.move_selected(),
+            Some(RENEW_KEY) => self.renew_selected(),
             Some(REVEAL_KEY) => {
                 self.toggle_reveal();
                 EnvAction::Consumed
@@ -629,16 +639,7 @@ impl EnvModal {
             self.message = Some(MOVE_HINT.to_owned());
             return EnvAction::Consumed;
         };
-        if self.refuse_if_blocked() {
-            return EnvAction::Consumed;
-        }
-        let expired = self
-            .local
-            .as_ref()
-            .and_then(|local| local.secret(&name, from))
-            .is_some_and(SecretListing::expired);
-        if expired {
-            self.message = Some(EXPIRED_MOVE.to_owned());
+        if self.refuse_if_blocked() || self.refuse_if_expired(&name, from) {
             return EnvAction::Consumed;
         }
         self.commit(Change::Secret(SecretEdit::Move {
@@ -646,6 +647,37 @@ impl EnvModal {
             from,
             foreign: ForeignEntry::Refuse,
         }))
+    }
+
+    /// Adds 24 hours to the selected session secret, from when it would have expired.
+    fn renew_selected(&mut self) -> EnvAction {
+        let name = match self.selected_secret() {
+            Some((name, SecretScope::Session)) => name,
+            Some((_, SecretScope::Remembered)) => {
+                self.message = Some(NEVER_EXPIRES.to_owned());
+                return EnvAction::Consumed;
+            }
+            None => {
+                self.message = Some(RENEW_HINT.to_owned());
+                return EnvAction::Consumed;
+            }
+        };
+        if self.refuse_if_blocked() || self.refuse_if_expired(&name, SecretScope::Session) {
+            return EnvAction::Consumed;
+        }
+        self.commit(Change::Secret(SecretEdit::Extend { name }))
+    }
+
+    fn refuse_if_expired(&mut self, name: &str, scope: SecretScope) -> bool {
+        let expired = self
+            .local
+            .as_ref()
+            .and_then(|local| local.secret(name, scope))
+            .is_some_and(SecretListing::expired);
+        if expired {
+            self.message = Some(EXPIRED_HINT.to_owned());
+        }
+        expired
     }
 
     /// Whether this tab lists the session's secrets: only a shell on this machine receives them.
@@ -771,7 +803,9 @@ impl EnvModal {
             Change::Secret(SecretEdit::Delete { name, .. }) => Some(delete_secret_prompt(name)),
             Change::Unforward(_, Unforward::Exact)
             | Change::SetValue { .. }
-            | Change::Secret(SecretEdit::Save { .. } | SecretEdit::Move { .. }) => None,
+            | Change::Secret(
+                SecretEdit::Save { .. } | SecretEdit::Move { .. } | SecretEdit::Extend { .. },
+            ) => None,
         };
         match prompt {
             Some(prompt) => {
@@ -866,6 +900,10 @@ impl EnvModal {
         {
             row.reveal();
         }
+        let header = Text::from(self.header_lines(rows.iter())).to_string();
+        for row in &mut rows {
+            row.size_info(&header);
+        }
         let checked = rows.iter().map(|row| row.checked).collect();
         let toggleable = rows.iter().map(EnvRow::toggleable).collect();
         self.picker
@@ -886,6 +924,28 @@ impl EnvModal {
 
     fn info_lines(&self) -> Vec<Line<'static>> {
         let t = theme::current();
+        let mut lines = self.header_lines((0..).map_while(|index| self.picker.item(index)));
+        let status = if let Some(pending) = &self.pending {
+            Some((pending.prompt.clone(), t.tool_warning))
+        } else if self.work == Some(Work::Write) {
+            Some((SAVING.to_owned(), t.tool_dim))
+        } else if let Some(message) = &self.message {
+            Some((message.clone(), t.tool_dim))
+        } else {
+            self.picker
+                .selected_item()
+                .and_then(|row| row.note.clone())
+                .map(|note| (note, t.item_desc))
+        };
+        if let Some((text, style)) = status {
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        lines
+    }
+
+    /// The tabs, the banner and the counts, which every row shares above its note.
+    fn header_lines<'a>(&self, rows: impl Iterator<Item = &'a EnvRow>) -> Vec<Line<'static>> {
+        let t = theme::current();
         let mut lines = Vec::new();
         if let EnvTarget::Sandbox(sandbox) = &self.target {
             let style = |tab| match self.tab == tab {
@@ -903,22 +963,7 @@ impl EnvModal {
         }
         lines.push(Line::from(self.banner()));
         if self.loaded() {
-            lines.push(Line::from(Span::styled(self.counts(), t.tool_dim)));
-        }
-        let status = if let Some(pending) = &self.pending {
-            Some((pending.prompt.clone(), t.tool_warning))
-        } else if self.work == Some(Work::Write) {
-            Some((SAVING.to_owned(), t.tool_dim))
-        } else if let Some(message) = &self.message {
-            Some((message.clone(), t.tool_dim))
-        } else {
-            self.picker
-                .selected_item()
-                .and_then(|row| row.note.clone())
-                .map(|note| (note, t.item_desc))
-        };
-        if let Some((text, style)) = status {
-            lines.push(Line::from(Span::styled(text, style)));
+            lines.push(Line::from(Span::styled(self.counts(rows), t.tool_dim)));
         }
         lines
     }
@@ -950,11 +995,8 @@ impl EnvModal {
         }
     }
 
-    fn counts(&self) -> String {
-        let rows: Vec<&EnvRow> = (0..)
-            .map_while(|index| self.picker.item(index))
-            .filter(|row| row.section != SECRETS_SECTION)
-            .collect();
+    fn counts<'a>(&self, rows: impl Iterator<Item = &'a EnvRow>) -> String {
+        let rows: Vec<&EnvRow> = rows.filter(|row| row.section != SECRETS_SECTION).collect();
         let forwarded = rows
             .iter()
             .filter(|row| row.section == FORWARDED_SECTION || row.action == RowAction::SetEntry)
@@ -1092,6 +1134,7 @@ fn browse_hints() -> Vec<Hint> {
 fn secret_footer() -> Vec<Hint> {
     vec![
         Hint::char(EDIT_LABEL, "replace"),
+        Hint::char(RENEW_LABEL, "+24h"),
         Hint::char(MOVE_LABEL, "move"),
         Hint::char(DELETE_LABEL, "delete"),
         Hint::char(SECRET_LABEL, "new secret"),
@@ -1168,6 +1211,7 @@ mod tests {
     const SECOND_GUEST: &str = "GUEST_TWO";
     const SCREEN_WIDTH: u16 = 160;
     const SCREEN_HEIGHT: u16 = 40;
+    const NARROW_SCREEN_WIDTH: u16 = 72;
     const SHOWN_UNREVEALED: &str = "a value must stay masked until its row is revealed";
     const REVEAL_LEAKED: &str = "revealing one row must not reveal another";
     const REVEAL_STUCK: &str = "moving off a revealed row masks it again";
@@ -1757,7 +1801,64 @@ mod tests {
             press(modal, KeyCode::Char(MOVE_KEY)),
             EnvAction::Consumed
         ));
-        assert!(info(modal).contains(EXPIRED_MOVE));
+        assert!(info(modal).contains(EXPIRED_HINT));
+    }
+
+    #[test]
+    fn r_extends_a_session_secret() {
+        let mut fixture = secrets_fixture(no_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, SESSION_SECRET);
+
+        assert!(matches!(
+            secret_edit(press(modal, KeyCode::Char(RENEW_KEY))),
+            SecretEdit::Extend { name } if name == SESSION_SECRET
+        ));
+    }
+
+    #[test_case(EXPIRED_SECRET, EXPIRED_HINT ; "expired")]
+    #[test_case(REMEMBERED_SECRET, NEVER_EXPIRES ; "remembered")]
+    fn r_says_why_a_secret_is_not_extended(name: &str, reason: &str) {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        select_secret(modal, name);
+
+        assert!(matches!(
+            press(modal, KeyCode::Char(RENEW_KEY)),
+            EnvAction::Consumed
+        ));
+        assert!(info(modal).contains(reason));
+    }
+
+    #[test]
+    fn r_on_a_variable_points_at_the_session_secrets() {
+        let mut fixture = local_fixture("", &[(PLAIN_NAME, "on", EnvSource::Process)]);
+        let modal = &mut fixture.modal;
+        select(modal, PLAIN_NAME);
+
+        assert!(matches!(
+            press(modal, KeyCode::Char(RENEW_KEY)),
+            EnvAction::Consumed
+        ));
+        assert!(info(modal).contains(RENEW_HINT));
+    }
+
+    #[test]
+    fn moving_the_selection_never_resizes_the_popup() {
+        let mut fixture = secrets_fixture(remembered_config, &every_scope(), EnvTarget::Local);
+        let modal = &mut fixture.modal;
+        let mut terminal =
+            Terminal::new(TestBackend::new(NARROW_SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
+        let mut popups = Vec::new();
+        for _ in 0..rows(modal).len() {
+            terminal
+                .draw(|frame| popups.push(modal.view(frame, frame.area())))
+                .unwrap();
+            press(modal, KeyCode::Down);
+        }
+
+        assert!(popups.len() > 1);
+        assert!(popups.iter().all(|popup| *popup == popups[0]), "{popups:?}");
     }
 
     #[test_case(EnvTarget::Remote { label: REMOTE_LABEL.to_owned() } ; "remote")]

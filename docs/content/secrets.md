@@ -29,7 +29,7 @@ The `execution_environment` tool lists `NAME (session secret)` among the forward
 
 ## Session and remembered secrets
 
-A session secret lasts 24 hours from when it was last saved. It survives quitting and resuming. After 24 hours shell commands stop receiving it, and `/env` marks it `expired`. Caudra keeps it in an owner-only file under `sessions/<id>/secrets/` in the [state directory](/docs/configuration/#directory-layout), and deleting the session deletes it.
+A session secret lasts 24 hours from when it was last saved. Each `r` in `/secrets` adds another 24 hours. It survives quitting and resuming. When it runs out, shell commands stop receiving it, and `/env` marks it `expired`. Caudra keeps it in an owner-only file under `sessions/<id>/secrets/` in the [state directory](/docs/configuration/#directory-layout), and deleting the session deletes it.
 
 A remembered secret is an owner-only file, `secrets/<NAME>` in the state directory. Caudra adds an `[agent.shell_env] set` entry to the global `caudra.toml` that reads it:
 
@@ -42,12 +42,13 @@ It reaches every local session from the next shell command, as any [forwarded va
 
 ## Manage secrets
 
-`/secrets` opens [`/env`](/docs/cli/#forwarding-more-variables) at its Secrets section. Each row shows a name, a `session` or `remembered` badge, and how long a session secret has left. Values are always masked, and `r` cannot reveal them.
+`/secrets` opens [`/env`](/docs/cli/#forwarding-more-variables) at its Secrets section. Each row shows a name, a `session` or `remembered` badge, and how long a session secret has left. Values are always masked, and `v` cannot reveal them.
 
 | Key | Action |
 |---|---|
 | `s` | Save a new secret, for this session |
 | `e` | Replace the selected secret. The field starts empty, because Caudra never shows the old value |
+| `r` | Add 24 hours to the selected session secret. An expired one needs a new value from `e` |
 | `m` | Move the selected secret between this session and all sessions |
 | `d` | Delete the selected secret, after you confirm |
 

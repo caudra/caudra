@@ -60,7 +60,7 @@ impl Extraction {
         let chat = self.window.chat_mut();
         chat.flush();
         chat.push(DisplayMessage::new(DisplayRole::Error, message));
-        self.window.finish_run(None);
+        self.window.finish_run();
     }
 
     /// Stops the request and keeps what it streamed.
@@ -70,7 +70,7 @@ impl Extraction {
         chat.flush();
         chat.cancel_in_progress();
         self.window.push_notice(STOPPED_NOTE);
-        self.window.finish_run(None);
+        self.window.finish_run();
     }
 }
 
@@ -230,15 +230,18 @@ impl App {
                     model,
                     purpose,
                     account,
-                } => self.settle_side_spend(
-                    &provider,
-                    account.as_deref(),
-                    &model,
-                    purpose,
-                    usage,
-                    cost,
-                    billing,
-                ),
+                } => {
+                    extraction.window.record_request(usage, cost, billing);
+                    self.settle_side_spend(
+                        &provider,
+                        account.as_deref(),
+                        &model,
+                        purpose,
+                        usage,
+                        cost,
+                        billing,
+                    );
+                }
                 AgentEvent::MessageStarted {
                     id,
                     model,
@@ -252,7 +255,7 @@ impl App {
                     });
                 }
                 AgentEvent::Error { message } => extraction.fail(message),
-                AgentEvent::Done { usage, .. } => extraction.window.finish_run(Some(usage)),
+                AgentEvent::Done { .. } => extraction.window.finish_run(),
                 event => {
                     extraction.window.handle_event(event);
                 }
