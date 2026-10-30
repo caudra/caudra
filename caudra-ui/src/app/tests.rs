@@ -20674,8 +20674,11 @@ fn btw_modal_key_routing_and_animation() {
     assert!(actions.is_empty());
     let _ = app.tick();
     assert!(!app.btw.is_open());
-    assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
-    assert_eq!(app.btw.cadence(), Cadence::IDLE);
+    assert!(app.btw.is_running(), "{BTW_RUN_KEPT}");
+    assert_eq!(
+        app.btw.cadence(),
+        Cadence::polling(super::btw::BACKGROUND_POLL)
+    );
 }
 
 /// A held `Backspace` keeps deleting in the follow-up, as it does in the
@@ -21232,7 +21235,7 @@ fn interrupting_a_btw_answer_unqueues_the_question_behind_it() {
 }
 
 #[test]
-fn closing_mid_answer_keeps_the_thread_without_the_stopped_question() {
+fn reopening_mid_answer_shows_the_question_still_running() {
     let mut app = btw_ready_app();
     app.start_btw(BTW_QUESTION.into());
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -21241,22 +21244,19 @@ fn closing_mid_answer_keeps_the_thread_without_the_stopped_question() {
     press_ask_btw(&mut app);
 
     assert_eq!(btw_questions(&app), [BTW_QUESTION], "{BTW_THREAD_KEPT}");
-    let thread = app.btw.thread().unwrap();
-    assert_eq!(thread.exchange_count(), 0);
-    assert!(thread.pending().is_none());
+    assert!(app.btw.is_running(), "{BTW_RUN_KEPT}");
+    assert!(app.btw.window().is_some_and(SideTranscript::is_running));
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_QUESTION));
 }
 
-/// Closing the window or interrupting the answer drops the request the
-/// provider was answering, rather than leaving it to run unseen.
-#[test_case(key(KeyCode::Esc), false ; "escape_closes")]
-#[test_case(kb::QUIT.to_key_event(), true ; "ctrl_c_interrupts")]
-fn leaving_a_btw_answer_stops_its_run(pressed: KeyEvent, stays_open: bool) {
+#[test]
+fn interrupting_a_btw_answer_stops_its_run() {
     let (held, requests) = flume::unbounded();
     let mut app = btw_app_over(Arc::new(HeldProvider(held)));
     app.start_btw(BTW_QUESTION.into());
     let request = requests.recv_timeout(BTW_RUN_DEADLINE).expect(BTW_NOT_SENT);
 
-    app.update(Msg::Key(pressed));
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
     let _ = app.tick();
 
     assert!(!app.btw.is_running(), "{BTW_RUN_LEFT}");
@@ -21265,7 +21265,76 @@ fn leaving_a_btw_answer_stops_its_run(pressed: KeyEvent, stays_open: bool) {
         Err(flume::RecvTimeoutError::Disconnected),
         "{BTW_RUN_LEFT}"
     );
-    assert_eq!(app.btw.is_open(), stays_open);
+    assert!(app.btw.is_open());
+}
+
+#[test]
+fn closing_a_btw_answer_leaves_its_request_running() {
+    let (held, requests) = flume::unbounded();
+    let mut app = btw_app_over(Arc::new(HeldProvider(held)));
+    app.start_btw(BTW_QUESTION.into());
+    let request = requests.recv_timeout(BTW_RUN_DEADLINE).expect(BTW_NOT_SENT);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    assert!(!app.btw.is_open());
+    assert!(app.btw.is_running(), "{BTW_RUN_KEPT}");
+    assert_eq!(
+        request.try_recv(),
+        Err(flume::TryRecvError::Empty),
+        "{BTW_RUN_KEPT}"
+    );
+}
+
+#[test_case(true, super::btw::BACKGROUND_ANSWERED ; "answered")]
+#[test_case(false, super::btw::BACKGROUND_FAILED ; "failed")]
+fn a_closed_btw_settles_into_its_thread_and_says_so(answers: bool, flash: &str) {
+    let (mut app, script) = btw_scripted_app();
+    app.start_btw(BTW_QUESTION.into());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    match answers {
+        true => script.responses.send(btw_reply(BTW_ANSWER)).unwrap(),
+        false => drop(script),
+    }
+    app.await_btw_run();
+
+    assert!(!app.btw.is_open() && !app.btw.is_running());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::background_flash(flash).as_str())
+    );
+    press_ask_btw(&mut app);
+    let thread = app.btw.thread().unwrap();
+    assert_eq!(thread.exchange_count(), usize::from(answers));
+    assert!(thread.pending().is_none());
+    assert_eq!(
+        app.btw
+            .window()
+            .and_then(SideTranscript::text)
+            .is_some_and(|text| text == BTW_ANSWER),
+        answers
+    );
+}
+
+#[test]
+fn asking_again_while_a_closed_btw_still_answers_keeps_the_question_unsent() {
+    let mut app = btw_ready_app();
+    app.start_btw(BTW_QUESTION.into());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    app.start_btw(BTW_FOLLOW_UP.into());
+
+    assert!(app.btw.is_open() && app.btw.is_running(), "{BTW_RUN_KEPT}");
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::STILL_ANSWERING)
+    );
+    assert_eq!(btw_input(&app), BTW_FOLLOW_UP);
+    assert_eq!(app.btw.thread().unwrap().pending(), Some(BTW_QUESTION));
 }
 
 #[test]
@@ -21461,6 +21530,93 @@ fn chat_notices(app: &App, index: usize) -> Vec<String> {
         .collect()
 }
 
+/// The header row under the window's intro, which says where it forks.
+fn btw_fork_row(app: &App) -> String {
+    let header = app
+        .btw
+        .window()
+        .map(SideTranscript::header)
+        .unwrap_or_default();
+    assert_eq!(
+        header.first().map(String::as_str),
+        Some(super::btw::HEADER_INTRO)
+    );
+    header.get(1).cloned().unwrap_or_default()
+}
+
+#[test]
+fn the_btw_header_follows_the_thread_from_fork_to_moved_on() {
+    use super::btw::{FORKED_PREFIX, MAIN_SOURCE, MOVED_ON_SUFFIX, PENDING_PREFIX, PENDING_SUFFIX};
+    let (mut app, script) = btw_scripted_app();
+
+    press_ask_btw(&mut app);
+    assert!(
+        btw_fork_row(&app).starts_with(&format!("{PENDING_PREFIX}{MAIN_SOURCE}{PENDING_SUFFIX}")),
+        "{}",
+        btw_fork_row(&app)
+    );
+
+    app.update(Msg::Paste(BTW_QUESTION.into()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(btw_fork_row(&app).starts_with(&format!("{FORKED_PREFIX}{MAIN_SOURCE}")));
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+
+    advance_main_history(&mut app, false);
+    let _ = app.tick();
+    assert!(
+        btw_fork_row(&app).ends_with(&format!("{MAIN_SOURCE}{MOVED_ON_SUFFIX}")),
+        "{}",
+        btw_fork_row(&app)
+    );
+}
+
+#[test]
+fn a_task_btw_header_names_the_task() {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, TaskSource::Live, true);
+
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+
+    let task = format!(
+        "{}{}{}",
+        super::btw::FORKED_PREFIX,
+        super::btw::TASK_SOURCE_PREFIX,
+        app.chats[1].name
+    );
+    assert!(
+        btw_fork_row(&app).starts_with(&task),
+        "{}",
+        btw_fork_row(&app)
+    );
+}
+
+#[test]
+fn a_btw_asked_in_another_chat_stops_the_closed_one() {
+    let mut app = focused_task_btw_app();
+    let _live = task_btw_source(&mut app, TaskSource::Live, true);
+    ask_aside(&mut app, &format!("/btw {BTW_QUESTION}"));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    app.active_chat = 0;
+    app.sync_subagent_input_target();
+    app.start_btw(BTW_FOLLOW_UP.into());
+    assert!(app.btw.is_running());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    press_ask_btw(&mut app);
+
+    let thread = app.btw.thread().unwrap();
+    assert!(
+        thread.pending().is_none(),
+        "only one side question runs at a time"
+    );
+    assert_eq!(thread.exchange_count(), 0);
+}
+
 #[test_case(TaskSource::Live, true ; "open_task_continues_its_own_prefix")]
 #[test_case(TaskSource::Live, false ; "open_task_without_a_prefix_borrows_mains")]
 #[test_case(TaskSource::Finished, true ; "finished_task_reads_the_kept_transcript")]
@@ -21534,6 +21690,7 @@ const BTW_READ_SCOPE: &str = "/tmp/btw.rs";
 const BTW_RUN_DEADLINE: Duration = Duration::from_secs(30);
 const BTW_NOT_SENT: &str = "the side question never reached the provider";
 const BTW_RUN_LEFT: &str = "leaving /btw must stop the run it was showing";
+const BTW_RUN_KEPT: &str = "closing /btw must leave its answer running";
 const BTW_TOOL_TURNS_KEPT: &str = "a follow-up must carry the tool turns of the answer before it";
 
 /// A btw whose first answer has landed, with the follow-up typed but not yet
@@ -21675,6 +21832,27 @@ fn the_btw_run_goes_on_after_its_approval_is_answered(answer: PermissionAnswer, 
     let (content, is_error) = btw_read_result(&requests).expect("the read reached the model");
     assert_eq!(is_error, refused);
     assert_eq!(content == MOCK_TOOL_OUTPUT, !refused, "{content}");
+}
+
+#[test]
+fn the_line_under_a_btw_answer_counts_every_request_it_made() {
+    let (mut app, script, request_id) = btw_awaiting_approval();
+    app.apply_permission_decision(PermissionDecision {
+        request_id,
+        answer: PermissionAnswer::AllowOnce,
+    });
+    app.finish_permission_jobs();
+    script.responses.send(btw_reply(BTW_ANSWER)).unwrap();
+    app.await_btw_run();
+
+    let chat = app.btw.window().unwrap().chat();
+    let summary = (0..chat.message_count())
+        .filter_map(|i| chat.message_at(i))
+        .rfind(|message| message.role == DisplayRole::Notice)
+        .map(|message| message.text.clone())
+        .unwrap_or_default();
+    let requests = crate::components::counted(2, crate::components::side_transcript::REQUEST_NOUN);
+    assert!(summary.contains(&requests), "{summary}");
 }
 
 #[test_case(App::close_btw ; "close")]

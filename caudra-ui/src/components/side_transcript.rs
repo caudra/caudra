@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use caudra_agent::{AgentEvent, format_live_duration, format_settled_duration};
 use caudra_grab::grab_scope;
-use caudra_providers::TokenUsage;
+use caudra_providers::{Billing, TokenUsage, format_tokens};
 use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -23,9 +23,10 @@ use crate::chat::{Chat, ChatEventResult};
 use crate::components::input::control_tip;
 use crate::components::keybindings::key;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
+use crate::components::status_bar::short_spend;
 use crate::components::tooltip::{Tip, TipKey};
 use crate::components::{
-    DisplayMessage, DisplayRole, Overlay, field_styles, format_compact, input_text_style,
+    DisplayMessage, DisplayRole, Overlay, counted, field_styles, input_text_style,
 };
 use crate::repaint::{Cadence, Dirty};
 use crate::selection::{Selection, SelectionZone, apply_highlight};
@@ -71,8 +72,8 @@ const QUEUED_PREFIX: &str = "queued: ";
 const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
 const ASK_PLACEHOLDER: &str = "Ask about this conversation…";
 const DRAFT_SEPARATOR: &str = " | ";
-const TOKENS_IN: &str = " in";
-const TOKENS_CACHED: &str = " cached";
+const CONTEXT_SUFFIX: &str = " context";
+pub(crate) const REQUEST_NOUN: &str = "request";
 const TOKENS_OUT: &str = " out";
 const SUMMARY_SEPARATOR: &str = " · ";
 /// Drawn under the last answer a thread kept from before the conversation it
@@ -219,38 +220,56 @@ pub(crate) enum SideAction {
     Interrupt,
 }
 
-/// What an exchange cost: how long it took, then the prompt, cached and output
-/// tokens when the provider reported them.
-fn usage_summary(settled: Duration, usage: Option<TokenUsage>) -> String {
-    let mut summary = format_settled_duration(settled);
-    let Some(usage) = usage else {
-        return summary;
-    };
-    let input =
-        u64::from(usage.input) + u64::from(usage.cache_read) + u64::from(usage.cache_creation);
-    summary.push_str(&format!(
-        "{SUMMARY_SEPARATOR}{}{TOKENS_IN}",
-        format_compact(input)
-    ));
-    if usage.cache_read > 0 {
-        summary.push_str(&format!(
-            "{SUMMARY_SEPARATOR}{}{TOKENS_CACHED}",
-            format_compact(u64::from(usage.cache_read))
-        ));
+/// What a run spent, request by request. Every request resends the whole
+/// conversation, so their prompts are not added up: the context is the last
+/// request's, which is what the status bar's gauge measures.
+#[derive(Default)]
+struct RunSpend {
+    requests: usize,
+    context: u32,
+    output: u32,
+    billed: Option<f64>,
+    covered: Option<f64>,
+}
+
+impl RunSpend {
+    fn record(&mut self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
+        self.requests += 1;
+        self.context = usage.context_tokens();
+        self.output = self.output.saturating_add(usage.output);
+        let total = match billing {
+            Billing::Api => &mut self.billed,
+            Billing::Subscription => &mut self.covered,
+        };
+        if let Some(cost) = cost {
+            *total = Some(total.unwrap_or_default() + cost);
+        }
     }
-    summary.push_str(&format!(
-        "{SUMMARY_SEPARATOR}{}{TOKENS_OUT}",
-        format_compact(u64::from(usage.output))
-    ));
-    summary
+
+    /// How long the run took, then its context, requests, output and cost
+    /// when any request reported them.
+    fn summary(&self, settled: Duration) -> String {
+        let mut parts = vec![format_settled_duration(settled)];
+        if self.requests > 0 {
+            parts.push(format!("{}{CONTEXT_SUFFIX}", format_tokens(self.context)));
+            parts.push(counted(self.requests, REQUEST_NOUN));
+            parts.push(format!("{}{TOKENS_OUT}", format_tokens(self.output)));
+            parts.extend(short_spend(self.billed, self.covered));
+        }
+        parts.join(SUMMARY_SEPARATOR)
+    }
 }
 
 pub(crate) struct SideTranscript {
     open: bool,
     title: &'static str,
     footer: SideFooter,
+    /// Pinned above the transcript: the first row in the accent, the rest
+    /// dimmed.
+    header: Vec<String>,
     chat: Chat,
     input: TextField,
+    spend: RunSpend,
     /// A question taken while a run was live, held until the owner can send it.
     queued: Option<String>,
     /// When the live run started, which is also what says one is live.
@@ -274,8 +293,10 @@ impl SideTranscript {
             open: false,
             title,
             footer,
+            header: Vec::new(),
             chat,
             input: TextField::new(FieldKind::Line),
+            spend: RunSpend::default(),
             queued: None,
             started: None,
             footer_hits: FooterHits::default(),
@@ -316,18 +337,39 @@ impl SideTranscript {
         ChatEventResult::Continue
     }
 
+    /// Pins `header` above the transcript. Dirty only when it changed.
+    pub fn set_header(&mut self, header: Vec<String>) -> Dirty {
+        if self.header == header {
+            return Dirty::NO;
+        }
+        self.header = header;
+        Dirty::YES
+    }
+
+    #[cfg(test)]
+    pub fn header(&self) -> &[String] {
+        &self.header
+    }
+
     /// Starts the status row's clock for a run the owner just started.
     pub fn begin_run(&mut self) {
         self.started = Some(Instant::now());
+        self.spend = RunSpend::default();
+    }
+
+    /// Counts one request of the live run towards the line under its answer.
+    pub fn record_request(&mut self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
+        self.spend.record(usage, cost, billing);
     }
 
     /// Stops the clock and says under the answer what the run took and cost.
-    pub fn finish_run(&mut self, usage: Option<TokenUsage>) {
+    pub fn finish_run(&mut self) {
         let Some(started) = self.started.take() else {
             return;
         };
         self.chat.flush();
-        self.push_notice(usage_summary(live_elapsed(started), usage));
+        let summary = self.spend.summary(live_elapsed(started));
+        self.push_notice(summary);
     }
 
     pub fn is_running(&self) -> bool {
@@ -725,6 +767,23 @@ impl SideTranscript {
             + FOOTER_ROW
     }
 
+    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let theme = theme::current();
+        let lines: Vec<Line> = self
+            .header
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                let style = match row {
+                    0 => theme.accent,
+                    _ => theme.tool_dim,
+                };
+                Line::from(Span::styled(text.clone(), style))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
     fn draw_status(frame: &mut Frame, area: Rect, started: Instant) {
         let theme = theme::current();
         let elapsed = live_elapsed(started);
@@ -753,8 +812,15 @@ impl SideTranscript {
             max_height_percent: PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, area.height);
+        let header_rows = u16::try_from(self.header.len())
+            .unwrap_or(u16::MAX)
+            .min(inner.height);
         let body = Rect {
-            height: inner.height.saturating_sub(self.chrome_rows()),
+            y: inner.y + header_rows,
+            height: inner
+                .height
+                .saturating_sub(header_rows)
+                .saturating_sub(self.chrome_rows()),
             ..inner
         };
         let mut row = body.bottom();
@@ -771,6 +837,13 @@ impl SideTranscript {
         let input = self.footer.has_composer().then(|| claim(INPUT_ROW));
         let footer_row = claim(FOOTER_ROW);
 
+        self.draw_header(
+            frame,
+            Rect {
+                height: header_rows,
+                ..inner
+            },
+        );
         self.chat.view(frame, body, self.sweeping, false);
         if let Some(sweep) = self.sweep
             && let Some(screen) = sweep.to_screen(self.chat.scroll_top())
@@ -849,6 +922,7 @@ impl Overlay for SideTranscript {
 mod tests {
     use caudra_config::UiConfig;
     use caudra_lua::EventHandle;
+    use caudra_providers::NOT_BILLED_MARK;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -869,7 +943,11 @@ mod tests {
     const HEIGHT: u16 = 24;
     const FILLER_ROWS: usize = 60;
     const INPUT_TOKENS: u32 = 1_200;
+    const PROMPT_TOKENS: u32 = 143_500;
     const OUTPUT_TOKENS: u32 = 340;
+    const REQUEST_COST: f64 = 0.02;
+    const HEADER_TOP: &str = "Side conversation";
+    const HEADER_FORK: &str = "Forked from main";
     const NOT_DRAWN: &str = "the window must draw what it was given";
     const STILL_FOLLOWING: &str = "a scroll key must move the transcript off the bottom";
     const ANSWER_ROW_MISSING: &str = "the answer must be drawn to sweep it";
@@ -1116,23 +1194,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finishing_a_run_says_what_it_cost() {
-        let mut side = window(SideFooter::FollowUp);
-        side.begin_run();
-        side.finish_run(Some(TokenUsage {
+    fn request(prompt: u32) -> TokenUsage {
+        TokenUsage {
             input: INPUT_TOKENS,
+            cache_read: prompt - INPUT_TOKENS,
             output: OUTPUT_TOKENS,
             ..Default::default()
-        }));
+        }
+    }
+
+    /// Each request resends the conversation, so the line names the last
+    /// request's context once and counts the requests rather than adding
+    /// their prompts up.
+    #[test_case(1, Billing::Api, "1 request", "$0.02" ; "one_billed_request")]
+    #[test_case(3, Billing::Api, "3 requests", "$0.06" ; "three_billed_requests")]
+    #[test_case(2, Billing::Subscription, "2 requests", "$0.04" ; "covered_requests")]
+    fn finishing_a_run_says_what_it_cost(
+        requests: u32,
+        billing: Billing,
+        shown_requests: &str,
+        cost: &str,
+    ) {
+        let mut side = window(SideFooter::FollowUp);
+        side.begin_run();
+        for growth in 0..requests {
+            side.record_request(request(PROMPT_TOKENS + growth), Some(REQUEST_COST), billing);
+        }
+        side.finish_run();
         assert!(!side.is_running());
         let note = side.chat().last_message_text();
+        let last = request(PROMPT_TOKENS + requests - 1).context_tokens();
+        let mark = match billing {
+            Billing::Api => "",
+            Billing::Subscription => NOT_BILLED_MARK,
+        };
         for part in [
-            format!("{}{TOKENS_IN}", format_compact(u64::from(INPUT_TOKENS))),
-            format!("{}{TOKENS_OUT}", format_compact(u64::from(OUTPUT_TOKENS))),
+            format!("{}{CONTEXT_SUFFIX}", format_tokens(last)),
+            shown_requests.to_owned(),
+            format!("{}{TOKENS_OUT}", format_tokens(OUTPUT_TOKENS * requests)),
+            format!("{mark}{cost}"),
         ] {
             assert!(note.contains(&part), "{note} must name {part}");
         }
+        let summed = format_tokens(PROMPT_TOKENS * requests);
+        assert!(
+            requests == 1 || !note.contains(&summed),
+            "{note} must not add the prompts up"
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_reached_the_provider_says_only_how_long_it_took() {
+        let mut side = window(SideFooter::FollowUp);
+        side.begin_run();
+        side.finish_run();
+        let note = side.chat().last_message_text();
+        assert!(
+            !note.contains(SUMMARY_SEPARATOR),
+            "{note} must be the duration alone"
+        );
+    }
+
+    #[test]
+    fn the_header_stays_pinned_above_a_scrolled_transcript() {
+        let mut side = answered(SideFooter::FollowUp);
+        for row in 0..FILLER_ROWS {
+            side.push_notice(format!("filler {row}"));
+        }
+        assert_eq!(
+            side.set_header(vec![HEADER_TOP.to_owned(), HEADER_FORK.to_owned()]),
+            Dirty::YES
+        );
+        assert_eq!(
+            side.set_header(vec![HEADER_TOP.to_owned(), HEADER_FORK.to_owned()]),
+            Dirty::NO
+        );
+        for code in [KeyCode::End, KeyCode::PageUp] {
+            side.handle_key(key(code));
+            let rows = rows_under_title(&mut side);
+            assert!(rows[0].contains(HEADER_TOP), "{rows:?}");
+            assert!(rows[1].contains(HEADER_FORK), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn no_header_leaves_the_transcript_at_the_top() {
+        let mut side = answered(SideFooter::Observe);
+        let rows = rows_under_title(&mut side);
+        assert!(rows[0].contains(ANSWER), "{rows:?}");
+    }
+
+    fn rows_under_title(side: &mut SideTranscript) -> Vec<String> {
+        let cells: Vec<char> = buffer_text(&draw(side, WIDE)).chars().collect();
+        cells
+            .chunks(usize::from(WIDE))
+            .map(|row| row.iter().collect::<String>())
+            .skip_while(|row| !row.contains(TITLE.trim()))
+            .skip(1)
+            .collect()
     }
 
     #[test]
