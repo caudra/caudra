@@ -1,6 +1,6 @@
 # Canonical docs
 
-This directory owns the user documentation consumed by the binary and the separate website. Website design, recordings, and publishing rules belong to the website repository.
+This directory owns the user documentation consumed by the binary and the website.
 
 ## Docs style
 
@@ -40,7 +40,7 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 - Every page under `content/` is compiled into Caudra. The agent reads it through the builtin `caudra-docs` skill, and users read it in the `/docs` modal. Rust reads the sources directly and must not require JavaScript tooling or a website build.
 - Pages use YAML `title` and `description` metadata. Do not repeat the title as an H1 in the body. Rust supplies it for terminal/model rendering, and the website supplies it for the browser.
 - `navigation.json` owns navigation groups and ordering for both consumers. List each non-index page exactly once. `index.md` is the plain-Markdown overview, not an HTML navigation manifest.
-- Keep shared content ordinary Markdown. Do not use MDX imports, Astro components, or Starlight-only directives in bundled pages. Site-only presentation belongs in the website repository.
+- Keep shared content ordinary Markdown. Do not use MDX imports, Astro components, or Starlight-only directives in bundled pages. The website adds its own site-only presentation.
 - Tests resolve every `/docs/<page>/#<anchor>` and `#<anchor>` link against the page headings, so renaming a heading means updating its links. Moving a source does not change its public URL or anchors. Example downloads remain at `/docs/<stem>.example.toml`.
 - Search corrects a misspelt word only while that word appears nowhere in the docs. Never write a misspelling as an example.
 - The TUI renders no inline HTML. It keeps the text inside a tag, shows a `badge` span as inline code and `<br>` as a space, and prints blockquotes as plain lines.

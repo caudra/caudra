@@ -158,7 +158,7 @@ The release-notes page is never checked in. `ReleaseNotes::page` in caudra-docs 
 
 Hand-written: quick-start, accounts, web-search, permissions, secrets, skills, mcp, cli, headless, acp, token-economy, context, memory, learning, sessions, review, workbench, worktrees, system-prompts, queue, notifications, telemetry, markdown, automations, and the docs index.
 
-Style, tone, structure, and canonical format rules: `docs/AGENTS.md`. Read it before writing any docs. Website design and publishing rules belong to the separate website repository. Preserve public `/docs/` URLs and section anchors when moving sources.
+Style, tone, structure, and canonical format rules: `docs/AGENTS.md`. Read it before writing any docs. Preserve public `/docs/` URLs and section anchors when moving sources.
 
 ## Release notes
 

@@ -28,6 +28,8 @@ BRANCH = "4" * 40
 TREE = "5" * 40
 BLOB = "6" * 40
 COMMIT = "7" * 40
+MAIN_APPS = "a" * 40
+BRANCH_APPS = "b" * 40
 BOT = {"login": "docs-app[bot]", "id": 123, "type": "Bot"}
 INPUTS = (
     "docs/content/index.md",
@@ -45,6 +47,13 @@ def manifest(revision):
 
 def entry(path, sha=BLOB, mode="100644"):
     return {"path": path, "type": "blob", "mode": mode, "sha": sha}
+
+
+def directories(sha):
+    return [
+        {"path": path, "type": "tree", "mode": "040000", "sha": sha}
+        for path in ("apps", "apps/site")
+    ]
 
 
 class FakeAPI:
@@ -87,8 +96,16 @@ class FakeAPI:
         self.trees = {
             OLD: [entry(path) for path in INPUTS],
             NEW: [entry(path, NEW if path == INPUTS[0] else BLOB) for path in INPUTS],
-            MAIN: [entry("docs-source.json", OLD), entry("package.json")],
-            BRANCH: [entry("docs-source.json", NEW), entry("package.json")],
+            MAIN: [
+                entry(UPDATER.MANIFEST, OLD),
+                *directories(MAIN_APPS),
+                entry("package.json"),
+            ],
+            BRANCH: [
+                entry(UPDATER.MANIFEST, NEW),
+                *directories(BRANCH_APPS),
+                entry("package.json"),
+            ],
         }
         self.blobs = {OLD: manifest(OLD), NEW: manifest(NEW)}
         self.commits = {}
@@ -130,12 +147,12 @@ class FakeAPI:
             "user": BOT.copy(),
             "head": {
                 "ref": "automation/docs-source",
-                "repo": {"full_name": "caudra/website"},
+                "repo": {"full_name": UPDATER.WEBSITE},
                 "sha": self.branch,
             },
             "base": {
                 "ref": "main",
-                "repo": {"full_name": "caudra/website"},
+                "repo": {"full_name": UPDATER.WEBSITE},
                 "sha": self.main,
             },
         }
@@ -157,7 +174,7 @@ class FakeAPI:
     def request(self, repo, path, method="GET", data=None, missing=False):
         if repo is None and path == f"users/{BOT['login']}":
             return BOT
-        expected = "caudra/caudra" if self.source else "caudra/website"
+        expected = "caudra/caudra" if self.source else UPDATER.WEBSITE
         if repo != expected:
             raise AssertionError(f"Token used for wrong repository: {repo}")
         if self.before_request:
@@ -167,7 +184,7 @@ class FakeAPI:
             self.mutations.append((path, method, data))
             if path == "git/trees":
                 self.trees[TREE] = copy.deepcopy(self.trees[MAIN])
-                self.trees[TREE][0] = entry("docs-source.json", COMMIT)
+                self.trees[TREE][0] = entry(UPDATER.MANIFEST, COMMIT)
                 self.blobs[COMMIT] = json.loads(data["tree"][0]["content"])
                 return {"sha": TREE}
             if path == "git/commits":
@@ -292,7 +309,7 @@ class UpdateTests(unittest.TestCase):
         )
         self.assertEqual(writes[0][2]["base_tree"], MAIN)
         self.assertEqual(len(writes[0][2]["tree"]), 1)
-        self.assertEqual(writes[0][2]["tree"][0]["path"], "docs-source.json")
+        self.assertEqual(writes[0][2]["tree"][0]["path"], UPDATER.MANIFEST)
         self.assertEqual(json.loads(writes[0][2]["tree"][0]["content"]), manifest(NEW))
         self.assertEqual(writes[1][2]["parents"], [MAIN])
         self.assertFalse(writes[-1][2]["maintainer_can_modify"])
@@ -492,9 +509,9 @@ class UpdateTests(unittest.TestCase):
 
     def test_main_advance_uses_two_parents_and_current_main_tree(self):
         self.website.branch = BRANCH
-        self.website.trees[BRANCH][0] = entry("docs-source.json", OLD)
+        self.website.trees[BRANCH][0] = entry(UPDATER.MANIFEST, OLD)
         self.website.trees[OLD] = [
-            entry("docs-source.json", OLD),
+            entry(UPDATER.MANIFEST, OLD),
             entry("package.json"),
         ]
         self.website.trees[MAIN].append(entry("new-website-file"))
@@ -572,8 +589,8 @@ class UpdateTests(unittest.TestCase):
             [], 0, stdout="HTTP/2.0 200 OK\r\n\r\n{}", stderr=""
         )
         for repo, path, endpoint in (
-            ("caudra/website", "", "repos/caudra/website"),
-            ("caudra/website", "pulls/3", "repos/caudra/website/pulls/3"),
+            ("caudra/infra", "", "repos/caudra/infra"),
+            ("caudra/infra", "pulls/3", "repos/caudra/infra/pulls/3"),
             (None, "user", "user"),
         ):
             with (
@@ -606,7 +623,7 @@ class UpdateTests(unittest.TestCase):
 
     def test_newer_pending_pin_cannot_regress(self):
         self.website.branch = BRANCH
-        self.website.trees[BRANCH][0] = entry("docs-source.json", COMMIT)
+        self.website.trees[BRANCH][0] = entry(UPDATER.MANIFEST, COMMIT)
         self.website.blobs[COMMIT] = manifest(COMMIT)
         original = self.source.request
 
@@ -701,7 +718,7 @@ class UpdateTests(unittest.TestCase):
                 if status == 404:
                     self.assertIsNone(
                         UPDATER.GitHub("secret").request(
-                            "caudra/website",
+                            UPDATER.WEBSITE,
                             "git/ref/heads/automation/docs-source",
                             missing=True,
                         )
@@ -709,7 +726,7 @@ class UpdateTests(unittest.TestCase):
                 else:
                     with self.assertRaises(UPDATER.Refusal):
                         UPDATER.GitHub("secret").request(
-                            "caudra/website",
+                            UPDATER.WEBSITE,
                             "git/ref/heads/automation/docs-source",
                             missing=True,
                         )
@@ -1040,6 +1057,35 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(
             any(path.endswith("/merge") for path, _, _ in self.website.mutations)
         )
+
+    def test_changed_paths_ignores_parent_directories_of_nested_manifest(self):
+        def tree(apps, revision, *extra):
+            return {
+                "apps": ("040000", "tree", apps),
+                "apps/site": ("040000", "tree", apps),
+                UPDATER.MANIFEST: ("100644", "blob", revision),
+                **dict(extra),
+            }
+
+        main = tree(MAIN_APPS, OLD)
+        self.assertEqual(
+            UPDATER.changed_paths(main, tree(BRANCH_APPS, NEW)), [UPDATER.MANIFEST]
+        )
+        nested = ("apps/site/package.json", ("100644", "blob", BLOB))
+        self.assertEqual(
+            UPDATER.changed_paths(main, tree(BRANCH_APPS, NEW, nested)),
+            [UPDATER.MANIFEST, "apps/site/package.json"],
+        )
+        submodule = ("apps/vendor", ("160000", "commit", COMMIT))
+        self.assertEqual(
+            UPDATER.changed_paths(main, tree(BRANCH_APPS, OLD, submodule)),
+            ["apps/vendor"],
+        )
+
+    def test_nested_file_beside_manifest_blocks_merge(self):
+        self.pending()
+        self.website.trees[BRANCH].append(entry("apps/site/surprise.txt"))
+        self.refused_merge()
 
     def test_real_update_merges_only_after_ci_with_expected_sha_and_retries_noop(self):
         self.assertIn("merged after canonical CI", self.update())

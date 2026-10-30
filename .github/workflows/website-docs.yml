@@ -61,7 +61,7 @@ jobs:
           app-id: ${{ vars.WEBSITE_APP_ID }}
           private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
           owner: caudra
-          repositories: website
+          repositories: infra
           permission-contents: write
           permission-pull-requests: write
           permission-actions: read
@@ -79,7 +79,7 @@ jobs:
           app-id: ${{ vars.WEBSITE_APP_ID }}
           private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
           owner: caudra
-          repositories: website
+          repositories: infra
           permission-contents: write
       - name: Dispatch verified published release for production
         if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'release'
