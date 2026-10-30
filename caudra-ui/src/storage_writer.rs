@@ -752,10 +752,18 @@ impl Writer {
         }
     }
 
-    fn flush(&mut self, pending: &Pending) {
+    /// Queued spend commits with the pass's first snapshot that saves, so the
+    /// pair costs one commit. What no save carried returns to the front of its
+    /// queue for [`Writer::flush_usage`].
+    fn flush(&mut self, pending: &Pending, usage: &PendingUsage) {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
         let batch = mem::take(&mut *lock(pending));
+        let mut riding = if self.usage_shares_database() && !batch.is_empty() {
+            mem::take(&mut *usage.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            Vec::new()
+        };
         for (id, entry) in batch {
             match entry {
                 Entry::Save(mut save) => {
@@ -768,7 +776,7 @@ impl Writer {
                             "session save waited in the writer queue"
                         );
                     }
-                    let result = self.write(&save.session);
+                    let result = self.write_with_usage(&save.session, &mut riding);
                     self.mark_changed(&result);
                     self.report(id, &result);
                     // A waiter hears the failure and decides for itself; a
@@ -798,6 +806,17 @@ impl Writer {
                 }
             }
         }
+        if !riding.is_empty() {
+            let mut queued = usage.lock().unwrap_or_else(|e| e.into_inner());
+            riding.append(&mut queued);
+            *queued = riding;
+        }
+    }
+
+    /// Whether spend lands in the session database: an ephemeral run keeps
+    /// its ledger in the persistent root instead.
+    fn usage_shares_database(&self) -> bool {
+        self.dir.for_class(StateClass::Persistent) == self.dir
     }
 
     fn flush_usage(&mut self, pending: &PendingUsage) {
@@ -1003,7 +1022,7 @@ impl Writer {
         let goal_writes = snapshot(&self.goal_writes);
         let engine_decisions = claim(&self.engine_decisions);
         let account_switches = claim(&self.account_switches);
-        self.flush(pending);
+        self.flush(pending, usage);
         self.write_autopilot(&autopilot_writes);
         drain_written(&self.autopilot_writes, autopilot_writes.len());
         self.write_goal_log(&goal_writes);
@@ -1119,8 +1138,20 @@ impl Writer {
         }
     }
 
+    #[cfg(test)]
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
+        self.write_with_usage(session, &mut Vec::new())
+    }
+
+    /// Saves `session`, committing `usage` with it. The entries leave `usage`
+    /// only once that commit carried them.
+    fn write_with_usage(
+        &mut self,
+        session: &AppSession,
+        usage: &mut Vec<QueuedUsage>,
+    ) -> Result<(), SessionError> {
         self.adopt_seeded_cursor(session);
+        let ephemeral = self.dir.is_ephemeral();
         if self.database.is_none() {
             self.database = Some(SessionDatabase::open(&self.dir)?);
         }
@@ -1145,9 +1176,20 @@ impl Writer {
         let saved = if let Some(recreation) = self.deleted_sessions.get(&session.id) {
             database.recreate(session, recreation)?
         } else {
+            let entries: Vec<_> = usage
+                .iter()
+                .map(|queued| queued.turn.entry(queued.enqueued_at, ephemeral))
+                .collect();
             // Borrow rather than remove: a retryable failure must retain the
             // latest committed cursor instead of falling back to a stale full write.
-            database.save(session, cursor)?
+            let (saved, usage_written) = database.save_with_usage(session, cursor, &entries)?;
+            match usage_written {
+                Ok(()) => usage.clear(),
+                Err(error) => {
+                    warn!(%error, turns = usage.len(), "spend refused beside a session save; retried on its own");
+                }
+            }
+            saved
         };
         if session.meta.peer_controls.is_some()
             && let Some(peer) = PeerSession::lookup(session.id)
@@ -2540,6 +2582,64 @@ mod tests {
         assert_eq!(total.priced_turns, 3);
         assert_eq!(total.input, 3);
         assert_eq!(total.output, 6);
+    }
+
+    #[test_case(Some(2.0), 3.0; "spend_commits_with_the_save")]
+    #[test_case(Some(f64::NAN), 0.0; "refused_spend_leaves_the_save_alone")]
+    fn spend_commits_with_the_session_save_of_its_pass(
+        second_cost: Option<f64>,
+        carried_cost: f64,
+    ) {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let pending: Pending = Arc::default();
+        lock(&pending).insert(session.id, Entry::save(Arc::clone(&session), None));
+        let turns = vec![queued_spend(Some(1.0), 0), queued_spend(second_cost, 0)];
+        let usage: PendingUsage = Arc::new(Mutex::new(turns.clone()));
+
+        writer.flush(&pending, &usage);
+
+        assert!(writer.cursors.contains_key(&session.id));
+        assert!(writer.ledger.is_none());
+        let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+        assert_eq!(total.cost, carried_cost);
+        let left = usage.lock().unwrap().len();
+        assert_eq!(left, if carried_cost == 0.0 { turns.len() } else { 0 });
+
+        if left > 0 {
+            usage.lock().unwrap()[1].turn.cost = Some(2.0);
+            writer.flush_usage(&usage);
+            assert!(usage.lock().unwrap().is_empty());
+            let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+            assert_eq!(total.cost, 3.0);
+            assert_eq!(total.priced_turns, 2);
+        }
+    }
+
+    #[test]
+    fn spend_waits_for_its_own_write_when_the_save_fails() {
+        let (_tmp, dir) = state_dir();
+        block_session_database(&dir);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let pending: Pending = Arc::default();
+        lock(&pending).insert(session.id, Entry::save(Arc::clone(&session), None));
+        let turns = vec![queued_spend(Some(1.0), 0), queued_spend(Some(2.0), 0)];
+        let usage: PendingUsage = Arc::new(Mutex::new(turns.clone()));
+
+        writer.flush(&pending, &usage);
+
+        assert!(!writer.cursors.contains_key(&session.id));
+        assert_eq!(*usage.lock().unwrap(), turns);
+        fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
+        writer.flush_usage(&usage);
+        assert!(usage.lock().unwrap().is_empty());
+        let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+        assert_eq!(total.cost, 3.0);
+        assert_eq!(total.priced_turns, 2);
     }
 
     #[test_case(false; "ledger_open_failure")]

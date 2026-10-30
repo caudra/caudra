@@ -111,6 +111,32 @@ pub struct TurnUsage {
     pub subscription: bool,
 }
 
+impl TurnUsage {
+    /// The ledger row this turn adds to, in the bucket `now` falls in.
+    pub fn entry(&self, now: u64, ephemeral: bool) -> LedgerEntry<'_> {
+        LedgerEntry {
+            bucket_start: bucket_for(now),
+            provider: &self.provider,
+            account: &self.account,
+            model: &self.model,
+            cwd: &self.cwd,
+            purpose: self.purpose,
+            ephemeral,
+            subscription: self.subscription,
+            usage: StoredTokenUsage {
+                input: self.input,
+                output: self.output,
+                cache_creation: self.cache_creation,
+                cache_read: self.cache_read,
+                cost: self.cost,
+                subscription_cost: None,
+                no_cost_estimate: self.purpose == LedgerPurpose::Decision,
+            },
+            cost: self.cost,
+        }
+    }
+}
+
 pub fn bucket_for(epoch_seconds: u64) -> i64 {
     (epoch_seconds - epoch_seconds % BUCKET_SECONDS) as i64
 }
@@ -138,26 +164,7 @@ impl UsageLedger {
     }
 
     pub fn record_at(&self, turn: &TurnUsage, now: u64) -> Result<(), SessionError> {
-        self.database.record_usage(&LedgerEntry {
-            bucket_start: bucket_for(now),
-            provider: &turn.provider,
-            account: &turn.account,
-            model: &turn.model,
-            cwd: &turn.cwd,
-            purpose: turn.purpose,
-            ephemeral: self.ephemeral,
-            subscription: turn.subscription,
-            usage: StoredTokenUsage {
-                input: turn.input,
-                output: turn.output,
-                cache_creation: turn.cache_creation,
-                cache_read: turn.cache_read,
-                cost: turn.cost,
-                subscription_cost: None,
-                no_cost_estimate: turn.purpose == LedgerPurpose::Decision,
-            },
-            cost: turn.cost,
-        })
+        self.database.record_usage(&turn.entry(now, self.ephemeral))
     }
 
     pub fn buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {

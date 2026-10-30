@@ -117,7 +117,7 @@ const ARTIFACT_LOCK_POLL: Duration = Duration::from_millis(20);
 /// Where state lives. Normally one directory. An ephemeral run splits it:
 /// session data goes to a volatile root removed at exit, while credentials,
 /// preferences, and trust keep using the persistent root.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir {
     root: PathBuf,
     persistent: Option<PathBuf>,

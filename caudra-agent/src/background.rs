@@ -608,7 +608,7 @@ impl BackgroundTasks {
         let (records, shells, recent, generation, sequence, restored) =
             smol::unblock(move || -> Result<_, String> {
                 let retry = RuntimeRetry::new(None, &|| false);
-                let db = SessionDatabase::open_runtime(&load_dir, &retry)
+                let db = SessionDatabase::runtime(&load_dir, &retry)
                     .map_err(|error| error.to_string())?;
                 let (mut records, (generation, sequence)) = db
                     .background_restore_runtime(session, &retry)
@@ -804,7 +804,7 @@ impl BackgroundTasks {
     ) -> Result<Option<TaskRecord>, String> {
         let cancelled = || admission.is_some_and(Admission::is_cancelled);
         let retry = RuntimeRetry::new(admission.and_then(Admission::runtime_deadline), &cancelled);
-        let db = SessionDatabase::open_runtime(&self.0.dir, &retry)
+        let db = SessionDatabase::runtime(&self.0.dir, &retry)
             .map_err(|error| format!("background history connection setup: {error}"))?;
         db.background_lookup_runtime(self.0.session, lookup, &retry)
             .map_err(|error| format!("background history lookup: {error}"))
@@ -946,8 +946,7 @@ impl BackgroundTasks {
                 admission.as_ref().and_then(Admission::runtime_deadline),
                 &cancelled,
             );
-            let db =
-                SessionDatabase::open_runtime(&dir, &retry).map_err(|error| error.to_string())?;
+            let db = SessionDatabase::runtime(&dir, &retry).map_err(|error| error.to_string())?;
             #[cfg(test)]
             saving.set(true);
             let mut archived = Vec::new();
@@ -1026,8 +1025,7 @@ impl BackgroundTasks {
         let session = self.0.session;
         smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            let db =
-                SessionDatabase::open_runtime(&dir, &retry).map_err(|error| error.to_string())?;
+            let db = SessionDatabase::runtime(&dir, &retry).map_err(|error| error.to_string())?;
             let page = db
                 .background_history_runtime(
                     session,
@@ -1059,8 +1057,7 @@ impl BackgroundTasks {
         let invocation_id = invocation_id.to_owned();
         smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            let db =
-                SessionDatabase::open_runtime(&dir, &retry).map_err(|error| error.to_string())?;
+            let db = SessionDatabase::runtime(&dir, &retry).map_err(|error| error.to_string())?;
             load_transcript(&db, session, &invocation_id, &retry)
         })
         .await
@@ -1296,7 +1293,7 @@ impl BackgroundTasks {
                 admission.as_ref().is_some_and(Admission::is_cancelled)
             };
             let retry = RuntimeRetry::new(deadline, &cancelled);
-            let db = SessionDatabase::open_runtime(&dir, &retry).map_err(|error| {
+            let db = SessionDatabase::runtime(&dir, &retry).map_err(|error| {
                 SaveError::session(&format!("{stage} connection setup"), &error)
             })?;
             #[cfg(test)]
@@ -1734,7 +1731,7 @@ impl BackgroundTasks {
         let session = self.0.session;
         let candidates = smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            let db = SessionDatabase::open_runtime(&dir, &retry)?;
+            let db = SessionDatabase::runtime(&dir, &retry)?;
             db.interrupted_background_tasks_runtime(session, MAX_RECOVERY_SCAN, &retry)?
                 .into_iter()
                 .map(|record| {
@@ -1799,7 +1796,7 @@ impl BackgroundTasks {
         let unarchived = invocation.clone();
         smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            SessionDatabase::open_runtime(&dir, &retry)?.unarchive_background_task_runtime(
+            SessionDatabase::runtime(&dir, &retry)?.unarchive_background_task_runtime(
                 session,
                 &unarchived,
                 &retry,
@@ -2387,7 +2384,7 @@ impl BackgroundTasks {
         let session = self.0.session;
         let accepted = smol::unblock(move || {
             let retry = RuntimeRetry::new(None, &|| false);
-            let database = SessionDatabase::open_runtime(&dir, &retry)
+            let database = SessionDatabase::runtime(&dir, &retry)
                 .map_err(|error| format!("background receipt connection setup: {error}"))?;
             database
                 .background_accepted_events_runtime(session, &event_ids, &retry)
@@ -2807,7 +2804,7 @@ impl BackgroundTasks {
                 admission.check()?;
                 let cancelled = || admission.is_cancelled();
                 let retry = RuntimeRetry::new(admission.runtime_deadline(), &cancelled);
-                let database = SessionDatabase::open_runtime(&dir, &retry)
+                let database = SessionDatabase::runtime(&dir, &retry)
                     .map_err(|error| format!("task identity connection setup: {error}"))?;
                 let lease = history.reserve_generated(&label, |id| {
                     database
@@ -3610,7 +3607,7 @@ fn save_records(
         return Ok(());
     }
     let retry = RuntimeRetry::new(None, &|| false);
-    SessionDatabase::open_runtime(dir, &retry)?.save_background_tasks_runtime(session, rows, &retry)
+    SessionDatabase::runtime(dir, &retry)?.save_background_tasks_runtime(session, rows, &retry)
 }
 
 /// The stored form of `text`, or `None` with a warning when its row could not

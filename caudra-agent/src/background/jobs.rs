@@ -385,7 +385,7 @@ impl JobScope {
                     false
                 };
                 let retry = RuntimeRetry::new(None, &cancelled);
-                let database = SessionDatabase::open_runtime(&dir, &retry)
+                let database = SessionDatabase::runtime(&dir, &retry)
                     .map_err(|error| format!("job checkpoint connection setup: {error}"))?;
                 #[cfg(test)]
                 saving.set(true);
@@ -653,7 +653,7 @@ impl JobScope {
             reservation.check()?;
             let cancelled = || reservation.is_cancelled();
             let retry = RuntimeRetry::new(reservation.runtime_deadline(), &cancelled);
-            let database = SessionDatabase::open_runtime(&dir, &retry)
+            let database = SessionDatabase::runtime(&dir, &retry)
                 .map_err(|error| format!("job identity connection setup: {error}"))?;
             let lease = history.reserve_generated(&identity, |id| {
                 database

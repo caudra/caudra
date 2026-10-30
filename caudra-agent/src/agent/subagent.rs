@@ -1598,7 +1598,7 @@ pub(crate) fn reserve_task_identity_with_retry(
         .or_else(|| jobs.map(JobScope::state_dir))
         .zip(session)
         .map(|(dir, session)| {
-            SessionDatabase::open_runtime(dir, retry)
+            SessionDatabase::runtime(dir, retry)
                 .map(|database| (database, session))
                 .map_err(|error| format!("{IDENTITY_CONNECTION_ERROR}: {error}"))
         })

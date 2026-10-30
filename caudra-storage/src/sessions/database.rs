@@ -55,9 +55,12 @@ use tracing::{field, warn};
 
 #[path = "media_payloads.rs"]
 mod media_payloads;
+#[path = "runtime_pool.rs"]
+mod runtime_pool;
 #[path = "source_code_rename.rs"]
 mod source_code_rename;
 
+pub use runtime_pool::RuntimeDatabase;
 pub use source_code_rename::SOURCE_CODE_TOOL_RENAMES;
 
 use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
@@ -123,6 +126,9 @@ const SESSION_OPEN_READ: &str = "loading session transcript";
 const SESSION_OPEN_MARK: &str = "recording session open";
 const SESSION_OPEN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_CONNECTION_SETUP: &str = "connection setup";
+const USAGE_SAVEPOINT: &str = "SAVEPOINT usage_riders";
+const USAGE_SAVEPOINT_ROLLBACK: &str = "ROLLBACK TO usage_riders";
+const USAGE_SAVEPOINT_RELEASE: &str = "RELEASE usage_riders";
 const RUNTIME_OWNER_CHECKPOINT: &str = "job owner checkpoint";
 const INITIALIZATION_LOCKED: &str = "session database initialization is locked";
 const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1000;
@@ -2704,45 +2710,9 @@ impl SessionDatabase {
     /// Folds one turn into its hourly bucket. Accumulating rather than
     /// inserting keeps the table bounded by time instead of by turn count.
     pub fn record_usage(&self, entry: &LedgerEntry) -> Result<(), SessionError> {
-        let (cost, priced, unpriced) = match entry.cost {
-            Some(cost) => (cost, 1, 0),
-            None => (0.0, 0, 1),
-        };
         // RAISE(FAIL) can retain statement changes; a failed contribution must be safe to retry.
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO usage_ledger (bucket_start, provider, account, model, cwd, purpose, \
-                 ephemeral, subscription, input_tokens, output_tokens, cache_creation, \
-                 cache_read, cost, priced_turns, unpriced_turns) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
-             ON CONFLICT(bucket_start, provider, account, model, cwd, purpose, ephemeral, \
-                 subscription) \
-             DO UPDATE SET \
-                 input_tokens = input_tokens + excluded.input_tokens, \
-                 output_tokens = output_tokens + excluded.output_tokens, \
-                 cache_creation = cache_creation + excluded.cache_creation, \
-                 cache_read = cache_read + excluded.cache_read, \
-                 cost = cost + excluded.cost, \
-                 priced_turns = priced_turns + excluded.priced_turns, \
-                 unpriced_turns = unpriced_turns + excluded.unpriced_turns",
-            params![
-                entry.bucket_start,
-                entry.provider,
-                entry.account,
-                entry.model,
-                entry.cwd,
-                entry.purpose.storage_name(),
-                i64::from(entry.ephemeral),
-                i64::from(entry.subscription),
-                i64::from(entry.usage.input),
-                i64::from(entry.usage.output),
-                i64::from(entry.usage.cache_creation),
-                i64::from(entry.usage.cache_read),
-                cost,
-                priced,
-                unpriced,
-            ],
-        )?;
+        insert_usage(&transaction, entry)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3336,6 +3306,24 @@ impl SessionDatabase {
         U: Serialize,
         T: Serialize,
     {
+        self.save_with_usage(session, cursor, &[])
+            .map(|(cursor, _)| cursor)
+    }
+
+    /// [`SessionDatabase::save`], committing `usage` with the snapshot so one
+    /// commit carries both. The inner result says whether the entries were
+    /// written; the snapshot commits either way.
+    pub fn save_with_usage<M, U, T>(
+        &mut self,
+        session: &Session<M, U, T>,
+        cursor: Option<&SessionCursor>,
+        usage: &[LedgerEntry<'_>],
+    ) -> Result<(SessionCursor, Result<(), SessionError>), SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
         if session
             .workspace_binding
             .as_deref()
@@ -3365,9 +3353,9 @@ impl SessionDatabase {
         if let Some(cursor) = cursor
             && let Some(targets) = RewriteTargets::since(session, cursor)
         {
-            return self.save_changes(session, cursor, &targets);
+            return self.save_changes(session, cursor, &targets, usage);
         }
-        self.save_full(session, cursor.map(SessionCursor::write_version))
+        self.save_full(session, cursor.map(SessionCursor::write_version), usage)
     }
 
     pub fn recreate<M, U, T>(
@@ -4236,7 +4224,8 @@ impl SessionDatabase {
         &mut self,
         session: &Session<M, U, T>,
         expected_write_version: Option<i64>,
-    ) -> Result<SessionCursor, SessionError>
+        usage: &[LedgerEntry<'_>],
+    ) -> Result<(SessionCursor, Result<(), SessionError>), SessionError>
     where
         M: Serialize,
         U: Serialize,
@@ -4297,6 +4286,7 @@ impl SessionDatabase {
         if let Some(archive) = &archive {
             register_archive(&transaction, archive)?;
         }
+        let usage_written = insert_usage_riding(&transaction, usage)?;
         timing.committing();
         transaction.commit()?;
         drop(timing);
@@ -4309,14 +4299,15 @@ impl SessionDatabase {
         session
             .write_version
             .store(write_version, Ordering::Release);
-        Ok(SessionCursor::new(
+        let cursor = SessionCursor::new(
             session,
             write_version,
             serialized.logical_bytes,
             serialized.root_bytes(),
             serialized.task_spec_bytes(),
             RowDigests::new(session, &serialized.task_specs),
-        ))
+        );
+        Ok((cursor, usage_written))
     }
 
     /// Appends what is new since `cursor` and replaces only what `targets`
@@ -4326,7 +4317,8 @@ impl SessionDatabase {
         session: &Session<M, U, T>,
         cursor: &SessionCursor,
         targets: &RewriteTargets,
-    ) -> Result<SessionCursor, SessionError>
+        usage: &[LedgerEntry<'_>],
+    ) -> Result<(SessionCursor, Result<(), SessionError>), SessionError>
     where
         M: Serialize,
         U: Serialize,
@@ -4424,6 +4416,7 @@ impl SessionDatabase {
         if let Some(archive) = &archive {
             register_archive(&transaction, archive)?;
         }
+        let usage_written = insert_usage_riding(&transaction, usage)?;
         timing.committing();
         transaction.commit()?;
         drop(timing);
@@ -4437,14 +4430,15 @@ impl SessionDatabase {
         session
             .write_version
             .store(write_version, Ordering::Release);
-        Ok(SessionCursor::new(
+        let cursor = SessionCursor::new(
             session,
             write_version,
             logical_bytes,
             root.bytes(),
             task_specs.values().map(String::len).sum(),
             digests,
-        ))
+        );
+        Ok((cursor, usage_written))
     }
 
     /// The archive's row committed with the rewrite, so its pending file is
@@ -5838,6 +5832,68 @@ fn archive_directory(
         return Ok(None);
     }
     Ok(Some(path))
+}
+
+fn insert_usage(connection: &Connection, entry: &LedgerEntry) -> Result<(), SessionError> {
+    let (cost, priced, unpriced) = match entry.cost {
+        Some(cost) => (cost, 1, 0),
+        None => (0.0, 0, 1),
+    };
+    connection.execute(
+        "INSERT INTO usage_ledger (bucket_start, provider, account, model, cwd, purpose, \
+             ephemeral, subscription, input_tokens, output_tokens, cache_creation, \
+             cache_read, cost, priced_turns, unpriced_turns) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+         ON CONFLICT(bucket_start, provider, account, model, cwd, purpose, ephemeral, \
+             subscription) \
+         DO UPDATE SET \
+             input_tokens = input_tokens + excluded.input_tokens, \
+             output_tokens = output_tokens + excluded.output_tokens, \
+             cache_creation = cache_creation + excluded.cache_creation, \
+             cache_read = cache_read + excluded.cache_read, \
+             cost = cost + excluded.cost, \
+             priced_turns = priced_turns + excluded.priced_turns, \
+             unpriced_turns = unpriced_turns + excluded.unpriced_turns",
+        params![
+            entry.bucket_start,
+            entry.provider,
+            entry.account,
+            entry.model,
+            entry.cwd,
+            entry.purpose.storage_name(),
+            i64::from(entry.ephemeral),
+            i64::from(entry.subscription),
+            i64::from(entry.usage.input),
+            i64::from(entry.usage.output),
+            i64::from(entry.usage.cache_creation),
+            i64::from(entry.usage.cache_read),
+            cost,
+            priced,
+            unpriced,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Writes `usage` under a savepoint inside a save's transaction. The outer
+/// error fails the save. The inner one rolled back only the entries, which
+/// stay queued for a write of their own.
+fn insert_usage_riding(
+    transaction: &Transaction<'_>,
+    usage: &[LedgerEntry<'_>],
+) -> Result<Result<(), SessionError>, SessionError> {
+    if usage.is_empty() {
+        return Ok(Ok(()));
+    }
+    transaction.execute_batch(USAGE_SAVEPOINT)?;
+    let written = usage
+        .iter()
+        .try_for_each(|entry| insert_usage(transaction, entry));
+    if written.is_err() {
+        transaction.execute_batch(USAGE_SAVEPOINT_ROLLBACK)?;
+    }
+    transaction.execute_batch(USAGE_SAVEPOINT_RELEASE)?;
+    Ok(written)
 }
 
 fn ensure_real_directory(path: &Path, create: bool) -> io::Result<bool> {

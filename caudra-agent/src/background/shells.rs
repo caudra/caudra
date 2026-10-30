@@ -238,7 +238,7 @@ impl ShellExecutions {
             let id = execution_id.clone();
             let loaded = smol::unblock(move || {
                 let retry = RuntimeRetry::new(None, &|| false);
-                SessionDatabase::open_runtime(&dir, &retry)
+                SessionDatabase::runtime(&dir, &retry)
                     .and_then(|database| database.shell_execution_output(session, &id))
                     .map_err(|error| error.to_string())
             })
@@ -385,7 +385,7 @@ impl ShellExecutions {
                     Deadline::At(deadline) => Some(deadline),
                 };
                 let retry = RuntimeRetry::new(deadline, &cancelled);
-                SessionDatabase::open_runtime(&dir, &retry)
+                SessionDatabase::runtime(&dir, &retry)
                     .and_then(|database| {
                         database.save_shell_execution_runtime(
                             session,
