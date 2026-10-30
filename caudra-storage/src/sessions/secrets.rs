@@ -15,7 +15,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::auth::{AUTH_FILE_MODE, now_millis, read_private_credential};
+#[cfg(unix)]
+use crate::auth::AUTH_FILE_MODE;
+use crate::auth::{now_millis, read_private_credential};
 use crate::id::CaudraId;
 use crate::paths::ensure_private_dir;
 use crate::sessions::SESSIONS_DIR;

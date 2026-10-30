@@ -3578,9 +3578,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::automation::catalog::{
-        BUNDLED_DELETE, REGULAR_DELETE, REVIEW_CHANGED, UNAVAILABLE_IN_SDK,
-    };
+    #[cfg(unix)]
+    use crate::automation::catalog::REGULAR_DELETE;
+    use crate::automation::catalog::{BUNDLED_DELETE, REVIEW_CHANGED, UNAVAILABLE_IN_SDK};
     use crate::automation::clock::{FakeClock, Wake};
     use crate::automation::frontend::delivery_due;
     use crate::automation::host::{HOST_PANICKED, NOT_IN_THIS_BUILD, THREAD_NAME as FIRING_THREAD};
