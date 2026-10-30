@@ -25,6 +25,7 @@ mod learning;
 mod live_switch;
 mod memory;
 pub(crate) mod mode;
+mod model_list;
 mod mouse;
 pub(crate) mod permission_editor;
 pub(crate) mod questions;
@@ -80,7 +81,7 @@ use crate::components::changelog_modal::{
 };
 use crate::components::command::words::{
     ALL_ARG, CHAT_ARG, CLEAR_ARG, DISCOVER_ARG, DISMISS_ARG, GOAL_CLEAR_ALIASES, LIST_ARG, LOG_ARG,
-    MIGRATE_ARG, MODEL_ARG, MOVE_ARG, NEXT_ARG, POP_ARG, PROJECT_ARG, SUGGESTED_ARG,
+    MIGRATE_ARG, MODEL_ARG, MOVE_ARG, NEXT_ARG, POP_ARG, PROJECT_ARG, REFRESH_ARG, SUGGESTED_ARG,
 };
 use crate::components::command::{
     CommandAction, CommandPalette, ParsedCommand, SEARCH_COMMAND, disabled_feature,
@@ -191,6 +192,7 @@ use caudra_agent::{
     SteeringQueue, SubagentHistoryStore, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_automation::event::{StartedBy, TurnOutcome};
+use caudra_config::models::ModelsConfig;
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SkillPacks,
@@ -202,6 +204,7 @@ use caudra_lua::{
 };
 use caudra_providers::accounts::{AccountStatus, RoutedAccount};
 use caudra_providers::calibration;
+use caudra_providers::model_data::RefreshOutcome;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{adjust_model_for_inspection, seed_setup_thinking};
 use caudra_providers::{
@@ -264,7 +267,7 @@ const SKILLS_USAGE: &str = "Usage: /skills";
 const DECISIONS_USAGE: &str = "Usage: /decisions [model|next]";
 const STASH_USAGE: &str = "Usage: /stash [pop|list]";
 const UPDATE_USAGE: &str = "Usage: /update [dismiss]";
-const MODEL_USAGE: &str = "Usage: /model [next]";
+const MODEL_USAGE: &str = "Usage: /model [next|refresh]";
 const SESSIONS_USAGE: &str = "Usage: /sessions [move|migrate [directory]]";
 const PERMISSIONS_USAGE: &str = "Usage: /permissions [discover]";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
@@ -786,6 +789,9 @@ pub struct App {
     revert_confirmation: Option<file_revert::RevertConfirmation>,
     /// Set by the event loop after construction, like `live_sessions`.
     pub(crate) snapshots_config: SnapshotsConfig,
+    /// Set by the event loop after construction, like `snapshots_config`.
+    pub(crate) models_config: ModelsConfig,
+    model_list_refresh: Option<Task<Result<RefreshOutcome, String>>>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
     decisions_slot: Arc<ArcSwapOption<DecisionsFetchState>>,
@@ -1114,6 +1120,8 @@ impl App {
             record_index_refresh: None,
             revert_confirmation: None,
             snapshots_config: SnapshotsConfig::default(),
+            models_config: ModelsConfig::default(),
+            model_list_refresh: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             storage_slot: Arc::new(ArcSwapOption::empty()),
             decisions_slot: Arc::new(ArcSwapOption::empty()),
@@ -6618,6 +6626,10 @@ impl App {
             "/model" => match subcommand(&cmd.args) {
                 (word, _) if word.is_empty() => self.open_model_picker_here(),
                 (word, "") if word == NEXT_ARG => self.cycle_favorite_model(),
+                (word, "") if word == REFRESH_ARG => {
+                    self.refresh_model_list();
+                    vec![]
+                }
                 _ => self.flash_usage(MODEL_USAGE),
             },
             "/accounts" => {
@@ -7539,6 +7551,7 @@ impl App {
             | self.poll_commit_index()
             | self.thinking_picker.tick()
             | self.poll_accounts_refresh()
+            | self.poll_model_list_refresh()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 

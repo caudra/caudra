@@ -316,8 +316,14 @@ const SESSIONS_SUBS: &[Subcommand] = &[
     .main_only(),
 ];
 
-const MODEL_SUBS: &[Subcommand] =
-    &[Subcommand::new(words::NEXT_ARG, "Switch to the next favorite model", LEAF).main_only()];
+const MODEL_SUBS: &[Subcommand] = &[
+    Subcommand::new(words::NEXT_ARG, "Switch to the next favorite model", LEAF).main_only(),
+    Subcommand::new(
+        words::REFRESH_ARG,
+        "Check for a newer signed model list now",
+        LEAF,
+    ),
+];
 const DECISIONS_SUBS: &[Subcommand] = &[
     Subcommand::new(
         words::MODEL_ARG,
@@ -579,7 +585,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     .main_only(),
     BuiltinCommand::new(
         "/model",
-        "Switch the chat's model (a task's own in a task) or assign job models",
+        "Switch the chat's model (a task's own in a task), assign job models, or check for a newer model list",
         Node::with(MODEL_SUBS, &[]),
     ),
     BuiltinCommand::new(

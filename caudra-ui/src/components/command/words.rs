@@ -15,6 +15,7 @@ pub(crate) const POP_ARG: &str = "pop";
 pub(crate) const LIST_ARG: &str = "list";
 pub(crate) const DISMISS_ARG: &str = "dismiss";
 pub(crate) const NEXT_ARG: &str = "next";
+pub(crate) const REFRESH_ARG: &str = "refresh";
 pub(crate) const MOVE_ARG: &str = "move";
 pub(crate) const MIGRATE_ARG: &str = "migrate";
 pub(crate) const CHAT_ARG: &str = "chat";

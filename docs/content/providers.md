@@ -68,6 +68,8 @@ Long-running sessions check `https://models.caudra.ai/v1/models.json` in the bac
 
 `caudra models refresh` checks now, even with automatic refresh disabled. It prints the previous and current publication times and whether the file changed. If another process is refreshing, it reports that and exits with an error. A failed check keeps the current list. A verified update takes effect even if saving the cache fails.
 
+In the TUI, `/model refresh` runs the same check without blocking the session and shows the result in the status bar.
+
 ```toml
 [models]
 refresh = true

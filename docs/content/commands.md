@@ -54,7 +54,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/sessions` | `[move\|migrate]` | Browse and switch sessions, or move them to another directory |  |  |
 | `/rename` | `<title>` | Rename the current session |  |  |
 | `/fork` |  | Fork the session into a new one at its latest message | Main only |  |
-| `/model` | `[next]` | Switch the chat's model (a task's own in a task) or assign job models |  |  |
+| `/model` | `[next\|refresh]` | Switch the chat's model (a task's own in a task), assign job models, or check for a newer model list |  |  |
 | `/accounts` |  | Choose which account of the model's provider requests go to | Main only |  |
 | `/system-prompt` |  | Inspect the system prompt and switch profile | Main only |  |
 | `/projection` |  | Inspect the conversation as the provider receives it | Main only |  |

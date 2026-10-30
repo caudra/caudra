@@ -63,6 +63,7 @@ use caudra_agent::{
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
 use caudra_config::decision_features_file::set_decision_feature_mode;
+use caudra_config::models::ModelsConfig;
 use caudra_config::providers::ProvidersConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
@@ -355,6 +356,7 @@ pub struct EventLoopParams {
     pub autopilot: AutopilotConfig,
     pub ui_config: UiConfig,
     pub snapshots: SnapshotsConfig,
+    pub models: ModelsConfig,
     /// Opens the change records of a local session's directory.
     pub change_factory: Option<ChangeServiceFactory>,
     pub allow_workspace_recovery: bool,
@@ -1227,6 +1229,7 @@ struct SpawnCtx {
     autopilot: AutopilotConfig,
     ui_config: UiConfig,
     snapshots: SnapshotsConfig,
+    models: ModelsConfig,
     change_factory: Option<ChangeServiceFactory>,
     allow_workspace_recovery: bool,
     input_history_size: usize,
@@ -1557,6 +1560,7 @@ impl SpawnCtx {
         app.reconcile_plan_target();
         let app_new_ms = lap();
         app.snapshots_config = self.snapshots;
+        app.models_config = self.models.clone();
         app.change_factory = self.change_factory.clone();
         app.local_changes = changes.local;
         app.change_recorder = change_recorder;
@@ -1973,6 +1977,7 @@ impl<'t> EventLoop<'t> {
             autopilot,
             ui_config,
             snapshots,
+            models,
             change_factory,
             allow_workspace_recovery,
             input_history_size,
@@ -2075,6 +2080,7 @@ impl<'t> EventLoop<'t> {
             autopilot,
             ui_config,
             snapshots,
+            models,
             change_factory,
             allow_workspace_recovery,
             input_history_size,
@@ -6026,6 +6032,7 @@ mod tests {
             autopilot: AutopilotConfig::default(),
             ui_config: UiConfig::default(),
             snapshots: SnapshotsConfig::default(),
+            models: ModelsConfig::default(),
             change_factory: None,
             allow_workspace_recovery: false,
             input_history_size: RELOCATION_INPUT_HISTORY,

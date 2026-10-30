@@ -1865,6 +1865,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<Finish> {
                 autopilot: stack.config.autopilot.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
+                models: stack.config.models.clone(),
                 change_factory,
                 allow_workspace_recovery: committed_relocation.is_none(),
                 input_history_size: stack.config.storage.input_history_size,
