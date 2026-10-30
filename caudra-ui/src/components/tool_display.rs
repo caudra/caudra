@@ -13,8 +13,8 @@ use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, ChildChips, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget,
-    STANDALONE_CHILD, ScrollSpan, ScrollWindow, SourceTrace, SubagentModels, ToolContent,
-    UNCONSTRAINED_WIDTH, WrappedRows,
+    STANDALONE_CHILD, ScrollSpan, ScrollWindow, SourceTrace, SubagentModel, SubagentModels,
+    ToolContent, UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -1239,6 +1239,12 @@ pub(super) fn header_spans(
     .any(|peer_tool| names_tool(peer_tool, tool))
     {
         return vec![Span::styled(escape_terminal_controls(header), base)];
+    }
+    if names_tool(TASK_TOOL_NAME, tool) {
+        return vec![Span::styled(
+            escape_terminal_controls(header),
+            base.add_modifier(Modifier::ITALIC),
+        )];
     }
     if is_shell_command(tool, header, raw_input) {
         return overlay(command_spans(header), base);
@@ -3111,8 +3117,8 @@ pub(super) fn shell_job(output: Option<&ToolOutput>) -> Option<&TaskCard> {
     }
 }
 
-/// What the header says in parentheses: how much work the call has done, then
-/// what it spent doing it.
+/// What the header says in parentheses: what a subagent runs on, how much work
+/// the call has done, then what it spent doing it.
 ///
 /// Composed here rather than stored, because a running subagent's clock keeps
 /// counting past its last report and a stored string would show it stopped.
@@ -3121,13 +3127,13 @@ pub(super) fn shell_job(output: Option<&ToolOutput>) -> Option<&TaskCard> {
 /// A task card's annotation was written when its receipt landed, so the state
 /// it names is `receipt_state`, which the job has since moved on from. A
 /// folded row says the state the job is in now; an open card names it in its
-/// body, so its header leaves it out. `model` is the subagent's, which follows
+/// body, so its header leaves it out. `model` is the subagent's, which leads
 /// the tally on a running and a settled card alike.
 fn header_annotation(
     msg: &DisplayMessage,
     receipt_state: Option<&str>,
     open: bool,
-    model: Option<&str>,
+    model: Option<&SubagentModel>,
 ) -> Option<String> {
     let tally = msg
         .progress
@@ -3148,19 +3154,25 @@ fn header_annotation(
     subagent_annotation(tally, model, own)
 }
 
-/// A subagent's tally, then its model, then what the call has to say. The run
-/// also announces its model live to whoever dispatched it, which a Lua plugin
-/// reads, so an annotation that is only that model is not said twice.
+/// A subagent's model and thinking level, then its tally, then what the call
+/// has to say. The run also announces its model live to whoever dispatched it,
+/// which a Lua plugin reads, so an annotation that is only that model is not
+/// said twice.
 pub(super) fn subagent_annotation(
     tally: Option<String>,
-    model: Option<&str>,
+    model: Option<&SubagentModel>,
     own: Option<String>,
 ) -> Option<String> {
-    let own = own.filter(|own| Some(own.as_str()) != model);
-    [tally, model.map(str::to_owned), own]
-        .into_iter()
-        .flatten()
-        .reduce(|joined, part| format!("{joined}{ACTIVITY_SEPARATOR}{part}"))
+    let own = own.filter(|own| model.is_none_or(|model| *own != model.model));
+    [
+        model.map(|model| model.model.clone()),
+        model.and_then(|model| model.thinking.clone()),
+        tally,
+        own,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|joined, part| format!("{joined}{ACTIVITY_SEPARATOR}{part}"))
 }
 
 /// The annotation with its part that names `stale` replaced by `current`, or
@@ -3232,7 +3244,7 @@ pub fn build_tool_lines(
     // follows the subagent's activity and scrolls that heading away, so the
     // header keeps the title.
     if expansion.is_some()
-        && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Tasks(_)))
+        && names_job(tool_name, msg.tool_output.as_deref())
         && msg.progress.as_ref().filter(follows).is_none()
     {
         header = "";
@@ -3264,7 +3276,7 @@ pub fn build_tool_lines(
     let mut b = ToolLineBuilder::new(rctx.width, indicator, limits);
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
-    let model = rctx.subagent_models.cards.get(call_id).map(String::as_str);
+    let model = rctx.subagent_models.cards.get(call_id);
     let mut report = header_annotation(msg, receipt_state, expansion.is_some(), model);
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
         append_annotation(&mut report, &timeout_annotation(timeout));
@@ -3500,6 +3512,13 @@ fn follows_progress(
     open: bool,
 ) -> bool {
     (indicator == Indicator::InProgress || progress.is_live()) && (!compact || open)
+}
+
+/// Whether the job receipt a call answered with names it below its header, so
+/// the header can leave the title to it. A task's title is what tells its rows
+/// apart, so the task keeps it on its own row.
+pub(super) fn names_job(tool: &str, output: Option<&ToolOutput>) -> bool {
+    matches!(output, Some(ToolOutput::Tasks(_))) && !names_tool(TASK_TOOL_NAME, tool)
 }
 
 fn project_task_output(
@@ -7407,13 +7426,12 @@ mod tests {
     }
 
     const TASK_TITLE: &str = "Find the auth middleware";
-    const TITLE_IN_HEADER_MSG: &str = "an open task card names its job in the header while the \
-                                       body follows the subagent, and in the body's heading once \
-                                       it settles";
+    const TITLE_IN_HEADER_MSG: &str =
+        "an open task card names its job in italics in the header, running or settled";
 
     #[test_case(true; "running")]
     #[test_case(false; "settled")]
-    fn an_open_running_task_keeps_its_title_in_the_header(running: bool) {
+    fn an_open_task_keeps_its_title_in_the_header(running: bool) {
         let task: TaskCard = serde_json::from_value(serde_json::json!({
             "task_id": "titled-task", "invocation_id": "invocation", "call_id": "t1",
             "root_call_id": "t1", "label": TASK_TITLE,
@@ -7446,24 +7464,18 @@ mod tests {
             Some(Disclosure::default()),
         );
         let header = line_text(&tl.lines[0]);
-        assert_eq!(
-            header.contains(TASK_TITLE),
-            running,
+        assert!(
+            tl.lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content == TASK_TITLE
+                    && span.style.add_modifier.contains(Modifier::ITALIC)),
             "{TITLE_IN_HEADER_MSG}: {header}"
         );
         assert!(
             header.contains(HISTORY_HEADER_TALLY),
             "{TITLE_IN_HEADER_MSG}: {header}"
         );
-        if !running {
-            assert!(
-                tl.lines[1..]
-                    .iter()
-                    .any(|line| line_text(line).contains(TASK_TITLE)),
-                "{TITLE_IN_HEADER_MSG}: {}",
-                lines_text(&tl)
-            );
-        }
     }
 
     fn history_msg() -> DisplayMessage {
@@ -8289,21 +8301,33 @@ mod tests {
     }
 
     const SUBAGENT_MODEL: &str = "openai/gpt-6.1-sol";
-    const SUBAGENT_ORDER_MSG: &str =
-        "a subagent's header reads its tally, then its model once, then what the call says";
+    const SUBAGENT_THINKING: &str = "xhigh";
+    const SUBAGENT_ORDER_MSG: &str = "a subagent's header reads its model once and its thinking \
+                                      level, then its tally, then what the call says";
 
-    #[test_case(Some("2 tools · 3s"), Some(SUBAGENT_MODEL), Some("1.2k↑"), Some("2 tools · 3s · openai/gpt-6.1-sol · 1.2k↑") ; "all_three_in_order")]
-    #[test_case(None, Some(SUBAGENT_MODEL), Some(SUBAGENT_MODEL), Some(SUBAGENT_MODEL) ; "the_announced_model_is_not_repeated")]
-    #[test_case(None, None, Some("1.2k↑"), Some("1.2k↑") ; "no_model_leaves_the_annotation")]
-    #[test_case(None, None, None, None ; "nothing_says_nothing")]
+    #[test_case(Some("2 tools · 3s"), Some(SUBAGENT_MODEL), None, Some("1.2k↑"), Some("openai/gpt-6.1-sol · 2 tools · 3s · 1.2k↑") ; "all_three_in_order")]
+    #[test_case(Some("2 tools · 3s"), Some(SUBAGENT_MODEL), Some(SUBAGENT_THINKING), None, Some("openai/gpt-6.1-sol · xhigh · 2 tools · 3s") ; "thinking_follows_the_model")]
+    #[test_case(None, Some(SUBAGENT_MODEL), None, Some(SUBAGENT_MODEL), Some(SUBAGENT_MODEL) ; "the_announced_model_is_not_repeated")]
+    #[test_case(None, None, None, Some("1.2k↑"), Some("1.2k↑") ; "no_model_leaves_the_annotation")]
+    #[test_case(None, None, None, None, None ; "nothing_says_nothing")]
     fn a_subagent_annotation_names_its_model_once(
         tally: Option<&str>,
         model: Option<&str>,
+        thinking: Option<&str>,
         own: Option<&str>,
         expected: Option<&str>,
     ) {
+        let model = model.map(|model| SubagentModel {
+            model: model.to_owned(),
+            thinking: thinking.map(str::to_owned),
+        });
         assert_eq!(
-            subagent_annotation(tally.map(str::to_owned), model, own.map(str::to_owned)).as_deref(),
+            subagent_annotation(
+                tally.map(str::to_owned),
+                model.as_ref(),
+                own.map(str::to_owned)
+            )
+            .as_deref(),
             expected,
             "{SUBAGENT_ORDER_MSG}"
         );

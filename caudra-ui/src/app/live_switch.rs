@@ -175,7 +175,7 @@ impl App {
             return vec![Action::AdoptLiveSwitch(model)];
         }
         if let Some(parent) = self.chats[chat_idx].parent_tool_use_id().cloned() {
-            self.chats[0].set_tool_model(&parent, &model);
+            self.chats[0].set_tool_model(&parent, &model, thinking.as_deref());
         }
         let chat = &mut self.chats[chat_idx];
         let name = chat.name.clone();

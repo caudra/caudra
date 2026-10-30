@@ -600,7 +600,8 @@ impl App {
         );
         if let Some(parent_tool_use_id) = sa.parent_tool_use_id {
             if let Some(model) = &sa.model {
-                self.main_chat().set_tool_model(&parent_tool_use_id, model);
+                self.main_chat()
+                    .set_tool_model(&parent_tool_use_id, model, sa.thinking.as_deref());
             }
             chat.set_parent_tool_use_id(parent_tool_use_id);
         }

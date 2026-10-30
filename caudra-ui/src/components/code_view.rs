@@ -20,8 +20,8 @@ use super::mcp_card::McpCall;
 use super::tool_display::{
     ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
     append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
-    header_workdir, inflected_header, keeps_clock, label_spans, names_tool, progress_lines,
-    raw_toggle_label, repeats_tool, report_header, report_markdown, report_message,
+    header_workdir, inflected_header, keeps_clock, label_spans, names_job, names_tool,
+    progress_lines, raw_toggle_label, repeats_tool, report_header, report_markdown, report_message,
     scroll_footer_text, subagent_annotation, title,
 };
 use super::{
@@ -1178,7 +1178,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
         let summary = match has_output
-            && (body_repeats_summary(entry) || matches!(entry.output, Some(ToolOutput::Tasks(_))))
+            && (body_repeats_summary(entry) || names_job(&entry.tool, entry.output.as_ref()))
         {
             true => "",
             false => &inflected,
@@ -1224,7 +1224,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             child_annotation(
                 entry,
                 limits.progress.get(&index),
-                limits.models.get(&index).map(String::as_str),
+                limits.models.get(&index),
                 limits.token_scale,
             )
             .as_deref(),
@@ -1588,16 +1588,16 @@ fn holds_a_body(entry: &BatchToolEntry) -> bool {
 /// otherwise: both are drawn in the plain tense, so with nothing to separate
 /// them a batch cut short looks like a batch that went wrong.
 ///
-/// A dispatching child's tally leads, so a row reads the way its own card's
-/// header does: what the run did, then what the call has to say about it. It
-/// rides the row running as well as settled, because hung off the child as a
-/// node it would be a branch of the tree holding nothing but a clock, with the
-/// child's own body drawn to the left of it. A subagent child's model follows
-/// the tally, as on a standalone card.
+/// A subagent child's model and thinking level lead, then its tally, so a row
+/// reads the way its own card's header does: what the run is on, what it did,
+/// then what the call has to say about it. The tally rides the row running as
+/// well as settled, because hung off the child as a node it would be a branch
+/// of the tree holding nothing but a clock, with the child's own body drawn to
+/// the left of it.
 fn child_annotation(
     entry: &BatchToolEntry,
     progress: Option<&ToolProgress>,
-    model: Option<&str>,
+    model: Option<&SubagentModel>,
     scale: TokenScale,
 ) -> Option<String> {
     let own = match entry.output.as_ref() {
@@ -3590,16 +3590,23 @@ pub type ChildLive = Arc<HashMap<usize, String>>;
 /// only those draw a clock worth counting up.
 pub type ChildStarted = Arc<HashMap<usize, Instant>>;
 
+/// The model a subagent runs on, and its thinking level when it set one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentModel {
+    pub model: String,
+    pub thinking: Option<String>,
+}
+
 /// The model each subagent child of one batch runs on, by index in the
 /// roster.
-pub type ChildModels = Arc<HashMap<usize, String>>;
+pub type ChildModels = Arc<HashMap<usize, SubagentModel>>;
 
 /// The model the subagent behind each call runs on. Kept apart from the
 /// annotation, which live usage and the call's answer both rewrite.
 #[derive(Default)]
 pub struct SubagentModels {
     /// A call drawn as its own card, by its id.
-    pub cards: HashMap<String, String>,
+    pub cards: HashMap<String, SubagentModel>,
     /// A batch child, on its batch's roster, by the batch's id.
     pub children: HashMap<String, ChildModels>,
 }
@@ -4753,7 +4760,7 @@ mod tests {
         }
     }
 
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
 
     const READ_MAX_LINES: usize = 5;
     const TASK_CONTROL_TOOL: &str = "task_control";
@@ -7996,6 +8003,58 @@ mod tests {
             assert_eq!(row.spans[0], SpanSource::Chrome, "{ADMITTED_METADATA_MSG}");
             assert_eq!(links[0], None, "{ADMITTED_METADATA_MSG}");
         }
+    }
+
+    const TASK_ROW_MODEL: &str = "anthropic/claude-opus-5-5";
+    const TASK_ROW_THINKING: &str = "xhigh";
+    const TASK_ROW_MSG: &str = "a batched task's row names its job in italics, then its model, \
+                                thinking level and tally, while it runs and once it settles";
+
+    #[test_case(BatchToolStatus::Running, NESTED_RUNNING ; "running")]
+    #[test_case(BatchToolStatus::Success, NESTED_SETTLED ; "settled")]
+    fn a_batched_task_row_names_its_job_and_what_it_runs_on(status: BatchToolStatus, verb: &str) {
+        let _clock = FrozenClock::at(Duration::ZERO);
+        let mut entries = admitted_task_entries(false, ADMITTED_RUNNING);
+        entries[ADMITTED_CHILD].status = status;
+        let title = entries[ADMITTED_CHILD].summary.clone();
+        let progress = retained_progress();
+        let tally = SubagentProgress::tally(progress.report.tools, progress.elapsed());
+        let limits = limits(BatchViews::default())
+            .with_width(ADMITTED_WIDE_WIDTH)
+            .with_progress(
+                Arc::new(HashMap::from([(ADMITTED_CHILD, progress)])),
+                Arc::default(),
+                Arc::default(),
+            )
+            .with_models(Arc::new(HashMap::from([(
+                ADMITTED_CHILD,
+                SubagentModel {
+                    model: TASK_ROW_MODEL.to_owned(),
+                    thinking: Some(TASK_ROW_THINKING.to_owned()),
+                },
+            )])));
+
+        let card = render_batch(&entries, false, &limits);
+
+        let row = card
+            .lines
+            .iter()
+            .find(|line| line_text(line).contains(verb))
+            .expect(TASK_ROW_MSG);
+        assert!(
+            line_text(row).contains(&format!(
+                "{verb} {title} ({TASK_ROW_MODEL} · {TASK_ROW_THINKING} · {tally}"
+            )),
+            "{TASK_ROW_MSG}: {}",
+            line_text(row)
+        );
+        assert!(
+            row.spans
+                .iter()
+                .any(|span| span.content == title
+                    && span.style.add_modifier.contains(Modifier::ITALIC)),
+            "{TASK_ROW_MSG}"
+        );
     }
 
     #[test]

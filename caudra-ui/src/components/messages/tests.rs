@@ -2624,10 +2624,12 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
 }
 
 const SUBAGENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const SUBAGENT_THINKING: &str = "xhigh";
 const LIVE_USAGE: &str = "1.2k↑ 345↓ $0.010";
 const MODEL_WIDTH: u16 = 200;
 const MODEL_NAMED_ONCE: &str =
     "a task's card names its subagent's model exactly once, however its annotation changes";
+const THINKING_SHOWN: &str = "a task's card names its subagent's thinking level after its model";
 const USAGE_SHOWN: &str = "the live usage still reaches the card beside the model";
 
 /// The model used to ride in the annotation, which a foreground task's live
@@ -2655,9 +2657,13 @@ fn a_task_keeps_its_model_through_usage_and_settling(batched: bool) {
         seg_text(panel, TOOL_ID).matches(SUBAGENT_MODEL).count()
     };
 
-    panel.set_tool_model(call, SUBAGENT_MODEL);
+    panel.set_tool_model(call, SUBAGENT_MODEL, Some(SUBAGENT_THINKING));
     panel.tool_annotation(call, SUBAGENT_MODEL.into());
     assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
+    assert!(
+        seg_text(&panel, TOOL_ID).contains(&format!("{SUBAGENT_MODEL} · {SUBAGENT_THINKING}")),
+        "{THINKING_SHOWN}"
+    );
 
     panel.tool_annotation(call, LIVE_USAGE.into());
     assert_eq!(models(&mut panel), 1, "{MODEL_NAMED_ONCE}");
@@ -2681,7 +2687,7 @@ fn a_task_keeps_its_model_through_usage_and_settling(batched: bool) {
 #[test]
 fn set_tool_turn_usage_updates_exact_tool_and_keeps_model() {
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
-    panel.set_tool_model("t1", SUBAGENT_MODEL);
+    panel.set_tool_model("t1", SUBAGENT_MODEL, None);
 
     panel.set_tool_turn_usage("t1", LIVE_USAGE.into());
 

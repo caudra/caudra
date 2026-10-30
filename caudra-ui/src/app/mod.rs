@@ -6336,7 +6336,11 @@ impl App {
         if first_parent_event {
             self.chats[0].update_tool_summary(parent_tool_use_id, &subagent.name);
             if let Some(model) = &subagent.model {
-                self.chats[0].set_tool_model(parent_tool_use_id, model);
+                self.chats[0].set_tool_model(
+                    parent_tool_use_id,
+                    model,
+                    subagent.thinking.as_deref(),
+                );
             }
         }
 
@@ -6379,11 +6383,17 @@ impl App {
             // model, so the first report of it is adopted here.
             let chat = &mut self.chats[idx];
             if let Some(model) = &subagent.model {
+                let changed =
+                    chat.model_id.as_ref() != Some(model) || chat.thinking != subagent.thinking;
                 chat.thinking.clone_from(&subagent.thinking);
                 chat.fast = subagent.fast;
-                if chat.model_id.as_ref() != Some(model) {
+                if changed {
                     chat.model_id = Some(model.clone());
-                    self.chats[0].set_tool_model(parent_tool_use_id, model);
+                    self.chats[0].set_tool_model(
+                        parent_tool_use_id,
+                        model,
+                        subagent.thinking.as_deref(),
+                    );
                 }
             }
             return idx;

@@ -25,7 +25,7 @@ use super::{
     code_view::{
         self, BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews,
         CardPolicy, Disclosure, InnerTarget, RenderLimits, RowTarget, ScrollSpan, ScrollWindow,
-        SubagentModels,
+        SubagentModel, SubagentModels,
     },
     command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
@@ -3138,7 +3138,11 @@ impl MessagesPanel {
         self.token_scale
     }
 
-    pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
+    pub fn set_tool_model(&mut self, tool_id: &str, model: &str, thinking: Option<&str>) {
+        let model = SubagentModel {
+            model: model.to_owned(),
+            thinking: thinking.map(str::to_owned),
+        };
         if self.tool_card(tool_id).is_none()
             && let Some((batch_id, index)) = batch_child_id(tool_id)
             && self.tool_card(batch_id).is_some()
@@ -3148,19 +3152,12 @@ impl MessagesPanel {
                 .children
                 .entry(batch_id.to_owned())
                 .or_default();
-            if children.get(&index).is_none_or(|known| known != model) {
-                Arc::make_mut(children).insert(index, model.to_owned());
+            if children.get(&index) != Some(&model) {
+                Arc::make_mut(children).insert(index, model);
                 self.mark_card_dirty(batch_id);
             }
-        } else if self
-            .subagent_models
-            .cards
-            .get(tool_id)
-            .is_none_or(|known| known != model)
-        {
-            self.subagent_models
-                .cards
-                .insert(tool_id.to_owned(), model.to_owned());
+        } else if self.subagent_models.cards.get(tool_id) != Some(&model) {
+            self.subagent_models.cards.insert(tool_id.to_owned(), model);
             self.mark_card_dirty(tool_id);
         }
     }
@@ -3169,7 +3166,7 @@ impl MessagesPanel {
         batch_child_id(tool_id)
             .and_then(|(batch_id, index)| self.subagent_models.children.get(batch_id)?.get(&index))
             .or_else(|| self.subagent_models.cards.get(tool_id))
-            .map(String::as_str)
+            .map(|model| model.model.as_str())
     }
 
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {

@@ -1058,8 +1058,8 @@ impl Chat {
         self.messages_panel.set_token_scale(scale);
     }
 
-    pub fn set_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.set_tool_model(tool_id, model);
+    pub fn set_tool_model(&mut self, tool_id: &str, model: &str, thinking: Option<&str>) {
+        self.messages_panel.set_tool_model(tool_id, model, thinking);
     }
 
     #[cfg(test)]
