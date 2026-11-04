@@ -20,6 +20,9 @@
 
 Autopilot, a decision system for screening and reranking, built-in token savings, background subagents and shell calls, a learner with memory, nudges that keep small and flagship models on track, and code mode. Everything else a modern coding agent should have comes with them, designed together in one native binary.
 
+> [!NOTE]
+> **Help shape what comes next.** I am designing how Caudra agents on different machines link into one swarm that you run from a single cockpit. [Read the plan and share your feedback](https://github.com/caudra/caudra/discussions/2).
+
 ```sh
 curl -fsSL https://caudra.ai/install.sh | sh
 ```
